@@ -14,41 +14,21 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # The repo is still a scaffold. Until the workspace lands, every job below
-  # skips instead of failing. Delete this job (and the `needs`/`if` on the
-  # others) once Cargo.toml is committed.
-  guard:
-    runs-on: ubuntu-latest
-    outputs:
-      has_cargo: ${{ steps.check.outputs.has_cargo }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: check
-        run: |
-          if [ -f Cargo.toml ]; then
-            echo "has_cargo=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_cargo=false" >> "$GITHUB_OUTPUT"
-            echo "No Cargo.toml yet — skipping build jobs." >> "$GITHUB_STEP_SUMMARY"
-          fi
-
   fmt:
-    needs: guard
-    if: needs.guard.outputs.has_cargo == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup component add rustfmt
       - run: cargo fmt --all --check
 
-  # `cargo clippy --target` needs no linker (no final link step), so the
-  # Windows target lints fine from Linux without mingw-w64.
+  # Linting for the Windows target needs no *linker* (no final link step), but
+  # `zstd-sys` compiles C in its build script, so cc-rs still demands the
+  # mingw-w64 cross-compiler named by `.cargo/config.toml`.
   clippy:
-    needs: guard
-    if: needs.guard.outputs.has_cargo == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - run: |
           rustup component add clippy
           rustup target add x86_64-pc-windows-gnu
@@ -58,8 +38,6 @@ jobs:
   # Host-target tests for the pure crates. The app crate is egui/eframe and
   # would drag in Linux GUI system deps, so it is excluded.
   test:
-    needs: guard
-    if: needs.guard.outputs.has_cargo == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

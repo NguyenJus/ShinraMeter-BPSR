@@ -1,0 +1,72 @@
+//! `shinra-bpsr` — capture -> protocol -> meter -> overlay (plan §T4.2).
+//!
+//! A capture failure is never fatal: the overlay still runs and shows
+//! `CaptureError::user_message()` in its status banner.
+
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+mod pipeline;
+mod ui;
+
+use bpsr_protocol::ProtocolEvent;
+use crossbeam_channel::bounded;
+use ui::{OverlayApp, StatusLine, UiCommand};
+
+/// Bounded so a stalled pipeline never grows unboundedly behind capture.
+const EVENT_CAPACITY: usize = 4096;
+const COMMAND_CAPACITY: usize = 64;
+
+fn main() -> eframe::Result {
+    env_logger::init();
+
+    let (tx_events, rx_events) = bounded::<ProtocolEvent>(EVENT_CAPACITY);
+    let (tx_command, rx_command) = bounded::<UiCommand>(COMMAND_CAPACITY);
+
+    // Capture is best-effort: on failure `tx_events` is dropped, the pipeline
+    // idles, and the overlay explains why.
+    let (status, capture) = match bpsr_capture::start_capture(tx_events) {
+        Ok(handle) => (StatusLine::Ok, Some(handle)),
+        Err(err) => {
+            log::error!("capture unavailable: {err}");
+            (StatusLine::Error(err.user_message().to_string()), None)
+        }
+    };
+
+    let (rx_snapshot, pipeline_thread) = pipeline::spawn(rx_events, rx_command);
+
+    // Kept alongside the clone handed to `OverlayApp` so shutdown can signal
+    // the pipeline explicitly below, rather than depending on `run_native`
+    // having already dropped `OverlayApp` (and with it its own sender) by
+    // the time it returns.
+    let tx_command_shutdown = tx_command.clone();
+
+    let native_options = eframe::NativeOptions {
+        viewport: ui::viewport(),
+        ..Default::default()
+    };
+
+    let result = eframe::run_native(
+        "shinra-bpsr",
+        native_options,
+        Box::new(move |cc| {
+            ui::apply_theme(&cc.egui_ctx);
+            Ok(Box::new(
+                OverlayApp::new(rx_snapshot, tx_command).with_status(status),
+            ))
+        }),
+    );
+
+    // Window closed: stop capture (drops its sender) and tell the pipeline
+    // thread to stop explicitly. `run_native` returns after closing the
+    // window regardless of *how* it was closed (`UiCommand::Quit` via the
+    // in-app button, alt-F4, or the window manager) — sending `Quit` here
+    // guarantees a clean shutdown without relying on `OverlayApp`'s own
+    // command sender having already been dropped.
+    if let Some(handle) = capture {
+        handle.stop();
+    }
+    let _ = tx_command_shutdown.try_send(UiCommand::Quit);
+    let _ = pipeline_thread.join();
+
+    result
+}
