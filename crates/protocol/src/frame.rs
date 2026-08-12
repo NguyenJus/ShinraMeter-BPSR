@@ -110,11 +110,7 @@ pub struct SplitFrames<'a> {
 pub fn split_frames(stream: &[u8]) -> SplitFrames<'_> {
     let mut frames = Vec::new();
     let mut consumed = 0usize;
-    loop {
-        let remaining = match stream.get(consumed..) {
-            Some(r) => r,
-            None => break,
-        };
+    while let Some(remaining) = stream.get(consumed..) {
         if remaining.len() < 4 {
             break;
         }

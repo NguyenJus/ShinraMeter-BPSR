@@ -453,7 +453,7 @@ mod tests {
         // [1000,1100) prefix but also carries genuinely new bytes
         // [1100,1300) that must not be dropped.
         let mut payload = vec![b'A'; 100];
-        payload.extend(std::iter::repeat(b'B').take(200));
+        payload.extend(std::iter::repeat_n(b'B', 200));
         r.push(1000, &payload);
         assert_eq!(r.take_stream(), vec![b'B'; 200]);
     }
@@ -528,7 +528,7 @@ mod tests {
         // be spliced into the stream, not thrown away as "stale".
         r.push(150, &[b'B'; 200]);
         let mut expected = vec![b'B'; 200];
-        expected.extend(std::iter::repeat(b'C').take(50));
+        expected.extend(std::iter::repeat_n(b'C', 50));
         assert_eq!(r.take_stream(), expected);
         assert_eq!(r.gap_bytes(), 0);
         assert!(!r.take_loss());
@@ -547,7 +547,7 @@ mod tests {
         assert_eq!(r.gap_bytes(), 100);
         r.push(103, &[b'G'; 197]); // fills the gap, draining the cached entry
         let mut expected = vec![b'G'; 197];
-        expected.extend(std::iter::repeat(b'L').take(100));
+        expected.extend(std::iter::repeat_n(b'L', 100));
         assert_eq!(r.take_stream(), expected);
         assert!(!r.take_loss());
     }
@@ -563,7 +563,7 @@ mod tests {
         // advances next_seq to base+150, i.e. into the middle of that entry
         r.push(base.wrapping_add(50), &[b'B'; 100]);
         let mut expected = vec![b'B'; 100];
-        expected.extend(std::iter::repeat(b'C').take(50));
+        expected.extend(std::iter::repeat_n(b'C', 50));
         assert_eq!(r.take_stream(), expected);
         assert_eq!(r.gap_bytes(), 0);
         assert!(!r.take_loss());
@@ -683,7 +683,7 @@ mod tests {
         // the speculative far-ahead junk, not the segment behind the gap.
         r.push(3, &[b'G'; 100]); // fills [3,103)
         let mut expected = vec![b'G'; 100];
-        expected.extend(std::iter::repeat(b'N').take(100));
+        expected.extend(std::iter::repeat_n(b'N', 100));
         assert_eq!(r.take_stream(), expected);
     }
 }
