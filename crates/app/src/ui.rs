@@ -74,6 +74,9 @@ impl eframe::App for OverlayApp {
                 egui::Frame::default().fill(egui::Color32::from_rgba_unmultiplied(18, 18, 22, 200)),
             )
             .show(ui, |ui| {
+                // First, so the header buttons drawn afterwards stay on top of
+                // the corner zones they overlap.
+                draw_resize_handles(ui, &ctx);
                 draw_header(ui, &ctx, &self.snapshot, &self.tx_command);
 
                 if let StatusLine::Error(msg) = &self.status {
@@ -101,6 +104,9 @@ fn draw_header(
     let band = {
         let mut rect = ui.available_rect_before_wrap();
         rect.max.y = rect.min.y + ui.spacing().interact_size.y;
+        // Leave the top resize strip alone — a drag surface spanning it would
+        // win the hit test and swallow every north-edge resize.
+        rect.min.y += RESIZE_EDGE;
         rect
     };
     let drag_surface = ui.interact(band, ui.id().with("title_bar"), egui::Sense::drag());
@@ -130,6 +136,85 @@ fn draw_header(
             }
         });
     });
+}
+
+/// Width of the invisible edge strips that start a resize, in points.
+const RESIZE_EDGE: f32 = 6.0;
+/// Side of the invisible corner squares, which resize on both axes at once.
+const RESIZE_CORNER: f32 = 14.0;
+
+/// The eight grab zones around a window rect, edges first so the corners
+/// registered after them win where the two overlap.
+fn resize_zones(
+    rect: egui::Rect,
+) -> [(egui::Rect, egui::ResizeDirection, egui::CursorIcon); 8] {
+    use egui::{pos2, CursorIcon as Cursor, Rect, ResizeDirection as Dir};
+
+    let (l, t, r, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+    let (e, c) = (RESIZE_EDGE, RESIZE_CORNER);
+
+    [
+        (
+            Rect::from_min_max(pos2(l, t), pos2(r, t + e)),
+            Dir::North,
+            Cursor::ResizeNorth,
+        ),
+        (
+            Rect::from_min_max(pos2(l, b - e), pos2(r, b)),
+            Dir::South,
+            Cursor::ResizeSouth,
+        ),
+        (
+            Rect::from_min_max(pos2(l, t), pos2(l + e, b)),
+            Dir::West,
+            Cursor::ResizeWest,
+        ),
+        (
+            Rect::from_min_max(pos2(r - e, t), pos2(r, b)),
+            Dir::East,
+            Cursor::ResizeEast,
+        ),
+        (
+            Rect::from_min_max(pos2(l, t), pos2(l + c, t + c)),
+            Dir::NorthWest,
+            Cursor::ResizeNorthWest,
+        ),
+        (
+            Rect::from_min_max(pos2(r - c, t), pos2(r, t + c)),
+            Dir::NorthEast,
+            Cursor::ResizeNorthEast,
+        ),
+        (
+            Rect::from_min_max(pos2(l, b - c), pos2(l + c, b)),
+            Dir::SouthWest,
+            Cursor::ResizeSouthWest,
+        ),
+        (
+            Rect::from_min_max(pos2(r - c, b - c), pos2(r, b)),
+            Dir::SouthEast,
+            Cursor::ResizeSouthEast,
+        ),
+    ]
+}
+
+/// A borderless window gets no OS resize frame, so the overlay supplies its
+/// own: invisible strips along the edges that hand the gesture back to the
+/// window manager via `BeginResize`.
+fn draw_resize_handles(ui: &mut egui::Ui, ctx: &egui::Context) {
+    let window = ctx.input(|i| i.viewport_rect());
+    // `ResizeDirection` is not `Hash`, so the zone's position in the array is
+    // what keeps the eight ids distinct.
+    for (index, (zone, direction, cursor)) in resize_zones(window).into_iter().enumerate() {
+        let handle = ui.interact(zone, ui.id().with(("resize", index)), egui::Sense::drag());
+        if handle.hovered() {
+            ctx.set_cursor_icon(cursor);
+        }
+        // Same as the title-bar drag: this opens a modal loop on the OS side,
+        // so it must fire once per gesture, not once per frame.
+        if handle.drag_started_by(egui::PointerButton::Primary) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+        }
+    }
 }
 
 fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot) {
@@ -221,6 +306,7 @@ pub fn viewport() -> egui::ViewportBuilder {
         .with_always_on_top()
         .with_decorations(false)
         .with_transparent(true)
+        .with_resizable(true)
         .with_inner_size([340.0, 220.0])
         .with_min_inner_size([220.0, 90.0])
 }
@@ -298,5 +384,77 @@ mod tests {
     #[test]
     fn fmt_share_full() {
         assert_eq!(fmt_share(100.0), "100.0%");
+    }
+
+    fn window() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(340.0, 220.0))
+    }
+
+    #[test]
+    fn resize_zones_cover_every_direction() {
+        let dirs: Vec<_> = resize_zones(window()).map(|(_, d, _)| d).into_iter().collect();
+        assert_eq!(dirs.len(), 8);
+        for dir in [
+            egui::ResizeDirection::North,
+            egui::ResizeDirection::South,
+            egui::ResizeDirection::East,
+            egui::ResizeDirection::West,
+            egui::ResizeDirection::NorthEast,
+            egui::ResizeDirection::SouthEast,
+            egui::ResizeDirection::NorthWest,
+            egui::ResizeDirection::SouthWest,
+        ] {
+            assert!(dirs.contains(&dir), "missing {dir:?}");
+        }
+    }
+
+    #[test]
+    fn resize_zones_stay_inside_the_window() {
+        let win = window();
+        for (zone, dir, _) in resize_zones(win) {
+            assert!(win.contains_rect(zone), "{dir:?} escapes the window");
+        }
+    }
+
+    /// Corners must be registered after the edges they overlap, so the later
+    /// widget wins the hit test and a corner grab resizes both axes.
+    #[test]
+    fn corners_are_registered_after_edges() {
+        let zones = resize_zones(window());
+        let first_corner = zones
+            .iter()
+            .position(|(_, d, _)| {
+                matches!(
+                    d,
+                    egui::ResizeDirection::NorthWest
+                        | egui::ResizeDirection::NorthEast
+                        | egui::ResizeDirection::SouthWest
+                        | egui::ResizeDirection::SouthEast
+                )
+            })
+            .expect("a corner zone exists");
+        let last_edge = zones
+            .iter()
+            .rposition(|(_, d, _)| {
+                matches!(
+                    d,
+                    egui::ResizeDirection::North
+                        | egui::ResizeDirection::South
+                        | egui::ResizeDirection::East
+                        | egui::ResizeDirection::West
+                )
+            })
+            .expect("an edge zone exists");
+        assert!(last_edge < first_corner);
+    }
+
+    /// The header drag band must clear the north strip, or the title bar eats
+    /// every top-edge resize.
+    #[test]
+    fn north_strip_is_not_swallowed_by_the_header() {
+        let win = window();
+        let (north, ..) = resize_zones(win)[0];
+        assert_eq!(north.height(), RESIZE_EDGE);
+        assert_eq!(north.top(), win.top());
     }
 }
