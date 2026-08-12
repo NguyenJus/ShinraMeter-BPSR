@@ -12,10 +12,9 @@ log = { workspace = true }
 bpsr-protocol = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windivert = { workspace = true, features = ["vendored"] }
-# Raw FFI: `stop()` needs the `Copy` OS HANDLE so it can call
-# `WinDivertShutdown` while the capture thread is blocked in a recv on the
-# same handle — the safe wrapper keeps its handle private and takes
-# `&mut self`, which cannot be produced soundly there.
-windivert-sys = { workspace = true, features = ["vendored"] }
+# WinDivert is loaded at runtime from the copy this crate unpacks out of the
+# executable (see `src/driver.rs`). The `windivert`/`windivert-sys` crates
+# link it through the import table instead, which the Windows loader resolves
+# before `main` runs — that cannot work when the DLL does not exist yet.
+libloading.workspace = true
 windows = { workspace = true }

@@ -1,1 +1,7 @@
 * text=auto eol=lf
+
+# The vendored WinDivert release binaries are embedded in the executable and
+# the driver is signature-checked by Windows: any line-ending normalisation
+# would corrupt them into a driver the kernel refuses to load.
+crates/capture/vendor/windivert/*.dll binary
+crates/capture/vendor/windivert/*.sys binary

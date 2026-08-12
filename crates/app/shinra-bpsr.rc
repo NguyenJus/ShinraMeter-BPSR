@@ -1,0 +1,4 @@
+/* Resource id 1 (CREATEPROCESS_MANIFEST_RESOURCE_ID), type 24 (RT_MANIFEST).
+   Spelled numerically so the script needs no Windows SDK headers, which the
+   mingw cross-build does not have. */
+1 24 "shinra-bpsr.manifest"
