@@ -111,9 +111,12 @@ fn interleaved_known_and_unknown_opcodes_only_known_produce_events() {
         false,
     ));
     stream.extend(notify(0x0000_00aa, b"unknown-2", true));
+    // `CharSerialize.char_id` is already a uid (the entity uuid's high bits),
+    // so it is emitted as-is — no `>> 16` — and lands in the same id space as
+    // `DamageEvent.attacker_uid` above.
     stream.extend(notify(
         bpsr_protocol::decode::opcode::SYNC_CONTAINER_DATA,
-        &sync_container_data_payload(ATTACKER_UUID, "Ari", 2),
+        &sync_container_data_payload(10, "Ari", 2),
         false,
     ));
     stream.extend(notify(0x0000_00bb, b"unknown-3", false));
@@ -127,10 +130,52 @@ fn interleaved_known_and_unknown_opcodes_only_known_produce_events() {
     }
     match &events[1] {
         ProtocolEvent::Player(p) => {
-            assert_eq!(p.uid, ATTACKER_UUID);
+            assert_eq!(p.uid, 10);
             assert_eq!(p.name.as_deref(), Some("Ari"));
         }
         other => panic!("expected Player, got {other:?}"),
+    }
+}
+
+/// A `SyncToMeDeltaInfo` (opcode `0x2e`) carries the entity's identity on the
+/// *outer* `AoiSyncToMeDelta.uuid`; `base_delta.uuid` is 0. The decoder must
+/// read the outer uuid, otherwise every to-me update decodes as uid 0 /
+/// `EntityKind::Unknown` and is dropped.
+#[test]
+fn sync_to_me_delta_info_uses_outer_uuid() {
+    use prost::Message;
+
+    let msg = bpsr_protocol::pb::SyncToMeDeltaInfo {
+        delta_info: Some(bpsr_protocol::pb::AoiSyncToMeDelta {
+            base_delta: Some(bpsr_protocol::pb::AoiSyncDelta {
+                uuid: 0,
+                attrs: None,
+                skill_effects: Some(bpsr_protocol::pb::SkillEffect {
+                    damages: vec![base_damage(ATTACKER_UUID, 8, 512)],
+                }),
+            }),
+            uuid: TARGET_UUID,
+        }),
+    };
+    let mut payload = Vec::new();
+    msg.encode(&mut payload).unwrap();
+    let stream = notify(
+        bpsr_protocol::decode::opcode::SYNC_TO_ME_DELTA_INFO,
+        &payload,
+        true,
+    );
+
+    let mut decoder = Decoder::new();
+    let events = decoder.push_stream(&stream, 8);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ProtocolEvent::Damage(d) => {
+            assert_eq!(d.value, 512);
+            assert_eq!(d.attacker_uid, 10);
+            assert_eq!(d.target_uid, 20);
+            assert_eq!(d.target_kind, EntityKind::Monster);
+        }
+        other => panic!("expected Damage, got {other:?}"),
     }
 }
 
@@ -172,7 +217,10 @@ fn sync_near_entities_emits_player_and_enemy_hp_events() {
         }
         other => panic!("expected EnemyHp, got {other:?}"),
     }
-    assert_eq!(bpsr_protocol::event::kind_of(ATTACKER_UUID), EntityKind::Player);
+    assert_eq!(
+        bpsr_protocol::event::kind_of(ATTACKER_UUID),
+        EntityKind::Player
+    );
 }
 
 /// Five good Notify frames followed by a garbage length prefix in one TCP
@@ -191,6 +239,37 @@ fn desync_after_good_frames_still_yields_their_events() {
             ProtocolEvent::Damage(d) => assert_eq!(d.value, 100 + i as i64 * 10),
             other => panic!("expected Damage, got {other:?}"),
         }
+    }
+}
+
+/// A length prefix above `MAX_FRAME_LEN` must cause that frame's whole body
+/// to be skipped, not merely the buffered tail to be dropped: otherwise the
+/// stream resumes mid-body and every following length prefix is garbage.
+#[test]
+fn oversized_frame_body_is_skipped_so_the_next_frame_realigns() {
+    const OVERSIZED: u32 = bpsr_protocol::frame::MAX_FRAME_LEN + 1;
+    const HEAD: usize = 64; // length prefix + the first slice of the huge body
+
+    let mut first = OVERSIZED.to_be_bytes().to_vec();
+    first.extend_from_slice(&2u16.to_be_bytes()); // Notify: a well-formed header
+    first.resize(HEAD, 0xAB);
+    let mut decoder = Decoder::new();
+    assert!(decoder.push_stream(&first, 0).is_empty());
+
+    // The remainder of the oversized body, immediately followed by a good
+    // frame in the same push: the good frame must still decode.
+    let mut second = vec![0xABu8; OVERSIZED as usize - HEAD];
+    second.extend(damage_notify_frame(
+        TARGET_UUID,
+        base_damage(ATTACKER_UUID, 4, 99),
+        false,
+    ));
+
+    let events = decoder.push_stream(&second, 1);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ProtocolEvent::Damage(d) => assert_eq!(d.value, 99),
+        other => panic!("expected Damage, got {other:?}"),
     }
 }
 

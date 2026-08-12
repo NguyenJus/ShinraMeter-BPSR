@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crate::event::{Class, DamageEvent, EntityKind, EnemyHp, PlayerInfo, ProtocolEvent};
+use crate::event::{Class, DamageEvent, EnemyHp, EntityKind, PlayerInfo, ProtocolEvent};
 use crate::reset::{EnemyState, ResetConfig, ResetReason, check_hp_rollback};
 use crate::stats::{PlayerRow, PlayerStats, Snapshot};
 
@@ -65,8 +65,8 @@ impl Meter {
                 None
             }
             ProtocolEvent::EnemyHp(e) => self.apply_enemy_hp(e),
-            ProtocolEvent::ServerChanged => {
-                self.reset(ResetReason::ServerChange, self.last_event_ms);
+            ProtocolEvent::ServerChanged { timestamp_ms } => {
+                self.reset(ResetReason::ServerChange, *timestamp_ms);
                 self.enemies.clear();
                 self.boss_uid = None;
                 Some(ResetReason::ServerChange)
@@ -87,15 +87,19 @@ impl Meter {
             self.recompute_boss();
         }
 
-        if self.fight_start_ms.is_none() {
-            self.fight_start_ms = Some(d.timestamp_ms);
-        }
         self.last_event_ms = self.last_event_ms.max(d.timestamp_ms);
 
-        // Only player attackers produce rows; monster damage is tracked
-        // above for boss-selection/reset purposes only.
+        // Only player attackers start the fight clock and produce rows;
+        // monster damage is tracked above for boss-selection/reset purposes
+        // only. Starting the clock on monster damage would let a boss
+        // attacking the tank before players open fire dilute every row's DPS
+        // with idle time.
         if d.attacker_kind != EntityKind::Player {
             return None;
+        }
+
+        if self.fight_start_ms.is_none() {
+            self.fight_start_ms = Some(d.timestamp_ms);
         }
 
         let cached = self.names.get(&d.attacker_uid).cloned();
@@ -148,8 +152,10 @@ impl Meter {
     }
 
     fn apply_enemy_hp(&mut self, e: &EnemyHp) -> Option<ResetReason> {
-        self.last_event_ms = self.last_event_ms.max(e.timestamp_ms);
-
+        // `last_event_ms` is the DPS-window end and must reflect damage
+        // only; enemy-HP sync/regen packets arriving after combat stops
+        // would otherwise keep extending the denominator and decay DPS
+        // toward zero with no combat happening.
         {
             let enemy = self.enemies.entry(e.uid).or_default();
             if e.curr_hp.is_some() {
@@ -201,7 +207,10 @@ impl Meter {
             .iter()
             .filter(|(_, e)| e.took_damage)
             .filter_map(|(uid, e)| e.max_hp.map(|hp| (*uid, hp)))
-            .max_by_key(|(_, hp)| *hp)
+            // Tie-break deterministically on uid: `HashMap` iteration order
+            // is unspecified, so breaking ties on `hp` alone let `boss_uid`
+            // flip between calls for two enemies sharing the same `max_hp`.
+            .max_by_key(|(uid, hp)| (*hp, *uid))
             .map(|(uid, _)| uid);
     }
 
@@ -214,6 +223,12 @@ impl Meter {
         }
         self.fight_start_ms = None;
         self.last_reset_ms = Some(now_ms);
+        // No enemy has `took_damage` anymore, so this clears `boss_uid`.
+        // Otherwise a stale `boss_uid` from the previous pull would still
+        // match an `EnemyHp` packet for the old boss arriving before the
+        // next damage event, letting its HP-refill curve fire a second,
+        // spurious reset.
+        self.recompute_boss();
     }
 
     pub fn snapshot(&self, now_ms: u64) -> Snapshot {
@@ -389,6 +404,50 @@ mod tests {
     }
 
     #[test]
+    fn fight_clock_does_not_start_on_monster_damage() {
+        let mut m = Meter::new();
+        // Boss hits a player at t=0; the clock must not start yet.
+        m.apply(&ProtocolEvent::Damage(DamageEvent {
+            attacker_uid: 99,
+            attacker_kind: EntityKind::Monster,
+            target_uid: 1,
+            target_kind: EntityKind::Player,
+            value: 500,
+            timestamp_ms: 0,
+            ..Default::default()
+        }));
+        assert!(!m.is_active());
+
+        // Players only open 60s later.
+        m.apply(&dmg(1, 1000, 60_000));
+        let snap = m.snapshot(61_000);
+        // DPS window must be anchored to the first *player* damage (60_000),
+        // not the earlier monster damage (0), or the 60s of idle time halves
+        // (here, 60x-diminishes) every row's DPS.
+        assert!((snap.rows[0].dps - 1000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn enemy_hp_packet_does_not_extend_dps_window() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 1000, 0));
+        m.apply(&dmg(1, 1000, 1000));
+
+        // A boss-HP sync/regen tick arrives long after combat stopped.
+        m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+            uid: 10,
+            curr_hp: Some(100),
+            max_hp: Some(100),
+            timestamp_ms: 60_000,
+            ..Default::default()
+        }));
+
+        let snap = m.snapshot(61_000);
+        // DPS window is last-damage(1000) - first-damage(0) = 1s, not 60s.
+        assert!((snap.rows[0].dps - 2000.0).abs() < 0.01);
+    }
+
+    #[test]
     fn monster_attacker_produces_no_row() {
         let mut m = Meter::new();
         m.apply(&ProtocolEvent::Damage(DamageEvent {
@@ -487,6 +546,71 @@ mod tests {
         }
 
         #[test]
+        fn recompute_boss_tie_break_is_deterministic_on_uid() {
+            // Two enemies tied on max_hp; insertion order differs between the
+            // two Meters. The tie-break must not depend on HashMap iteration
+            // order.
+            let mut m1 = Meter::new();
+            m1.apply(&boss_hit(5, 0));
+            m1.apply(&hp(5, 100, 100, 0));
+            m1.apply(&boss_hit(10, 0));
+            m1.apply(&hp(10, 100, 100, 0));
+            m1.apply(&boss_hit(7, 0));
+            m1.apply(&hp(7, 100, 100, 0));
+
+            let mut m2 = Meter::new();
+            m2.apply(&boss_hit(7, 0));
+            m2.apply(&hp(7, 100, 100, 0));
+            m2.apply(&boss_hit(10, 0));
+            m2.apply(&hp(10, 100, 100, 0));
+            m2.apply(&boss_hit(5, 0));
+            m2.apply(&hp(5, 100, 100, 0));
+
+            assert_eq!(m1.boss_uid, Some(10));
+            assert_eq!(m2.boss_uid, Some(10));
+        }
+
+        #[test]
+        fn server_change_cooldown_uses_change_time_not_stale_last_event_ms() {
+            let mut m = Meter::new();
+            // Old fight, long since idle.
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 100, 100, 0));
+
+            // Server change detected 5 minutes later.
+            m.apply(&ProtocolEvent::ServerChanged {
+                timestamp_ms: 300_000,
+            });
+
+            // New zone: boss picked up again almost immediately.
+            m.apply(&boss_hit(10, 300_050));
+            m.apply(&hp(10, 55, 100, 300_060));
+            let r = m.apply(&hp(10, 96, 100, 300_100));
+
+            // This looks like a rollback shape, but the cooldown (anchored to
+            // the server-change moment, not the stale last-event time) hasn't
+            // elapsed yet -> must be suppressed.
+            assert_eq!(r, None);
+        }
+
+        #[test]
+        fn reset_clears_boss_uid_so_stale_hp_packet_cannot_refire() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 100, 100, 0));
+            assert_eq!(m.boss_uid, Some(10));
+
+            m.reset(ResetReason::Manual, 1000);
+            assert_eq!(m.boss_uid, None);
+
+            // An HP packet for the old boss uid, arriving before any new
+            // damage picks a new boss, must not be able to drive a reset off
+            // the stale boss_uid.
+            let r = m.apply(&hp(10, 55, 100, 1100));
+            assert_eq!(r, None);
+        }
+
+        #[test]
         fn reset_clears_took_damage_on_all_enemies() {
             let mut m = Meter::new();
             m.apply(&boss_hit(10, 0));
@@ -502,7 +626,7 @@ mod tests {
             m.apply(&dmg(1, 100, 0));
             m.apply(&boss_hit(10, 0));
             m.apply(&hp(10, 100, 100, 0));
-            let r = m.apply(&ProtocolEvent::ServerChanged);
+            let r = m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 1000 });
             assert_eq!(r, Some(ResetReason::ServerChange));
             let snap = m.snapshot(1000);
             assert!(snap.rows.is_empty());

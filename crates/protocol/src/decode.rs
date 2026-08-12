@@ -8,8 +8,8 @@
 use prost::Message;
 
 use crate::attrs::{enemy_hp_from_attrs, player_info_from_attrs};
-use crate::event::{kind_of, uid_of, DamageEvent, EntityKind, PlayerInfo, ProtocolEvent};
-use crate::frame::{parse_frame, split_frames, Notify};
+use crate::event::{DamageEvent, EntityKind, PlayerInfo, ProtocolEvent, kind_of, uid_of};
+use crate::frame::{Desync, MAX_TAIL_LEN, Notify, parse_frame, split_frames};
 use crate::pb::{self, AoiSyncDelta, Class, EDamageType};
 
 pub mod opcode {
@@ -35,20 +35,31 @@ pub fn decode_notify(n: &Notify, now_ms: u64, out: &mut Vec<ProtocolEvent>) {
         opcode::SYNC_NEAR_DELTA_INFO => match pb::SyncNearDeltaInfo::decode(n.payload.as_slice()) {
             Ok(msg) => {
                 for delta in &msg.delta_infos {
-                    on_aoi_sync_delta(delta, now_ms, out);
+                    on_aoi_sync_delta(delta, delta.uuid, now_ms, out);
                 }
             }
             Err(_) => log::debug!("bpsr-protocol: SyncNearDeltaInfo decode failed"),
         },
-        opcode::SYNC_TO_ME_DELTA_INFO => match pb::SyncToMeDeltaInfo::decode(n.payload.as_slice())
-        {
-            Ok(msg) => {
-                if let Some(delta) = msg.delta_info.and_then(|d| d.base_delta) {
-                    on_aoi_sync_delta(&delta, now_ms, out);
+        opcode::SYNC_TO_ME_DELTA_INFO => {
+            match pb::SyncToMeDeltaInfo::decode(n.payload.as_slice()) {
+                Ok(msg) => {
+                    if let Some(to_me) = msg.delta_info {
+                        // The wrapper's own `uuid` identifies the entity this
+                        // "to-me" update is about; `base_delta.uuid` is usually 0
+                        // and only serves as a fallback.
+                        if let Some(delta) = &to_me.base_delta {
+                            let uuid = if to_me.uuid != 0 {
+                                to_me.uuid
+                            } else {
+                                delta.uuid
+                            };
+                            on_aoi_sync_delta(delta, uuid, now_ms, out);
+                        }
+                    }
                 }
+                Err(_) => log::debug!("bpsr-protocol: SyncToMeDeltaInfo decode failed"),
             }
-            Err(_) => log::debug!("bpsr-protocol: SyncToMeDeltaInfo decode failed"),
-        },
+        }
         _ => {}
     }
 }
@@ -78,9 +89,12 @@ fn on_sync_near_entities(msg: &pb::SyncNearEntities, now_ms: u64, out: &mut Vec<
     }
 }
 
-fn on_aoi_sync_delta(delta: &AoiSyncDelta, now_ms: u64, out: &mut Vec<ProtocolEvent>) {
-    let target_uid = uid_of(delta.uuid);
-    let target_kind = kind_of(delta.uuid);
+/// `uuid` is the delta's identity (the entity the attrs/damage apply to); it
+/// is passed in because a `SyncToMeDeltaInfo` carries it on the wrapper rather
+/// than on the `AoiSyncDelta` itself.
+fn on_aoi_sync_delta(delta: &AoiSyncDelta, uuid: i64, now_ms: u64, out: &mut Vec<ProtocolEvent>) {
+    let target_uid = uid_of(uuid);
+    let target_kind = kind_of(uuid);
     if let Some(attrs) = &delta.attrs {
         match target_kind {
             EntityKind::Player => {
@@ -165,18 +179,44 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
 /// and returns the events decoded from whatever complete frames arrived.
 pub struct Decoder {
     tail: Vec<u8>,
+    /// Bytes still to be discarded from the stream to get past the body of a
+    /// refused over-large frame. Non-zero only while `tail` is empty.
+    skip: u64,
 }
 
 impl Decoder {
     pub fn new() -> Self {
-        Self { tail: Vec::new() }
+        Self {
+            tail: Vec::new(),
+            skip: 0,
+        }
+    }
+
+    /// Bytes currently buffered waiting for a frame to complete. Never
+    /// exceeds `MAX_TAIL_LEN`.
+    pub fn pending_len(&self) -> usize {
+        self.tail.len()
     }
 
     /// Feeds `bytes` (raw, reassembled TCP payload) in; returns every event
     /// decoded from complete frames. Incomplete trailing bytes are kept for
-    /// the next call. A framing desync clears the buffered tail rather than
-    /// looping forever on unparseable data.
+    /// the next call.
+    ///
+    /// Desync recovery depends on how badly the stream broke: an unusable
+    /// length prefix drops the buffered tail and re-synchronises on whatever
+    /// arrives next, while a refused *over-large* frame also skips the rest of
+    /// that frame's body (possibly spanning several pushes) so the stream
+    /// resumes on a real frame boundary instead of mid-body.
     pub fn push_stream(&mut self, bytes: &[u8], now_ms: u64) -> Vec<ProtocolEvent> {
+        let mut bytes = bytes;
+        if self.skip > 0 {
+            let dropped = self.skip.min(bytes.len() as u64);
+            self.skip -= dropped;
+            bytes = &bytes[dropped as usize..];
+            if bytes.is_empty() {
+                return Vec::new();
+            }
+        }
         self.tail.extend_from_slice(bytes);
         let mut out = Vec::new();
         let (consumed, desync) = {
@@ -193,16 +233,39 @@ impl Decoder {
         if consumed > 0 {
             self.tail.drain(..consumed);
         }
-        if desync {
-            log::debug!("bpsr-protocol: stream desync, dropping buffered tail");
+        match desync {
+            None => {}
+            Some(Desync::Unrecoverable) => {
+                log::debug!("bpsr-protocol: stream desync, dropping buffered tail");
+                self.tail.clear();
+            }
+            Some(Desync::Oversized { total_len }) => {
+                // `tail` now starts at the refused frame's length prefix, so
+                // whatever is buffered already counts against the skip.
+                let buffered = self.tail.len() as u64;
+                self.tail.clear();
+                self.skip = u64::from(total_len).saturating_sub(buffered);
+                log::debug!(
+                    "bpsr-protocol: refusing {total_len}-byte frame, skipping {} more bytes",
+                    self.skip
+                );
+            }
+        }
+        // Backstop: a pending frame is capped at MAX_FRAME_LEN, so the tail
+        // cannot legitimately exceed MAX_TAIL_LEN. If it ever does, the stream
+        // is not frame-aligned — drop it rather than buffer without limit.
+        if self.tail.len() > MAX_TAIL_LEN {
+            log::debug!("bpsr-protocol: buffered tail exceeded MAX_TAIL_LEN, resynchronising");
             self.tail.clear();
         }
         out
     }
 
-    /// Drops any buffered tail bytes; call on a server/connection change.
+    /// Drops any buffered tail bytes and pending skip; call on a
+    /// server/connection change.
     pub fn reset(&mut self) {
         self.tail.clear();
+        self.skip = 0;
     }
 }
 
@@ -240,9 +303,7 @@ mod tests {
         let delta = AoiSyncDelta {
             uuid: TARGET_UUID,
             attrs: None,
-            skill_effects: Some(SkillEffect {
-                damages: vec![dmg],
-            }),
+            skill_effects: Some(SkillEffect { damages: vec![dmg] }),
         };
         let msg = SyncNearDeltaInfo {
             delta_infos: vec![delta],
@@ -399,6 +460,59 @@ mod tests {
             }
             other => panic!("expected Player, got {other:?}"),
         }
+    }
+
+    fn to_me_notify(outer_uuid: i64, base_uuid: i64) -> Notify {
+        let attrs = AttrCollection {
+            uuid: 0,
+            attrs: vec![pb::Attr {
+                id: crate::attrs::attr_id::NAME,
+                raw_data: vec![0xFF, b'A', b'l', b'i'],
+            }],
+        };
+        let msg = pb::SyncToMeDeltaInfo {
+            delta_info: Some(pb::AoiSyncToMeDelta {
+                base_delta: Some(AoiSyncDelta {
+                    uuid: base_uuid,
+                    attrs: Some(attrs),
+                    skill_effects: None,
+                }),
+                uuid: outer_uuid,
+            }),
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        Notify {
+            method_id: opcode::SYNC_TO_ME_DELTA_INFO,
+            payload,
+        }
+    }
+
+    fn only_player(out: Vec<ProtocolEvent>) -> PlayerInfo {
+        assert_eq!(out.len(), 1);
+        match out.into_iter().next().unwrap() {
+            ProtocolEvent::Player(p) => p,
+            other => panic!("expected Player, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_me_delta_takes_identity_from_the_outer_uuid() {
+        // The "to-me" wrapper carries the entity uuid; base_delta.uuid is 0.
+        let n = to_me_notify(ATTACKER_UUID, 0);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out);
+        let p = only_player(out);
+        assert_eq!(p.uid, uid_of(ATTACKER_UUID));
+        assert_eq!(p.name.as_deref(), Some("Ali"));
+    }
+
+    #[test]
+    fn to_me_delta_falls_back_to_base_delta_uuid() {
+        let n = to_me_notify(0, ATTACKER_UUID);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out);
+        assert_eq!(only_player(out).uid, uid_of(ATTACKER_UUID));
     }
 
     #[test]

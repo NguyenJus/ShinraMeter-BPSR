@@ -70,9 +70,9 @@ impl eframe::App for OverlayApp {
         apply_theme(&ctx);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(egui::Color32::from_rgba_unmultiplied(
-                18, 18, 22, 200,
-            )))
+            .frame(
+                egui::Frame::default().fill(egui::Color32::from_rgba_unmultiplied(18, 18, 22, 200)),
+            )
             .show(ui, |ui| {
                 draw_header(ui, &ctx, &self.snapshot, &self.tx_command);
 

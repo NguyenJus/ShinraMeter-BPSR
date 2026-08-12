@@ -64,9 +64,12 @@ pub fn looks_like_game_server(payload: &[u8]) -> bool {
         if offset + 4 > payload.len() {
             break;
         }
-        let len =
-            u32::from_be_bytes([payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3]])
-                as usize;
+        let len = u32::from_be_bytes([
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+        ]) as usize;
         if len < 4 {
             break;
         }
@@ -234,7 +237,8 @@ impl ServerDetector {
         let Some(prefix) = self.known_subnet else {
             return false;
         };
-        if !subnet_adoption_eligible(conn, payload, prefix) || self.subnet_candidates.contains(conn) {
+        if !subnet_adoption_eligible(conn, payload, prefix) || self.subnet_candidates.contains(conn)
+        {
             return false;
         }
         if self.subnet_candidates.len() >= Self::MAX_SUBNET_CONNECTIONS {
@@ -258,7 +262,15 @@ impl ServerDetector {
             self.subnet_candidates.clear();
         }
         self.known_subnet = Some(prefix);
-        self.subnet_candidates.insert(*conn);
+        // Bounded for the same reason `detects` is: the payload-signature
+        // paths adopt without consulting the cap, so a long session of channel
+        // switches inside one /16 would otherwise grow this set for the
+        // process lifetime. Dropping the insert once the set is full costs
+        // nothing — at the cap `detects` already refuses every subnet-path
+        // candidate, so there is no re-adoption left for the record to block.
+        if self.subnet_candidates.len() < Self::MAX_SUBNET_CONNECTIONS {
+            self.subnet_candidates.insert(*conn);
+        }
     }
 }
 
@@ -347,36 +359,74 @@ mod tests {
 
     #[test]
     fn same_connection_matches_identical_tuple() {
-        let conn = Conn { src: [1, 2, 3, 4], src_port: 100, dst: [10, 0, 0, 5], dst_port: 200 };
+        let conn = Conn {
+            src: [1, 2, 3, 4],
+            src_port: 100,
+            dst: [10, 0, 0, 5],
+            dst_port: 200,
+        };
         assert!(same_connection(&conn, &conn));
     }
 
     #[test]
     fn same_connection_matches_reversed_direction() {
-        let server_to_client = Conn { src: [1, 2, 3, 4], src_port: 100, dst: [10, 0, 0, 5], dst_port: 200 };
-        let client_to_server = Conn { src: [10, 0, 0, 5], src_port: 200, dst: [1, 2, 3, 4], dst_port: 100 };
+        let server_to_client = Conn {
+            src: [1, 2, 3, 4],
+            src_port: 100,
+            dst: [10, 0, 0, 5],
+            dst_port: 200,
+        };
+        let client_to_server = Conn {
+            src: [10, 0, 0, 5],
+            src_port: 200,
+            dst: [1, 2, 3, 4],
+            dst_port: 100,
+        };
         assert!(same_connection(&client_to_server, &server_to_client));
     }
 
     #[test]
     fn same_connection_rejects_a_different_connection() {
-        let a = Conn { src: [1, 2, 3, 4], src_port: 100, dst: [10, 0, 0, 5], dst_port: 200 };
-        let b = Conn { src: [1, 2, 3, 4], src_port: 101, dst: [10, 0, 0, 5], dst_port: 200 };
+        let a = Conn {
+            src: [1, 2, 3, 4],
+            src_port: 100,
+            dst: [10, 0, 0, 5],
+            dst_port: 200,
+        };
+        let b = Conn {
+            src: [1, 2, 3, 4],
+            src_port: 101,
+            dst: [10, 0, 0, 5],
+            dst_port: 200,
+        };
         assert!(!same_connection(&a, &b));
     }
 
     fn adopted() -> Conn {
         // server -> client, the direction whose payload carried the signature
-        Conn { src: [1, 2, 3, 4], src_port: 100, dst: [10, 0, 0, 5], dst_port: 200 }
+        Conn {
+            src: [1, 2, 3, 4],
+            src_port: 100,
+            dst: [10, 0, 0, 5],
+            dst_port: 200,
+        }
     }
 
     fn reversed() -> Conn {
-        Conn { src: [10, 0, 0, 5], src_port: 200, dst: [1, 2, 3, 4], dst_port: 100 }
+        Conn {
+            src: [10, 0, 0, 5],
+            src_port: 200,
+            dst: [1, 2, 3, 4],
+            dst_port: 100,
+        }
     }
 
     #[test]
     fn adopted_direction_is_the_server_stream() {
-        assert_eq!(classify_connection(&adopted(), Some(&adopted())), ConnStreamRole::Adopted);
+        assert_eq!(
+            classify_connection(&adopted(), Some(&adopted())),
+            ConnStreamRole::Adopted
+        );
     }
 
     #[test]
@@ -385,29 +435,53 @@ mod tests {
         // ping-pong-adopt), and must not be `Adopted` (client->server bytes
         // live in a different 32-bit sequence space and would corrupt the
         // server reassembler).
-        assert_eq!(classify_connection(&reversed(), Some(&adopted())), ConnStreamRole::Reverse);
+        assert_eq!(
+            classify_connection(&reversed(), Some(&adopted())),
+            ConnStreamRole::Reverse
+        );
     }
 
     #[test]
     fn other_connection_is_unrelated() {
-        let other = Conn { src: [1, 2, 3, 4], src_port: 101, dst: [10, 0, 0, 5], dst_port: 200 };
-        assert_eq!(classify_connection(&other, Some(&adopted())), ConnStreamRole::Unrelated);
+        let other = Conn {
+            src: [1, 2, 3, 4],
+            src_port: 101,
+            dst: [10, 0, 0, 5],
+            dst_port: 200,
+        };
+        assert_eq!(
+            classify_connection(&other, Some(&adopted())),
+            ConnStreamRole::Unrelated
+        );
     }
 
     #[test]
     fn nothing_adopted_yet_is_unrelated() {
-        assert_eq!(classify_connection(&adopted(), None), ConnStreamRole::Unrelated);
+        assert_eq!(
+            classify_connection(&adopted(), None),
+            ConnStreamRole::Unrelated
+        );
     }
 
     /// server → client packet from a public address, as the adopted stream
     /// direction always looks.
     fn server_to_client(src: [u8; 4], src_port: u16) -> Conn {
-        Conn { src, src_port, dst: [192, 168, 1, 50], dst_port: 55_000 }
+        Conn {
+            src,
+            src_port,
+            dst: [192, 168, 1, 50],
+            dst_port: 55_000,
+        }
     }
 
     /// client → server packet: the reverse tuple of the above.
     fn client_to_server(dst: [u8; 4], dst_port: u16) -> Conn {
-        Conn { src: [192, 168, 1, 50], src_port: 55_000, dst, dst_port }
+        Conn {
+            src: [192, 168, 1, 50],
+            src_port: 55_000,
+            dst,
+            dst_port,
+        }
     }
 
     fn detector_knowing(subnet_of: &Conn) -> ServerDetector {
@@ -452,22 +526,53 @@ mod tests {
     fn subnet_candidates_are_capped() {
         let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
         for port in 0..(ServerDetector::MAX_SUBNET_CONNECTIONS as u16 + 4) {
-            let _ = d.detects(&server_to_client([203, 0, 113, 8], 6000 + port), b"payload", false);
+            let _ = d.detects(
+                &server_to_client([203, 0, 113, 8], 6000 + port),
+                b"payload",
+                false,
+            );
         }
         assert!(!d.detects(&server_to_client([203, 0, 113, 8], 9999), b"payload", false));
+    }
+
+    #[test]
+    fn signature_path_adoptions_cannot_grow_candidates_without_bound() {
+        // `detects` returns `true` from the payload-signature path without
+        // consulting the cap (a signature match is proof, not a guess), so
+        // every channel switch inside one /16 reaches `adopt` with a fresh
+        // 4-tuple. If `adopt` inserted unconditionally the set would grow for
+        // the process lifetime and silently eat the reconnect path's budget.
+        let mut d = ServerDetector::new();
+        for port in 0..(ServerDetector::MAX_SUBNET_CONNECTIONS as u16 * 4) {
+            d.adopt(&server_to_client([203, 0, 113, 7], 5000 + port));
+        }
+        assert!(
+            d.subnet_candidates.len() <= ServerDetector::MAX_SUBNET_CONNECTIONS,
+            "subnet_candidates grew to {}, past the {} cap",
+            d.subnet_candidates.len(),
+            ServerDetector::MAX_SUBNET_CONNECTIONS,
+        );
     }
 
     #[test]
     fn changing_subnet_clears_stale_candidates() {
         let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
         for port in 0..(ServerDetector::MAX_SUBNET_CONNECTIONS as u16 + 4) {
-            let _ = d.detects(&server_to_client([203, 0, 113, 8], 6000 + port), b"payload", false);
+            let _ = d.detects(
+                &server_to_client([203, 0, 113, 8], 6000 + port),
+                b"payload",
+                false,
+            );
         }
         // A signature match in a different /16 adopts a server elsewhere; the
         // candidates accumulated under the old subnet must not keep consuming
         // the new subnet's cap.
         d.adopt(&server_to_client([198, 51, 100, 7], 7000));
-        assert!(d.detects(&server_to_client([198, 51, 100, 9], 7001), b"payload", false));
+        assert!(d.detects(
+            &server_to_client([198, 51, 100, 9], 7001),
+            b"payload",
+            false
+        ));
     }
 
     #[test]

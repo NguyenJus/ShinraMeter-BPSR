@@ -20,7 +20,7 @@ use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bpsr_protocol::{Decoder, ProtocolEvent};
 use crossbeam_channel::Sender;
@@ -40,6 +40,20 @@ const FILTER: &str = "!loopback && ip && tcp";
 
 /// Recv buffer, reused across calls to `WinDivertRecv`.
 const RECV_BUFFER_SIZE: usize = 10 * 1024 * 1024;
+
+/// Backoff applied after the first failed `WinDivertRecv`, multiplied by the
+/// consecutive-failure count and clamped to [`MAX_RECV_ERROR_BACKOFF`]. A
+/// transient failure costs one short nap; a handle stuck in a permanently
+/// failing state (adapter removed, driver unloaded or upgraded mid-session)
+/// no longer spins the thread at 100% CPU.
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(20);
+const MAX_RECV_ERROR_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Consecutive `WinDivertRecv` failures tolerated before the capture thread
+/// concludes the handle is dead and exits. Exiting drops `tx`, which closes
+/// the event channel and is how the failure reaches the rest of the app —
+/// far better than a live thread that silently never emits again.
+const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 64;
 
 /// Handle to the running capture thread.
 pub struct CaptureHandle {
@@ -108,7 +122,12 @@ pub fn start_capture(tx: Sender<ProtocolEvent>) -> Result<CaptureHandle, Capture
     let thread_handle = handle;
     let join = thread::spawn(move || recv_loop(thread_handle, tx, thread_stop, thread_restart));
 
-    Ok(CaptureHandle { stop, restart, handle, join })
+    Ok(CaptureHandle {
+        stop,
+        restart,
+        handle,
+        join,
+    })
 }
 
 /// Maps a WinDivert open failure to the user-facing [`CaptureError`]
@@ -130,10 +149,15 @@ fn map_open_error(err: std::io::Error) -> CaptureError {
     }
 }
 
-/// Blocking single-packet receive. Returns the captured packet bytes (IP
-/// header onwards) borrowed from `buffer`, or `None` if the driver call
-/// failed (including the shutdown-initiated wakeup).
-fn recv_packet<'a>(handle: HANDLE, buffer: &'a mut [u8]) -> Option<&'a [u8]> {
+/// Blocking single-packet receive. On success returns how many bytes of
+/// `buffer` the driver filled with the captured packet (IP header onwards);
+/// on failure returns the OS error, which the caller must inspect — a
+/// shutdown-initiated wakeup and a dead adapter both surface here and are
+/// only distinguishable by the error (and by the stop flag).
+///
+/// Returns a length rather than a borrow of `buffer` so the caller can react
+/// to an error without holding a borrow across the retry.
+fn recv_packet(handle: HANDLE, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
     let mut packet_len: u32 = 0;
     let mut addr = MaybeUninit::<WINDIVERT_ADDRESS>::uninit();
     // SAFETY: `handle` is live for the whole capture thread; `buffer` is a
@@ -150,18 +174,23 @@ fn recv_packet<'a>(handle: HANDLE, buffer: &'a mut [u8]) -> Option<&'a [u8]> {
         )
     };
     if !ok.as_bool() {
-        return None;
+        return Err(std::io::Error::last_os_error());
     }
-    let len = (packet_len as usize).min(buffer.len());
-    Some(&buffer[..len])
+    Ok((packet_len as usize).min(buffer.len()))
 }
 
-fn recv_loop(handle: HANDLE, tx: Sender<ProtocolEvent>, stop: Arc<AtomicBool>, restart: Arc<AtomicBool>) {
+fn recv_loop(
+    handle: HANDLE,
+    tx: Sender<ProtocolEvent>,
+    stop: Arc<AtomicBool>,
+    restart: Arc<AtomicBool>,
+) {
     let mut buffer = vec![0u8; RECV_BUFFER_SIZE];
     let mut known_server: Option<Conn> = None;
     let mut detector = ServerDetector::new();
     let mut reassembler = TcpReassembler::new();
     let mut decoder = Decoder::new();
+    let mut consecutive_errors: u32 = 0;
 
     while !stop.load(Ordering::Relaxed) {
         if restart.swap(false, Ordering::SeqCst) {
@@ -170,9 +199,36 @@ fn recv_loop(handle: HANDLE, tx: Sender<ProtocolEvent>, stop: Arc<AtomicBool>, r
             decoder.reset();
         }
 
-        let Some(packet) = recv_packet(handle, &mut buffer) else {
-            continue;
+        let packet_len = match recv_packet(handle, &mut buffer) {
+            Ok(len) => {
+                consecutive_errors = 0;
+                len
+            }
+            Err(err) => {
+                // `CaptureHandle::stop` sets the flag *before* calling
+                // `WinDivertShutdown`, so an expected shutdown wakeup always
+                // finds it set: this is the normal exit, not a failure.
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                consecutive_errors += 1;
+                log::warn!(
+                    "WinDivertRecv failed ({consecutive_errors}/{MAX_CONSECUTIVE_RECV_ERRORS} consecutive): {err}"
+                );
+                if consecutive_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                    log::error!(
+                        "WinDivertRecv failed {consecutive_errors} times in a row; \
+                         giving up on the capture handle (last error: {err})"
+                    );
+                    break;
+                }
+                thread::sleep(
+                    (RECV_ERROR_BACKOFF * consecutive_errors).min(MAX_RECV_ERROR_BACKOFF),
+                );
+                continue;
+            }
         };
+        let packet = &buffer[..packet_len];
 
         let Ok(sliced) = SlicedPacket::from_ip(packet) else {
             continue;
@@ -232,5 +288,8 @@ fn recv_loop(handle: HANDLE, tx: Sender<ProtocolEvent>, stop: Arc<AtomicBool>, r
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }

@@ -122,5 +122,10 @@ pub enum ProtocolEvent {
     Damage(DamageEvent),
     Player(PlayerInfo),
     EnemyHp(EnemyHp),
-    ServerChanged,
+    /// `timestamp_ms` is the caller-supplied "now" at detection time (this
+    /// event carries no other timing signal of its own) — used to anchor the
+    /// post-reset cooldown so it isn't stamped with a stale prior event time.
+    ServerChanged {
+        timestamp_ms: u64,
+    },
 }

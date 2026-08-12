@@ -34,6 +34,12 @@ fn main() -> eframe::Result {
 
     let (rx_snapshot, pipeline_thread) = pipeline::spawn(rx_events, rx_command);
 
+    // Kept alongside the clone handed to `OverlayApp` so shutdown can signal
+    // the pipeline explicitly below, rather than depending on `run_native`
+    // having already dropped `OverlayApp` (and with it its own sender) by
+    // the time it returns.
+    let tx_command_shutdown = tx_command.clone();
+
     let native_options = eframe::NativeOptions {
         viewport: ui::viewport(),
         ..Default::default()
@@ -50,11 +56,16 @@ fn main() -> eframe::Result {
         }),
     );
 
-    // Window closed: stop capture (drops its sender) and let the pipeline
-    // thread wind down — the overlay's command sender is gone by now.
+    // Window closed: stop capture (drops its sender) and tell the pipeline
+    // thread to stop explicitly. `run_native` returns after closing the
+    // window regardless of *how* it was closed (`UiCommand::Quit` via the
+    // in-app button, alt-F4, or the window manager) — sending `Quit` here
+    // guarantees a clean shutdown without relying on `OverlayApp`'s own
+    // command sender having already been dropped.
     if let Some(handle) = capture {
         handle.stop();
     }
+    let _ = tx_command_shutdown.try_send(UiCommand::Quit);
     let _ = pipeline_thread.join();
 
     result

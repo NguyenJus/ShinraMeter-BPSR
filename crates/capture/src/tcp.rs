@@ -4,26 +4,52 @@
 //! byte stream. Pure logic, no sockets — host-testable.
 
 use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
 
 /// Default cap on the accumulated (undrained) byte stream: 10 MiB.
 const DEFAULT_MAX_BUFFER: usize = 10 * 1024 * 1024;
+
+/// Default cap on the accounted size of the out-of-order cache: 2 MiB.
+/// Legitimate reordering never holds more than roughly a send window.
+const DEFAULT_MAX_CACHE: usize = 2 * 1024 * 1024;
+
+/// Bookkeeping charged per cached segment on top of its payload (BTreeMap
+/// node share + `Vec` header + allocator slack), so that the cache cap bounds
+/// a flood of tiny far-ahead segments by entry count as well as by bytes.
+const CACHE_ENTRY_OVERHEAD: usize = 64;
+
+/// How far behind `next_seq` a segment must start before it is read as the
+/// peer re-anchoring the stream rather than as a retransmit. Retransmits and
+/// keepalive probes sit within a send window of `next_seq` (TCP's largest
+/// scaled window is ~1 GiB, real senders use a few MiB at most); a fresh ISN
+/// after a reconnect on the same 4-tuple lands ~1 GiB behind on average.
+const MIN_BEHIND_FOR_RESYNC: u32 = 16 * 1024 * 1024;
 
 /// Reassembles a TCP byte stream from possibly out-of-order / retransmitted
 /// segments, handling 32-bit sequence-number wraparound and recovering from
 /// a permanent gap (e.g. after a reconnect or zone change) via a stall guard.
 pub struct TcpReassembler {
     /// Out-of-order segments waiting for the gap ahead of them to fill in.
+    /// Keyed by raw `u32`, so its iteration order is *not* modular sequence
+    /// order across a wraparound — rank with [`Self::nearest_cached_seq`] /
+    /// [`Self::furthest_cached_seq`] instead of `keys().next()`.
     cache: BTreeMap<u32, Vec<u8>>,
+    /// Accounted size of `cache`: payload bytes plus
+    /// [`CACHE_ENTRY_OVERHEAD`] per entry. Maintained incrementally so the
+    /// cap check stays O(1) per push.
+    cache_cost: usize,
+    /// Upper bound on `cache_cost`; the segments furthest ahead of
+    /// `next_seq` are evicted past this.
+    max_cache: usize,
     /// Next sequence number expected to extend `buffer`.
     next_seq: Option<u32>,
     /// Contiguous, ordered bytes ready to be handed to the decoder.
     buffer: Vec<u8>,
     /// Upper bound on `buffer`'s size; oldest bytes are dropped past this.
     max_buffer: usize,
-    /// Consecutive pushes that made no progress while segments are cached —
-    /// once this hits `MAX_STALL_PUSHES`, the reassembler gives up on the
-    /// gap and resyncs to the lowest cached sequence number.
+    /// Consecutive pushes that made no progress while the stream is stuck —
+    /// either segments are cached ahead of an unfillable gap, or the peer
+    /// re-anchored far behind `next_seq`. Once this hits `MAX_STALL_PUSHES`
+    /// the reassembler gives up and resyncs.
     stall_pushes: usize,
     /// Set whenever stream bytes are discarded in a way that breaks byte
     /// contiguity with what a caller (e.g. a stateful protocol decoder) has
@@ -33,17 +59,25 @@ pub struct TcpReassembler {
 }
 
 impl TcpReassembler {
-    /// Pushes made with no progress (cache non-empty, `next_seq` unmoved)
-    /// before the stall guard forces a resync to the lowest cached segment.
+    /// Pushes made with no progress (`next_seq` unmoved) before the stall
+    /// guard forces a resync.
     pub const MAX_STALL_PUSHES: usize = 256;
 
     pub fn new() -> Self {
-        Self::with_max_buffer(DEFAULT_MAX_BUFFER)
+        Self::with_limits(DEFAULT_MAX_BUFFER, DEFAULT_MAX_CACHE)
     }
 
     pub fn with_max_buffer(max_buffer: usize) -> Self {
+        Self::with_limits(max_buffer, DEFAULT_MAX_CACHE)
+    }
+
+    /// `max_cache` bounds the out-of-order cache's accounted size (payload
+    /// bytes plus a fixed per-entry charge), not raw payload bytes alone.
+    pub fn with_limits(max_buffer: usize, max_cache: usize) -> Self {
         Self {
             cache: BTreeMap::new(),
+            cache_cost: 0,
+            max_cache,
             next_seq: None,
             buffer: Vec::new(),
             max_buffer,
@@ -96,28 +130,42 @@ impl TcpReassembler {
             // A repacketized retransmit can land on an existing key with
             // *fewer* bytes than the cached segment; overwriting would
             // silently discard the cached tail and stall the stream there.
-            match self.cache.entry(seq) {
-                Entry::Vacant(slot) => {
-                    slot.insert(payload.to_vec());
-                }
-                Entry::Occupied(mut slot) => {
-                    if payload.len() > slot.get().len() {
-                        slot.insert(payload.to_vec());
-                    }
-                }
+            let longer_than_cached = match self.cache.get(&seq) {
+                Some(cached) => payload.len() > cached.len(),
+                None => true,
+            };
+            if longer_than_cached {
+                self.cache_insert(seq, payload.to_vec());
             }
         }
 
         self.reconcile_stale_cache();
+        self.enforce_cache_cap();
 
         let after = self.next_seq.expect("set above");
-        if after == before && !self.cache.is_empty() {
+        // A segment implausibly far behind `next_seq` is neither a
+        // retransmit nor a keepalive probe: the peer re-anchored the stream
+        // (e.g. a reconnect on the same 4-tuple with a fresh ISN landing in
+        // the "behind" half of the sequence space). That path caches
+        // nothing, so it has to drive the stall guard itself — otherwise
+        // every segment is dropped as a retransmit and capture stays dead
+        // forever with no loss reported.
+        let re_anchored = diff < 0 && before.wrapping_sub(seq) >= MIN_BEHIND_FOR_RESYNC;
+        if after == before && (!self.cache.is_empty() || re_anchored) {
             self.stall_pushes += 1;
             if self.stall_pushes >= Self::MAX_STALL_PUSHES {
-                if let Some(&lowest) = self.cache.keys().next() {
-                    self.resync(lowest);
-                    self.loss = true;
+                match self.nearest_cached_seq() {
+                    // Give up on the gap and restart from the cached segment
+                    // nearest ahead of it, in modular order.
+                    Some(nearest) => self.resync(nearest),
+                    // Nothing cached: the live stream is behind `next_seq`,
+                    // so re-anchor on this segment and deliver it.
+                    None => {
+                        self.resync(seq);
+                        self.advance_with(payload);
+                    }
                 }
+                self.loss = true;
             }
         } else {
             self.stall_pushes = 0;
@@ -156,10 +204,15 @@ impl TcpReassembler {
             let Some(next) = self.next_seq else { return };
             // Wraparound-safe "starts behind next_seq"; BTreeMap key order is
             // raw-u32 order, so scan rather than range.
-            let Some(seq) = self.cache.keys().copied().find(|&seq| (seq.wrapping_sub(next) as i32) < 0) else {
+            let Some(seq) = self
+                .cache
+                .keys()
+                .copied()
+                .find(|&seq| (seq.wrapping_sub(next) as i32) < 0)
+            else {
                 return;
             };
-            let data = self.cache.remove(&seq).expect("key just found");
+            let data = self.cache_remove(seq).expect("key just found");
             let end = seq.wrapping_add(data.len() as u32);
             if (end.wrapping_sub(next) as i32) > 0 {
                 let skip = next.wrapping_sub(seq) as usize;
@@ -173,7 +226,7 @@ impl TcpReassembler {
     fn drain_contiguous(&mut self) {
         loop {
             let Some(next) = self.next_seq else { return };
-            let Some(data) = self.cache.remove(&next) else {
+            let Some(data) = self.cache_remove(next) else {
                 break;
             };
             self.next_seq = Some(next.wrapping_add(data.len() as u32));
@@ -210,6 +263,7 @@ impl TcpReassembler {
     /// Called on server change / zone change / stall recovery.
     pub fn resync(&mut self, seq: u32) {
         self.cache.clear();
+        self.cache_cost = 0;
         self.buffer.clear();
         self.next_seq = Some(seq);
         self.stall_pushes = 0;
@@ -219,6 +273,74 @@ impl TcpReassembler {
     /// Total bytes currently held in out-of-order cache, waiting on a gap.
     pub fn gap_bytes(&self) -> usize {
         self.cache.values().map(Vec::len).sum()
+    }
+
+    /// Number of out-of-order segments currently cached.
+    pub fn gap_segments(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Inserts (replacing any entry at `seq`), keeping `cache_cost` in sync.
+    fn cache_insert(&mut self, seq: u32, data: Vec<u8>) {
+        self.cache_cost += data.len() + CACHE_ENTRY_OVERHEAD;
+        if let Some(old) = self.cache.insert(seq, data) {
+            self.cache_cost -= old.len() + CACHE_ENTRY_OVERHEAD;
+        }
+    }
+
+    /// Removes the entry at `seq`, keeping `cache_cost` in sync.
+    fn cache_remove(&mut self, seq: u32) -> Option<Vec<u8>> {
+        let data = self.cache.remove(&seq)?;
+        self.cache_cost -= data.len() + CACHE_ENTRY_OVERHEAD;
+        Some(data)
+    }
+
+    /// Cached segment nearest ahead of `next_seq` in modular sequence order.
+    /// Ranked by wrapping distance: `BTreeMap`'s raw-`u32` key order puts a
+    /// wrapped segment (say `0x0000_0100`) *before* an unwrapped one (say
+    /// `0xFFFF_FF00`) even though it is ~4 GiB further ahead of the stream.
+    fn nearest_cached_seq(&self) -> Option<u32> {
+        let next = self.next_seq?;
+        self.cache
+            .keys()
+            .copied()
+            .min_by_key(|&seq| seq.wrapping_sub(next))
+    }
+
+    /// Cached segment furthest ahead of `next_seq` in modular sequence order.
+    fn furthest_cached_seq(&self) -> Option<u32> {
+        let next = self.next_seq?;
+        self.cache
+            .keys()
+            .copied()
+            .max_by_key(|&seq| seq.wrapping_sub(next))
+    }
+
+    /// Bounds the out-of-order cache, evicting the segments furthest ahead of
+    /// `next_seq` first.
+    ///
+    /// `buffer` is capped but the cache used to be bounded only by the stall
+    /// guard, whose counter resets on *any* forward progress. A sniffer
+    /// accepts every packet matching the 4-tuple (no checksum or window
+    /// validation), so a stream alternating one in-order segment with
+    /// far-ahead junk keeps `stall_pushes` at 0 while the cache grows until
+    /// RAM runs out. Far-ahead segments are evicted first: legitimate
+    /// reordering sits close to `next_seq`, so those entries are the most
+    /// speculative and the least likely to ever drain.
+    ///
+    /// Eviction deliberately does not report loss. The discarded bytes were
+    /// never delivered and sit behind a gap that has not filled, so the
+    /// delivered prefix stays contiguous and downstream decoder state stays
+    /// valid; flagging loss here would reset the decoder on every junk
+    /// packet. If the gap does later fill, the hole stops
+    /// [`Self::drain_contiguous`] and the stall guard reports the break then.
+    fn enforce_cache_cap(&mut self) {
+        while self.cache_cost > self.max_cache {
+            let Some(furthest) = self.furthest_cached_seq() else {
+                break;
+            };
+            self.cache_remove(furthest);
+        }
     }
 }
 
@@ -445,5 +567,123 @@ mod tests {
         assert_eq!(r.take_stream(), expected);
         assert_eq!(r.gap_bytes(), 0);
         assert!(!r.take_loss());
+    }
+
+    #[test]
+    fn stall_guard_resyncs_to_modular_lowest_cached_segment_across_wraparound() {
+        let mut r = TcpReassembler::new();
+        let base = 0xFFFF_FF00u32;
+        r.push(base, b"AAA"); // next_seq = base + 3
+        let _ = r.take_stream();
+        // Two cached segments sit ahead of a gap that never fills. In
+        // modular sequence order the nearest is 0xFFFF_FFF0; 0x0000_0100 is
+        // a wraparound *further* ahead, even though it is the numerically
+        // lowest raw u32 (i.e. the first BTreeMap key).
+        r.push(0x0000_0100, b"LATER");
+        for _ in 0..TcpReassembler::MAX_STALL_PUSHES {
+            r.push(0xFFFF_FFF0, b"SOON");
+        }
+        // Resyncing to 0x0000_0100 would park next_seq ~4 GiB ahead of the
+        // live stream, after which every real segment looks like a
+        // retransmit and is dropped forever. Resyncing to 0xFFFF_FFF0
+        // instead lets the retries land and the stream continue.
+        assert!(r.take_stream().ends_with(b"SOON"));
+        assert!(r.take_loss());
+        r.push(0xFFFF_FFF4, b"OK");
+        assert_eq!(r.take_stream(), b"OK".to_vec());
+    }
+
+    #[test]
+    fn stall_guard_recovers_when_the_stream_re_anchors_behind_next_seq() {
+        let mut r = TcpReassembler::new();
+        r.push(0x8000_0000, b"AAA"); // next_seq = 0x8000_0003
+        let _ = r.take_stream();
+        // The 4-tuple is reused after a reconnect and the fresh ISN lands in
+        // the "behind" half of the sequence space (~50% likely). Every
+        // segment then looks like an already-consumed retransmit: dropped,
+        // never cached, so a cache-only stall guard never fires and capture
+        // is permanently dead with no loss reported.
+        let fresh = 0x4000_0000u32;
+        for i in 0..TcpReassembler::MAX_STALL_PUSHES as u32 {
+            r.push(fresh.wrapping_add(i * 3), b"BBB");
+        }
+        r.push(
+            fresh.wrapping_add(TcpReassembler::MAX_STALL_PUSHES as u32 * 3),
+            b"CCC",
+        );
+        assert_eq!(r.take_stream(), b"BBBCCC".to_vec());
+        assert!(r.take_loss());
+    }
+
+    #[test]
+    fn repeated_keepalive_probes_do_not_force_a_resync() {
+        let mut r = TcpReassembler::new();
+        r.push(1000, b"AAA"); // next_seq = 1003
+        let _ = r.take_stream();
+        // A TCP keepalive probe is one garbage byte at next_seq - 1. A
+        // long-idle connection sends far more of them than the stall
+        // threshold; they must not be mistaken for a re-anchored stream.
+        for _ in 0..TcpReassembler::MAX_STALL_PUSHES * 2 {
+            r.push(1002, b"\0");
+        }
+        assert!(!r.take_loss());
+        assert_eq!(r.take_stream(), Vec::<u8>::new());
+        r.push(1003, b"BBB");
+        assert_eq!(r.take_stream(), b"BBB".to_vec());
+    }
+
+    #[test]
+    fn out_of_order_cache_is_bounded_while_the_stream_keeps_progressing() {
+        let mut r = TcpReassembler::new();
+        r.push(0, b"A"); // next_seq = 1
+        // One in-order byte per far-ahead 1 KiB segment: the forward
+        // progress pins stall_pushes at 0, so the stall guard never bounds
+        // the cache. Only a cache cap can.
+        for i in 0..8_000u32 {
+            r.push(1 + i, b".");
+            r.push(1_000_000 + i * 1024, &[b'X'; 1024]);
+        }
+        assert!(
+            r.gap_bytes() <= 4 * 1024 * 1024,
+            "unbounded out-of-order cache: {} bytes",
+            r.gap_bytes()
+        );
+        // Evicting speculative far-ahead bytes does not break contiguity of
+        // what was already delivered, so it must not reset the decoder.
+        assert!(!r.take_loss());
+    }
+
+    #[test]
+    fn out_of_order_cache_bounds_a_flood_of_tiny_far_ahead_segments() {
+        let mut r = TcpReassembler::with_limits(64 * 1024, 1024);
+        r.push(0, b"A"); // next_seq = 1
+        for i in 0..5_000u32 {
+            r.push(1 + i, b"."); // forward progress: the stall guard never fires
+            r.push(1_000_000 + i * 4, b"X"); // 1-byte far-ahead junk
+        }
+        // A payload-bytes-only cap would still admit ~1000 near-empty
+        // entries, each costing far more than its single byte of payload;
+        // the per-entry charge bounds entry count too.
+        assert!(
+            r.gap_segments() <= 32,
+            "{} cached segments",
+            r.gap_segments()
+        );
+    }
+
+    #[test]
+    fn cache_eviction_keeps_the_segments_nearest_the_gap() {
+        let mut r = TcpReassembler::with_limits(64 * 1024, 300);
+        r.push(0, &[b'A'; 3]); // next_seq = 3
+        let _ = r.take_stream();
+        r.push(103, &[b'N'; 100]); // just past a small gap: still drainable
+        r.push(10_000, &[b'F'; 100]); // far-ahead junk
+        r.push(20_000, &[b'F'; 100]); // far-ahead junk
+        // Only one 100-byte entry fits under the cap, so eviction must drop
+        // the speculative far-ahead junk, not the segment behind the gap.
+        r.push(3, &[b'G'; 100]); // fills [3,103)
+        let mut expected = vec![b'G'; 100];
+        expected.extend(std::iter::repeat(b'N').take(100));
+        assert_eq!(r.take_stream(), expected);
     }
 }

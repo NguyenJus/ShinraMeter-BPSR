@@ -83,7 +83,9 @@ pub fn map_event(ev: proto::ProtocolEvent) -> meter::ProtocolEvent {
             monster_id: e.monster_id,
             timestamp_ms: e.timestamp_ms,
         }),
-        proto::ProtocolEvent::ServerChanged => meter::ProtocolEvent::ServerChanged,
+        proto::ProtocolEvent::ServerChanged => meter::ProtocolEvent::ServerChanged {
+            timestamp_ms: now_ms(),
+        },
     }
 }
 
@@ -217,7 +219,10 @@ mod tests {
 
     #[test]
     fn maps_every_entity_kind() {
-        assert_eq!(map_kind(proto::EntityKind::Player), meter::EntityKind::Player);
+        assert_eq!(
+            map_kind(proto::EntityKind::Player),
+            meter::EntityKind::Player
+        );
         assert_eq!(
             map_kind(proto::EntityKind::Monster),
             meter::EntityKind::Monster
@@ -306,10 +311,16 @@ mod tests {
     }
 
     #[test]
-    fn maps_server_changed() {
-        assert_eq!(
-            map_event(proto::ProtocolEvent::ServerChanged),
-            meter::ProtocolEvent::ServerChanged
+    fn maps_server_changed_stamps_the_current_wall_clock_time() {
+        let before = now_ms();
+        let mapped = map_event(proto::ProtocolEvent::ServerChanged);
+        let after = now_ms();
+        let meter::ProtocolEvent::ServerChanged { timestamp_ms } = mapped else {
+            panic!("expected a server-changed event");
+        };
+        assert!(
+            (before..=after).contains(&timestamp_ms),
+            "expected {timestamp_ms} in [{before}, {after}]"
         );
     }
 

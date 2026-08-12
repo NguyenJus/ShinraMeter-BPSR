@@ -18,24 +18,49 @@ pub mod attr_id {
     pub const FIGHT_POINT: i32 = 0x272E;
 }
 
-/// protobuf varint → `i64`; `None` on empty/malformed input.
+/// protobuf varint → `u64`; `None` on empty/malformed input. The widest
+/// lossless form — the typed helpers below narrow it with checked casts so an
+/// out-of-range value is rejected rather than silently truncated or
+/// reinterpreted.
+pub fn decode_varint_u64(raw: &[u8]) -> Option<u64> {
+    prost::encoding::decode_varint(&mut Cursor::new(raw)).ok()
+}
+
+/// protobuf varint → `i64`; `None` on empty/malformed input or a value above
+/// `i64::MAX` (which would otherwise read back as a negative number).
 pub fn decode_varint_i64(raw: &[u8]) -> Option<i64> {
-    let mut cursor = Cursor::new(raw);
-    prost::encoding::decode_varint(&mut cursor)
-        .ok()
-        .map(|v| v as i64)
+    decode_varint_u64(raw).and_then(|v| i64::try_from(v).ok())
 }
 
-/// protobuf varint → `i32`; `None` on empty/malformed input.
+/// protobuf varint → `i32`; `None` on empty/malformed input or a value
+/// outside `i32` range (truncating it would yield a plausible-but-wrong id).
 pub fn decode_varint_i32(raw: &[u8]) -> Option<i32> {
-    decode_varint_i64(raw).map(|v| v as i32)
+    decode_varint_u64(raw).and_then(|v| i32::try_from(v).ok())
 }
 
-/// Drops the stray leading byte (a length/tag byte the server prepends),
-/// then UTF-8 decodes the remainder. Invalid UTF-8 → `None`.
+/// `raw_data` for a name attr is the string bytes behind a protobuf varint
+/// length prefix. When that prefix is self-consistent it is honoured (so a
+/// 128+ byte name, whose prefix is two bytes, keeps no stray byte); otherwise
+/// a single leading byte is dropped, matching the servers that prepend one
+/// opaque tag byte. Invalid UTF-8 or an empty result → `None`, so the caller
+/// falls back to `Player <uid>` instead of rendering a blank name.
 pub fn decode_name(raw: &[u8]) -> Option<String> {
-    let rest = raw.get(1..)?;
-    std::str::from_utf8(rest).ok().map(str::to_string)
+    let mut cursor = Cursor::new(raw);
+    let bytes = match prost::encoding::decode_varint(&mut cursor) {
+        Ok(len) => {
+            let rest = &raw[cursor.position() as usize..];
+            if len == rest.len() as u64 {
+                rest
+            } else {
+                raw.get(1..)?
+            }
+        }
+        Err(_) => raw.get(1..)?,
+    };
+    if bytes.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok().map(str::to_string)
 }
 
 /// Builds a `PlayerInfo` from an entity's `Attr` list, reading `NAME` and
@@ -77,18 +102,20 @@ pub fn enemy_hp_from_attrs(uid: i64, attrs: &[pb::Attr], now_ms: u64) -> EnemyHp
         }
         match attr.id {
             attr_id::HP => {
-                if let Some(v) = decode_varint_i64(&attr.raw_data) {
-                    curr_hp = Some(v.max(0) as u64);
+                if let Some(v) = decode_varint_u64(&attr.raw_data) {
+                    curr_hp = Some(v);
                 }
             }
             attr_id::MAX_HP => {
-                if let Some(v) = decode_varint_i64(&attr.raw_data) {
-                    max_hp = Some(v.max(0) as u64);
+                if let Some(v) = decode_varint_u64(&attr.raw_data) {
+                    max_hp = Some(v);
                 }
             }
             attr_id::MONSTER_ID => {
-                if let Some(v) = decode_varint_i32(&attr.raw_data) {
-                    monster_id = Some(v.max(0) as u32);
+                if let Some(v) =
+                    decode_varint_u64(&attr.raw_data).and_then(|v| u32::try_from(v).ok())
+                {
+                    monster_id = Some(v);
                 }
             }
             _ => {}
@@ -136,11 +163,74 @@ mod tests {
         assert_eq!(hp.curr_hp, None);
     }
 
+    fn varint(v: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        prost::encoding::encode_varint(v, &mut buf);
+        buf
+    }
+
+    #[test]
+    fn varint_out_of_i32_range_is_rejected_not_truncated() {
+        let raw = varint(0x1_0000_0001);
+        assert_eq!(decode_varint_i32(&raw), None);
+    }
+
+    #[test]
+    fn varint_above_i64_max_is_rejected_not_reinterpreted() {
+        let raw = varint(u64::MAX);
+        assert_eq!(decode_varint_i64(&raw), None);
+    }
+
+    #[test]
+    fn huge_hp_varint_is_not_clamped_to_zero() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::HP,
+            raw_data: varint(u64::MAX),
+        }];
+        let hp = enemy_hp_from_attrs(1, &attrs, 0);
+        assert_eq!(hp.curr_hp, Some(u64::MAX));
+    }
+
+    #[test]
+    fn out_of_range_profession_id_yields_no_class() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::PROFESSION_ID,
+            raw_data: varint(0x1_0000_0001),
+        }];
+        assert_eq!(player_info_from_attrs(1, &attrs).class, None);
+    }
+
+    #[test]
+    fn out_of_range_monster_id_is_rejected() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::MONSTER_ID,
+            raw_data: varint(u64::from(u32::MAX) + 1),
+        }];
+        assert_eq!(enemy_hp_from_attrs(1, &attrs, 0).monster_id, None);
+    }
+
+    #[test]
+    fn single_byte_name_is_none_not_empty_string() {
+        assert_eq!(decode_name(&[0x00]), None);
+    }
+
+    #[test]
+    fn long_name_keeps_no_stray_prefix_byte() {
+        let name = "a".repeat(130);
+        let mut raw = varint(name.len() as u64); // 2-byte length varint
+        assert_eq!(raw.len(), 2);
+        raw.extend_from_slice(name.as_bytes());
+        assert_eq!(decode_name(&raw), Some(name));
+    }
+
     #[test]
     fn unknown_attr_id_ignored() {
         let mut raw = Vec::new();
         prost::encoding::encode_varint(999u64, &mut raw);
-        let attrs = vec![pb::Attr { id: 0x9999, raw_data: raw }];
+        let attrs = vec![pb::Attr {
+            id: 0x9999,
+            raw_data: raw,
+        }];
         let info = player_info_from_attrs(1, &attrs);
         assert_eq!(info.name, None);
         assert_eq!(info.class, None);

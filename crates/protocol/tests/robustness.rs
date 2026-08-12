@@ -56,20 +56,22 @@ fn valid_stream() -> Vec<u8> {
 }
 
 /// 50k fully random byte buffers of random length, pushed through a reused
-/// `Decoder` (simulating a continuous garbage stream): must never panic.
+/// `Decoder` (simulating a continuous garbage stream): must never panic, and
+/// must keep its buffer bounded *without* any `reset()` — production has no
+/// equivalent hook, so the no-reset path is the one that matters.
 #[test]
-fn fifty_thousand_random_buffers_never_panic() {
+fn fifty_thousand_random_buffers_never_panic_or_grow_unbounded() {
     let mut rng = XorShift64::new(SEED);
     let mut decoder = Decoder::new();
     for i in 0..50_000u64 {
         let len = (rng.next_u32() % 300) as usize;
         let buf: Vec<u8> = (0..len).map(|_| rng.next_byte()).collect();
         let _ = decoder.push_stream(&buf, i);
-        if i % 4096 == 0 {
-            // Bound memory growth across the fuzz loop; a real connection
-            // would eventually desync and clear on its own.
-            decoder.reset();
-        }
+        assert!(
+            decoder.pending_len() <= bpsr_protocol::frame::MAX_TAIL_LEN,
+            "buffered tail exceeded MAX_TAIL_LEN at iteration {i}: {}",
+            decoder.pending_len()
+        );
     }
 }
 
@@ -143,12 +145,69 @@ fn total_len_below_minimum_does_not_panic() {
     assert!(events.is_empty());
 }
 
+/// A length prefix inside the legal range whose body dribbles in over many
+/// pushes: the decoder must buffer it without ever exceeding `MAX_TAIL_LEN`,
+/// and must still decode the next real frame once that body has gone by — all
+/// on the production path, with no `reset()` anywhere.
+#[test]
+fn in_range_claim_dribbled_in_stays_bounded_and_then_recovers() {
+    const CLAIM: u32 = bpsr_protocol::frame::MAX_FRAME_LEN;
+    let mut decoder = Decoder::new();
+    let mut header = CLAIM.to_be_bytes().to_vec();
+    header.extend_from_slice(&2u16.to_be_bytes()); // Notify
+    assert!(decoder.push_stream(&header, 0).is_empty());
+
+    let chunk = vec![0u8; 64 * 1024];
+    let mut pushed = header.len();
+    while pushed < CLAIM as usize {
+        let n = chunk.len().min(CLAIM as usize - pushed);
+        assert!(decoder.push_stream(&chunk[..n], 0).is_empty());
+        pushed += n;
+        assert!(
+            decoder.pending_len() <= bpsr_protocol::frame::MAX_TAIL_LEN,
+            "buffered tail exceeded MAX_TAIL_LEN: {}",
+            decoder.pending_len()
+        );
+    }
+    assert_eq!(decoder.pending_len(), 0, "completed frame must be released");
+
+    let good = damage_notify_frame(
+        (2i64 << 16) | 64,
+        base_damage((1i64 << 16) | 640, 1, 10),
+        false,
+    );
+    assert_eq!(decoder.push_stream(&good, 1).len(), 1);
+}
+
+/// A `total_len` far beyond anything the protocol could ever produce is
+/// garbage, not a real over-large frame: the decoder must realign on the very
+/// next push rather than swallowing the gigabytes the prefix claims.
+#[test]
+fn absurd_total_len_does_not_swallow_the_following_stream() {
+    let mut decoder = Decoder::new();
+    assert!(
+        decoder
+            .push_stream(&0xFFFF_FFFFu32.to_be_bytes(), 0)
+            .is_empty()
+    );
+    let good = damage_notify_frame(
+        (2i64 << 16) | 64,
+        base_damage((1i64 << 16) | 640, 1, 10),
+        false,
+    );
+    assert_eq!(decoder.push_stream(&good, 1).len(), 1);
+}
+
 /// A FrameDown that nests itself 100 levels deep: the depth cap (4) stops
 /// recursion far short of the innermost Notify, so no stack overflow and no
 /// events reach `out`.
 #[test]
 fn framedown_nested_100_deep_does_not_panic() {
-    let mut current = damage_notify_frame((2i64 << 16) | 64, base_damage((1i64 << 16) | 640, 1, 10), false);
+    let mut current = damage_notify_frame(
+        (2i64 << 16) | 64,
+        base_damage((1i64 << 16) | 640, 1, 10),
+        false,
+    );
     for _ in 0..100 {
         current = framedown(&current, false);
     }
