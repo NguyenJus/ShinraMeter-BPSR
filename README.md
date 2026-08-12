@@ -58,9 +58,17 @@ The binary lands at `target/x86_64-pc-windows-gnu/release/shinra-bpsr.exe`.
 
 ### Windows Runtime
 
-1. Download `WinDivert.dll` and `WinDivert64.sys` (version 2.x) from [reqrypt.org](https://reqrypt.org/wdivert.html).
-2. Place both files next to `shinra-bpsr.exe` in the same directory.
-3. Run the exe as Administrator. (The WinDivert kernel driver requires elevated privileges for packet interception.)
+Nothing to install: `shinra-bpsr.exe` is self-contained. Download it, double-click it, and accept the UAC prompt.
+
+The WinDivert 2.2.2 runtime (`WinDivert.dll` and the signed `WinDivert64.sys` kernel driver) is embedded in the executable and unpacked to `%LOCALAPPDATA%\shinra-bpsr\windivert\2.2.2\` on first run — the driver has to exist as a real file because Windows loads kernel drivers by path, but the user never handles it. Subsequent runs reuse the unpacked copy and write nothing.
+
+The exe carries a manifest requesting `requireAdministrator`, so Windows prompts for elevation on launch; WinDivert installs its driver through the Service Control Manager, which is administrator-only.
+
+To uninstall, delete the exe and `%LOCALAPPDATA%\shinra-bpsr\`.
+
+#### Updating the bundled WinDivert
+
+The binaries live in `crates/capture/vendor/windivert/`, taken verbatim from the official [reqrypt.org](https://reqrypt.org/wdivert.html) x64 release — the driver cannot be rebuilt locally, since Windows only loads a kernel driver carrying a signature it trusts. To move to a new release, replace the three files there and bump `WINDIVERT_VERSION` in `crates/capture/src/driver.rs`, which is also the name of the unpack directory and so keeps the new copy clear of the old one.
 
 ## Testing
 
@@ -74,11 +82,22 @@ The `bpsr-protocol`, `bpsr-meter`, and `bpsr-capture` (tcp/detect) crates are fu
 
 ## Troubleshooting
 
-### Error: "WinDivert driver not found"
-Ensure `WinDivert.dll` and `WinDivert64.sys` are in the same directory as the exe. If NordVPN or Brave browser are running, they may block the WinDivert driver (known conflict — restart them if capture fails).
+The status banner names the specific failure — each of these has a different fix, so read which one it says.
 
-### Error: "Run as Administrator"
-The exe must be elevated to capture packets. Retry with administrator privileges.
+### "Windows blocked the WinDivert driver"
+Antivirus, a VPN filter, or Core Isolation / Memory Integrity vetoed the driver. NordVPN and Brave are known conflicts; close them and retry. Otherwise check Windows Security → Device security → Core isolation.
+
+### "A different version of the WinDivert driver is already loaded"
+Another packet-capture tool holds an older WinDivert. Close it, or reboot, and retry.
+
+### "The Base Filtering Engine service is disabled"
+Start it: `services.msc` → Base Filtering Engine → Start.
+
+### "Windows could not find the WinDivert driver file"
+The driver is unpacked to `%LOCALAPPDATA%\shinra-bpsr\windivert\<version>\` at startup; this means it is not there when WinDivert looks. Check that antivirus is not quarantining it, then delete that folder to force a clean unpack.
+
+### "Run as Administrator"
+The manifest normally makes Windows prompt for this automatically, so seeing this means elevation was declined or stripped. Right-click the exe → Run as administrator.
 
 ### No damage data appears
 1. Verify you are logged into the game and in combat.

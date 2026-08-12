@@ -1,7 +1,10 @@
 pub mod detect;
 pub mod error;
+pub mod install;
 pub mod tcp;
 
+#[cfg(windows)]
+mod driver;
 #[cfg(not(windows))]
 mod stub;
 #[cfg(windows)]
