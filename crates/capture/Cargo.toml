@@ -1,0 +1,15 @@
+[package]
+name = "bpsr-capture"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[dependencies]
+thiserror = { workspace = true }
+etherparse = { workspace = true }
+crossbeam-channel = { workspace = true }
+log = { workspace = true }
+bpsr-protocol = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windivert = { workspace = true, features = ["vendored"] }

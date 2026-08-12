@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
+[workspace.dependencies]
+prost = "0.14"
+bytes = "1"
+zstd = "0.13"
+thiserror = "2"
+etherparse = "0.21"
+windivert = "0.6"
+eframe = "0.36"
+egui = "0.36"
+crossbeam-channel = "0.5"
+log = "0.4"
+env_logger = "0.11"
+bpsr-protocol = { path = "crates/protocol" }
+bpsr-meter = { path = "crates/meter" }
+bpsr-capture = { path = "crates/capture" }

@@ -1,0 +1,290 @@
+//! ShinraMeter-style egui overlay (plan §T4.1).
+//!
+//! `OverlayApp` is pure "snapshot in, commands out": it renders a
+//! `bpsr_meter::Snapshot` handed to it over a channel and emits `UiCommand`s
+//! for the app layer to act on. No threads or channels are created in this
+//! module beyond the `crossbeam_channel` endpoints eframe's caller hands in.
+
+use std::time::Duration;
+
+use bpsr_meter::{PlayerRow, Snapshot};
+use crossbeam_channel::{Receiver, Sender};
+use eframe::egui;
+
+/// Commands the overlay emits for the app layer to consume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiCommand {
+    Reset,
+    Quit,
+}
+
+/// Non-fatal status banner shown above the player rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusLine {
+    Ok,
+    Error(String),
+}
+
+/// The overlay's eframe app: holds the latest snapshot plus the channel
+/// endpoints used to receive updates and send commands.
+pub struct OverlayApp {
+    snapshot: Snapshot,
+    status: StatusLine,
+    rx_snapshot: Receiver<Snapshot>,
+    tx_command: Sender<UiCommand>,
+}
+
+impl OverlayApp {
+    pub fn new(rx_snapshot: Receiver<Snapshot>, tx_command: Sender<UiCommand>) -> Self {
+        Self {
+            snapshot: Snapshot {
+                duration_ms: 0,
+                total_damage: 0,
+                rows: Vec::new(),
+            },
+            status: StatusLine::Ok,
+            rx_snapshot,
+            tx_command,
+        }
+    }
+
+    pub fn with_status(mut self, status: StatusLine) -> Self {
+        self.status = status;
+        self
+    }
+}
+
+impl eframe::App for OverlayApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Drain the channel, keeping only the most recent snapshot.
+        for snap in self.rx_snapshot.try_iter() {
+            self.snapshot = snap;
+        }
+
+        let ctx = ui.ctx().clone();
+        apply_theme(&ctx);
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(egui::Color32::from_rgba_unmultiplied(
+                18, 18, 22, 200,
+            )))
+            .show(ui, |ui| {
+                draw_header(ui, &ctx, &self.snapshot, &self.tx_command);
+
+                if let StatusLine::Error(msg) = &self.status {
+                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), msg.as_str());
+                }
+
+                ui.separator();
+                draw_rows(ui, &self.snapshot);
+            });
+
+        // ~10 Hz.
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+}
+
+fn draw_header(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    snapshot: &Snapshot,
+    tx_command: &Sender<UiCommand>,
+) {
+    ui.horizontal(|ui| {
+        let drag_handle = ui.label("⠿").interact(egui::Sense::drag());
+        if drag_handle.dragged() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+
+        ui.label(fmt_duration(snapshot.duration_ms));
+        ui.label(format!("{} DPS", fmt_short(total_dps(snapshot) as i64)));
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("✕").clicked() {
+                let _ = tx_command.try_send(UiCommand::Quit);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            if ui.button("Reset").clicked() {
+                let _ = tx_command.try_send(UiCommand::Reset);
+            }
+        });
+    });
+}
+
+fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot) {
+    for row in &snapshot.rows {
+        draw_row(ui, row);
+    }
+}
+
+fn draw_row(ui: &mut egui::Ui, row: &PlayerRow) {
+    let desired_size = egui::vec2(ui.available_width(), 20.0);
+    let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+
+    // Proportional background bar scaled by this player's damage share.
+    let bar_frac = (row.share_pct / 100.0).clamp(0.0, 1.0);
+    let bar_rect =
+        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * bar_frac, rect.height()));
+    ui.painter().rect_filled(
+        bar_rect,
+        2.0,
+        egui::Color32::from_rgba_unmultiplied(60, 120, 220, 120),
+    );
+
+    let name = row_name(row);
+    ui.painter().text(
+        rect.left_center() + egui::vec2(4.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        name,
+        egui::FontId::monospace(13.0),
+        egui::Color32::WHITE,
+    );
+
+    let stats_text = format!(
+        "{}  {}/s  {}",
+        fmt_short(row.damage),
+        fmt_short(row.dps as i64),
+        fmt_share(row.share_pct)
+    );
+    ui.painter().text(
+        rect.right_center() - egui::vec2(4.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        stats_text,
+        egui::FontId::monospace(13.0),
+        egui::Color32::WHITE,
+    );
+}
+
+/// `bpsr_meter` already fills unknown names with `Player {uid}`; this is a
+/// defensive fallback in case a row ever arrives with an empty name.
+fn row_name(row: &PlayerRow) -> String {
+    if row.name.is_empty() {
+        format!("Player {}", row.uid)
+    } else {
+        row.name.clone()
+    }
+}
+
+fn total_dps(snapshot: &Snapshot) -> f64 {
+    if snapshot.duration_ms == 0 {
+        0.0
+    } else {
+        snapshot.total_damage as f64 / (snapshot.duration_ms as f64 / 1000.0)
+    }
+}
+
+/// Compact damage abbreviation: `999`, `1.0K`, `1.2M`, `1.0B`.
+pub fn fmt_short(v: i64) -> String {
+    let sign = if v < 0 { "-" } else { "" };
+    let av = v.unsigned_abs();
+
+    if av >= 1_000_000_000 {
+        format!("{sign}{:.1}B", av as f64 / 1_000_000_000.0)
+    } else if av >= 1_000_000 {
+        format!("{sign}{:.1}M", av as f64 / 1_000_000.0)
+    } else if av >= 1_000 {
+        format!("{sign}{:.1}K", av as f64 / 1_000.0)
+    } else {
+        format!("{sign}{av}")
+    }
+}
+
+/// Fight duration as `m:ss`.
+pub fn fmt_duration(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    format!("{mins}:{secs:02}")
+}
+
+/// Damage-share percentage as `12.3%`.
+pub fn fmt_share(share_pct: f32) -> String {
+    format!("{share_pct:.1}%")
+}
+
+/// Overlay window shape: always-on-top, borderless, transparent, small.
+pub fn viewport() -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_always_on_top()
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_inner_size([340.0, 220.0])
+        .with_min_inner_size([220.0, 90.0])
+}
+
+/// Dark, compact visuals with monospace numerals for the overlay.
+pub fn apply_theme(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = egui::Color32::from_rgba_unmultiplied(18, 18, 22, 200);
+    visuals.window_fill = visuals.panel_fill;
+    ctx.set_visuals(visuals);
+
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = egui::vec2(6.0, 2.0);
+        style.spacing.button_padding = egui::vec2(4.0, 2.0);
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_short_below_thousand_is_plain() {
+        assert_eq!(fmt_short(999), "999");
+    }
+
+    #[test]
+    fn fmt_short_thousands() {
+        assert_eq!(fmt_short(1_000), "1.0K");
+    }
+
+    #[test]
+    fn fmt_short_millions() {
+        assert_eq!(fmt_short(1_234_567), "1.2M");
+    }
+
+    #[test]
+    fn fmt_short_negative() {
+        assert_eq!(fmt_short(-1_500), "-1.5K");
+    }
+
+    #[test]
+    fn fmt_short_billions() {
+        assert_eq!(fmt_short(2_500_000_000), "2.5B");
+    }
+
+    #[test]
+    fn fmt_duration_zero() {
+        assert_eq!(fmt_duration(0), "0:00");
+    }
+
+    #[test]
+    fn fmt_duration_minute_and_seconds() {
+        assert_eq!(fmt_duration(65_000), "1:05");
+    }
+
+    #[test]
+    fn fmt_duration_no_hour_rollover() {
+        assert_eq!(fmt_duration(3_600_000), "60:00");
+    }
+
+    #[test]
+    fn fmt_share_zero() {
+        assert_eq!(fmt_share(0.0), "0.0%");
+    }
+
+    #[test]
+    fn fmt_share_rounds_to_one_decimal() {
+        assert_eq!(fmt_share(12.34), "12.3%");
+    }
+
+    #[test]
+    fn fmt_share_full() {
+        assert_eq!(fmt_share(100.0), "100.0%");
+    }
+}
