@@ -72,17 +72,26 @@ pub enum CaptureError {
 }
 
 // Win32 status codes `WinDivertOpen` reports through `GetLastError`, per the
-// WinDivert documentation. Kept here, off the Windows-only path, so the
-// mapping below stays host-testable — it is the part that was previously
-// wrong, and CI only runs tests on Linux.
-/// `ERROR_FILE_NOT_FOUND`: the DLL could not find `WinDivert64.sys`.
-pub(crate) const ERROR_FILE_NOT_FOUND: i32 = 2;
-const ERROR_ACCESS_DENIED: i32 = 5;
-const ERROR_INVALID_IMAGE_HASH: i32 = 577;
-const ERROR_DRIVER_FAILED_PRIOR_UNLOAD: i32 = 654;
-const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
-const ERROR_DRIVER_BLOCKED: i32 = 1275;
-const EPT_S_NOT_REGISTERED: i32 = 1753;
+// WinDivert documentation.
+//
+// These and [`CaptureError::from_open_error`] deliberately sit here rather
+// than in the cfg-gated Windows backend: this classification is the part that
+// was previously wrong, and CI runs the test suite on Linux only, so gating it
+// off would mean shipping it untested. Nothing on a non-Windows host *calls*
+// it — only the tests below do — hence the narrow allow.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod codes {
+    /// The DLL could not find `WinDivert64.sys`.
+    pub(crate) const ERROR_FILE_NOT_FOUND: i32 = 2;
+    pub(crate) const ERROR_ACCESS_DENIED: i32 = 5;
+    pub(crate) const ERROR_INVALID_IMAGE_HASH: i32 = 577;
+    pub(crate) const ERROR_DRIVER_FAILED_PRIOR_UNLOAD: i32 = 654;
+    pub(crate) const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+    pub(crate) const ERROR_DRIVER_BLOCKED: i32 = 1275;
+    pub(crate) const EPT_S_NOT_REGISTERED: i32 = 1753;
+}
+
+pub(crate) use codes::*;
 
 impl CaptureError {
     /// Classifies a `WinDivertOpen` failure.
@@ -90,6 +99,7 @@ impl CaptureError {
     /// Each rejection keeps its identity all the way to the status banner: the
     /// fixes (elevate, unblock in your AV, start a service, reboot) have
     /// nothing in common, so collapsing them into one message helps nobody.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn from_open_error(err: &std::io::Error) -> Self {
         let rejection = match err.raw_os_error() {
             Some(ERROR_ACCESS_DENIED) => return CaptureError::NotElevated,
