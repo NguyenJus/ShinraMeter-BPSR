@@ -22,18 +22,49 @@ jobs:
       - run: cargo fmt --all --check
 
   # Linting for the Windows target needs no *linker* (no final link step), but
-  # `zstd-sys` compiles C in its build script, so cc-rs still demands the
-  # mingw-w64 cross-compiler named by `.cargo/config.toml`.
+  # build scripts still run: `zstd-sys` compiles C, and the app crate's
+  # `build.rs` runs `windres` to embed the UAC manifest — so cc-rs and
+  # embed-resource both demand the mingw-w64 cross-toolchain named by
+  # `.cargo/config.toml`.
   clippy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
       - run: |
           rustup component add clippy
           rustup target add x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu
+
+  # The release link is the only place the embedded manifest and the absence
+  # of a load-time WinDivert import can actually be observed, and both are
+  # what make the single-file distribution work — so assert them here rather
+  # than discovering a two-file regression on a user's machine.
+  build-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+      - run: rustup target add x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target x86_64-pc-windows-gnu
+      - name: Assert the executable is self-contained
+        run: |
+          set -euo pipefail
+          exe=target/x86_64-pc-windows-gnu/release/shinra-bpsr.exe
+          if x86_64-w64-mingw32-objdump -p "$exe" | grep -qi 'DLL Name: WinDivert'; then
+            echo "::error::WinDivert is linked at load time; the exe needs WinDivert.dll beside it"
+            exit 1
+          fi
+          if ! strings -a "$exe" | grep -q 'requireAdministrator'; then
+            echo "::error::the UAC manifest is missing from the executable"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shinra-bpsr-windows-x64
+          path: target/x86_64-pc-windows-gnu/release/shinra-bpsr.exe
 
   # Host-target tests for the pure crates. The app crate is egui/eframe and
   # would drag in Linux GUI system deps, so it is excluded.

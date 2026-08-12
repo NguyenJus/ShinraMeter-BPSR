@@ -7,15 +7,16 @@
 //! only wires WinDivert + etherparse to that pure logic and cannot itself be
 //! tested off Windows.
 //!
-//! The driver is driven through the raw [`windivert_sys`] FFI rather than the
-//! `windivert` safe wrapper: that wrapper keeps its OS `HANDLE` private and
-//! takes `&mut self` in `shutdown`, which cannot be called soundly while the
-//! capture thread is parked in `recv` on the same object. Owning the `Copy`
-//! `HANDLE` ourselves lets [`CaptureHandle::stop`] unblock `recv` with a
-//! plain syscall and no Rust references at all. The `windivert` crate is
-//! still used for its open-error classification.
+//! The driver is driven through the raw FFI declared in [`crate::driver`]
+//! rather than a safe wrapper crate: the wrapper keeps its OS `HANDLE`
+//! private and takes `&mut self` in `shutdown`, which cannot be called
+//! soundly while the capture thread is parked in `recv` on the same object.
+//! Owning the `Copy` `HANDLE` ourselves lets [`CaptureHandle::stop`] unblock
+//! `recv` with a plain syscall and no Rust references at all. Hand-declaring
+//! the four entry points is also what allows the library to be loaded at
+//! runtime from the unpacked copy — see [`crate::driver`].
 
-use std::ffi::{CString, c_void};
+use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,13 +26,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bpsr_protocol::{Decoder, ProtocolEvent};
 use crossbeam_channel::Sender;
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
-use windivert::error::WinDivertOpenError;
-use windivert_sys as sys;
-use windivert_sys::address::WINDIVERT_ADDRESS;
-use windivert_sys::{WinDivertFlags, WinDivertLayer, WinDivertShutdownMode};
 use windows::Win32::Foundation::HANDLE;
 
 use crate::detect::{Conn, ConnStreamRole, ServerDetector, classify_connection};
+use crate::driver::{Api, WinDivertAddress};
 use crate::error::CaptureError;
 use crate::tcp::TcpReassembler;
 
@@ -65,6 +63,9 @@ pub struct CaptureHandle {
     /// reference to a shared object is ever formed, so there is no aliasing
     /// question to answer.
     handle: HANDLE,
+    /// The loaded WinDivert runtime. Borrowed from the process-lifetime
+    /// static, so shutdown never has to re-enter the load path.
+    api: &'static Api,
     join: JoinHandle<()>,
 }
 
@@ -89,13 +90,13 @@ impl CaptureHandle {
         // `WinDivertShutdown` is documented as callable concurrently with a
         // blocked recv on the same handle, and takes the handle by value.
         unsafe {
-            sys::WinDivertShutdown(self.handle, WinDivertShutdownMode::Recv);
+            self.api.shutdown_recv(self.handle);
         }
         let _ = self.join.join();
         // SAFETY: the capture thread has exited, so nothing can use the
         // handle after this point.
         unsafe {
-            sys::WinDivertClose(self.handle);
+            self.api.close(self.handle);
         }
     }
 }
@@ -105,13 +106,8 @@ impl CaptureHandle {
 /// stream and emits decoded [`ProtocolEvent`]s on `tx`.
 pub fn start_capture(tx: Sender<ProtocolEvent>) -> Result<CaptureHandle, CaptureError> {
     let filter = CString::new(FILTER).expect("FILTER is a literal without interior NULs");
-    let flags = WinDivertFlags::new().set_sniff();
-    // SAFETY: `filter` is a valid NUL-terminated C string that outlives the
-    // call; the remaining arguments are plain values.
-    let handle = unsafe { sys::WinDivertOpen(filter.as_ptr(), WinDivertLayer::Network, 0, flags) };
-    if handle.is_invalid() {
-        return Err(map_open_error(std::io::Error::last_os_error()));
-    }
+    let api = crate::driver::api()?;
+    let handle = api.open_sniff(&filter)?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let restart = Arc::new(AtomicBool::new(false));
@@ -120,33 +116,16 @@ pub fn start_capture(tx: Sender<ProtocolEvent>) -> Result<CaptureHandle, Capture
     // `HANDLE` is a `Copy` newtype over `isize`; the capture thread gets its
     // own copy of the value, not a reference into shared state.
     let thread_handle = handle;
-    let join = thread::spawn(move || recv_loop(thread_handle, tx, thread_stop, thread_restart));
+    let join =
+        thread::spawn(move || recv_loop(api, thread_handle, tx, thread_stop, thread_restart));
 
     Ok(CaptureHandle {
         stop,
         restart,
         handle,
+        api,
         join,
     })
-}
-
-/// Maps a WinDivert open failure to the user-facing [`CaptureError`]
-/// variants (§0.7 of the plan): missing driver files / blocked driver vs.
-/// missing elevation vs. everything else.
-fn map_open_error(err: std::io::Error) -> CaptureError {
-    let text = err.to_string();
-    match WinDivertOpenError::try_from(err) {
-        Ok(WinDivertOpenError::AccessDenied) => CaptureError::NotElevated,
-        Ok(
-            open_err @ (WinDivertOpenError::MissingSYS
-            | WinDivertOpenError::MissingInstall
-            | WinDivertOpenError::DriverBlocked
-            | WinDivertOpenError::InvalidImageHash
-            | WinDivertOpenError::IncompatibleVersion
-            | WinDivertOpenError::BaseFilteringEngineDisabled),
-        ) => CaptureError::DriverMissing(format!("{open_err:?}")),
-        _ => CaptureError::Open(text),
-    }
 }
 
 /// Blocking single-packet receive. On success returns how many bytes of
@@ -157,29 +136,18 @@ fn map_open_error(err: std::io::Error) -> CaptureError {
 ///
 /// Returns a length rather than a borrow of `buffer` so the caller can react
 /// to an error without holding a borrow across the retry.
-fn recv_packet(handle: HANDLE, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
-    let mut packet_len: u32 = 0;
-    let mut addr = MaybeUninit::<WINDIVERT_ADDRESS>::uninit();
+fn recv_packet(api: &Api, handle: HANDLE, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
+    let mut addr = MaybeUninit::<WinDivertAddress>::uninit();
     // SAFETY: `handle` is live for the whole capture thread; `buffer` is a
-    // valid writable slice of `buffer.len()` bytes; `packet_len` and `addr`
-    // are valid out-parameters. `addr` is only read back on success, when
-    // the driver has initialized it.
-    let ok = unsafe {
-        sys::WinDivertRecv(
-            handle,
-            buffer.as_mut_ptr() as *mut c_void,
-            buffer.len() as u32,
-            &mut packet_len,
-            addr.as_mut_ptr(),
-        )
-    };
-    if !ok.as_bool() {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((packet_len as usize).min(buffer.len()))
+    // valid writable slice of `buffer.len()` bytes and `addr` a valid
+    // out-parameter of exactly the size the driver writes. `addr` is never
+    // read back, so it does not matter that the driver leaves it untouched
+    // on failure.
+    unsafe { api.recv(handle, buffer, addr.as_mut_ptr()) }
 }
 
 fn recv_loop(
+    api: &Api,
     handle: HANDLE,
     tx: Sender<ProtocolEvent>,
     stop: Arc<AtomicBool>,
@@ -199,7 +167,7 @@ fn recv_loop(
             decoder.reset();
         }
 
-        let packet_len = match recv_packet(handle, &mut buffer) {
+        let packet_len = match recv_packet(api, handle, &mut buffer) {
             Ok(len) => {
                 consecutive_errors = 0;
                 len

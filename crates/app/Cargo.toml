@@ -17,3 +17,6 @@ bpsr-capture = { workspace = true }
 bpsr-protocol = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
+
+[build-dependencies]
+embed-resource.workspace = true
