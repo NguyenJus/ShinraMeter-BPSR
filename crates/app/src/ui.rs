@@ -95,11 +95,27 @@ fn draw_header(
     snapshot: &Snapshot,
     tx_command: &Sender<UiCommand>,
 ) {
+    // The whole header band is the drag surface, registered *before* the row's
+    // contents so the buttons drawn into it end up on top and still get their
+    // clicks. Grabbing a single glyph was too small a target to hit.
+    let band = {
+        let mut rect = ui.available_rect_before_wrap();
+        rect.max.y = rect.min.y + ui.spacing().interact_size.y;
+        rect
+    };
+    let drag_surface = ui.interact(band, ui.id().with("title_bar"), egui::Sense::drag());
+    if drag_surface.hovered() {
+        ctx.set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    // Once per gesture: `drag_window` starts a modal move loop on the OS side,
+    // so re-sending it every frame while the drag is held is at best redundant.
+    if drag_surface.drag_started_by(egui::PointerButton::Primary) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+
     ui.horizontal(|ui| {
-        let drag_handle = ui.label("⠿").interact(egui::Sense::drag());
-        if drag_handle.dragged() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
+        // Purely an affordance — the band above is what actually drags.
+        ui.label("☰");
 
         ui.label(fmt_duration(snapshot.duration_ms));
         ui.label(format!("{} DPS", fmt_short(snapshot.total_dps as i64)));
@@ -219,6 +235,9 @@ pub fn apply_theme(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = egui::vec2(6.0, 2.0);
         style.spacing.button_padding = egui::vec2(4.0, 2.0);
+        // Labels sense click-and-drag when selectable, which would swallow the
+        // header drag as a text selection. Nothing here is worth selecting.
+        style.interaction.selectable_labels = false;
     });
 }
 
