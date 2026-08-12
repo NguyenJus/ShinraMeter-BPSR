@@ -1,0 +1,6 @@
+/target
+Cargo.lock.orig
+*.pcap
+*.pcapng
+docs/specs/
+docs/plans/
