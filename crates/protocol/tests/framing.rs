@@ -175,6 +175,25 @@ fn sync_near_entities_emits_player_and_enemy_hp_events() {
     assert_eq!(bpsr_protocol::event::kind_of(ATTACKER_UUID), EntityKind::Player);
 }
 
+/// Five good Notify frames followed by a garbage length prefix in one TCP
+/// packet: a desync at the tail must not discard the frames parsed before
+/// it — only the trailing garbage is dropped.
+#[test]
+fn desync_after_good_frames_still_yields_their_events() {
+    let mut stream = build_multi_frame_stream(); // 5 good Notify frames
+    stream.extend_from_slice(&5u32.to_be_bytes()); // garbage: below MIN_FRAME_LEN
+
+    let mut decoder = Decoder::new();
+    let events = decoder.push_stream(&stream, 3);
+    assert_eq!(events.len(), 5);
+    for (i, ev) in events.iter().enumerate() {
+        match ev {
+            ProtocolEvent::Damage(d) => assert_eq!(d.value, 100 + i as i64 * 10),
+            other => panic!("expected Damage, got {other:?}"),
+        }
+    }
+}
+
 /// Two independent frames delivered in a single push, plus a partial third
 /// frame held over to the next push, both surface correctly.
 #[test]

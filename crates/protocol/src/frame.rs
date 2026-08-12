@@ -60,11 +60,24 @@ pub enum FrameError {
     Zstd,
 }
 
+/// Result of `split_frames`: the frames found and bytes consumed before
+/// either running out of complete frames or hitting a desync. `frames` and
+/// `consumed` cover everything parsed *before* the desync point — a desync
+/// must not discard frames already parsed earlier in the same buffer.
+#[derive(Debug)]
+pub struct SplitFrames<'a> {
+    pub frames: Vec<&'a [u8]>,
+    pub consumed: usize,
+    pub desync: bool,
+}
+
 /// Splits `stream` into complete outer frames, returning the frames found and
 /// the number of bytes consumed (the caller keeps whatever tail remains for
 /// the next push). A `total_len` outside `[MIN_FRAME_LEN, MAX_FRAME_LEN]`
-/// signals `FrameError::Desync` rather than being advanced past blindly.
-pub fn split_frames(stream: &[u8]) -> Result<(Vec<&[u8]>, usize), FrameError> {
+/// sets `desync: true`; `frames`/`consumed` still reflect everything parsed
+/// before that point, so the caller can keep the good frames and drop only
+/// the tail from `consumed` onward.
+pub fn split_frames(stream: &[u8]) -> SplitFrames<'_> {
     let mut frames = Vec::new();
     let mut consumed = 0usize;
     loop {
@@ -81,7 +94,11 @@ pub fn split_frames(stream: &[u8]) -> Result<(Vec<&[u8]>, usize), FrameError> {
             None => break,
         };
         if total_len < MIN_FRAME_LEN || total_len > MAX_FRAME_LEN {
-            return Err(FrameError::Desync);
+            return SplitFrames {
+                frames,
+                consumed,
+                desync: true,
+            };
         }
         let total_len = total_len as usize;
         if remaining.len() < total_len {
@@ -95,7 +112,11 @@ pub fn split_frames(stream: &[u8]) -> Result<(Vec<&[u8]>, usize), FrameError> {
         frames.push(frame);
         consumed += total_len;
     }
-    Ok((frames, consumed))
+    SplitFrames {
+        frames,
+        consumed,
+        desync: false,
+    }
 }
 
 fn decompress(payload: &[u8]) -> Option<Vec<u8>> {
@@ -180,14 +201,11 @@ fn handle_frame_down(body: &[u8], is_zstd: bool, depth: usize, out: &mut Vec<Not
     } else {
         raw_nested.to_vec()
     };
-    let (frames, _consumed) = match split_frames(&nested) {
-        Ok(v) => v,
-        Err(_) => {
-            log::debug!("bpsr-protocol: desync while splitting FrameDown nested stream");
-            return;
-        }
-    };
-    for f in frames {
+    let result = split_frames(&nested);
+    if result.desync {
+        log::debug!("bpsr-protocol: desync while splitting FrameDown nested stream");
+    }
+    for f in result.frames {
         parse_frame(f, depth + 1, out);
     }
 }
@@ -261,18 +279,20 @@ mod tests {
     fn two_frames_in_one_buffer() {
         let mut stream = build_notify_frame(1, b"a", false);
         stream.extend(build_notify_frame(2, b"bb", false));
-        let (frames, consumed) = split_frames(&stream).unwrap();
-        assert_eq!(frames.len(), 2);
-        assert_eq!(consumed, stream.len());
+        let result = split_frames(&stream);
+        assert!(!result.desync);
+        assert_eq!(result.frames.len(), 2);
+        assert_eq!(result.consumed, stream.len());
     }
 
     #[test]
     fn partial_frame_yields_nothing() {
         let full = build_notify_frame(1, b"abcdef", false);
         let partial = &full[..full.len() - 1];
-        let (frames, consumed) = split_frames(partial).unwrap();
-        assert_eq!(frames.len(), 0);
-        assert_eq!(consumed, 0);
+        let result = split_frames(partial);
+        assert!(!result.desync);
+        assert_eq!(result.frames.len(), 0);
+        assert_eq!(result.consumed, 0);
     }
 
     #[test]
@@ -310,14 +330,43 @@ mod tests {
     #[test]
     fn total_len_too_small_is_desync() {
         let buf = 5u32.to_be_bytes().to_vec();
-        let err = split_frames(&buf).unwrap_err();
-        assert!(matches!(err, FrameError::Desync));
+        let result = split_frames(&buf);
+        assert!(result.desync);
+        assert!(result.frames.is_empty());
+        assert_eq!(result.consumed, 0);
     }
 
     #[test]
     fn total_len_max_is_desync() {
         let buf = 0xFFFF_FFFFu32.to_be_bytes().to_vec();
-        let err = split_frames(&buf).unwrap_err();
-        assert!(matches!(err, FrameError::Desync));
+        let result = split_frames(&buf);
+        assert!(result.desync);
+        assert!(result.frames.is_empty());
+        assert_eq!(result.consumed, 0);
+    }
+
+    #[test]
+    fn desync_after_good_frames_preserves_frames_and_consumed() {
+        let mut stream = build_notify_frame(1, b"a", false);
+        stream.extend(build_notify_frame(2, b"bb", false));
+        let good_len = stream.len();
+        stream.extend_from_slice(&5u32.to_be_bytes()); // garbage: below MIN_FRAME_LEN
+        let result = split_frames(&stream);
+        assert!(result.desync);
+        assert_eq!(result.frames.len(), 2);
+        assert_eq!(result.consumed, good_len);
+    }
+
+    #[test]
+    fn framedown_desync_after_good_notifies_preserves_them() {
+        let mut nested = build_notify_frame(1, b"one", false);
+        nested.extend(build_notify_frame(2, b"two", false));
+        nested.extend_from_slice(&5u32.to_be_bytes()); // garbage: below MIN_FRAME_LEN
+        let frame = build_framedown_frame(42, &nested, false);
+        let mut out = Vec::new();
+        parse_frame(&frame, 0, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].method_id, 1);
+        assert_eq!(out[1].method_id, 2);
     }
 }

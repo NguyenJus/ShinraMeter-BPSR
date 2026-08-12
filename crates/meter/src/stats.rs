@@ -67,6 +67,11 @@ pub struct PlayerRow {
 pub struct Snapshot {
     pub duration_ms: u64,
     pub total_damage: i64,
+    /// Aggregate DPS over the same window used for each row's `dps` (see
+    /// `Meter::snapshot`), not `duration_ms` — keeping the header and rows on
+    /// separate denominators lets them diverge (e.g. a huge spike on the
+    /// first tick, or the header decaying while idle).
+    pub total_dps: f64,
     pub rows: Vec<PlayerRow>,
 }
 

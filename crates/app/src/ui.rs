@@ -40,6 +40,7 @@ impl OverlayApp {
             snapshot: Snapshot {
                 duration_ms: 0,
                 total_damage: 0,
+                total_dps: 0.0,
                 rows: Vec::new(),
             },
             status: StatusLine::Ok,
@@ -101,7 +102,7 @@ fn draw_header(
         }
 
         ui.label(fmt_duration(snapshot.duration_ms));
-        ui.label(format!("{} DPS", fmt_short(total_dps(snapshot) as i64)));
+        ui.label(format!("{} DPS", fmt_short(snapshot.total_dps as i64)));
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button("✕").clicked() {
@@ -166,14 +167,6 @@ fn row_name(row: &PlayerRow) -> String {
         format!("Player {}", row.uid)
     } else {
         row.name.clone()
-    }
-}
-
-fn total_dps(snapshot: &Snapshot) -> f64 {
-    if snapshot.duration_ms == 0 {
-        0.0
-    } else {
-        snapshot.total_damage as f64 / (snapshot.duration_ms as f64 / 1000.0)
     }
 }
 

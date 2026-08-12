@@ -128,7 +128,7 @@ fn on_aoi_sync_delta(delta: &AoiSyncDelta, now_ms: u64, out: &mut Vec<ProtocolEv
             crit: dmg.type_flag & 1 != 0,
             lucky: dmg.lucky_value != 0,
             hp_lessen: dmg.hp_lessen_value,
-            is_miss: dmg.is_miss,
+            is_miss: dmg.is_miss || dmg.r#type == EDamageType::Miss as i32,
             is_heal: dmg.r#type == EDamageType::Heal as i32,
             target_uid,
             target_kind,
@@ -179,26 +179,23 @@ impl Decoder {
     pub fn push_stream(&mut self, bytes: &[u8], now_ms: u64) -> Vec<ProtocolEvent> {
         self.tail.extend_from_slice(bytes);
         let mut out = Vec::new();
-        let consumed = {
-            let (frames, consumed) = match split_frames(&self.tail) {
-                Ok(v) => v,
-                Err(_) => {
-                    log::debug!("bpsr-protocol: stream desync, dropping buffered tail");
-                    self.tail.clear();
-                    return out;
-                }
-            };
+        let (consumed, desync) = {
+            let result = split_frames(&self.tail);
             let mut notifies = Vec::new();
-            for f in &frames {
+            for f in &result.frames {
                 parse_frame(f, 0, &mut notifies);
             }
             for n in &notifies {
                 decode_notify(n, now_ms, &mut out);
             }
-            consumed
+            (result.consumed, result.desync)
         };
         if consumed > 0 {
             self.tail.drain(..consumed);
+        }
+        if desync {
+            log::debug!("bpsr-protocol: stream desync, dropping buffered tail");
+            self.tail.clear();
         }
         out
     }
@@ -341,6 +338,21 @@ mod tests {
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out);
         assert!(only_damage(out).is_heal);
+    }
+
+    #[test]
+    fn miss_type_counts_as_hit_with_is_miss_true_even_if_flag_false() {
+        // plan §0.6: Miss(1)/is_miss counts as a hit with 0 damage. The
+        // server may set r#type == Miss without also setting is_miss.
+        let dmg = pb::SyncDamageInfo {
+            r#type: EDamageType::Miss as i32,
+            is_miss: false,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out);
+        assert!(only_damage(out).is_miss);
     }
 
     #[test]

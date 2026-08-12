@@ -13,3 +13,9 @@ bpsr-protocol = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windivert = { workspace = true, features = ["vendored"] }
+# Raw FFI: `stop()` needs the `Copy` OS HANDLE so it can call
+# `WinDivertShutdown` while the capture thread is blocked in a recv on the
+# same handle — the safe wrapper keeps its handle private and takes
+# `&mut self`, which cannot be produced soundly there.
+windivert-sys = { workspace = true, features = ["vendored"] }
+windows = { workspace = true }

@@ -170,14 +170,21 @@ impl Meter {
                 Some(last) => e.timestamp_ms.saturating_sub(last) >= self.reset_cfg.cooldown_ms,
                 None => true,
             };
-            if cooldown_ok {
-                let should_reset = {
-                    let enemy = &self.enemies[&e.uid];
-                    check_hp_rollback(enemy, &self.reset_cfg)
-                };
-                if should_reset {
+            let should_reset = {
+                let enemy = &self.enemies[&e.uid];
+                check_hp_rollback(enemy, &self.reset_cfg)
+            };
+            if should_reset {
+                if cooldown_ok {
                     self.reset(ResetReason::BossHpRollback, e.timestamp_ms);
                     return Some(ResetReason::BossHpRollback);
+                }
+                // The rollback shape was observed but suppressed by the
+                // cooldown gate. Latch it so the same rollback can't re-fire
+                // the instant the cooldown expires (it's level-triggered on
+                // `lowest_pct`, which only clears inside `reset`).
+                if let Some(enemy) = self.enemies.get_mut(&e.uid) {
+                    enemy.lowest_pct = None;
                 }
             }
         }
@@ -203,6 +210,7 @@ impl Meter {
         self.players.clear();
         for enemy in self.enemies.values_mut() {
             enemy.lowest_pct = None;
+            enemy.took_damage = false;
         }
         self.fight_start_ms = None;
         self.last_reset_ms = Some(now_ms);
@@ -250,9 +258,12 @@ impl Meter {
             .collect();
         rows.sort_by_key(|r| std::cmp::Reverse(r.damage));
 
+        let total_dps = total_damage as f64 / (dps_duration_ms as f64 / 1000.0);
+
         Snapshot {
             duration_ms: display_duration_ms,
             total_damage,
+            total_dps,
             rows,
         }
     }
@@ -364,6 +375,20 @@ mod tests {
     }
 
     #[test]
+    fn header_total_dps_matches_row_dps_on_first_tick() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 5000, 1_000_000));
+        // now_ms is called 1ms after the fight-start timestamp: display
+        // duration would be 1ms, but the DPS window (last_event - start,
+        // min 1000ms) is 1000ms. The header's total_dps must use the same
+        // window as the row, not the display duration.
+        let snap = m.snapshot(1_000_001);
+        assert_eq!(snap.rows.len(), 1);
+        assert!((snap.total_dps - snap.rows[0].dps).abs() < 0.01);
+        assert!((snap.total_dps - 5000.0).abs() < 0.01);
+    }
+
+    #[test]
     fn monster_attacker_produces_no_row() {
         let mut m = Meter::new();
         m.apply(&ProtocolEvent::Damage(DamageEvent {
@@ -437,6 +462,38 @@ mod tests {
             m.apply(&hp(10, 55, 100, 300));
             let second = m.apply(&hp(10, 95, 100, 700));
             assert_eq!(second, None);
+        }
+
+        #[test]
+        fn cooldown_suppressed_rollback_does_not_refire_after_cooldown_expires() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 100, 100, 0));
+            m.apply(&hp(10, 55, 100, 100));
+            let first = m.apply(&hp(10, 95, 100, 200));
+            assert_eq!(first, Some(ResetReason::BossHpRollback));
+
+            // Within cooldown (last_reset_ms=200, cooldown=2000): the same
+            // drop/recover shape is observed but suppressed.
+            m.apply(&hp(10, 55, 100, 300));
+            let suppressed = m.apply(&hp(10, 95, 100, 700));
+            assert_eq!(suppressed, None);
+
+            // Cooldown has now expired (2300 - 200 = 2100ms >= 2000ms). The
+            // suppressed rollback must not re-fire just because the cooldown
+            // gate opened again.
+            let after_cooldown = m.apply(&hp(10, 96, 100, 2300));
+            assert_eq!(after_cooldown, None);
+        }
+
+        #[test]
+        fn reset_clears_took_damage_on_all_enemies() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 100, 100, 0));
+            assert!(m.enemies[&10].took_damage);
+            m.reset(ResetReason::Manual, 1000);
+            assert!(!m.enemies[&10].took_damage);
         }
 
         #[test]

@@ -3,6 +3,7 @@
 //! No port filter — the game server is identified by scanning TCP payload
 //! bytes for a known signature, with a login-return fallback.
 
+use std::collections::HashSet;
 use std::fmt;
 
 /// Signature bytes located at [`SERVER_SIGNATURE_OFFSET`] within a
@@ -97,14 +98,167 @@ pub fn is_login_return(payload: &[u8]) -> bool {
     payload[14..20] == LOGIN_RETURN_SIGNATURE_2
 }
 
+/// True if `conn` is the same TCP connection as `known`, regardless of which
+/// direction it was captured in — a client→server packet and the matching
+/// server→client packet describe one connection but are distinct (reversed)
+/// [`Conn`] tuples. Used to recognize "this is still the adopted server
+/// connection, just seen from the other direction" without re-running
+/// detection (which would otherwise ping-pong-adopt the connection on every
+/// packet: see the win.rs adoption bug this exists to prevent).
+pub fn same_connection(conn: &Conn, known: &Conn) -> bool {
+    conn == known
+        || (conn.src == known.dst
+            && conn.src_port == known.dst_port
+            && conn.dst == known.src
+            && conn.dst_port == known.src_port)
+}
+
+/// What an observed packet's 4-tuple means relative to the adopted
+/// game-server connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnStreamRole {
+    /// Exactly the adopted direction (server → client). Its payload *is* the
+    /// server byte stream and belongs in the reassembler.
+    Adopted,
+    /// The other direction of the adopted connection (client → server).
+    /// Recognized, so it must not re-run detection, but its payload lives in
+    /// that direction's own 32-bit sequence space: feeding it to the
+    /// server-stream reassembler would bloat the out-of-order cache with
+    /// unreachable segments and eventually splice client bytes into the
+    /// server stream. Its payload must be dropped.
+    Reverse,
+    /// Not the adopted connection — or nothing adopted yet. Detection runs.
+    Unrelated,
+}
+
+/// Classifies `conn` against the currently adopted server connection.
+pub fn classify_connection(conn: &Conn, known: Option<&Conn>) -> ConnStreamRole {
+    match known {
+        Some(known) if conn == known => ConnStreamRole::Adopted,
+        Some(known) if same_connection(conn, known) => ConnStreamRole::Reverse,
+        _ => ConnStreamRole::Unrelated,
+    }
+}
+
 /// Derives the `[a, b]` /16 subnet prefix for a detected server connection,
 /// taken from whichever endpoint looks non-RFC1918 (checked by first octet
 /// only, matching the reference implementation).
 pub fn subnet_prefix(conn: &Conn) -> [u8; 2] {
-    if conn.src[0] != 10 && conn.src[0] != 172 && conn.src[0] != 192 {
-        [conn.src[0], conn.src[1]]
-    } else {
+    if is_private(conn.src) {
         [conn.dst[0], conn.dst[1]]
+    } else {
+        [conn.src[0], conn.src[1]]
+    }
+}
+
+/// RFC1918-ish check by first octet only, matching the reference
+/// implementation (and deliberately coarse: 172.x / 192.x outside the
+/// reserved ranges are treated as private too, which only ever costs a
+/// missed adoption, never a wrong one).
+fn is_private(addr: [u8; 4]) -> bool {
+    matches!(addr[0], 10 | 172 | 192)
+}
+
+/// Whether a packet may be adopted as the game-server stream purely because
+/// it sits in the known /16 subnet.
+///
+/// Two requirements beyond the subnet match, both load-bearing:
+///
+/// * **Direction.** The packet's *source* must be the non-RFC1918 endpoint
+///   whose /16 is `known_subnet`, i.e. it is a server→client packet. The
+///   first packet of a new connection after a channel switch is the client's
+///   SYN; adopting that client→server tuple makes every subsequent
+///   server→client packet classify as [`ConnStreamRole::Reverse`] and be
+///   dropped, with detection never running again — capture silently dead.
+/// * **Payload.** Control packets (SYN / SYN-ACK / pure ACK) carry no stream
+///   bytes and their raw sequence number is one below the first data byte
+///   (SYN consumes a sequence number), so resyncing the reassembler onto one
+///   opens a phantom 1-byte gap that stalls the stream.
+pub fn subnet_adoption_eligible(conn: &Conn, payload: &[u8], known_subnet: [u8; 2]) -> bool {
+    !payload.is_empty() && !is_private(conn.src) && [conn.src[0], conn.src[1]] == known_subnet
+}
+
+/// Tracks the game-server detection state that outlives a single packet: the
+/// /16 subnet the server was last seen in, and which connections inside that
+/// subnet have already been tried by the reconnect path.
+///
+/// Lives here rather than in `win.rs` so the whole decision — including the
+/// direction and payload requirements that keep a client SYN from being
+/// adopted as the server stream — is host-testable.
+#[derive(Debug, Default)]
+pub struct ServerDetector {
+    known_subnet: Option<[u8; 2]>,
+    subnet_candidates: HashSet<Conn>,
+}
+
+impl ServerDetector {
+    /// Bound on how many distinct connections within the known server's /16
+    /// subnet get auto-adopted as the new game-server connection (the
+    /// "reconnect to the same datacenter" path) before that path gives up
+    /// and only the payload-signature scan is tried.
+    pub const MAX_SUBNET_CONNECTIONS: usize = 16;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Forgets everything learned about the server, so detection re-runs from
+    /// scratch (user-requested restart).
+    pub fn reset(&mut self) {
+        self.known_subnet = None;
+        self.subnet_candidates.clear();
+    }
+
+    /// Game-server detection per §0.7: payload signature scan, then the
+    /// login-return fallback, then (once a server has ever been seen) the
+    /// subnet-tracking path for reconnects to the same datacenter.
+    ///
+    /// `server_adopted` must be `true` iff a server connection is currently
+    /// adopted (win.rs's `known_server.is_some()`). The subnet-reconnect path
+    /// is a *reconnect* mechanism only — it must not run while a server is
+    /// already adopted, or a co-located non-game connection in the same /16
+    /// (e.g. a CDN endpoint) can be adopted over the real, still-live game
+    /// connection. The signature paths above are unaffected by this flag:
+    /// they legitimately detect channel switches while a server is adopted.
+    ///
+    /// A `true` result must be followed by [`Self::adopt`].
+    pub fn detects(&mut self, conn: &Conn, payload: &[u8], server_adopted: bool) -> bool {
+        if looks_like_game_server(payload) || is_login_return(payload) {
+            return true;
+        }
+
+        if server_adopted {
+            return false;
+        }
+
+        let Some(prefix) = self.known_subnet else {
+            return false;
+        };
+        if !subnet_adoption_eligible(conn, payload, prefix) || self.subnet_candidates.contains(conn) {
+            return false;
+        }
+        if self.subnet_candidates.len() >= Self::MAX_SUBNET_CONNECTIONS {
+            return false;
+        }
+        self.subnet_candidates.insert(*conn);
+        true
+    }
+
+    /// Records `conn` as the adopted server connection.
+    pub fn adopt(&mut self, conn: &Conn) {
+        let prefix = subnet_prefix(conn);
+        // Candidates are keyed by connection alone, so they only mean
+        // anything relative to the subnet they were gathered in: on a move to
+        // a different /16 they are stale and would otherwise keep consuming
+        // the new subnet's cap until the reconnect path is dead. Within one
+        // subnet they must survive — they are what stops two connections in
+        // the same /16 from re-adopting each other forever, each swap
+        // resetting the decoder and wiping the meter.
+        if self.known_subnet != Some(prefix) {
+            self.subnet_candidates.clear();
+        }
+        self.known_subnet = Some(prefix);
+        self.subnet_candidates.insert(*conn);
     }
 }
 
@@ -189,5 +343,160 @@ mod tests {
             dst_port: 443,
         };
         assert_eq!(subnet_prefix(&conn), [203, 0]);
+    }
+
+    #[test]
+    fn same_connection_matches_identical_tuple() {
+        let conn = Conn { src: [1, 2, 3, 4], src_port: 100, dst: [10, 0, 0, 5], dst_port: 200 };
+        assert!(same_connection(&conn, &conn));
+    }
+
+    #[test]
+    fn same_connection_matches_reversed_direction() {
+        let server_to_client = Conn { src: [1, 2, 3, 4], src_port: 100, dst: [10, 0, 0, 5], dst_port: 200 };
+        let client_to_server = Conn { src: [10, 0, 0, 5], src_port: 200, dst: [1, 2, 3, 4], dst_port: 100 };
+        assert!(same_connection(&client_to_server, &server_to_client));
+    }
+
+    #[test]
+    fn same_connection_rejects_a_different_connection() {
+        let a = Conn { src: [1, 2, 3, 4], src_port: 100, dst: [10, 0, 0, 5], dst_port: 200 };
+        let b = Conn { src: [1, 2, 3, 4], src_port: 101, dst: [10, 0, 0, 5], dst_port: 200 };
+        assert!(!same_connection(&a, &b));
+    }
+
+    fn adopted() -> Conn {
+        // server -> client, the direction whose payload carried the signature
+        Conn { src: [1, 2, 3, 4], src_port: 100, dst: [10, 0, 0, 5], dst_port: 200 }
+    }
+
+    fn reversed() -> Conn {
+        Conn { src: [10, 0, 0, 5], src_port: 200, dst: [1, 2, 3, 4], dst_port: 100 }
+    }
+
+    #[test]
+    fn adopted_direction_is_the_server_stream() {
+        assert_eq!(classify_connection(&adopted(), Some(&adopted())), ConnStreamRole::Adopted);
+    }
+
+    #[test]
+    fn reverse_direction_is_recognized_but_not_the_server_stream() {
+        // Must not be `Unrelated` (that would re-run detection and
+        // ping-pong-adopt), and must not be `Adopted` (client->server bytes
+        // live in a different 32-bit sequence space and would corrupt the
+        // server reassembler).
+        assert_eq!(classify_connection(&reversed(), Some(&adopted())), ConnStreamRole::Reverse);
+    }
+
+    #[test]
+    fn other_connection_is_unrelated() {
+        let other = Conn { src: [1, 2, 3, 4], src_port: 101, dst: [10, 0, 0, 5], dst_port: 200 };
+        assert_eq!(classify_connection(&other, Some(&adopted())), ConnStreamRole::Unrelated);
+    }
+
+    #[test]
+    fn nothing_adopted_yet_is_unrelated() {
+        assert_eq!(classify_connection(&adopted(), None), ConnStreamRole::Unrelated);
+    }
+
+    /// server → client packet from a public address, as the adopted stream
+    /// direction always looks.
+    fn server_to_client(src: [u8; 4], src_port: u16) -> Conn {
+        Conn { src, src_port, dst: [192, 168, 1, 50], dst_port: 55_000 }
+    }
+
+    /// client → server packet: the reverse tuple of the above.
+    fn client_to_server(dst: [u8; 4], dst_port: u16) -> Conn {
+        Conn { src: [192, 168, 1, 50], src_port: 55_000, dst, dst_port }
+    }
+
+    fn detector_knowing(subnet_of: &Conn) -> ServerDetector {
+        let mut d = ServerDetector::new();
+        d.adopt(subnet_of);
+        d
+    }
+
+    #[test]
+    fn subnet_path_adopts_a_server_to_client_data_packet() {
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        assert!(d.detects(&server_to_client([203, 0, 113, 9], 5001), b"payload", false));
+    }
+
+    #[test]
+    fn subnet_path_ignores_the_client_to_server_direction() {
+        // On a channel switch the *first* packet of the new connection is the
+        // client's SYN — a client→server tuple. Adopting it makes every real
+        // server→client packet classify as Reverse and get dropped forever.
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        assert!(!d.detects(&client_to_server([203, 0, 113, 9], 5001), b"payload", false));
+    }
+
+    #[test]
+    fn subnet_path_ignores_payload_less_control_packets() {
+        // A SYN/ACK carries no stream bytes, and its raw seq is one below the
+        // first data byte: adopting on it resyncs the reassembler onto a
+        // phantom 1-byte gap.
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        assert!(!d.detects(&server_to_client([203, 0, 113, 9], 5001), b"", false));
+    }
+
+    #[test]
+    fn payload_signature_paths_never_fire_on_an_empty_payload() {
+        // Guarantees no adoption path can resync the reassembler onto a
+        // payload-less packet.
+        assert!(!looks_like_game_server(b""));
+        assert!(!is_login_return(b""));
+    }
+
+    #[test]
+    fn subnet_candidates_are_capped() {
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        for port in 0..(ServerDetector::MAX_SUBNET_CONNECTIONS as u16 + 4) {
+            let _ = d.detects(&server_to_client([203, 0, 113, 8], 6000 + port), b"payload", false);
+        }
+        assert!(!d.detects(&server_to_client([203, 0, 113, 8], 9999), b"payload", false));
+    }
+
+    #[test]
+    fn changing_subnet_clears_stale_candidates() {
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        for port in 0..(ServerDetector::MAX_SUBNET_CONNECTIONS as u16 + 4) {
+            let _ = d.detects(&server_to_client([203, 0, 113, 8], 6000 + port), b"payload", false);
+        }
+        // A signature match in a different /16 adopts a server elsewhere; the
+        // candidates accumulated under the old subnet must not keep consuming
+        // the new subnet's cap.
+        d.adopt(&server_to_client([198, 51, 100, 7], 7000));
+        assert!(d.detects(&server_to_client([198, 51, 100, 9], 7001), b"payload", false));
+    }
+
+    #[test]
+    fn same_subnet_adoption_keeps_candidates() {
+        // Clearing on every adoption lets two connections in one /16 re-adopt
+        // each other forever, resetting the decoder each time.
+        let first = server_to_client([203, 0, 113, 7], 5000);
+        let mut d = detector_knowing(&first);
+        let second = server_to_client([203, 0, 113, 8], 6000);
+        assert!(d.detects(&second, b"payload", false));
+        d.adopt(&second);
+        assert!(!d.detects(&first, b"payload", false));
+    }
+
+    #[test]
+    fn reset_forgets_the_known_subnet() {
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        d.reset();
+        assert!(!d.detects(&server_to_client([203, 0, 113, 9], 5001), b"payload", false));
+    }
+
+    #[test]
+    fn subnet_path_only_runs_when_no_server_currently_adopted() {
+        // Regression for: a co-located non-game connection in the same /16
+        // (e.g. a CDN endpoint) must not be adopted onto the reassembler
+        // while the real game-server connection is still adopted.
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        let candidate = server_to_client([203, 0, 113, 200], 6000);
+        assert!(!d.detects(&candidate, b"payload", true));
+        assert!(d.detects(&candidate, b"payload", false));
     }
 }
