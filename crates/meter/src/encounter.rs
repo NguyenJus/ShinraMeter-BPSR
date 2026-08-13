@@ -15,6 +15,13 @@ use crate::stats::{PlayerRow, PlayerStats, Snapshot};
 struct NameEntry {
     name: Option<String>,
     class: Option<Class>,
+    /// Ability score (a.k.a. combat power). Kept in-memory alongside
+    /// name/class so it survives a `reset` the same way they do (issue #15).
+    /// Deliberately **not** part of the on-disk cache (`names_cache.rs`):
+    /// unlike name/class it can drift across sessions (gear changes), so
+    /// persisting a stale value risks being more misleading than showing
+    /// nothing until a fresh packet arrives.
+    ability_score: Option<u32>,
     seq: u64,
 }
 
@@ -83,19 +90,28 @@ impl Meter {
             // Index 0 is the most-recently-used on-disk entry, so it gets the
             // highest seq; the last entry gets seq 1.
             let seq = total - i as u64;
-            m.names.insert(uid, NameEntry { name, class, seq });
+            m.names.insert(
+                uid,
+                NameEntry {
+                    name,
+                    class,
+                    ability_score: None,
+                    seq,
+                },
+            );
         }
         m.names_seq = total;
         m
     }
 
-    /// Reads a cached name/class, bumping its recency for `names_for_save`.
-    fn name_lookup(&mut self, uid: i64) -> Option<(Option<String>, Option<Class>)> {
+    /// Reads a cached name/class/ability_score, bumping its recency for
+    /// `names_for_save`.
+    fn name_lookup(&mut self, uid: i64) -> Option<(Option<String>, Option<Class>, Option<u32>)> {
         self.names_seq += 1;
         let seq = self.names_seq;
         self.names.get_mut(&uid).map(|entry| {
             entry.seq = seq;
-            (entry.name.clone(), entry.class)
+            (entry.name.clone(), entry.class, entry.ability_score)
         })
     }
 
@@ -108,7 +124,8 @@ impl Meter {
         uid: i64,
         name: Option<String>,
         class: Option<Class>,
-    ) -> (Option<String>, Option<Class>) {
+        ability_score: Option<u32>,
+    ) -> (Option<String>, Option<Class>, Option<u32>) {
         self.names_seq += 1;
         let seq = self.names_seq;
         let entry = self.names.entry(uid).or_default();
@@ -118,8 +135,11 @@ impl Meter {
         if class.is_some() {
             entry.class = class;
         }
+        if ability_score.is_some() {
+            entry.ability_score = ability_score;
+        }
         entry.seq = seq;
-        (entry.name.clone(), entry.class)
+        (entry.name.clone(), entry.class, entry.ability_score)
     }
 
     /// Exports the name cache for persistence, ordered most-recently-touched
@@ -194,12 +214,15 @@ impl Meter {
             .players
             .entry(d.attacker_uid)
             .or_insert_with(|| PlayerStats::new(d.attacker_uid));
-        if let Some((name, class)) = cached {
+        if let Some((name, class, ability_score)) = cached {
             if stats.name.is_none() {
                 stats.name = name;
             }
             if stats.class.is_none() {
                 stats.class = class;
+            }
+            if stats.ability_score.is_none() {
+                stats.ability_score = ability_score;
             }
         }
 
@@ -220,13 +243,17 @@ impl Meter {
     }
 
     fn apply_player(&mut self, p: &PlayerInfo) {
-        let (name, class) = self.name_upsert(p.uid, p.name.clone(), p.class);
+        let (name, class, ability_score) =
+            self.name_upsert(p.uid, p.name.clone(), p.class, p.ability_score);
         if let Some(stats) = self.players.get_mut(&p.uid) {
             if name.is_some() {
                 stats.name = name;
             }
             if class.is_some() {
                 stats.class = class;
+            }
+            if ability_score.is_some() {
+                stats.ability_score = ability_score;
             }
         }
     }
@@ -342,6 +369,7 @@ impl Meter {
                         .clone()
                         .unwrap_or_else(|| format!("Player {}", p.uid)),
                     class: p.class,
+                    ability_score: p.ability_score,
                     damage: p.total_damage,
                     dps,
                     share_pct,
@@ -445,10 +473,41 @@ mod tests {
             uid: 5,
             name: Some("Foo".to_string()),
             class: Some(Class::Stormblade),
+            ability_score: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].name, "Foo");
         assert_eq!(snap.rows[0].class, Some(Class::Stormblade));
+    }
+
+    #[test]
+    fn player_info_ability_score_reaches_row() {
+        let mut m = Meter::new();
+        m.apply(&dmg(7, 100, 1000));
+        m.apply(&ProtocolEvent::Player(PlayerInfo {
+            uid: 7,
+            name: None,
+            class: None,
+            ability_score: Some(45_000),
+        }));
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows[0].ability_score, Some(45_000));
+    }
+
+    #[test]
+    fn ability_score_survives_reset_like_name_and_class() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Player(PlayerInfo {
+            uid: 3,
+            name: Some("Foo".to_string()),
+            class: None,
+            ability_score: Some(1000),
+        }));
+        m.apply(&dmg(3, 100, 0));
+        m.reset(ResetReason::Manual, 1000);
+        m.apply(&dmg(3, 50, 2000));
+        let snap = m.snapshot(3000);
+        assert_eq!(snap.rows[0].ability_score, Some(1000));
     }
 
     #[test]
@@ -568,6 +627,7 @@ mod tests {
                 uid: 5,
                 name: Some("Fresh".to_string()),
                 class: Some(Class::FrostMage),
+                ability_score: None,
             }));
             m.apply(&dmg(5, 100, 1000));
 
@@ -586,6 +646,7 @@ mod tests {
                 uid: 5,
                 name: Some("Renamed".to_string()),
                 class: None,
+                ability_score: None,
             }));
             m.apply(&dmg(5, 100, 1000));
 
@@ -635,16 +696,19 @@ mod tests {
                 uid: 1,
                 name: Some("A".to_string()),
                 class: None,
+                ability_score: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
                 uid: 2,
                 name: Some("B".to_string()),
                 class: None,
+                ability_score: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
                 uid: 3,
                 name: Some("C".to_string()),
                 class: None,
+                ability_score: None,
             }));
             // Re-touch uid 1 so it becomes the most recently used, ahead of
             // 3 and 2 (in that order).
@@ -652,6 +716,7 @@ mod tests {
                 uid: 1,
                 name: Some("A".to_string()),
                 class: None,
+                ability_score: None,
             }));
 
             let before = m.names_for_save();
@@ -676,11 +741,13 @@ mod tests {
                 uid: 1,
                 name: Some("First".to_string()),
                 class: None,
+                ability_score: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
                 uid: 2,
                 name: Some("Second".to_string()),
                 class: None,
+                ability_score: None,
             }));
 
             let saved = m.names_for_save();
@@ -695,6 +762,7 @@ mod tests {
                 uid: 1,
                 name: Some("Foo".to_string()),
                 class: None,
+                ability_score: None,
             }));
             m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 1000 });
 
@@ -882,6 +950,7 @@ mod tests {
                 uid: 1,
                 name: Some("Foo".to_string()),
                 class: None,
+                ability_score: None,
             }));
             m.apply(&dmg(1, 100, 0));
             m.reset(ResetReason::Manual, 1000);

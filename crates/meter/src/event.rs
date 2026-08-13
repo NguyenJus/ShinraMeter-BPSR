@@ -110,6 +110,9 @@ pub struct PlayerInfo {
     pub uid: i64,
     pub name: Option<String>,
     pub class: Option<Class>,
+    /// Ability score (a.k.a. combat power). Mirrors
+    /// `bpsr_protocol::PlayerInfo::ability_score` (issue #15).
+    pub ability_score: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

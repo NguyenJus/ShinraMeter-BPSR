@@ -142,14 +142,19 @@ pub fn sync_near_entities_payload(entities: Vec<pb::Entity>) -> Vec<u8> {
 
 /// Prost-encodes a `SyncContainerData` payload (not wrapped in a frame)
 /// carrying a character name + profession id.
-pub fn sync_container_data_payload(char_id: i64, name: &str, profession_id: i32) -> Vec<u8> {
+pub fn sync_container_data_payload(
+    char_id: i64,
+    name: &str,
+    profession_id: i32,
+    fight_point: i32,
+) -> Vec<u8> {
     let msg = pb::SyncContainerData {
         v_data: Some(pb::CharSerialize {
             char_id,
             char_base: Some(pb::CharBaseInfo {
                 char_id,
                 name: name.to_string(),
-                fight_point: 0,
+                fight_point,
             }),
             profession_list: Some(pb::ProfessionList {
                 cur_profession_id: profession_id,

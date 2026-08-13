@@ -54,6 +54,10 @@ pub struct PlayerInfo {
     pub uid: i64,
     pub name: Option<String>,
     pub class: Option<Class>,
+    /// Ability score (a.k.a. combat power), sourced from `attr_id::FIGHT_POINT`
+    /// or `CharBaseInfo.fight_point` — not every packet carries it, so this is
+    /// `None` rather than `Some(0)` when absent (issue #15).
+    pub ability_score: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
