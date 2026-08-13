@@ -3009,6 +3009,8 @@ dependencies = [
  "embed-resource",
  "env_logger",
  "log",
+ "raw-window-handle",
+ "windows 0.48.0",
 ]
 
 [[package]]
