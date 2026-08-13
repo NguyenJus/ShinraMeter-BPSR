@@ -36,7 +36,11 @@ pub fn kind_of(uuid: i64) -> EntityKind {
 
 /// Player class, derived from `ATTR_PROFESSION_ID` / `cur_profession_id`
 /// (plan §0.6). Mirrors `bpsr_protocol::pb::Class` exactly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// `Serialize`/`Deserialize` back the on-disk name cache (issue #12); the
+/// derive uses serde's default enum representation (variant name as a JSON
+/// string), which is stable across the fields defined here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Class {
     Stormblade,
     FrostMage,
