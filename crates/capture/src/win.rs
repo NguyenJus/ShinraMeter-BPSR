@@ -28,7 +28,10 @@ use crossbeam_channel::Sender;
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use windows::Win32::Foundation::HANDLE;
 
-use crate::detect::{Conn, ConnStreamRole, ServerDetector, classify_connection};
+use crate::backoff::recv_error_backoff;
+use crate::detect::{
+    Conn, ConnStreamRole, ServerDetector, classify_connection, is_teardown_of_known,
+};
 use crate::driver::{Api, WinDivertAddress};
 use crate::error::CaptureError;
 use crate::tcp::TcpReassembler;
@@ -66,7 +69,11 @@ pub struct CaptureHandle {
     /// The loaded WinDivert runtime. Borrowed from the process-lifetime
     /// static, so shutdown never has to re-enter the load path.
     api: &'static Api,
-    join: JoinHandle<()>,
+    /// `None` once `stop()` (or `Drop`) has taken it to join the thread.
+    /// `Option` rather than a bare `JoinHandle` because [`Self::stop`] needs
+    /// to move it out through `&mut self` — a value of a type that
+    /// implements `Drop` cannot be partially moved out of by value.
+    join: Option<JoinHandle<()>>,
 }
 
 impl CaptureHandle {
@@ -83,7 +90,19 @@ impl CaptureHandle {
     /// setting the stop flag alone is not enough. `WinDivertShutdown` is the
     /// driver-documented way to unblock a thread parked in a recv on the
     /// same handle from another thread.
-    pub fn stop(self) {
+    ///
+    /// Does the same work as `Drop`, then `mem::forget`s `self` so `Drop`
+    /// never repeats it — the driver handle must be closed exactly once.
+    pub fn stop(mut self) {
+        self.shutdown_and_close();
+        std::mem::forget(self);
+    }
+
+    /// Shared teardown: signal, unblock `recv`, join the thread, close the
+    /// handle. Idempotent to call at most once per handle — callers
+    /// (`stop`, `Drop::drop`) are responsible for that, since `HANDLE` has no
+    /// "already closed" state of its own to check.
+    fn shutdown_and_close(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         // SAFETY: `self.handle` is a live WinDivert handle (checked at open,
         // closed only below after the capture thread has joined).
@@ -92,12 +111,27 @@ impl CaptureHandle {
         unsafe {
             self.api.shutdown_recv(self.handle);
         }
-        let _ = self.join.join();
-        // SAFETY: the capture thread has exited, so nothing can use the
-        // handle after this point.
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        // SAFETY: the capture thread has exited (or was never spawned with
+        // this handle outstanding), so nothing can use the handle after
+        // this point.
         unsafe {
             self.api.close(self.handle);
         }
+    }
+}
+
+impl Drop for CaptureHandle {
+    /// Runs `WinDivertShutdown`/join/`WinDivertClose` if the handle is
+    /// dropped without an explicit `stop()` — e.g. an unwind out of
+    /// `eframe::run_native` — so the driver handle and capture thread are
+    /// never leaked until process exit. `stop()` performs this same
+    /// teardown itself and then `mem::forget`s `self`, so this never runs a
+    /// second time for a handle that was `stop()`-ed.
+    fn drop(&mut self) {
+        self.shutdown_and_close();
     }
 }
 
@@ -124,7 +158,7 @@ pub fn start_capture(tx: Sender<ProtocolEvent>) -> Result<CaptureHandle, Capture
         restart,
         handle,
         api,
-        join,
+        join: Some(join),
     })
 }
 
@@ -190,9 +224,11 @@ fn recv_loop(
                     );
                     break;
                 }
-                thread::sleep(
-                    (RECV_ERROR_BACKOFF * consecutive_errors).min(MAX_RECV_ERROR_BACKOFF),
-                );
+                thread::sleep(recv_error_backoff(
+                    consecutive_errors,
+                    RECV_ERROR_BACKOFF,
+                    MAX_RECV_ERROR_BACKOFF,
+                ));
                 continue;
             }
         };
@@ -217,7 +253,17 @@ fn recv_loop(
         let payload = tcp.payload();
         let seq = tcp.sequence_number();
 
-        match classify_connection(&conn, known_server.as_ref()) {
+        let role = classify_connection(&conn, known_server.as_ref());
+        // A FIN or RST on either direction of the tracked flow means it is
+        // tearing down naturally. Clearing `known_server` here (rather than
+        // only on an explicit `request_restart`) lets the subnet-reconnect
+        // fallback re-arm on its own for the connection that replaces it —
+        // otherwise only a user-initiated restart ever re-enables it.
+        if is_teardown_of_known(role, tcp.fin(), tcp.rst()) {
+            known_server = None;
+        }
+
+        match role {
             // The client→server half of the adopted connection: recognized,
             // so detection/adoption does not ping-pong on it, but its bytes
             // belong to that direction's own sequence space and must never

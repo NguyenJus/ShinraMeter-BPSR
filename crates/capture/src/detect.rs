@@ -181,6 +181,41 @@ pub fn subnet_adoption_eligible(conn: &Conn, payload: &[u8], known_subnet: [u8; 
     !payload.is_empty() && !is_private(conn.src) && [conn.src[0], conn.src[1]] == known_subnet
 }
 
+/// Whether the signature-scan paths (`looks_like_game_server`,
+/// `is_login_return`) may treat `conn` as a candidate server connection.
+///
+/// A blanket non-RFC1918 source guard would reject legitimate LAN- or
+/// proxy-hosted servers, so this keys off the one address the process can
+/// ever be sure about instead: its own. Once any connection has been
+/// adopted, [`ServerDetector`] remembers that connection's client-side
+/// address (`local_endpoint`) for the rest of the session — it does not
+/// change just because the server connection is later torn down and
+/// re-detected. A payload whose *source* is that address is client→server
+/// traffic, not a server response, no matter what its bytes happen to look
+/// like (e.g. the client echoing signature-shaped bytes back); adopting it
+/// would reverse the tracked direction and blind capture until restart.
+///
+/// Before any connection has ever been adopted, `local_endpoint` is `None`
+/// and this always allows the match — there is nothing yet to compare
+/// against, and the signature bytes are still the primary evidence.
+fn signature_direction_ok(conn: &Conn, local_endpoint: Option<[u8; 4]>) -> bool {
+    local_endpoint != Some(conn.src)
+}
+
+/// Whether a packet with `role` relative to the currently adopted server
+/// connection, carrying `fin`/`rst`, marks that connection's natural
+/// teardown.
+///
+/// Only [`ConnStreamRole::Adopted`] and [`ConnStreamRole::Reverse`] belong to
+/// the tracked flow at all (`Unrelated` is a different connection
+/// entirely — its FIN/RST says nothing about the one being tracked). A FIN or
+/// RST from either direction of that flow means it is ending; the caller
+/// must clear its `known_server` so the subnet-reconnect fallback can re-arm
+/// instead of waiting on an explicit restart.
+pub fn is_teardown_of_known(role: ConnStreamRole, fin: bool, rst: bool) -> bool {
+    matches!(role, ConnStreamRole::Adopted | ConnStreamRole::Reverse) && (fin || rst)
+}
+
 /// Tracks the game-server detection state that outlives a single packet: the
 /// /16 subnet the server was last seen in, and which connections inside that
 /// subnet have already been tried by the reconnect path.
@@ -192,6 +227,11 @@ pub fn subnet_adoption_eligible(conn: &Conn, payload: &[u8], known_subnet: [u8; 
 pub struct ServerDetector {
     known_subnet: Option<[u8; 2]>,
     subnet_candidates: HashSet<Conn>,
+    /// The client-side address (`dst` of the last adopted server→client
+    /// tuple), learned once any connection is adopted and kept across
+    /// `known_server` clears (a reconnect must not forget its own address).
+    /// Only [`Self::reset`] forgets it. See [`signature_direction_ok`].
+    local_endpoint: Option<[u8; 4]>,
 }
 
 impl ServerDetector {
@@ -210,6 +250,7 @@ impl ServerDetector {
     pub fn reset(&mut self) {
         self.known_subnet = None;
         self.subnet_candidates.clear();
+        self.local_endpoint = None;
     }
 
     /// Game-server detection per §0.7: payload signature scan, then the
@@ -226,7 +267,9 @@ impl ServerDetector {
     ///
     /// A `true` result must be followed by [`Self::adopt`].
     pub fn detects(&mut self, conn: &Conn, payload: &[u8], server_adopted: bool) -> bool {
-        if looks_like_game_server(payload) || is_login_return(payload) {
+        if signature_direction_ok(conn, self.local_endpoint)
+            && (looks_like_game_server(payload) || is_login_return(payload))
+        {
             return true;
         }
 
@@ -250,6 +293,7 @@ impl ServerDetector {
 
     /// Records `conn` as the adopted server connection.
     pub fn adopt(&mut self, conn: &Conn) {
+        self.local_endpoint = Some(conn.dst);
         let prefix = subnet_prefix(conn);
         // Candidates are keyed by connection alone, so they only mean
         // anything relative to the subnet they were gathered in: on a move to
@@ -603,5 +647,101 @@ mod tests {
         let candidate = server_to_client([203, 0, 113, 200], 6000);
         assert!(!d.detects(&candidate, b"payload", true));
         assert!(d.detects(&candidate, b"payload", false));
+    }
+
+    // --- signature-path direction guard (issue #1, item 1) ---
+
+    #[test]
+    fn signature_direction_ok_rejects_known_local_source() {
+        let local = [192, 168, 1, 50];
+        let candidate = client_to_server([1, 2, 3, 4], 80); // src == local
+        assert!(!signature_direction_ok(&candidate, Some(local)));
+    }
+
+    #[test]
+    fn signature_direction_ok_allows_when_local_endpoint_unknown() {
+        let candidate = client_to_server([1, 2, 3, 4], 80);
+        assert!(signature_direction_ok(&candidate, None));
+    }
+
+    #[test]
+    fn signature_direction_ok_allows_a_different_source() {
+        let local = [192, 168, 1, 50];
+        let candidate = server_to_client([1, 2, 3, 4], 100); // src != local
+        assert!(signature_direction_ok(&candidate, Some(local)));
+    }
+
+    #[test]
+    fn detects_rejects_a_signature_match_sourced_from_the_known_local_endpoint() {
+        // Once a server connection has been adopted, the client's own IP is
+        // known. A later packet whose *source* is that same IP can never be
+        // a real server response, even if its payload coincidentally
+        // matches the signature (e.g. the client echoing bytes back) --
+        // adopting it would reverse the tracked direction and blind capture
+        // until restart.
+        let mut d = ServerDetector::new();
+        d.adopt(&server_to_client([203, 0, 113, 7], 5000)); // dst = 192.168.1.50 (client)
+
+        let frag = frag_with_signature_at(SERVER_SIGNATURE_OFFSET);
+        let payload = payload_with_frag(&frag);
+        let bogus = Conn {
+            src: [192, 168, 1, 50],
+            src_port: 9999,
+            dst: [1, 2, 3, 4],
+            dst_port: 80,
+        };
+        assert!(!d.detects(&bogus, &payload, false));
+    }
+
+    #[test]
+    fn detects_accepts_a_signature_match_before_any_local_endpoint_is_known() {
+        let mut d = ServerDetector::new();
+        let frag = frag_with_signature_at(SERVER_SIGNATURE_OFFSET);
+        let payload = payload_with_frag(&frag);
+        assert!(d.detects(&server_to_client([203, 0, 113, 7], 5000), &payload, false));
+    }
+
+    #[test]
+    fn reset_forgets_the_learned_local_endpoint() {
+        let mut d = ServerDetector::new();
+        d.adopt(&server_to_client([203, 0, 113, 7], 5000));
+        d.reset();
+
+        let frag = frag_with_signature_at(SERVER_SIGNATURE_OFFSET);
+        let payload = payload_with_frag(&frag);
+        let bogus = Conn {
+            src: [192, 168, 1, 50],
+            src_port: 9999,
+            dst: [1, 2, 3, 4],
+            dst_port: 80,
+        };
+        assert!(d.detects(&bogus, &payload, false));
+    }
+
+    // --- FIN/RST teardown detection (issue #1, item 2) ---
+
+    #[test]
+    fn fin_on_the_adopted_connection_is_a_teardown() {
+        assert!(is_teardown_of_known(ConnStreamRole::Adopted, true, false));
+    }
+
+    #[test]
+    fn rst_on_the_adopted_connection_is_a_teardown() {
+        assert!(is_teardown_of_known(ConnStreamRole::Adopted, false, true));
+    }
+
+    #[test]
+    fn fin_on_the_reverse_direction_is_a_teardown() {
+        assert!(is_teardown_of_known(ConnStreamRole::Reverse, true, false));
+    }
+
+    #[test]
+    fn adopted_connection_without_fin_or_rst_is_not_a_teardown() {
+        assert!(!is_teardown_of_known(ConnStreamRole::Adopted, false, false));
+    }
+
+    #[test]
+    fn fin_on_an_unrelated_connection_is_not_a_teardown() {
+        assert!(!is_teardown_of_known(ConnStreamRole::Unrelated, true, true));
     }
 }
