@@ -136,6 +136,15 @@ fn draw_header(
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             // Plain ASCII, covered by every vendored font (issue #14).
+            //
+            // There's no tray icon and no other in-app restore path: this
+            // relies entirely on the OS taskbar entry to un-minimize.
+            // `viewport()` below never calls `.with_taskbar(false)` (which
+            // is what would hide it via `skip_taskbar`), so the window
+            // keeps the default winit/OS taskbar presence even though it's
+            // borderless and always-on-top. If `viewport()` ever gains a
+            // taskbar-hiding or tool-window setting, this button needs a
+            // real restore mechanism first.
             if ui.button("_").clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
@@ -230,22 +239,39 @@ fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot) {
 }
 
 /// One column in the stats row (issue #8). `width` is the fixed on-screen
-/// space, in points, reserved for the column's right-aligned text —
-/// including the gap to the next column to its right — so a digit-count
-/// change in the painted text never shifts the column's anchor point.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// space, in points, that this column reserves to its own *left*: per
+/// `column_anchors`, the gap between the previous column's anchor and this
+/// column's anchor equals this column's width (see
+/// `column_anchors_spacing_matches_column_widths_when_room_allows`). A
+/// digit-count change in the painted text therefore never shifts any
+/// column's anchor point. `text` renders this column's value for a given
+/// row, so a column's width and its formatter travel together.
+#[derive(Debug, Clone, Copy)]
 pub struct StatColumn {
     pub width: f32,
+    pub text: fn(&PlayerRow) -> String,
 }
 
 /// The stats-row columns, left to right. Issue #13 will append crit% /
-/// lucky% / hits here — new columns just extend this array in the desired
-/// left-to-right order; `column_anchors` and `draw_row`'s zip need no
-/// further changes.
+/// lucky% / hits here — new columns just extend this array with a width and
+/// a `text` formatter in the desired left-to-right order. `column_anchors`
+/// produces exactly one anchor per entry in `columns`, and `draw_row` zips
+/// those anchors against this same array (not a separately-sized literal),
+/// so an added column always gets both a placed anchor and rendered text —
+/// there is no way to add a column here without wiring up its rendering.
 pub const STAT_COLUMNS: [StatColumn; 3] = [
-    StatColumn { width: 56.0 }, // damage
-    StatColumn { width: 56.0 }, // dps
-    StatColumn { width: 44.0 }, // share%
+    StatColumn {
+        width: 56.0,
+        text: |row| fmt_short(row.damage),
+    }, // damage: budgeted for its ≤6-char max, e.g. "999.9K"
+    StatColumn {
+        width: 76.0,
+        text: |row| format!("{}/s", fmt_short(row.dps as i64)),
+    }, // dps: fmt_short's ≤6 chars plus the 2-char "/s" suffix = ≤8 chars
+    StatColumn {
+        width: 56.0,
+        text: |row| fmt_share(row.share_pct),
+    }, // share%: same ≤6-char max as damage (e.g. "100.0%"), same width
 ];
 
 /// Computes each column's right-aligned text anchor (an x coordinate, for
@@ -312,14 +338,13 @@ fn draw_row(ui: &mut egui::Ui, row: &PlayerRow) {
 
     // Each stat gets its own fixed-width column (issue #8) so a
     // digit-count change (e.g. `9.9K` -> `10.1K`) shifts only that
-    // column's text, never the column's anchor point.
+    // column's text, never the column's anchor point. Anchors and text are
+    // both derived from `STAT_COLUMNS`, so the two can never drift apart in
+    // length (issue #8 review): `column_anchors` yields exactly one anchor
+    // per `STAT_COLUMNS` entry, and each entry supplies its own formatter.
     let anchors = column_anchors(rect.left(), rect.right(), &STAT_COLUMNS, 4.0);
-    let column_text = [
-        fmt_short(row.damage),
-        format!("{}/s", fmt_short(row.dps as i64)),
-        fmt_share(row.share_pct),
-    ];
-    for (anchor_x, text) in anchors.into_iter().zip(column_text) {
+    for (anchor_x, column) in anchors.into_iter().zip(STAT_COLUMNS) {
+        let text = (column.text)(row);
         ui.painter().text(
             egui::pos2(anchor_x, rect.center().y),
             egui::Align2::RIGHT_CENTER,
@@ -594,5 +619,53 @@ mod tests {
         let a = column_anchors(0.0, 300.0, &STAT_COLUMNS, 4.0);
         let b = column_anchors(50.0, 300.0, &STAT_COLUMNS, 4.0);
         assert_eq!(a, b);
+    }
+
+    /// The geometry tests above only check anchor placement; none of them
+    /// confirm the *painted text* actually fits inside its column's width
+    /// budget. This measures each column's widest plausible formatted
+    /// output with the same font `draw_row` paints with
+    /// (`FontId::monospace(13.0)`) and asserts it fits inside
+    /// `STAT_COLUMNS[i].width`. Pre-fix, the dps column reused the damage
+    /// column's 56.0-wide budget even though its text carries a 2-char
+    /// "/s" suffix on top of `fmt_short`'s ~6-char max — this test fails
+    /// against that width.
+    #[test]
+    fn widest_formatted_text_fits_its_column_width_budget() {
+        let ctx = egui::Context::default();
+        // Load the real (non-empty) default fonts, so glyph metrics match
+        // what `draw_row` actually paints with, then discard the resulting
+        // font-atlas texture upload — nothing is painted in this test.
+        ctx.run_ui(egui::RawInput::default(), |_ui| {})
+            .drop_without_applying_deltas();
+
+        // Widest plausible text per column, matching `STAT_COLUMNS`'s
+        // left-to-right order (damage, dps, share%).
+        let widest_damage = fmt_short(999_949); // "999.9K"
+        let widest_dps = format!("{}/s", fmt_short(999_949)); // "999.9K/s"
+        let widest_share = fmt_share(100.0); // "100.0%"
+        assert_eq!(widest_damage, "999.9K");
+        assert_eq!(widest_dps, "999.9K/s");
+        assert_eq!(widest_share, "100.0%");
+
+        for (text, column) in [widest_damage, widest_dps, widest_share]
+            .into_iter()
+            .zip(STAT_COLUMNS)
+        {
+            let text_width = ctx.fonts_mut(|f| {
+                f.layout_no_wrap(
+                    text.clone(),
+                    egui::FontId::monospace(13.0),
+                    egui::Color32::WHITE,
+                )
+                .rect
+                .width()
+            });
+            assert!(
+                text_width <= column.width,
+                "{text:?} is {text_width}pt wide, wider than its {}pt column budget",
+                column.width
+            );
+        }
     }
 }
