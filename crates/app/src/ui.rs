@@ -145,10 +145,8 @@ const RESIZE_CORNER: f32 = 14.0;
 
 /// The eight grab zones around a window rect, edges first so the corners
 /// registered after them win where the two overlap.
-fn resize_zones(
-    rect: egui::Rect,
-) -> [(egui::Rect, egui::ResizeDirection, egui::CursorIcon); 8] {
-    use egui::{pos2, CursorIcon as Cursor, Rect, ResizeDirection as Dir};
+fn resize_zones(rect: egui::Rect) -> [(egui::Rect, egui::ResizeDirection, egui::CursorIcon); 8] {
+    use egui::{CursorIcon as Cursor, Rect, ResizeDirection as Dir, pos2};
 
     let (l, t, r, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
     let (e, c) = (RESIZE_EDGE, RESIZE_CORNER);
@@ -392,7 +390,10 @@ mod tests {
 
     #[test]
     fn resize_zones_cover_every_direction() {
-        let dirs: Vec<_> = resize_zones(window()).map(|(_, d, _)| d).into_iter().collect();
+        let dirs: Vec<_> = resize_zones(window())
+            .map(|(_, d, _)| d)
+            .into_iter()
+            .collect();
         assert_eq!(dirs.len(), 8);
         for dir in [
             egui::ResizeDirection::North,
