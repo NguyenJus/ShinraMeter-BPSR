@@ -734,6 +734,7 @@ mod tests {
             crit_pct: 100.0,
             lucky_pct: 100.0,
             hits: 999_949,
+            ability_score: Some(999_949),
         };
 
         for (kind, column) in ColumnKind::ALL
