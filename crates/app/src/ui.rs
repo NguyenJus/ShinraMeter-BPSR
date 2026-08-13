@@ -127,9 +127,17 @@ fn draw_header(
         ui.label(format!("{} DPS", fmt_short(snapshot.total_dps as i64)));
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("✕").clicked() {
+            // U+2715 (✕) isn't covered by any vendored `epaint_default_fonts`
+            // TTF and rendered as a tofu square (issue #14). U+00D7 (×) is
+            // covered by the default proportional font (Ubuntu-Light /
+            // Hack-Regular), which is what this button actually uses.
+            if ui.button("×").clicked() {
                 let _ = tx_command.try_send(UiCommand::Quit);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            // Plain ASCII, covered by every vendored font (issue #14).
+            if ui.button("_").clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
             if ui.button("Reset").clicked() {
                 let _ = tx_command.try_send(UiCommand::Reset);
@@ -221,6 +229,64 @@ fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot) {
     }
 }
 
+/// One column in the stats row (issue #8). `width` is the fixed on-screen
+/// space, in points, reserved for the column's right-aligned text —
+/// including the gap to the next column to its right — so a digit-count
+/// change in the painted text never shifts the column's anchor point.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StatColumn {
+    pub width: f32,
+}
+
+/// The stats-row columns, left to right. Issue #13 will append crit% /
+/// lucky% / hits here — new columns just extend this array in the desired
+/// left-to-right order; `column_anchors` and `draw_row`'s zip need no
+/// further changes.
+pub const STAT_COLUMNS: [StatColumn; 3] = [
+    StatColumn { width: 56.0 }, // damage
+    StatColumn { width: 56.0 }, // dps
+    StatColumn { width: 44.0 }, // share%
+];
+
+/// Computes each column's right-aligned text anchor (an x coordinate, for
+/// use with `Align2::RIGHT_CENTER`), given the row rect's left/right edges,
+/// the column specs (left-to-right), and the margin from the rect's right
+/// edge to the rightmost column's anchor.
+///
+/// Anchors are placed right-to-left starting at `rect_right - margin`, each
+/// preceding column offset left by the next column's width. This is a pure
+/// function of the rect and column specs — it never sees the text that will
+/// be painted — so a column's anchor is stable regardless of how many
+/// digits its number has.
+///
+/// When the available width (`rect_right - rect_left - margin`) is less
+/// than the columns' combined width, every column width is scaled down
+/// proportionally so the columns still fit rather than spilling past the
+/// rect's left edge — graceful degradation for a narrow window.
+pub fn column_anchors(
+    rect_left: f32,
+    rect_right: f32,
+    columns: &[StatColumn],
+    margin: f32,
+) -> Vec<f32> {
+    let total_width: f32 = columns.iter().map(|c| c.width).sum();
+    let available = (rect_right - rect_left - margin).max(0.0);
+    let scale = if total_width > available && total_width > 0.0 {
+        available / total_width
+    } else {
+        1.0
+    };
+
+    let mut anchors = Vec::with_capacity(columns.len());
+    let mut x = rect_right - margin;
+    for col in columns.iter().rev() {
+        anchors.push(x);
+        x -= col.width * scale;
+    }
+    anchors.reverse();
+    anchors
+}
+
 fn draw_row(ui: &mut egui::Ui, row: &PlayerRow) {
     let desired_size = egui::vec2(ui.available_width(), 20.0);
     let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
@@ -244,19 +310,24 @@ fn draw_row(ui: &mut egui::Ui, row: &PlayerRow) {
         egui::Color32::WHITE,
     );
 
-    let stats_text = format!(
-        "{}  {}/s  {}",
+    // Each stat gets its own fixed-width column (issue #8) so a
+    // digit-count change (e.g. `9.9K` -> `10.1K`) shifts only that
+    // column's text, never the column's anchor point.
+    let anchors = column_anchors(rect.left(), rect.right(), &STAT_COLUMNS, 4.0);
+    let column_text = [
         fmt_short(row.damage),
-        fmt_short(row.dps as i64),
-        fmt_share(row.share_pct)
-    );
-    ui.painter().text(
-        rect.right_center() - egui::vec2(4.0, 0.0),
-        egui::Align2::RIGHT_CENTER,
-        stats_text,
-        egui::FontId::monospace(13.0),
-        egui::Color32::WHITE,
-    );
+        format!("{}/s", fmt_short(row.dps as i64)),
+        fmt_share(row.share_pct),
+    ];
+    for (anchor_x, text) in anchors.into_iter().zip(column_text) {
+        ui.painter().text(
+            egui::pos2(anchor_x, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            text,
+            egui::FontId::monospace(13.0),
+            egui::Color32::WHITE,
+        );
+    }
 }
 
 /// `bpsr_meter` already fills unknown names with `Player {uid}`; this is a
@@ -457,5 +528,71 @@ mod tests {
         let (north, ..) = resize_zones(win)[0];
         assert_eq!(north.height(), RESIZE_EDGE);
         assert_eq!(north.top(), win.top());
+    }
+
+    // -- column_anchors (issue #8) --------------------------------------
+
+    /// The anchor for a column never depends on what text will be painted
+    /// into it — only on the row rect and the column specs — so a
+    /// digit-count change in the text can never shift it. Calling the
+    /// function twice with identical inputs (standing in for "row before"
+    /// vs. "row after" a digit-count change) must yield identical anchors.
+    #[test]
+    fn column_anchors_are_stable_across_repeated_calls() {
+        let first = column_anchors(0.0, 300.0, &STAT_COLUMNS, 4.0);
+        let second = column_anchors(0.0, 300.0, &STAT_COLUMNS, 4.0);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn column_anchors_rightmost_column_sits_margin_from_right_edge() {
+        let anchors = column_anchors(0.0, 300.0, &STAT_COLUMNS, 4.0);
+        let last = *anchors.last().unwrap();
+        assert_eq!(last, 300.0 - 4.0);
+    }
+
+    #[test]
+    fn column_anchors_are_ordered_left_to_right() {
+        let anchors = column_anchors(0.0, 300.0, &STAT_COLUMNS, 4.0);
+        for pair in anchors.windows(2) {
+            assert!(pair[0] < pair[1], "anchors must increase left-to-right");
+        }
+    }
+
+    #[test]
+    fn column_anchors_spacing_matches_column_widths_when_room_allows() {
+        let anchors = column_anchors(0.0, 300.0, &STAT_COLUMNS, 4.0);
+        // Ample room: no scaling, so consecutive anchors are exactly one
+        // column-width apart (the earlier column's own width).
+        for i in 0..STAT_COLUMNS.len() - 1 {
+            let gap = anchors[i + 1] - anchors[i];
+            assert_eq!(gap, STAT_COLUMNS[i + 1].width);
+        }
+    }
+
+    #[test]
+    fn column_anchors_degrade_gracefully_in_a_narrow_window() {
+        // Total column width plus margin exceeds the available rect, so the
+        // columns must shrink to fit rather than spilling past the left
+        // edge indefinitely.
+        let total: f32 = STAT_COLUMNS.iter().map(|c| c.width).sum();
+        let narrow_right = total * 0.5;
+        let anchors = column_anchors(0.0, narrow_right, &STAT_COLUMNS, 4.0);
+        assert!(*anchors.first().unwrap() >= 0.0);
+        // Still ordered and still anchored to the right edge.
+        for pair in anchors.windows(2) {
+            assert!(pair[0] < pair[1]);
+        }
+        assert_eq!(*anchors.last().unwrap(), narrow_right - 4.0);
+    }
+
+    #[test]
+    fn column_anchors_unaffected_by_rect_left_when_room_allows() {
+        // Anchors are computed from the right edge; moving the rect's left
+        // edge around (without shrinking available width below the column
+        // total) must not move them.
+        let a = column_anchors(0.0, 300.0, &STAT_COLUMNS, 4.0);
+        let b = column_anchors(50.0, 300.0, &STAT_COLUMNS, 4.0);
+        assert_eq!(a, b);
     }
 }
