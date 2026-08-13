@@ -3040,6 +3040,8 @@ dependencies = [
  "env_logger",
  "log",
  "raw-window-handle",
+ "serde",
+ "serde_json",
  "windows 0.48.0",
 ]
 
