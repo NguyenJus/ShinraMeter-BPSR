@@ -4,3 +4,4 @@ Cargo.lock.orig
 *.pcapng
 docs/specs/
 docs/plans/
+/dist
