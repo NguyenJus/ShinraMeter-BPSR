@@ -546,6 +546,7 @@ mod tests {
                 uid: 1,
                 name: Some("Foo".to_string()),
                 class: None,
+                ability_score: None,
             }));
 
             assert!(!path.exists());
