@@ -168,7 +168,7 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
         .as_ref()
         .map(|p| Class::from(p.cur_profession_id));
     let ability_score = if char_base.fight_point > 0 {
-        Some(char_base.fight_point as u32)
+        u32::try_from(char_base.fight_point).ok()
     } else {
         None
     };

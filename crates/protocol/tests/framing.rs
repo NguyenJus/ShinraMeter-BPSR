@@ -171,6 +171,7 @@ fn container_data_zero_fight_point_is_no_ability_score() {
 
     let mut decoder = Decoder::new();
     let events = decoder.push_stream(&stream, 5);
+    assert_eq!(events.len(), 1);
     match &events[0] {
         ProtocolEvent::Player(p) => assert_eq!(p.ability_score, None),
         other => panic!("expected Player, got {other:?}"),

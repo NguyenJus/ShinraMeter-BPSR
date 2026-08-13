@@ -38,6 +38,12 @@ pub fn decode_varint_i32(raw: &[u8]) -> Option<i32> {
     decode_varint_u64(raw).and_then(|v| i32::try_from(v).ok())
 }
 
+/// protobuf varint → `u32`; `None` on empty/malformed input or a value
+/// outside `u32` range (truncating it would yield a plausible-but-wrong id).
+pub fn decode_varint_u32(raw: &[u8]) -> Option<u32> {
+    decode_varint_u64(raw).and_then(|v| u32::try_from(v).ok())
+}
+
 /// `raw_data` for a name attr is the string bytes behind a protobuf varint
 /// length prefix. When that prefix is self-consistent it is honoured (so a
 /// 128+ byte name, whose prefix is two bytes, keeps no stray byte); otherwise
@@ -86,9 +92,11 @@ pub fn player_info_from_attrs(uid: i64, attrs: &[pb::Attr]) -> PlayerInfo {
                 }
             }
             attr_id::FIGHT_POINT => {
-                if let Some(v) =
-                    decode_varint_u64(&attr.raw_data).and_then(|v| u32::try_from(v).ok())
-                {
+                // A raw value of 0 is the wire default when the server hasn't
+                // populated the field, not a real ability score — treat it as
+                // absent, matching `SyncContainerData`'s `char_base.fight_point
+                // > 0` guard in decode.rs.
+                if let Some(v) = decode_varint_u32(&attr.raw_data).filter(|&v| v > 0) {
                     ability_score = Some(v);
                 }
             }
@@ -126,9 +134,7 @@ pub fn enemy_hp_from_attrs(uid: i64, attrs: &[pb::Attr], now_ms: u64) -> EnemyHp
                 }
             }
             attr_id::MONSTER_ID => {
-                if let Some(v) =
-                    decode_varint_u64(&attr.raw_data).and_then(|v| u32::try_from(v).ok())
-                {
+                if let Some(v) = decode_varint_u32(&attr.raw_data) {
                     monster_id = Some(v);
                 }
             }
@@ -247,6 +253,15 @@ mod tests {
             player_info_from_attrs(1, &attrs).ability_score,
             Some(123_456)
         );
+    }
+
+    #[test]
+    fn zero_fight_point_yields_no_ability_score() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::FIGHT_POINT,
+            raw_data: varint(0),
+        }];
+        assert_eq!(player_info_from_attrs(1, &attrs).ability_score, None);
     }
 
     #[test]
