@@ -58,6 +58,7 @@ fn main() -> eframe::Result {
     };
 
     let (rx_snapshot, pipeline_thread) = pipeline::spawn(rx_events, rx_command, names_cache_path());
+    let (tx_settings, settings_thread) = settings::spawn_writer();
 
     // Kept alongside the clone handed to `OverlayApp` so shutdown can signal
     // the pipeline explicitly below, rather than depending on `run_native`
@@ -78,7 +79,7 @@ fn main() -> eframe::Result {
             ui::apply_theme(&cc.egui_ctx);
             platform::disable_aero_snap(cc);
             Ok(Box::new(
-                OverlayApp::new(rx_snapshot, tx_command).with_status(status),
+                OverlayApp::new(rx_snapshot, tx_command, tx_settings).with_status(status),
             ))
         }),
     );
@@ -94,6 +95,11 @@ fn main() -> eframe::Result {
     }
     let _ = tx_command_shutdown.try_send(UiCommand::Quit);
     let _ = pipeline_thread.join();
+    // `OverlayApp` (and its `tx_settings`) is dropped by the time
+    // `run_native` returns, which closes the settings-writer's channel and
+    // lets its thread exit; joining here just makes sure the last-sent
+    // settings value has finished being persisted before the process ends.
+    let _ = settings_thread.join();
 
     result
 }

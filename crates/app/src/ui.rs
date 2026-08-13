@@ -35,10 +35,15 @@ pub struct OverlayApp {
     settings: Settings,
     rx_snapshot: Receiver<Snapshot>,
     tx_command: Sender<UiCommand>,
+    tx_settings: Sender<Settings>,
 }
 
 impl OverlayApp {
-    pub fn new(rx_snapshot: Receiver<Snapshot>, tx_command: Sender<UiCommand>) -> Self {
+    pub fn new(
+        rx_snapshot: Receiver<Snapshot>,
+        tx_command: Sender<UiCommand>,
+        tx_settings: Sender<Settings>,
+    ) -> Self {
         Self {
             snapshot: Snapshot {
                 duration_ms: 0,
@@ -50,6 +55,7 @@ impl OverlayApp {
             settings: settings::load(),
             rx_snapshot,
             tx_command,
+            tx_settings,
         }
     }
 
@@ -87,6 +93,7 @@ impl eframe::App for OverlayApp {
                     &self.snapshot,
                     &self.tx_command,
                     &mut self.settings,
+                    &self.tx_settings,
                 );
 
                 if let StatusLine::Error(msg) = &self.status {
@@ -108,6 +115,7 @@ fn draw_header(
     snapshot: &Snapshot,
     tx_command: &Sender<UiCommand>,
     settings: &mut Settings,
+    tx_settings: &Sender<Settings>,
 ) {
     // The whole header band is the drag surface, registered *before* the row's
     // contents so the buttons drawn into it end up on top and still get their
@@ -164,7 +172,7 @@ fn draw_header(
             }
             // Plain ASCII, covered by every vendored font (issue #14) —
             // the gear glyph (U+2699) isn't in either bundled TTF.
-            draw_settings_menu(ui, settings);
+            draw_settings_menu(ui, settings, tx_settings);
         });
     });
 }
@@ -172,7 +180,7 @@ fn draw_header(
 /// The settings menu: a compact dropdown (egui's `menu_button`, so it needs
 /// no extra open/closed state of its own) letting the user toggle which
 /// stat columns render (issue #13).
-fn draw_settings_menu(ui: &mut egui::Ui, settings: &mut Settings) {
+fn draw_settings_menu(ui: &mut egui::Ui, settings: &mut Settings, tx_settings: &Sender<Settings>) {
     ui.menu_button("S", |ui| {
         ui.label("Columns");
         let mut changed = false;
@@ -194,7 +202,14 @@ fn draw_settings_menu(ui: &mut egui::Ui, settings: &mut Settings) {
             }
         }
         if changed {
-            settings::save(settings);
+            // Persisting is blocking file IO (`fs::write` + `fs::rename`),
+            // so it must not run on this render thread — hand the new
+            // value to the dedicated settings-writer thread instead, same
+            // as `pipeline::spawn` owns the meter off this thread. A
+            // disconnected receiver (writer thread gone) is not fatal:
+            // the in-memory `settings` the UI already mutated stays
+            // correct for the rest of this session.
+            let _ = tx_settings.send(settings.clone());
         }
     });
 }
@@ -277,8 +292,15 @@ fn draw_resize_handles(ui: &mut egui::Ui, ctx: &egui::Context) {
 }
 
 fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot, columns: &[ColumnKind]) {
+    // The enabled-column set (and therefore the column widths and their
+    // anchors) is identical for every row in a frame, so both are computed
+    // once here rather than once per row inside `draw_row`.
+    let stat_columns = stat_columns_for(columns);
+    let avail = ui.available_rect_before_wrap();
+    let anchors = column_anchors(avail.left(), avail.right(), &stat_columns, 4.0);
+
     for row in &snapshot.rows {
-        draw_row(ui, row, columns);
+        draw_row(ui, row, &stat_columns, &anchors);
     }
 }
 
@@ -348,7 +370,7 @@ pub fn column_anchors(
     anchors
 }
 
-fn draw_row(ui: &mut egui::Ui, row: &PlayerRow, columns: &[ColumnKind]) {
+fn draw_row(ui: &mut egui::Ui, row: &PlayerRow, columns: &[StatColumn], anchors: &[f32]) {
     let desired_size = egui::vec2(ui.available_width(), 20.0);
     let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
 
@@ -374,17 +396,17 @@ fn draw_row(ui: &mut egui::Ui, row: &PlayerRow, columns: &[ColumnKind]) {
     // Each stat gets its own fixed-width column (issue #8) so a
     // digit-count change (e.g. `9.9K` -> `10.1K`) shifts only that
     // column's text, never the column's anchor point. Which columns
-    // appear, and in what order, comes from the user's settings (#13);
-    // anchors and text are both derived from that same built column slice,
-    // so the two can never drift apart in length (issue #8 review):
+    // appear, and in what order, comes from the user's settings (#13).
+    // Widths and anchors are row-invariant within a frame, so the caller
+    // (`draw_rows`) builds the column slice and its anchors once and hands
+    // both down. Anchors and text still come from that one slice, so the
+    // two can never drift apart in length (issue #8 review):
     // `column_anchors` yields exactly one anchor per `StatColumn`, and each
     // `StatColumn` carries its own formatter.
-    let stat_columns = stat_columns_for(columns);
-    let anchors = column_anchors(rect.left(), rect.right(), &stat_columns, 4.0);
-    for (anchor_x, column) in anchors.into_iter().zip(&stat_columns) {
+    for (anchor_x, column) in anchors.iter().zip(columns) {
         let text = (column.text)(row);
         ui.painter().text(
-            egui::pos2(anchor_x, rect.center().y),
+            egui::pos2(*anchor_x, rect.center().y),
             egui::Align2::RIGHT_CENTER,
             text,
             egui::FontId::monospace(13.0),

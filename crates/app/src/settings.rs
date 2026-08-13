@@ -5,7 +5,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread::JoinHandle;
 
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use serde::{Deserialize, Serialize};
 
 use crate::ui::{StatColumn, fmt_share, fmt_short};
@@ -79,9 +81,15 @@ impl ColumnKind {
                 width: 56.0,
                 text: |row| fmt_share(row.lucky_pct),
             },
+            // `fmt_short` bounds this to ~6 chars regardless of how many
+            // hits land, so it shares `Damage`/`Dps`'s width instead of
+            // growing without limit like a raw `to_string()` would (it
+            // could otherwise overflow this column's fixed-width slot into
+            // its neighbor's, since `draw_row`'s painter text is
+            // unclipped).
             ColumnKind::Hits => StatColumn {
                 width: 56.0,
-                text: |row| row.hits.to_string(),
+                text: |row| fmt_short(row.hits as i64),
             },
         }
     }
@@ -173,6 +181,45 @@ pub fn save(settings: &Settings) {
     match settings_path() {
         Some(path) => save_to(&path, settings),
         None => log::warn!("APPDATA not set; settings not persisted"),
+    }
+}
+
+/// Spawns the dedicated settings-writer thread: it owns the settings file
+/// and is the only place `save` is called from, keeping the blocking
+/// `fs::write` + `fs::rename` off the UI/render thread — the same
+/// channel-owning-thread pattern `pipeline::spawn` uses for the meter.
+///
+/// The UI sends a `Settings` snapshot on every change; the writer coalesces
+/// bursts (e.g. several rapid checkbox toggles) by draining the channel down
+/// to the newest value before persisting, so a flurry of toggles results in
+/// one save of the final state rather than one save per toggle.
+pub fn spawn_writer() -> (Sender<Settings>, JoinHandle<()>) {
+    spawn_writer_with(save)
+}
+
+/// Same as `spawn_writer`, but with the persist step injected — lets tests
+/// observe what the writer thread saves without touching the real
+/// `%APPDATA%` settings file.
+fn spawn_writer_with(
+    persist: impl Fn(&Settings) + Send + 'static,
+) -> (Sender<Settings>, JoinHandle<()>) {
+    let (tx, rx) = unbounded::<Settings>();
+    let handle = std::thread::Builder::new()
+        .name("settings-writer".to_string())
+        .spawn(move || run_writer(rx, persist))
+        .expect("failed to spawn the settings-writer thread");
+    (tx, handle)
+}
+
+/// Blocks on the channel, persisting the newest pending `Settings` each time
+/// it wakes up. Returns (and the thread exits) once every `Sender` is
+/// dropped.
+fn run_writer(rx: Receiver<Settings>, persist: impl Fn(&Settings)) {
+    while let Ok(mut settings) = rx.recv() {
+        for latest in rx.try_iter() {
+            settings = latest;
+        }
+        persist(&settings);
     }
 }
 
@@ -316,6 +363,64 @@ mod tests {
 
         assert_eq!(load_from(&path), Settings::default());
         let _ = fs::remove_file(&path);
+    }
+
+    // -- spawn_writer / run_writer (the settings-writer thread) ----------
+
+    /// Sending one `Settings` value results in exactly one persist call
+    /// with that value — the basic wiring works.
+    #[test]
+    fn writer_persists_a_sent_settings_value() {
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<Settings>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let (tx, handle) = spawn_writer_with(move |s| seen_clone.lock().unwrap().push(s.clone()));
+
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::Hits);
+        tx.send(settings.clone()).expect("writer thread is alive");
+
+        drop(tx);
+        handle.join().expect("writer thread should not panic");
+
+        assert_eq!(*seen.lock().unwrap(), vec![settings]);
+    }
+
+    /// A burst of sends made faster than the writer can wake up and drain
+    /// must coalesce down to the final value rather than persisting every
+    /// intermediate one.
+    #[test]
+    fn writer_coalesces_a_burst_of_sends_to_the_latest_value() {
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<Settings>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let (tx, handle) = spawn_writer_with(move |s| seen_clone.lock().unwrap().push(s.clone()));
+
+        let mut settings = Settings::default();
+        for col in [ColumnKind::CritPct, ColumnKind::LuckyPct, ColumnKind::Hits] {
+            settings.toggle(col);
+            tx.send(settings.clone()).expect("writer thread is alive");
+        }
+
+        drop(tx);
+        handle.join().expect("writer thread should not panic");
+
+        // The writer may or may not have woken up between individual sends
+        // (that race is exactly what coalescing tolerates), but the very
+        // last thing persisted must be the final settings state, and
+        // nothing after it.
+        assert_eq!(seen.lock().unwrap().last(), Some(&settings));
+    }
+
+    /// Dropping every `Sender` closes the channel and the thread exits
+    /// cleanly instead of blocking forever.
+    #[test]
+    fn writer_thread_exits_once_the_sender_is_dropped() {
+        let (tx, handle) = spawn_writer_with(|_| {});
+        drop(tx);
+        handle.join().expect("writer thread should not panic");
     }
 
     #[test]
