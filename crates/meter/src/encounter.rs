@@ -7,12 +7,29 @@ use crate::event::{Class, DamageEvent, EnemyHp, EntityKind, PlayerInfo, Protocol
 use crate::reset::{EnemyState, ResetConfig, ResetReason, check_hp_rollback};
 use crate::stats::{PlayerRow, PlayerStats, Snapshot};
 
+/// One player-identity cache entry. `seq` is a monotonic touch counter (set
+/// on both read and write) used purely to order entries by recency for
+/// [`Meter::names_for_save`] — it is never persisted itself, only the
+/// resulting order is (see `names_cache::save`'s cap).
+#[derive(Clone, Debug, Default)]
+struct NameEntry {
+    name: Option<String>,
+    class: Option<Class>,
+    seq: u64,
+}
+
 pub struct Meter {
     players: HashMap<i64, PlayerStats>,
     /// Player identity cache, keyed by uid. Never cleared by `reset` — names
     /// often arrive in packets separate from (and out of order relative to)
-    /// damage, so late-named rows must still resolve after a reset.
-    names: HashMap<i64, (Option<String>, Option<Class>)>,
+    /// damage, so late-named rows must still resolve after a reset. Seeded
+    /// at construction time from the on-disk cross-session cache (issue
+    /// #12) via [`Meter::with_names_cache`]; live packet data always wins
+    /// over a seeded value once it arrives (see `name_upsert`).
+    names: HashMap<i64, NameEntry>,
+    /// Monotonic counter bumped on every name-cache touch (read or write);
+    /// backs the recency order returned by [`Meter::names_for_save`].
+    names_seq: u64,
     enemies: HashMap<i64, EnemyState>,
     fight_start_ms: Option<u64>,
     /// Timestamp of the most recent event seen (damage or enemy-hp). Used as
@@ -31,6 +48,7 @@ impl Meter {
         Self {
             players: HashMap::new(),
             names: HashMap::new(),
+            names_seq: 0,
             enemies: HashMap::new(),
             fight_start_ms: None,
             last_event_ms: 0,
@@ -45,6 +63,73 @@ impl Meter {
             reset_cfg: cfg,
             ..Self::new()
         }
+    }
+
+    /// Seeds the name cache from a previously-persisted uid -> (name, class)
+    /// map (issue #12) before any packet has been seen this session, so a
+    /// previously-known player resolves instantly instead of showing
+    /// `Player {uid}` until their first info/damage packet arrives. Live
+    /// packet data received afterwards always takes precedence over a
+    /// seeded value (see `name_upsert`).
+    pub fn with_names_cache(cached: HashMap<i64, (Option<String>, Option<Class>)>) -> Self {
+        let mut m = Self::new();
+        for (uid, (name, class)) in cached {
+            m.names_seq += 1;
+            m.names.insert(
+                uid,
+                NameEntry {
+                    name,
+                    class,
+                    seq: m.names_seq,
+                },
+            );
+        }
+        m
+    }
+
+    /// Reads a cached name/class, bumping its recency for `names_for_save`.
+    fn name_lookup(&mut self, uid: i64) -> Option<(Option<String>, Option<Class>)> {
+        self.names_seq += 1;
+        let seq = self.names_seq;
+        self.names.get_mut(&uid).map(|entry| {
+            entry.seq = seq;
+            (entry.name.clone(), entry.class)
+        })
+    }
+
+    /// Merges live packet data into the name cache: a `Some` field always
+    /// overwrites (live wins over cached/stale data); a `None` field leaves
+    /// whatever was already cached untouched. Returns the merged value and
+    /// bumps recency.
+    fn name_upsert(
+        &mut self,
+        uid: i64,
+        name: Option<String>,
+        class: Option<Class>,
+    ) -> (Option<String>, Option<Class>) {
+        self.names_seq += 1;
+        let seq = self.names_seq;
+        let entry = self.names.entry(uid).or_default();
+        if name.is_some() {
+            entry.name = name;
+        }
+        if class.is_some() {
+            entry.class = class;
+        }
+        entry.seq = seq;
+        (entry.name.clone(), entry.class)
+    }
+
+    /// Exports the name cache for persistence, ordered most-recently-touched
+    /// first so a caller (e.g. `names_cache::save`) that caps the entry
+    /// count evicts the least-recently-used entries.
+    pub fn names_for_save(&self) -> Vec<(i64, Option<String>, Option<Class>)> {
+        let mut entries: Vec<(i64, &NameEntry)> = self.names.iter().map(|(u, e)| (*u, e)).collect();
+        entries.sort_by_key(|(uid, e)| std::cmp::Reverse((e.seq, *uid)));
+        entries
+            .into_iter()
+            .map(|(uid, e)| (uid, e.name.clone(), e.class))
+            .collect()
     }
 
     pub fn set_reset_config(&mut self, cfg: ResetConfig) {
@@ -102,7 +187,7 @@ impl Meter {
             self.fight_start_ms = Some(d.timestamp_ms);
         }
 
-        let cached = self.names.get(&d.attacker_uid).cloned();
+        let cached = self.name_lookup(d.attacker_uid);
         let stats = self
             .players
             .entry(d.attacker_uid)
@@ -133,14 +218,7 @@ impl Meter {
     }
 
     fn apply_player(&mut self, p: &PlayerInfo) {
-        let entry = self.names.entry(p.uid).or_insert((None, None));
-        if p.name.is_some() {
-            entry.0 = p.name.clone();
-        }
-        if p.class.is_some() {
-            entry.1 = p.class;
-        }
-        let (name, class) = entry.clone();
+        let (name, class) = self.name_upsert(p.uid, p.name.clone(), p.class);
         if let Some(stats) = self.players.get_mut(&p.uid) {
             if name.is_some() {
                 stats.name = name;
@@ -461,6 +539,109 @@ mod tests {
         }));
         let snap = m.snapshot(2000);
         assert!(snap.rows.is_empty());
+    }
+
+    mod names_cache {
+        use super::*;
+        use std::collections::HashMap;
+
+        #[test]
+        fn cached_name_resolves_before_any_packet_arrives_this_session() {
+            let mut cache = HashMap::new();
+            cache.insert(5, (Some("Cached".to_string()), Some(Class::Marksman)));
+            let mut m = Meter::with_names_cache(cache);
+
+            // No PlayerInfo event this session — only damage.
+            m.apply(&dmg(5, 100, 1000));
+
+            let snap = m.snapshot(2000);
+            assert_eq!(snap.rows[0].name, "Cached");
+            assert_eq!(snap.rows[0].class, Some(Class::Marksman));
+        }
+
+        #[test]
+        fn live_player_info_overrides_cached_name() {
+            let mut cache = HashMap::new();
+            cache.insert(5, (Some("Stale".to_string()), Some(Class::Marksman)));
+            let mut m = Meter::with_names_cache(cache);
+
+            m.apply(&ProtocolEvent::Player(PlayerInfo {
+                uid: 5,
+                name: Some("Fresh".to_string()),
+                class: Some(Class::FrostMage),
+            }));
+            m.apply(&dmg(5, 100, 1000));
+
+            let snap = m.snapshot(2000);
+            assert_eq!(snap.rows[0].name, "Fresh");
+            assert_eq!(snap.rows[0].class, Some(Class::FrostMage));
+        }
+
+        #[test]
+        fn live_partial_update_keeps_cached_field_it_did_not_supply() {
+            let mut cache = HashMap::new();
+            cache.insert(5, (Some("Cached".to_string()), Some(Class::Marksman)));
+            let mut m = Meter::with_names_cache(cache);
+
+            // Live packet only carries a name this time, no class.
+            m.apply(&ProtocolEvent::Player(PlayerInfo {
+                uid: 5,
+                name: Some("Renamed".to_string()),
+                class: None,
+            }));
+            m.apply(&dmg(5, 100, 1000));
+
+            let snap = m.snapshot(2000);
+            assert_eq!(snap.rows[0].name, "Renamed");
+            assert_eq!(snap.rows[0].class, Some(Class::Marksman));
+        }
+
+        #[test]
+        fn names_for_save_round_trips_through_with_names_cache() {
+            let mut cache = HashMap::new();
+            cache.insert(1, (Some("Alice".to_string()), Some(Class::Marksman)));
+            cache.insert(2, (Some("Bob".to_string()), None));
+            let m = Meter::with_names_cache(cache);
+
+            let saved = m.names_for_save();
+            assert_eq!(saved.len(), 2);
+            assert!(saved.contains(&(1, Some("Alice".to_string()), Some(Class::Marksman))));
+            assert!(saved.contains(&(2, Some("Bob".to_string()), None)));
+        }
+
+        #[test]
+        fn names_for_save_orders_most_recently_touched_first() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Player(PlayerInfo {
+                uid: 1,
+                name: Some("First".to_string()),
+                class: None,
+            }));
+            m.apply(&ProtocolEvent::Player(PlayerInfo {
+                uid: 2,
+                name: Some("Second".to_string()),
+                class: None,
+            }));
+
+            let saved = m.names_for_save();
+            assert_eq!(saved[0].0, 2);
+            assert_eq!(saved[1].0, 1);
+        }
+
+        #[test]
+        fn server_change_reset_preserves_names_for_save() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Player(PlayerInfo {
+                uid: 1,
+                name: Some("Foo".to_string()),
+                class: None,
+            }));
+            m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 1000 });
+
+            let saved = m.names_for_save();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].0, 1);
+        }
     }
 
     mod reset {

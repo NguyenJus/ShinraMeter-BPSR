@@ -8,6 +8,8 @@
 mod pipeline;
 mod ui;
 
+use std::path::PathBuf;
+
 use bpsr_protocol::ProtocolEvent;
 use crossbeam_channel::bounded;
 use ui::{OverlayApp, StatusLine, UiCommand};
@@ -15,6 +17,26 @@ use ui::{OverlayApp, StatusLine, UiCommand};
 /// Bounded so a stalled pipeline never grows unboundedly behind capture.
 const EVENT_CAPACITY: usize = 4096;
 const COMMAND_CAPACITY: usize = 64;
+
+/// Where the cross-session uid -> (name, class) cache (issue #12) lives:
+/// `%APPDATA%\shinra-bpsr\names.json`. `bpsr-meter` deliberately knows
+/// nothing about this path (it's caller-supplied, no Windows-specific
+/// assumptions, no `directories` crate) — the app crate owns picking it.
+/// Falls back to a current-directory file, logged, if `APPDATA` isn't set
+/// (e.g. non-Windows dev/CI environments).
+fn names_cache_path() -> PathBuf {
+    match std::env::var("APPDATA") {
+        Ok(appdata) if !appdata.is_empty() => PathBuf::from(appdata)
+            .join("shinra-bpsr")
+            .join("names.json"),
+        _ => {
+            log::warn!(
+                "APPDATA is not set; falling back to a working-directory file for the name cache"
+            );
+            PathBuf::from("shinra-bpsr-names.json")
+        }
+    }
+}
 
 fn main() -> eframe::Result {
     env_logger::init();
@@ -32,7 +54,7 @@ fn main() -> eframe::Result {
         }
     };
 
-    let (rx_snapshot, pipeline_thread) = pipeline::spawn(rx_events, rx_command);
+    let (rx_snapshot, pipeline_thread) = pipeline::spawn(rx_events, rx_command, names_cache_path());
 
     // Kept alongside the clone handed to `OverlayApp` so shutdown can signal
     // the pipeline explicitly below, rather than depending on `run_native`

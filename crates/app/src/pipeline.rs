@@ -9,6 +9,7 @@
 //! explicit `now_ms`), and `bpsr-protocol` events already carry the capture
 //! thread's timestamp. [`now_ms`] is this crate's only `SystemTime` call site.
 
+use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -92,12 +93,38 @@ pub fn map_event(ev: proto::ProtocolEvent) -> meter::ProtocolEvent {
 /// Owns the encounter state and applies mapped protocol events to it.
 pub struct Pipeline {
     meter: meter::Meter,
+    /// Where the cross-session name cache (issue #12) is persisted. `None`
+    /// in tests / `Pipeline::new()` — no path means no disk IO at all.
+    names_cache_path: Option<PathBuf>,
 }
 
 impl Pipeline {
     pub fn new() -> Self {
         Self {
             meter: meter::Meter::new(),
+            names_cache_path: None,
+        }
+    }
+
+    /// Loads the uid -> (name, class) cache from `path` (if it exists) to
+    /// seed the meter, and remembers `path` so future resets/shutdown
+    /// persist back to it. A missing or corrupt file is not an error — the
+    /// meter simply starts with an empty cache (see `meter::names_cache::load`).
+    pub fn with_names_cache_path(path: PathBuf) -> Self {
+        let cached = meter::names_cache::load(&path);
+        Self {
+            meter: meter::Meter::with_names_cache(cached),
+            names_cache_path: Some(path),
+        }
+    }
+
+    /// Persists the current name cache, if a path was configured. Cheap
+    /// relative to per-packet work since it's only called on
+    /// reset/encounter-end and on shutdown (never per-packet). Never panics
+    /// — `meter::names_cache::save` logs and swallows IO errors.
+    pub fn save_names_cache(&self) {
+        if let Some(path) = &self.names_cache_path {
+            meter::names_cache::save(path, &self.meter.names_for_save());
         }
     }
 
@@ -107,6 +134,7 @@ impl Pipeline {
         let reason = self.meter.apply(&map_event(ev));
         if let Some(reason) = reason {
             log::debug!("meter reset: {reason:?}");
+            self.save_names_cache();
         }
         reason
     }
@@ -114,6 +142,7 @@ impl Pipeline {
     /// Manual reset, triggered by the overlay's Reset button.
     pub fn reset(&mut self, now_ms: u64) {
         self.meter.reset(meter::ResetReason::Manual, now_ms);
+        self.save_names_cache();
     }
 
     pub fn snapshot(&self, now_ms: u64) -> meter::Snapshot {
@@ -137,13 +166,14 @@ impl Default for Pipeline {
 pub fn spawn(
     events: Receiver<proto::ProtocolEvent>,
     commands: Receiver<UiCommand>,
+    names_cache_path: PathBuf,
 ) -> (Receiver<meter::Snapshot>, JoinHandle<()>) {
     let (tx_snapshot, rx_snapshot) = bounded::<meter::Snapshot>(1);
     let stale = rx_snapshot.clone();
 
     let handle = std::thread::Builder::new()
         .name("pipeline".to_string())
-        .spawn(move || run(events, commands, tx_snapshot, stale))
+        .spawn(move || run(events, commands, tx_snapshot, stale, names_cache_path))
         .expect("failed to spawn the pipeline thread");
 
     (rx_snapshot, handle)
@@ -154,8 +184,9 @@ fn run(
     commands: Receiver<UiCommand>,
     tx_snapshot: Sender<meter::Snapshot>,
     stale: Receiver<meter::Snapshot>,
+    names_cache_path: PathBuf,
 ) {
-    let mut pipeline = Pipeline::new();
+    let mut pipeline = Pipeline::with_names_cache_path(names_cache_path);
     // Replaced by `never()` once capture disconnects, so a dead channel does
     // not spin the select loop.
     let mut events = events;
@@ -180,6 +211,10 @@ fn run(
             recv(ticker) -> _ => publish(&pipeline, &tx_snapshot, &stale),
         }
     }
+
+    // Shutdown save: catches identity data learned since the last
+    // reset/encounter-end save (e.g. a session with no resets at all).
+    pipeline.save_names_cache();
 }
 
 /// Publishes the latest snapshot, dropping the previous one if the UI has not
@@ -354,6 +389,54 @@ mod tests {
         let snap = p.snapshot(2_000);
         assert_eq!(snap.total_damage, 0);
         assert!(snap.rows.is_empty());
+    }
+
+    mod names_cache_wiring {
+        use super::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        fn scratch_path() -> PathBuf {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bpsr-pipeline-names-cache-test-{n}.json"))
+        }
+
+        #[test]
+        fn with_names_cache_path_seeds_the_meter_from_an_existing_file() {
+            let path = scratch_path();
+            meter::names_cache::save(
+                &path,
+                &[(5, Some("Cached".to_string()), Some(meter::Class::Marksman))],
+            );
+
+            let mut p = Pipeline::with_names_cache_path(path.clone());
+            p.step(proto::ProtocolEvent::Damage(damage(5, 100, 1_000)));
+            let snap = p.snapshot(2_000);
+            assert_eq!(snap.rows[0].name, "Cached");
+
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn manual_reset_persists_the_names_cache_to_disk() {
+            let path = scratch_path();
+            let mut p = Pipeline::with_names_cache_path(path.clone());
+            p.step(proto::ProtocolEvent::Player(proto::PlayerInfo {
+                uid: 1,
+                name: Some("Foo".to_string()),
+                class: None,
+            }));
+
+            assert!(!path.exists());
+            p.reset(1_000);
+            assert!(path.exists());
+
+            let loaded = meter::names_cache::load(&path);
+            assert_eq!(loaded[&1].0, Some("Foo".to_string()));
+
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     #[test]
