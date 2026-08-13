@@ -5,7 +5,9 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod fonts;
 mod pipeline;
+mod platform;
 mod ui;
 
 use bpsr_protocol::ProtocolEvent;
@@ -49,7 +51,9 @@ fn main() -> eframe::Result {
         "shinra-bpsr",
         native_options,
         Box::new(move |cc| {
+            fonts::install_cjk_fallback(&cc.egui_ctx);
             ui::apply_theme(&cc.egui_ctx);
+            platform::disable_aero_snap(cc);
             Ok(Box::new(
                 OverlayApp::new(rx_snapshot, tx_command).with_status(status),
             ))
