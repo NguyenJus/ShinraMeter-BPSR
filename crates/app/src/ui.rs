@@ -11,6 +11,8 @@ use bpsr_meter::{PlayerRow, Snapshot};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 
+use crate::settings::{self, ColumnKind, Settings};
+
 /// Commands the overlay emits for the app layer to consume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiCommand {
@@ -30,12 +32,18 @@ pub enum StatusLine {
 pub struct OverlayApp {
     snapshot: Snapshot,
     status: StatusLine,
+    settings: Settings,
     rx_snapshot: Receiver<Snapshot>,
     tx_command: Sender<UiCommand>,
+    tx_settings: Sender<Settings>,
 }
 
 impl OverlayApp {
-    pub fn new(rx_snapshot: Receiver<Snapshot>, tx_command: Sender<UiCommand>) -> Self {
+    pub fn new(
+        rx_snapshot: Receiver<Snapshot>,
+        tx_command: Sender<UiCommand>,
+        tx_settings: Sender<Settings>,
+    ) -> Self {
         Self {
             snapshot: Snapshot {
                 duration_ms: 0,
@@ -44,8 +52,10 @@ impl OverlayApp {
                 rows: Vec::new(),
             },
             status: StatusLine::Ok,
+            settings: settings::load(),
             rx_snapshot,
             tx_command,
+            tx_settings,
         }
     }
 
@@ -77,14 +87,21 @@ impl eframe::App for OverlayApp {
                 // First, so the header buttons drawn afterwards stay on top of
                 // the corner zones they overlap.
                 draw_resize_handles(ui, &ctx);
-                draw_header(ui, &ctx, &self.snapshot, &self.tx_command);
+                draw_header(
+                    ui,
+                    &ctx,
+                    &self.snapshot,
+                    &self.tx_command,
+                    &mut self.settings,
+                    &self.tx_settings,
+                );
 
                 if let StatusLine::Error(msg) = &self.status {
                     ui.colored_label(egui::Color32::from_rgb(220, 80, 80), msg.as_str());
                 }
 
                 ui.separator();
-                draw_rows(ui, &self.snapshot);
+                draw_rows(ui, &self.snapshot, &self.settings.ordered_columns());
             });
 
         // ~10 Hz.
@@ -97,6 +114,8 @@ fn draw_header(
     ctx: &egui::Context,
     snapshot: &Snapshot,
     tx_command: &Sender<UiCommand>,
+    settings: &mut Settings,
+    tx_settings: &Sender<Settings>,
 ) {
     // The whole header band is the drag surface, registered *before* the row's
     // contents so the buttons drawn into it end up on top and still get their
@@ -151,7 +170,47 @@ fn draw_header(
             if ui.button("Reset").clicked() {
                 let _ = tx_command.try_send(UiCommand::Reset);
             }
+            // Plain ASCII, covered by every vendored font (issue #14) —
+            // the gear glyph (U+2699) isn't in either bundled TTF.
+            draw_settings_menu(ui, settings, tx_settings);
         });
+    });
+}
+
+/// The settings menu: a compact dropdown (egui's `menu_button`, so it needs
+/// no extra open/closed state of its own) letting the user toggle which
+/// stat columns render (issue #13).
+fn draw_settings_menu(ui: &mut egui::Ui, settings: &mut Settings, tx_settings: &Sender<Settings>) {
+    ui.menu_button("S", |ui| {
+        ui.label("Columns");
+        let mut changed = false;
+        for col in ColumnKind::ALL {
+            let is_visible = settings.is_visible(col);
+            // Disabling the last remaining column would leave the row with
+            // nothing to show, so its checkbox is greyed out and inert
+            // rather than letting the click land (issue #13's "keep the
+            // UI usable" guard).
+            let would_disable_last = is_visible && settings.visible_columns.len() <= 1;
+            let mut checked = is_visible;
+            let resp = ui.add_enabled(
+                !would_disable_last,
+                egui::Checkbox::new(&mut checked, col.label()),
+            );
+            if resp.changed() {
+                settings.toggle(col);
+                changed = true;
+            }
+        }
+        if changed {
+            // Persisting is blocking file IO (`fs::write` + `fs::rename`),
+            // so it must not run on this render thread — hand the new
+            // value to the dedicated settings-writer thread instead, same
+            // as `pipeline::spawn` owns the meter off this thread. A
+            // disconnected receiver (writer thread gone) is not fatal:
+            // the in-memory `settings` the UI already mutated stays
+            // correct for the rest of this session.
+            let _ = tx_settings.send(settings.clone());
+        }
     });
 }
 
@@ -232,9 +291,16 @@ fn draw_resize_handles(ui: &mut egui::Ui, ctx: &egui::Context) {
     }
 }
 
-fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot) {
+fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot, columns: &[ColumnKind]) {
+    // The enabled-column set (and therefore the column widths and their
+    // anchors) is identical for every row in a frame, so both are computed
+    // once here rather than once per row inside `draw_row`.
+    let stat_columns = stat_columns_for(columns);
+    let avail = ui.available_rect_before_wrap();
+    let anchors = column_anchors(avail.left(), avail.right(), &stat_columns, 4.0);
+
     for row in &snapshot.rows {
-        draw_row(ui, row);
+        draw_row(ui, row, &stat_columns, &anchors);
     }
 }
 
@@ -252,27 +318,18 @@ pub struct StatColumn {
     pub text: fn(&PlayerRow) -> String,
 }
 
-/// The stats-row columns, left to right. Issue #13 will append crit% /
-/// lucky% / hits here — new columns just extend this array with a width and
-/// a `text` formatter in the desired left-to-right order. `column_anchors`
-/// produces exactly one anchor per entry in `columns`, and `draw_row` zips
-/// those anchors against this same array (not a separately-sized literal),
-/// so an added column always gets both a placed anchor and rendered text —
-/// there is no way to add a column here without wiring up its rendering.
-pub const STAT_COLUMNS: [StatColumn; 3] = [
-    StatColumn {
-        width: 56.0,
-        text: |row| fmt_short(row.damage),
-    }, // damage: budgeted for its ≤6-char max, e.g. "999.9K"
-    StatColumn {
-        width: 76.0,
-        text: |row| format!("{}/s", fmt_short(row.dps as i64)),
-    }, // dps: fmt_short's ≤6 chars plus the 2-char "/s" suffix = ≤8 chars
-    StatColumn {
-        width: 56.0,
-        text: |row| fmt_share(row.share_pct),
-    }, // share%: same ≤6-char max as damage (e.g. "100.0%"), same width
-];
+/// Builds the column specs for `column_anchors` out of the currently
+/// enabled `ColumnKind`s (issue #13: the column set is now dynamic and
+/// user-filterable rather than the fixed-size array issue #8 shipped).
+///
+/// Each kind hands over both its width and its `text` formatter in one
+/// `StatColumn` (`ColumnKind::spec`), and `column_anchors` produces exactly
+/// one anchor per entry here, so `draw_row` can zip anchors against this
+/// same slice: a column can never end up with an anchor but no text, and
+/// adding a `ColumnKind` cannot skip wiring up its rendering.
+fn stat_columns_for(columns: &[ColumnKind]) -> Vec<StatColumn> {
+    columns.iter().map(|c| c.spec()).collect()
+}
 
 /// Computes each column's right-aligned text anchor (an x coordinate, for
 /// use with `Align2::RIGHT_CENTER`), given the row rect's left/right edges,
@@ -313,7 +370,7 @@ pub fn column_anchors(
     anchors
 }
 
-fn draw_row(ui: &mut egui::Ui, row: &PlayerRow) {
+fn draw_row(ui: &mut egui::Ui, row: &PlayerRow, columns: &[StatColumn], anchors: &[f32]) {
     let desired_size = egui::vec2(ui.available_width(), 20.0);
     let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
 
@@ -338,15 +395,18 @@ fn draw_row(ui: &mut egui::Ui, row: &PlayerRow) {
 
     // Each stat gets its own fixed-width column (issue #8) so a
     // digit-count change (e.g. `9.9K` -> `10.1K`) shifts only that
-    // column's text, never the column's anchor point. Anchors and text are
-    // both derived from `STAT_COLUMNS`, so the two can never drift apart in
-    // length (issue #8 review): `column_anchors` yields exactly one anchor
-    // per `STAT_COLUMNS` entry, and each entry supplies its own formatter.
-    let anchors = column_anchors(rect.left(), rect.right(), &STAT_COLUMNS, 4.0);
-    for (anchor_x, column) in anchors.into_iter().zip(STAT_COLUMNS) {
+    // column's text, never the column's anchor point. Which columns
+    // appear, and in what order, comes from the user's settings (#13).
+    // Widths and anchors are row-invariant within a frame, so the caller
+    // (`draw_rows`) builds the column slice and its anchors once and hands
+    // both down. Anchors and text still come from that one slice, so the
+    // two can never drift apart in length (issue #8 review):
+    // `column_anchors` yields exactly one anchor per `StatColumn`, and each
+    // `StatColumn` carries its own formatter.
+    for (anchor_x, column) in anchors.iter().zip(columns) {
         let text = (column.text)(row);
         ui.painter().text(
-            egui::pos2(anchor_x, rect.center().y),
+            egui::pos2(*anchor_x, rect.center().y),
             egui::Align2::RIGHT_CENTER,
             text,
             egui::FontId::monospace(13.0),
@@ -424,6 +484,7 @@ pub fn apply_theme(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{ColumnKind, Settings};
 
     #[test]
     fn fmt_short_below_thousand_is_plain() {
@@ -557,6 +618,24 @@ mod tests {
 
     // -- column_anchors (issue #8) --------------------------------------
 
+    /// A stand-in three-column layout (same widths the old fixed
+    /// `STAT_COLUMNS` array used) for tests that exercise `column_anchors`'
+    /// pure math and don't care where the widths came from.
+    const TEST_COLUMNS: [StatColumn; 3] = [
+        StatColumn {
+            width: 56.0,
+            text: |row| fmt_short(row.damage),
+        },
+        StatColumn {
+            width: 56.0,
+            text: |row| format!("{}/s", fmt_short(row.dps as i64)),
+        },
+        StatColumn {
+            width: 44.0,
+            text: |row| fmt_share(row.share_pct),
+        },
+    ];
+
     /// The anchor for a column never depends on what text will be painted
     /// into it — only on the row rect and the column specs — so a
     /// digit-count change in the text can never shift it. Calling the
@@ -564,21 +643,21 @@ mod tests {
     /// vs. "row after" a digit-count change) must yield identical anchors.
     #[test]
     fn column_anchors_are_stable_across_repeated_calls() {
-        let first = column_anchors(0.0, 300.0, &STAT_COLUMNS, 4.0);
-        let second = column_anchors(0.0, 300.0, &STAT_COLUMNS, 4.0);
+        let first = column_anchors(0.0, 300.0, &TEST_COLUMNS, 4.0);
+        let second = column_anchors(0.0, 300.0, &TEST_COLUMNS, 4.0);
         assert_eq!(first, second);
     }
 
     #[test]
     fn column_anchors_rightmost_column_sits_margin_from_right_edge() {
-        let anchors = column_anchors(0.0, 300.0, &STAT_COLUMNS, 4.0);
+        let anchors = column_anchors(0.0, 300.0, &TEST_COLUMNS, 4.0);
         let last = *anchors.last().unwrap();
         assert_eq!(last, 300.0 - 4.0);
     }
 
     #[test]
     fn column_anchors_are_ordered_left_to_right() {
-        let anchors = column_anchors(0.0, 300.0, &STAT_COLUMNS, 4.0);
+        let anchors = column_anchors(0.0, 300.0, &TEST_COLUMNS, 4.0);
         for pair in anchors.windows(2) {
             assert!(pair[0] < pair[1], "anchors must increase left-to-right");
         }
@@ -586,12 +665,12 @@ mod tests {
 
     #[test]
     fn column_anchors_spacing_matches_column_widths_when_room_allows() {
-        let anchors = column_anchors(0.0, 300.0, &STAT_COLUMNS, 4.0);
+        let anchors = column_anchors(0.0, 300.0, &TEST_COLUMNS, 4.0);
         // Ample room: no scaling, so consecutive anchors are exactly one
         // column-width apart (the earlier column's own width).
-        for i in 0..STAT_COLUMNS.len() - 1 {
+        for i in 0..TEST_COLUMNS.len() - 1 {
             let gap = anchors[i + 1] - anchors[i];
-            assert_eq!(gap, STAT_COLUMNS[i + 1].width);
+            assert_eq!(gap, TEST_COLUMNS[i + 1].width);
         }
     }
 
@@ -600,9 +679,9 @@ mod tests {
         // Total column width plus margin exceeds the available rect, so the
         // columns must shrink to fit rather than spilling past the left
         // edge indefinitely.
-        let total: f32 = STAT_COLUMNS.iter().map(|c| c.width).sum();
+        let total: f32 = TEST_COLUMNS.iter().map(|c| c.width).sum();
         let narrow_right = total * 0.5;
-        let anchors = column_anchors(0.0, narrow_right, &STAT_COLUMNS, 4.0);
+        let anchors = column_anchors(0.0, narrow_right, &TEST_COLUMNS, 4.0);
         assert!(*anchors.first().unwrap() >= 0.0);
         // Still ordered and still anchored to the right edge.
         for pair in anchors.windows(2) {
@@ -616,17 +695,19 @@ mod tests {
         // Anchors are computed from the right edge; moving the rect's left
         // edge around (without shrinking available width below the column
         // total) must not move them.
-        let a = column_anchors(0.0, 300.0, &STAT_COLUMNS, 4.0);
-        let b = column_anchors(50.0, 300.0, &STAT_COLUMNS, 4.0);
+        let a = column_anchors(0.0, 300.0, &TEST_COLUMNS, 4.0);
+        let b = column_anchors(50.0, 300.0, &TEST_COLUMNS, 4.0);
         assert_eq!(a, b);
     }
 
     /// The geometry tests above only check anchor placement; none of them
     /// confirm the *painted text* actually fits inside its column's width
-    /// budget. This measures each column's widest plausible formatted
-    /// output with the same font `draw_row` paints with
-    /// (`FontId::monospace(13.0)`) and asserts it fits inside
-    /// `STAT_COLUMNS[i].width`. Pre-fix, the dps column reused the damage
+    /// budget. This builds the widest plausible row, renders every
+    /// selectable column's text through its own `StatColumn::text` with the
+    /// same font `draw_row` paints with (`FontId::monospace(13.0)`), and
+    /// asserts each fits inside that column's `width`. Running over
+    /// `ColumnKind::ALL` holds every column — including any added later —
+    /// to its own budget. Pre-fix, the dps column reused the damage
     /// column's 56.0-wide budget even though its text carries a 2-char
     /// "/s" suffix on top of `fmt_short`'s ~6-char max — this test fails
     /// against that width.
@@ -639,19 +720,27 @@ mod tests {
         ctx.run_ui(egui::RawInput::default(), |_ui| {})
             .drop_without_applying_deltas();
 
-        // Widest plausible text per column, matching `STAT_COLUMNS`'s
-        // left-to-right order (damage, dps, share%).
-        let widest_damage = fmt_short(999_949); // "999.9K"
-        let widest_dps = format!("{}/s", fmt_short(999_949)); // "999.9K/s"
-        let widest_share = fmt_share(100.0); // "100.0%"
-        assert_eq!(widest_damage, "999.9K");
-        assert_eq!(widest_dps, "999.9K/s");
-        assert_eq!(widest_share, "100.0%");
+        // Widest plausible value for every field any column formats:
+        // `fmt_short`'s 6-char maximum and `fmt_share`'s.
+        assert_eq!(fmt_short(999_949), "999.9K");
+        assert_eq!(fmt_share(100.0), "100.0%");
+        let widest_row = PlayerRow {
+            uid: 1,
+            name: String::new(),
+            class: None,
+            damage: 999_949,
+            dps: 999_949.0,
+            share_pct: 100.0,
+            crit_pct: 100.0,
+            lucky_pct: 100.0,
+            hits: 999_949,
+        };
 
-        for (text, column) in [widest_damage, widest_dps, widest_share]
+        for (kind, column) in ColumnKind::ALL
             .into_iter()
-            .zip(STAT_COLUMNS)
+            .zip(stat_columns_for(&ColumnKind::ALL))
         {
+            let text = (column.text)(&widest_row);
             let text_width = ctx.fonts_mut(|f| {
                 f.layout_no_wrap(
                     text.clone(),
@@ -663,9 +752,81 @@ mod tests {
             });
             assert!(
                 text_width <= column.width,
-                "{text:?} is {text_width}pt wide, wider than its {}pt column budget",
+                "{kind:?}: {text:?} is {text_width}pt wide, wider than its {}pt column budget",
                 column.width
             );
         }
+    }
+
+    // -- dynamic columns from settings (issue #13) -----------------------
+    //
+    // `stat_columns_for` (production, above) builds column specs from the
+    // enabled `ColumnKind`s; these tests exercise that it still preserves
+    // `column_anchors`' invariants as the enabled set changes.
+
+    #[test]
+    fn default_settings_columns_match_original_three_column_layout() {
+        let cols = Settings::default().ordered_columns();
+        let anchors = column_anchors(0.0, 300.0, &stat_columns_for(&cols), 4.0);
+
+        // Same three columns (damage/dps/share%) as the original fixed
+        // STAT_COLUMNS array from issue #8.
+        assert_eq!(anchors.len(), 3);
+        assert_eq!(*anchors.last().unwrap(), 300.0 - 4.0);
+    }
+
+    #[test]
+    fn rightmost_anchor_stays_pinned_to_margin_as_columns_are_enabled() {
+        let mut settings = Settings::default();
+        let before = column_anchors(
+            0.0,
+            300.0,
+            &stat_columns_for(&settings.ordered_columns()),
+            4.0,
+        );
+
+        settings.toggle(ColumnKind::CritPct);
+        settings.toggle(ColumnKind::Hits);
+        let after = column_anchors(
+            0.0,
+            300.0,
+            &stat_columns_for(&settings.ordered_columns()),
+            4.0,
+        );
+
+        assert_eq!(*before.last().unwrap(), 300.0 - 4.0);
+        assert_eq!(*after.last().unwrap(), 300.0 - 4.0);
+        assert!(after.len() > before.len());
+    }
+
+    #[test]
+    fn disabling_a_column_still_leaves_anchors_ordered_and_pinned() {
+        let mut settings = Settings {
+            visible_columns: ColumnKind::ALL.to_vec(),
+        };
+        settings.toggle(ColumnKind::Dps);
+        let cols = settings.ordered_columns();
+        let anchors = column_anchors(0.0, 300.0, &stat_columns_for(&cols), 4.0);
+
+        assert_eq!(anchors.len(), 5);
+        assert_eq!(*anchors.last().unwrap(), 300.0 - 4.0);
+        for pair in anchors.windows(2) {
+            assert!(pair[0] < pair[1]);
+        }
+    }
+
+    #[test]
+    fn toggle_order_does_not_affect_resulting_anchor_layout() {
+        let mut a = Settings::default();
+        a.toggle(ColumnKind::Hits);
+        a.toggle(ColumnKind::CritPct);
+
+        let mut b = Settings::default();
+        b.toggle(ColumnKind::CritPct);
+        b.toggle(ColumnKind::Hits);
+
+        let anchors_a = column_anchors(0.0, 300.0, &stat_columns_for(&a.ordered_columns()), 4.0);
+        let anchors_b = column_anchors(0.0, 300.0, &stat_columns_for(&b.ordered_columns()), 4.0);
+        assert_eq!(anchors_a, anchors_b);
     }
 }
