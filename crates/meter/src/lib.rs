@@ -2,6 +2,7 @@
 
 pub mod encounter;
 pub mod event;
+pub mod names_cache;
 pub mod reset;
 pub mod stats;
 

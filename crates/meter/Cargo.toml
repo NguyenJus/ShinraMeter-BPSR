@@ -3,3 +3,11 @@ name = "bpsr-meter"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+bpsr-test-support = { workspace = true }
