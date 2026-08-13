@@ -167,10 +167,16 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
         .profession_list
         .as_ref()
         .map(|p| Class::from(p.cur_profession_id));
+    let ability_score = if char_base.fight_point > 0 {
+        Some(char_base.fight_point as u32)
+    } else {
+        None
+    };
     out.push(ProtocolEvent::Player(PlayerInfo {
         uid: v_data.char_id,
         name,
         class,
+        ability_score,
     }));
 }
 

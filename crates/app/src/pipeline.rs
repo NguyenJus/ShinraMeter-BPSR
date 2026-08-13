@@ -76,6 +76,7 @@ pub fn map_event(ev: proto::ProtocolEvent) -> meter::ProtocolEvent {
             uid: p.uid,
             name: p.name,
             class: p.class.map(map_class),
+            ability_score: p.ability_score,
         }),
         proto::ProtocolEvent::EnemyHp(e) => meter::ProtocolEvent::EnemyHp(meter::EnemyHp {
             uid: e.uid,
@@ -399,6 +400,7 @@ mod tests {
             uid: 42,
             name: Some("Foo".to_string()),
             class: Some(proto::Class::Marksman),
+            ability_score: Some(9_999),
         }));
         assert_eq!(
             mapped,
@@ -406,6 +408,7 @@ mod tests {
                 uid: 42,
                 name: Some("Foo".to_string()),
                 class: Some(meter::Class::Marksman),
+                ability_score: Some(9_999),
             })
         );
     }
@@ -515,6 +518,7 @@ mod tests {
                 uid: 1,
                 name: Some("Foo".to_string()),
                 class: None,
+                ability_score: None,
             }));
 
             assert!(!path.exists());
@@ -566,9 +570,24 @@ mod tests {
             uid: 5,
             name: Some("Late".to_string()),
             class: Some(proto::Class::FrostMage),
+            ability_score: None,
         }));
         let snap = p.snapshot(2_000);
         assert_eq!(snap.rows[0].name, "Late");
         assert_eq!(snap.rows[0].class, Some(meter::Class::FrostMage));
+    }
+
+    #[test]
+    fn ability_score_flows_from_protocol_player_info_to_the_snapshot_row() {
+        let mut p = Pipeline::new();
+        p.step(proto::ProtocolEvent::Damage(damage(9, 100, 1_000)));
+        p.step(proto::ProtocolEvent::Player(proto::PlayerInfo {
+            uid: 9,
+            name: None,
+            class: None,
+            ability_score: Some(77_000),
+        }));
+        let snap = p.snapshot(2_000);
+        assert_eq!(snap.rows[0].ability_score, Some(77_000));
     }
 }

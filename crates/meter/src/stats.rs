@@ -7,6 +7,10 @@ pub struct PlayerStats {
     pub uid: i64,
     pub name: Option<String>,
     pub class: Option<Class>,
+    /// Ability score (a.k.a. combat power); `None` until a packet carrying
+    /// it (attrs `FIGHT_POINT`, or `SyncContainerData.fight_point`) has been
+    /// seen for this player (issue #15).
+    pub ability_score: Option<u32>,
     pub total_damage: i64,
     pub hits: u64,
     pub crit_hits: u64,
@@ -21,6 +25,7 @@ impl PlayerStats {
             uid,
             name: None,
             class: None,
+            ability_score: None,
             total_damage: 0,
             hits: 0,
             crit_hits: 0,
@@ -53,6 +58,9 @@ pub struct PlayerRow {
     pub uid: i64,
     pub name: String,
     pub class: Option<Class>,
+    /// Ability score (a.k.a. combat power); `None` when no packet carrying
+    /// it has been seen for this player yet (issue #15).
+    pub ability_score: Option<u32>,
     pub damage: i64,
     pub dps: f64,
     pub share_pct: f32,

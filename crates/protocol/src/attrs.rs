@@ -63,11 +63,13 @@ pub fn decode_name(raw: &[u8]) -> Option<String> {
     std::str::from_utf8(bytes).ok().map(str::to_string)
 }
 
-/// Builds a `PlayerInfo` from an entity's `Attr` list, reading `NAME` and
-/// `PROFESSION_ID`. Unknown ids, empty `raw_data`, and `id == 0` are skipped.
+/// Builds a `PlayerInfo` from an entity's `Attr` list, reading `NAME`,
+/// `PROFESSION_ID`, and `FIGHT_POINT` (ability score). Unknown ids, empty
+/// `raw_data`, and `id == 0` are skipped.
 pub fn player_info_from_attrs(uid: i64, attrs: &[pb::Attr]) -> PlayerInfo {
     let mut name = None;
     let mut class = None;
+    let mut ability_score = None;
     for attr in attrs {
         if attr.raw_data.is_empty() || attr.id == 0 {
             continue;
@@ -83,10 +85,22 @@ pub fn player_info_from_attrs(uid: i64, attrs: &[pb::Attr]) -> PlayerInfo {
                     class = Some(Class::from(id));
                 }
             }
+            attr_id::FIGHT_POINT => {
+                if let Some(v) =
+                    decode_varint_u64(&attr.raw_data).and_then(|v| u32::try_from(v).ok())
+                {
+                    ability_score = Some(v);
+                }
+            }
             _ => {}
         }
     }
-    PlayerInfo { uid, name, class }
+    PlayerInfo {
+        uid,
+        name,
+        class,
+        ability_score,
+    }
 }
 
 /// Builds an `EnemyHp` from an entity's `Attr` list, reading `HP`, `MAX_HP`,
@@ -221,6 +235,36 @@ mod tests {
         assert_eq!(raw.len(), 2);
         raw.extend_from_slice(name.as_bytes());
         assert_eq!(decode_name(&raw), Some(name));
+    }
+
+    #[test]
+    fn fight_point_attr_sets_ability_score() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::FIGHT_POINT,
+            raw_data: varint(123_456),
+        }];
+        assert_eq!(
+            player_info_from_attrs(1, &attrs).ability_score,
+            Some(123_456)
+        );
+    }
+
+    #[test]
+    fn missing_fight_point_attr_yields_no_ability_score() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::PROFESSION_ID,
+            raw_data: varint(1),
+        }];
+        assert_eq!(player_info_from_attrs(1, &attrs).ability_score, None);
+    }
+
+    #[test]
+    fn out_of_range_fight_point_is_rejected_not_truncated() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::FIGHT_POINT,
+            raw_data: varint(0x1_0000_0001),
+        }];
+        assert_eq!(player_info_from_attrs(1, &attrs).ability_score, None);
     }
 
     #[test]
