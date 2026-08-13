@@ -1,3 +1,4 @@
+pub mod backoff;
 pub mod detect;
 pub mod error;
 pub mod install;
