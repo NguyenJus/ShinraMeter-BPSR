@@ -8,6 +8,7 @@
 mod fonts;
 mod pipeline;
 mod platform;
+mod settings;
 mod ui;
 
 use std::path::PathBuf;
