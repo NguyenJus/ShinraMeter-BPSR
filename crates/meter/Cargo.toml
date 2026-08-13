@@ -8,3 +8,6 @@ license = "GPL-3.0-only"
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+bpsr-test-support = { workspace = true }

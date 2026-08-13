@@ -7,7 +7,6 @@
 //! logged and swallowed rather than propagated as a panic or error: a broken
 //! cache must degrade to "no cache", never crash the app.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -28,16 +27,24 @@ struct CachedEntry {
     class: Option<Class>,
 }
 
-/// Loads the uid -> (name, class) cache from `path`. A missing file is the
-/// expected first-run state and resolves silently to an empty map; any other
-/// read or parse failure resolves to an empty map too, logged at `warn`.
-pub fn load(path: &Path) -> HashMap<i64, (Option<String>, Option<Class>)> {
+/// A loaded uid -> (name, class) cache, in on-disk order (most-recently-used
+/// first — see [`load`]'s docs). Named so `Meter::with_names_cache`'s
+/// signature (and clippy) don't have to spell the nested tuple out.
+pub type LoadedNames = Vec<(i64, (Option<String>, Option<Class>))>;
+
+/// Loads the uid -> (name, class) cache from `path`, preserving on-disk
+/// order (most-recently-used first, matching `save`'s ordering contract) —
+/// callers that reconstruct recency (see `Meter::with_names_cache`) depend on
+/// this order rather than any incidental iteration order. A missing file is
+/// the expected first-run state and resolves silently to an empty vec; any
+/// other read or parse failure resolves to an empty vec too, logged at `warn`.
+pub fn load(path: &Path) -> LoadedNames {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(err) => {
             log::warn!("names cache: failed to read {}: {err}", path.display());
-            return HashMap::new();
+            return Vec::new();
         }
     };
 
@@ -48,7 +55,7 @@ pub fn load(path: &Path) -> HashMap<i64, (Option<String>, Option<Class>)> {
             .collect(),
         Err(err) => {
             log::warn!("names cache: corrupt file {}: {err}", path.display());
-            HashMap::new()
+            Vec::new()
         }
     }
 }
@@ -104,16 +111,7 @@ pub fn save(path: &Path, names: &[(i64, Option<String>, Option<Class>)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// A fresh, never-yet-existing path under the OS temp dir, unique per
-    /// call so parallel tests never collide.
-    fn scratch_path(label: &str) -> std::path::PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("bpsr-names-cache-test-{label}-{n}.json"))
-    }
+    use bpsr_test_support::scratch_path;
 
     #[test]
     fn round_trip_load_after_save() {
@@ -126,13 +124,14 @@ mod tests {
         save(&path, &names);
 
         let loaded = load(&path);
-        assert_eq!(loaded.len(), 3);
         assert_eq!(
-            loaded[&1],
-            (Some("Alice".to_string()), Some(Class::Marksman))
+            loaded,
+            vec![
+                (1, (Some("Alice".to_string()), Some(Class::Marksman))),
+                (2, (None, Some(Class::FrostMage))),
+                (3, (Some("Carol".to_string()), None)),
+            ]
         );
-        assert_eq!(loaded[&2], (None, Some(Class::FrostMage)));
-        assert_eq!(loaded[&3], (Some("Carol".to_string()), None));
 
         let _ = fs::remove_file(&path);
     }
@@ -167,8 +166,12 @@ mod tests {
         assert_eq!(loaded.len(), MAX_CACHED_NAMES);
         // The cap keeps the front of the slice (the caller's
         // most-recently-used ordering) and drops the tail.
-        assert!(loaded.contains_key(&0));
-        assert!(!loaded.contains_key(&(MAX_CACHED_NAMES as i64 + 100)));
+        assert_eq!(loaded[0].0, 0);
+        assert!(
+            !loaded
+                .iter()
+                .any(|(uid, _)| *uid == MAX_CACHED_NAMES as i64 + 100)
+        );
 
         let _ = fs::remove_file(&path);
     }

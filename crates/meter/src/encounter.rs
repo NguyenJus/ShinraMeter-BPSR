@@ -66,24 +66,26 @@ impl Meter {
     }
 
     /// Seeds the name cache from a previously-persisted uid -> (name, class)
-    /// map (issue #12) before any packet has been seen this session, so a
+    /// list (issue #12) before any packet has been seen this session, so a
     /// previously-known player resolves instantly instead of showing
     /// `Player {uid}` until their first info/damage packet arrives. Live
     /// packet data received afterwards always takes precedence over a
     /// seeded value (see `name_upsert`).
-    pub fn with_names_cache(cached: HashMap<i64, (Option<String>, Option<Class>)>) -> Self {
+    ///
+    /// `cached` must be in on-disk order, most-recently-used first (see
+    /// `names_cache::load`); descending `seq` values are assigned following
+    /// that order so the on-disk recency ranking survives the session
+    /// boundary instead of being reshuffled into arbitrary iteration order.
+    pub fn with_names_cache(cached: crate::names_cache::LoadedNames) -> Self {
         let mut m = Self::new();
-        for (uid, (name, class)) in cached {
-            m.names_seq += 1;
-            m.names.insert(
-                uid,
-                NameEntry {
-                    name,
-                    class,
-                    seq: m.names_seq,
-                },
-            );
+        let total = cached.len() as u64;
+        for (i, (uid, (name, class))) in cached.into_iter().enumerate() {
+            // Index 0 is the most-recently-used on-disk entry, so it gets the
+            // highest seq; the last entry gets seq 1.
+            let seq = total - i as u64;
+            m.names.insert(uid, NameEntry { name, class, seq });
         }
+        m.names_seq = total;
         m
     }
 
@@ -543,12 +545,10 @@ mod tests {
 
     mod names_cache {
         use super::*;
-        use std::collections::HashMap;
 
         #[test]
         fn cached_name_resolves_before_any_packet_arrives_this_session() {
-            let mut cache = HashMap::new();
-            cache.insert(5, (Some("Cached".to_string()), Some(Class::Marksman)));
+            let cache = vec![(5, (Some("Cached".to_string()), Some(Class::Marksman)))];
             let mut m = Meter::with_names_cache(cache);
 
             // No PlayerInfo event this session — only damage.
@@ -561,8 +561,7 @@ mod tests {
 
         #[test]
         fn live_player_info_overrides_cached_name() {
-            let mut cache = HashMap::new();
-            cache.insert(5, (Some("Stale".to_string()), Some(Class::Marksman)));
+            let cache = vec![(5, (Some("Stale".to_string()), Some(Class::Marksman)))];
             let mut m = Meter::with_names_cache(cache);
 
             m.apply(&ProtocolEvent::Player(PlayerInfo {
@@ -579,8 +578,7 @@ mod tests {
 
         #[test]
         fn live_partial_update_keeps_cached_field_it_did_not_supply() {
-            let mut cache = HashMap::new();
-            cache.insert(5, (Some("Cached".to_string()), Some(Class::Marksman)));
+            let cache = vec![(5, (Some("Cached".to_string()), Some(Class::Marksman)))];
             let mut m = Meter::with_names_cache(cache);
 
             // Live packet only carries a name this time, no class.
@@ -598,15 +596,77 @@ mod tests {
 
         #[test]
         fn names_for_save_round_trips_through_with_names_cache() {
-            let mut cache = HashMap::new();
-            cache.insert(1, (Some("Alice".to_string()), Some(Class::Marksman)));
-            cache.insert(2, (Some("Bob".to_string()), None));
+            let cache = vec![
+                (1, (Some("Alice".to_string()), Some(Class::Marksman))),
+                (2, (Some("Bob".to_string()), None)),
+            ];
             let m = Meter::with_names_cache(cache);
 
             let saved = m.names_for_save();
             assert_eq!(saved.len(), 2);
             assert!(saved.contains(&(1, Some("Alice".to_string()), Some(Class::Marksman))));
             assert!(saved.contains(&(2, Some("Bob".to_string()), None)));
+        }
+
+        #[test]
+        fn with_names_cache_assigns_seq_following_on_disk_order() {
+            // `cached` is in on-disk order, most-recently-used first (as
+            // `names_cache::load` returns it). The resulting recency order
+            // (via `names_for_save`) must follow that order exactly, not an
+            // arbitrary HashMap-derived order.
+            let cache = vec![
+                (30, (Some("Thirty".to_string()), None)),
+                (10, (Some("Ten".to_string()), None)),
+                (20, (Some("Twenty".to_string()), None)),
+            ];
+            let m = Meter::with_names_cache(cache);
+
+            let saved = m.names_for_save();
+            let order: Vec<i64> = saved.iter().map(|(uid, _, _)| *uid).collect();
+            assert_eq!(order, vec![30, 10, 20]);
+        }
+
+        #[test]
+        fn load_save_round_trip_preserves_relative_recency_order() {
+            let path = bpsr_test_support::scratch_path("load-save-order");
+
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Player(PlayerInfo {
+                uid: 1,
+                name: Some("A".to_string()),
+                class: None,
+            }));
+            m.apply(&ProtocolEvent::Player(PlayerInfo {
+                uid: 2,
+                name: Some("B".to_string()),
+                class: None,
+            }));
+            m.apply(&ProtocolEvent::Player(PlayerInfo {
+                uid: 3,
+                name: Some("C".to_string()),
+                class: None,
+            }));
+            // Re-touch uid 1 so it becomes the most recently used, ahead of
+            // 3 and 2 (in that order).
+            m.apply(&ProtocolEvent::Player(PlayerInfo {
+                uid: 1,
+                name: Some("A".to_string()),
+                class: None,
+            }));
+
+            let before = m.names_for_save();
+            let order_before: Vec<i64> = before.iter().map(|(uid, _, _)| *uid).collect();
+            assert_eq!(order_before, vec![1, 3, 2]);
+
+            crate::names_cache::save(&path, &before);
+            let loaded = crate::names_cache::load(&path);
+            let m2 = Meter::with_names_cache(loaded);
+            let after = m2.names_for_save();
+            let order_after: Vec<i64> = after.iter().map(|(uid, _, _)| *uid).collect();
+
+            assert_eq!(order_before, order_after);
+
+            let _ = std::fs::remove_file(&path);
         }
 
         #[test]

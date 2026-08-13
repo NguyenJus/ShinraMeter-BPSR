@@ -557,6 +557,7 @@ dependencies = [
 name = "bpsr-meter"
 version = "0.1.0"
 dependencies = [
+ "bpsr-test-support",
  "log",
  "serde",
  "serde_json",
@@ -572,6 +573,10 @@ dependencies = [
  "thiserror 2.0.20",
  "zstd",
 ]
+
+[[package]]
+name = "bpsr-test-support"
+version = "0.1.0"
 
 [[package]]
 name = "bumpalo"
@@ -3027,6 +3032,7 @@ dependencies = [
  "bpsr-capture",
  "bpsr-meter",
  "bpsr-protocol",
+ "bpsr-test-support",
  "crossbeam-channel",
  "eframe",
  "egui",
