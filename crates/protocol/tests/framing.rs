@@ -116,7 +116,7 @@ fn interleaved_known_and_unknown_opcodes_only_known_produce_events() {
     // `DamageEvent.attacker_uid` above.
     stream.extend(notify(
         bpsr_protocol::decode::opcode::SYNC_CONTAINER_DATA,
-        &sync_container_data_payload(10, "Ari", 2),
+        &sync_container_data_payload(10, "Ari", 2, 0),
         false,
     ));
     stream.extend(notify(0x0000_00bb, b"unknown-3", false));
@@ -133,6 +133,47 @@ fn interleaved_known_and_unknown_opcodes_only_known_produce_events() {
             assert_eq!(p.uid, 10);
             assert_eq!(p.name.as_deref(), Some("Ari"));
         }
+        other => panic!("expected Player, got {other:?}"),
+    }
+}
+
+/// `CharBaseInfo.fight_point` (ability score) is carried straight through
+/// into `PlayerInfo.ability_score`.
+#[test]
+fn container_data_fight_point_becomes_ability_score() {
+    let mut stream = Vec::new();
+    stream.extend(notify(
+        bpsr_protocol::decode::opcode::SYNC_CONTAINER_DATA,
+        &sync_container_data_payload(11, "Zed", 2, 98_765),
+        false,
+    ));
+
+    let mut decoder = Decoder::new();
+    let events = decoder.push_stream(&stream, 5);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ProtocolEvent::Player(p) => assert_eq!(p.ability_score, Some(98_765)),
+        other => panic!("expected Player, got {other:?}"),
+    }
+}
+
+/// A zero `fight_point` (the wire default when the server doesn't populate
+/// the field) is treated as absent, matching how an empty `name` is treated
+/// as absent.
+#[test]
+fn container_data_zero_fight_point_is_no_ability_score() {
+    let mut stream = Vec::new();
+    stream.extend(notify(
+        bpsr_protocol::decode::opcode::SYNC_CONTAINER_DATA,
+        &sync_container_data_payload(12, "Yin", 2, 0),
+        false,
+    ));
+
+    let mut decoder = Decoder::new();
+    let events = decoder.push_stream(&stream, 5);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ProtocolEvent::Player(p) => assert_eq!(p.ability_score, None),
         other => panic!("expected Player, got {other:?}"),
     }
 }

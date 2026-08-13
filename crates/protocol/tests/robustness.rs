@@ -49,7 +49,7 @@ fn valid_stream() -> Vec<u8> {
     let mut stream = framedown(&nested, true);
     stream.extend(notify(
         bpsr_protocol::decode::opcode::SYNC_CONTAINER_DATA,
-        &sync_container_data_payload(7, "Ari", 2),
+        &sync_container_data_payload(7, "Ari", 2, 0),
         false,
     ));
     stream
