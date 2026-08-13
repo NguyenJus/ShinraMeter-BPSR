@@ -74,6 +74,11 @@ pub struct CaptureHandle {
     /// to move it out through `&mut self` — a value of a type that
     /// implements `Drop` cannot be partially moved out of by value.
     join: Option<JoinHandle<()>>,
+    /// Set once [`Self::shutdown_and_close`] has run, so a second call
+    /// (`stop()` followed by the `Drop` that runs when it returns) is a
+    /// no-op instead of re-running `WinDivertShutdown`/`WinDivertClose` on an
+    /// already-closed handle.
+    closed: bool,
 }
 
 impl CaptureHandle {
@@ -91,18 +96,23 @@ impl CaptureHandle {
     /// driver-documented way to unblock a thread parked in a recv on the
     /// same handle from another thread.
     ///
-    /// Does the same work as `Drop`, then `mem::forget`s `self` so `Drop`
-    /// never repeats it — the driver handle must be closed exactly once.
+    /// Does the same work `Drop` would; the `closed` guard in
+    /// `shutdown_and_close` makes the `Drop` that runs when `self` falls out
+    /// of scope here a no-op, so the driver handle is still closed exactly
+    /// once and nothing in `self` (the `stop`/`restart` `Arc`s included) is
+    /// leaked.
     pub fn stop(mut self) {
         self.shutdown_and_close();
-        std::mem::forget(self);
     }
 
     /// Shared teardown: signal, unblock `recv`, join the thread, close the
-    /// handle. Idempotent to call at most once per handle — callers
-    /// (`stop`, `Drop::drop`) are responsible for that, since `HANDLE` has no
-    /// "already closed" state of its own to check.
+    /// handle. Idempotent — guarded by `closed` — so it is safe to call from
+    /// both `stop` and the `Drop` that follows it.
     fn shutdown_and_close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
         self.stop.store(true, Ordering::SeqCst);
         // SAFETY: `self.handle` is a live WinDivert handle (checked at open,
         // closed only below after the capture thread has joined).
@@ -127,9 +137,9 @@ impl Drop for CaptureHandle {
     /// Runs `WinDivertShutdown`/join/`WinDivertClose` if the handle is
     /// dropped without an explicit `stop()` — e.g. an unwind out of
     /// `eframe::run_native` — so the driver handle and capture thread are
-    /// never leaked until process exit. `stop()` performs this same
-    /// teardown itself and then `mem::forget`s `self`, so this never runs a
-    /// second time for a handle that was `stop()`-ed.
+    /// never leaked until process exit. `stop()` performs this same teardown
+    /// itself; the `closed` guard in `shutdown_and_close` makes this a no-op
+    /// when it then runs on the same handle.
     fn drop(&mut self) {
         self.shutdown_and_close();
     }
@@ -159,6 +169,7 @@ pub fn start_capture(tx: Sender<ProtocolEvent>) -> Result<CaptureHandle, Capture
         handle,
         api,
         join: Some(join),
+        closed: false,
     })
 }
 
