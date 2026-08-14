@@ -17,6 +17,7 @@ use crate::ui::{StatColumn, fmt_share, fmt_short};
 /// enabled, regardless of the order columns were toggled in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ColumnKind {
+    AbilityScore,
     Damage,
     Dps,
     SharePct,
@@ -27,7 +28,14 @@ pub enum ColumnKind {
 
 impl ColumnKind {
     /// Every selectable column, in canonical left-to-right order.
-    pub const ALL: [ColumnKind; 6] = [
+    ///
+    /// `AbilityScore` leads the list rather than sitting among the
+    /// combat-derived columns: it's a static per-player character stat (a
+    /// gear-score snapshot, not something that accrues over the fight like
+    /// damage/hits do), so it reads better next to the row's name than
+    /// mixed in with `Damage`/`Dps`/etc.
+    pub const ALL: [ColumnKind; 7] = [
+        ColumnKind::AbilityScore,
         ColumnKind::Damage,
         ColumnKind::Dps,
         ColumnKind::SharePct,
@@ -39,6 +47,7 @@ impl ColumnKind {
     /// Label shown next to this column's checkbox in the settings menu.
     pub fn label(self) -> &'static str {
         match self {
+            ColumnKind::AbilityScore => "Ability Score",
             ColumnKind::Damage => "Damage",
             ColumnKind::Dps => "DPS",
             ColumnKind::SharePct => "Share %",
@@ -59,6 +68,18 @@ impl ColumnKind {
     /// holds every column here to that budget.
     pub fn spec(self) -> StatColumn {
         match self {
+            // `None` (no FIGHT_POINT packet seen yet for this player) is a
+            // blank cell, not "0" — a missing reading is not the same as a
+            // zero score. `fmt_short`'s ≤6-char budget applies whenever a
+            // value is present, so this shares the 56.0 width with
+            // `Damage`/`Hits`.
+            ColumnKind::AbilityScore => StatColumn {
+                width: 56.0,
+                text: |row| match row.ability_score {
+                    Some(v) => fmt_short(v as i64),
+                    None => String::new(),
+                },
+            },
             ColumnKind::Damage => StatColumn {
                 width: 56.0,
                 text: |row| fmt_short(row.damage),
@@ -346,6 +367,37 @@ mod tests {
         settings.toggle(ColumnKind::Damage);
 
         assert_eq!(settings.visible_columns, vec![ColumnKind::Damage]);
+    }
+
+    #[test]
+    fn ability_score_is_not_visible_by_default() {
+        assert!(!Settings::default().is_visible(ColumnKind::AbilityScore));
+    }
+
+    #[test]
+    fn ability_score_column_round_trips() {
+        let path = temp_settings_path("ability-score-roundtrip");
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::AbilityScore);
+        save_to(&path, &settings);
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded, settings);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn settings_json_without_ability_score_still_deserializes() {
+        let path = temp_settings_path("legacy-no-ability-score");
+        fs::write(&path, br#"{"visible_columns":["Damage","Dps","SharePct"]}"#)
+            .expect("write legacy fixture");
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded, Settings::default());
+        assert!(!loaded.is_visible(ColumnKind::AbilityScore));
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

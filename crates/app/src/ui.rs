@@ -541,6 +541,35 @@ mod tests {
         assert_eq!(fmt_share(100.0), "100.0%");
     }
 
+    fn sample_row(ability_score: Option<u32>) -> PlayerRow {
+        PlayerRow {
+            uid: 1,
+            name: String::new(),
+            class: None,
+            damage: 0,
+            dps: 0.0,
+            share_pct: 0.0,
+            crit_pct: 0.0,
+            lucky_pct: 0.0,
+            hits: 0,
+            ability_score,
+        }
+    }
+
+    #[test]
+    fn ability_score_column_blank_when_none() {
+        let row = sample_row(None);
+        let column = ColumnKind::AbilityScore.spec();
+        assert_eq!((column.text)(&row), "");
+    }
+
+    #[test]
+    fn ability_score_column_formats_value_when_some() {
+        let row = sample_row(Some(12_345));
+        let column = ColumnKind::AbilityScore.spec();
+        assert_eq!((column.text)(&row), fmt_short(12_345));
+    }
+
     fn window() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(340.0, 220.0))
     }
@@ -809,7 +838,7 @@ mod tests {
         let cols = settings.ordered_columns();
         let anchors = column_anchors(0.0, 300.0, &stat_columns_for(&cols), 4.0);
 
-        assert_eq!(anchors.len(), 5);
+        assert_eq!(anchors.len(), ColumnKind::ALL.len() - 1);
         assert_eq!(*anchors.last().unwrap(), 300.0 - 4.0);
         for pair in anchors.windows(2) {
             assert!(pair[0] < pair[1]);
