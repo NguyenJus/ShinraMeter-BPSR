@@ -60,6 +60,12 @@ fn main() -> eframe::Result {
     let (rx_snapshot, pipeline_thread) = pipeline::spawn(rx_events, rx_command, names_cache_path());
     let (tx_settings, settings_thread) = settings::spawn_writer();
 
+    // Loaded once, here, rather than inside `OverlayApp::new`: issue #27
+    // needs this same value before `OverlayApp` exists, to seed
+    // `ui::viewport`'s starting position, so the single load is hoisted up
+    // to cover both uses instead of loading twice.
+    let settings = settings::load();
+
     // Kept alongside the clone handed to `OverlayApp` so shutdown can signal
     // the pipeline explicitly below, rather than depending on `run_native`
     // having already dropped `OverlayApp` (and with it its own sender) by
@@ -67,7 +73,7 @@ fn main() -> eframe::Result {
     let tx_command_shutdown = tx_command.clone();
 
     let native_options = eframe::NativeOptions {
-        viewport: ui::viewport(),
+        viewport: ui::viewport(settings.window_position),
         ..Default::default()
     };
 
@@ -79,7 +85,7 @@ fn main() -> eframe::Result {
             ui::apply_theme(&cc.egui_ctx);
             platform::disable_aero_snap(cc);
             Ok(Box::new(
-                OverlayApp::new(rx_snapshot, tx_command, tx_settings).with_status(status),
+                OverlayApp::new(rx_snapshot, tx_command, tx_settings, settings).with_status(status),
             ))
         }),
     );

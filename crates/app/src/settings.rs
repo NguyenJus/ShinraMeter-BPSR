@@ -1,7 +1,10 @@
-//! Persisted user settings: which stat columns the meter renders (issue #13).
+//! Persisted user settings: which stat columns the meter renders (issue #13)
+//! and where the overlay window sits (issue #27).
 //!
 //! Lives entirely at the UI layer — no meter/pipeline involvement. Loaded
-//! once at startup and saved on every change from the settings menu.
+//! once at startup, then written by two paths: a change from the settings
+//! menu, and a drag that moves the overlay window. Both go through the
+//! settings-writer thread rather than saving inline (`spawn_writer`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -120,15 +123,32 @@ impl ColumnKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub visible_columns: Vec<ColumnKind>,
+    /// Last on-screen window position (issue #27), applied via
+    /// `ViewportBuilder::with_position` on the next launch, or `None` if the
+    /// window has never been dragged (or this predates the field). The
+    /// `#[serde(default)]` is what lets a settings.json written before issue
+    /// #27 (with no `window_position` key at all) keep deserializing instead
+    /// of erroring on a missing field — the only backward-compat guarantee
+    /// this change makes.
+    #[serde(default)]
+    pub window_position: Option<[f32; 2]>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             visible_columns: vec![ColumnKind::Damage, ColumnKind::Dps, ColumnKind::SharePct],
+            window_position: None,
         }
     }
 }
+
+/// How far (in logical pixels) the window has to move before it counts as a
+/// new `window_position`. The coordinates come from live UI reporting and
+/// jitter by sub-pixel amounts under fractional DPI scaling without the
+/// window having been touched, so exact equality would forward that jitter
+/// to the settings-writer channel on every repaint.
+const POSITION_EPSILON: f32 = 1.0;
 
 impl Settings {
     /// Whether `col` is currently enabled.
@@ -158,16 +178,34 @@ impl Settings {
         }
     }
 
-    /// Falls back to the default column set if this value is in a nonsense
-    /// state (currently: no columns enabled). `toggle` already prevents
+    /// Returns an updated copy with `window_position` set to `position`, or
+    /// `None` if it is still the same position (issue #27). The overlay
+    /// reports its outer position every single frame — including every frame
+    /// of a drag gesture — so this is the change-detection gate that keeps
+    /// the settings-writer channel from being sent an identical value on
+    /// every repaint; only an actual move should result in a send.
+    pub fn with_window_position_if_changed(&self, position: [f32; 2]) -> Option<Settings> {
+        if let Some(current) = self.window_position
+            && (current[0] - position[0]).abs() < POSITION_EPSILON
+            && (current[1] - position[1]).abs() < POSITION_EPSILON
+        {
+            return None;
+        }
+        let mut updated = self.clone();
+        updated.window_position = Some(position);
+        Some(updated)
+    }
+
+    /// Repairs a nonsense state (currently: no columns enabled) by resetting
+    /// only the offending field, leaving everything else — `window_position`
+    /// included — exactly as it was loaded. `toggle` already prevents
     /// reaching this via the settings menu, but a hand-edited or otherwise
     /// malformed settings file could still deserialize into one.
-    fn sanitized(self) -> Self {
+    fn sanitized(mut self) -> Self {
         if self.visible_columns.is_empty() {
-            Self::default()
-        } else {
-            self
+            self.visible_columns = Self::default().visible_columns;
         }
+        self
     }
 }
 
@@ -362,6 +400,7 @@ mod tests {
     fn toggle_refuses_to_disable_the_last_visible_column() {
         let mut settings = Settings {
             visible_columns: vec![ColumnKind::Damage],
+            window_position: None,
         };
 
         settings.toggle(ColumnKind::Damage);
@@ -404,6 +443,7 @@ mod tests {
     fn empty_visible_columns_sanitizes_to_default() {
         let settings = Settings {
             visible_columns: vec![],
+            window_position: None,
         };
         assert_eq!(settings.sanitized(), Settings::default());
     }
@@ -414,6 +454,25 @@ mod tests {
         fs::write(&path, br#"{"visible_columns":[]}"#).expect("write fixture");
 
         assert_eq!(load_from(&path), Settings::default());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Repairing the column list must not throw the rest of the file away:
+    /// a settings.json with no columns but a perfectly good window position
+    /// still reopens the overlay where it was left.
+    #[test]
+    fn sanitizing_an_empty_column_list_keeps_every_other_field() {
+        let path = temp_settings_path("empty-columns-with-position");
+        fs::write(
+            &path,
+            br#"{"visible_columns":[],"window_position":[321.0,654.0]}"#,
+        )
+        .expect("write fixture");
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded.window_position, Some([321.0, 654.0]));
+        assert_eq!(loaded.visible_columns, Settings::default().visible_columns);
         let _ = fs::remove_file(&path);
     }
 
@@ -475,16 +534,120 @@ mod tests {
         handle.join().expect("writer thread should not panic");
     }
 
+    // -- window_position (issue #27) --------------------------------------
+
+    #[test]
+    fn round_trip_preserves_window_position() {
+        let path = temp_settings_path("position-roundtrip");
+        let settings = Settings {
+            window_position: Some([123.0, 456.0]),
+            ..Settings::default()
+        };
+        save_to(&path, &settings);
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded, settings);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A settings.json written before issue #27 (no `window_position` key at
+    /// all) must still deserialize — the one backward-compat guarantee this
+    /// change makes (`#[serde(default)]`, not a migration).
+    #[test]
+    fn settings_json_without_window_position_key_falls_back_to_none() {
+        let path = temp_settings_path("no-position-key");
+        fs::write(&path, br#"{"visible_columns":["Damage","Dps","SharePct"]}"#)
+            .expect("write pre-#27 fixture");
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded.window_position, None);
+        assert_eq!(loaded.visible_columns, Settings::default().visible_columns);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn with_window_position_if_changed_returns_none_when_unchanged() {
+        let settings = Settings {
+            window_position: Some([10.0, 20.0]),
+            ..Settings::default()
+        };
+
+        assert_eq!(settings.with_window_position_if_changed([10.0, 20.0]), None);
+    }
+
+    #[test]
+    fn with_window_position_if_changed_returns_updated_settings_on_change() {
+        let settings = Settings {
+            window_position: Some([10.0, 20.0]),
+            ..Settings::default()
+        };
+
+        let updated = settings
+            .with_window_position_if_changed([30.0, 40.0])
+            .expect("position changed, should produce an update");
+
+        assert_eq!(updated.window_position, Some([30.0, 40.0]));
+        // Everything else carries over unchanged.
+        assert_eq!(updated.visible_columns, settings.visible_columns);
+    }
+
+    /// Sub-pixel drift under fractional DPI scaling is not a move — the
+    /// window sat still and the reported coordinates merely wobbled.
+    #[test]
+    fn with_window_position_if_changed_ignores_sub_pixel_jitter() {
+        let settings = Settings {
+            window_position: Some([10.0, 20.0]),
+            ..Settings::default()
+        };
+
+        assert_eq!(
+            settings.with_window_position_if_changed([10.4, 19.6]),
+            None,
+            "a fraction of a pixel is not a move"
+        );
+    }
+
+    /// A move of a full logical pixel or more is a real move and must be
+    /// persisted.
+    #[test]
+    fn with_window_position_if_changed_reports_a_one_pixel_move() {
+        let settings = Settings {
+            window_position: Some([10.0, 20.0]),
+            ..Settings::default()
+        };
+
+        let updated = settings
+            .with_window_position_if_changed([10.0, 21.0])
+            .expect("a full pixel of movement should produce an update");
+
+        assert_eq!(updated.window_position, Some([10.0, 21.0]));
+    }
+
+    #[test]
+    fn with_window_position_if_changed_treats_no_prior_position_as_a_change() {
+        let settings = Settings::default();
+        assert_eq!(settings.window_position, None);
+
+        let updated = settings
+            .with_window_position_if_changed([1.0, 2.0])
+            .expect("first-ever position should count as a change");
+        assert_eq!(updated.window_position, Some([1.0, 2.0]));
+    }
+
     #[test]
     fn ordered_columns_follows_canonical_order_regardless_of_toggle_order() {
         let mut a = Settings {
             visible_columns: vec![ColumnKind::Damage],
+            window_position: None,
         };
         a.toggle(ColumnKind::Hits);
         a.toggle(ColumnKind::CritPct);
 
         let mut b = Settings {
             visible_columns: vec![ColumnKind::Damage],
+            window_position: None,
         };
         b.toggle(ColumnKind::CritPct);
         b.toggle(ColumnKind::Hits);
