@@ -125,19 +125,48 @@ impl eframe::App for OverlayApp {
 /// on an actual change; the writer thread's own burst-coalescing
 /// (`run_writer` in `settings.rs`) still collapses a drag's many small
 /// changes into a single disk write.
+///
+/// A minimized window is skipped entirely: the platform parks it far
+/// off-screen (Windows uses -32000, -32000) and reports *that* as the outer
+/// position, which would otherwise be persisted and reopen the overlay
+/// somewhere the user cannot reach it.
 fn track_window_position(
     ctx: &egui::Context,
     settings: &mut Settings,
     tx_settings: &Sender<Settings>,
 ) {
-    let Some(rect) = ctx.input(|i| i.viewport().outer_rect) else {
+    let (outer_rect, minimized) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().minimized));
+    if minimized == Some(true) {
+        return;
+    }
+    let Some(rect) = outer_rect else {
         return;
     };
+    if !is_plausible_position(rect.min) {
+        return;
+    }
     if let Some(updated) = settings.with_window_position_if_changed([rect.min.x, rect.min.y]) {
         *settings = updated.clone();
         let _ = tx_settings.send(updated);
     }
 }
+
+/// Whether a reported window position is worth persisting at all — belt and
+/// braces behind `track_window_position`'s minimized guard, in case a
+/// platform reports its off-screen parking spot for a frame before the
+/// `minimized` flag catches up. A multi-monitor layout can legitimately put
+/// the overlay at negative coordinates, so only absurd ones are rejected.
+fn is_plausible_position(position: egui::Pos2) -> bool {
+    position.x.is_finite()
+        && position.y.is_finite()
+        && position.x > MIN_PLAUSIBLE_COORD
+        && position.y > MIN_PLAUSIBLE_COORD
+}
+
+/// Floor for a believable on-screen coordinate: far enough out to clear any
+/// real monitor arrangement, tight enough to catch Windows' -32000 parking
+/// spot for minimized windows.
+const MIN_PLAUSIBLE_COORD: f32 = -20_000.0;
 
 fn draw_header(
     ui: &mut egui::Ui,
@@ -977,6 +1006,98 @@ mod tests {
         // the default opening size must never start below its own floor.
         assert!(default_inner_width() >= 220.0);
         assert!(default_inner_height() >= 90.0);
+    }
+
+    // -- window position tracking (issue #27) -----------------------------
+
+    /// Runs one frame with `outer_rect`/`minimized` reported for the
+    /// viewport, calling `track_window_position` from inside it exactly like
+    /// `OverlayApp::update` does. Returns everything it sent on the
+    /// settings-writer channel.
+    fn track_one_frame(
+        settings: &mut Settings,
+        outer_rect: Option<egui::Rect>,
+        minimized: Option<bool>,
+    ) -> Vec<Settings> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut input = egui::RawInput::default();
+        input.viewports.insert(
+            input.viewport_id,
+            egui::ViewportInfo {
+                outer_rect,
+                minimized,
+                ..Default::default()
+            },
+        );
+
+        let ctx = egui::Context::default();
+        ctx.run_ui(input, |ui| track_window_position(ui.ctx(), settings, &tx))
+            .drop_without_applying_deltas();
+
+        drop(tx);
+        rx.try_iter().collect()
+    }
+
+    fn outer_rect_at(x: f32, y: f32) -> Option<egui::Rect> {
+        Some(egui::Rect::from_min_size(
+            egui::pos2(x, y),
+            egui::vec2(340.0, 220.0),
+        ))
+    }
+
+    #[test]
+    fn track_window_position_persists_a_moved_window() {
+        let mut settings = Settings::default();
+
+        let sent = track_one_frame(&mut settings, outer_rect_at(100.0, 200.0), Some(false));
+
+        assert_eq!(settings.window_position, Some([100.0, 200.0]));
+        assert_eq!(sent.len(), 1, "one move, one send");
+        assert_eq!(sent[0].window_position, Some([100.0, 200.0]));
+    }
+
+    #[test]
+    fn track_window_position_stays_quiet_when_the_window_has_not_moved() {
+        let mut settings = Settings {
+            window_position: Some([100.0, 200.0]),
+            ..Settings::default()
+        };
+
+        let sent = track_one_frame(&mut settings, outer_rect_at(100.0, 200.0), Some(false));
+
+        assert!(sent.is_empty(), "an unmoved window must not send");
+        assert_eq!(settings.window_position, Some([100.0, 200.0]));
+    }
+
+    /// Minimizing parks the window somewhere the user never put it, so
+    /// nothing reported while minimized is persisted — not even a position
+    /// that looks perfectly ordinary.
+    #[test]
+    fn track_window_position_ignores_a_minimized_window() {
+        let mut settings = Settings {
+            window_position: Some([100.0, 200.0]),
+            ..Settings::default()
+        };
+
+        let sent = track_one_frame(&mut settings, outer_rect_at(400.0, 500.0), Some(true));
+
+        assert!(sent.is_empty(), "a minimized window must not send");
+        assert_eq!(settings.window_position, Some([100.0, 200.0]));
+    }
+
+    /// Same parking spot, but reported before the `minimized` flag catches
+    /// up — the plausibility floor is what rejects it.
+    #[test]
+    fn track_window_position_ignores_an_absurd_off_screen_position() {
+        let mut settings = Settings {
+            window_position: Some([100.0, 200.0]),
+            ..Settings::default()
+        };
+
+        let sent = track_one_frame(&mut settings, outer_rect_at(-32000.0, -32000.0), None);
+
+        assert!(sent.is_empty(), "a bogus position must not send");
+        assert_eq!(settings.window_position, Some([100.0, 200.0]));
     }
 
     #[test]
