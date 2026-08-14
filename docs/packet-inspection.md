@@ -28,6 +28,39 @@ the minimal bytes needed as a synthetic fixture under
    you do below, so the corresponding dump records can be found afterward
    (`ts_ms` in each dump line).
 
+## Offline replay: `inspect-replay`
+
+Slice B added a small binary, `crates/protocol/src/bin/inspect-replay.rs`, that
+reads a dump file and re-runs the decoder over it *offline* — no live game or
+Windows box needed, so this is the tool to reach for while doing the diffing
+in steps 1-3 below. It rebuilds the same histograms a live run would have
+logged: every service id and method id observed (count, first/last-seen
+`ts_ms`, and whether it's one we currently decode), plus every unknown attr
+id (no constant in `attrs::attr_id`) observed on any entity's attr list, with
+a sample uid and raw bytes. Unrecognized service ids and unknown attr ids are
+called out distinctly from known ones — that distinction is the entire point
+of the tool.
+
+Run it against a dump:
+
+```
+cargo run -p bpsr-protocol --bin inspect-replay -- path/to/dump-<pid>.jsonl
+```
+
+Narrow it to a window around a noted timestamp with `--since`/`--until`
+(milliseconds, matching the dump's `ts_ms`), e.g. to look at just the minute
+around a zone transition noted at `ts_ms=1_699_999_000_000`:
+
+```
+cargo run -p bpsr-protocol --bin inspect-replay -- dump.jsonl \
+  --since 1699999000000 --until 1699999060000
+```
+
+Run it twice with different windows (before/after the event) and compare the
+two reports by eye — a service/method/attr id that only appears in the
+"after" window is the candidate. `cargo test -p bpsr-protocol` covers the
+reader itself against synthetic fixtures; it never needs a real dump to pass.
+
 ## Step 1 — control run: ability score (`FIGHT_POINT`)
 
 Ability score (`attr_id::FIGHT_POINT` / `SyncContainerData.char_base.fight_point`,
