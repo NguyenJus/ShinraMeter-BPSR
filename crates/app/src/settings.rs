@@ -70,7 +70,7 @@ impl ColumnKind {
         match self {
             // `None` (no FIGHT_POINT packet seen yet for this player) is a
             // blank cell, not "0" — a missing reading is not the same as a
-            // zero score. `fmt_short`'s ≤6-char budget applies whenever a
+            // zero score. `fmt_short`'s ≤7-char budget applies whenever a
             // value is present, so this shares the 56.0 width with
             // `Damage`/`Hits`.
             ColumnKind::AbilityScore => StatColumn {
@@ -84,7 +84,7 @@ impl ColumnKind {
                 width: 56.0,
                 text: |row| fmt_short(row.damage),
             },
-            // `fmt_short`'s ≤6 chars plus the 2-char "/s" suffix = ≤8
+            // `fmt_short`'s ≤7 chars plus the 2-char "/s" suffix = ≤9
             // chars, so this column needs more room than the others.
             ColumnKind::Dps => StatColumn {
                 width: 76.0,
@@ -102,7 +102,7 @@ impl ColumnKind {
                 width: 56.0,
                 text: |row| fmt_share(row.lucky_pct),
             },
-            // `fmt_short` bounds this to ~6 chars regardless of how many
+            // `fmt_short` bounds this to ~7 chars regardless of how many
             // hits land, so it shares `Damage`/`Dps`'s width instead of
             // growing without limit like a raw `to_string()` would (it
             // could otherwise overflow this column's fixed-width slot into

@@ -738,7 +738,7 @@ mod tests {
     /// `ColumnKind::ALL` holds every column — including any added later —
     /// to its own budget. Pre-fix, the dps column reused the damage
     /// column's 56.0-wide budget even though its text carries a 2-char
-    /// "/s" suffix on top of `fmt_short`'s ~6-char max — this test fails
+    /// "/s" suffix on top of `fmt_short`'s ~7-char max — this test fails
     /// against that width.
     #[test]
     fn widest_formatted_text_fits_its_column_width_budget() {
@@ -750,20 +750,21 @@ mod tests {
             .drop_without_applying_deltas();
 
         // Widest plausible value for every field any column formats:
-        // `fmt_short`'s 6-char maximum and `fmt_share`'s.
-        assert_eq!(fmt_short(999_949), "999.9K");
+        // `fmt_short`'s 7-char maximum (rounds up across a K/M/B
+        // threshold, e.g. 999_950 -> "1000.0K") and `fmt_share`'s.
+        assert_eq!(fmt_short(999_950), "1000.0K");
         assert_eq!(fmt_share(100.0), "100.0%");
         let widest_row = PlayerRow {
             uid: 1,
             name: String::new(),
             class: None,
-            damage: 999_949,
-            dps: 999_949.0,
+            damage: 999_950,
+            dps: 999_950.0,
             share_pct: 100.0,
             crit_pct: 100.0,
             lucky_pct: 100.0,
-            hits: 999_949,
-            ability_score: Some(999_949),
+            hits: 999_950,
+            ability_score: Some(999_950),
         };
 
         for (kind, column) in ColumnKind::ALL
