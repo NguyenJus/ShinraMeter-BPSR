@@ -10,3 +10,9 @@ bytes = { workspace = true }
 zstd = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+# Only used by the offline replay/inspect binary (src/bin/inspect-replay.rs,
+# issue #25 slice B) to parse the dump.jsonl format documented in
+# crates/app/src/dump.rs. Already resolved workspace-wide (crates/app uses
+# both), so this adds no new external dependency to the lockfile.
+serde = { workspace = true }
+serde_json = { workspace = true }

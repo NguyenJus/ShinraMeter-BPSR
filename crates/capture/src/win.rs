@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bpsr_protocol::{Decoder, ProtocolEvent};
+use bpsr_protocol::{Decoder, InspectSink, ProtocolEvent};
 use crossbeam_channel::Sender;
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use windows::Win32::Foundation::HANDLE;
@@ -147,8 +147,13 @@ impl Drop for CaptureHandle {
 
 /// Opens a WinDivert sniff-mode handle on all non-loopback TCP/IP traffic
 /// and spawns a thread that reassembles the detected game-server's TCP
-/// stream and emits decoded [`ProtocolEvent`]s on `tx`.
-pub fn start_capture(tx: Sender<ProtocolEvent>) -> Result<CaptureHandle, CaptureError> {
+/// stream and emits decoded [`ProtocolEvent`]s on `tx`. `inspect_sink`
+/// (issue #25 slice A) is opt-in diagnostic observation, wired straight into
+/// the thread's `Decoder`; `None` reproduces the pre-#25 decoder exactly.
+pub fn start_capture(
+    tx: Sender<ProtocolEvent>,
+    inspect_sink: Option<Arc<dyn InspectSink>>,
+) -> Result<CaptureHandle, CaptureError> {
     let filter = CString::new(FILTER).expect("FILTER is a literal without interior NULs");
     let api = crate::driver::api()?;
     let handle = api.open_sniff(&filter)?;
@@ -160,8 +165,16 @@ pub fn start_capture(tx: Sender<ProtocolEvent>) -> Result<CaptureHandle, Capture
     // `HANDLE` is a `Copy` newtype over `isize`; the capture thread gets its
     // own copy of the value, not a reference into shared state.
     let thread_handle = handle;
-    let join =
-        thread::spawn(move || recv_loop(api, thread_handle, tx, thread_stop, thread_restart));
+    let join = thread::spawn(move || {
+        recv_loop(
+            api,
+            thread_handle,
+            tx,
+            thread_stop,
+            thread_restart,
+            inspect_sink,
+        )
+    });
 
     Ok(CaptureHandle {
         stop,
@@ -197,12 +210,16 @@ fn recv_loop(
     tx: Sender<ProtocolEvent>,
     stop: Arc<AtomicBool>,
     restart: Arc<AtomicBool>,
+    inspect_sink: Option<Arc<dyn InspectSink>>,
 ) {
     let mut buffer = vec![0u8; RECV_BUFFER_SIZE];
     let mut known_server: Option<Conn> = None;
     let mut detector = ServerDetector::new();
     let mut reassembler = TcpReassembler::new();
-    let mut decoder = Decoder::new();
+    let mut decoder = match inspect_sink {
+        Some(sink) => Decoder::with_inspect_sink(sink),
+        None => Decoder::new(),
+    };
     let mut consecutive_errors: u32 = 0;
 
     while !stop.load(Ordering::Relaxed) {
