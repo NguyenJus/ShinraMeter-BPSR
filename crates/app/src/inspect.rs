@@ -3,10 +3,13 @@
 //! Off by default — `SHINRA_INSPECT=1` (any non-empty value other than `0`
 //! or `false`, case-insensitively) turns it on. When on:
 //!
-//! - every Notify-shaped fragment observed — recognized service or not — is
-//!   appended to a JSONL dump file on a dedicated writer thread, so a
-//!   session can be replayed offline (slice B item 4). See [`crate::dump`]
-//!   for the exact on-disk format.
+//! - every Notify-shaped fragment observed — recognized service or not, and
+//!   including one whose payload would not decompress (dumped as its raw
+//!   bytes with `payload_decoded: false`) — is appended to a JSONL dump file
+//!   on a dedicated writer thread, so a session can be replayed offline
+//!   (slice B item 4). See [`crate::dump`] for the exact on-disk format, and
+//!   for the drop-on-full policy that can make a dump incomplete under a
+//!   stalled disk (reported at shutdown).
 //! - the first time a given unrecognized service uuid is seen it is logged
 //!   at `info` level with its method id, payload length, and a truncated
 //!   hex prefix; a running count and first-seen timestamp are kept and
@@ -27,7 +30,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use bpsr_protocol::InspectSink;
-use crossbeam_channel::Sender;
 
 use crate::dump;
 
@@ -132,13 +134,13 @@ struct ServiceStat {
 /// unknown attr ids for the log-on-first-sight-plus-shutdown-summary
 /// behavior described in the module doc comment.
 struct DiagnosticSink {
-    tx: Sender<dump::Record>,
+    tx: dump::RecordSender,
     services: Mutex<HashMap<u64, ServiceStat>>,
     attrs: Mutex<HashMap<(i64, i32), u64>>,
 }
 
 impl DiagnosticSink {
-    fn new(tx: Sender<dump::Record>) -> Self {
+    fn new(tx: dump::RecordSender) -> Self {
         Self {
             tx,
             services: Mutex::new(HashMap::new()),
@@ -176,14 +178,23 @@ impl Drop for DiagnosticSink {
 }
 
 impl InspectSink for DiagnosticSink {
-    fn on_notify(&self, service_uuid: u64, method_id: u32, payload: &[u8], now_ms: u64) {
-        // Every service uuid, recognized or not, feeds the raw dump — it's
-        // what makes slice B's offline replay possible.
-        let _ = self.tx.send(dump::Record {
+    fn on_notify(
+        &self,
+        service_uuid: u64,
+        method_id: u32,
+        payload: &[u8],
+        payload_decoded: bool,
+        now_ms: u64,
+    ) {
+        // Every service uuid, recognized or not — and every payload,
+        // decompressed or not (`payload_decoded` tells a reader which) — feeds
+        // the raw dump; it's what makes slice B's offline replay possible.
+        self.tx.send(dump::Record {
             ts_ms: now_ms,
             service_uuid,
             method_id,
             payload: payload.to_vec(),
+            payload_decoded,
         });
 
         if service_uuid == bpsr_protocol::frame::SERVICE_UUID {
@@ -203,7 +214,7 @@ impl InspectSink for DiagnosticSink {
         stat.last_payload_len = payload.len();
         if is_new {
             log::info!(
-                "packet-inspect: new unrecognized service_uuid=0x{service_uuid:016x} method_id=0x{method_id:08x} payload_len={} first_seen_ms={now_ms} hex_prefix={}",
+                "packet-inspect: new unrecognized service_uuid=0x{service_uuid:016x} method_id=0x{method_id:08x} payload_len={} payload_decoded={payload_decoded} first_seen_ms={now_ms} hex_prefix={}",
                 payload.len(),
                 stat.hex_prefix,
             );
@@ -291,15 +302,15 @@ mod tests {
     // -- DiagnosticSink ---------------------------------------------------
 
     fn new_sink() -> (DiagnosticSink, crossbeam_channel::Receiver<dump::Record>) {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        (DiagnosticSink::new(tx), rx)
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        (DiagnosticSink::new(dump::RecordSender::new(tx)), rx)
     }
 
     #[test]
     fn on_notify_forwards_every_service_to_the_dump_channel_in_order() {
         let (sink, rx) = new_sink();
-        sink.on_notify(bpsr_protocol::frame::SERVICE_UUID, 1, b"a", 10);
-        sink.on_notify(0xDEAD, 2, b"bb", 20);
+        sink.on_notify(bpsr_protocol::frame::SERVICE_UUID, 1, b"a", true, 10);
+        sink.on_notify(0xDEAD, 2, b"bb", true, 20);
 
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -308,6 +319,7 @@ mod tests {
                 service_uuid: bpsr_protocol::frame::SERVICE_UUID,
                 method_id: 1,
                 payload: b"a".to_vec(),
+                payload_decoded: true,
             }
         );
         assert_eq!(
@@ -317,6 +329,26 @@ mod tests {
                 service_uuid: 0xDEAD,
                 method_id: 2,
                 payload: b"bb".to_vec(),
+                payload_decoded: true,
+            }
+        );
+    }
+
+    /// A fragment whose payload wouldn't decompress still reaches the dump —
+    /// as its raw bytes, flagged so a reader never feeds them to the decoder.
+    #[test]
+    fn on_notify_dumps_an_undecodable_payload_flagged_as_such() {
+        let (sink, rx) = new_sink();
+        sink.on_notify(0xDEAD, 3, b"raw-compressed", false, 30);
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            dump::Record {
+                ts_ms: 30,
+                service_uuid: 0xDEAD,
+                method_id: 3,
+                payload: b"raw-compressed".to_vec(),
+                payload_decoded: false,
             }
         );
     }
@@ -324,8 +356,8 @@ mod tests {
     #[test]
     fn unrecognized_service_is_aggregated_with_a_count_and_first_seen_timestamp() {
         let (sink, _rx) = new_sink();
-        sink.on_notify(0xDEAD, 1, b"a", 10);
-        sink.on_notify(0xDEAD, 2, b"bb", 20);
+        sink.on_notify(0xDEAD, 1, b"a", true, 10);
+        sink.on_notify(0xDEAD, 2, b"bb", true, 20);
 
         let services = sink.services.lock().unwrap();
         let stat = services.get(&0xDEAD).expect("service should be tracked");
@@ -338,7 +370,7 @@ mod tests {
     #[test]
     fn recognized_service_is_not_aggregated_as_unrecognized() {
         let (sink, _rx) = new_sink();
-        sink.on_notify(bpsr_protocol::frame::SERVICE_UUID, 1, b"a", 10);
+        sink.on_notify(bpsr_protocol::frame::SERVICE_UUID, 1, b"a", true, 10);
         assert!(sink.services.lock().unwrap().is_empty());
     }
 

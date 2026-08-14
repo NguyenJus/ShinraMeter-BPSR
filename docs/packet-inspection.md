@@ -19,12 +19,21 @@ the minimal bytes needed as a synthetic fixture under
    `SHINRA_INSPECT_DUMP=<path>` to control where the dump lands; otherwise it
    defaults to `%APPDATA%\shinra-bpsr\inspect\dump-<pid>.jsonl`).
 2. Play normally. Every unrecognized service uuid and every unknown attr id
-   gets logged (`packet-inspect: new ...`) the first time it's seen, with a
-   running count/first-seen timestamp/hex prefix summarized again in the log
-   when the app exits. The dump file accumulates every Notify-shaped
-   fragment observed, decompressed, with timestamps — see the format
-   documented in `crates/app/src/dump.rs`.
-3. Note wall-clock (or in-app elapsed) timestamps for anything interesting
+   — on enemy entities as well as player ones — gets logged
+   (`packet-inspect: new ...`) the first time it's seen, with a running
+   count/first-seen timestamp/hex prefix summarized again in the log when the
+   app exits. The dump file accumulates every Notify-shaped fragment
+   observed, decompressed, with timestamps — see the format documented in
+   `crates/app/src/dump.rs`. A fragment whose payload *fails* to decompress
+   (corrupt, or a codec we don't speak) is dumped too, as its raw bytes with
+   `"payload_decoded":false` — that traffic is exactly what this mode exists
+   to surface, so it is never dropped on the way to the dump.
+3. Check the shutdown log for `inspect dump is INCOMPLETE`. The dump channel
+   is bounded and drops records rather than back-pressuring packet capture,
+   so a stalled disk can thin a dump; that line (absent when nothing was
+   dropped) says how many records were lost, and therefore how much to trust
+   a count in the replay report below.
+4. Note wall-clock (or in-app elapsed) timestamps for anything interesting
    you do below, so the corresponding dump records can be found afterward
    (`ts_ms` in each dump line).
 
@@ -44,7 +53,11 @@ control run diffs — `FIGHT_POINT`'s raw value should visibly change across
 the gear swap; the unrecognized section is what steps 2-3 diff for a
 brand-new candidate id. Unrecognized service ids, undecoded method ids, and
 unrecognized attr ids are called out distinctly from known ones in every
-section — that distinction is the entire point of the tool.
+section — that distinction is the entire point of the tool. A final section
+totals the records whose payload the capture couldn't decompress: they still
+count towards the service/method histograms (a foreign codec is itself a
+finding) but contribute no attr ids, so a nonzero total there explains a
+thinner-than-expected attr section.
 
 Run it against a dump:
 

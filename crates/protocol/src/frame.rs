@@ -239,6 +239,29 @@ fn decode_payload(raw_payload: &[u8], is_zstd: bool) -> Option<Vec<u8>> {
     }
 }
 
+/// A Notify body's header fields plus its payload bytes, still exactly as
+/// they arrived (compressed, if the outer frame carried the zstd flag).
+struct NotifyBody<'a> {
+    service_uuid: u64,
+    method_id: u32,
+    raw_payload: &'a [u8],
+}
+
+/// Splits a Notify body into its header fields and payload; `None` on a
+/// truncated body. One parse for both modes — normal and diagnostic differ
+/// only in what they do with the result, never in how they read it.
+fn parse_notify_body(body: &[u8]) -> Option<NotifyBody<'_>> {
+    let mut reader = Reader::new(body);
+    let service_uuid = reader.read_u64()?;
+    let _stub_id = reader.read_u32()?;
+    let method_id = reader.read_u32()?;
+    Some(NotifyBody {
+        service_uuid,
+        method_id,
+        raw_payload: reader.read_rest(),
+    })
+}
+
 fn handle_notify(
     body: &[u8],
     is_zstd: bool,
@@ -246,57 +269,48 @@ fn handle_notify(
     sink: Option<&dyn InspectSink>,
     now_ms: u64,
 ) {
-    let Some(sink) = sink else {
-        // No diagnostic sink: byte-for-byte the pre-#25 code path — an
-        // unrecognized service uuid returns immediately, before stub_id or
-        // method_id are even read, so a normal (non-diagnostic) run pays
-        // nothing extra here.
-        let mut reader = Reader::new(body);
-        let service_uuid = match reader.read_u64() {
-            Some(v) => v,
-            None => return,
-        };
-        if service_uuid != SERVICE_UUID {
-            return;
-        }
-        let _stub_id = match reader.read_u32() {
-            Some(v) => v,
-            None => return,
-        };
-        let method_id = match reader.read_u32() {
-            Some(v) => v,
-            None => return,
-        };
-        let raw_payload = reader.read_rest();
-        let Some(payload) = decode_payload(raw_payload, is_zstd) else {
-            return;
-        };
-        out.push(Notify { method_id, payload });
+    let Some(body) = parse_notify_body(body) else {
         return;
     };
-
-    // Diagnostic path: fully parse and (attempt to) decompress regardless of
-    // service_uuid, so `sink.on_notify` observes every Notify-shaped
-    // fragment — including the ones a normal run would have dropped at the
-    // service check above.
-    let mut reader = Reader::new(body);
-    let Some(service_uuid) = reader.read_u64() else {
+    // Without a diagnostic sink this is the pre-#25 code path: an
+    // unrecognized service uuid returns before any decompression happens, so
+    // a normal run pays nothing extra for traffic it was always going to
+    // drop. With a sink, we decompress regardless of service uuid so
+    // `sink.on_notify` observes every Notify-shaped fragment — including the
+    // ones a normal run drops right here.
+    if sink.is_none() && body.service_uuid != SERVICE_UUID {
         return;
-    };
-    let Some(_stub_id) = reader.read_u32() else {
-        return;
-    };
-    let Some(method_id) = reader.read_u32() else {
-        return;
-    };
-    let raw_payload = reader.read_rest();
-    let Some(payload) = decode_payload(raw_payload, is_zstd) else {
-        return;
-    };
-    sink.on_notify(service_uuid, method_id, &payload, now_ms);
-    if service_uuid == SERVICE_UUID {
-        out.push(Notify { method_id, payload });
     }
+    let payload = decode_payload(body.raw_payload, is_zstd);
+    if let Some(sink) = sink {
+        // A payload we failed to decompress is still reported, as the raw
+        // undecompressed bytes flagged `payload_decoded = false` — malformed
+        // or foreign-codec traffic is exactly what the diagnostic mode
+        // exists to surface, so it must not vanish here.
+        let (observed, payload_decoded) = match payload.as_deref() {
+            Some(p) => (p, true),
+            None => (body.raw_payload, false),
+        };
+        sink.on_notify(
+            body.service_uuid,
+            body.method_id,
+            observed,
+            payload_decoded,
+            now_ms,
+        );
+    }
+    if body.service_uuid != SERVICE_UUID {
+        return;
+    }
+    // A decompression failure drops the fragment in both modes: `out` only
+    // ever carries payloads the decoder can actually read.
+    let Some(payload) = payload else {
+        return;
+    };
+    out.push(Notify {
+        method_id: body.method_id,
+        payload,
+    });
 }
 
 fn handle_frame_down(
@@ -367,9 +381,9 @@ mod tests {
         buf
     }
 
-    /// `(service_uuid, method_id, payload, now_ms)`, as recorded by
-    /// `RecordingSink::on_notify`.
-    type RecordedNotify = (u64, u32, Vec<u8>, u64);
+    /// `(service_uuid, method_id, payload, payload_decoded, now_ms)`, as
+    /// recorded by `RecordingSink::on_notify`.
+    type RecordedNotify = (u64, u32, Vec<u8>, bool, u64);
 
     /// Test-only `InspectSink` that just records every `on_notify` call, in
     /// order, for assertions.
@@ -386,11 +400,21 @@ mod tests {
     }
 
     impl InspectSink for RecordingSink {
-        fn on_notify(&self, service_uuid: u64, method_id: u32, payload: &[u8], now_ms: u64) {
-            self.notifies
-                .lock()
-                .unwrap()
-                .push((service_uuid, method_id, payload.to_vec(), now_ms));
+        fn on_notify(
+            &self,
+            service_uuid: u64,
+            method_id: u32,
+            payload: &[u8],
+            payload_decoded: bool,
+            now_ms: u64,
+        ) {
+            self.notifies.lock().unwrap().push((
+                service_uuid,
+                method_id,
+                payload.to_vec(),
+                payload_decoded,
+                now_ms,
+            ));
         }
 
         fn on_attr(&self, _uid: i64, _attr_id: i32, _raw: &[u8], _known: bool) {}
@@ -618,7 +642,10 @@ mod tests {
             "an unrecognized service must still be dropped from decoded notifies"
         );
         let seen = sink.notifies.lock().unwrap();
-        assert_eq!(*seen, vec![(other_service, 0x42, b"hello".to_vec(), 123)]);
+        assert_eq!(
+            *seen,
+            vec![(other_service, 0x42, b"hello".to_vec(), true, 123)]
+        );
     }
 
     /// A recognized service is *also* observed via the sink (this is what
@@ -635,7 +662,10 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         let seen = sink.notifies.lock().unwrap();
-        assert_eq!(*seen, vec![(SERVICE_UUID, 0x07, b"payload".to_vec(), 55)]);
+        assert_eq!(
+            *seen,
+            vec![(SERVICE_UUID, 0x07, b"payload".to_vec(), true, 55)]
+        );
     }
 
     /// `sink = None` reproduces the exact pre-#25 dropping behavior: no
@@ -667,6 +697,48 @@ mod tests {
 
         assert!(out.is_empty());
         let seen = sink.notifies.lock().unwrap();
-        assert_eq!(*seen, vec![(other_service, 0x9, b"nested".to_vec(), 7)]);
+        assert_eq!(
+            *seen,
+            vec![(other_service, 0x9, b"nested".to_vec(), true, 7)]
+        );
+    }
+
+    /// A Notify whose payload we cannot decompress is still handed to the
+    /// sink — as the raw undecompressed bytes, flagged `payload_decoded =
+    /// false` — because malformed/foreign-codec traffic is exactly what the
+    /// diagnostic mode exists to surface. It is still kept out of `out`.
+    #[test]
+    fn notify_whose_payload_fails_to_decompress_still_reaches_the_sink() {
+        let garbage = b"not-actually-zstd";
+        let body = build_notify_body(0x15, garbage);
+        let frame = build_frame(2, true, &body); // claims zstd, isn't
+        let sink = RecordingSink::new();
+        let mut out = Vec::new();
+
+        parse_frame(&frame, 0, &mut out, Some(&sink), 99);
+
+        assert!(
+            out.is_empty(),
+            "an undecodable payload must still be dropped from decoded notifies"
+        );
+        let seen = sink.notifies.lock().unwrap();
+        assert_eq!(
+            *seen,
+            vec![(SERVICE_UUID, 0x15, garbage.to_vec(), false, 99)]
+        );
+    }
+
+    /// The same undecodable fragment without a sink is dropped in silence,
+    /// exactly as before — the diagnostic seam must not change what a normal
+    /// run decodes.
+    #[test]
+    fn undecodable_payload_without_a_sink_is_dropped_silently() {
+        let body = build_notify_body(0x15, b"not-actually-zstd");
+        let frame = build_frame(2, true, &body);
+        let mut out = Vec::new();
+
+        parse_frame(&frame, 0, &mut out, None, 0);
+
+        assert!(out.is_empty());
     }
 }

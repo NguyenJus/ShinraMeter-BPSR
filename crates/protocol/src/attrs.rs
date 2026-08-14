@@ -128,15 +128,28 @@ pub fn player_info_from_attrs(
 }
 
 /// Builds an `EnemyHp` from an entity's `Attr` list, reading `HP`, `MAX_HP`,
-/// and `MONSTER_ID`. Unknown ids, empty `raw_data`, and `id == 0` are
-/// skipped.
-pub fn enemy_hp_from_attrs(uid: i64, attrs: &[pb::Attr], now_ms: u64) -> EnemyHp {
+/// and `MONSTER_ID`. Empty `raw_data` and `id == 0` are always skipped
+/// outright — no decoding, no sink call. Every other id, when `sink` is set
+/// (issue #25 diagnostic mode), is reported via `InspectSink::on_attr` —
+/// known ids (the three above) as well as unknown ones, each tagged with
+/// whether we decode it, exactly as `player_info_from_attrs` does: an attr
+/// id is no less worth discovering for sitting on an enemy entity.
+pub fn enemy_hp_from_attrs(
+    uid: i64,
+    attrs: &[pb::Attr],
+    now_ms: u64,
+    sink: Option<&dyn InspectSink>,
+) -> EnemyHp {
     let mut curr_hp = None;
     let mut max_hp = None;
     let mut monster_id = None;
     for attr in attrs {
         if attr.raw_data.is_empty() || attr.id == 0 {
             continue;
+        }
+        if let Some(sink) = sink {
+            let known = matches!(attr.id, attr_id::HP | attr_id::MAX_HP | attr_id::MONSTER_ID);
+            sink.on_attr(uid, attr.id, &attr.raw_data, known);
         }
         match attr.id {
             attr_id::HP => {
@@ -195,7 +208,7 @@ mod tests {
             id: attr_id::HP,
             raw_data: Vec::new(),
         }];
-        let hp = enemy_hp_from_attrs(1, &attrs, 0);
+        let hp = enemy_hp_from_attrs(1, &attrs, 0, None);
         assert_eq!(hp.curr_hp, None);
     }
 
@@ -223,7 +236,7 @@ mod tests {
             id: attr_id::HP,
             raw_data: varint(u64::MAX),
         }];
-        let hp = enemy_hp_from_attrs(1, &attrs, 0);
+        let hp = enemy_hp_from_attrs(1, &attrs, 0, None);
         assert_eq!(hp.curr_hp, Some(u64::MAX));
     }
 
@@ -242,7 +255,7 @@ mod tests {
             id: attr_id::MONSTER_ID,
             raw_data: varint(u64::from(u32::MAX) + 1),
         }];
-        assert_eq!(enemy_hp_from_attrs(1, &attrs, 0).monster_id, None);
+        assert_eq!(enemy_hp_from_attrs(1, &attrs, 0, None).monster_id, None);
     }
 
     #[test]
@@ -331,7 +344,15 @@ mod tests {
     }
 
     impl InspectSink for RecordingSink {
-        fn on_notify(&self, _service_uuid: u64, _method_id: u32, _payload: &[u8], _now_ms: u64) {}
+        fn on_notify(
+            &self,
+            _service_uuid: u64,
+            _method_id: u32,
+            _payload: &[u8],
+            _payload_decoded: bool,
+            _now_ms: u64,
+        ) {
+        }
 
         fn on_attr(&self, uid: i64, attr_id: i32, raw: &[u8], known: bool) {
             self.attrs
@@ -388,6 +409,62 @@ mod tests {
         let sink = RecordingSink::new();
 
         let _ = player_info_from_attrs(1, &attrs, Some(&sink));
+
+        assert!(sink.attrs.lock().unwrap().is_empty());
+    }
+
+    // -- InspectSink observation on enemy entities ------------------------
+    //
+    // The enemy attr walk reports to the sink exactly as the player one
+    // does; an unknown id is no less a discovery for sitting on a monster.
+
+    #[test]
+    fn unknown_enemy_attr_id_is_observed_via_sink_as_not_known() {
+        let raw = varint(999);
+        let attrs = vec![pb::Attr {
+            id: 0x9999,
+            raw_data: raw.clone(),
+        }];
+        let sink = RecordingSink::new();
+
+        let hp = enemy_hp_from_attrs(7, &attrs, 0, Some(&sink));
+
+        assert_eq!(hp.curr_hp, None);
+        assert_eq!(*sink.attrs.lock().unwrap(), vec![(7, 0x9999, raw, false)]);
+    }
+
+    #[test]
+    fn known_enemy_attr_id_is_observed_via_sink_as_known() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::HP,
+            raw_data: varint(1234),
+        }];
+        let sink = RecordingSink::new();
+
+        let hp = enemy_hp_from_attrs(1, &attrs, 0, Some(&sink));
+
+        assert_eq!(hp.curr_hp, Some(1234));
+        assert_eq!(
+            *sink.attrs.lock().unwrap(),
+            vec![(1, attr_id::HP, varint(1234), true)]
+        );
+    }
+
+    #[test]
+    fn empty_raw_data_and_zero_id_do_not_trigger_the_enemy_attr_sink_call() {
+        let attrs = vec![
+            pb::Attr {
+                id: 0x1234,
+                raw_data: Vec::new(),
+            },
+            pb::Attr {
+                id: 0,
+                raw_data: varint(1),
+            },
+        ];
+        let sink = RecordingSink::new();
+
+        let _ = enemy_hp_from_attrs(1, &attrs, 0, Some(&sink));
 
         assert!(sink.attrs.lock().unwrap().is_empty());
     }

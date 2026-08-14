@@ -97,6 +97,7 @@ fn on_sync_near_entities(
                     uid,
                     &attrs.attrs,
                     now_ms,
+                    sink,
                 )));
             }
             EntityKind::Unknown => {}
@@ -130,6 +131,7 @@ fn on_aoi_sync_delta(
                     target_uid,
                     &attrs.attrs,
                     now_ms,
+                    sink,
                 )));
             }
             EntityKind::Unknown => {}
@@ -588,8 +590,8 @@ mod tests {
 
     // -- InspectSink observation (issue #25 slice A) -----------------------
 
-    /// `(service_uuid, method_id, payload, now_ms)`.
-    type RecordedNotify = (u64, u32, Vec<u8>, u64);
+    /// `(service_uuid, method_id, payload, payload_decoded, now_ms)`.
+    type RecordedNotify = (u64, u32, Vec<u8>, bool, u64);
     /// `(uid, attr_id, raw, known)`.
     type RecordedAttr = (i64, i32, Vec<u8>, bool);
 
@@ -608,11 +610,21 @@ mod tests {
     }
 
     impl crate::inspect::InspectSink for RecordingSink {
-        fn on_notify(&self, service_uuid: u64, method_id: u32, payload: &[u8], now_ms: u64) {
-            self.notifies
-                .lock()
-                .unwrap()
-                .push((service_uuid, method_id, payload.to_vec(), now_ms));
+        fn on_notify(
+            &self,
+            service_uuid: u64,
+            method_id: u32,
+            payload: &[u8],
+            payload_decoded: bool,
+            now_ms: u64,
+        ) {
+            self.notifies.lock().unwrap().push((
+                service_uuid,
+                method_id,
+                payload.to_vec(),
+                payload_decoded,
+                now_ms,
+            ));
         }
 
         fn on_attr(&self, uid: i64, attr_id: i32, raw: &[u8], known: bool) {
@@ -725,7 +737,7 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(
             *sink.notifies.lock().unwrap(),
-            vec![(other_service, 0x42, b"hello".to_vec(), 999)]
+            vec![(other_service, 0x42, b"hello".to_vec(), true, 999)]
         );
     }
 }

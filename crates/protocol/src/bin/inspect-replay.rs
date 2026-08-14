@@ -36,11 +36,18 @@
 //! themselves (every record already carries both); the attr-id histogram
 //! comes from a local `InspectSink` that `decode_notify`'s attr walk reports
 //! into exactly as it would during a live run — `InspectSink::on_attr` fires
-//! for *every* attr id it sees (see `attrs::player_info_from_attrs`), tagged
+//! for *every* attr id it sees, on player and enemy entities alike (see
+//! `attrs::player_info_from_attrs` / `attrs::enemy_hp_from_attrs`), tagged
 //! with whether `attrs::attr_id` has a constant for it, so the report shows
 //! both a known id moving (e.g. `FIGHT_POINT` across the confirmation
 //! procedure's control run) and unrecognized ids being discovered, split
 //! into their own sections below.
+//!
+//! A record the capture couldn't decompress (`"payload_decoded":false`) is
+//! still counted in the service/method histograms — a corrupt or
+//! foreign-codec fragment is itself a finding — but never handed to the
+//! decoder, since its bytes are not protobuf; the report totals them
+//! separately.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -65,6 +72,10 @@ struct DumpRecord {
     service_uuid: u64,
     method_id: u32,
     payload: Vec<u8>,
+    /// `false` when the capture couldn't decompress this fragment, so
+    /// `payload` is the raw compressed bytes — replay counts it in the
+    /// service/method histograms but must not hand it to the decoder.
+    payload_decoded: bool,
 }
 
 /// The on-disk JSON shape, straight off the wire — see `crates/app/src/dump.rs`.
@@ -74,6 +85,7 @@ struct RawLine {
     service_uuid: String,
     method_id: String,
     payload_hex: String,
+    payload_decoded: bool,
 }
 
 fn parse_hex_u64(s: &str) -> Option<u64> {
@@ -111,6 +123,7 @@ fn parse_record(line: &str) -> Result<DumpRecord, String> {
         service_uuid,
         method_id,
         payload,
+        payload_decoded: raw.payload_decoded,
     })
 }
 
@@ -159,6 +172,11 @@ struct Histogram {
     /// Every attr id observed, known or not (`AttrStats::known` tells them
     /// apart) — `format_report` splits this into two sections.
     attrs: BTreeMap<i32, AttrStats>,
+    /// Records whose payload the capture couldn't decompress. They still
+    /// count towards the service/method histograms — a foreign codec is
+    /// itself a finding — but carry no attr ids, so the report says how many
+    /// there were rather than letting them silently thin the attr counts.
+    undecodable: u64,
 }
 
 /// `true` for the four opcodes `decode::decode_notify` currently dispatches
@@ -205,7 +223,15 @@ impl HistogramSink {
 }
 
 impl InspectSink for HistogramSink {
-    fn on_notify(&self, _service_uuid: u64, _method_id: u32, _payload: &[u8], _now_ms: u64) {}
+    fn on_notify(
+        &self,
+        _service_uuid: u64,
+        _method_id: u32,
+        _payload: &[u8],
+        _payload_decoded: bool,
+        _now_ms: u64,
+    ) {
+    }
 
     fn on_attr(&self, uid: i64, attr_id: i32, raw: &[u8], known: bool) {
         let ts_ms = self.current_ts.load(Ordering::Relaxed);
@@ -246,6 +272,16 @@ fn build_histogram(
                 .entry((record.service_uuid, record.method_id))
                 .or_default()
                 .observe(record.ts_ms, method_known);
+            if !record.payload_decoded {
+                h.undecodable += 1;
+            }
+        }
+        // A payload the capture couldn't decompress is still compressed (or
+        // in a codec we don't speak): feeding it to `decode_notify` would
+        // only produce protobuf garbage, so it contributes to the
+        // service/method histograms above and nothing else.
+        if !record.payload_decoded {
+            continue;
         }
         sink.set_current_ts(record.ts_ms);
         let notify = Notify {
@@ -258,9 +294,9 @@ fn build_histogram(
     sink.into_histogram()
 }
 
-/// Renders `h` as a human-readable summary: four sections (services,
-/// methods, known attrs, unrecognized attrs), unrecognized/undecoded
-/// entries called out distinctly from known ones.
+/// Renders `h` as a human-readable summary: five sections (services,
+/// methods, known attrs, unrecognized attrs, undecodable payloads),
+/// unrecognized/undecoded entries called out distinctly from known ones.
 fn format_report(h: &Histogram) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -305,6 +341,15 @@ fn format_report(h: &Histogram) -> String {
         "== Attr IDs (unrecognized — no constant in attrs::attr_id) ==",
         h.attrs.iter().filter(|(_, stats)| !stats.known),
     );
+
+    // Called out on its own line because these records carry no attr ids:
+    // without this the attr sections would look thinner than the traffic was.
+    writeln!(
+        out,
+        "\n== Undecodable payloads ==\ncount={} (capture could not decompress these; service/method counted, payload not decoded)",
+        h.undecodable
+    )
+    .unwrap();
 
     out
 }
@@ -446,7 +491,7 @@ mod tests {
     fn parse_record_parses_a_well_formed_dump_line() {
         let payload = delta_notify_payload(0x7777, vec![0x01]);
         let line = format!(
-            r#"{{"ts_ms":100,"service_uuid":"0x0000000063335342","method_id":"0x0000002d","payload_hex":"{}"}}"#,
+            r#"{{"ts_ms":100,"service_uuid":"0x0000000063335342","method_id":"0x0000002d","payload_hex":"{}","payload_decoded":true}}"#,
             to_hex(&payload)
         );
 
@@ -456,6 +501,19 @@ mod tests {
         assert_eq!(record.service_uuid, SERVICE_UUID);
         assert_eq!(record.method_id, opcode::SYNC_NEAR_DELTA_INFO);
         assert_eq!(record.payload, payload);
+        assert!(record.payload_decoded);
+    }
+
+    /// A record the capture couldn't decompress parses like any other; the
+    /// flag is what tells replay not to decode its bytes.
+    #[test]
+    fn parse_record_carries_the_undecodable_payload_flag() {
+        let line = r#"{"ts_ms":1,"service_uuid":"0x0000000063335342","method_id":"0x0000002d","payload_hex":"deadbeef","payload_decoded":false}"#;
+
+        let record = parse_record(line).expect("well-formed line must parse");
+
+        assert!(!record.payload_decoded);
+        assert_eq!(record.payload, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     #[test]
@@ -465,7 +523,7 @@ mod tests {
 
     #[test]
     fn parse_record_rejects_odd_length_payload_hex() {
-        let line = r#"{"ts_ms":1,"service_uuid":"0x0000000063335342","method_id":"0x00000001","payload_hex":"abc"}"#;
+        let line = r#"{"ts_ms":1,"service_uuid":"0x0000000063335342","method_id":"0x00000001","payload_hex":"abc","payload_decoded":true}"#;
         assert!(parse_record(line).is_err());
     }
 
@@ -476,12 +534,14 @@ mod tests {
             service_uuid: SERVICE_UUID,
             method_id: opcode::SYNC_NEAR_DELTA_INFO,
             payload: known_attr_payload(),
+            payload_decoded: true,
         };
         let recognized_unknown_attr = DumpRecord {
             ts_ms: 150,
             service_uuid: SERVICE_UUID,
             method_id: opcode::SYNC_NEAR_DELTA_INFO,
             payload: delta_notify_payload(0x7777, vec![0x02]),
+            payload_decoded: true,
         };
         let other_service = SERVICE_UUID.wrapping_add(1);
         let unrecognized = DumpRecord {
@@ -489,6 +549,7 @@ mod tests {
             service_uuid: other_service,
             method_id: 0x42,
             payload: b"hello".to_vec(),
+            payload_decoded: true,
         };
 
         let histogram = build_histogram(
@@ -553,6 +614,7 @@ mod tests {
             service_uuid: SERVICE_UUID,
             method_id: opcode::SYNC_NEAR_DELTA_INFO,
             payload: known_attr_payload(),
+            payload_decoded: true,
         };
         let before = DumpRecord {
             ts_ms: 100,
@@ -574,6 +636,45 @@ mod tests {
         assert_eq!(svc.first_ms, 500);
     }
 
+    /// An undecodable record still counts as traffic on its service/method,
+    /// is never fed to the decoder (its bytes aren't protobuf), and is
+    /// totalled on its own so a thin attr section is explained rather than
+    /// mysterious.
+    #[test]
+    fn build_histogram_counts_undecodable_records_without_decoding_them() {
+        let decoded = DumpRecord {
+            ts_ms: 10,
+            service_uuid: SERVICE_UUID,
+            method_id: opcode::SYNC_NEAR_DELTA_INFO,
+            payload: known_attr_payload(),
+            payload_decoded: true,
+        };
+        let undecodable = DumpRecord {
+            ts_ms: 20,
+            service_uuid: SERVICE_UUID,
+            method_id: opcode::SYNC_NEAR_DELTA_INFO,
+            // Still-compressed bytes: protobuf garbage if decoded.
+            payload: b"not-actually-zstd".to_vec(),
+            payload_decoded: false,
+        };
+
+        let histogram = build_histogram(vec![decoded, undecodable].into_iter(), None, None);
+
+        assert_eq!(histogram.undecodable, 1);
+        assert_eq!(histogram.services.get(&SERVICE_UUID).unwrap().count, 2);
+        let name = histogram
+            .attrs
+            .get(&bpsr_protocol::attrs::attr_id::NAME)
+            .expect("the decodable record's attr id is still observed");
+        assert_eq!(name.count, 1);
+        assert_eq!(
+            histogram.attrs.len(),
+            1,
+            "the undecodable record must contribute no attr ids"
+        );
+        assert!(format_report(&histogram).contains("== Undecodable payloads ==\ncount=1"));
+    }
+
     #[test]
     fn format_report_calls_out_unrecognized_service_and_splits_attr_sections() {
         let other_service = SERVICE_UUID.wrapping_add(1);
@@ -584,18 +685,21 @@ mod tests {
                 service_uuid: other_service,
                 method_id: 0x42,
                 payload: b"hello".to_vec(),
+                payload_decoded: true,
             },
             DumpRecord {
                 ts_ms: 2,
                 service_uuid: SERVICE_UUID,
                 method_id: opcode::SYNC_NEAR_DELTA_INFO,
                 payload: delta_notify_payload(0x7777, vec![0x02]),
+                payload_decoded: true,
             },
             DumpRecord {
                 ts_ms: 3,
                 service_uuid: SERVICE_UUID,
                 method_id: opcode::SYNC_NEAR_DELTA_INFO,
                 payload: known_attr_payload(),
+                payload_decoded: true,
             },
         ];
         let histogram = build_histogram(records.into_iter(), None, None);
