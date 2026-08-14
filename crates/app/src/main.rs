@@ -5,13 +5,16 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod dump;
 mod fonts;
+mod inspect;
 mod pipeline;
 mod platform;
 mod settings;
 mod ui;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use bpsr_protocol::ProtocolEvent;
 use crossbeam_channel::bounded;
@@ -47,9 +50,15 @@ fn main() -> eframe::Result {
     let (tx_events, rx_events) = bounded::<ProtocolEvent>(EVENT_CAPACITY);
     let (tx_command, rx_command) = bounded::<UiCommand>(COMMAND_CAPACITY);
 
+    // Opt-in packet-inspection diagnostics (issue #25 slice A); `None` unless
+    // `SHINRA_INSPECT` is set, in which case `start_capture` below wires the
+    // sink into its decoder.
+    let inspect_handle = inspect::init();
+    let inspect_sink = inspect_handle.as_ref().map(|h| Arc::clone(&h.sink));
+
     // Capture is best-effort: on failure `tx_events` is dropped, the pipeline
     // idles, and the overlay explains why.
-    let (status, capture) = match bpsr_capture::start_capture(tx_events) {
+    let (status, capture) = match bpsr_capture::start_capture(tx_events, inspect_sink) {
         Ok(handle) => (StatusLine::Ok, Some(handle)),
         Err(err) => {
             log::error!("capture unavailable: {err}");
@@ -106,6 +115,12 @@ fn main() -> eframe::Result {
     // lets its thread exit; joining here just makes sure the last-sent
     // settings value has finished being persisted before the process ends.
     let _ = settings_thread.join();
+    // Capture has already stopped above, so its `Decoder`'s reference to the
+    // sink is gone by now — this drops the last one, which is what lets
+    // `DiagnosticSink`'s summary actually log (see `inspect::Handle::shutdown`).
+    if let Some(inspect_handle) = inspect_handle {
+        inspect_handle.shutdown();
+    }
 
     result
 }

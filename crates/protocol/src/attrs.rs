@@ -7,6 +7,7 @@
 use std::io::Cursor;
 
 use crate::event::{EnemyHp, PlayerInfo};
+use crate::inspect::InspectSink;
 use crate::pb::{self, Class};
 
 pub mod attr_id {
@@ -70,15 +71,30 @@ pub fn decode_name(raw: &[u8]) -> Option<String> {
 }
 
 /// Builds a `PlayerInfo` from an entity's `Attr` list, reading `NAME`,
-/// `PROFESSION_ID`, and `FIGHT_POINT` (ability score). Unknown ids, empty
-/// `raw_data`, and `id == 0` are skipped.
-pub fn player_info_from_attrs(uid: i64, attrs: &[pb::Attr]) -> PlayerInfo {
+/// `PROFESSION_ID`, and `FIGHT_POINT` (ability score). Empty `raw_data` and
+/// `id == 0` are always skipped outright — no decoding, no sink call. Every
+/// other id, when `sink` is set (issue #25 diagnostic mode), is reported via
+/// `InspectSink::on_attr` — known ids (the three above) as well as unknown
+/// ones, each tagged with whether we decode it, instead of only unknown ids
+/// reaching the sink (slice B widened this from an unknowns-only hook).
+pub fn player_info_from_attrs(
+    uid: i64,
+    attrs: &[pb::Attr],
+    sink: Option<&dyn InspectSink>,
+) -> PlayerInfo {
     let mut name = None;
     let mut class = None;
     let mut ability_score = None;
     for attr in attrs {
         if attr.raw_data.is_empty() || attr.id == 0 {
             continue;
+        }
+        if let Some(sink) = sink {
+            let known = matches!(
+                attr.id,
+                attr_id::NAME | attr_id::PROFESSION_ID | attr_id::FIGHT_POINT
+            );
+            sink.on_attr(uid, attr.id, &attr.raw_data, known);
         }
         match attr.id {
             attr_id::NAME => {
@@ -112,15 +128,28 @@ pub fn player_info_from_attrs(uid: i64, attrs: &[pb::Attr]) -> PlayerInfo {
 }
 
 /// Builds an `EnemyHp` from an entity's `Attr` list, reading `HP`, `MAX_HP`,
-/// and `MONSTER_ID`. Unknown ids, empty `raw_data`, and `id == 0` are
-/// skipped.
-pub fn enemy_hp_from_attrs(uid: i64, attrs: &[pb::Attr], now_ms: u64) -> EnemyHp {
+/// and `MONSTER_ID`. Empty `raw_data` and `id == 0` are always skipped
+/// outright — no decoding, no sink call. Every other id, when `sink` is set
+/// (issue #25 diagnostic mode), is reported via `InspectSink::on_attr` —
+/// known ids (the three above) as well as unknown ones, each tagged with
+/// whether we decode it, exactly as `player_info_from_attrs` does: an attr
+/// id is no less worth discovering for sitting on an enemy entity.
+pub fn enemy_hp_from_attrs(
+    uid: i64,
+    attrs: &[pb::Attr],
+    now_ms: u64,
+    sink: Option<&dyn InspectSink>,
+) -> EnemyHp {
     let mut curr_hp = None;
     let mut max_hp = None;
     let mut monster_id = None;
     for attr in attrs {
         if attr.raw_data.is_empty() || attr.id == 0 {
             continue;
+        }
+        if let Some(sink) = sink {
+            let known = matches!(attr.id, attr_id::HP | attr_id::MAX_HP | attr_id::MONSTER_ID);
+            sink.on_attr(uid, attr.id, &attr.raw_data, known);
         }
         match attr.id {
             attr_id::HP => {
@@ -179,7 +208,7 @@ mod tests {
             id: attr_id::HP,
             raw_data: Vec::new(),
         }];
-        let hp = enemy_hp_from_attrs(1, &attrs, 0);
+        let hp = enemy_hp_from_attrs(1, &attrs, 0, None);
         assert_eq!(hp.curr_hp, None);
     }
 
@@ -207,7 +236,7 @@ mod tests {
             id: attr_id::HP,
             raw_data: varint(u64::MAX),
         }];
-        let hp = enemy_hp_from_attrs(1, &attrs, 0);
+        let hp = enemy_hp_from_attrs(1, &attrs, 0, None);
         assert_eq!(hp.curr_hp, Some(u64::MAX));
     }
 
@@ -217,7 +246,7 @@ mod tests {
             id: attr_id::PROFESSION_ID,
             raw_data: varint(0x1_0000_0001),
         }];
-        assert_eq!(player_info_from_attrs(1, &attrs).class, None);
+        assert_eq!(player_info_from_attrs(1, &attrs, None).class, None);
     }
 
     #[test]
@@ -226,7 +255,7 @@ mod tests {
             id: attr_id::MONSTER_ID,
             raw_data: varint(u64::from(u32::MAX) + 1),
         }];
-        assert_eq!(enemy_hp_from_attrs(1, &attrs, 0).monster_id, None);
+        assert_eq!(enemy_hp_from_attrs(1, &attrs, 0, None).monster_id, None);
     }
 
     #[test]
@@ -250,7 +279,7 @@ mod tests {
             raw_data: varint(123_456),
         }];
         assert_eq!(
-            player_info_from_attrs(1, &attrs).ability_score,
+            player_info_from_attrs(1, &attrs, None).ability_score,
             Some(123_456)
         );
     }
@@ -261,7 +290,7 @@ mod tests {
             id: attr_id::FIGHT_POINT,
             raw_data: varint(0),
         }];
-        assert_eq!(player_info_from_attrs(1, &attrs).ability_score, None);
+        assert_eq!(player_info_from_attrs(1, &attrs, None).ability_score, None);
     }
 
     #[test]
@@ -270,7 +299,7 @@ mod tests {
             id: attr_id::PROFESSION_ID,
             raw_data: varint(1),
         }];
-        assert_eq!(player_info_from_attrs(1, &attrs).ability_score, None);
+        assert_eq!(player_info_from_attrs(1, &attrs, None).ability_score, None);
     }
 
     #[test]
@@ -279,7 +308,7 @@ mod tests {
             id: attr_id::FIGHT_POINT,
             raw_data: varint(0x1_0000_0001),
         }];
-        assert_eq!(player_info_from_attrs(1, &attrs).ability_score, None);
+        assert_eq!(player_info_from_attrs(1, &attrs, None).ability_score, None);
     }
 
     #[test]
@@ -290,8 +319,153 @@ mod tests {
             id: 0x9999,
             raw_data: raw,
         }];
-        let info = player_info_from_attrs(1, &attrs);
+        let info = player_info_from_attrs(1, &attrs, None);
         assert_eq!(info.name, None);
         assert_eq!(info.class, None);
+    }
+
+    // -- InspectSink observation (issue #25 slice A) ----------------------
+
+    /// Test-only `InspectSink` that just records every `on_attr` call, in
+    /// order, for assertions.
+    /// `(uid, attr_id, raw, known)`.
+    type RecordedAttr = (i64, i32, Vec<u8>, bool);
+
+    struct RecordingSink {
+        attrs: std::sync::Mutex<Vec<RecordedAttr>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Self {
+            Self {
+                attrs: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl InspectSink for RecordingSink {
+        fn on_notify(
+            &self,
+            _service_uuid: u64,
+            _method_id: u32,
+            _payload: &[u8],
+            _payload_decoded: bool,
+            _now_ms: u64,
+        ) {
+        }
+
+        fn on_attr(&self, uid: i64, attr_id: i32, raw: &[u8], known: bool) {
+            self.attrs
+                .lock()
+                .unwrap()
+                .push((uid, attr_id, raw.to_vec(), known));
+        }
+    }
+
+    #[test]
+    fn unknown_attr_id_is_observed_via_sink_as_not_known() {
+        let raw = varint(999);
+        let attrs = vec![pb::Attr {
+            id: 0x9999,
+            raw_data: raw.clone(),
+        }];
+        let sink = RecordingSink::new();
+
+        let info = player_info_from_attrs(7, &attrs, Some(&sink));
+
+        assert_eq!(info.name, None);
+        assert_eq!(*sink.attrs.lock().unwrap(), vec![(7, 0x9999, raw, false)]);
+    }
+
+    #[test]
+    fn known_attr_id_is_observed_via_sink_as_known() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::NAME,
+            raw_data: vec![0xFF, b'H', b'i'],
+        }];
+        let sink = RecordingSink::new();
+
+        let info = player_info_from_attrs(1, &attrs, Some(&sink));
+
+        assert_eq!(info.name.as_deref(), Some("Hi"));
+        assert_eq!(
+            *sink.attrs.lock().unwrap(),
+            vec![(1, attr_id::NAME, vec![0xFF, b'H', b'i'], true)]
+        );
+    }
+
+    #[test]
+    fn empty_raw_data_and_zero_id_do_not_trigger_the_attr_sink_call() {
+        let attrs = vec![
+            pb::Attr {
+                id: 0x1234,
+                raw_data: Vec::new(),
+            },
+            pb::Attr {
+                id: 0,
+                raw_data: varint(1),
+            },
+        ];
+        let sink = RecordingSink::new();
+
+        let _ = player_info_from_attrs(1, &attrs, Some(&sink));
+
+        assert!(sink.attrs.lock().unwrap().is_empty());
+    }
+
+    // -- InspectSink observation on enemy entities ------------------------
+    //
+    // The enemy attr walk reports to the sink exactly as the player one
+    // does; an unknown id is no less a discovery for sitting on a monster.
+
+    #[test]
+    fn unknown_enemy_attr_id_is_observed_via_sink_as_not_known() {
+        let raw = varint(999);
+        let attrs = vec![pb::Attr {
+            id: 0x9999,
+            raw_data: raw.clone(),
+        }];
+        let sink = RecordingSink::new();
+
+        let hp = enemy_hp_from_attrs(7, &attrs, 0, Some(&sink));
+
+        assert_eq!(hp.curr_hp, None);
+        assert_eq!(*sink.attrs.lock().unwrap(), vec![(7, 0x9999, raw, false)]);
+    }
+
+    #[test]
+    fn known_enemy_attr_id_is_observed_via_sink_as_known() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::HP,
+            raw_data: varint(1234),
+        }];
+        let sink = RecordingSink::new();
+
+        let hp = enemy_hp_from_attrs(1, &attrs, 0, Some(&sink));
+
+        assert_eq!(hp.curr_hp, Some(1234));
+        assert_eq!(
+            *sink.attrs.lock().unwrap(),
+            vec![(1, attr_id::HP, varint(1234), true)]
+        );
+    }
+
+    #[test]
+    fn empty_raw_data_and_zero_id_do_not_trigger_the_enemy_attr_sink_call() {
+        let attrs = vec![
+            pb::Attr {
+                id: 0x1234,
+                raw_data: Vec::new(),
+            },
+            pb::Attr {
+                id: 0,
+                raw_data: varint(1),
+            },
+        ];
+        let sink = RecordingSink::new();
+
+        let _ = enemy_hp_from_attrs(1, &attrs, 0, Some(&sink));
+
+        assert!(sink.attrs.lock().unwrap().is_empty());
     }
 }
