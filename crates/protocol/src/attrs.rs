@@ -71,10 +71,12 @@ pub fn decode_name(raw: &[u8]) -> Option<String> {
 }
 
 /// Builds a `PlayerInfo` from an entity's `Attr` list, reading `NAME`,
-/// `PROFESSION_ID`, and `FIGHT_POINT` (ability score). Unknown ids, empty
-/// `raw_data`, and `id == 0` are skipped — unless `sink` is set (issue #25
-/// slice A diagnostic mode), in which case every id with no known constant
-/// is reported via `InspectSink::on_unknown_attr` instead of just vanishing.
+/// `PROFESSION_ID`, and `FIGHT_POINT` (ability score). Empty `raw_data` and
+/// `id == 0` are always skipped outright — no decoding, no sink call. Every
+/// other id, when `sink` is set (issue #25 diagnostic mode), is reported via
+/// `InspectSink::on_attr` — known ids (the three above) as well as unknown
+/// ones, each tagged with whether we decode it, instead of only unknown ids
+/// reaching the sink (slice B widened this from an unknowns-only hook).
 pub fn player_info_from_attrs(
     uid: i64,
     attrs: &[pb::Attr],
@@ -86,6 +88,13 @@ pub fn player_info_from_attrs(
     for attr in attrs {
         if attr.raw_data.is_empty() || attr.id == 0 {
             continue;
+        }
+        if let Some(sink) = sink {
+            let known = matches!(
+                attr.id,
+                attr_id::NAME | attr_id::PROFESSION_ID | attr_id::FIGHT_POINT
+            );
+            sink.on_attr(uid, attr.id, &attr.raw_data, known);
         }
         match attr.id {
             attr_id::NAME => {
@@ -107,11 +116,7 @@ pub fn player_info_from_attrs(
                     ability_score = Some(v);
                 }
             }
-            other => {
-                if let Some(sink) = sink {
-                    sink.on_unknown_attr(uid, other, &attr.raw_data);
-                }
-            }
+            _ => {}
         }
     }
     PlayerInfo {
@@ -308,16 +313,19 @@ mod tests {
 
     // -- InspectSink observation (issue #25 slice A) ----------------------
 
-    /// Test-only `InspectSink` that just records every `on_unknown_attr`
-    /// call, in order, for assertions.
+    /// Test-only `InspectSink` that just records every `on_attr` call, in
+    /// order, for assertions.
+    /// `(uid, attr_id, raw, known)`.
+    type RecordedAttr = (i64, i32, Vec<u8>, bool);
+
     struct RecordingSink {
-        unknown: std::sync::Mutex<Vec<(i64, i32, Vec<u8>)>>,
+        attrs: std::sync::Mutex<Vec<RecordedAttr>>,
     }
 
     impl RecordingSink {
         fn new() -> Self {
             Self {
-                unknown: std::sync::Mutex::new(Vec::new()),
+                attrs: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -325,16 +333,16 @@ mod tests {
     impl InspectSink for RecordingSink {
         fn on_notify(&self, _service_uuid: u64, _method_id: u32, _payload: &[u8], _now_ms: u64) {}
 
-        fn on_unknown_attr(&self, uid: i64, attr_id: i32, raw: &[u8]) {
-            self.unknown
+        fn on_attr(&self, uid: i64, attr_id: i32, raw: &[u8], known: bool) {
+            self.attrs
                 .lock()
                 .unwrap()
-                .push((uid, attr_id, raw.to_vec()));
+                .push((uid, attr_id, raw.to_vec(), known));
         }
     }
 
     #[test]
-    fn unknown_attr_id_is_observed_via_sink_when_present() {
+    fn unknown_attr_id_is_observed_via_sink_as_not_known() {
         let raw = varint(999);
         let attrs = vec![pb::Attr {
             id: 0x9999,
@@ -345,24 +353,28 @@ mod tests {
         let info = player_info_from_attrs(7, &attrs, Some(&sink));
 
         assert_eq!(info.name, None);
-        assert_eq!(*sink.unknown.lock().unwrap(), vec![(7, 0x9999, raw)]);
+        assert_eq!(*sink.attrs.lock().unwrap(), vec![(7, 0x9999, raw, false)]);
     }
 
     #[test]
-    fn known_attr_id_does_not_trigger_the_unknown_attr_sink_call() {
+    fn known_attr_id_is_observed_via_sink_as_known() {
         let attrs = vec![pb::Attr {
             id: attr_id::NAME,
             raw_data: vec![0xFF, b'H', b'i'],
         }];
         let sink = RecordingSink::new();
 
-        let _ = player_info_from_attrs(1, &attrs, Some(&sink));
+        let info = player_info_from_attrs(1, &attrs, Some(&sink));
 
-        assert!(sink.unknown.lock().unwrap().is_empty());
+        assert_eq!(info.name.as_deref(), Some("Hi"));
+        assert_eq!(
+            *sink.attrs.lock().unwrap(),
+            vec![(1, attr_id::NAME, vec![0xFF, b'H', b'i'], true)]
+        );
     }
 
     #[test]
-    fn empty_raw_data_and_zero_id_do_not_trigger_the_unknown_attr_sink_call() {
+    fn empty_raw_data_and_zero_id_do_not_trigger_the_attr_sink_call() {
         let attrs = vec![
             pb::Attr {
                 id: 0x1234,
@@ -377,6 +389,6 @@ mod tests {
 
         let _ = player_info_from_attrs(1, &attrs, Some(&sink));
 
-        assert!(sink.unknown.lock().unwrap().is_empty());
+        assert!(sink.attrs.lock().unwrap().is_empty());
     }
 }

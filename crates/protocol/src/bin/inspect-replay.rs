@@ -6,11 +6,13 @@
 //! Reads the JSONL dump format written by `crates/app/src/dump.rs` (see that
 //! module's doc comment for the authoritative on-disk shape) and rebuilds,
 //! offline, exactly the histograms a live session would have produced:
-//! service ids, method ids, and unknown attr ids, each with a count and
+//! service ids, method ids, and attr ids, each with a count and
 //! first/last-seen timestamp, and each marked as one we currently decode or
-//! not. `--since`/`--until` narrow the replay to a millisecond window so a
-//! dump can be diffed around a noted in-game event (see
-//! `docs/packet-inspection.md`).
+//! not — attr ids split into a known section and an unrecognized section, so
+//! a known id (e.g. `FIGHT_POINT`) can be diffed as a control alongside
+//! discovering unrecognized ones. `--since`/`--until` narrow the replay to a
+//! millisecond window so a dump can be diffed around a noted in-game event
+//! (see `docs/packet-inspection.md`).
 //!
 //! ## Why this lives here (`crates/protocol/src/bin/`), not the app crate
 //!
@@ -31,12 +33,14 @@
 //! `decode::decode_notify` directly with a synthetic `Notify { method_id,
 //! payload }` built from each record, rather than re-parsing outer frames.
 //! Service-id and method-id histograms come straight from the dump records
-//! themselves (every record already carries both); the unknown-attr-id
-//! histogram comes from a local `InspectSink` that `decode_notify`'s attr
-//! walk reports into exactly as it would during a live run — known attr ids
-//! (`attrs::attr_id`) are deliberately never reported to a sink at all (see
-//! `attrs::player_info_from_attrs`), so this histogram is unknown ids only,
-//! by construction — which is the entire point per the issue.
+//! themselves (every record already carries both); the attr-id histogram
+//! comes from a local `InspectSink` that `decode_notify`'s attr walk reports
+//! into exactly as it would during a live run — `InspectSink::on_attr` fires
+//! for *every* attr id it sees (see `attrs::player_info_from_attrs`), tagged
+//! with whether `attrs::attr_id` has a constant for it, so the report shows
+//! both a known id moving (e.g. `FIGHT_POINT` across the confirmation
+//! procedure's control run) and unrecognized ids being discovered, split
+//! into their own sections below.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -131,13 +135,16 @@ impl IdStats {
     }
 }
 
-/// Same as `IdStats`, plus a sample so a human can eyeball what an unknown
-/// attr's raw bytes look like (issue #12/#15's "list-shaped?" question).
+/// Same as `IdStats`, plus a sample so a human can eyeball what an attr's
+/// raw bytes look like (issue #12/#15's "list-shaped?" question) — `known`
+/// mirrors `IdStats::known`: whether `attrs::attr_id` has a constant for
+/// this id.
 #[derive(Debug, Clone, Default)]
 struct AttrStats {
     count: u64,
     first_ms: u64,
     last_ms: u64,
+    known: bool,
     sample_uid: i64,
     sample_raw: Vec<u8>,
 }
@@ -149,7 +156,9 @@ struct Histogram {
     /// within their own service, and a foreign service's method ids are
     /// exactly what issue #12 needs to see.
     methods: BTreeMap<(u64, u32), IdStats>,
-    unknown_attrs: BTreeMap<i32, AttrStats>,
+    /// Every attr id observed, known or not (`AttrStats::known` tells them
+    /// apart) — `format_report` splits this into two sections.
+    attrs: BTreeMap<i32, AttrStats>,
 }
 
 /// `true` for the four opcodes `decode::decode_notify` currently dispatches
@@ -164,16 +173,16 @@ fn is_known_opcode(method_id: u32) -> bool {
     )
 }
 
-/// Feeds `decode_notify`'s attr walk into `unknown_attrs`. `on_notify` is a
-/// no-op here: that hook only ever fires from `frame.rs` during live
-/// capture (parsing outer frames), never from `decode_notify` — replay
-/// starts one layer downstream of it, already holding decompressed
-/// records, so service/method histograms are built directly from the dump
-/// records in `build_histogram` instead.
+/// Feeds `decode_notify`'s attr walk into `attrs`. `on_notify` is a no-op
+/// here: that hook only ever fires from `frame.rs` during live capture
+/// (parsing outer frames), never from `decode_notify` — replay starts one
+/// layer downstream of it, already holding decompressed records, so
+/// service/method histograms are built directly from the dump records in
+/// `build_histogram` instead.
 struct HistogramSink {
     histogram: Mutex<Histogram>,
-    /// `on_unknown_attr` carries no timestamp of its own; `build_histogram`
-    /// sets this to the current record's `ts_ms` before each `decode_notify`
+    /// `on_attr` carries no timestamp of its own; `build_histogram` sets
+    /// this to the current record's `ts_ms` before each `decode_notify`
     /// call so the attr walk's callback can still be timestamped.
     current_ts: AtomicU64,
 }
@@ -198,15 +207,16 @@ impl HistogramSink {
 impl InspectSink for HistogramSink {
     fn on_notify(&self, _service_uuid: u64, _method_id: u32, _payload: &[u8], _now_ms: u64) {}
 
-    fn on_unknown_attr(&self, uid: i64, attr_id: i32, raw: &[u8]) {
+    fn on_attr(&self, uid: i64, attr_id: i32, raw: &[u8], known: bool) {
         let ts_ms = self.current_ts.load(Ordering::Relaxed);
         let mut h = self.histogram.lock().expect("mutex never poisoned");
-        let entry = h.unknown_attrs.entry(attr_id).or_default();
+        let entry = h.attrs.entry(attr_id).or_default();
         if entry.count == 0 {
             entry.first_ms = ts_ms;
         }
         entry.count += 1;
         entry.last_ms = ts_ms;
+        entry.known = known;
         entry.sample_uid = uid;
         entry.sample_raw = raw.to_vec();
     }
@@ -248,9 +258,9 @@ fn build_histogram(
     sink.into_histogram()
 }
 
-/// Renders `h` as a human-readable summary: three sections (services,
-/// methods, unknown attrs), unrecognized/undecoded entries called out
-/// distinctly from known ones.
+/// Renders `h` as a human-readable summary: four sections (services,
+/// methods, known attrs, unrecognized attrs), unrecognized/undecoded
+/// entries called out distinctly from known ones.
 fn format_report(h: &Histogram) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -285,15 +295,34 @@ fn format_report(h: &Histogram) -> String {
         .unwrap();
     }
 
-    writeln!(
-        out,
-        "\n== Unknown attr IDs (no constant in attrs::attr_id) =="
-    )
-    .unwrap();
-    if h.unknown_attrs.is_empty() {
-        writeln!(out, "(none observed)").unwrap();
-    }
-    for (&attr_id, stats) in &h.unknown_attrs {
+    write_attr_section(
+        &mut out,
+        "== Attr IDs (known — we decode these; diff a value here for the confirmation procedure's control run) ==",
+        h.attrs.iter().filter(|(_, stats)| stats.known),
+    );
+    write_attr_section(
+        &mut out,
+        "== Attr IDs (unrecognized — no constant in attrs::attr_id) ==",
+        h.attrs.iter().filter(|(_, stats)| !stats.known),
+    );
+
+    out
+}
+
+/// Renders one attr-id section (known or unrecognized — see `format_report`)
+/// as `attr_id=... count=... first_ms=... last_ms=... sample_uid=...
+/// sample_raw_hex=...` lines, one per id, or `(none observed)` if `entries`
+/// is empty.
+fn write_attr_section<'a>(
+    out: &mut String,
+    heading: &str,
+    entries: impl Iterator<Item = (&'a i32, &'a AttrStats)>,
+) {
+    use std::fmt::Write as _;
+    writeln!(out, "\n{heading}").unwrap();
+    let mut any = false;
+    for (&attr_id, stats) in entries {
+        any = true;
         let sample_hex: String = stats
             .sample_raw
             .iter()
@@ -306,8 +335,9 @@ fn format_report(h: &Histogram) -> String {
         )
         .unwrap();
     }
-
-    out
+    if !any {
+        writeln!(out, "(none observed)").unwrap();
+    }
 }
 
 fn main() -> ExitCode {
@@ -496,16 +526,19 @@ mod tests {
             .expect("unrecognized method present");
         assert!(!other_method.known);
 
-        assert!(
-            !histogram
-                .unknown_attrs
-                .contains_key(&bpsr_protocol::attrs::attr_id::NAME)
-        );
+        let known = histogram
+            .attrs
+            .get(&bpsr_protocol::attrs::attr_id::NAME)
+            .expect("known attr id observed");
+        assert_eq!(known.count, 1);
+        assert!(known.known);
+
         let unknown = histogram
-            .unknown_attrs
+            .attrs
             .get(&0x7777)
             .expect("unknown attr id observed");
         assert_eq!(unknown.count, 1);
+        assert!(!unknown.known);
         assert_eq!(
             unknown.sample_uid,
             bpsr_protocol::event::uid_of(PLAYER_UUID)
@@ -542,8 +575,9 @@ mod tests {
     }
 
     #[test]
-    fn format_report_calls_out_unrecognized_and_unknown_distinctly() {
+    fn format_report_calls_out_unrecognized_service_and_splits_attr_sections() {
         let other_service = SERVICE_UUID.wrapping_add(1);
+        let name_attr_hex = format!("attr_id=0x{:08x}", bpsr_protocol::attrs::attr_id::NAME);
         let records = vec![
             DumpRecord {
                 ts_ms: 1,
@@ -557,12 +591,31 @@ mod tests {
                 method_id: opcode::SYNC_NEAR_DELTA_INFO,
                 payload: delta_notify_payload(0x7777, vec![0x02]),
             },
+            DumpRecord {
+                ts_ms: 3,
+                service_uuid: SERVICE_UUID,
+                method_id: opcode::SYNC_NEAR_DELTA_INFO,
+                payload: known_attr_payload(),
+            },
         ];
         let histogram = build_histogram(records.into_iter(), None, None);
 
         let report = format_report(&histogram);
 
         assert!(report.contains("UNRECOGNIZED"));
-        assert!(report.contains("attr_id=0x00007777"));
+        assert!(report.contains("known — we decode these"));
+        assert!(report.contains("unrecognized — no constant"));
+
+        // The known NAME id must land in the known section, not the
+        // unrecognized one, and vice versa for the unknown 0x7777 id.
+        let known_start = report.find("known — we decode these").unwrap();
+        let unrecognized_start = report.find("unrecognized — no constant").unwrap();
+        let known_section = &report[known_start..unrecognized_start];
+        let unrecognized_section = &report[unrecognized_start..];
+
+        assert!(known_section.contains(&name_attr_hex));
+        assert!(!known_section.contains("attr_id=0x00007777"));
+        assert!(unrecognized_section.contains("attr_id=0x00007777"));
+        assert!(!unrecognized_section.contains(&name_attr_hex));
     }
 }

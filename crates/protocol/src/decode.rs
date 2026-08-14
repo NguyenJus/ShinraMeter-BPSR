@@ -590,19 +590,19 @@ mod tests {
 
     /// `(service_uuid, method_id, payload, now_ms)`.
     type RecordedNotify = (u64, u32, Vec<u8>, u64);
-    /// `(uid, attr_id, raw)`.
-    type RecordedUnknownAttr = (i64, i32, Vec<u8>);
+    /// `(uid, attr_id, raw, known)`.
+    type RecordedAttr = (i64, i32, Vec<u8>, bool);
 
     struct RecordingSink {
         notifies: std::sync::Mutex<Vec<RecordedNotify>>,
-        unknown_attrs: std::sync::Mutex<Vec<RecordedUnknownAttr>>,
+        attrs: std::sync::Mutex<Vec<RecordedAttr>>,
     }
 
     impl RecordingSink {
         fn new() -> Self {
             Self {
                 notifies: std::sync::Mutex::new(Vec::new()),
-                unknown_attrs: std::sync::Mutex::new(Vec::new()),
+                attrs: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -615,16 +615,17 @@ mod tests {
                 .push((service_uuid, method_id, payload.to_vec(), now_ms));
         }
 
-        fn on_unknown_attr(&self, uid: i64, attr_id: i32, raw: &[u8]) {
-            self.unknown_attrs
+        fn on_attr(&self, uid: i64, attr_id: i32, raw: &[u8], known: bool) {
+            self.attrs
                 .lock()
                 .unwrap()
-                .push((uid, attr_id, raw.to_vec()));
+                .push((uid, attr_id, raw.to_vec(), known));
         }
     }
 
     /// `decode_notify` threads its sink down into the entity attr walk, so
-    /// an unknown attr id on a player entity reaches it end to end.
+    /// an unknown attr id on a player entity reaches it end to end, tagged
+    /// `known = false`.
     #[test]
     fn decode_notify_forwards_unknown_attr_ids_to_the_sink() {
         let attrs = AttrCollection {
@@ -654,9 +655,50 @@ mod tests {
         decode_notify(&n, 0, &mut out, Some(&sink));
 
         assert_eq!(
-            *sink.unknown_attrs.lock().unwrap(),
-            vec![(uid_of(ATTACKER_UUID), 0x7777, vec![0x01])]
+            *sink.attrs.lock().unwrap(),
+            vec![(uid_of(ATTACKER_UUID), 0x7777, vec![0x01], false)]
         );
+    }
+
+    /// The same path, for an id we do decode (`FIGHT_POINT`): the sink
+    /// still sees it, tagged `known = true` — this is what lets an operator
+    /// diff a known id like ability score across an in-game change (issue
+    /// #25's control-run procedure), not just discover new ones.
+    #[test]
+    fn decode_notify_forwards_known_attr_ids_to_the_sink_as_known() {
+        let mut raw_data = Vec::new();
+        prost::encoding::encode_varint(1_000_000u64, &mut raw_data);
+        let attrs = AttrCollection {
+            uuid: ATTACKER_UUID,
+            attrs: vec![pb::Attr {
+                id: crate::attrs::attr_id::FIGHT_POINT,
+                raw_data,
+            }],
+        };
+        let delta = AoiSyncDelta {
+            uuid: ATTACKER_UUID,
+            attrs: Some(attrs),
+            skill_effects: None,
+        };
+        let msg = SyncNearDeltaInfo {
+            delta_infos: vec![delta],
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let n = Notify {
+            method_id: opcode::SYNC_NEAR_DELTA_INFO,
+            payload,
+        };
+        let sink = RecordingSink::new();
+        let mut out = Vec::new();
+
+        decode_notify(&n, 0, &mut out, Some(&sink));
+
+        let recorded = sink.attrs.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, uid_of(ATTACKER_UUID));
+        assert_eq!(recorded[0].1, crate::attrs::attr_id::FIGHT_POINT);
+        assert!(recorded[0].3, "FIGHT_POINT must be reported as known");
     }
 
     /// End-to-end through `Decoder::with_inspect_sink` + `push_stream`: a

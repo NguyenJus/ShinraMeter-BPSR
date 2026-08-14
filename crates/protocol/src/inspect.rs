@@ -30,7 +30,16 @@ pub trait InspectSink: Send + Sync {
     /// against `frame::SERVICE_UUID`.
     fn on_notify(&self, service_uuid: u64, method_id: u32, payload: &[u8], now_ms: u64);
 
-    /// An attr id on entity `uid`'s attr list with no known constant in
-    /// `attrs::attr_id` (slice A item 3).
-    fn on_unknown_attr(&self, uid: i64, attr_id: i32, raw: &[u8]);
+    /// An attr id on entity `uid`'s attr list, for *every* id
+    /// `attrs::player_info_from_attrs`'s walk sees with non-empty `raw_data`
+    /// and a nonzero id — known or not. `known` is `true` when
+    /// `attrs::attr_id` has a constant for it (the value was therefore also
+    /// decoded into the entity's `PlayerInfo`), `false` when it isn't
+    /// (slice A item 3). Widened from an unknowns-only hook (slice B) so a
+    /// sink can diff a *known* id like `FIGHT_POINT` across a deliberate
+    /// in-game change — the confirmation procedure's control run
+    /// (`docs/packet-inspection.md`) needs to see that value move, not just
+    /// discover new ids. Implementations that only care about discoveries
+    /// filter on `known` themselves.
+    fn on_attr(&self, uid: i64, attr_id: i32, raw: &[u8], known: bool);
 }

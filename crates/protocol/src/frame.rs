@@ -393,7 +393,7 @@ mod tests {
                 .push((service_uuid, method_id, payload.to_vec(), now_ms));
         }
 
-        fn on_unknown_attr(&self, _uid: i64, _attr_id: i32, _raw: &[u8]) {}
+        fn on_attr(&self, _uid: i64, _attr_id: i32, _raw: &[u8], _known: bool) {}
     }
 
     fn build_notify_frame(method_id: u32, payload: &[u8], compressed: bool) -> Vec<u8> {

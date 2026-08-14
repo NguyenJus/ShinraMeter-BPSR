@@ -35,11 +35,16 @@ reads a dump file and re-runs the decoder over it *offline* — no live game or
 Windows box needed, so this is the tool to reach for while doing the diffing
 in steps 1-3 below. It rebuilds the same histograms a live run would have
 logged: every service id and method id observed (count, first/last-seen
-`ts_ms`, and whether it's one we currently decode), plus every unknown attr
-id (no constant in `attrs::attr_id`) observed on any entity's attr list, with
-a sample uid and raw bytes. Unrecognized service ids and unknown attr ids are
-called out distinctly from known ones — that distinction is the entire point
-of the tool.
+`ts_ms`, and whether it's one we currently decode), plus every attr id
+observed on any entity's attr list — split into a "known" section (ids
+`attrs::attr_id` has a constant for, e.g. `FIGHT_POINT`) and an
+"unrecognized" section (no constant), each with a count, first/last-seen
+`ts_ms`, and a sample uid/raw bytes. The known section is what step 1's
+control run diffs — `FIGHT_POINT`'s raw value should visibly change across
+the gear swap; the unrecognized section is what steps 2-3 diff for a
+brand-new candidate id. Unrecognized service ids, undecoded method ids, and
+unrecognized attr ids are called out distinctly from known ones in every
+section — that distinction is the entire point of the tool.
 
 Run it against a dump:
 

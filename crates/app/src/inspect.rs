@@ -210,7 +210,14 @@ impl InspectSink for DiagnosticSink {
         }
     }
 
-    fn on_unknown_attr(&self, uid: i64, attr_id: i32, raw: &[u8]) {
+    fn on_attr(&self, uid: i64, attr_id: i32, raw: &[u8], known: bool) {
+        // A known id is already decoded elsewhere and isn't a discovery —
+        // this sink only aggregates/logs the unrecognized ones (slice A's
+        // behavior, preserved as-is after slice B widened the seam itself
+        // to report every id).
+        if known {
+            return;
+        }
         let mut attrs = self.attrs.lock().unwrap();
         let count = attrs.entry((uid, attr_id)).or_insert(0);
         *count += 1;
@@ -338,13 +345,21 @@ mod tests {
     #[test]
     fn unknown_attr_is_counted_per_uid_and_attr_id() {
         let (sink, _rx) = new_sink();
-        sink.on_unknown_attr(5, 0x99, &[1, 2]);
-        sink.on_unknown_attr(5, 0x99, &[3]);
-        sink.on_unknown_attr(6, 0x99, &[]);
+        sink.on_attr(5, 0x99, &[1, 2], false);
+        sink.on_attr(5, 0x99, &[3], false);
+        sink.on_attr(6, 0x99, &[], false);
 
         let attrs = sink.attrs.lock().unwrap();
         assert_eq!(attrs.get(&(5, 0x99)), Some(&2));
         assert_eq!(attrs.get(&(6, 0x99)), Some(&1));
+    }
+
+    #[test]
+    fn known_attr_is_not_aggregated_or_logged_as_a_discovery() {
+        let (sink, _rx) = new_sink();
+        sink.on_attr(5, 0x99, &[1], true);
+
+        assert!(sink.attrs.lock().unwrap().is_empty());
     }
 
     #[test]
