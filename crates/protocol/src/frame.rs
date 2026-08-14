@@ -3,6 +3,7 @@
 //! Wire format, repeated back-to-back in the reassembled TCP byte stream:
 //! `[total_len: BE u32 (includes itself)][packet_type: BE u16][body...]`.
 
+use crate::inspect::InspectSink;
 use crate::reader::Reader;
 
 pub const COMPRESSION_FLAG: u16 = 0x8000;
@@ -192,7 +193,16 @@ fn decompress(payload: &[u8]) -> Option<Vec<u8>> {
 /// any decoded `Notify` fragments onto `out`. Handles `Notify` and
 /// `FrameDown` only; every other fragment type is a silent no-op. Never
 /// panics or propagates an error for malformed bodies — it just drops them.
-pub fn parse_frame(frame: &[u8], depth: usize, out: &mut Vec<Notify>) {
+///
+/// `sink`/`now_ms` are the diagnostic-mode observation hook (issue #25 slice
+/// A): `None` reproduces the pre-#25 behavior exactly (see `handle_notify`).
+pub fn parse_frame(
+    frame: &[u8],
+    depth: usize,
+    out: &mut Vec<Notify>,
+    sink: Option<&dyn InspectSink>,
+    now_ms: u64,
+) {
     let mut reader = Reader::new(frame);
     let _total_len = match reader.read_u32() {
         Some(v) => v,
@@ -207,45 +217,96 @@ pub fn parse_frame(frame: &[u8], depth: usize, out: &mut Vec<Notify>) {
     let body = reader.read_rest();
 
     match fragment_type {
-        FragmentType::Notify => handle_notify(body, is_zstd, out),
-        FragmentType::FrameDown => handle_frame_down(body, is_zstd, depth, out),
+        FragmentType::Notify => handle_notify(body, is_zstd, out, sink, now_ms),
+        FragmentType::FrameDown => handle_frame_down(body, is_zstd, depth, out, sink, now_ms),
         _ => {}
     }
 }
 
-fn handle_notify(body: &[u8], is_zstd: bool, out: &mut Vec<Notify>) {
-    let mut reader = Reader::new(body);
-    let service_uuid = match reader.read_u64() {
-        Some(v) => v,
-        None => return,
-    };
-    if service_uuid != SERVICE_UUID {
-        return;
-    }
-    let _stub_id = match reader.read_u32() {
-        Some(v) => v,
-        None => return,
-    };
-    let method_id = match reader.read_u32() {
-        Some(v) => v,
-        None => return,
-    };
-    let raw_payload = reader.read_rest();
-    let payload = if is_zstd {
+/// Shared zstd-or-passthrough payload step; `None` means "drop the
+/// fragment" (a decompression failure), matching the pre-#25 behavior.
+fn decode_payload(raw_payload: &[u8], is_zstd: bool) -> Option<Vec<u8>> {
+    if is_zstd {
         match decompress(raw_payload) {
-            Some(p) => p,
+            Some(p) => Some(p),
             None => {
                 log::debug!("bpsr-protocol: zstd decode failed for Notify payload");
-                return;
+                None
             }
         }
     } else {
-        raw_payload.to_vec()
-    };
-    out.push(Notify { method_id, payload });
+        Some(raw_payload.to_vec())
+    }
 }
 
-fn handle_frame_down(body: &[u8], is_zstd: bool, depth: usize, out: &mut Vec<Notify>) {
+fn handle_notify(
+    body: &[u8],
+    is_zstd: bool,
+    out: &mut Vec<Notify>,
+    sink: Option<&dyn InspectSink>,
+    now_ms: u64,
+) {
+    let Some(sink) = sink else {
+        // No diagnostic sink: byte-for-byte the pre-#25 code path — an
+        // unrecognized service uuid returns immediately, before stub_id or
+        // method_id are even read, so a normal (non-diagnostic) run pays
+        // nothing extra here.
+        let mut reader = Reader::new(body);
+        let service_uuid = match reader.read_u64() {
+            Some(v) => v,
+            None => return,
+        };
+        if service_uuid != SERVICE_UUID {
+            return;
+        }
+        let _stub_id = match reader.read_u32() {
+            Some(v) => v,
+            None => return,
+        };
+        let method_id = match reader.read_u32() {
+            Some(v) => v,
+            None => return,
+        };
+        let raw_payload = reader.read_rest();
+        let Some(payload) = decode_payload(raw_payload, is_zstd) else {
+            return;
+        };
+        out.push(Notify { method_id, payload });
+        return;
+    };
+
+    // Diagnostic path: fully parse and (attempt to) decompress regardless of
+    // service_uuid, so `sink.on_notify` observes every Notify-shaped
+    // fragment — including the ones a normal run would have dropped at the
+    // service check above.
+    let mut reader = Reader::new(body);
+    let Some(service_uuid) = reader.read_u64() else {
+        return;
+    };
+    let Some(_stub_id) = reader.read_u32() else {
+        return;
+    };
+    let Some(method_id) = reader.read_u32() else {
+        return;
+    };
+    let raw_payload = reader.read_rest();
+    let Some(payload) = decode_payload(raw_payload, is_zstd) else {
+        return;
+    };
+    sink.on_notify(service_uuid, method_id, &payload, now_ms);
+    if service_uuid == SERVICE_UUID {
+        out.push(Notify { method_id, payload });
+    }
+}
+
+fn handle_frame_down(
+    body: &[u8],
+    is_zstd: bool,
+    depth: usize,
+    out: &mut Vec<Notify>,
+    sink: Option<&dyn InspectSink>,
+    now_ms: u64,
+) {
     if depth >= MAX_FRAMEDOWN_DEPTH {
         return;
     }
@@ -271,7 +332,7 @@ fn handle_frame_down(body: &[u8], is_zstd: bool, depth: usize, out: &mut Vec<Not
         log::debug!("bpsr-protocol: desync while splitting FrameDown nested stream");
     }
     for f in result.frames {
-        parse_frame(f, depth + 1, out);
+        parse_frame(f, depth + 1, out, sink, now_ms);
     }
 }
 
@@ -290,12 +351,49 @@ mod tests {
     }
 
     fn build_notify_body(method_id: u32, payload: &[u8]) -> Vec<u8> {
+        build_notify_body_with_service(SERVICE_UUID, method_id, payload)
+    }
+
+    fn build_notify_body_with_service(
+        service_uuid: u64,
+        method_id: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&SERVICE_UUID.to_be_bytes());
+        buf.extend_from_slice(&service_uuid.to_be_bytes());
         buf.extend_from_slice(&0u32.to_be_bytes());
         buf.extend_from_slice(&method_id.to_be_bytes());
         buf.extend_from_slice(payload);
         buf
+    }
+
+    /// `(service_uuid, method_id, payload, now_ms)`, as recorded by
+    /// `RecordingSink::on_notify`.
+    type RecordedNotify = (u64, u32, Vec<u8>, u64);
+
+    /// Test-only `InspectSink` that just records every `on_notify` call, in
+    /// order, for assertions.
+    struct RecordingSink {
+        notifies: std::sync::Mutex<Vec<RecordedNotify>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Self {
+            Self {
+                notifies: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl InspectSink for RecordingSink {
+        fn on_notify(&self, service_uuid: u64, method_id: u32, payload: &[u8], now_ms: u64) {
+            self.notifies
+                .lock()
+                .unwrap()
+                .push((service_uuid, method_id, payload.to_vec(), now_ms));
+        }
+
+        fn on_unknown_attr(&self, _uid: i64, _attr_id: i32, _raw: &[u8]) {}
     }
 
     fn build_notify_frame(method_id: u32, payload: &[u8], compressed: bool) -> Vec<u8> {
@@ -324,7 +422,7 @@ mod tests {
     fn uncompressed_notify_parses() {
         let frame = build_notify_frame(0x06, b"hello", false);
         let mut out = Vec::new();
-        parse_frame(&frame, 0, &mut out);
+        parse_frame(&frame, 0, &mut out, None, 0);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].method_id, 0x06);
         assert_eq!(out[0].payload, b"hello");
@@ -334,7 +432,7 @@ mod tests {
     fn zstd_notify_decompresses() {
         let frame = build_notify_frame(0x15, b"payload-data-payload-data", true);
         let mut out = Vec::new();
-        parse_frame(&frame, 0, &mut out);
+        parse_frame(&frame, 0, &mut out, None, 0);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].method_id, 0x15);
         assert_eq!(out[0].payload, b"payload-data-payload-data");
@@ -366,7 +464,7 @@ mod tests {
         nested.extend(build_notify_frame(2, b"two", false));
         let frame = build_framedown_frame(42, &nested, false);
         let mut out = Vec::new();
-        parse_frame(&frame, 0, &mut out);
+        parse_frame(&frame, 0, &mut out, None, 0);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].method_id, 1);
         assert_eq!(out[1].method_id, 2);
@@ -380,7 +478,7 @@ mod tests {
             current = build_framedown_frame(1, &current, false);
         }
         let mut out = Vec::new();
-        parse_frame(&current, 0, &mut out);
+        parse_frame(&current, 0, &mut out, None, 0);
         assert!(out.is_empty());
     }
 
@@ -388,7 +486,7 @@ mod tests {
     fn unknown_fragment_type_skipped() {
         let frame = build_frame(99, false, b"whatever");
         let mut out = Vec::new();
-        parse_frame(&frame, 0, &mut out);
+        parse_frame(&frame, 0, &mut out, None, 0);
         assert!(out.is_empty());
     }
 
@@ -405,7 +503,7 @@ mod tests {
             frame.len()
         );
         let mut out = Vec::new();
-        parse_frame(&frame, 0, &mut out);
+        parse_frame(&frame, 0, &mut out, None, 0);
         assert!(
             out.is_empty(),
             "a payload expanding past MAX_FRAME_LEN must be dropped"
@@ -419,7 +517,7 @@ mod tests {
         let payload = vec![7u8; 1024 * 1024];
         let frame = build_notify_frame(0x15, &payload, true);
         let mut out = Vec::new();
-        parse_frame(&frame, 0, &mut out);
+        parse_frame(&frame, 0, &mut out, None, 0);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].payload.len(), payload.len());
     }
@@ -494,9 +592,81 @@ mod tests {
         nested.extend_from_slice(&5u32.to_be_bytes()); // garbage: below MIN_FRAME_LEN
         let frame = build_framedown_frame(42, &nested, false);
         let mut out = Vec::new();
-        parse_frame(&frame, 0, &mut out);
+        parse_frame(&frame, 0, &mut out, None, 0);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].method_id, 1);
         assert_eq!(out[1].method_id, 2);
+    }
+
+    // -- InspectSink observation (issue #25 slice A) ----------------------
+
+    /// The headline case: a Notify on a service uuid we don't recognize is
+    /// still dropped from `out` (normal behavior preserved), but a supplied
+    /// sink observes it instead of it vanishing silently.
+    #[test]
+    fn unrecognized_service_uuid_is_observed_via_sink_but_still_dropped() {
+        let other_service = SERVICE_UUID.wrapping_add(1);
+        let body = build_notify_body_with_service(other_service, 0x42, b"hello");
+        let frame = build_frame(2, false, &body);
+        let sink = RecordingSink::new();
+        let mut out = Vec::new();
+
+        parse_frame(&frame, 0, &mut out, Some(&sink), 123);
+
+        assert!(
+            out.is_empty(),
+            "an unrecognized service must still be dropped from decoded notifies"
+        );
+        let seen = sink.notifies.lock().unwrap();
+        assert_eq!(*seen, vec![(other_service, 0x42, b"hello".to_vec(), 123)]);
+    }
+
+    /// A recognized service is *also* observed via the sink (this is what
+    /// feeds the slice A item 4 raw-frame dump), in addition to still
+    /// reaching `out` as before.
+    #[test]
+    fn recognized_service_is_also_observed_via_sink() {
+        let body = build_notify_body(0x07, b"payload");
+        let frame = build_frame(2, false, &body);
+        let sink = RecordingSink::new();
+        let mut out = Vec::new();
+
+        parse_frame(&frame, 0, &mut out, Some(&sink), 55);
+
+        assert_eq!(out.len(), 1);
+        let seen = sink.notifies.lock().unwrap();
+        assert_eq!(*seen, vec![(SERVICE_UUID, 0x07, b"payload".to_vec(), 55)]);
+    }
+
+    /// `sink = None` reproduces the exact pre-#25 dropping behavior: no
+    /// observation, and an unrecognized service is still silently dropped.
+    #[test]
+    fn no_sink_means_no_observation_and_unchanged_dropping() {
+        let other_service = SERVICE_UUID.wrapping_add(1);
+        let body = build_notify_body_with_service(other_service, 0x42, b"hello");
+        let frame = build_frame(2, false, &body);
+        let mut out = Vec::new();
+
+        parse_frame(&frame, 0, &mut out, None, 0);
+
+        assert!(out.is_empty());
+    }
+
+    /// The sink also sees Notify fragments nested inside `FrameDown`, not
+    /// just top-level ones.
+    #[test]
+    fn unrecognized_service_nested_in_framedown_is_observed() {
+        let other_service = SERVICE_UUID.wrapping_add(1);
+        let body = build_notify_body_with_service(other_service, 0x9, b"nested");
+        let nested = build_frame(2, false, &body);
+        let frame = build_framedown_frame(1, &nested, false);
+        let sink = RecordingSink::new();
+        let mut out = Vec::new();
+
+        parse_frame(&frame, 0, &mut out, Some(&sink), 7);
+
+        assert!(out.is_empty());
+        let seen = sink.notifies.lock().unwrap();
+        assert_eq!(*seen, vec![(other_service, 0x9, b"nested".to_vec(), 7)]);
     }
 }

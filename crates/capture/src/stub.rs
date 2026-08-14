@@ -5,7 +5,9 @@
 //! `crates/app` can call `start_capture` unconditionally, but it always
 //! reports [`CaptureError::UnsupportedPlatform`].
 
-use bpsr_protocol::ProtocolEvent;
+use std::sync::Arc;
+
+use bpsr_protocol::{InspectSink, ProtocolEvent};
 use crossbeam_channel::Sender;
 
 use crate::error::CaptureError;
@@ -22,8 +24,13 @@ impl CaptureHandle {
 }
 
 /// Always fails with [`CaptureError::UnsupportedPlatform`] on non-Windows
-/// platforms — packet capture requires the WinDivert driver.
-pub fn start_capture(_tx: Sender<ProtocolEvent>) -> Result<CaptureHandle, CaptureError> {
+/// platforms — packet capture requires the WinDivert driver. `_inspect_sink`
+/// (issue #25 slice A) is accepted only to keep this signature matching
+/// `win::start_capture`'s; there is no decoder here to wire it into.
+pub fn start_capture(
+    _tx: Sender<ProtocolEvent>,
+    _inspect_sink: Option<Arc<dyn InspectSink>>,
+) -> Result<CaptureHandle, CaptureError> {
     Err(CaptureError::UnsupportedPlatform)
 }
 
@@ -34,7 +41,7 @@ mod tests {
     #[test]
     fn start_capture_returns_unsupported_platform() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        match start_capture(tx) {
+        match start_capture(tx, None) {
             Err(CaptureError::UnsupportedPlatform) => {}
             Err(other) => panic!("expected UnsupportedPlatform, got {other:?}"),
             Ok(_) => panic!("expected an error on non-Windows"),

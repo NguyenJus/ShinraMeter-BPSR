@@ -7,9 +7,12 @@
 
 use prost::Message;
 
+use std::sync::Arc;
+
 use crate::attrs::{enemy_hp_from_attrs, player_info_from_attrs};
 use crate::event::{DamageEvent, EntityKind, PlayerInfo, ProtocolEvent, kind_of, uid_of};
 use crate::frame::{Desync, MAX_TAIL_LEN, Notify, parse_frame, split_frames};
+use crate::inspect::InspectSink;
 use crate::pb::{self, AoiSyncDelta, Class, EDamageType};
 
 pub mod opcode {
@@ -21,11 +24,17 @@ pub mod opcode {
 
 /// Decodes one Notify's payload and appends any resulting events to `out`.
 /// Unknown opcodes are skipped silently; a prost decode failure is dropped
-/// with a debug log.
-pub fn decode_notify(n: &Notify, now_ms: u64, out: &mut Vec<ProtocolEvent>) {
+/// with a debug log. `sink` is the issue #25 slice A diagnostic hook: `None`
+/// on every normal (non-diagnostic) call site.
+pub fn decode_notify(
+    n: &Notify,
+    now_ms: u64,
+    out: &mut Vec<ProtocolEvent>,
+    sink: Option<&dyn InspectSink>,
+) {
     match n.method_id {
         opcode::SYNC_NEAR_ENTITIES => match pb::SyncNearEntities::decode(n.payload.as_slice()) {
-            Ok(msg) => on_sync_near_entities(&msg, now_ms, out),
+            Ok(msg) => on_sync_near_entities(&msg, now_ms, out, sink),
             Err(_) => log::debug!("bpsr-protocol: SyncNearEntities decode failed"),
         },
         opcode::SYNC_CONTAINER_DATA => match pb::SyncContainerData::decode(n.payload.as_slice()) {
@@ -35,7 +44,7 @@ pub fn decode_notify(n: &Notify, now_ms: u64, out: &mut Vec<ProtocolEvent>) {
         opcode::SYNC_NEAR_DELTA_INFO => match pb::SyncNearDeltaInfo::decode(n.payload.as_slice()) {
             Ok(msg) => {
                 for delta in &msg.delta_infos {
-                    on_aoi_sync_delta(delta, delta.uuid, now_ms, out);
+                    on_aoi_sync_delta(delta, delta.uuid, now_ms, out, sink);
                 }
             }
             Err(_) => log::debug!("bpsr-protocol: SyncNearDeltaInfo decode failed"),
@@ -53,7 +62,7 @@ pub fn decode_notify(n: &Notify, now_ms: u64, out: &mut Vec<ProtocolEvent>) {
                             } else {
                                 delta.uuid
                             };
-                            on_aoi_sync_delta(delta, uuid, now_ms, out);
+                            on_aoi_sync_delta(delta, uuid, now_ms, out, sink);
                         }
                     }
                 }
@@ -64,7 +73,12 @@ pub fn decode_notify(n: &Notify, now_ms: u64, out: &mut Vec<ProtocolEvent>) {
     }
 }
 
-fn on_sync_near_entities(msg: &pb::SyncNearEntities, now_ms: u64, out: &mut Vec<ProtocolEvent>) {
+fn on_sync_near_entities(
+    msg: &pb::SyncNearEntities,
+    now_ms: u64,
+    out: &mut Vec<ProtocolEvent>,
+    sink: Option<&dyn InspectSink>,
+) {
     for entity in &msg.appear {
         let Some(attrs) = &entity.attrs else {
             continue;
@@ -75,6 +89,7 @@ fn on_sync_near_entities(msg: &pb::SyncNearEntities, now_ms: u64, out: &mut Vec<
                 out.push(ProtocolEvent::Player(player_info_from_attrs(
                     uid,
                     &attrs.attrs,
+                    sink,
                 )));
             }
             EntityKind::Monster => {
@@ -92,7 +107,13 @@ fn on_sync_near_entities(msg: &pb::SyncNearEntities, now_ms: u64, out: &mut Vec<
 /// `uuid` is the delta's identity (the entity the attrs/damage apply to); it
 /// is passed in because a `SyncToMeDeltaInfo` carries it on the wrapper rather
 /// than on the `AoiSyncDelta` itself.
-fn on_aoi_sync_delta(delta: &AoiSyncDelta, uuid: i64, now_ms: u64, out: &mut Vec<ProtocolEvent>) {
+fn on_aoi_sync_delta(
+    delta: &AoiSyncDelta,
+    uuid: i64,
+    now_ms: u64,
+    out: &mut Vec<ProtocolEvent>,
+    sink: Option<&dyn InspectSink>,
+) {
     let target_uid = uid_of(uuid);
     let target_kind = kind_of(uuid);
     if let Some(attrs) = &delta.attrs {
@@ -101,6 +122,7 @@ fn on_aoi_sync_delta(delta: &AoiSyncDelta, uuid: i64, now_ms: u64, out: &mut Vec
                 out.push(ProtocolEvent::Player(player_info_from_attrs(
                     target_uid,
                     &attrs.attrs,
+                    sink,
                 )));
             }
             EntityKind::Monster => {
@@ -188,6 +210,12 @@ pub struct Decoder {
     /// Bytes still to be discarded from the stream to get past the body of a
     /// refused over-large frame. Non-zero only while `tail` is empty.
     skip: u64,
+    /// Issue #25 slice A diagnostic hook. `None` (the default, via `new`) is
+    /// zero-cost: every call site downstream only pays for a null check.
+    /// `Arc`, not a borrow, because the decoder — and the sink it reports
+    /// to — both outlive a single `push_stream` call across the capture
+    /// thread's lifetime.
+    sink: Option<Arc<dyn InspectSink>>,
 }
 
 impl Decoder {
@@ -195,6 +223,20 @@ impl Decoder {
         Self {
             tail: Vec::new(),
             skip: 0,
+            sink: None,
+        }
+    }
+
+    /// Same as `new`, but with diagnostic observation turned on: every
+    /// unrecognized service/method id, raw post-decompression frame, and
+    /// unknown attr id reaches `sink` instead of being silently dropped.
+    /// Opt-in only — see `crates/app/src/inspect.rs` for how a user turns
+    /// this on (issue #25 slice A).
+    pub fn with_inspect_sink(sink: Arc<dyn InspectSink>) -> Self {
+        Self {
+            tail: Vec::new(),
+            skip: 0,
+            sink: Some(sink),
         }
     }
 
@@ -224,15 +266,16 @@ impl Decoder {
             }
         }
         self.tail.extend_from_slice(bytes);
+        let sink = self.sink.as_deref();
         let mut out = Vec::new();
         let (consumed, desync) = {
             let result = split_frames(&self.tail);
             let mut notifies = Vec::new();
             for f in &result.frames {
-                parse_frame(f, 0, &mut notifies);
+                parse_frame(f, 0, &mut notifies, sink, now_ms);
             }
             for n in &notifies {
-                decode_notify(n, now_ms, &mut out);
+                decode_notify(n, now_ms, &mut out, sink);
             }
             (result.consumed, result.desync)
         };
@@ -338,7 +381,7 @@ mod tests {
         };
         let n = notify_for_damage(dmg);
         let mut out = Vec::new();
-        decode_notify(&n, 0, &mut out);
+        decode_notify(&n, 0, &mut out, None);
         let ev = only_damage(out);
         assert_eq!(ev.attacker_uid, uid_of(SUMMONER_UUID));
         assert_eq!(ev.attacker_kind, EntityKind::Player);
@@ -352,7 +395,7 @@ mod tests {
         };
         let n = notify_for_damage(dmg);
         let mut out = Vec::new();
-        decode_notify(&n, 0, &mut out);
+        decode_notify(&n, 0, &mut out, None);
         assert!(out.is_empty());
     }
 
@@ -364,7 +407,7 @@ mod tests {
         };
         let n = notify_for_damage(dmg);
         let mut out = Vec::new();
-        decode_notify(&n, 0, &mut out);
+        decode_notify(&n, 0, &mut out, None);
         assert!(only_damage(out).crit);
     }
 
@@ -376,7 +419,7 @@ mod tests {
         };
         let n = notify_for_damage(dmg);
         let mut out = Vec::new();
-        decode_notify(&n, 0, &mut out);
+        decode_notify(&n, 0, &mut out, None);
         assert!(!only_damage(out).crit);
     }
 
@@ -389,7 +432,7 @@ mod tests {
         };
         let n = notify_for_damage(dmg);
         let mut out = Vec::new();
-        decode_notify(&n, 0, &mut out);
+        decode_notify(&n, 0, &mut out, None);
         let ev = only_damage(out);
         assert_eq!(ev.value, 250);
         assert!(ev.lucky);
@@ -403,7 +446,7 @@ mod tests {
         };
         let n = notify_for_damage(dmg);
         let mut out = Vec::new();
-        decode_notify(&n, 0, &mut out);
+        decode_notify(&n, 0, &mut out, None);
         assert!(only_damage(out).is_heal);
     }
 
@@ -418,7 +461,7 @@ mod tests {
         };
         let n = notify_for_damage(dmg);
         let mut out = Vec::new();
-        decode_notify(&n, 0, &mut out);
+        decode_notify(&n, 0, &mut out, None);
         assert!(only_damage(out).is_miss);
     }
 
@@ -429,7 +472,7 @@ mod tests {
             payload: Vec::new(),
         };
         let mut out = Vec::new();
-        decode_notify(&n, 0, &mut out);
+        decode_notify(&n, 0, &mut out, None);
         assert!(out.is_empty());
     }
 
@@ -457,7 +500,7 @@ mod tests {
             payload,
         };
         let mut out = Vec::new();
-        decode_notify(&n, 0, &mut out);
+        decode_notify(&n, 0, &mut out, None);
         assert_eq!(out.len(), 1);
         match &out[0] {
             ProtocolEvent::Player(p) => {
@@ -507,7 +550,7 @@ mod tests {
         // The "to-me" wrapper carries the entity uuid; base_delta.uuid is 0.
         let n = to_me_notify(ATTACKER_UUID, 0);
         let mut out = Vec::new();
-        decode_notify(&n, 0, &mut out);
+        decode_notify(&n, 0, &mut out, None);
         let p = only_player(out);
         assert_eq!(p.uid, uid_of(ATTACKER_UUID));
         assert_eq!(p.name.as_deref(), Some("Ali"));
@@ -517,7 +560,7 @@ mod tests {
     fn to_me_delta_falls_back_to_base_delta_uuid() {
         let n = to_me_notify(0, ATTACKER_UUID);
         let mut out = Vec::new();
-        decode_notify(&n, 0, &mut out);
+        decode_notify(&n, 0, &mut out, None);
         assert_eq!(only_player(out).uid, uid_of(ATTACKER_UUID));
     }
 
@@ -541,5 +584,106 @@ mod tests {
         let mut decoder = Decoder::new();
         let out = decoder.push_stream(&frame, 0);
         assert_eq!(only_damage(out).skill_id, 1);
+    }
+
+    // -- InspectSink observation (issue #25 slice A) -----------------------
+
+    /// `(service_uuid, method_id, payload, now_ms)`.
+    type RecordedNotify = (u64, u32, Vec<u8>, u64);
+    /// `(uid, attr_id, raw)`.
+    type RecordedUnknownAttr = (i64, i32, Vec<u8>);
+
+    struct RecordingSink {
+        notifies: std::sync::Mutex<Vec<RecordedNotify>>,
+        unknown_attrs: std::sync::Mutex<Vec<RecordedUnknownAttr>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Self {
+            Self {
+                notifies: std::sync::Mutex::new(Vec::new()),
+                unknown_attrs: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::inspect::InspectSink for RecordingSink {
+        fn on_notify(&self, service_uuid: u64, method_id: u32, payload: &[u8], now_ms: u64) {
+            self.notifies
+                .lock()
+                .unwrap()
+                .push((service_uuid, method_id, payload.to_vec(), now_ms));
+        }
+
+        fn on_unknown_attr(&self, uid: i64, attr_id: i32, raw: &[u8]) {
+            self.unknown_attrs
+                .lock()
+                .unwrap()
+                .push((uid, attr_id, raw.to_vec()));
+        }
+    }
+
+    /// `decode_notify` threads its sink down into the entity attr walk, so
+    /// an unknown attr id on a player entity reaches it end to end.
+    #[test]
+    fn decode_notify_forwards_unknown_attr_ids_to_the_sink() {
+        let attrs = AttrCollection {
+            uuid: ATTACKER_UUID,
+            attrs: vec![pb::Attr {
+                id: 0x7777,
+                raw_data: vec![0x01],
+            }],
+        };
+        let delta = AoiSyncDelta {
+            uuid: ATTACKER_UUID,
+            attrs: Some(attrs),
+            skill_effects: None,
+        };
+        let msg = SyncNearDeltaInfo {
+            delta_infos: vec![delta],
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let n = Notify {
+            method_id: opcode::SYNC_NEAR_DELTA_INFO,
+            payload,
+        };
+        let sink = RecordingSink::new();
+        let mut out = Vec::new();
+
+        decode_notify(&n, 0, &mut out, Some(&sink));
+
+        assert_eq!(
+            *sink.unknown_attrs.lock().unwrap(),
+            vec![(uid_of(ATTACKER_UUID), 0x7777, vec![0x01])]
+        );
+    }
+
+    /// End-to-end through `Decoder::with_inspect_sink` + `push_stream`: a
+    /// Notify on an unrecognized service uuid is observed via the sink and
+    /// still produces no `ProtocolEvent`s.
+    #[test]
+    fn decoder_with_inspect_sink_observes_an_unrecognized_service_end_to_end() {
+        let other_service = crate::frame::SERVICE_UUID.wrapping_add(1);
+        let mut body = Vec::new();
+        body.extend_from_slice(&other_service.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&0x42u32.to_be_bytes());
+        body.extend_from_slice(b"hello");
+        let mut frame = Vec::new();
+        let total_len = 4 + 2 + body.len() as u32;
+        frame.extend_from_slice(&total_len.to_be_bytes());
+        frame.extend_from_slice(&2u16.to_be_bytes()); // Notify, uncompressed
+        frame.extend_from_slice(&body);
+
+        let sink = Arc::new(RecordingSink::new());
+        let mut decoder = Decoder::with_inspect_sink(sink.clone());
+        let out = decoder.push_stream(&frame, 999);
+
+        assert!(out.is_empty());
+        assert_eq!(
+            *sink.notifies.lock().unwrap(),
+            vec![(other_service, 0x42, b"hello".to_vec(), 999)]
+        );
     }
 }

@@ -5,3 +5,11 @@ Cargo.lock.orig
 docs/specs/
 docs/plans/
 /dist
+
+# Packet-inspection diagnostic dumps (issue #25, SHINRA_INSPECT=1). These
+# contain player names and other identifying traffic captured from a live
+# session — never commit one or attach it to an issue/PR; mint a minimal
+# synthetic fixture instead.
+shinra-bpsr-inspect-dump-*.jsonl
+inspect-dumps/
+*.inspect-dump.jsonl

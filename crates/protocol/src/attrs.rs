@@ -7,6 +7,7 @@
 use std::io::Cursor;
 
 use crate::event::{EnemyHp, PlayerInfo};
+use crate::inspect::InspectSink;
 use crate::pb::{self, Class};
 
 pub mod attr_id {
@@ -71,8 +72,14 @@ pub fn decode_name(raw: &[u8]) -> Option<String> {
 
 /// Builds a `PlayerInfo` from an entity's `Attr` list, reading `NAME`,
 /// `PROFESSION_ID`, and `FIGHT_POINT` (ability score). Unknown ids, empty
-/// `raw_data`, and `id == 0` are skipped.
-pub fn player_info_from_attrs(uid: i64, attrs: &[pb::Attr]) -> PlayerInfo {
+/// `raw_data`, and `id == 0` are skipped — unless `sink` is set (issue #25
+/// slice A diagnostic mode), in which case every id with no known constant
+/// is reported via `InspectSink::on_unknown_attr` instead of just vanishing.
+pub fn player_info_from_attrs(
+    uid: i64,
+    attrs: &[pb::Attr],
+    sink: Option<&dyn InspectSink>,
+) -> PlayerInfo {
     let mut name = None;
     let mut class = None;
     let mut ability_score = None;
@@ -100,7 +107,11 @@ pub fn player_info_from_attrs(uid: i64, attrs: &[pb::Attr]) -> PlayerInfo {
                     ability_score = Some(v);
                 }
             }
-            _ => {}
+            other => {
+                if let Some(sink) = sink {
+                    sink.on_unknown_attr(uid, other, &attr.raw_data);
+                }
+            }
         }
     }
     PlayerInfo {
@@ -217,7 +228,7 @@ mod tests {
             id: attr_id::PROFESSION_ID,
             raw_data: varint(0x1_0000_0001),
         }];
-        assert_eq!(player_info_from_attrs(1, &attrs).class, None);
+        assert_eq!(player_info_from_attrs(1, &attrs, None).class, None);
     }
 
     #[test]
@@ -250,7 +261,7 @@ mod tests {
             raw_data: varint(123_456),
         }];
         assert_eq!(
-            player_info_from_attrs(1, &attrs).ability_score,
+            player_info_from_attrs(1, &attrs, None).ability_score,
             Some(123_456)
         );
     }
@@ -261,7 +272,7 @@ mod tests {
             id: attr_id::FIGHT_POINT,
             raw_data: varint(0),
         }];
-        assert_eq!(player_info_from_attrs(1, &attrs).ability_score, None);
+        assert_eq!(player_info_from_attrs(1, &attrs, None).ability_score, None);
     }
 
     #[test]
@@ -270,7 +281,7 @@ mod tests {
             id: attr_id::PROFESSION_ID,
             raw_data: varint(1),
         }];
-        assert_eq!(player_info_from_attrs(1, &attrs).ability_score, None);
+        assert_eq!(player_info_from_attrs(1, &attrs, None).ability_score, None);
     }
 
     #[test]
@@ -279,7 +290,7 @@ mod tests {
             id: attr_id::FIGHT_POINT,
             raw_data: varint(0x1_0000_0001),
         }];
-        assert_eq!(player_info_from_attrs(1, &attrs).ability_score, None);
+        assert_eq!(player_info_from_attrs(1, &attrs, None).ability_score, None);
     }
 
     #[test]
@@ -290,8 +301,82 @@ mod tests {
             id: 0x9999,
             raw_data: raw,
         }];
-        let info = player_info_from_attrs(1, &attrs);
+        let info = player_info_from_attrs(1, &attrs, None);
         assert_eq!(info.name, None);
         assert_eq!(info.class, None);
+    }
+
+    // -- InspectSink observation (issue #25 slice A) ----------------------
+
+    /// Test-only `InspectSink` that just records every `on_unknown_attr`
+    /// call, in order, for assertions.
+    struct RecordingSink {
+        unknown: std::sync::Mutex<Vec<(i64, i32, Vec<u8>)>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Self {
+            Self {
+                unknown: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl InspectSink for RecordingSink {
+        fn on_notify(&self, _service_uuid: u64, _method_id: u32, _payload: &[u8], _now_ms: u64) {}
+
+        fn on_unknown_attr(&self, uid: i64, attr_id: i32, raw: &[u8]) {
+            self.unknown
+                .lock()
+                .unwrap()
+                .push((uid, attr_id, raw.to_vec()));
+        }
+    }
+
+    #[test]
+    fn unknown_attr_id_is_observed_via_sink_when_present() {
+        let raw = varint(999);
+        let attrs = vec![pb::Attr {
+            id: 0x9999,
+            raw_data: raw.clone(),
+        }];
+        let sink = RecordingSink::new();
+
+        let info = player_info_from_attrs(7, &attrs, Some(&sink));
+
+        assert_eq!(info.name, None);
+        assert_eq!(*sink.unknown.lock().unwrap(), vec![(7, 0x9999, raw)]);
+    }
+
+    #[test]
+    fn known_attr_id_does_not_trigger_the_unknown_attr_sink_call() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::NAME,
+            raw_data: vec![0xFF, b'H', b'i'],
+        }];
+        let sink = RecordingSink::new();
+
+        let _ = player_info_from_attrs(1, &attrs, Some(&sink));
+
+        assert!(sink.unknown.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_raw_data_and_zero_id_do_not_trigger_the_unknown_attr_sink_call() {
+        let attrs = vec![
+            pb::Attr {
+                id: 0x1234,
+                raw_data: Vec::new(),
+            },
+            pb::Attr {
+                id: 0,
+                raw_data: varint(1),
+            },
+        ];
+        let sink = RecordingSink::new();
+
+        let _ = player_info_from_attrs(1, &attrs, Some(&sink));
+
+        assert!(sink.unknown.lock().unwrap().is_empty());
     }
 }
