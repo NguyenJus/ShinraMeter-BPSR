@@ -99,12 +99,22 @@ impl ColumnKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub visible_columns: Vec<ColumnKind>,
+    /// Last on-screen window position (issue #27), applied via
+    /// `ViewportBuilder::with_position` on the next launch, or `None` if the
+    /// window has never been dragged (or this predates the field). The
+    /// `#[serde(default)]` is what lets a settings.json written before issue
+    /// #27 (with no `window_position` key at all) keep deserializing instead
+    /// of erroring on a missing field — the only backward-compat guarantee
+    /// this change makes.
+    #[serde(default)]
+    pub window_position: Option<[f32; 2]>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             visible_columns: vec![ColumnKind::Damage, ColumnKind::Dps, ColumnKind::SharePct],
+            window_position: None,
         }
     }
 }
@@ -134,6 +144,22 @@ impl Settings {
             }
         } else {
             self.visible_columns.push(col);
+        }
+    }
+
+    /// Returns an updated copy with `window_position` set to `position`, or
+    /// `None` if it already matches (issue #27). The overlay reports its
+    /// outer position every single frame — including every frame of a drag
+    /// gesture — so this is the change-detection gate that keeps the
+    /// settings-writer channel from being sent an identical value on every
+    /// repaint; only an actual move should result in a send.
+    pub fn with_window_position_if_changed(&self, position: [f32; 2]) -> Option<Settings> {
+        if self.window_position == Some(position) {
+            None
+        } else {
+            let mut updated = self.clone();
+            updated.window_position = Some(position);
+            Some(updated)
         }
     }
 
@@ -341,6 +367,7 @@ mod tests {
     fn toggle_refuses_to_disable_the_last_visible_column() {
         let mut settings = Settings {
             visible_columns: vec![ColumnKind::Damage],
+            window_position: None,
         };
 
         settings.toggle(ColumnKind::Damage);
@@ -352,6 +379,7 @@ mod tests {
     fn empty_visible_columns_sanitizes_to_default() {
         let settings = Settings {
             visible_columns: vec![],
+            window_position: None,
         };
         assert_eq!(settings.sanitized(), Settings::default());
     }
@@ -423,16 +451,88 @@ mod tests {
         handle.join().expect("writer thread should not panic");
     }
 
+    // -- window_position (issue #27) --------------------------------------
+
+    #[test]
+    fn round_trip_preserves_window_position() {
+        let path = temp_settings_path("position-roundtrip");
+        let settings = Settings {
+            window_position: Some([123.0, 456.0]),
+            ..Settings::default()
+        };
+        save_to(&path, &settings);
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded, settings);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A settings.json written before issue #27 (no `window_position` key at
+    /// all) must still deserialize — the one backward-compat guarantee this
+    /// change makes (`#[serde(default)]`, not a migration).
+    #[test]
+    fn settings_json_without_window_position_key_falls_back_to_none() {
+        let path = temp_settings_path("no-position-key");
+        fs::write(&path, br#"{"visible_columns":["Damage","Dps","SharePct"]}"#)
+            .expect("write pre-#27 fixture");
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded.window_position, None);
+        assert_eq!(loaded.visible_columns, Settings::default().visible_columns);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn with_window_position_if_changed_returns_none_when_unchanged() {
+        let settings = Settings {
+            window_position: Some([10.0, 20.0]),
+            ..Settings::default()
+        };
+
+        assert_eq!(settings.with_window_position_if_changed([10.0, 20.0]), None);
+    }
+
+    #[test]
+    fn with_window_position_if_changed_returns_updated_settings_on_change() {
+        let settings = Settings {
+            window_position: Some([10.0, 20.0]),
+            ..Settings::default()
+        };
+
+        let updated = settings
+            .with_window_position_if_changed([30.0, 40.0])
+            .expect("position changed, should produce an update");
+
+        assert_eq!(updated.window_position, Some([30.0, 40.0]));
+        // Everything else carries over unchanged.
+        assert_eq!(updated.visible_columns, settings.visible_columns);
+    }
+
+    #[test]
+    fn with_window_position_if_changed_treats_no_prior_position_as_a_change() {
+        let settings = Settings::default();
+        assert_eq!(settings.window_position, None);
+
+        let updated = settings
+            .with_window_position_if_changed([1.0, 2.0])
+            .expect("first-ever position should count as a change");
+        assert_eq!(updated.window_position, Some([1.0, 2.0]));
+    }
+
     #[test]
     fn ordered_columns_follows_canonical_order_regardless_of_toggle_order() {
         let mut a = Settings {
             visible_columns: vec![ColumnKind::Damage],
+            window_position: None,
         };
         a.toggle(ColumnKind::Hits);
         a.toggle(ColumnKind::CritPct);
 
         let mut b = Settings {
             visible_columns: vec![ColumnKind::Damage],
+            window_position: None,
         };
         b.toggle(ColumnKind::CritPct);
         b.toggle(ColumnKind::Hits);

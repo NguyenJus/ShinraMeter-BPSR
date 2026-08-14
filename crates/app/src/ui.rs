@@ -11,7 +11,7 @@ use bpsr_meter::{PlayerRow, Snapshot};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 
-use crate::settings::{self, ColumnKind, Settings};
+use crate::settings::{ColumnKind, Settings};
 
 /// Commands the overlay emits for the app layer to consume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,10 +39,17 @@ pub struct OverlayApp {
 }
 
 impl OverlayApp {
+    /// `settings` is loaded by the caller (`main.rs`) rather than via
+    /// `settings::load()` in here, because issue #27 needs the same loaded
+    /// value before this exists too — to build `ui::viewport`'s starting
+    /// position — so there is exactly one load per run, not one for the
+    /// viewport and a second (redundant, potentially racing a concurrent
+    /// write) one here.
     pub fn new(
         rx_snapshot: Receiver<Snapshot>,
         tx_command: Sender<UiCommand>,
         tx_settings: Sender<Settings>,
+        settings: Settings,
     ) -> Self {
         Self {
             snapshot: Snapshot {
@@ -52,7 +59,7 @@ impl OverlayApp {
                 rows: Vec::new(),
             },
             status: StatusLine::Ok,
-            settings: settings::load(),
+            settings,
             rx_snapshot,
             tx_command,
             tx_settings,
@@ -104,8 +111,31 @@ impl eframe::App for OverlayApp {
                 draw_rows(ui, &self.snapshot, &self.settings.ordered_columns());
             });
 
+        track_window_position(&ctx, &mut self.settings, &self.tx_settings);
+
         // ~10 Hz.
         ctx.request_repaint_after(Duration::from_millis(100));
+    }
+}
+
+/// Tracks the window's outer (on-screen) position and persists it via the
+/// same settings-writer path column settings use (issue #27). `outer_rect`
+/// is reported on every single frame — including every frame of a drag
+/// gesture — so `Settings::with_window_position_if_changed` gates the send
+/// on an actual change; the writer thread's own burst-coalescing
+/// (`run_writer` in `settings.rs`) still collapses a drag's many small
+/// changes into a single disk write.
+fn track_window_position(
+    ctx: &egui::Context,
+    settings: &mut Settings,
+    tx_settings: &Sender<Settings>,
+) {
+    let Some(rect) = ctx.input(|i| i.viewport().outer_rect) else {
+        return;
+    };
+    if let Some(updated) = settings.with_window_position_if_changed([rect.min.x, rect.min.y]) {
+        *settings = updated.clone();
+        let _ = tx_settings.send(updated);
     }
 }
 
@@ -371,7 +401,7 @@ pub fn column_anchors(
 }
 
 fn draw_row(ui: &mut egui::Ui, row: &PlayerRow, columns: &[StatColumn], anchors: &[f32]) {
-    let desired_size = egui::vec2(ui.available_width(), 20.0);
+    let desired_size = egui::vec2(ui.available_width(), ROW_HEIGHT);
     let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
 
     // Proportional background bar scaled by this player's damage share.
@@ -454,15 +484,101 @@ pub fn fmt_share(share_pct: f32) -> String {
     format!("{share_pct:.1}%")
 }
 
-/// Overlay window shape: always-on-top, borderless, transparent, small.
-pub fn viewport() -> egui::ViewportBuilder {
-    egui::ViewportBuilder::default()
+// -- default window size (issue #26) -----------------------------------
+//
+// The old default, `[340.0, 220.0]`, was sized for ~8-9 rows and left no
+// room for names next to the default stat columns. These constants and
+// helpers derive a default that fits a full 20-player raid with no
+// scrolling, and leaves a name a real budget before the stat columns
+// start, out of the same numbers `draw_header`/`draw_row`/`apply_theme`
+// already use — so a future change to any of them (e.g. a taller row)
+// updates the default size instead of silently drifting out of sync with it.
+
+/// Number of player rows the default height fits without scrolling: a full
+/// raid roster.
+const DEFAULT_VISIBLE_ROWS: usize = 20;
+
+/// `draw_row`'s fixed row height (its `desired_size.y`), named here so the
+/// default-size math and the row painter can never drift apart.
+const ROW_HEIGHT: f32 = 20.0;
+
+/// egui's fixed height for `ui.separator()`'s own painted line
+/// (`Style::separator_style`'s `spacing: 6.0`) — a constant of egui's, not
+/// anything `apply_theme` overrides.
+const SEPARATOR_HEIGHT: f32 = 6.0;
+
+/// Vertical gap egui's layout inserts between consecutive widgets
+/// (`apply_theme` sets `style.spacing.item_spacing` to `(6.0, 2.0)`). The
+/// header band, the separator, and each of the 20 rows are each their own
+/// widget in the central panel's vertical layout, so this gap is paid once
+/// between every consecutive pair of them.
+const ITEM_SPACING_Y: f32 = 2.0;
+
+/// Left-anchored space `draw_row` paints a player's name into before the
+/// row's own left edge (`draw_row`'s `rect.left_center() + vec2(4.0, 0.0)`).
+const NAME_LEFT_PAD: f32 = 4.0;
+
+/// Budgeted width for the name itself. `draw_row` paints names unclipped in
+/// `FontId::monospace(13.0)` — truncation/ellipsis is explicitly out of
+/// scope for issue #26 — so this is not a hard cap, just enough room
+/// (roughly 15 monospace characters at this font size) that a typical
+/// alphanumeric in-game name doesn't visually crowd the stat columns that
+/// start right after it.
+const NAME_WIDTH_BUDGET: f32 = 150.0;
+
+/// Breathing room between the name budget and the first stat column.
+const NAME_COLUMN_GAP: f32 = 12.0;
+
+/// Right-edge margin, matching the `margin` `draw_rows` passes to
+/// `column_anchors` for the rightmost column's anchor.
+const COLUMN_RIGHT_MARGIN: f32 = 4.0;
+
+/// Default opening height (issue #26): header band + separator + a full
+/// 20-row raid roster, plus the `ITEM_SPACING_Y` gap egui's layout inserts
+/// between each of those 22 widgets (21 gaps), so no scrolling is needed on
+/// first launch.
+///
+///   header (18.0) + separator (6.0) + 20 rows * 20.0 (400.0)
+///     + 21 gaps * 2.0 (42.0) = 466.0
+fn default_inner_height() -> f32 {
+    let header = egui::Style::default().spacing.interact_size.y;
+    let rows = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
+    let gaps = (DEFAULT_VISIBLE_ROWS + 1) as f32 * ITEM_SPACING_Y;
+    header + SEPARATOR_HEIGHT + rows + gaps
+}
+
+/// Default opening width (issue #26): a name budget in front of the default
+/// stat columns' combined fixed width (`Settings::default`'s Damage + DPS +
+/// Share % = 188pt total, from `ColumnKind::spec` in `settings.rs`), so
+/// names don't visually collide with them.
+///
+///   left pad (4.0) + name budget (150.0) + gap (12.0)
+///     + columns (56.0 + 76.0 + 56.0 = 188.0) + right margin (4.0) = 358.0
+fn default_inner_width() -> f32 {
+    let columns_width: f32 = stat_columns_for(&Settings::default().ordered_columns())
+        .iter()
+        .map(|c| c.width)
+        .sum();
+    NAME_LEFT_PAD + NAME_WIDTH_BUDGET + NAME_COLUMN_GAP + columns_width + COLUMN_RIGHT_MARGIN
+}
+
+/// Overlay window shape: always-on-top, borderless, transparent, sized to
+/// fit a full raid by default (issue #26). `window_position` is the
+/// last-saved position (issue #27, `Settings::window_position`) to reopen
+/// at, or `None` on a first launch / wiped settings file, which leaves the
+/// position to today's default OS/winit placement.
+pub fn viewport(window_position: Option<[f32; 2]>) -> egui::ViewportBuilder {
+    let mut builder = egui::ViewportBuilder::default()
         .with_always_on_top()
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(true)
-        .with_inner_size([340.0, 220.0])
-        .with_min_inner_size([220.0, 90.0])
+        .with_inner_size([default_inner_width(), default_inner_height()])
+        .with_min_inner_size([220.0, 90.0]);
+    if let Some(position) = window_position {
+        builder = builder.with_position(position);
+    }
+    builder
 }
 
 /// Dark, compact visuals with monospace numerals for the overlay.
@@ -804,6 +920,7 @@ mod tests {
     fn disabling_a_column_still_leaves_anchors_ordered_and_pinned() {
         let mut settings = Settings {
             visible_columns: ColumnKind::ALL.to_vec(),
+            window_position: None,
         };
         settings.toggle(ColumnKind::Dps);
         let cols = settings.ordered_columns();
@@ -814,6 +931,52 @@ mod tests {
         for pair in anchors.windows(2) {
             assert!(pair[0] < pair[1]);
         }
+    }
+
+    // -- default window size (issue #26) ----------------------------------
+
+    #[test]
+    fn default_inner_height_fits_twenty_rows_without_scrolling() {
+        // The row-content budget alone (20 rows * 20pt) must fit inside the
+        // computed default height, with room left over for the header band
+        // and separator on top of it.
+        let rows_only = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
+        assert!(
+            default_inner_height() > rows_only,
+            "default height {} must exceed the {} rows themselves",
+            default_inner_height(),
+            rows_only
+        );
+    }
+
+    #[test]
+    fn default_inner_height_matches_header_plus_separator_plus_rows_plus_gaps() {
+        let header = egui::Style::default().spacing.interact_size.y;
+        let rows = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
+        let gaps = (DEFAULT_VISIBLE_ROWS + 1) as f32 * ITEM_SPACING_Y;
+        let expected = header + SEPARATOR_HEIGHT + rows + gaps;
+        assert_eq!(default_inner_height(), expected);
+    }
+
+    #[test]
+    fn default_inner_width_exceeds_the_default_stat_columns_width() {
+        let columns_width: f32 = stat_columns_for(&Settings::default().ordered_columns())
+            .iter()
+            .map(|c| c.width)
+            .sum();
+        assert!(
+            default_inner_width() > columns_width,
+            "default width must leave room for a name in front of the {}pt of stat columns",
+            columns_width
+        );
+    }
+
+    #[test]
+    fn default_size_stays_above_the_min_inner_size() {
+        // `with_min_inner_size` is [220.0, 90.0] (unaffected by issue #26);
+        // the default opening size must never start below its own floor.
+        assert!(default_inner_width() >= 220.0);
+        assert!(default_inner_height() >= 90.0);
     }
 
     #[test]
