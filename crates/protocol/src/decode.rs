@@ -13,7 +13,7 @@ use crate::attrs::{enemy_hp_from_attrs, player_info_from_attrs};
 use crate::event::{DamageEvent, EntityKind, PlayerInfo, ProtocolEvent, kind_of, uid_of};
 use crate::frame::{Desync, MAX_TAIL_LEN, Notify, parse_frame, split_frames};
 use crate::inspect::InspectSink;
-use crate::pb::{self, AoiSyncDelta, Class, EDamageType};
+use crate::pb::{self, AoiSyncDelta, EDamageType};
 
 pub mod opcode {
     pub const SYNC_NEAR_ENTITIES: u32 = 0x0000_0006;
@@ -196,10 +196,13 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
     } else {
         Some(char_base.name.clone())
     };
+    // An Imagine transform id (issue #37) yields `None` rather than
+    // `Some(Class::Unknown)` — see `pb::class_of_profession_id`'s doc
+    // comment.
     let class = v_data
         .profession_list
         .as_ref()
-        .map(|p| Class::from(p.cur_profession_id));
+        .and_then(|p| pb::class_of_profession_id(p.cur_profession_id));
     let ability_score = if char_base.fight_point > 0 {
         u32::try_from(char_base.fight_point).ok()
     } else {
@@ -772,6 +775,31 @@ mod tests {
             out.iter()
                 .any(|e| matches!(e, ProtocolEvent::Player(p) if p.uid == 7))
         );
+    }
+
+    // -- Imagine profession ids (issue #37) ---------------------------------
+
+    #[test]
+    fn container_data_imagine_profession_id_yields_no_class() {
+        let n = container_notify(pb::CharSerialize {
+            char_id: 8,
+            char_base: Some(pb::CharBaseInfo {
+                char_id: 8,
+                name: "Ari".to_string(),
+                fight_point: 0,
+            }),
+            scene_data: None,
+            profession_list: Some(pb::ProfessionList {
+                cur_profession_id: 8, // Dorothy (Imagine)
+            }),
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ProtocolEvent::Player(p) => assert_eq!(p.class, None),
+            other => panic!("expected Player, got {other:?}"),
+        }
     }
 
     #[test]

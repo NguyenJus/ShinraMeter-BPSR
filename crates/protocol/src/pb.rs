@@ -179,6 +179,13 @@ pub enum Class {
     Unknown,
 }
 
+/// **Decoders should not call `Class::from` directly on a raw profession
+/// id** — use [`class_of_profession_id`] instead, which routes an "Imagine"
+/// transform id (see [`IMAGINE_PROFESSION_IDS`]) to `None` rather than
+/// `Some(Class::Unknown)`. This impl is kept as the plain, total id -> class
+/// table `class_of_profession_id` and `Class::from` in general both build
+/// on; any id not listed here (including an Imagine id) falls through to
+/// `Unknown`.
 impl From<i32> for Class {
     fn from(id: i32) -> Self {
         match id {
@@ -210,6 +217,43 @@ impl Class {
             Class::BeatPerformer => "BeatPerformer",
             Class::Unknown => "Unknown",
         }
+    }
+}
+
+/// Profession ids belonging to "Imagine" skills (issue #37): temporary
+/// transforms into an NPC-like character (Dorothy, Dark Spirit Dance, Lucy,
+/// Natsu), not real player classes. A transformed player's
+/// `cur_profession_id` / `ATTR_PROFESSION_ID` reads one of these for the
+/// duration of the transform.
+///
+/// Reference-derived, **not confirmed against a live capture** (issue #37):
+/// reimplemented from BPSR-ZDPS's `EProfessionId` (`Dorothy = 8`,
+/// `DarkSpiritDance = 10`, `Lucy = 14`, `Natsu = 15`) because no packet
+/// capture was available while fixing this — the repo owner sanctioned this
+/// as the same kind of exception `attr_id::SEASON_LEVEL` /
+/// `attr_id::SEASON_STRENGTH` document in `crates/protocol/src/attrs.rs`
+/// (see also `docs/packet-inspection.md`). Re-verify against a real capture
+/// if one ever becomes available; do not extend this list without one.
+pub const IMAGINE_PROFESSION_IDS: [i32; 4] = [8, 10, 14, 15];
+
+/// True for a profession id that identifies an Imagine transform rather
+/// than a real player class. See [`IMAGINE_PROFESSION_IDS`].
+pub fn is_imagine_profession_id(id: i32) -> bool {
+    IMAGINE_PROFESSION_IDS.contains(&id)
+}
+
+/// Resolves a raw profession id to the `Class` it represents — except an
+/// Imagine id (see [`is_imagine_profession_id`]), which yields `None`
+/// rather than `Some(Class::Unknown)`. Decoders must call this instead of
+/// `Class::from` directly: a transform id is not "an unrecognized class",
+/// it is "no class information in this packet", so it must merge the same
+/// way an absent profession id does (leaving a cached class untouched)
+/// rather than clobbering it with `Unknown`.
+pub fn class_of_profession_id(id: i32) -> Option<Class> {
+    if is_imagine_profession_id(id) {
+        None
+    } else {
+        Some(Class::from(id))
     }
 }
 
@@ -274,5 +318,45 @@ mod tests {
         assert_eq!(Class::from(999), Class::Unknown);
         assert_eq!(Class::Stormblade.name(), "Stormblade");
         assert_eq!(Class::TwinStriker.name(), "TwinStriker");
+    }
+
+    // -- Imagine profession ids (issue #37) --------------------------------
+
+    #[test]
+    fn class_of_profession_id_maps_known_ids_like_class_from() {
+        assert_eq!(class_of_profession_id(1), Some(Class::Stormblade));
+        assert_eq!(class_of_profession_id(13), Some(Class::BeatPerformer));
+    }
+
+    #[test]
+    fn class_of_profession_id_yields_none_for_imagine_ids() {
+        for id in IMAGINE_PROFESSION_IDS {
+            assert_eq!(
+                class_of_profession_id(id),
+                None,
+                "imagine profession id {id} must not resolve to a class"
+            );
+        }
+    }
+
+    #[test]
+    fn class_of_profession_id_yields_unknown_for_genuinely_unrecognized_ids() {
+        for id in [0, 6, 7, 999] {
+            assert_eq!(
+                class_of_profession_id(id),
+                Some(Class::Unknown),
+                "unrecognized (non-Imagine) id {id} must still map to Class::Unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn is_imagine_profession_id_matches_exactly_the_documented_four() {
+        for id in IMAGINE_PROFESSION_IDS {
+            assert!(is_imagine_profession_id(id), "id {id} should be an Imagine id");
+        }
+        for id in [0, 1, 6, 7, 9, 13, 999] {
+            assert!(!is_imagine_profession_id(id), "id {id} should not be an Imagine id");
+        }
     }
 }
