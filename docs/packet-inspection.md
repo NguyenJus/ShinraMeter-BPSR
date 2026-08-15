@@ -116,26 +116,56 @@ field numbers for `scene_data.line_id`.
 
 ## Step 3 — season score / imagines (`#15`)
 
-Blocked on an attr id (or proto field) that demonstrably changes when season
-level/strength changes in game, and on whether a skill-list attribute
-(`AttrSkillLevelIdList`-equivalent) reaches us at all.
+Season score is **done**. Imagines are **not implemented** — recorded below
+so the investigation isn't lost.
 
-1. Start a capture session, note the character's current season
-   level/strength (in whatever in-game UI exposes it) and, separately, its
-   equipped skill list.
-2. Trigger a change: level up the season track, or change strength via
-   whatever in-game action does that; separately, equip/unequip an imagine
-   skill.
-3. Diff the unknown-attr-id log / dump around each moment, the same way as
-   the ability-score control run in step 1: look for an attr id (keyed by
-   the player's own uid) whose raw value changes exactly when the in-game
-   value changes, and stays stable otherwise.
-4. For imagines specifically: check whether *any* attr id on the player's
-   attr list looks list-shaped (repeated/array-like raw bytes) rather than a
-   single scalar — that's the shape `AttrSkillLevelIdList` would take if it
-   reaches us at all. If nothing list-shaped shows up, that's itself an
-   answer (the data doesn't reach the client this way) worth recording, not
-   a failed run.
+### Season score: done, via reference-derived ids
+
+No packet capture was available while building this, so `attr_id::SEASON_LEVEL`
+(`0x2756`) and `attr_id::SEASON_STRENGTH` (`0x2CB0`) were reimplemented from
+BPSR-ZDPS's `EnumEAttrType.cs` (`AttrSeasonLevel = 10070`,
+`AttrSeasonStrength = 11440`) rather than confirmed against captured traffic —
+the one exception the repo owner sanctioned to this doc's normal
+confirm-before-committing rule (see "Recording a result" below). Both decode
+as plain varints on the same per-entity `Attr` list `FIGHT_POINT` already
+uses, so they're expected to reach us for any nearby entity, not just the
+local player.
+
+Re-verifying against a real capture, whenever one becomes available, is the
+same procedure as step 1's ability-score control run: note the character's
+current season level/strength in whatever in-game UI exposes it, trigger a
+change (level up the season track, or change strength via whatever in-game
+action does that), and diff the attr-id log/dump around that moment —
+`SEASON_LEVEL`/`SEASON_STRENGTH` should show the old and new values
+bracketing the change. Short of a capture, the simplest live check is just
+whether the two columns (off by default; enable them from the settings menu)
+populate at all in-game.
+
+### Imagines: not implemented
+
+Blocked on classification, not on data availability. The reference carries a
+player's full skill list as attr `0x74` (116, `AttrSkillLevelIdList`), a
+repeated length-delimited message of `{ skillId = 1, currentLevel = 2,
+remodelLevel = 3 }`, on the same generic per-entity attr channel — so, like
+season score, it would be available for other players too, not just the
+local one. Imagine damage is attributed to the owning player via
+`SyncDamageInfo.TopSummonerId` (field 21, nonzero → credit that uuid instead
+of the summon's) — that part is unremarkable and already mirrors how pet
+damage is attributed here (`on_aoi_sync_delta`'s `top_summoner_id` handling).
+
+What's missing is a way to tell which two of a player's skills are their
+equipped Imagines. The reference answers this with a static `SkillId ->
+slot/name/icon` table (checking whether `SlotPositionId` contains 7 or 8),
+built from a 10.8 MB `Data/SkillTable.json` extracted from the game client.
+There is no id range, bit pattern, or other protocol-native substitute for
+that table — even falling back to just the icon path needs the same lookup.
+That table has no stated license or provenance in the reference repo (its
+MIT license covers only the C# source, not the extracted game data), and its
+own slot-7/8 heuristic has ~15 known false positives out of 125 matching
+rows. Redistributing it is therefore out of scope for this GPL-3.0 project.
+If a licensable or protocol-native classification source ever turns up,
+`AttrSkillLevelIdList` decoding itself should be straightforward — it's the
+table, not the wire format, that's blocking this.
 
 ## Recording a result
 

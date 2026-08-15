@@ -78,6 +78,8 @@ pub fn map_event(ev: proto::ProtocolEvent) -> meter::ProtocolEvent {
             name: p.name,
             class: p.class.map(map_class),
             ability_score: p.ability_score,
+            season_level: p.season_level,
+            season_strength: p.season_strength,
         }),
         proto::ProtocolEvent::EnemyHp(e) => meter::ProtocolEvent::EnemyHp(meter::EnemyHp {
             uid: e.uid,
@@ -406,6 +408,8 @@ mod tests {
             name: Some("Foo".to_string()),
             class: Some(proto::Class::Marksman),
             ability_score: Some(9_999),
+            season_level: Some(42),
+            season_strength: Some(3_333),
         }));
         assert_eq!(
             mapped,
@@ -414,6 +418,8 @@ mod tests {
                 name: Some("Foo".to_string()),
                 class: Some(meter::Class::Marksman),
                 ability_score: Some(9_999),
+                season_level: Some(42),
+                season_strength: Some(3_333),
             })
         );
     }
@@ -530,6 +536,8 @@ mod tests {
                 name: Some("Foo".to_string()),
                 class: None,
                 ability_score: None,
+                season_level: None,
+                season_strength: None,
             }));
 
             assert!(!path.exists());
@@ -558,6 +566,8 @@ mod tests {
                 name: Some("Foo".to_string()),
                 class: None,
                 ability_score: None,
+                season_level: None,
+                season_strength: None,
             }));
 
             assert!(!path.exists());
@@ -583,6 +593,8 @@ mod tests {
             name: Some("Late".to_string()),
             class: Some(proto::Class::FrostMage),
             ability_score: None,
+            season_level: None,
+            season_strength: None,
         }));
         let snap = p.snapshot(2_000);
         assert_eq!(snap.rows[0].name, "Late");
@@ -598,8 +610,27 @@ mod tests {
             name: None,
             class: None,
             ability_score: Some(77_000),
+            season_level: None,
+            season_strength: None,
         }));
         let snap = p.snapshot(2_000);
         assert_eq!(snap.rows[0].ability_score, Some(77_000));
+    }
+
+    #[test]
+    fn season_data_flows_from_protocol_player_info_to_the_snapshot_row() {
+        let mut p = Pipeline::new();
+        p.step(proto::ProtocolEvent::Damage(damage(10, 100, 1_000)));
+        p.step(proto::ProtocolEvent::Player(proto::PlayerInfo {
+            uid: 10,
+            name: None,
+            class: None,
+            ability_score: None,
+            season_level: Some(42),
+            season_strength: Some(3_333),
+        }));
+        let snap = p.snapshot(2_000);
+        assert_eq!(snap.rows[0].season_level, Some(42));
+        assert_eq!(snap.rows[0].season_strength, Some(3_333));
     }
 }

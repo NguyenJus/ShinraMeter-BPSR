@@ -22,10 +22,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-# The Aero Snap workaround (see `src/platform.rs`) needs the raw HWND and
-# the Win32 window-style APIs, neither of which egui/eframe expose.
+# The Aero Snap workaround and the saved-position clamp (see
+# `src/platform.rs`) need the raw HWND, the Win32 window-style APIs, and
+# (for the position clamp) the monitor-enumeration/work-area APIs — none of
+# which egui/eframe expose.
 raw-window-handle = { workspace = true }
-windows = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }
+windows = { workspace = true, features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
 
 [build-dependencies]
 embed-resource.workspace = true

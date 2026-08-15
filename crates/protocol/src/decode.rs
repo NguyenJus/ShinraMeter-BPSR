@@ -210,6 +210,10 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
         name,
         class,
         ability_score,
+        // Season data has no confirmed `CharBaseInfo` field (issue #15) —
+        // attr-list path only, via `player_info_from_attrs`.
+        season_level: None,
+        season_strength: None,
     }));
 }
 

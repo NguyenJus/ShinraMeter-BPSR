@@ -16,14 +16,30 @@ use crate::tables;
 struct NameEntry {
     name: Option<String>,
     class: Option<Class>,
-    /// Ability score (a.k.a. combat power). Kept in-memory alongside
-    /// name/class so it survives a `reset` the same way they do (issue #15).
-    /// Deliberately **not** part of the on-disk cache (`names_cache.rs`):
-    /// unlike name/class it can drift across sessions (gear changes), so
+    /// Ability score (a.k.a. combat power), season level, and season
+    /// strength. Kept in-memory alongside name/class so each survives a
+    /// `reset` the same way they do (issue #15). Deliberately **not** part
+    /// of the on-disk cache (`names_cache.rs`): unlike name/class these can
+    /// drift across sessions (gear changes, season progression), so
     /// persisting a stale value risks being more misleading than showing
     /// nothing until a fresh packet arrives.
     ability_score: Option<u32>,
+    season_level: Option<u32>,
+    season_strength: Option<u32>,
     seq: u64,
+}
+
+/// The identity/stat fields threaded through `name_lookup`/`name_upsert`.
+/// Grouping these as a named struct, rather than a positional tuple, avoids
+/// transposing same-typed fields (three of these five are `Option<u32>`) at
+/// a call site.
+#[derive(Clone, Debug, Default)]
+struct CachedAttrs {
+    name: Option<String>,
+    class: Option<Class>,
+    ability_score: Option<u32>,
+    season_level: Option<u32>,
+    season_strength: Option<u32>,
 }
 
 pub struct Meter {
@@ -103,6 +119,8 @@ impl Meter {
                     name,
                     class,
                     ability_score: None,
+                    season_level: None,
+                    season_strength: None,
                     seq,
                 },
             );
@@ -113,12 +131,18 @@ impl Meter {
 
     /// Reads a cached name/class/ability_score, bumping its recency for
     /// `names_for_save`.
-    fn name_lookup(&mut self, uid: i64) -> Option<(Option<String>, Option<Class>, Option<u32>)> {
+    fn name_lookup(&mut self, uid: i64) -> Option<CachedAttrs> {
         self.names_seq += 1;
         let seq = self.names_seq;
         self.names.get_mut(&uid).map(|entry| {
             entry.seq = seq;
-            (entry.name.clone(), entry.class, entry.ability_score)
+            CachedAttrs {
+                name: entry.name.clone(),
+                class: entry.class,
+                ability_score: entry.ability_score,
+                season_level: entry.season_level,
+                season_strength: entry.season_strength,
+            }
         })
     }
 
@@ -126,27 +150,33 @@ impl Meter {
     /// overwrites (live wins over cached/stale data); a `None` field leaves
     /// whatever was already cached untouched. Returns the merged value and
     /// bumps recency.
-    fn name_upsert(
-        &mut self,
-        uid: i64,
-        name: Option<String>,
-        class: Option<Class>,
-        ability_score: Option<u32>,
-    ) -> (Option<String>, Option<Class>, Option<u32>) {
+    fn name_upsert(&mut self, uid: i64, incoming: CachedAttrs) -> CachedAttrs {
         self.names_seq += 1;
         let seq = self.names_seq;
         let entry = self.names.entry(uid).or_default();
-        if name.is_some() {
-            entry.name = name;
+        if incoming.name.is_some() {
+            entry.name = incoming.name;
         }
-        if class.is_some() {
-            entry.class = class;
+        if incoming.class.is_some() {
+            entry.class = incoming.class;
         }
-        if ability_score.is_some() {
-            entry.ability_score = ability_score;
+        if incoming.ability_score.is_some() {
+            entry.ability_score = incoming.ability_score;
+        }
+        if incoming.season_level.is_some() {
+            entry.season_level = incoming.season_level;
+        }
+        if incoming.season_strength.is_some() {
+            entry.season_strength = incoming.season_strength;
         }
         entry.seq = seq;
-        (entry.name.clone(), entry.class, entry.ability_score)
+        CachedAttrs {
+            name: entry.name.clone(),
+            class: entry.class,
+            ability_score: entry.ability_score,
+            season_level: entry.season_level,
+            season_strength: entry.season_strength,
+        }
     }
 
     /// Exports the name cache for persistence, ordered most-recently-touched
@@ -226,15 +256,21 @@ impl Meter {
             .players
             .entry(d.attacker_uid)
             .or_insert_with(|| PlayerStats::new(d.attacker_uid));
-        if let Some((name, class, ability_score)) = cached {
+        if let Some(cached) = cached {
             if stats.name.is_none() {
-                stats.name = name;
+                stats.name = cached.name;
             }
             if stats.class.is_none() {
-                stats.class = class;
+                stats.class = cached.class;
             }
             if stats.ability_score.is_none() {
-                stats.ability_score = ability_score;
+                stats.ability_score = cached.ability_score;
+            }
+            if stats.season_level.is_none() {
+                stats.season_level = cached.season_level;
+            }
+            if stats.season_strength.is_none() {
+                stats.season_strength = cached.season_strength;
             }
         }
 
@@ -255,17 +291,31 @@ impl Meter {
     }
 
     fn apply_player(&mut self, p: &PlayerInfo) {
-        let (name, class, ability_score) =
-            self.name_upsert(p.uid, p.name.clone(), p.class, p.ability_score);
+        let merged = self.name_upsert(
+            p.uid,
+            CachedAttrs {
+                name: p.name.clone(),
+                class: p.class,
+                ability_score: p.ability_score,
+                season_level: p.season_level,
+                season_strength: p.season_strength,
+            },
+        );
         if let Some(stats) = self.players.get_mut(&p.uid) {
-            if name.is_some() {
-                stats.name = name;
+            if merged.name.is_some() {
+                stats.name = merged.name;
             }
-            if class.is_some() {
-                stats.class = class;
+            if merged.class.is_some() {
+                stats.class = merged.class;
             }
-            if ability_score.is_some() {
-                stats.ability_score = ability_score;
+            if merged.ability_score.is_some() {
+                stats.ability_score = merged.ability_score;
+            }
+            if merged.season_level.is_some() {
+                stats.season_level = merged.season_level;
+            }
+            if merged.season_strength.is_some() {
+                stats.season_strength = merged.season_strength;
             }
         }
     }
@@ -385,6 +435,8 @@ impl Meter {
                         .unwrap_or_else(|| format!("Player {}", p.uid)),
                     class: p.class,
                     ability_score: p.ability_score,
+                    season_level: p.season_level,
+                    season_strength: p.season_strength,
                     damage: p.total_damage,
                     dps,
                     share_pct,
@@ -501,6 +553,8 @@ mod tests {
             name: Some("Foo".to_string()),
             class: Some(Class::Stormblade),
             ability_score: None,
+            season_level: None,
+            season_strength: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].name, "Foo");
@@ -516,6 +570,8 @@ mod tests {
             name: None,
             class: None,
             ability_score: Some(45_000),
+            season_level: None,
+            season_strength: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].ability_score, Some(45_000));
@@ -529,12 +585,50 @@ mod tests {
             name: Some("Foo".to_string()),
             class: None,
             ability_score: Some(1000),
+            season_level: None,
+            season_strength: None,
         }));
         m.apply(&dmg(3, 100, 0));
         m.reset(ResetReason::Manual, 1000);
         m.apply(&dmg(3, 50, 2000));
         let snap = m.snapshot(3000);
         assert_eq!(snap.rows[0].ability_score, Some(1000));
+    }
+
+    #[test]
+    fn player_info_season_data_reaches_row() {
+        let mut m = Meter::new();
+        m.apply(&dmg(8, 100, 1000));
+        m.apply(&ProtocolEvent::Player(PlayerInfo {
+            uid: 8,
+            name: None,
+            class: None,
+            ability_score: None,
+            season_level: Some(42),
+            season_strength: Some(12_345),
+        }));
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows[0].season_level, Some(42));
+        assert_eq!(snap.rows[0].season_strength, Some(12_345));
+    }
+
+    #[test]
+    fn season_data_survives_reset_like_name_and_class() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Player(PlayerInfo {
+            uid: 4,
+            name: Some("Foo".to_string()),
+            class: None,
+            ability_score: None,
+            season_level: Some(7),
+            season_strength: Some(999),
+        }));
+        m.apply(&dmg(4, 100, 0));
+        m.reset(ResetReason::Manual, 1000);
+        m.apply(&dmg(4, 50, 2000));
+        let snap = m.snapshot(3000);
+        assert_eq!(snap.rows[0].season_level, Some(7));
+        assert_eq!(snap.rows[0].season_strength, Some(999));
     }
 
     #[test]
@@ -655,6 +749,8 @@ mod tests {
                 name: Some("Fresh".to_string()),
                 class: Some(Class::FrostMage),
                 ability_score: None,
+                season_level: None,
+                season_strength: None,
             }));
             m.apply(&dmg(5, 100, 1000));
 
@@ -674,6 +770,8 @@ mod tests {
                 name: Some("Renamed".to_string()),
                 class: None,
                 ability_score: None,
+                season_level: None,
+                season_strength: None,
             }));
             m.apply(&dmg(5, 100, 1000));
 
@@ -724,18 +822,24 @@ mod tests {
                 name: Some("A".to_string()),
                 class: None,
                 ability_score: None,
+                season_level: None,
+                season_strength: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
                 uid: 2,
                 name: Some("B".to_string()),
                 class: None,
                 ability_score: None,
+                season_level: None,
+                season_strength: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
                 uid: 3,
                 name: Some("C".to_string()),
                 class: None,
                 ability_score: None,
+                season_level: None,
+                season_strength: None,
             }));
             // Re-touch uid 1 so it becomes the most recently used, ahead of
             // 3 and 2 (in that order).
@@ -744,6 +848,8 @@ mod tests {
                 name: Some("A".to_string()),
                 class: None,
                 ability_score: None,
+                season_level: None,
+                season_strength: None,
             }));
 
             let before = m.names_for_save();
@@ -769,12 +875,16 @@ mod tests {
                 name: Some("First".to_string()),
                 class: None,
                 ability_score: None,
+                season_level: None,
+                season_strength: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
                 uid: 2,
                 name: Some("Second".to_string()),
                 class: None,
                 ability_score: None,
+                season_level: None,
+                season_strength: None,
             }));
 
             let saved = m.names_for_save();
@@ -790,6 +900,8 @@ mod tests {
                 name: Some("Foo".to_string()),
                 class: None,
                 ability_score: None,
+                season_level: None,
+                season_strength: None,
             }));
             m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 1000 });
 
@@ -978,6 +1090,8 @@ mod tests {
                 name: Some("Foo".to_string()),
                 class: None,
                 ability_score: None,
+                season_level: None,
+                season_strength: None,
             }));
             m.apply(&dmg(1, 100, 0));
             m.reset(ResetReason::Manual, 1000);
