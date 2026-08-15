@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use egui::Color32;
 
-use crate::ui::{CRIT_PCT_RGB, LUCKY_PCT_RGB, StatColumn, fmt_share, fmt_short};
+use crate::ui::{CRIT_PCT_RGB, DEATH_COUNT_RGB, LUCKY_PCT_RGB, StatColumn, fmt_share, fmt_short};
 
 /// One selectable stat column. Declaration order here is also the
 /// canonical left-to-right column order used whenever more than one is
@@ -30,6 +30,7 @@ pub enum ColumnKind {
     CritPct,
     LuckyPct,
     Hits,
+    Deaths,
 }
 
 impl ColumnKind {
@@ -41,7 +42,15 @@ impl ColumnKind {
     /// snapshot, not something that accrues over the fight like
     /// damage/hits do), so they read better next to the row's name than
     /// mixed in with `Damage`/`Dps`/etc.
-    pub const ALL: [ColumnKind; 8] = [
+    ///
+    /// `Deaths` (issue #49) closes the list, so it is the *rightmost*
+    /// column whenever it is enabled — the position the reference render
+    /// (`docs/reference/new-shinra-ex.webp`) puts its skull counter in, just
+    /// past the percentage. It is also the only column painted as a pill
+    /// rather than as bare text (`ui`'s `ColumnEmphasis::Counter`), so
+    /// keeping it at the end also keeps that chrome from sitting between two
+    /// plain-text columns.
+    pub const ALL: [ColumnKind; 9] = [
         ColumnKind::AbilityScore,
         ColumnKind::SeasonStrength,
         ColumnKind::Damage,
@@ -50,6 +59,7 @@ impl ColumnKind {
         ColumnKind::CritPct,
         ColumnKind::LuckyPct,
         ColumnKind::Hits,
+        ColumnKind::Deaths,
     ];
 
     /// Label shown next to this column's checkbox in the settings menu.
@@ -63,6 +73,7 @@ impl ColumnKind {
             ColumnKind::CritPct => "Crit %",
             ColumnKind::LuckyPct => "Lucky %",
             ColumnKind::Hits => "Hits",
+            ColumnKind::Deaths => "Deaths",
         }
     }
 
@@ -157,6 +168,27 @@ impl ColumnKind {
                 text: |row| fmt_short(row.hits as i64),
                 color: Color32::WHITE,
             },
+            // Death count (issue #49). The plain count, un-abbreviated: a
+            // wipe-count is a 1-2 digit figure, so `fmt_short` would only
+            // ever hand back the same digits with more code between them.
+            //
+            // `width` is the odd one out in this match: this is the only
+            // column `draw_row` paints as an oval `stat_pill` (a skull glyph,
+            // a gap, then the count) rather than as bare text, so its budget
+            // has to cover the whole pill — `2 * PILL_PAD_X` + icon +
+            // `PILL_ICON_GAP` + the digits — not just the string.
+            // `ui`'s `deaths_column_width_fits_the_whole_counter_pill` is
+            // what holds this number to that, the same way
+            // `widest_formatted_text_fits_its_column_width_budget` holds
+            // every text-only column to its own. Measured at ~39pt for the
+            // widest plausible count ("99") and rounded up to the next
+            // multiple of 8, the same small-margin convention the columns
+            // above use.
+            ColumnKind::Deaths => StatColumn {
+                width: 48.0,
+                text: |row| row.deaths.to_string(),
+                color: Color32::from_rgb(DEATH_COUNT_RGB.0, DEATH_COUNT_RGB.1, DEATH_COUNT_RGB.2),
+            },
         }
     }
 }
@@ -178,8 +210,19 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
+        // `Deaths` joins the out-of-the-box set (issue #49) because the
+        // reference render shows the skull counter on every row — it is part
+        // of what the meter looks like, not an opt-in extra. Only *new*
+        // installs (and wiped settings files) get it: an existing
+        // `settings.json` carries its own `visible_columns` and is left
+        // exactly as the user last left it, which is intended.
         Self {
-            visible_columns: vec![ColumnKind::Dps, ColumnKind::CritPct, ColumnKind::LuckyPct],
+            visible_columns: vec![
+                ColumnKind::Dps,
+                ColumnKind::CritPct,
+                ColumnKind::LuckyPct,
+                ColumnKind::Deaths,
+            ],
             window_position: None,
         }
     }
@@ -378,6 +421,7 @@ fn save_to(path: &Path, settings: &Settings) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bpsr_meter::PlayerRow;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -751,11 +795,19 @@ mod tests {
 
     // -- default-columns rework: Dps/CritPct/LuckyPct, with color ---------
 
+    /// The out-of-the-box column set, in order. `Deaths` was appended by
+    /// issue #49 (the reference render shows the skull counter on every row);
+    /// the three columns before it are untouched.
     #[test]
-    fn default_columns_are_dps_crit_lucky_in_order() {
+    fn default_columns_are_dps_crit_lucky_deaths_in_order() {
         assert_eq!(
             Settings::default().visible_columns,
-            vec![ColumnKind::Dps, ColumnKind::CritPct, ColumnKind::LuckyPct]
+            vec![
+                ColumnKind::Dps,
+                ColumnKind::CritPct,
+                ColumnKind::LuckyPct,
+                ColumnKind::Deaths
+            ]
         );
     }
 
@@ -795,7 +847,108 @@ mod tests {
 
     #[test]
     fn season_level_variant_no_longer_exists_in_all() {
-        assert_eq!(ColumnKind::ALL.len(), 8);
+        assert_eq!(ColumnKind::ALL.len(), 9);
         assert!(ColumnKind::ALL.iter().all(|c| c.label() != "Season Level"));
+    }
+
+    // -- death count column (issue #49) -----------------------------------
+
+    /// Every column in `ALL` needs a label and a spec; the compiler enforces
+    /// the `match` arms exist, but not that a new variant was actually added
+    /// to `ALL` — which is the one list nothing else generates.
+    #[test]
+    fn deaths_is_in_all_and_has_a_label_and_a_spec() {
+        assert!(ColumnKind::ALL.contains(&ColumnKind::Deaths));
+        assert_eq!(ColumnKind::Deaths.label(), "Deaths");
+        assert!(ColumnKind::Deaths.spec().width > 0.0);
+    }
+
+    /// The reference render puts the skull counter at the row's right edge,
+    /// past the percentage — so `Deaths` has to be last in the canonical
+    /// order, not merely present in it.
+    #[test]
+    fn deaths_is_the_rightmost_column() {
+        assert_eq!(ColumnKind::ALL.last(), Some(&ColumnKind::Deaths));
+
+        let all = Settings {
+            visible_columns: ColumnKind::ALL.to_vec(),
+            window_position: None,
+        };
+        assert_eq!(all.ordered_columns().last(), Some(&ColumnKind::Deaths));
+    }
+
+    #[test]
+    fn deaths_is_visible_by_default() {
+        assert!(Settings::default().is_visible(ColumnKind::Deaths));
+    }
+
+    /// The plain count, never `fmt_short`'s abbreviation — a wipe count is a
+    /// 1-2 digit figure and "1.0K deaths" would be nonsense.
+    #[test]
+    fn deaths_column_formats_the_plain_count() {
+        let row = PlayerRow {
+            uid: 7,
+            name: String::new(),
+            class: None,
+            damage: 0,
+            dps: 0.0,
+            share_pct: 0.0,
+            crit_pct: 0.0,
+            lucky_pct: 0.0,
+            hits: 0,
+            deaths: 12,
+            ability_score: None,
+            season_strength: None,
+        };
+        assert_eq!((ColumnKind::Deaths.spec().text)(&row), "12");
+    }
+
+    /// The counter is the dimmest text in a row (issue #56's type
+    /// hierarchy), so it is deliberately not `Color32::WHITE` like the plain
+    /// stat columns.
+    #[test]
+    fn deaths_spec_is_dim_gray() {
+        let color = ColumnKind::Deaths.spec().color;
+        assert_eq!(
+            color,
+            Color32::from_rgb(DEATH_COUNT_RGB.0, DEATH_COUNT_RGB.1, DEATH_COUNT_RGB.2)
+        );
+        assert_ne!(color, Color32::WHITE);
+    }
+
+    #[test]
+    fn deaths_column_round_trips() {
+        let path = temp_settings_path("deaths-roundtrip");
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::Deaths);
+        assert!(!settings.is_visible(ColumnKind::Deaths));
+        save_to(&path, &settings);
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded, settings);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A settings.json written before issue #49 has no `"Deaths"` entry at
+    /// all; it must keep deserializing (and keep its own column list) rather
+    /// than being migrated or rejected.
+    #[test]
+    fn settings_json_without_deaths_still_deserializes() {
+        let path = temp_settings_path("legacy-no-deaths");
+        fs::write(
+            &path,
+            br#"{"visible_columns":["Dps","CritPct","LuckyPct"]}"#,
+        )
+        .expect("write legacy fixture");
+
+        let loaded = load_from(&path);
+
+        assert_eq!(
+            loaded.visible_columns,
+            vec![ColumnKind::Dps, ColumnKind::CritPct, ColumnKind::LuckyPct]
+        );
+        assert!(!loaded.is_visible(ColumnKind::Deaths));
+        let _ = fs::remove_file(&path);
     }
 }

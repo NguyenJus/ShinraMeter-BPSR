@@ -72,13 +72,13 @@ pub fn map_event(ev: proto::ProtocolEvent) -> meter::ProtocolEvent {
             target_uid: d.target_uid,
             target_kind: map_kind(d.target_kind),
             timestamp_ms: d.timestamp_ms,
+            is_dead: d.is_dead,
         }),
         proto::ProtocolEvent::Player(p) => meter::ProtocolEvent::Player(meter::PlayerInfo {
             uid: p.uid,
             name: p.name,
             class: p.class.map(map_class),
             ability_score: p.ability_score,
-            season_level: p.season_level,
             season_strength: p.season_strength,
         }),
         proto::ProtocolEvent::EnemyHp(e) => meter::ProtocolEvent::EnemyHp(meter::EnemyHp {
@@ -342,6 +342,7 @@ mod tests {
             target_uid: 500,
             target_kind: proto::EntityKind::Monster,
             timestamp_ms: ts,
+            is_dead: false,
         }
     }
 
@@ -399,6 +400,20 @@ mod tests {
         assert_eq!(m.target_uid, d.target_uid);
         assert_eq!(m.target_kind, meter::EntityKind::Monster);
         assert_eq!(m.timestamp_ms, d.timestamp_ms);
+        assert_eq!(m.is_dead, d.is_dead);
+    }
+
+    #[test]
+    fn maps_is_dead_true() {
+        let d = proto::DamageEvent {
+            is_dead: true,
+            ..damage(11, 1234, 9_000)
+        };
+        let mapped = map_event(proto::ProtocolEvent::Damage(d));
+        let meter::ProtocolEvent::Damage(m) = mapped else {
+            panic!("expected a damage event");
+        };
+        assert!(m.is_dead);
     }
 
     #[test]
@@ -418,7 +433,6 @@ mod tests {
                 name: Some("Foo".to_string()),
                 class: Some(meter::Class::Marksman),
                 ability_score: Some(9_999),
-                season_level: Some(42),
                 season_strength: Some(3_333),
             })
         );
@@ -618,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn season_data_flows_from_protocol_player_info_to_the_snapshot_row() {
+    fn season_strength_flows_from_protocol_player_info_to_the_snapshot_row() {
         let mut p = Pipeline::new();
         p.step(proto::ProtocolEvent::Damage(damage(10, 100, 1_000)));
         p.step(proto::ProtocolEvent::Player(proto::PlayerInfo {
@@ -626,11 +640,10 @@ mod tests {
             name: None,
             class: None,
             ability_score: None,
-            season_level: Some(42),
+            season_level: None,
             season_strength: Some(3_333),
         }));
         let snap = p.snapshot(2_000);
-        assert_eq!(snap.rows[0].season_level, Some(42));
         assert_eq!(snap.rows[0].season_strength, Some(3_333));
     }
 }

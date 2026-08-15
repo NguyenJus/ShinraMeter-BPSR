@@ -11,9 +11,6 @@ pub struct PlayerStats {
     /// it (attrs `FIGHT_POINT`, or `SyncContainerData.fight_point`) has been
     /// seen for this player (issue #15).
     pub ability_score: Option<u32>,
-    /// Season level; `None` until a packet carrying it (attrs
-    /// `SEASON_LEVEL`) has been seen for this player (issue #15).
-    pub season_level: Option<u32>,
     /// Season strength; `None` until a packet carrying it (attrs
     /// `SEASON_STRENGTH`) has been seen for this player (issue #15).
     pub season_strength: Option<u32>,
@@ -23,6 +20,15 @@ pub struct PlayerStats {
     pub crit_damage: i64,
     pub lucky_hits: u64,
     pub lucky_damage: i64,
+    /// Times this player died this encounter, per `DamageEvent::is_dead`
+    /// (issue #49). This counts the *victim*, not the attacker — see
+    /// `Meter::apply_damage`.
+    pub deaths: u32,
+    /// Timestamp (event clock, not wall time) of the last death counted for
+    /// this player, used to debounce a retransmitted/duplicated delta packet
+    /// from double-counting a single death (issue #49). `pub(crate)`, not
+    /// part of the display DTO (`PlayerRow`) — see `DEATH_DEBOUNCE_MS`.
+    pub(crate) last_death_ms: Option<u64>,
 }
 
 impl PlayerStats {
@@ -32,7 +38,6 @@ impl PlayerStats {
             name: None,
             class: None,
             ability_score: None,
-            season_level: None,
             season_strength: None,
             total_damage: 0,
             hits: 0,
@@ -40,6 +45,8 @@ impl PlayerStats {
             crit_damage: 0,
             lucky_hits: 0,
             lucky_damage: 0,
+            deaths: 0,
+            last_death_ms: None,
         }
     }
 
@@ -69,9 +76,6 @@ pub struct PlayerRow {
     /// Ability score (a.k.a. combat power); `None` when no packet carrying
     /// it has been seen for this player yet (issue #15).
     pub ability_score: Option<u32>,
-    /// Season level; `None` when no packet carrying it has been seen for
-    /// this player yet (issue #15).
-    pub season_level: Option<u32>,
     /// Season strength; `None` when no packet carrying it has been seen for
     /// this player yet (issue #15).
     pub season_strength: Option<u32>,
@@ -81,6 +85,9 @@ pub struct PlayerRow {
     pub crit_pct: f32,
     pub lucky_pct: f32,
     pub hits: u64,
+    /// Times this player died this encounter (issue #49). See
+    /// `PlayerStats::deaths`.
+    pub deaths: u32,
 }
 
 /// What the meter believes is being fought, as far as the packet stream reveals

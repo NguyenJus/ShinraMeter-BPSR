@@ -47,6 +47,11 @@ pub struct DamageEvent {
     pub target_uid: i64,
     pub target_kind: EntityKind,
     pub timestamp_ms: u64,
+    /// Whether the target died from this hit, sourced from
+    /// `pb::SyncDamageInfo` tag 17 (`is_dead`). This is a per-hit flag on the
+    /// *victim*, not the attacker — a player entry here means that player
+    /// died, not that they scored a kill (issue #49).
+    pub is_dead: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -60,6 +65,14 @@ pub struct PlayerInfo {
     pub ability_score: Option<u32>,
     /// Season level, sourced from `attr_id::SEASON_LEVEL`. `None` rather than
     /// `Some(0)` when absent (issue #15).
+    ///
+    /// Deliberately decoded but unconsumed above this crate: the UI column
+    /// that displayed it was removed in #51, and issue #55 stripped the rest
+    /// of the chain (`bpsr_meter::PlayerStats`/`PlayerRow`,
+    /// `pipeline::map_event`). `SEASON_LEVEL` is a documented
+    /// reverse-engineering finding (`docs/packet-inspection.md`), so it stays
+    /// decoded here on purpose — do not "clean up" this field by removing it
+    /// from the protocol layer too.
     pub season_level: Option<u32>,
     /// Season strength, sourced from `attr_id::SEASON_STRENGTH`. `None`
     /// rather than `Some(0)` when absent (issue #15).
