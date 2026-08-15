@@ -2057,8 +2057,11 @@ mod tests {
         // threshold, e.g. 999_950 -> "1000.0K") and `fmt_share`'s.
         // `ability_score`/`season_strength` are the two exceptions: they
         // render the full, un-abbreviated digit string (owner requirement),
-        // so their widest plausible input is their field type's own
-        // ceiling — `u32::MAX` — rather than a `fmt_short`-derived value.
+        // so their widest plausible input is their real in-game ceiling —
+        // ability score is a 5-digit stat (max 99_999) and season strength
+        // is a 4-digit stat (max 9_999), per the repo owner — rather than
+        // the field type's own ceiling (`u32::MAX`) or a `fmt_short`-derived
+        // value. Do not "fix" these back to `u32::MAX`.
         assert_eq!(fmt_short(999_950), "1000.0K");
         assert_eq!(fmt_share(100.0), "100.0%");
         let widest_row = PlayerRow {
@@ -2071,9 +2074,9 @@ mod tests {
             crit_pct: 100.0,
             lucky_pct: 100.0,
             hits: 999_950,
-            ability_score: Some(u32::MAX),
+            ability_score: Some(99_999),
             season_level: Some(999_950),
-            season_strength: Some(u32::MAX),
+            season_strength: Some(9_999),
         };
 
         for (kind, column) in ColumnKind::ALL

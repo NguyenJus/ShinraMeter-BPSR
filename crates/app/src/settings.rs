@@ -85,22 +85,27 @@ impl ColumnKind {
             // rate/total where a rounded "12.3M" is good enough. No
             // thousands separator: the codebase has no existing formatter
             // for one, and this slice isn't the place to add one. `width`
-            // is sized to `u32::MAX`'s 10-digit worst case
-            // (`ability_score`'s own field type ceiling, measured at
-            // 78.28pt in `widest_formatted_text_fits_its_column_width_budget`),
-            // not a guessed/observed game value.
+            // is sized to ability score's real in-game ceiling — a 5-digit
+            // stat, max 99_999, per the repo owner, not the field type's
+            // own `u32::MAX` ceiling — measured at 39.125pt in
+            // `widest_formatted_text_fits_its_column_width_budget` and
+            // rounded up to the next multiple of 8, the same small-margin
+            // convention `Damage`/`Hits` below use.
             ColumnKind::AbilityScore => StatColumn {
-                width: 80.0,
+                width: 40.0,
                 text: |row| match row.ability_score {
                     Some(v) => v.to_string(),
                     None => String::new(),
                 },
                 color: Color32::WHITE,
             },
-            // Same full-figure requirement and width reasoning as
-            // `AbilityScore` above.
+            // Same full-figure requirement as `AbilityScore` above, but its
+            // own independent width: season strength's real in-game
+            // ceiling is a 4-digit stat, max 9_999, per the repo owner,
+            // measured at 31.3125pt and rounded up to the next multiple of
+            // 8.
             ColumnKind::SeasonStrength => StatColumn {
-                width: 80.0,
+                width: 32.0,
                 text: |row| match row.season_strength {
                     Some(v) => v.to_string(),
                     None => String::new(),
