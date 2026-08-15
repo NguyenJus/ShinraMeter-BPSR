@@ -135,8 +135,10 @@ impl eframe::App for OverlayApp {
                     &ctx,
                     &self.snapshot,
                     &self.tx_command,
-                    &mut self.settings,
-                    &self.tx_settings,
+                    SettingsHandle {
+                        settings: &mut self.settings,
+                        tx_settings: &self.tx_settings,
+                    },
                     &icons.toolbar,
                     &mut self.window_gesture,
                 );
@@ -215,13 +217,23 @@ fn is_plausible_position(position: egui::Pos2) -> bool {
 /// spot for minimized windows.
 const MIN_PLAUSIBLE_COORD: f32 = -20_000.0;
 
+/// The persisted settings plus the channel that persists changes to disk,
+/// bundled because every draw site that touches settings needs both —
+/// mutating `settings` in place without also sending the update through
+/// `tx_settings` would silently drop the change instead of writing it (see
+/// `draw_settings_menu`). Also what keeps `draw_header` under clippy's
+/// too-many-arguments limit now that it takes a `WindowGesture` too.
+struct SettingsHandle<'a> {
+    settings: &'a mut Settings,
+    tx_settings: &'a Sender<Settings>,
+}
+
 fn draw_header(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     snapshot: &Snapshot,
     tx_command: &Sender<UiCommand>,
-    settings: &mut Settings,
-    tx_settings: &Sender<Settings>,
+    settings: SettingsHandle<'_>,
     toolbar: &ToolbarIcons,
     gesture: &mut WindowGesture,
 ) {
@@ -313,8 +325,8 @@ fn draw_header(
             }
             draw_settings_menu(
                 ui,
-                settings,
-                tx_settings,
+                settings.settings,
+                settings.tx_settings,
                 toolbar.get(ToolbarIcon::Settings),
             );
         });
@@ -775,10 +787,13 @@ fn begin_window_gesture(ctx: &egui::Context, gesture: &mut WindowGesture, kind: 
 /// frame after the header and resize zones have had their chance to start
 /// one.
 fn drive_window_gesture(ctx: &egui::Context, gesture: &mut WindowGesture) {
-    let Some((kind, start_pointer, start_rect)) = gesture
+    let Some(kind) = gesture.kind() else {
+        return;
+    };
+    let Some((start_pointer, start_rect)) = gesture
         .active
         .as_ref()
-        .map(|active| (active.kind, active.start_pointer, active.start_rect))
+        .map(|active| (active.start_pointer, active.start_rect))
     else {
         return;
     };
@@ -1516,8 +1531,10 @@ mod tests {
                 &ctx,
                 snapshot,
                 &tx_command,
-                &mut settings,
-                &tx_settings,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
                 &toolbar,
                 &mut WindowGesture::default(),
             );
@@ -1578,8 +1595,10 @@ mod tests {
                 &ctx,
                 &snapshot,
                 &tx_command,
-                &mut settings,
-                &tx_settings,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
                 &toolbar,
                 &mut WindowGesture::default(),
             );
