@@ -792,6 +792,43 @@ mod tests {
             assert_eq!(snap.rows[0].class, Some(Class::Marksman));
         }
 
+        /// Issue #37: an Imagine transform decodes (in `bpsr-protocol`) to a
+        /// `PlayerInfo` with `class: None`, never `Some(Class::Unknown)`. This
+        /// regression test documents that the meter's existing "`Some`
+        /// overwrites, `None` preserves" merge rule (`name_upsert` /
+        /// `apply_player` above) already handles that correctly and needs no
+        /// Imagine-specific logic of its own — it passes without any change
+        /// to this file, unlike the `bpsr-protocol` tests for this issue
+        /// which must go red first.
+        #[test]
+        fn class_none_packet_preserves_a_previously_known_class() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Player(PlayerInfo {
+                uid: 5,
+                name: Some("Ren".to_string()),
+                class: Some(Class::Stormblade),
+                ability_score: None,
+                season_level: None,
+                season_strength: None,
+            }));
+            m.apply(&dmg(5, 100, 1000));
+
+            // A simulated Imagine-transform packet: profession id decoded to
+            // no class at all (see `bpsr_protocol::pb::class_of_profession_id`).
+            m.apply(&ProtocolEvent::Player(PlayerInfo {
+                uid: 5,
+                name: None,
+                class: None,
+                ability_score: None,
+                season_level: None,
+                season_strength: None,
+            }));
+
+            let snap = m.snapshot(2000);
+            assert_eq!(snap.rows[0].name, "Ren");
+            assert_eq!(snap.rows[0].class, Some(Class::Stormblade));
+        }
+
         #[test]
         fn names_for_save_round_trips_through_with_names_cache() {
             let cache = vec![

@@ -116,8 +116,12 @@ field numbers for `scene_data.line_id`.
 
 ## Step 3 — season score / imagines (`#15`)
 
-Season score is **done**. Imagines are **not implemented** — recorded below
-so the investigation isn't lost.
+Season score is **done**. Imagine skill classification (which two of a
+player's skills are their equipped Imagines) is **not implemented** —
+recorded below so the investigation isn't lost. Separately, issue #37 fixed a
+related but distinct gap: recognizing when a profession id names an Imagine
+*transform* rather than a real class, so it doesn't clobber the transformed
+player's row — also recorded below.
 
 ### Season score: done, via reference-derived ids
 
@@ -166,6 +170,32 @@ rows. Redistributing it is therefore out of scope for this GPL-3.0 project.
 If a licensable or protocol-native classification source ever turns up,
 `AttrSkillLevelIdList` decoding itself should be straightforward — it's the
 table, not the wire format, that's blocking this.
+
+### Imagine profession ids: done, via reference-derived ids
+
+Separately from the skill-classification gap above, issue #37 found that
+`cur_profession_id` / `ATTR_PROFESSION_ID` itself reads one of four ids while
+an Imagine transform is active (Dorothy, Dark Spirit Dance, Lucy, Natsu) — not
+a real player class — and `Class::from` was silently mapping each of them to
+`Class::Unknown`, clobbering the transformed player's real class for the
+transform's duration.
+
+No packet capture was available while fixing this, so `pb::IMAGINE_PROFESSION_IDS`
+(`[8, 10, 14, 15]`) was reimplemented from BPSR-ZDPS's `EProfessionId`
+(`Dorothy = 8`, `DarkSpiritDance = 10`, `Lucy = 14`, `Natsu = 15`) rather than
+confirmed against captured traffic — the same kind of exception to this doc's
+normal confirm-before-committing rule that `attr_id::SEASON_LEVEL` /
+`attr_id::SEASON_STRENGTH` document above, sanctioned by the repo owner on the
+same basis. Decoders resolve a raw id via `pb::class_of_profession_id`, which
+returns `None` for these four ids (rather than `Some(Class::Unknown)`) so the
+existing "`Some` overwrites, `None` preserves" merge rule already used
+elsewhere leaves the player's real class untouched.
+
+Re-verifying against a real capture, whenever one becomes available, is the
+same procedure as `SEASON_LEVEL`/`SEASON_STRENGTH` above: trigger each
+Imagine transform in-game, note it against the attr-id log/dump, and confirm
+`cur_profession_id`/`ATTR_PROFESSION_ID` reads the expected id for its
+duration and reverts afterward.
 
 ## Recording a result
 
