@@ -47,7 +47,8 @@ pub fn disable_aero_snap(cc: &eframe::CreationContext<'_>) {
     use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GWL_STYLE, GetWindowLongPtrW, SetWindowLongPtrW, WS_MAXIMIZEBOX,
+        GWL_STYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_MAXIMIZEBOX,
     };
 
     debug_assert_eq!(WS_MAXIMIZEBOX.0 as isize, WS_MAXIMIZEBOX_BIT);
@@ -91,6 +92,33 @@ pub fn disable_aero_snap(cc: &eframe::CreationContext<'_>) {
         // returns that same nonzero previous style; 0 means it failed.
         log::warn!("SetWindowLongPtrW(GWL_STYLE) failed; Aero Snap may still trigger on drag");
         return;
+    }
+
+    // A `GWL_STYLE` change alone doesn't make DWM recompute the window's
+    // frame — Win32 requires an explicit `SWP_FRAMECHANGED` `SetWindowPos`
+    // for that. Without this, DWM keeps compositing the client area
+    // against its own opaque redirection surface instead of honoring the
+    // per-pixel alpha winit set up via `DwmEnableBlurBehindWindow`, so the
+    // whole window paints opaque gray at startup until something else
+    // (e.g. a resize) forces a frame update. `SWP_NOMOVE | SWP_NOSIZE`
+    // means this call only asks for the frame-change side effect, not an
+    // actual move/resize, so the position/size arguments are ignored.
+    // SAFETY: same as above.
+    let framechanged = unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND(0),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )
+    };
+    if !framechanged.as_bool() {
+        log::warn!(
+            "SetWindowPos(SWP_FRAMECHANGED) failed; the window may keep painting opaque until resized"
+        );
     }
 
     log::info!("cleared WS_MAXIMIZEBOX to disable Aero Snap on drag");
