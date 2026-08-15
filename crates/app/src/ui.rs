@@ -243,15 +243,15 @@ fn draw_header(
     // header's height never jitters between frames; the subtitle is omitted
     // entirely — not rendered blank — when the scene is unknown (issue #9
     // slice 2).
-    draw_title_line(ui, &title);
+    let title_rect = draw_title_line(ui, &title);
+    for (segment_rect, color) in title_separator_segments(title_rect) {
+        ui.painter().rect_filled(segment_rect, 0.0, color);
+    }
     if let Some(subtitle) = &subtitle {
         draw_subtitle_line(ui, subtitle);
     }
 
     ui.horizontal(|ui| {
-        // Purely an affordance — the band above is what actually drags.
-        ui.label("☰");
-
         // Decorative — painted immediately left of the duration text, no
         // click target and no tooltip of its own (issue #41). Skipped
         // entirely if the PNG somehow failed to decode, same as a row's
@@ -262,6 +262,13 @@ fn draw_header(
         }
         ui.label(fmt_duration(snapshot.duration_ms));
         ui.label(format!("{} DPS", fmt_short(snapshot.total_dps as i64)));
+        // Total damage for the fight (reference render's e.g. "30.1B"
+        // beside a heart icon). `snapshot.total_damage` already existed but
+        // went unpainted; no gauge/heart icon asset exists in the upstream
+        // ShinraMeter icon set this project draws from (see
+        // `THIRD_PARTY_NOTICES.md`), so this ships text-only rather than
+        // inventing a substitute glyph.
+        ui.label(format!("{} DMG", fmt_short(snapshot.total_damage)));
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Raster PNG icons throughout this row (issue #41), not glyphs —
@@ -313,15 +320,22 @@ fn draw_header(
 /// this module's own `toolbar_icon_button_height_matches_interact_size`.
 const TOOLBAR_ICON_SIZE: f32 = 14.0;
 
+/// Slate-blue-gray tint applied to every toolbar/stat icon (reference
+/// render's uniform icon family) — the source PNGs are otherwise painted in
+/// whatever native color they were authored in, which doesn't match.
+const TOOLBAR_ICON_TINT: egui::Color32 = egui::Color32::from_rgb(0x70, 0x80, 0x90);
+
 /// Builds an `egui::Image` for a loaded toolbar icon texture at the fixed
 /// `TOOLBAR_ICON_SIZE`, overriding whatever size the source PNG itself
 /// carries (`SizedTexture::from_handle` would use the PNG's native 48x48
-/// instead).
+/// instead), and multiplied by `TOOLBAR_ICON_TINT` so every icon reads as
+/// the same slate-blue-gray family regardless of its source color.
 fn toolbar_icon_image(handle: &egui::TextureHandle) -> egui::Image<'static> {
     egui::Image::from_texture(egui::load::SizedTexture::new(
         handle.id(),
         egui::Vec2::splat(TOOLBAR_ICON_SIZE),
     ))
+    .tint(TOOLBAR_ICON_TINT)
 }
 
 /// Paints one toolbar icon button and attaches its tooltip in one place
@@ -448,6 +462,20 @@ const TITLE_LINE_HEIGHT: f32 = 20.0;
 /// strength colour, matching the reference screenshot (issue #9 slice 2).
 const TITLE_FONT_SIZE: f32 = 15.0;
 
+/// Bright white the title line is painted in, matching the reference
+/// render — deliberately not `ui.visuals().text_color()` (the theme's
+/// default, dimmer body-text white) since the title needs to read as the
+/// visually heaviest element in the header.
+const TITLE_TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(0xF5, 0xF5, 0xF5);
+
+/// Horizontal offset (points) `draw_title_line` repaints the title at, on
+/// top of the first paint, to fake a heavier weight. No bold variant of the
+/// vendored font exists (`fonts.rs` installs a single weight into both
+/// egui font families), so this is the cheapest way to read visually
+/// heavier than the row text without embedding a second font file for one
+/// label.
+const TITLE_FAUX_BOLD_OFFSET: f32 = 0.6;
+
 /// Height of the header's subtitle line. Not part of `default_inner_height`
 /// — the subtitle is conditional and the default window assumes it is
 /// absent (see `default_inner_height`'s doc).
@@ -476,16 +504,75 @@ fn header_band_height(has_subtitle: bool, button_row_height: f32) -> f32 {
 /// height so `draw_header`'s drag band and `default_inner_height` can both
 /// reason about it exactly, the same way `draw_row` paints stat text inside
 /// an `allocate_exact_size`d rect instead of an auto-sized `ui.label`.
-fn draw_title_line(ui: &mut egui::Ui, text: &str) {
+/// Returns the allocated rect so `draw_header` can paint the fading
+/// separator (`title_separator_segments`) flush against its bottom edge
+/// without allocating any extra vertical space of its own.
+fn draw_title_line(ui: &mut egui::Ui, text: &str) -> egui::Rect {
     let desired_size = egui::vec2(ui.available_width(), TITLE_LINE_HEIGHT);
     let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    let font = egui::FontId::proportional(TITLE_FONT_SIZE);
+    // Painted twice, offset by `TITLE_FAUX_BOLD_OFFSET` — see its doc
+    // comment for why there's no real bold font to reach for instead.
+    ui.painter().text(
+        rect.left_center() + egui::vec2(TITLE_FAUX_BOLD_OFFSET, 0.0),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font.clone(),
+        TITLE_TEXT_COLOR,
+    );
     ui.painter().text(
         rect.left_center(),
         egui::Align2::LEFT_CENTER,
         text,
-        egui::FontId::proportional(TITLE_FONT_SIZE),
-        ui.visuals().text_color(),
+        font,
+        TITLE_TEXT_COLOR,
     );
+    rect
+}
+
+/// Color of the fading separator line painted under the header title
+/// (`title_separator_segments`), matching the reference render's slate-blue
+/// divider.
+const TITLE_SEPARATOR_RGB: (u8, u8, u8) = (0x70, 0x7F, 0x90);
+
+/// Thickness, in points, of the title separator line.
+const TITLE_SEPARATOR_THICKNESS: f32 = 1.0;
+
+/// Number of thin strips `title_separator_segments` divides the fade into.
+/// High enough to read as a smooth gradient, modest enough to stay cheap to
+/// paint every frame.
+const TITLE_SEPARATOR_SEGMENTS: usize = 24;
+
+/// Builds the fading title-underline as a series of thin filled rects:
+/// egui has no built-in gradient stroke, so the "fades toward the
+/// background" effect from the reference render is approximated with
+/// segments whose alpha steps down linearly from opaque at `rect`'s left
+/// edge to fully transparent at its horizontal midpoint — nothing is
+/// painted past that, so the line visibly fades out by roughly mid-width
+/// rather than running the full title row. Extracted as a pure function,
+/// same reasoning as `share_bar_paints`: unit-testable without a live
+/// `egui::Ui`.
+fn title_separator_segments(rect: egui::Rect) -> Vec<(egui::Rect, egui::Color32)> {
+    let (r, g, b) = TITLE_SEPARATOR_RGB;
+    let fade_width = rect.width() / 2.0;
+    let segment_width = fade_width / TITLE_SEPARATOR_SEGMENTS as f32;
+    let y = rect.bottom() - TITLE_SEPARATOR_THICKNESS;
+
+    (0..TITLE_SEPARATOR_SEGMENTS)
+        .map(|i| {
+            let t = i as f32 / (TITLE_SEPARATOR_SEGMENTS - 1) as f32; // 0.0 ..= 1.0
+            let alpha = ((1.0 - t) * 255.0).round() as u8;
+            let x0 = rect.left() + i as f32 * segment_width;
+            let segment_rect = egui::Rect::from_min_size(
+                egui::pos2(x0, y),
+                egui::vec2(segment_width, TITLE_SEPARATOR_THICKNESS),
+            );
+            (
+                segment_rect,
+                egui::Color32::from_rgba_unmultiplied(r, g, b, alpha),
+            )
+        })
+        .collect()
 }
 
 /// Paints the header's subtitle line (scene name/id), dimmed. Only called
@@ -1143,6 +1230,205 @@ mod tests {
     #[test]
     fn fmt_duration_no_hour_rollover() {
         assert_eq!(fmt_duration(3_600_000), "60:00");
+    }
+
+    // -- header restyle (top-bar restyle: hamburger removal, total-damage
+    // stat, title separator, icon tint) ------------------------------------
+
+    /// Builds a minimal `Snapshot` for header-rendering tests: a resolved
+    /// boss name (so `encounter_title` returns non-empty text) and a
+    /// distinctive `total_damage` so the formatted figure is unambiguous in
+    /// assertions below.
+    fn header_test_snapshot(total_damage: i64) -> Snapshot {
+        Snapshot {
+            duration_ms: 90_000,
+            total_damage,
+            total_dps: 12_345.0,
+            rows: Vec::new(),
+            encounter: EncounterInfo {
+                boss_monster_id: Some(1),
+                is_boss: true,
+                boss_name: Some("Bahaar"),
+                scene_id: None,
+                scene_name: None,
+            },
+        }
+    }
+
+    /// Walks a painted `Shape`, collecting the text of every `Shape::Text`
+    /// found — recursing into `Shape::Vec` since egui groups a layout's
+    /// child shapes (e.g. `ui.horizontal`'s row) that way. `Galley`
+    /// dereferences to `str` (`Deref<Target = str>`), so `galley.text()`
+    /// hands back exactly the string that was laid out.
+    fn collect_text_shapes(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text_shape) => out.push(text_shape.galley.text().to_string()),
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_text_shapes(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Renders `draw_header` and returns the text of every string it
+    /// painted this frame (title, subtitle, and every `ui.label` in the
+    /// button row) by walking the frame's raw `FullOutput::shapes` — the
+    /// title/subtitle are painted directly via `ui.painter().text`, which
+    /// never reaches accesskit, so this reads the same ground truth for
+    /// both painter-drawn and widget-drawn text instead of two different
+    /// mechanisms.
+    fn header_rendered_texts(snapshot: &Snapshot) -> Vec<String> {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let toolbar = ToolbarIcons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header(
+                ui,
+                &ctx,
+                snapshot,
+                &tx_command,
+                &mut settings,
+                &tx_settings,
+                &toolbar,
+            );
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text_shapes(&clipped.shape, &mut texts);
+        }
+        output.drop_without_applying_deltas();
+        texts
+    }
+
+    /// The stray `☰` hamburger label had no counterpart in the reference
+    /// render and no behavior of its own (the whole header band is already
+    /// the drag surface) — it must not appear anywhere in the rendered
+    /// header.
+    #[test]
+    fn draw_header_omits_hamburger_glyph() {
+        let texts = header_rendered_texts(&header_test_snapshot(30_100_000_000));
+        assert!(!texts.iter().any(|text| text == "☰"));
+    }
+
+    /// The reference render shows a total-damage figure alongside the DPS
+    /// figure (e.g. "30.1B"), abbreviated with the same `fmt_short` used
+    /// everywhere else — `snapshot.total_damage` existed but was never
+    /// painted before this change.
+    #[test]
+    fn draw_header_shows_total_damage_abbreviated() {
+        let texts = header_rendered_texts(&header_test_snapshot(30_100_000_000));
+        let expected = fmt_short(30_100_000_000);
+        assert_eq!(expected, "30.1B");
+        assert!(
+            texts.iter().any(|text| text.contains(&expected)),
+            "expected a painted text containing {expected:?}, got {texts:?}"
+        );
+    }
+
+    /// The header band's height budget (`header_band_height`) must still
+    /// cover everything `draw_header` actually paints even after adding the
+    /// total-damage stat to the button row and the fading separator under
+    /// the title — neither should make the rendered content taller than the
+    /// band `draw_header` already computes as its drag surface.
+    #[test]
+    fn draw_header_fits_within_its_own_band_height() {
+        let snapshot = header_test_snapshot(30_100_000_000);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let toolbar = ToolbarIcons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+
+        let mut rendered_height = 0.0;
+        let mut interact_size_y = 0.0;
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header(
+                ui,
+                &ctx,
+                &snapshot,
+                &tx_command,
+                &mut settings,
+                &tx_settings,
+                &toolbar,
+            );
+            interact_size_y = ui.spacing().interact_size.y;
+            rendered_height = ui.min_rect().height();
+        });
+        output.drop_without_applying_deltas();
+
+        let has_subtitle = encounter_subtitle(&snapshot.encounter).is_some();
+        let band = header_band_height(has_subtitle, interact_size_y);
+        assert!(
+            rendered_height <= band,
+            "rendered header ({rendered_height}) overflowed its band ({band})"
+        );
+    }
+
+    // -- title separator (fading slate-blue divider under the title) ------
+
+    /// Pure-function version of the fade math (same reasoning as
+    /// `share_bar_paints`): the leftmost segment must be at (or very near)
+    /// full opacity and alpha must fall off monotonically toward zero by
+    /// roughly the midpoint, never rising back up.
+    #[test]
+    fn title_separator_segments_fade_monotonically_from_full_to_zero() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 20.0));
+        let segments = title_separator_segments(rect);
+
+        assert!(!segments.is_empty());
+        let first_alpha = segments.first().unwrap().1.a();
+        let last_alpha = segments.last().unwrap().1.a();
+        assert!(
+            first_alpha >= 250,
+            "leftmost segment should be near-opaque, got {first_alpha}"
+        );
+        assert_eq!(
+            last_alpha, 0,
+            "rightmost segment should have faded to nothing"
+        );
+
+        let mut previous = 255;
+        for (_, color) in &segments {
+            assert!(color.a() <= previous, "alpha rose instead of fading");
+            previous = color.a();
+        }
+    }
+
+    /// The fade must not extend past the title row's own width — the whole
+    /// point is that it fades out by roughly mid-width, not that it runs the
+    /// full row.
+    #[test]
+    fn title_separator_segments_stay_within_rect_width() {
+        let rect = egui::Rect::from_min_size(egui::pos2(5.0, 0.0), egui::vec2(200.0, 20.0));
+        let segments = title_separator_segments(rect);
+        for (seg_rect, _) in &segments {
+            assert!(seg_rect.left() >= rect.left());
+            assert!(seg_rect.right() <= rect.right() + 1.0);
+        }
+    }
+
+    // -- toolbar icon tint (slate-blue-gray family, matching reference) ---
+
+    /// `toolbar_icon_image` must multiply every toolbar/stat icon by the
+    /// reference render's slate-blue-gray family instead of leaving the
+    /// source PNG's native color untouched.
+    #[test]
+    fn toolbar_icon_image_applies_slate_tint() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "test-icon-tint",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        let image = toolbar_icon_image(&texture);
+        assert_eq!(image.image_options().tint, TOOLBAR_ICON_TINT);
     }
 
     #[test]
