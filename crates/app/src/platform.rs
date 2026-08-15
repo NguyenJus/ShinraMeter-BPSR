@@ -4,17 +4,35 @@
 //! Issue #11: dragging the borderless overlay via
 //! `ViewportCommand::StartDrag` (see `ui::draw_header`) enters winit's
 //! native move loop, and Windows applies Aero Snap to that gesture the same
-//! way it would a real title-bar drag. Snap behavior is driven by the
-//! `WS_MAXIMIZEBOX` window style, not by whether the window has decorations,
-//! so we clear that bit directly on the raw `HWND` right after the window is
-//! created. `WS_THICKFRAME` — which `ui::draw_resize_handles` relies on for
-//! edge-drag resizing via `BeginResize` — is untouched, so manual resize
-//! keeps working.
+//! way it would a real title-bar drag. That *drag-triggered* snap path is
+//! driven by the `WS_MAXIMIZEBOX` window style, not by whether the window
+//! has decorations, so `disable_aero_snap` clears that bit directly on the
+//! raw `HWND` right after the window is created (and, since a `GWL_STYLE`
+//! change alone doesn't take visible effect, forces a frame-change
+//! notification so DWM actually picks it up).
 //!
-//! Not verified against a real Windows session: this workaround can only be
-//! confirmed by actually dragging the overlay near a screen edge on
-//! Windows, which isn't possible from this (Linux, cross-compiling)
-//! environment.
+//! That style bit doesn't reach every path to Snap, though: Win+Arrow
+//! keyboard snap and the shell's own maximize command are shell/DWM-
+//! initiated, not drag gestures, and ignore `WS_MAXIMIZEBOX` entirely. The
+//! owner wants Snap disabled outright, so `install_snap_blocker` adds a
+//! second, message-level defense — a `SetWindowSubclass` hook (chained with
+//! `DefSubclassProc`, not a `GWLP_WNDPROC` swap) that rejects snap-shaped
+//! `WM_WINDOWPOSCHANGING` proposals and swallows `WM_SYSCOMMAND`/
+//! `SC_MAXIMIZE` as a backstop. See its doc comment and `is_snap_shaped`'s
+//! for the actual decision logic.
+//!
+//! `WS_THICKFRAME` — which `ui::draw_resize_handles` relies on for
+//! edge-drag resizing via `BeginResize` — is untouched by any of this, so
+//! manual resize keeps working; the subclass tells a legitimate app-driven
+//! reposition (this file's own `clamp_window_to_visible_area`, and manual
+//! move/resize in `ui.rs`) apart from a shell-initiated Snap via
+//! `app_driven_reposition`, which every such call site must be wrapped in.
+//!
+//! Not verified against a real Windows session: these workarounds can only
+//! be confirmed by actually dragging/Win+Arrow-snapping the overlay near a
+//! screen edge on Windows, which isn't possible from this (Linux,
+//! cross-compiling) environment. Only the pure `is_snap_shaped` geometry is
+//! exercised by tests here, the same way `corrected_position` is below.
 //!
 //! Issue #30: `clamp_window_to_visible_area` below is a second, unrelated
 //! startup tweak that lives here for the same reason — it needs the raw
@@ -351,8 +369,7 @@ fn corrected_position(window: Rect, monitors: &[Rect]) -> Option<(i32, i32)> {
 #[cfg(windows)]
 pub fn clamp_window_to_visible_area(cc: &eframe::CreationContext<'_>) {
     use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
-    use windows::Win32::Foundation::{HWND, LPARAM, RECT};
-    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC};
+    use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowRect, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
     };
@@ -388,28 +405,7 @@ pub fn clamp_window_to_visible_area(cc: &eframe::CreationContext<'_>) {
         bottom: win_rect.bottom,
     };
 
-    let mut monitors: Vec<Rect> = Vec::new();
-    // SAFETY: `EnumDisplayMonitors` calls `monitor_enum_callback`
-    // synchronously, on this thread, once per monitor, only for the
-    // duration of this call — it doesn't retain the callback or the
-    // `LPARAM` afterwards. The pointer handed to it here is `&mut
-    // monitors`, a local that outlives the call, so the callback's
-    // raw-pointer round-trip back to `&mut Vec<Rect>` is valid on every
-    // invocation.
-    let enumerated = unsafe {
-        EnumDisplayMonitors(
-            HDC(0),
-            None,
-            Some(monitor_enum_callback),
-            LPARAM(std::ptr::addr_of_mut!(monitors) as isize),
-        )
-    };
-    if !enumerated.as_bool() {
-        // Keep going with whatever the callback did collect: a partial list
-        // still beats no clamp at all, and the `is_empty` guard below covers
-        // total failure.
-        log::warn!("EnumDisplayMonitors failed; the monitor list may be partial");
-    }
+    let monitors = enumerate_monitor_work_areas();
     if monitors.is_empty() {
         log::warn!("no monitors enumerated; skipping the position clamp");
         return;
@@ -423,9 +419,12 @@ pub fn clamp_window_to_visible_area(cc: &eframe::CreationContext<'_>) {
         window.left,
         window.top
     );
+    // Wrapped in `app_driven_reposition` so the snap-blocking subclass
+    // (`install_snap_blocker`) never mistakes this app-initiated
+    // correction for a shell-driven Snap and vetoes it.
     // SAFETY: same as `GetWindowRect` above. `SWP_NOSIZE` means `cx`/`cy`
     // are ignored, and `SWP_NOZORDER` means the second handle is ignored.
-    let moved = unsafe {
+    let moved = app_driven_reposition(|| unsafe {
         SetWindowPos(
             hwnd,
             HWND(0),
@@ -435,7 +434,7 @@ pub fn clamp_window_to_visible_area(cc: &eframe::CreationContext<'_>) {
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         )
-    };
+    });
     if !moved.as_bool() {
         log::warn!("SetWindowPos failed while correcting the overlay's position");
     }
@@ -478,6 +477,294 @@ unsafe extern "system" fn monitor_enum_callback(
         });
     }
     true.into()
+}
+
+/// Shared by `clamp_window_to_visible_area` above and `window_proc` below:
+/// the current monitors' work areas (`MONITORINFO.rcWork`, excluding the
+/// taskbar), via the same `EnumDisplayMonitors` + `monitor_enum_callback`
+/// pairing `clamp_window_to_visible_area` used before this was extracted.
+#[cfg(windows)]
+fn enumerate_monitor_work_areas() -> Vec<Rect> {
+    use windows::Win32::Foundation::LPARAM;
+    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC};
+
+    let mut monitors: Vec<Rect> = Vec::new();
+    // SAFETY: see `monitor_enum_callback`'s doc comment above — same
+    // synchronous, single-threaded, non-retaining call.
+    let enumerated = unsafe {
+        EnumDisplayMonitors(
+            HDC(0),
+            None,
+            Some(monitor_enum_callback),
+            LPARAM(std::ptr::addr_of_mut!(monitors) as isize),
+        )
+    };
+    if !enumerated.as_bool() {
+        // Keep going with whatever the callback did collect: a partial
+        // list still beats an empty one; callers guard against `is_empty`.
+        log::warn!("EnumDisplayMonitors failed; the monitor list may be partial");
+    }
+    monitors
+}
+
+/// Wraps an app-initiated `SetWindowPos` call — this module's own
+/// `clamp_window_to_visible_area` above, and manual move/resize in
+/// `ui.rs` — so the snap-blocking subclass installed by
+/// `install_snap_blocker` can tell "the app moved itself" apart from a
+/// shell/DWM-initiated Windows Snap and only veto the latter.
+///
+/// Every direct `SetWindowPos` call anywhere in this crate MUST be
+/// wrapped in this. An unwrapped call risks being rejected by
+/// `window_proc`'s `WM_WINDOWPOSCHANGING` handling below whenever it
+/// happens to propose a snap-shaped rect — e.g. a manual resize that
+/// lands on exactly half the screen, or this module's own position clamp.
+///
+/// The flag this sets (`APP_DRIVEN_REPOSITION`) is process-wide, not
+/// per-window, so keep `f` scoped tightly to the `SetWindowPos` call(s)
+/// that need to bypass the guard, not unrelated work that happens to run
+/// alongside it.
+#[cfg(windows)]
+pub fn app_driven_reposition<R>(f: impl FnOnce() -> R) -> R {
+    use std::sync::atomic::Ordering;
+
+    // RAII so the flag is cleared even if `f` panics and unwinds through
+    // this call, rather than leaving Snap permanently blocked.
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            APP_DRIVEN_REPOSITION.store(false, Ordering::SeqCst);
+        }
+    }
+
+    APP_DRIVEN_REPOSITION.store(true, Ordering::SeqCst);
+    let _clear = ClearOnDrop;
+    f()
+}
+
+#[cfg(not(windows))]
+pub fn app_driven_reposition<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
+/// Set for the duration of an `app_driven_reposition` call; see there.
+#[cfg(windows)]
+static APP_DRIVEN_REPOSITION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Tolerance, in physical pixels, when matching a proposed rect against a
+/// monitor-half/quarter/full shape in `is_snap_shaped`. Windows computes
+/// snap rects by splitting the work area's width/height, which can land a
+/// pixel off from a naive `/2` when that dimension is odd; this absorbs
+/// that rounding without being loose enough to false-positive on a
+/// deliberate user resize that merely lands close to (but isn't) a
+/// half/quarter.
+#[cfg(any(windows, test))]
+const SNAP_SHAPE_TOLERANCE: i32 = 2;
+
+#[cfg(any(windows, test))]
+fn approx_eq(a: i32, b: i32) -> bool {
+    (a - b).abs() <= SNAP_SHAPE_TOLERANCE
+}
+
+#[cfg(any(windows, test))]
+fn rects_approx_eq(a: Rect, b: Rect) -> bool {
+    approx_eq(a.left, b.left)
+        && approx_eq(a.top, b.top)
+        && approx_eq(a.right, b.right)
+        && approx_eq(a.bottom, b.bottom)
+}
+
+/// Whether `proposed` — a candidate window rect taken from a
+/// `WM_WINDOWPOSCHANGING` message — matches the shape Windows Snap (Win+
+/// Arrow, drag-to-edge, or maximize) would produce on any of `monitors`:
+/// a half (left/right/top/bottom), a quarter (one of the four corners),
+/// or a monitor's full work area. `window_proc` below vetoes proposals
+/// this returns `true` for, unless they're app-driven (see
+/// `app_driven_reposition`).
+///
+/// Pure geometry, no windows-crate types, so it's unit-testable off
+/// Windows — the actual Win32 message plumbing lives in `window_proc`.
+#[cfg(any(windows, test))]
+fn is_snap_shaped(proposed: Rect, monitors: &[Rect]) -> bool {
+    monitors.iter().any(|m| {
+        let mid_x = m.left + m.width() / 2;
+        let mid_y = m.top + m.height() / 2;
+        let shapes = [
+            *m,
+            Rect {
+                left: m.left,
+                top: m.top,
+                right: mid_x,
+                bottom: m.bottom,
+            }, // left half
+            Rect {
+                left: mid_x,
+                top: m.top,
+                right: m.right,
+                bottom: m.bottom,
+            }, // right half
+            Rect {
+                left: m.left,
+                top: m.top,
+                right: m.right,
+                bottom: mid_y,
+            }, // top half
+            Rect {
+                left: m.left,
+                top: mid_y,
+                right: m.right,
+                bottom: m.bottom,
+            }, // bottom half
+            Rect {
+                left: m.left,
+                top: m.top,
+                right: mid_x,
+                bottom: mid_y,
+            }, // top-left quarter
+            Rect {
+                left: mid_x,
+                top: m.top,
+                right: m.right,
+                bottom: mid_y,
+            }, // top-right quarter
+            Rect {
+                left: m.left,
+                top: mid_y,
+                right: mid_x,
+                bottom: m.bottom,
+            }, // bottom-left quarter
+            Rect {
+                left: mid_x,
+                top: mid_y,
+                right: m.right,
+                bottom: m.bottom,
+            }, // bottom-right quarter
+        ];
+        shapes.iter().any(|shape| rects_approx_eq(proposed, *shape))
+    })
+}
+
+/// Subclass ID passed to `SetWindowSubclass`; unique among any subclasses
+/// this crate installs on the same `HWND` (there's currently only this
+/// one).
+#[cfg(windows)]
+const SNAP_BLOCKER_SUBCLASS_ID: usize = 1;
+
+/// Installs a `SetWindowSubclass` hook — chained with `DefSubclassProc`,
+/// never a direct `GWLP_WNDPROC` swap, since that would break winit's own
+/// message pump (focus, close, DPI-change, ...) — that blocks Windows
+/// Snap end to end:
+///
+/// - `WM_WINDOWPOSCHANGING`: `disable_aero_snap`'s `WS_MAXIMIZEBOX` clear
+///   only stops the *drag-triggered* Aero Snap path. Win+Arrow keyboard
+///   snap and drag-to-edge are shell/DWM-initiated and don't consult that
+///   style bit at all — they show up here as a `WINDOWPOS` proposal whose
+///   rect happens to be a monitor half/quarter (`is_snap_shaped`, reusing
+///   `enumerate_monitor_work_areas`, the same monitor enumeration
+///   `clamp_window_to_visible_area` uses). Legitimate app-driven
+///   repositioning is exempted via `app_driven_reposition` — every call
+///   site must be wrapped in it, or it risks being vetoed here.
+/// - `WM_SYSCOMMAND` / `SC_MAXIMIZE`: a backstop for the shell's maximize
+///   command directly, independent of whatever rect it would propose.
+///
+/// Neither handler touches focus or z-order, so always-on-top and the
+/// game keeping focus are unaffected; every other message falls through
+/// to `DefSubclassProc` unchanged.
+#[cfg(windows)]
+pub fn install_snap_blocker(cc: &eframe::CreationContext<'_>) {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::SetWindowSubclass;
+
+    let handle = match cc.window_handle() {
+        Ok(handle) => handle,
+        Err(err) => {
+            log::warn!("couldn't get the overlay's window handle; Snap may still trigger: {err:?}");
+            return;
+        }
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        log::warn!(
+            "overlay window handle isn't a Win32 handle; skipping the Snap-blocking subclass"
+        );
+        return;
+    };
+    let hwnd = HWND(win32.hwnd.get());
+
+    // SAFETY: `hwnd` is winit's own handle for the window that owns this
+    // `CreationContext`, alive and on the current thread; `window_proc` is
+    // a valid `SUBCLASSPROC` for the lifetime of the window (Windows
+    // removes all subclasses automatically when the window is destroyed,
+    // so there's no matching `RemoveWindowSubclass` needed here).
+    let installed =
+        unsafe { SetWindowSubclass(hwnd, Some(window_proc), SNAP_BLOCKER_SUBCLASS_ID, 0) };
+    if !installed.as_bool() {
+        log::warn!("SetWindowSubclass failed; keyboard/shell Snap may still trigger");
+        return;
+    }
+    log::info!("installed the window-message subclass that blocks Snap");
+}
+
+#[cfg(not(windows))]
+pub fn install_snap_blocker(_cc: &eframe::CreationContext<'_>) {}
+
+/// `SetWindowSubclass` callback installed by `install_snap_blocker`; see
+/// its doc comment for what each message does and why.
+#[cfg(windows)]
+unsafe extern "system" fn window_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+    _uidsubclass: usize,
+    _dwrefdata: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::UI::Shell::DefSubclassProc;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SC_MAXIMIZE, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING,
+    };
+
+    if msg == WM_WINDOWPOSCHANGING && !APP_DRIVEN_REPOSITION.load(Ordering::SeqCst) {
+        // SAFETY: for `WM_WINDOWPOSCHANGING`, `lparam` is a valid pointer
+        // to a `WINDOWPOS` the sender owns for the duration of this call;
+        // mutating it in place before forwarding to `DefSubclassProc` is
+        // exactly how a handler is meant to countermand a proposed
+        // move/resize.
+        let windowpos = unsafe { &mut *(lparam.0 as *mut WINDOWPOS) };
+        // If the proposal is already pinned on move and/or size, it isn't
+        // a full move+resize and so can't be a snap shape (Snap always
+        // both moves and resizes) — nothing to veto.
+        let already_pinned = (windowpos.flags & (SWP_NOMOVE | SWP_NOSIZE)).0 != 0;
+        if !already_pinned {
+            let proposed = Rect {
+                left: windowpos.x,
+                top: windowpos.y,
+                right: windowpos.x + windowpos.cx,
+                bottom: windowpos.y + windowpos.cy,
+            };
+            if is_snap_shaped(proposed, &enumerate_monitor_work_areas()) {
+                windowpos.flags = windowpos.flags | SWP_NOMOVE | SWP_NOSIZE;
+            }
+        }
+    } else if msg == WM_SYSCOMMAND {
+        // The low 4 bits of a WM_SYSCOMMAND wParam can carry a mouse/key
+        // source flag; mask them off before comparing, per the SC_* usage
+        // convention.
+        let cmd = (wparam.0 & 0xFFF0) as u32;
+        if cmd == SC_MAXIMIZE {
+            // Swallow it outright rather than forwarding: returning 0
+            // without calling DefSubclassProc is how WM_SYSCOMMAND
+            // handlers signal "handled, don't do the default action".
+            return windows::Win32::Foundation::LRESULT(0);
+        }
+    }
+
+    // SAFETY: `hwnd`/`msg`/`wparam`/`lparam` are exactly what this
+    // subclass procedure was called with; forwarding them unchanged to
+    // `DefSubclassProc` is how every message this handler doesn't
+    // explicitly veto keeps reaching winit's own window procedure.
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
 #[cfg(test)]
@@ -631,5 +918,77 @@ mod tests {
         let monitor = rect(0, 0, 1920, 1040);
         let window = rect(-32000, -32000, -31600, -31700);
         assert!(corrected_position(window, &[monitor]).is_some());
+    }
+
+    #[test]
+    fn left_half_snap_is_rejected() {
+        let monitor = rect(0, 0, 1920, 1040);
+        let proposal = rect(0, 0, 960, 1040);
+        assert!(is_snap_shaped(proposal, &[monitor]));
+    }
+
+    #[test]
+    fn right_half_snap_is_rejected() {
+        let monitor = rect(0, 0, 1920, 1040);
+        let proposal = rect(960, 0, 1920, 1040);
+        assert!(is_snap_shaped(proposal, &[monitor]));
+    }
+
+    #[test]
+    fn top_half_snap_is_rejected() {
+        let monitor = rect(0, 0, 1920, 1040);
+        let proposal = rect(0, 0, 1920, 520);
+        assert!(is_snap_shaped(proposal, &[monitor]));
+    }
+
+    #[test]
+    fn bottom_half_snap_is_rejected() {
+        let monitor = rect(0, 0, 1920, 1040);
+        let proposal = rect(0, 520, 1920, 1040);
+        assert!(is_snap_shaped(proposal, &[monitor]));
+    }
+
+    #[test]
+    fn quarter_snap_is_rejected() {
+        let monitor = rect(0, 0, 1920, 1040);
+        let proposal = rect(960, 0, 1920, 520); // top-right quadrant
+        assert!(is_snap_shaped(proposal, &[monitor]));
+    }
+
+    #[test]
+    fn full_maximize_shape_is_rejected() {
+        let monitor = rect(0, 0, 1920, 1040);
+        let proposal = rect(0, 0, 1920, 1040);
+        assert!(is_snap_shaped(proposal, &[monitor]));
+    }
+
+    #[test]
+    fn off_by_one_rounding_still_counts_as_snap_shaped() {
+        // 1921 is odd, so a real half-split can't divide it evenly; Windows
+        // rounds one side up by a pixel. The tolerance should absorb this.
+        let monitor = rect(0, 0, 1921, 1040);
+        let proposal = rect(0, 0, 961, 1040);
+        assert!(is_snap_shaped(proposal, &[monitor]));
+    }
+
+    #[test]
+    fn arbitrary_user_resize_is_not_snap_shaped() {
+        let monitor = rect(0, 0, 1920, 1040);
+        let proposal = rect(200, 150, 900, 700);
+        assert!(!is_snap_shaped(proposal, &[monitor]));
+    }
+
+    #[test]
+    fn user_drag_to_a_non_half_position_is_not_snap_shaped() {
+        // Deliberately close to, but not matching, the left-half shape.
+        let monitor = rect(0, 0, 1920, 1040);
+        let proposal = rect(50, 50, 1010, 990);
+        assert!(!is_snap_shaped(proposal, &[monitor]));
+    }
+
+    #[test]
+    fn no_monitors_is_never_snap_shaped() {
+        let proposal = rect(0, 0, 960, 1040);
+        assert!(!is_snap_shaped(proposal, &[]));
     }
 }
