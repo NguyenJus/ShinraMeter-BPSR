@@ -15,6 +15,13 @@
 //! confirmed by actually dragging the overlay near a screen edge on
 //! Windows, which isn't possible from this (Linux, cross-compiling)
 //! environment.
+//!
+//! Issue #30: `clamp_window_to_visible_area` below is a second, unrelated
+//! startup tweak that lives here for the same reason — it needs the raw
+//! `HWND` and Win32 monitor APIs egui/eframe don't expose. See its own doc
+//! comment and `corrected_position`'s for what it does and why. Likewise
+//! not verified against a real Windows session; only the pure
+//! `corrected_position` geometry is exercised by tests here.
 
 /// Bit for `WS_MAXIMIZEBOX` in a Win32 window style (`GWL_STYLE`) bitmask.
 /// Kept as a plain literal — rather than referencing
@@ -92,6 +99,300 @@ pub fn disable_aero_snap(cc: &eframe::CreationContext<'_>) {
 #[cfg(not(windows))]
 pub fn disable_aero_snap(_cc: &eframe::CreationContext<'_>) {}
 
+/// A monitor's or window's rectangle in physical pixels / virtual-screen
+/// coordinates — so a monitor to the left of or above the primary one has
+/// negative `left`/`top`, never remapped to `[0, size]`. Left/top are
+/// inclusive, right/bottom exclusive, matching Win32's `RECT` convention.
+/// Hand-rolled rather than reusing `windows::Win32::Foundation::RECT` so
+/// `corrected_position` below has no windows-crate types in its signature
+/// and can be unit-tested off-Windows.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[cfg(any(windows, test))]
+impl Rect {
+    fn width(self) -> i32 {
+        self.right - self.left
+    }
+
+    fn height(self) -> i32 {
+        self.bottom - self.top
+    }
+
+    fn center(self) -> (i32, i32) {
+        (self.left + self.width() / 2, self.top + self.height() / 2)
+    }
+}
+
+/// Height, in physical pixels, of the drag band `ui::draw_header` actually
+/// registers at the top of the overlay window. The overlay is borderless
+/// (`ui::viewport`) and that band is the *only* way the user can move it,
+/// which is what makes "is enough of it reachable" the right test below
+/// instead of "is the whole window on screen". This file never converts
+/// between points and physical pixels or accounts for per-monitor DPI — it
+/// stays entirely in the same physical-pixel, virtual-screen space Win32
+/// itself uses (`GetWindowRect`, `MONITORINFO.rcWork`) — so this is a
+/// deliberately approximate stand-in for `ui.rs`'s point-based header
+/// height, not a scaled match to it; only "comfortably smaller than a real
+/// header" matters here.
+#[cfg(any(windows, test))]
+const HEADER_BAND_HEIGHT: i32 = 32;
+
+/// Minimum width, in physical pixels, of the header band that must land
+/// inside some monitor's work area for a saved position to count as
+/// recoverable by dragging.
+#[cfg(any(windows, test))]
+const MIN_VISIBLE_WIDTH: i32 = 160;
+
+/// Minimum height, in physical pixels, of the header band that must land
+/// inside some monitor's work area for a saved position to count as
+/// recoverable. Deliberately smaller than `HEADER_BAND_HEIGHT` itself:
+/// requiring the *full* band height would reject positions where the
+/// window is shifted up so only the band's lower pixels show, even though
+/// that's still enough to grab and drag.
+#[cfg(any(windows, test))]
+const MIN_VISIBLE_HEIGHT: i32 = 24;
+
+/// Issue #30: decides whether `window`'s current position needs correcting
+/// given the monitors currently attached (`monitors`, each that monitor's
+/// *work area* — `MONITORINFO.rcWork`, excluding the taskbar, since a
+/// header hidden under the taskbar is exactly as unreachable as one off the
+/// edge of the display), and if so, where to move it. All geometry is
+/// physical pixels / virtual-screen coordinates.
+///
+/// # Why "is the header band reachable" rather than "is the window on
+/// screen"
+///
+/// The overlay is borderless, and the drag surface in `ui::draw_header` —
+/// the top `HEADER_BAND_HEIGHT` px across the window's full width — is the
+/// *only* way the user can move it (see `ViewportCommand::StartDrag`
+/// there). So "acceptable" isn't "fully on some monitor": a window sitting
+/// mostly off a monitor's edge, with just enough header showing to grab, is
+/// already recoverable by the user, and correcting it anyway would fight a
+/// deliberate multi-monitor layout (e.g. parked mostly off-screen in a
+/// corner on purpose). The bar is instead: does at least `MIN_VISIBLE_WIDTH`
+/// x `MIN_VISIBLE_HEIGHT` physical pixels of that band overlap *some*
+/// monitor's work area.
+///
+/// # Why the nearest monitor when it doesn't
+///
+/// When no monitor clears that bar, the window moves to whichever
+/// monitor's work-area center is closest (squared distance) to the
+/// window's own center, clamped to fit inside that monitor's work area.
+/// The failure mode this exists for is "the monitor this was saved on is
+/// gone, or the layout changed", so reappearing on the nearest surviving
+/// monitor reads as "it moved" rather than "an arbitrary monitor was
+/// picked for me".
+///
+/// Returns `None` when no correction is needed — the common case — so the
+/// caller can skip `SetWindowPos` entirely.
+#[cfg(any(windows, test))]
+fn corrected_position(window: Rect, monitors: &[Rect]) -> Option<(i32, i32)> {
+    if monitors.is_empty() {
+        // No information to correct against: doing nothing is safer than
+        // guessing. The caller logs a warning when this happens, since it
+        // only occurs if monitor enumeration itself failed.
+        return None;
+    }
+
+    let band = Rect {
+        left: window.left,
+        top: window.top,
+        right: window.right,
+        bottom: window.top + HEADER_BAND_HEIGHT,
+    };
+    let reachable = monitors.iter().any(|m| {
+        let overlap_width = band.right.min(m.right) - band.left.max(m.left);
+        let overlap_height = band.bottom.min(m.bottom) - band.top.max(m.top);
+        overlap_width >= MIN_VISIBLE_WIDTH && overlap_height >= MIN_VISIBLE_HEIGHT
+    });
+    if reachable {
+        return None;
+    }
+
+    let (wx, wy) = window.center();
+    // Squared distance as `i64` so the `i32` deltas can't overflow it.
+    let nearest = monitors
+        .iter()
+        .min_by_key(|m| {
+            let (mx, my) = m.center();
+            let dx = i64::from(mx - wx);
+            let dy = i64::from(my - wy);
+            dx * dx + dy * dy
+        })
+        .expect("monitors is non-empty, checked above");
+
+    let clamp = |value: i32, lo: i32, hi: i32| -> i32 {
+        // `hi` can end up less than `lo` when the window is bigger than the
+        // work area on this axis (e.g. a huge saved size restored onto a
+        // small monitor) — pin to `lo` in that case rather than calling
+        // `i32::clamp` with an inverted range, which panics.
+        if hi < lo { lo } else { value.clamp(lo, hi) }
+    };
+    let x = clamp(window.left, nearest.left, nearest.right - window.width());
+    let y = clamp(window.top, nearest.top, nearest.bottom - window.height());
+    Some((x, y))
+}
+
+/// Issue #30: `Settings.window_position` is restored verbatim into
+/// `ViewportBuilder::with_position` (`ui::viewport`, called from
+/// `main.rs`) with no validation. If the monitor it was saved on is gone,
+/// or the monitor layout changed since, the window can reopen at
+/// coordinates on no visible display — invisible, and because the only way
+/// to move a borderless overlay is dragging its header
+/// (`ui::draw_header`), also unreachable; the only recovery today is
+/// hand-editing settings.json.
+///
+/// This runs at `CreationContext` time, alongside `disable_aero_snap`
+/// above, so any correction happens before the first paint — no visible
+/// jump, no "wait a frame then check" flag needed.
+///
+/// Not solved through egui/eframe: no app-facing hook receives a winit
+/// event loop or monitor list at `ViewportBuilder` time, and
+/// `egui::ViewportInfo::monitor_size` only exposes the *current* monitor's
+/// size in points, with no origin and no list of the others — not enough
+/// to validate a position, since a window at a negative x on a monitor to
+/// the left of primary is perfectly valid and a `[0, monitor_size]` clamp
+/// would wrongly yank it back. So this goes straight to the raw `HWND` and
+/// Win32 monitor APIs, the same way `disable_aero_snap` does.
+///
+/// See `corrected_position` for the actual decision (what counts as
+/// "reachable", and where an unreachable window goes instead) — this
+/// function is just the Win32 plumbing: read the window's real rect,
+/// enumerate monitors' work areas, and apply whatever `corrected_position`
+/// decides.
+#[cfg(windows)]
+pub fn clamp_window_to_visible_area(cc: &eframe::CreationContext<'_>) {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+    };
+
+    let handle = match cc.window_handle() {
+        Ok(handle) => handle,
+        Err(err) => {
+            log::warn!(
+                "couldn't get the overlay's window handle; skipping the position clamp: {err:?}"
+            );
+            return;
+        }
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        log::warn!("overlay window handle isn't a Win32 handle; skipping the position clamp");
+        return;
+    };
+    let hwnd = HWND(win32.hwnd.get());
+
+    let mut win_rect = RECT::default();
+    // SAFETY: `hwnd` is winit's own handle for the window that owns this
+    // `CreationContext`, alive and on the current thread; `win_rect` is a
+    // valid, correctly-sized out-param for the duration of this call.
+    let got_rect = unsafe { GetWindowRect(hwnd, &mut win_rect) };
+    if !got_rect.as_bool() {
+        log::warn!("GetWindowRect failed; skipping the position clamp");
+        return;
+    }
+    let window = Rect {
+        left: win_rect.left,
+        top: win_rect.top,
+        right: win_rect.right,
+        bottom: win_rect.bottom,
+    };
+
+    let mut monitors: Vec<Rect> = Vec::new();
+    // SAFETY: `EnumDisplayMonitors` calls `monitor_enum_callback`
+    // synchronously, on this thread, once per monitor, only for the
+    // duration of this call — it doesn't retain the callback or the
+    // `LPARAM` afterwards. The pointer handed to it here is `&mut
+    // monitors`, a local that outlives the call, so the callback's
+    // raw-pointer round-trip back to `&mut Vec<Rect>` is valid on every
+    // invocation.
+    unsafe {
+        EnumDisplayMonitors(
+            HDC(0),
+            None,
+            Some(monitor_enum_callback),
+            LPARAM(std::ptr::addr_of_mut!(monitors) as isize),
+        );
+    }
+    if monitors.is_empty() {
+        log::warn!("no monitors enumerated; skipping the position clamp");
+        return;
+    }
+
+    let Some((x, y)) = corrected_position(window, &monitors) else {
+        return;
+    };
+    log::info!(
+        "overlay position ({}, {}) isn't reachable on the current monitor layout; moving it to ({x}, {y})",
+        window.left,
+        window.top
+    );
+    // SAFETY: same as `GetWindowRect` above. `SWP_NOSIZE` means `cx`/`cy`
+    // are ignored, and `SWP_NOZORDER` means the second handle is ignored.
+    let moved = unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND(0),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    };
+    if !moved.as_bool() {
+        log::warn!("SetWindowPos failed while correcting the overlay's position");
+    }
+}
+
+#[cfg(not(windows))]
+pub fn clamp_window_to_visible_area(_cc: &eframe::CreationContext<'_>) {}
+
+/// `EnumDisplayMonitors` callback used by `clamp_window_to_visible_area`:
+/// appends each monitor's work area (`MONITORINFO.rcWork`, i.e. excluding
+/// the taskbar) to the `Vec<Rect>` whose address was passed through
+/// `lparam`.
+#[cfg(windows)]
+unsafe extern "system" fn monitor_enum_callback(
+    hmonitor: windows::Win32::Graphics::Gdi::HMONITOR,
+    _hdc: windows::Win32::Graphics::Gdi::HDC,
+    _clip_rect: *mut windows::Win32::Foundation::RECT,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::BOOL {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `hmonitor` is a live handle `EnumDisplayMonitors` owns for
+    // the duration of this callback; `info` is a correctly-sized out-param.
+    if unsafe { GetMonitorInfoW(hmonitor, &mut info) }.as_bool() {
+        // SAFETY: `lparam` was set by `clamp_window_to_visible_area`, our
+        // only caller, to the address of a `Vec<Rect>` local that outlives
+        // this entire `EnumDisplayMonitors` call; `EnumDisplayMonitors`
+        // invokes this callback synchronously and single-threaded, so
+        // there's no aliasing and no reentrancy on that pointer.
+        let monitors = unsafe { &mut *(lparam.0 as *mut Vec<Rect>) };
+        monitors.push(Rect {
+            left: info.rcWork.left,
+            top: info.rcWork.top,
+            right: info.rcWork.right,
+            bottom: info.rcWork.bottom,
+        });
+    }
+    true.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +422,88 @@ mod tests {
     fn unchanged_when_maximize_box_already_absent() {
         let style = WS_POPUP | WS_VISIBLE | WS_THICKFRAME;
         assert_eq!(without_maximize_box(style), style);
+    }
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
+        Rect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn fully_on_screen_needs_no_correction() {
+        let monitor = rect(0, 0, 1920, 1040);
+        let window = rect(100, 100, 500, 400);
+        assert_eq!(corrected_position(window, &[monitor]), None);
+    }
+
+    #[test]
+    fn negative_x_on_secondary_monitor_left_of_primary_is_left_alone() {
+        // Regression guard: a naive `[0, monitor_size]` clamp would wrongly
+        // yank this window back onto the primary monitor, even though it's
+        // already perfectly reachable where it is.
+        let secondary = rect(-1920, 0, 0, 1040);
+        let primary = rect(0, 0, 1920, 1040);
+        let window = rect(-1800, 100, -1400, 400);
+        assert_eq!(corrected_position(window, &[secondary, primary]), None);
+    }
+
+    #[test]
+    fn position_on_a_disconnected_monitor_is_clamped_into_the_remaining_one() {
+        let remaining = rect(0, 0, 1920, 1040);
+        // Far outside every monitor: the monitor this was saved on is gone.
+        let window = rect(5000, 5000, 5400, 5300);
+        let Some((x, y)) = corrected_position(window, &[remaining]) else {
+            panic!("expected a correction");
+        };
+        let (w, h) = (window.width(), window.height());
+        assert!(x >= remaining.left && x + w <= remaining.right);
+        assert!(y >= remaining.top && y + h <= remaining.bottom);
+    }
+
+    #[test]
+    fn sliver_of_header_below_the_minimum_is_corrected() {
+        let monitor = rect(0, 0, 1920, 1040);
+        // Only 50px of header width would show — below MIN_VISIBLE_WIDTH.
+        let window = rect(1870, 100, 2270, 400);
+        assert!(corrected_position(window, &[monitor]).is_some());
+    }
+
+    #[test]
+    fn header_visible_at_exactly_the_minimum_needs_no_correction() {
+        let monitor = rect(0, 0, 1920, 1040);
+        let window = rect(1920 - MIN_VISIBLE_WIDTH, 100, 2160, 400);
+        assert_eq!(corrected_position(window, &[monitor]), None);
+    }
+
+    #[test]
+    fn empty_monitor_list_is_left_alone() {
+        let window = rect(-32000, -32000, -31600, -31700);
+        assert_eq!(corrected_position(window, &[]), None);
+    }
+
+    #[test]
+    fn window_larger_than_the_work_area_is_pinned_to_top_left() {
+        let monitor = rect(0, 0, 800, 600);
+        // 1000x700 — bigger than the monitor on both axes.
+        let window = rect(2000, 2000, 3000, 2700);
+        assert_eq!(corrected_position(window, &[monitor]), Some((0, 0)));
+    }
+
+    #[test]
+    fn windows_minimize_parking_spot_is_corrected() {
+        // -32000, -32000 is where Windows parks a minimized window.
+        // `ui::is_plausible_position` already guards the *save* side
+        // against persisting that value; this is the *load*-side backstop
+        // for whatever's already sitting in settings.json regardless of
+        // how it got there (an older build, a hand-edit, a race) — the two
+        // don't fight each other, they guard opposite ends of the same
+        // value's lifecycle.
+        let monitor = rect(0, 0, 1920, 1040);
+        let window = rect(-32000, -32000, -31600, -31700);
+        assert!(corrected_position(window, &[monitor]).is_some());
     }
 }
