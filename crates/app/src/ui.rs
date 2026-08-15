@@ -264,22 +264,31 @@ fn draw_header(
 }
 
 /// Header title text (issue #9 slice 2; gated to boss fights by issue #42):
-/// the boss name when the current target is a recognized boss, else blank
-/// for a non-boss pull, else "No target" when nothing has been hit yet.
-/// Always returns something (never omits the line) so `draw_header` can
-/// render it unconditionally and the header's height never jitters between
-/// frames depending on whether a target — or a name for it — is known.
+/// the boss name when the current target is a recognized boss with a
+/// resolved name, `Monster #{id}` when it's a recognized boss whose name
+/// didn't resolve (the two vendored lists aren't guaranteed to agree — see
+/// `EncounterInfo::is_boss`), else blank for a non-boss pull, else "No
+/// target" when nothing has been hit yet. Always returns something (never
+/// omits the line) so `draw_header` can render it unconditionally and the
+/// header's height never jitters between frames depending on whether a
+/// target — or a name for it — is known.
 ///
 /// "No target" is kept for the genuinely-empty-encounter case (no target at
 /// all), but a non-boss pull is a real target we're deliberately not naming
 /// — showing `Monster #{id}` there was dropped rather than kept as the
 /// non-boss fallback, since a raw id would read as an unresolved boss name
 /// rather than the intentional omission it actually is (the reference meter
-/// only names boss fights; see `tables::is_boss_monster`).
+/// only names boss fights; see `tables::is_boss_monster`). A *recognized
+/// boss* with no resolved name is different: it's a real boss fight, and an
+/// empty header would be indistinguishable from a trash pull — so that case
+/// still falls back to the raw id.
 fn encounter_title(e: &EncounterInfo) -> String {
     match e.boss_monster_id {
         None => "No target".to_string(),
-        Some(_) if e.is_boss => e.boss_name.map(str::to_string).unwrap_or_default(),
+        Some(id) if e.is_boss => e
+            .boss_name
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Monster #{id}")),
         Some(_) => String::new(),
     }
 }
@@ -888,6 +897,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(encounter_title(&e), "Rathalos");
+    }
+
+    #[test]
+    fn title_shows_monster_id_for_unnamed_boss() {
+        // The two vendored lists aren't guaranteed to agree (see
+        // `EncounterInfo::is_boss`'s doc comment) — a recognized boss can
+        // still have no resolved name. That's a real boss fight, so it must
+        // not render as blank (indistinguishable from a trash pull); it
+        // falls back to the same `Monster #{id}` style the header used
+        // before issue #42 gated it to boss fights only.
+        let e = EncounterInfo {
+            boss_monster_id: Some(999_999),
+            boss_name: None,
+            is_boss: true,
+            ..Default::default()
+        };
+        assert_eq!(encounter_title(&e), "Monster #999999");
     }
 
     #[test]
