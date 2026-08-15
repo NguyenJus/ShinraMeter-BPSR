@@ -185,20 +185,17 @@ pub enum ToolbarIcon {
     Reset,
     /// Close button, replacing the `"×"` glyph button.
     Close,
-    /// Death-count glyph, consumed by the per-player death column (issue
-    /// #49). Sourced separately from the other toolbar icons below — see
-    /// `TOOLBAR_ICON_BYTES`'s doc comment.
-    Skull,
 }
 
 /// Every `ToolbarIcon` an embedded PNG exists for. `Settings`, `Reset`, and
-/// `Close` are sourced from neowutran/ShinraMeter's `resources/img/` (MIT);
-/// `Skull` is sourced separately, also from
-/// neowutran/ShinraMeter (MIT), verbatim and unrenamed — see
-/// `THIRD_PARTY_NOTICES.md`. No pin/lock and no minimize icon exists in
+/// `Close` are sourced from neowutran/ShinraMeter's `resources/img/` (MIT) —
+/// see `THIRD_PARTY_NOTICES.md`. No pin/lock and no minimize icon exists in
 /// that repo (issue #41's scope note): minimize is instead drawn
 /// procedurally by `ui.rs`'s `minimize_button`, and pin/lock is out of
-/// scope entirely (no pinning feature exists yet).
+/// scope entirely (no pinning feature exists yet). The death-count glyph
+/// (formerly `ToolbarIcon::Skull`) moved to `GlyphIcon::Skull` (issue #59)
+/// once the pill row it feeds started painting rasterized glyphs
+/// throughout.
 const TOOLBAR_ICON_BYTES: &[(ToolbarIcon, &[u8])] = &[
     (
         ToolbarIcon::Settings,
@@ -211,10 +208,6 @@ const TOOLBAR_ICON_BYTES: &[(ToolbarIcon, &[u8])] = &[
     (
         ToolbarIcon::Close,
         include_bytes!("../assets/icons/close.png"),
-    ),
-    (
-        ToolbarIcon::Skull,
-        include_bytes!("../assets/icons/skull.png"),
     ),
 ];
 
@@ -384,7 +377,6 @@ mod tests {
         ToolbarIcon::Settings,
         ToolbarIcon::Reset,
         ToolbarIcon::Close,
-        ToolbarIcon::Skull,
     ];
 
     #[test]

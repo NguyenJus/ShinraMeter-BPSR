@@ -36,11 +36,7 @@ use crate::settings::{ColumnKind, Settings};
 /// Boss/encounter title — the source's `FontSize="13" FontWeight="DemiBold"`.
 const FONT_SIZE_TITLE: f32 = 13.0;
 /// The value inside the timer half-pill — the source's `FontSize="16"
-/// FontWeight="DemiBold"`, the largest text in the UI. Unused until slice 4
-/// wires up the timer half-pill; `#[allow(dead_code)]` rather than leaving
-/// it out, so the full scale lands in one place (see
-/// `font_scale_matches_the_source_metrics`, which already pins its value).
-#[allow(dead_code)]
+/// FontWeight="DemiBold"`, the largest text in the UI.
 const FONT_SIZE_TIMER: f32 = 16.0;
 /// Every text in a player row — name and every metric column alike. The
 /// source's `MetricTextBlockStyle` is a flat `FontSize="13"` with no
@@ -489,13 +485,16 @@ fn draw_header(
         // words cost more width than the whole pill chrome does.
         stat_pill(
             ui,
-            StatPill::header(&fmt_duration(snapshot.duration_ms), PillIcon::Stopwatch),
+            StatPill::timer(
+                &fmt_duration(snapshot.duration_ms),
+                icons.glyphs.get(GlyphIcon::Timer).map(|t| t.id()),
+            ),
         );
         stat_pill(
             ui,
             StatPill::header(
                 &format!("{}/s", fmt_short(snapshot.total_dps as i64)),
-                PillIcon::Speedometer,
+                icons.glyphs.get(GlyphIcon::Speed).map(|t| t.id()),
             ),
         );
         // Total damage for the fight (reference render's e.g. "30.1B"). The
@@ -504,8 +503,12 @@ fn draw_header(
         // party-HP figure anywhere in this codebase.
         stat_pill(
             ui,
-            StatPill::header(&fmt_short(snapshot.total_damage), PillIcon::Heart),
+            StatPill::header(
+                &fmt_short(snapshot.total_damage),
+                icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
+            ),
         );
+        toggle_cluster(ui, icons);
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Raster PNG icons throughout this row (issue #41), not glyphs —
@@ -543,6 +546,96 @@ fn draw_header(
             );
         });
     });
+}
+
+// -- status indicators (issue #62) ---------------------------------------
+//
+// The source's fourth stat-row cell: a click-through LED, a cloud-upload LED
+// and a queue gauge, in a 22pt pill. We have none of those features, so
+// these render **in their off state and are inert** — no click handling, no
+// settings, no tooltip. Rendering them off is the honest reading: the
+// source's `OffBrush` is `#1fff` for both LEDs, and an empty queue gauge is
+// a bare ring with its check glyph, which is exactly the state a meter with
+// no upload queue is in. Rendering them *on* would claim capabilities that
+// do not exist. Issue #62 is explicit that no click-through or
+// cloud-upload feature exists and a use for these slots will be decided
+// later.
+
+/// Tint every inert toggle glyph and the queue ring are painted with — the
+/// source's `OffBrush="#1fff"`.
+const TOGGLE_OFF_COLOR: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x11);
+const TOGGLE_MOUSE_SIDE: f32 = 12.0;
+const TOGGLE_CLOUD_SIDE: f32 = 14.0;
+const TOGGLE_QUEUE_SIDE: f32 = 14.0;
+const TOGGLE_QUEUE_GLYPH_SIDE: f32 = 6.0;
+const TOGGLE_GAP: f32 = 5.0;
+const TOGGLE_PAD_X: f32 = 4.0;
+
+/// Paints the three inert status toggles: a click-through LED (mouse-off), a
+/// cloud-upload LED (cloud-off), and a queue gauge (an empty ring with a
+/// check glyph — the source's backlog `Arc` overlay has nothing to draw with
+/// no queue). All in one `PILL_FILL` oval, matching the DPS/damage pills'
+/// chrome.
+///
+/// Allocated with `Sense::hover()` and its `Response` discarded — deliberately
+/// no `on_hover_text`, no `widget_info`: a labelled inert control is worse
+/// than an unlabelled decoration, since a screen reader announcing a
+/// tooltip for a control that does nothing would be actively misleading.
+fn toggle_cluster(ui: &mut egui::Ui, icons: &Icons) {
+    let height = ui.spacing().interact_size.y;
+    let width = 2.0 * TOGGLE_PAD_X
+        + TOGGLE_MOUSE_SIDE
+        + TOGGLE_GAP
+        + TOGGLE_CLOUD_SIDE
+        + TOGGLE_GAP
+        + TOGGLE_QUEUE_SIDE;
+    let (rect, _response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    // deliberately no tooltip / no widget_info — see the section comment
+    // above.
+
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter();
+    painter.rect_filled(rect, rect.height() / 2.0, PILL_FILL);
+
+    let mut x = rect.left() + TOGGLE_PAD_X;
+    let y = rect.center().y;
+
+    if let Some(mouse_off) = icons.glyphs.get(GlyphIcon::MouseOff) {
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(x + TOGGLE_MOUSE_SIDE / 2.0, y),
+            egui::Vec2::splat(TOGGLE_MOUSE_SIDE),
+        );
+        painter.image(mouse_off.id(), icon_rect, UV_FULL, TOGGLE_OFF_COLOR);
+    }
+    x += TOGGLE_MOUSE_SIDE + TOGGLE_GAP;
+
+    if let Some(cloud_off) = icons.glyphs.get(GlyphIcon::CloudOff) {
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(x + TOGGLE_CLOUD_SIDE / 2.0, y),
+            egui::Vec2::splat(TOGGLE_CLOUD_SIDE),
+        );
+        painter.image(cloud_off.id(), icon_rect, UV_FULL, TOGGLE_OFF_COLOR);
+    }
+    x += TOGGLE_CLOUD_SIDE + TOGGLE_GAP;
+
+    // The queue gauge: an empty ring (the source's `Ellipse 14x14
+    // Fill="#0aaa"` has alpha 0, so only the stroke is drawn) with the check
+    // glyph centered in it. No backlog arc — with no queue there is nothing
+    // for it to show.
+    let queue_center = egui::pos2(x + TOGGLE_QUEUE_SIDE / 2.0, y);
+    painter.circle_stroke(
+        queue_center,
+        TOGGLE_QUEUE_SIDE / 2.0,
+        egui::Stroke::new(1.0, TOGGLE_OFF_COLOR),
+    );
+    if let Some(check) = icons.glyphs.get(GlyphIcon::Check) {
+        let icon_rect =
+            egui::Rect::from_center_size(queue_center, egui::Vec2::splat(TOGGLE_QUEUE_GLYPH_SIDE));
+        painter.image(check.id(), icon_rect, UV_FULL, TOGGLE_OFF_COLOR);
+    }
 }
 
 /// Fixed display size, in points, every toolbar icon (issue #41) is drawn
@@ -704,7 +797,7 @@ fn chevron_rect(title_row: egui::Rect) -> egui::Rect {
 /// Down means "there is more below — click to fold it away" (the expanded
 /// state, which is what the reference render shows); up means "click to
 /// unfold" (collapsed). Pure, so the mirroring is unit-testable without a
-/// painter — same reasoning as `arc_points`/`heart_points`.
+/// painter — same reasoning as `pill_content_layout`.
 fn chevron_points(rect: egui::Rect, pointing_down: bool) -> [egui::Pos2; 3] {
     let half_width = CHEVRON_PAINT_WIDTH / 2.0;
     let half_height = CHEVRON_PAINT_HEIGHT / 2.0;
@@ -749,31 +842,61 @@ fn collapse_chevron(ui: &mut egui::Ui, rect: egui::Rect, collapsed: bool) -> egu
     response.on_hover_text(label)
 }
 
-// -- stat pills (issue #56) --------------------------------------------
+// -- stat pills (issue #56, #59, #62) ------------------------------------
 //
 // The reference render's header stats sit in fully-rounded oval containers:
 // a barely-brighter translucent fill over the panel, no border stroke,
-// generous horizontal padding, the value in bold white, and a small outline
-// icon in a light steel blue. The same chrome is reused, at a smaller size,
-// for issue #49's per-row death counter — which is why every knob below is a
-// shared constant and the painter is one helper rather than three copies.
+// generous horizontal padding, the value in bold white, and a small
+// rasterized glyph. The same chrome is reused, at a smaller size, for issue
+// #49's per-row death counter — which is why every knob below is a shared
+// constant and the painter is one helper rather than three copies.
+//
+// Every glyph is now a real rasterized icon (`GlyphIcon`, `icons.rs`)
+// blitted through `Painter::image`, not a hand-painted approximation —
+// issue #59 vendors the source's actual stopwatch/speedometer/heart SVGs,
+// so there is nothing left to paint procedurally.
 
-/// Fill of a stat pill: white at a low alpha, i.e. a wash that lifts the
-/// pill *slightly* off whatever is behind it (the panel fill, or a row's
-/// share-bar wash) without ever reading as a solid chip. Deliberately not a
-/// fixed opaque color — the overlay is translucent, so the pill has to tint
-/// what shows through rather than replace it.
-/// (Spelled premultiplied — white at alpha `a` premultiplied is `(a, a, a,
-/// a)` — because `from_rgba_unmultiplied`/`from_white_alpha` are not `const
-/// fn` in ecolor and this has to be a constant the pill painter and issue
-/// #49 can both name.)
-const PILL_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(20, 20, 20, 20);
+/// Fill of a header/DPS/damage stat pill — the source's `#09ffffff`, white
+/// at a very low alpha. Spelled premultiplied — white at alpha `a`
+/// premultiplied is `(a, a, a, a)` — because `from_rgba_unmultiplied` is not
+/// `const fn` in ecolor.
+const PILL_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(9, 9, 9, 9);
 
-/// Light steel blue every pill icon is stroked in, sampled from the
-/// reference render's stat glyphs. Distinct from `TOOLBAR_ICON_TINT`'s
-/// grayer slate: the stat icons in the reference read as an accent, the
-/// window controls as chrome.
-const PILL_ICON_COLOR: egui::Color32 = egui::Color32::from_rgb(0x7E, 0x9C, 0xBF);
+/// Value text color inside a header/DPS/damage pill — the source's `#afff`.
+const PILL_VALUE_COLOR: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0xAA);
+
+/// Glyph tint inside a header/DPS/damage pill — the source's `#5bdf`, a
+/// light steel blue distinct from `TOOLBAR_ICON_TINT`'s grayer slate: the
+/// stat icons read as an accent, the window controls as chrome.
+const PILL_ICON_COLOR: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0xBB, 0xDD, 0xFF, 0x55);
+
+/// Side of a header/DPS/damage pill's glyph box, in points — the source's
+/// `GeneralStatPathStyle` `14x14`.
+const PILL_GLYPH_SIDE: f32 = 14.0;
+
+/// Timer half-pill fill — the source's `#1aaa`.
+const TIMER_PILL_FILL: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0xAA, 0xAA, 0xAA, 0x11);
+
+/// Timer half-pill border — the source's `#2fff`.
+const TIMER_PILL_BORDER: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x22);
+
+/// Counter (death) pill fill — `MetricBorderStyle`'s `#1fff`.
+const COUNTER_PILL_FILL: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x11);
+
+/// Counter (death) pill glyph tint — `MetricPathStyle`'s `#5fff`. Dimmer,
+/// via alpha rather than a darker gray, than the (now white)
+/// `DEATH_COUNT_RGB` digits beside it.
+const COUNTER_ICON_COLOR: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x55);
+
+/// Side of a counter pill's glyph box, in points — the source's
+/// `MetricPathStyle` `12x12`.
+const COUNTER_GLYPH_SIDE: f32 = 12.0;
 
 /// Horizontal padding inside a pill, on both ends. Generous on purpose —
 /// it is most of what makes the oval read as a container rather than as a
@@ -789,85 +912,78 @@ const PILL_PAD_Y: f32 = 2.0;
 /// Gap between a pill's value text and its icon.
 const PILL_ICON_GAP: f32 = 5.0;
 
-/// A pill icon's side length as a fraction of its value text's line height —
-/// roughly the text's cap height, matching the reference render, and derived
-/// rather than fixed so issue #49's smaller counter pill gets a
-/// proportionally smaller glyph for free.
-const PILL_ICON_CAP_RATIO: f32 = 0.62;
-
-/// Stroke width every pill icon is drawn with. These are outline glyphs at
-/// ~9pt, so anything heavier fills the shapes in.
-const PILL_ICON_STROKE: f32 = 1.2;
-
-/// Number of straight segments a pill icon's curves are approximated with.
-/// Enough to read as a curve at ~9pt, cheap enough to rebuild every frame
-/// (these are painted, not cached textures).
-const PILL_ICON_SEGMENTS: usize = 24;
-
-/// The glyphs `stat_pill` can paint. Painted procedurally with
-/// `egui::Painter` rather than loaded as textures, following exactly the
-/// precedent `minimize_button` set: the reference's thin outline stopwatch /
-/// speedometer / heart are not in the upstream ShinraMeter icon set this
-/// project vendors (see `THIRD_PARTY_NOTICES.md`), and one more icon family
-/// is not worth adding for three ~9pt glyphs. Painting also lets them take
-/// the accent color and the pill-derived size directly, which a fixed-size,
-/// fixed-tint `toolbar_icon_image` texture cannot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PillIcon {
-    /// Encounter duration. Painted rather than reusing a toolbar-style icon:
-    /// toolbar icons are locked to `TOOLBAR_ICON_SIZE` and `TOOLBAR_ICON_TINT`
-    /// by `toolbar_icon_image`, while the reference here is unmistakably a
-    /// stopwatch — round body, crown and stem on top, single hand.
-    Stopwatch,
-    /// Total party DPS.
-    Speedometer,
-    /// Total damage. The reference's glyph, kept for fidelity even though
-    /// the number behind it is damage rather than anything health-shaped.
-    Heart,
-    /// Death count (issue #49). The one glyph in this enum that is *blitted*
-    /// rather than painted: unlike the stopwatch/speedometer/heart above,
-    /// a skull does exist in the upstream ShinraMeter icon set this project
-    /// already vendors, so it ships as `assets/icons/skull.png` /
-    /// `ToolbarIcon::Skull` (see `icons.rs`) and there is nothing to gain
-    /// from re-drawing a skull's jaw and eye sockets by hand.
-    ///
-    /// Carries the texture rather than looking it up, because
-    /// `paint_pill_icon` only has a `Painter` — and it is an `Option`
-    /// because `ToolbarIcons::get` can hand back `None` if the PNG somehow
-    /// failed to decode. That case paints an *empty* icon box rather than
-    /// nothing at all: the pill keeps the same width either way, exactly
-    /// like `draw_row` reserves a class-icon slot for rows whose class has
-    /// no icon.
-    Skull(Option<egui::TextureId>),
-}
-
 /// One stat pill's content. A struct rather than a long argument list
-/// because issue #49's death counter needs the same chrome with a different
-/// size, colors, and icon side — and a positional `(&str, f32, Color32,
-/// Color32, bool)` call would be unreadable at three header call sites.
+/// because issue #49's death counter and issue #59's timer half-pill need
+/// the same chrome with different sizes, colors, glyph sides and corner
+/// radii — a positional call would be unreadable at every call site.
 struct StatPill<'a> {
     value: &'a str,
-    icon: PillIcon,
-    /// Point size of `value`; also what the icon's size is derived from.
+    /// The glyph texture, or `None` when its PNG failed to decode (never
+    /// expected — the bytes are compile-time constants). `None` paints an
+    /// empty icon box so the pill keeps the same width either way, exactly
+    /// like `draw_row` reserves a class-icon slot for a class with no icon.
+    icon: Option<egui::TextureId>,
+    /// Side of the icon's square box, in points. Explicit rather than
+    /// derived from the text's line height: the source fixes these per call
+    /// site (`GeneralStatPathStyle` 14x14, `MetricPathStyle` 12x12).
+    icon_side: f32,
+    /// Point size of `value`.
     size: f32,
     value_color: egui::Color32,
     icon_color: egui::Color32,
-    /// Icon before the value instead of after it. The header's pills read
-    /// value-then-icon; issue #49's death counter reads skull-then-count.
+    /// Icon before the value instead of after it. The header's DPS/damage
+    /// pills read value-then-icon; the timer half-pill and issue #49's
+    /// death counter read icon-then-value.
     icon_first: bool,
+    /// Per-corner radius. The DPS/damage pills are full ovals; the timer
+    /// half-pill is `CornerRadius="0 13 13 0"`, flush against the panel's
+    /// left border.
+    corner_radius: egui::CornerRadius,
+    /// Fill behind the pill.
+    fill: egui::Color32,
+    /// Optional 1pt outline — only the timer half-pill has one (`#2fff`).
+    stroke: Option<egui::Stroke>,
 }
 
 impl<'a> StatPill<'a> {
-    /// A header stat pill: bold value in the title's bright white, accent
-    /// icon trailing it — the three pills in the reference's stat row.
-    fn header(value: &'a str, icon: PillIcon) -> Self {
+    /// A header stat pill (DPS or total damage): bold value in a light
+    /// white, accent icon trailing it — the two ovals right of the timer in
+    /// the reference's stat row.
+    fn header(value: &'a str, icon: Option<egui::TextureId>) -> Self {
         Self {
             value,
             icon,
+            icon_side: PILL_GLYPH_SIDE,
             size: FONT_SIZE_PILL_VALUE,
-            value_color: TITLE_TEXT_COLOR,
+            value_color: PILL_VALUE_COLOR,
             icon_color: PILL_ICON_COLOR,
             icon_first: false,
+            corner_radius: egui::CornerRadius::same((BUTTON_ROW_HEIGHT / 2.0) as u8),
+            fill: PILL_FILL,
+            stroke: None,
+        }
+    }
+
+    /// The encounter-duration half-pill, flush against the panel's left
+    /// border (`CornerRadius="0 13 13 0"`) — the source's largest stat text
+    /// and its only stroked/bordered pill.
+    fn timer(value: &'a str, icon: Option<egui::TextureId>) -> Self {
+        Self {
+            value,
+            icon,
+            icon_side: PILL_GLYPH_SIDE,
+            size: FONT_SIZE_TIMER,
+            value_color: PILL_VALUE_COLOR,
+            icon_color: PILL_ICON_COLOR,
+            icon_first: true,
+            corner_radius: egui::CornerRadius {
+                nw: 0,
+                ne: 13,
+                sw: 0,
+                se: 13,
+            },
+            fill: TIMER_PILL_FILL,
+            stroke: Some(egui::Stroke::new(1.0, TIMER_PILL_BORDER)),
         }
     }
 
@@ -880,23 +996,21 @@ impl<'a> StatPill<'a> {
     /// than being fixed here, so the one place a column's color is declared
     /// stays `ColumnKind::spec` for the pill column too, exactly as it is
     /// for every text column.
-    fn counter(value: &'a str, icon: PillIcon, value_color: egui::Color32) -> Self {
+    fn counter(value: &'a str, icon: Option<egui::TextureId>, value_color: egui::Color32) -> Self {
         Self {
             value,
             icon,
+            icon_side: COUNTER_GLYPH_SIDE,
             size: FONT_SIZE_COUNTER,
             value_color,
             icon_color: COUNTER_ICON_COLOR,
             icon_first: true,
+            corner_radius: egui::CornerRadius::same(12),
+            fill: COUNTER_PILL_FILL,
+            stroke: None,
         }
     }
 }
-
-/// Dim gray the death-counter's skull is tinted with (issue #49). Grayer and
-/// darker than `PILL_ICON_COLOR`'s accent blue: in the reference render the
-/// header's stat glyphs read as an accent while the row's skull reads as
-/// de-emphasized detail, dimmer even than the count beside it.
-const COUNTER_ICON_COLOR: egui::Color32 = egui::Color32::from_rgb(0x8A, 0x8A, 0x8A);
 
 /// RGB of the death count's digits (issue #49, issue #62) —
 /// `ColumnKind::spec`'s color for `ColumnKind::Deaths`, declared here with
@@ -906,23 +1020,16 @@ const COUNTER_ICON_COLOR: egui::Color32 = egui::Color32::from_rgb(0x8A, 0x8A, 0x
 /// digit color.
 pub(crate) const DEATH_COUNT_RGB: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
 
-/// Side length of a pill's icon box for a value text of `text_height` line
-/// height — see `PILL_ICON_CAP_RATIO`. Rounded to whole points so a 1.2pt
-/// stroke lands on the same subpixel offsets across all three icons.
-fn pill_icon_side(text_height: f32) -> f32 {
-    (text_height * PILL_ICON_CAP_RATIO).round()
-}
-
-/// Outer size of a pill holding text of `text_size`, capped at
-/// `max_height`.
+/// Outer size of a pill holding text of `text_size` with a glyph box of
+/// `icon_side`, capped at `max_height`.
 ///
 /// The cap is load-bearing rather than cosmetic: the pills live in
 /// `draw_header`'s button row, whose height `header_band_height` budgets as
-/// egui's `interact_size.y` (the same height `icon_button`/`minimize_button`
+/// `BUTTON_ROW_HEIGHT` (the same height `icon_button`/`minimize_button`
 /// occupy). A pill taller than that would silently grow the header band past
 /// the drag surface `draw_header` registered for it.
-fn pill_size(text_size: egui::Vec2, max_height: f32) -> egui::Vec2 {
-    let width = 2.0 * PILL_PAD_X + text_size.x + PILL_ICON_GAP + pill_icon_side(text_size.y);
+fn pill_size(text_size: egui::Vec2, icon_side: f32, max_height: f32) -> egui::Vec2 {
+    let width = 2.0 * PILL_PAD_X + text_size.x + PILL_ICON_GAP + icon_side;
     let height = (text_size.y + 2.0 * PILL_PAD_Y).min(max_height);
     egui::vec2(width, height)
 }
@@ -934,32 +1041,32 @@ fn pill_size(text_size: egui::Vec2, max_height: f32) -> egui::Vec2 {
 fn pill_content_layout(
     rect: egui::Rect,
     text_size: egui::Vec2,
+    icon_side: f32,
     icon_first: bool,
 ) -> (egui::Pos2, egui::Rect) {
-    let side = pill_icon_side(text_size.y);
     let left = rect.left() + PILL_PAD_X;
     let (text_x, icon_x) = if icon_first {
-        (left + side + PILL_ICON_GAP, left)
+        (left + icon_side + PILL_ICON_GAP, left)
     } else {
         (left, left + text_size.x + PILL_ICON_GAP)
     };
     let y = rect.center().y;
     (
         egui::pos2(text_x, y),
-        egui::Rect::from_center_size(egui::pos2(icon_x + side / 2.0, y), egui::Vec2::splat(side)),
+        egui::Rect::from_center_size(
+            egui::pos2(icon_x + icon_side / 2.0, y),
+            egui::Vec2::splat(icon_side),
+        ),
     )
 }
 
 /// Paints one oval stat pill and returns its `Response` (hover-only: none of
 /// these are click targets — the reference's three *circular* buttons at the
-/// right of the same row are toggles for features this app doesn't have, and
-/// are deliberately not implemented).
-///
-/// The corner radius is half the pill's height, which is what makes the
-/// container a true oval at any height rather than a rounded rectangle.
+/// right of the same row are inert status toggles for features this app
+/// doesn't have; see `toggle_cluster`).
 fn stat_pill(ui: &mut egui::Ui, pill: StatPill<'_>) -> egui::Response {
     let text_size = pill_text_size(ui.painter(), &pill);
-    let size = pill_size(text_size, ui.spacing().interact_size.y);
+    let size = pill_size(text_size, pill.icon_side, ui.spacing().interact_size.y);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
 
     if ui.is_rect_visible(rect) {
@@ -980,17 +1087,21 @@ fn pill_text_size(painter: &egui::Painter, pill: &StatPill<'_>) -> egui::Vec2 {
         .size()
 }
 
-/// Paints a pill's fill, value and icon into `rect`. The layout half of
-/// `stat_pill`, with no `Ui` and therefore no allocation — see
-/// `pill_text_size` for why the two are separate.
+/// Paints a pill's fill, optional stroke, value and icon into `rect`. The
+/// layout half of `stat_pill`, with no `Ui` and therefore no allocation —
+/// see `pill_text_size` for why the two are separate.
 fn paint_stat_pill(
     painter: &egui::Painter,
     rect: egui::Rect,
     text_size: egui::Vec2,
     pill: &StatPill<'_>,
 ) {
-    painter.rect_filled(rect, rect.height() / 2.0, PILL_FILL);
-    let (text_pos, icon_rect) = pill_content_layout(rect, text_size, pill.icon_first);
+    painter.rect_filled(rect, pill.corner_radius, pill.fill);
+    if let Some(stroke) = pill.stroke {
+        painter.rect_stroke(rect, pill.corner_radius, stroke, egui::StrokeKind::Inside);
+    }
+    let (text_pos, icon_rect) =
+        pill_content_layout(rect, text_size, pill.icon_side, pill.icon_first);
     paint_bold_text(
         painter,
         text_pos,
@@ -999,184 +1110,14 @@ fn paint_stat_pill(
         pill.size,
         pill.value_color,
     );
-    paint_pill_icon(painter, pill.icon, icon_rect, pill.icon_color);
-}
-
-/// Paints one pill glyph, stroked, fitted to `rect` (a square, from
-/// `pill_content_layout`).
-fn paint_pill_icon(
-    painter: &egui::Painter,
-    icon: PillIcon,
-    rect: egui::Rect,
-    color: egui::Color32,
-) {
-    let stroke = egui::Stroke::new(PILL_ICON_STROKE, color);
-    match icon {
-        PillIcon::Stopwatch => {
-            // Round body sitting on the box's bottom edge, with the crown
-            // and stem occupying the strip above it — the same proportions
-            // as the reference glyph, where the body is most of the height.
-            let side = rect.width().min(rect.height());
-            let radius = side * STOPWATCH_BODY_RADIUS;
-            let center = egui::pos2(rect.center().x, rect.bottom() - radius);
-            painter.circle_stroke(center, radius, stroke);
-            let crown_half = side * STOPWATCH_CROWN_HALF_WIDTH;
-            painter.line_segment(
-                [
-                    egui::pos2(center.x - crown_half, rect.top()),
-                    egui::pos2(center.x + crown_half, rect.top()),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(center.x, rect.top()),
-                    egui::pos2(center.x, center.y - radius),
-                ],
-                stroke,
-            );
-            // The single hand, pointing straight up (a stopped stopwatch
-            // reads as a timer; an angled hand reads as a clock face).
-            painter.line_segment(
-                [center, egui::pos2(center.x, center.y - radius * 0.55)],
-                stroke,
-            );
-        }
-        PillIcon::Speedometer => {
-            // A gauge: an arc open at the bottom plus a needle. The
-            // reference's glyph is a rounded dial with a needle sweeping up
-            // and to the right; an arc is the closest honest approximation
-            // at this size.
-            let side = rect.width().min(rect.height());
-            let center = egui::pos2(rect.center().x, rect.center().y + side * GAUGE_CENTER_DROP);
-            let radius = side * GAUGE_RADIUS;
-            painter.add(egui::Shape::line(
-                arc_points(
-                    center,
-                    radius,
-                    GAUGE_START_ANGLE,
-                    GAUGE_END_ANGLE,
-                    PILL_ICON_SEGMENTS,
-                ),
-                stroke,
-            ));
-            let needle = GAUGE_NEEDLE_ANGLE;
-            painter.line_segment(
-                [
-                    center,
-                    egui::pos2(
-                        center.x + radius * GAUGE_NEEDLE_LENGTH * needle.cos(),
-                        center.y + radius * GAUGE_NEEDLE_LENGTH * needle.sin(),
-                    ),
-                ],
-                stroke,
-            );
-        }
-        PillIcon::Heart => {
-            painter.add(egui::Shape::closed_line(heart_points(rect), stroke));
-        }
-        // Blitted rather than stroked (issue #49) — the only arm that is,
-        // because it is the only glyph with a vendored asset behind it. The
-        // `None` case paints nothing and leaves the icon box empty; see
-        // `PillIcon::Skull`.
-        //
-        // Not routed through `toolbar_icon_image`: that helper locks every
-        // icon to `TOOLBAR_ICON_SIZE` and `TOOLBAR_ICON_TINT`, and this one
-        // has to take the pill-derived box size (`pill_icon_side`) and the
-        // counter's own dim gray instead.
-        PillIcon::Skull(texture) => {
-            if let Some(id) = texture {
-                painter.image(id, rect, UV_FULL, color);
-            }
-        }
+    if let Some(id) = pill.icon {
+        painter.image(id, icon_rect, UV_FULL, pill.icon_color);
     }
 }
 
 /// The whole of a texture, in normalized texture coordinates — the `uv`
 /// argument every full-texture `Painter::image` blit in this module passes.
 const UV_FULL: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-
-/// Stopwatch body radius, as a fraction of the icon box's side. Leaves the
-/// remaining ~24% of the height for the crown and stem above it.
-const STOPWATCH_BODY_RADIUS: f32 = 0.38;
-/// Half-width of the stopwatch's crown bar, as a fraction of the box side.
-const STOPWATCH_CROWN_HALF_WIDTH: f32 = 0.16;
-
-/// How far below the icon box's center the gauge's arc is centered, as a
-/// fraction of the box side — an arc open at the bottom looks top-heavy
-/// centered exactly.
-const GAUGE_CENTER_DROP: f32 = 0.12;
-/// Gauge arc radius, as a fraction of the icon box's side.
-const GAUGE_RADIUS: f32 = 0.44;
-/// Gauge arc sweep, in radians, in `arc_points`' screen-space convention
-/// (0 = right, increasing clockwise because y grows downward): from just
-/// below the left horizontal, over the top, to just below the right
-/// horizontal — i.e. a dial open at the bottom.
-const GAUGE_START_ANGLE: f32 = 2.79; // ~160°
-const GAUGE_END_ANGLE: f32 = 6.63; // ~380°, i.e. 20° past the right horizontal
-/// Where the needle points (~250°, up and slightly left of vertical) and how
-/// far out it reaches as a fraction of the arc radius.
-const GAUGE_NEEDLE_ANGLE: f32 = 4.36;
-const GAUGE_NEEDLE_LENGTH: f32 = 0.8;
-
-/// Points along a circular arc, clockwise from `start` to `end` (radians, 0
-/// = +x, angles increasing clockwise on screen since y grows downward).
-/// Pure, so the gauge's geometry is unit-testable without a live painter.
-fn arc_points(
-    center: egui::Pos2,
-    radius: f32,
-    start: f32,
-    end: f32,
-    segments: usize,
-) -> Vec<egui::Pos2> {
-    (0..=segments)
-        .map(|i| {
-            let t = i as f32 / segments as f32;
-            let angle = start + (end - start) * t;
-            egui::pos2(
-                center.x + radius * angle.cos(),
-                center.y + radius * angle.sin(),
-            )
-        })
-        .collect()
-}
-
-/// Outline of a heart filling `rect`, as a closed polyline.
-///
-/// Uses the classic parametric heart curve (`x = sin³t`, `y = 13cos t −
-/// 5cos 2t − 2cos 3t − cos 4t`) rather than hand-placed béziers: it is one
-/// expression and it is symmetric by construction.
-///
-/// `y` is normalized against the sampled curve's *own* extremes rather than
-/// a hand-derived constant — the expression's maximum is an awkward ~11.95
-/// at t ≈ 0.92 (the top of the lobes), nowhere near the tidy value at t = 0
-/// — so the outline fills the icon box exactly, which is what keeps it
-/// aligned with the other two glyphs.
-fn heart_points(rect: egui::Rect) -> Vec<egui::Pos2> {
-    let steps = PILL_ICON_SEGMENTS * 2;
-    let raw: Vec<(f32, f32)> = (0..steps)
-        .map(|i| {
-            let t = std::f32::consts::TAU * i as f32 / steps as f32;
-            let x = t.sin().powi(3);
-            let y =
-                13.0 * t.cos() - 5.0 * (2.0 * t).cos() - 2.0 * (3.0 * t).cos() - (4.0 * t).cos();
-            (x, y)
-        })
-        .collect();
-
-    let y_min = raw.iter().fold(f32::MAX, |acc, (_, y)| acc.min(*y));
-    let y_max = raw.iter().fold(f32::MIN, |acc, (_, y)| acc.max(*y));
-    let y_span = (y_max - y_min).max(f32::EPSILON);
-
-    raw.iter()
-        .map(|(x, y)| {
-            egui::pos2(
-                rect.center().x + x * rect.width() / 2.0,
-                rect.bottom() - (y - y_min) / y_span * rect.height(),
-            )
-        })
-        .collect()
-}
 
 /// Header title text (issue #9 slice 2; gated to boss fights by issue #42):
 /// the boss name when the current target is a recognized boss with a
@@ -2350,12 +2291,12 @@ fn draw_row(
     // two can never drift apart in length (issue #8 review):
     // `column_anchors` yields exactly one anchor per `StatColumn`, and each
     // `StatColumn` carries its own formatter.
-    // The death counter's skull (issue #49), resolved once per row rather
-    // than once per column: `ToolbarIcons::get` is a linear scan, and the
-    // texture is the same for every row in every frame. `None` (the PNG
-    // failed to decode — never expected, the bytes are compile-time
-    // constants) degrades to an empty icon box, see `PillIcon::Skull`.
-    let skull = PillIcon::Skull(icons.toolbar.get(ToolbarIcon::Skull).map(|t| t.id()));
+    // The death counter's skull (issue #49, issue #59), resolved once per
+    // row rather than once per column: `GlyphIcons::get` is a linear scan,
+    // and the texture is the same for every row in every frame. `None` (the
+    // PNG failed to decode — never expected, the bytes are compile-time
+    // constants) degrades to an empty icon box, see `StatPill::icon`.
+    let skull = icons.glyphs.get(GlyphIcon::Skull).map(|t| t.id());
 
     for ((anchor_x, column), kind) in anchors.iter().zip(columns).zip(kinds) {
         let text = (column.text)(row);
@@ -2414,7 +2355,7 @@ fn paint_counter_pill(painter: &egui::Painter, row: egui::Rect, anchor: f32, pil
     // Capped at the row's own height for the same reason the header's pills
     // are capped at the button row's (`pill_size`): a pill taller than its
     // container would overlap the rows above and below it.
-    let size = pill_size(text_size, row.height());
+    let size = pill_size(text_size, pill.icon_side, row.height());
     paint_stat_pill(
         painter,
         counter_pill_rect(row, anchor, size),
@@ -2764,18 +2705,30 @@ fn default_inner_height() -> f32 {
     TITLE_LINE_HEIGHT + BUTTON_ROW_HEIGHT + SEPARATOR_HEIGHT + rows + gaps
 }
 
+/// Extra width folded into `default_inner_width` on top of the row-column
+/// budget below, so the window opens wide enough to lay out the header's
+/// stat row without wrapping. That row (issue #59's real rasterized pill
+/// glyphs, the timer half-pill, and issue #62's 58pt inert status-toggle
+/// cluster, alongside the four window controls) is measured independently
+/// by `the_stat_pills_and_window_controls_fit_the_default_window_width`,
+/// which is the ground truth this headroom exists to satisfy; 20pt clears
+/// the gap with room to spare across minor font-metric variance between
+/// environments.
+const HEADER_ROW_EXTRA_WIDTH: f32 = 20.0;
+
 /// Default opening width (issue #26, widened for issue #9's icon gutter): a
 /// name budget in front of the default stat columns' combined fixed width
 /// (read out of `ColumnKind::spec` for whatever `Settings::default` enables,
 /// never hardcoded), so names don't visually collide with them — plus the
 /// fixed icon gutter now reserved at the row's left edge, so adding it
 /// doesn't squeeze the name budget or the stat columns relative to before
-/// issue #9.
+/// issue #9 — plus `HEADER_ROW_EXTRA_WIDTH` so the header's own (now wider)
+/// stat row fits too.
 ///
 ///   icon gutter (3.5 + 18.0 + 3.5 = 25.0) + left pad (2.0)
 ///     + name budget (150.0) + gap (10.0)
 ///     + columns (DPS 80.0 + crit 56.0 + lucky 56.0 + deaths 48.0 = 240.0)
-///     + right margin (4.0) = 431.0
+///     + right margin (4.0) + header row headroom (20.0) = 451.0
 ///
 /// The columns term grew with issue #49's death column joining the default
 /// set; because it is summed rather than written down, the default window
@@ -2791,6 +2744,7 @@ fn default_inner_width() -> f32 {
         + NAME_COLUMN_GAP
         + columns_width
         + COLUMN_RIGHT_MARGIN
+        + HEADER_ROW_EXTRA_WIDTH
 }
 
 /// Overlay window shape: always-on-top, borderless, transparent, sized to
@@ -2937,6 +2891,29 @@ mod tests {
             egui::Shape::Vec(shapes) => {
                 for s in shapes {
                     collect_text_shapes(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Walks a painted `Shape`, collecting every `Shape::Mesh`'s
+    /// `(texture_id, tint)` — `Painter::image` bakes its `tint` directly
+    /// into every vertex (`Mesh::add_rect_with_uv`), so a mesh's first
+    /// vertex color is exactly the tint the blit was painted with.
+    fn collect_image_texture_tints(
+        shape: &egui::Shape,
+        out: &mut Vec<(egui::TextureId, egui::Color32)>,
+    ) {
+        match shape {
+            egui::Shape::Mesh(mesh) => {
+                if let Some(vertex) = mesh.vertices.first() {
+                    out.push((mesh.texture_id, vertex.color));
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_image_texture_tints(s, out);
                 }
             }
             _ => {}
@@ -3218,18 +3195,15 @@ mod tests {
         );
     }
 
-    // -- stat pills (issue #56) -------------------------------------------
+    // -- stat pills (issue #56, #59, #62) ----------------------------------
 
     /// A pill is padding + text + gap + icon, and nothing else — the
-    /// formula issue #49's counter pill will inherit.
+    /// formula issue #49's counter pill inherits.
     #[test]
     fn pill_width_is_padding_plus_text_plus_gap_plus_icon() {
         let text = egui::vec2(40.0, 15.0);
-        let size = pill_size(text, 18.0);
-        assert_eq!(
-            size.x,
-            2.0 * PILL_PAD_X + text.x + PILL_ICON_GAP + pill_icon_side(text.y)
-        );
+        let size = pill_size(text, 14.0, 22.0);
+        assert_eq!(size.x, 2.0 * PILL_PAD_X + text.x + PILL_ICON_GAP + 14.0);
     }
 
     /// The height cap is what keeps the pills from silently growing
@@ -3238,11 +3212,10 @@ mod tests {
     /// this clamp is load-bearing, not theoretical.
     #[test]
     fn pill_height_never_exceeds_the_row_it_sits_in() {
-        let row_height = 18.0;
         for text_height in [10.0, 15.0, 40.0] {
-            let size = pill_size(egui::vec2(30.0, text_height), row_height);
+            let size = pill_size(egui::vec2(30.0, text_height), 14.0, BUTTON_ROW_HEIGHT);
             assert!(
-                size.y <= row_height,
+                size.y <= BUTTON_ROW_HEIGHT,
                 "a {text_height}pt text grew the pill to {}pt",
                 size.y
             );
@@ -3253,24 +3226,17 @@ mod tests {
     /// ceiling, not a fixed height.
     #[test]
     fn pill_height_follows_its_text_below_the_cap() {
-        let size = pill_size(egui::vec2(30.0, 10.0), 18.0);
+        let size = pill_size(egui::vec2(30.0, 10.0), 14.0, 18.0);
         assert_eq!(size.y, 10.0 + 2.0 * PILL_PAD_Y);
-    }
-
-    /// The icon tracks the text size, so issue #49's smaller counter pill
-    /// gets a proportionally smaller glyph without touching this code.
-    #[test]
-    fn pill_icon_scales_with_its_text() {
-        assert!(pill_icon_side(20.0) > pill_icon_side(12.0));
     }
 
     /// Header layout: value first, icon after it, both inside the padding.
     #[test]
     fn pill_content_sits_inside_its_padding_with_the_icon_trailing() {
         let text = egui::vec2(40.0, 15.0);
-        let size = pill_size(text, 18.0);
+        let size = pill_size(text, 14.0, 18.0);
         let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), size);
-        let (text_pos, icon_rect) = pill_content_layout(rect, text, false);
+        let (text_pos, icon_rect) = pill_content_layout(rect, text, 14.0, false);
 
         assert_eq!(text_pos.x, rect.left() + PILL_PAD_X);
         assert_eq!(text_pos.y, rect.center().y);
@@ -3283,13 +3249,14 @@ mod tests {
     }
 
     /// `icon_first` swaps the two without changing the pill's width — the
-    /// ordering issue #49's skull-then-count counter needs.
+    /// ordering issue #49's skull-then-count counter (and the timer
+    /// half-pill) need.
     #[test]
     fn pill_content_can_lead_with_its_icon() {
         let text = egui::vec2(40.0, 15.0);
-        let size = pill_size(text, 18.0);
+        let size = pill_size(text, 14.0, 18.0);
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size);
-        let (text_pos, icon_rect) = pill_content_layout(rect, text, true);
+        let (text_pos, icon_rect) = pill_content_layout(rect, text, 14.0, true);
 
         assert_eq!(icon_rect.left(), rect.left() + PILL_PAD_X);
         assert!(text_pos.x >= icon_rect.right());
@@ -3299,87 +3266,41 @@ mod tests {
         );
     }
 
-    /// The oval: a corner radius of half the height is what `stat_pill`
-    /// paints with, and it must fully round the ends at every pill height.
+    /// The DPS/damage pills are full ovals (corner radius at least half the
+    /// button row height, uniform on all four corners); the timer half-pill
+    /// is flush against the panel's left border — the source's
+    /// `CornerRadius="0 13 13 0"`.
     #[test]
-    fn pill_corner_radius_fully_rounds_its_ends() {
-        for height in [12.0, 18.0, 30.0] {
-            let radius: egui::CornerRadius = (height / 2.0).into();
-            assert_eq!(radius.nw as f32, (height / 2.0).round());
-            assert!(radius.nw as f32 * 2.0 >= height - 1.0);
-        }
+    fn header_pills_are_ovals_and_the_timer_is_a_half_pill() {
+        let header = StatPill::header("1", None);
+        assert_eq!(header.corner_radius.nw, header.corner_radius.ne);
+        assert_eq!(header.corner_radius.ne, header.corner_radius.se);
+        assert_eq!(header.corner_radius.se, header.corner_radius.sw);
+        assert!(header.corner_radius.nw as f32 >= BUTTON_ROW_HEIGHT / 2.0 - 1.0);
+
+        let timer = StatPill::timer("1", None);
+        assert_eq!(timer.corner_radius.nw, 0);
+        assert_eq!(timer.corner_radius.sw, 0);
+        assert!(timer.corner_radius.ne > 0);
+        assert!(timer.corner_radius.se > 0);
     }
 
-    // -- procedurally painted pill glyphs (issue #56) ---------------------
-
-    /// Every arc point is exactly `radius` from the center, and the sweep
-    /// starts and ends where the gauge constants say it does.
+    /// `StatPill::timer`'s corner radius has zero west corners — flush
+    /// against the panel's left border — independent of the general oval
+    /// check above.
     #[test]
-    fn arc_points_stay_on_their_circle() {
-        let center = egui::pos2(10.0, 20.0);
-        let points = arc_points(center, 5.0, GAUGE_START_ANGLE, GAUGE_END_ANGLE, 16);
-        assert_eq!(points.len(), 17);
-        for point in &points {
-            assert!(
-                (point.distance(center) - 5.0).abs() < 0.001,
-                "{point:?} is not on the circle"
-            );
-        }
-        let first = points.first().unwrap();
-        assert!(
-            (first.x - (center.x + 5.0 * GAUGE_START_ANGLE.cos())).abs() < 0.001,
-            "the arc must start at GAUGE_START_ANGLE"
-        );
+    fn the_timer_pill_is_flush_against_the_left_border() {
+        let pill = StatPill::timer("1", None);
+        assert_eq!(pill.corner_radius.nw, 0);
+        assert_eq!(pill.corner_radius.sw, 0);
     }
 
-    /// The gauge is open at the bottom: no point on the arc reaches the
-    /// lowest part of the dial, which is what distinguishes it from a plain
-    /// circle at 9pt.
-    #[test]
-    fn gauge_arc_is_open_at_the_bottom() {
-        let center = egui::pos2(0.0, 0.0);
-        let radius = 5.0;
-        let points = arc_points(
-            center,
-            radius,
-            GAUGE_START_ANGLE,
-            GAUGE_END_ANGLE,
-            PILL_ICON_SEGMENTS,
-        );
-        let lowest = points.iter().fold(f32::MIN, |acc, p| acc.max(p.y));
-        assert!(
-            lowest < radius * 0.5,
-            "arc reached {lowest}, i.e. it closed the bottom of the dial"
-        );
-    }
-
-    /// The heart fills its icon box exactly — no overflow into the pill's
-    /// padding, no shrinking away from the other two glyphs' footprint.
-    #[test]
-    fn heart_points_fill_their_box_without_escaping_it() {
-        let rect = egui::Rect::from_min_size(egui::pos2(4.0, 7.0), egui::vec2(9.0, 9.0));
-        let points = heart_points(rect);
-        assert!(points.len() >= 16);
-
-        let epsilon = 0.001;
-        for point in &points {
-            assert!(point.x >= rect.left() - epsilon && point.x <= rect.right() + epsilon);
-            assert!(point.y >= rect.top() - epsilon && point.y <= rect.bottom() + epsilon);
-        }
-        // The curve's extremes are its lowest point (the tip) and its top
-        // lobes, so it must actually touch both edges rather than floating
-        // inside the box.
-        let lowest = points.iter().fold(f32::MIN, |acc, p| acc.max(p.y));
-        let highest = points.iter().fold(f32::MAX, |acc, p| acc.min(p.y));
-        assert!((lowest - rect.bottom()).abs() < 0.01);
-        assert!((highest - rect.top()).abs() < 0.01);
-    }
-
-    /// The stat row is one non-wrapping `ui.horizontal`: if the three pills
-    /// and the four window controls ever stop fitting the default window
-    /// width, the controls get pushed off the right edge rather than
-    /// wrapping. Measured with real font metrics (the pills size themselves
-    /// from their laid-out text) against realistic worst-case values.
+    /// The stat row is one non-wrapping `ui.horizontal`: if the timer/DPS/
+    /// damage pills, the status-toggle cluster and the four window controls
+    /// ever stop fitting the default window width, the controls get pushed
+    /// off the right edge rather than wrapping. Measured with real font
+    /// metrics (the pills size themselves from their laid-out text) against
+    /// realistic worst-case values.
     #[test]
     fn the_stat_pills_and_window_controls_fit_the_default_window_width() {
         let ctx = egui::Context::default();
@@ -3388,36 +3309,122 @@ mod tests {
         ctx.run_ui(egui::RawInput::default(), |_ui| {})
             .drop_without_applying_deltas();
 
-        let style = egui::Style::default();
-        let row_height = style.spacing.interact_size.y;
-        // A long fight at raid-boss numbers: the widest each pill gets.
-        let pills: f32 = ["120:00", "1000.0K/s", "1000.0B"]
-            .into_iter()
-            .map(|value| {
-                let text = ctx.fonts_mut(|f| {
-                    f.layout_no_wrap(
-                        value.to_owned(),
-                        bold(FONT_SIZE_PILL_VALUE),
-                        TITLE_TEXT_COLOR,
-                    )
+        let row_height = BUTTON_ROW_HEIGHT;
+        let measure = |value: &str, size: f32| {
+            ctx.fonts_mut(|f| {
+                f.layout_no_wrap(value.to_owned(), bold(size), PILL_VALUE_COLOR)
                     .rect
                     .size()
-                });
-                pill_size(text, row_height).x
             })
-            .sum();
+        };
+        // A long fight at raid-boss numbers: the widest each pill gets.
+        let timer = pill_size(
+            measure("120:00", FONT_SIZE_TIMER),
+            PILL_GLYPH_SIDE,
+            row_height,
+        )
+        .x;
+        let dps = pill_size(
+            measure("1000.0K/s", FONT_SIZE_PILL_VALUE),
+            PILL_GLYPH_SIDE,
+            row_height,
+        )
+        .x;
+        let dmg = pill_size(
+            measure("1000.0B", FONT_SIZE_PILL_VALUE),
+            PILL_GLYPH_SIDE,
+            row_height,
+        )
+        .x;
+        // The three inert status toggles (decision 5): a fixed-width pill,
+        // not measured text.
+        let toggles = 2.0 * TOGGLE_PAD_X
+            + TOGGLE_MOUSE_SIDE
+            + TOGGLE_GAP
+            + TOGGLE_CLOUD_SIDE
+            + TOGGLE_GAP
+            + TOGGLE_QUEUE_SIDE;
 
         // Close, minimize, reset, settings — each an icon plus
         // `apply_theme`'s horizontal button padding on both sides.
         let controls = 4.0 * (TOOLBAR_ICON_SIZE + 2.0 * 4.0);
-        // Six `item_spacing.x` gaps between the seven widgets.
-        let gaps = 6.0 * 6.0;
+        // Four gaps between the outer horizontal's five direct children
+        // (timer, dps, dmg, toggle cluster, control block) plus three more
+        // between the four controls inside that block.
+        let gaps = 4.0 * 6.0 + 3.0 * 6.0;
+
+        let total = timer + dps + dmg + toggles + controls + gaps;
+        assert!(
+            total <= default_inner_width(),
+            "stat row needs {total}pt but the default window is only {}pt wide",
+            default_inner_width()
+        );
+    }
+
+    /// The source's `OffBrush="#1fff"`: every glyph the cluster blits — the
+    /// mouse-off LED, the cloud-off LED, and the queue gauge's check glyph —
+    /// is tinted `TOGGLE_OFF_COLOR`, never an "on" color, since none of
+    /// those features exist (decision 5).
+    #[test]
+    fn the_status_toggles_render_in_their_off_state() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |_ui| {})
+            .drop_without_applying_deltas();
+        let icons = Icons::load(&ctx);
+        let mouse_off = icons.glyphs.get(GlyphIcon::MouseOff).unwrap().id();
+        let cloud_off = icons.glyphs.get(GlyphIcon::CloudOff).unwrap().id();
+        let check = icons.glyphs.get(GlyphIcon::Check).unwrap().id();
+
+        let mut blits = Vec::new();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            toggle_cluster(ui, &icons);
+        });
+        for clipped in &output.shapes {
+            collect_image_texture_tints(&clipped.shape, &mut blits);
+        }
+        output.drop_without_applying_deltas();
+
+        for expected in [mouse_off, cloud_off, check] {
+            let tint = blits
+                .iter()
+                .find(|(id, _)| *id == expected)
+                .map(|(_, c)| *c);
+            assert_eq!(
+                tint,
+                Some(TOGGLE_OFF_COLOR),
+                "{expected:?} was not blitted at TOGGLE_OFF_COLOR: {blits:?}"
+            );
+        }
+    }
+
+    /// The three status toggles are strictly non-interactive (decision 5,
+    /// issue #62): no click handling, no hover cursor, no tooltip that
+    /// implies they work. `widget_info` is never called for them, so no
+    /// accesskit node in the tree may claim a `Button` role.
+    #[test]
+    fn the_status_toggles_are_inert() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            toggle_cluster(ui, &icons);
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        output.drop_without_applying_deltas();
 
         assert!(
-            pills + controls + gaps <= default_inner_width(),
-            "stat row needs {}pt but the default window is only {}pt wide",
-            pills + controls + gaps,
-            default_inner_width()
+            update
+                .nodes
+                .iter()
+                .all(|(_, node)| node.role() != egui::accesskit::Role::Button),
+            "the inert status toggles must never expose a Button role"
         );
     }
 
@@ -4430,9 +4437,10 @@ mod tests {
             + NAME_WIDTH_BUDGET
             + NAME_COLUMN_GAP
             + columns_width
-            + COLUMN_RIGHT_MARGIN;
+            + COLUMN_RIGHT_MARGIN
+            + HEADER_ROW_EXTRA_WIDTH;
         assert_eq!(default_inner_width(), expected);
-        assert_eq!(default_inner_width(), 431.0);
+        assert_eq!(default_inner_width(), 451.0);
     }
 
     #[test]
@@ -4860,13 +4868,13 @@ mod tests {
         // A death count is a 1-2 digit figure in practice; "99" is the
         // widest plausible one, the same reasoning the in-game ceilings in
         // `ColumnKind::spec` use, not the field type's `u32::MAX`.
-        let pill = StatPill::counter("99", PillIcon::Skull(None), column.color);
+        let pill = StatPill::counter("99", None, column.color);
         let text_size = ctx.fonts_mut(|f| {
             f.layout_no_wrap(pill.value.to_owned(), bold(pill.size), pill.value_color)
                 .rect
                 .size()
         });
-        let pill_width = pill_size(text_size, ROW_HEIGHT).x;
+        let pill_width = pill_size(text_size, pill.icon_side, ROW_HEIGHT).x;
 
         assert!(
             pill_width <= column.width,
@@ -4921,13 +4929,17 @@ mod tests {
         let column = ColumnKind::Deaths.spec();
         let row = row_rect();
         let anchor = row.right() - COLUMN_RIGHT_MARGIN;
-        let pill = StatPill::counter("99", PillIcon::Skull(None), column.color);
+        let pill = StatPill::counter("99", None, column.color);
         let text_size = ctx.fonts_mut(|f| {
             f.layout_no_wrap(pill.value.to_owned(), bold(pill.size), pill.value_color)
                 .rect
                 .size()
         });
-        let pill_rect = counter_pill_rect(row, anchor, pill_size(text_size, row.height()));
+        let pill_rect = counter_pill_rect(
+            row,
+            anchor,
+            pill_size(text_size, pill.icon_side, row.height()),
+        );
         let clip = column_clip_rect(row, anchor, column.width);
 
         assert!(
@@ -4942,7 +4954,11 @@ mod tests {
     #[test]
     fn counter_pill_never_outgrows_its_row() {
         for text_height in [8.0, 13.0, 40.0] {
-            let size = pill_size(egui::vec2(12.0, text_height), ROW_HEIGHT);
+            let size = pill_size(
+                egui::vec2(12.0, text_height),
+                COUNTER_GLYPH_SIDE,
+                ROW_HEIGHT,
+            );
             assert!(size.y <= ROW_HEIGHT, "a {text_height}pt text overflowed");
         }
     }
@@ -4956,20 +4972,23 @@ mod tests {
     fn counter_pill_leads_with_a_dimmed_skull() {
         let color =
             egui::Color32::from_rgb(DEATH_COUNT_RGB.0, DEATH_COUNT_RGB.1, DEATH_COUNT_RGB.2);
-        let pill = StatPill::counter("3", PillIcon::Skull(None), color);
+        let pill = StatPill::counter("3", None, color);
 
         assert!(pill.icon_first, "the reference reads skull-then-count");
         assert_eq!(pill.size, FONT_SIZE_COUNTER);
         assert_eq!(pill.value_color, color);
         assert_eq!(pill.icon_color, COUNTER_ICON_COLOR);
-        // The skull stays dimmer than the (now white) digits beside it.
-        assert!(COUNTER_ICON_COLOR.r() < color.r());
+        assert_eq!(pill.icon_side, COUNTER_GLYPH_SIDE);
+        // The skull is dimmer than the (now white) digits beside it — by
+        // alpha (`#5fff`), not by a darker RGB, now that the glyph is a
+        // rasterized icon rather than a stroked shape.
+        assert!(COUNTER_ICON_COLOR.a() < 255);
         // And not the header's accent blue — the row's skull is chrome, not
         // an accent (see `COUNTER_ICON_COLOR`).
         assert_ne!(pill.icon_color, PILL_ICON_COLOR);
     }
 
-    /// Walks a painted `Shape`, collecting every `Shape::Image`'s texture id
+    /// Walks a painted `Shape`, collecting every `Shape::Mesh`'s texture id
     /// — the counterpart to `collect_text_shapes`, for the one pill glyph
     /// that is blitted rather than stroked.
     fn collect_image_textures(shape: &egui::Shape, out: &mut Vec<egui::TextureId>) {
@@ -4988,7 +5007,7 @@ mod tests {
     /// it blitted. Text shapes upload through the font atlas, so the pill's
     /// digits show up as the font texture — the assertions below compare
     /// against the specific skull texture rather than counting blits.
-    fn counter_pill_textures(icon: PillIcon) -> Vec<egui::TextureId> {
+    fn counter_pill_textures(icon: Option<egui::TextureId>) -> Vec<egui::TextureId> {
         let ctx = egui::Context::default();
         let mut textures = Vec::new();
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -5006,9 +5025,9 @@ mod tests {
         textures
     }
 
-    /// The skull is the vendored `assets/icons/skull.png` texture, blitted —
-    /// not a hand-painted approximation. This is what would fail if the
-    /// `PillIcon::Skull` arm ever stopped drawing the asset.
+    /// The skull is the vendored `assets/icons/glyphs/skull.png` texture,
+    /// blitted — not a hand-painted approximation. This is what would fail
+    /// if `paint_stat_pill`'s icon blit ever stopped drawing the asset.
     #[test]
     fn the_counter_pill_blits_its_skull_texture() {
         let ctx = egui::Context::default();
@@ -5017,7 +5036,7 @@ mod tests {
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             egui::TextureOptions::LINEAR,
         );
-        let textures = counter_pill_textures(PillIcon::Skull(Some(texture.id())));
+        let textures = counter_pill_textures(Some(texture.id()));
         assert!(
             textures.contains(&texture.id()),
             "the skull texture was never painted: {textures:?}"
@@ -5026,7 +5045,7 @@ mod tests {
 
     /// A skull whose PNG failed to decode degrades to an empty icon box —
     /// the count still paints, nothing panics, and no other texture is
-    /// substituted for it (see `PillIcon::Skull`).
+    /// substituted for it (see `StatPill::icon`).
     #[test]
     fn a_missing_skull_texture_paints_an_empty_icon_box() {
         let ctx = egui::Context::default();
@@ -5035,7 +5054,7 @@ mod tests {
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             egui::TextureOptions::LINEAR,
         );
-        let textures = counter_pill_textures(PillIcon::Skull(None));
+        let textures = counter_pill_textures(None);
         assert!(!textures.contains(&texture.id()));
     }
 
