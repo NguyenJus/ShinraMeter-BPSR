@@ -5,7 +5,8 @@ use std::collections::HashMap;
 
 use crate::event::{Class, DamageEvent, EnemyHp, EntityKind, PlayerInfo, ProtocolEvent};
 use crate::reset::{EnemyState, ResetConfig, ResetReason, check_hp_rollback};
-use crate::stats::{PlayerRow, PlayerStats, Snapshot};
+use crate::stats::{EncounterInfo, PlayerRow, PlayerStats, Snapshot};
+use crate::tables;
 
 /// One player-identity cache entry. `seq` is a monotonic touch counter (set
 /// on both read and write) used purely to order entries by recency for
@@ -63,6 +64,11 @@ pub struct Meter {
     /// happened yet, so the cooldown gate never blocks the first rollback.
     last_reset_ms: Option<u64>,
     boss_uid: Option<i64>,
+    /// Current dungeon/instance id (issue #9 slice 2), from the most recent
+    /// `ProtocolEvent::Scene`. Survives `Meter::reset` (a manual reset or a
+    /// boss-HP rollback both stay in the same dungeon); cleared only on
+    /// `ServerChanged`, in `apply` directly rather than in `reset` itself.
+    scene_id: Option<u32>,
     reset_cfg: ResetConfig,
 }
 
@@ -77,6 +83,7 @@ impl Meter {
             last_event_ms: 0,
             last_reset_ms: None,
             boss_uid: None,
+            scene_id: None,
             reset_cfg: ResetConfig::default(),
         }
     }
@@ -202,10 +209,15 @@ impl Meter {
                 None
             }
             ProtocolEvent::EnemyHp(e) => self.apply_enemy_hp(e),
+            ProtocolEvent::Scene { level_map_id } => {
+                self.scene_id = Some(*level_map_id);
+                None
+            }
             ProtocolEvent::ServerChanged { timestamp_ms } => {
                 self.reset(ResetReason::ServerChange, *timestamp_ms);
                 self.enemies.clear();
                 self.boss_uid = None;
+                self.scene_id = None;
                 Some(ResetReason::ServerChange)
             }
         }
@@ -321,6 +333,9 @@ impl Meter {
             if e.max_hp.is_some() {
                 enemy.max_hp = e.max_hp;
             }
+            if e.monster_id.is_some() {
+                enemy.monster_id = e.monster_id;
+            }
             if let Some(pct) = enemy.pct() {
                 enemy.lowest_pct = Some(enemy.lowest_pct.map_or(pct, |lp| lp.min(pct)));
             }
@@ -435,11 +450,23 @@ impl Meter {
 
         let total_dps = total_damage as f64 / (dps_duration_ms as f64 / 1000.0);
 
+        let boss_monster_id = self
+            .boss_uid
+            .and_then(|uid| self.enemies.get(&uid))
+            .and_then(|e| e.monster_id);
+        let encounter = EncounterInfo {
+            boss_monster_id,
+            boss_name: boss_monster_id.and_then(tables::monster_name),
+            scene_id: self.scene_id,
+            scene_name: self.scene_id.and_then(tables::scene_name),
+        };
+
         Snapshot {
             duration_ms: display_duration_ms,
             total_damage,
             total_dps,
             rows,
+            encounter,
         }
     }
 
@@ -1072,6 +1099,100 @@ mod tests {
             m.apply(&dmg(1, 50, 2000));
             let snap = m.snapshot(3000);
             assert_eq!(snap.rows[0].name, "Foo");
+        }
+    }
+
+    mod encounter_info {
+        use super::*;
+
+        fn boss_hit(uid: i64, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: uid,
+                target_kind: EntityKind::Monster,
+                value: 1,
+                timestamp_ms: ts,
+                ..Default::default()
+            })
+        }
+
+        fn hp(uid: i64, curr: u64, max: u64, monster_id: Option<u32>, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::EnemyHp(EnemyHp {
+                uid,
+                curr_hp: Some(curr),
+                max_hp: Some(max),
+                monster_id,
+                timestamp_ms: ts,
+            })
+        }
+
+        #[test]
+        fn boss_name_resolves_for_a_known_monster_id() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 100, 100, Some(103), 0));
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.boss_monster_id, Some(103));
+            assert_eq!(snap.encounter.boss_name, Some("Rathalos"));
+        }
+
+        #[test]
+        fn unnamed_monster_id_yields_id_without_a_name() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 100, 100, Some(999_999), 0));
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.boss_monster_id, Some(999_999));
+            assert_eq!(snap.encounter.boss_name, None);
+        }
+
+        #[test]
+        fn no_boss_yet_yields_no_boss_monster_id_or_name() {
+            let m = Meter::new();
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.boss_monster_id, None);
+            assert_eq!(snap.encounter.boss_name, None);
+        }
+
+        #[test]
+        fn scene_survives_a_manual_reset() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            m.reset(ResetReason::Manual, 1000);
+            let snap = m.snapshot(2000);
+            assert_eq!(snap.encounter.scene_id, Some(1001));
+            assert_eq!(snap.encounter.scene_name, Some("Tina's Mindrealm"));
+        }
+
+        #[test]
+        fn scene_survives_a_boss_hp_rollback_reset() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            m.reset(ResetReason::BossHpRollback, 1000);
+            let snap = m.snapshot(2000);
+            assert_eq!(snap.encounter.scene_id, Some(1001));
+        }
+
+        #[test]
+        fn scene_clears_on_server_change() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 1000 });
+            let snap = m.snapshot(2000);
+            assert_eq!(snap.encounter.scene_id, None);
+            assert_eq!(snap.encounter.scene_name, None);
+        }
+
+        #[test]
+        fn unknown_scene_id_yields_id_without_a_name() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: 999_999,
+            });
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.scene_id, Some(999_999));
+            assert_eq!(snap.encounter.scene_name, None);
         }
     }
 }

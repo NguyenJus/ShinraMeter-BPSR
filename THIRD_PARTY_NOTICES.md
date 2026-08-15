@@ -23,3 +23,24 @@ only replacing them in that directory.
 
 `shinra-bpsr` itself is licensed GPL-3.0-only (see `LICENSE`), with which
 WinDivert's LGPL-3.0 option is compatible.
+
+## BPSR-ZDPS class icons
+
+- Files: `crates/app/assets/classes/*.png`
+- Upstream: <https://github.com/Blue-Protocol-Source/BPSR-ZDPS>
+- License: MIT
+- Embedded verbatim (compiled into the executable via `include_bytes!` in
+  `crates/app/src/icons.rs`), unmodified, at build time.
+
+## Monster and scene name tables
+
+- Files: `crates/meter/data/MonsterName.json`, `crates/meter/data/SceneName.json`
+  (from `resonance-logs/resonance-logs`, GPL-3.0) and
+  `crates/meter/data/MonsterNameCrowdsource.json` (from `winjwinj/bpsr-logs`,
+  GPL-3.0)
+- Upstream: <https://github.com/resonance-logs/resonance-logs>,
+  <https://github.com/winjwinj/bpsr-logs>
+- License: GPL-3.0, matching this project's own licence
+- Not shipped as files: compiled into `crates/meter/src/tables.rs` by
+  `scripts/gen-name-tables.py` at development time, then built into the
+  executable as Rust source.

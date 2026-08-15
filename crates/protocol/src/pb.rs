@@ -130,8 +130,21 @@ pub struct CharSerialize {
     pub char_id: i64,
     #[prost(message, optional, tag = "2")]
     pub char_base: Option<CharBaseInfo>,
+    #[prost(message, optional, tag = "3")]
+    pub scene_data: Option<SceneData>,
     #[prost(message, optional, tag = "61")]
     pub profession_list: Option<ProfessionList>,
+}
+
+/// Dungeon/instance identity, confirmed against `winjwinj/bpsr-logs`'
+/// `src-tauri/src/protocol/pb.proto` (`message SceneData { uint32
+/// level_map_id = 6; uint32 line_id = 15; }`). `line_id` (the instance's
+/// party-line number, not its identity) is not decoded — nothing downstream
+/// needs it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SceneData {
+    #[prost(uint32, tag = "6")]
+    pub level_map_id: u32,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -156,6 +169,7 @@ pub struct ProfessionList {
 pub enum Class {
     Stormblade,
     FrostMage,
+    TwinStriker,
     WindKnight,
     VerdantOracle,
     HeavyGuardian,
@@ -170,6 +184,7 @@ impl From<i32> for Class {
         match id {
             1 => Class::Stormblade,
             2 => Class::FrostMage,
+            3 => Class::TwinStriker,
             4 => Class::WindKnight,
             5 => Class::VerdantOracle,
             9 => Class::HeavyGuardian,
@@ -186,6 +201,7 @@ impl Class {
         match self {
             Class::Stormblade => "Stormblade",
             Class::FrostMage => "FrostMage",
+            Class::TwinStriker => "TwinStriker",
             Class::WindKnight => "WindKnight",
             Class::VerdantOracle => "VerdantOracle",
             Class::HeavyGuardian => "HeavyGuardian",
@@ -253,8 +269,10 @@ mod tests {
     #[test]
     fn class_from_id() {
         assert_eq!(Class::from(1), Class::Stormblade);
+        assert_eq!(Class::from(3), Class::TwinStriker);
         assert_eq!(Class::from(13), Class::BeatPerformer);
         assert_eq!(Class::from(999), Class::Unknown);
         assert_eq!(Class::Stormblade.name(), "Stormblade");
+        assert_eq!(Class::TwinStriker.name(), "TwinStriker");
     }
 }

@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 eframe = { workspace = true }
 egui = { workspace = true }
+image = { workspace = true }
 crossbeam-channel = { workspace = true }
 bpsr-meter = { workspace = true }
 bpsr-capture = { workspace = true }

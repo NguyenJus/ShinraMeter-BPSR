@@ -179,6 +179,15 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
     let Some(v_data) = &msg.v_data else {
         return;
     };
+    // `level_map_id == 0` is proto3's unset-scalar wire value (a `SceneData`
+    // submessage can be present with every field at its default), not a real
+    // scene id — treated as absent, matching `char_base.fight_point > 0`'s
+    // guard below.
+    if let Some(scene) = v_data.scene_data.as_ref().filter(|s| s.level_map_id > 0) {
+        out.push(ProtocolEvent::Scene {
+            level_map_id: scene.level_map_id,
+        });
+    }
     let Some(char_base) = &v_data.char_base else {
         return;
     };
@@ -715,6 +724,82 @@ mod tests {
         assert_eq!(recorded[0].0, uid_of(ATTACKER_UUID));
         assert_eq!(recorded[0].1, crate::attrs::attr_id::FIGHT_POINT);
         assert!(recorded[0].3, "FIGHT_POINT must be reported as known");
+    }
+
+    // -- Scene (issue #9 slice 2) -------------------------------------
+
+    fn container_notify(v_data: pb::CharSerialize) -> Notify {
+        let msg = pb::SyncContainerData {
+            v_data: Some(v_data),
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        Notify {
+            method_id: opcode::SYNC_CONTAINER_DATA,
+            payload,
+        }
+    }
+
+    #[test]
+    fn scene_data_on_char_serialize_emits_a_scene_event() {
+        let n = container_notify(pb::CharSerialize {
+            char_id: 1,
+            char_base: None,
+            scene_data: Some(pb::SceneData { level_map_id: 4242 }),
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.contains(&ProtocolEvent::Scene { level_map_id: 4242 }));
+    }
+
+    #[test]
+    fn scene_data_survives_alongside_char_base_in_the_same_notify() {
+        let n = container_notify(pb::CharSerialize {
+            char_id: 7,
+            char_base: Some(pb::CharBaseInfo {
+                char_id: 7,
+                name: "Ali".to_string(),
+                fight_point: 0,
+            }),
+            scene_data: Some(pb::SceneData { level_map_id: 99 }),
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.contains(&ProtocolEvent::Scene { level_map_id: 99 }));
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, ProtocolEvent::Player(p) if p.uid == 7))
+        );
+    }
+
+    #[test]
+    fn missing_scene_data_produces_no_scene_event() {
+        let n = container_notify(pb::CharSerialize {
+            char_id: 1,
+            char_base: None,
+            scene_data: None,
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(!out.iter().any(|e| matches!(e, ProtocolEvent::Scene { .. })));
+    }
+
+    #[test]
+    fn zero_level_map_id_is_treated_as_absent() {
+        // level_map_id == 0 is proto3's unset-scalar wire value, indistinguishable
+        // from "not populated" — must not surface as a real scene id.
+        let n = container_notify(pb::CharSerialize {
+            char_id: 1,
+            char_base: None,
+            scene_data: Some(pb::SceneData { level_map_id: 0 }),
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(!out.iter().any(|e| matches!(e, ProtocolEvent::Scene { .. })));
     }
 
     /// End-to-end through `Decoder::with_inspect_sink` + `push_stream`: a
