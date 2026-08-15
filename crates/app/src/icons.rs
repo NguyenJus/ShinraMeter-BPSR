@@ -14,47 +14,65 @@
 use bpsr_meter::Class;
 use eframe::egui;
 
-/// One embedded PNG per class an icon exists for. `Class::Unknown` has no
-/// entry — an unrecognized (or absent) class simply paints no icon, never a
-/// fallback glyph (see `ClassIcons::get`).
-const CLASS_ICON_BYTES: &[(Class, &[u8])] = &[
-    (
-        Class::Stormblade,
-        include_bytes!("../assets/classes/stormblade.png"),
-    ),
-    (
-        Class::FrostMage,
-        include_bytes!("../assets/classes/frost_mage.png"),
-    ),
-    (
-        Class::TwinStriker,
-        include_bytes!("../assets/classes/twin_striker.png"),
-    ),
-    (
-        Class::WindKnight,
-        include_bytes!("../assets/classes/wind_knight.png"),
-    ),
-    (
-        Class::VerdantOracle,
-        include_bytes!("../assets/classes/verdant_oracle.png"),
-    ),
-    (
-        Class::HeavyGuardian,
-        include_bytes!("../assets/classes/heavy_guardian.png"),
-    ),
-    (
-        Class::Marksman,
-        include_bytes!("../assets/classes/marksman.png"),
-    ),
-    (
-        Class::ShieldKnight,
-        include_bytes!("../assets/classes/shield_knight.png"),
-    ),
-    (
-        Class::BeatPerformer,
-        include_bytes!("../assets/classes/beat_performer.png"),
-    ),
-];
+/// Generates `class_icon_bytes` — an exhaustive match with no wildcard arm
+/// pairing every `Class` variant to its embedded PNG, or to `None` for
+/// `Class::Unknown` (which intentionally has no icon) — and
+/// `LOADABLE_CLASSES`, the list `ClassIcons::load` iterates to know which
+/// classes to eager-load a texture for. Both are generated from the same
+/// list of variants given to this macro, so they cannot silently disagree
+/// with each other.
+///
+/// Before this (issue #52), the class→bytes pairing was a hand-maintained
+/// `const` slice, and its only coverage check compared that slice's length
+/// against a second hand-maintained list (`ALL_CLASSES`, formerly in this
+/// module's tests). A `Class` variant added to
+/// `crates/meter/src/event.rs` without a matching entry in either list
+/// compiled, passed that test, and silently rendered no icon — the failure
+/// was invisible until someone noticed a blank icon slot in a row. Matching
+/// on the real `Class` type instead means rustc's own exhaustiveness
+/// checker is the enforcement: a new variant makes `class_icon_bytes` fail
+/// to compile until it is paired here. Mirrors `Class::role()` in
+/// `crates/meter/src/event.rs`, which uses the same "no wildcard arm" trick
+/// for the same reason.
+///
+/// `LOADABLE_CLASSES` only drives eager-load iteration order — `Class` has
+/// no built-in enumerator, so *something* has to list its variants for
+/// `ClassIcons::load` to walk. It cannot go stale relative to
+/// `class_icon_bytes`'s match arms (they're written once, here, and both
+/// are generated from it), so the only representation left to keep in sync
+/// with reality is the match itself, which the compiler already does.
+macro_rules! class_icons {
+    ($($variant:ident => $path:literal),+ $(,)?) => {
+        /// The embedded icon bytes for `class`, or `None` if no icon exists
+        /// for it (`Class::Unknown`). See the `class_icons!` invocation
+        /// below for why adding a `Class` variant without pairing it here
+        /// is a compile error rather than a silently-missing icon.
+        fn class_icon_bytes(class: Class) -> Option<&'static [u8]> {
+            match class {
+                $(Class::$variant => Some(include_bytes!($path)),)+
+                Class::Unknown => None,
+            }
+        }
+
+        /// Every `Class` variant `class_icon_bytes` pairs to `Some` bytes,
+        /// in the order given to `class_icons!`. Used only by
+        /// `ClassIcons::load` to know which classes to attempt eager-
+        /// loading a texture for — see the `class_icons!` doc comment.
+        const LOADABLE_CLASSES: &[Class] = &[$(Class::$variant),+];
+    };
+}
+
+class_icons! {
+    Stormblade => "../assets/classes/stormblade.png",
+    FrostMage => "../assets/classes/frost_mage.png",
+    TwinStriker => "../assets/classes/twin_striker.png",
+    WindKnight => "../assets/classes/wind_knight.png",
+    VerdantOracle => "../assets/classes/verdant_oracle.png",
+    HeavyGuardian => "../assets/classes/heavy_guardian.png",
+    Marksman => "../assets/classes/marksman.png",
+    ShieldKnight => "../assets/classes/shield_knight.png",
+    BeatPerformer => "../assets/classes/beat_performer.png",
+}
 
 /// Decodes one embedded PNG into an egui-ready image. Never panics on a
 /// malformed slice — logs and returns `None` instead, belt-and-braces since
@@ -134,9 +152,13 @@ pub struct ClassIcons(IconSet<Class>);
 
 impl ClassIcons {
     pub fn load(ctx: &egui::Context) -> Self {
+        let entries: Vec<(Class, &[u8])> = LOADABLE_CLASSES
+            .iter()
+            .filter_map(|&class| class_icon_bytes(class).map(|bytes| (class, bytes)))
+            .collect();
         Self(IconSet::load(
             ctx,
-            CLASS_ICON_BYTES,
+            &entries,
             |class| format!("class-icon-{}", class.name()),
             |class| format!("class icon {}", class.name()),
         ))
@@ -165,14 +187,20 @@ pub enum ToolbarIcon {
     Close,
     /// Decorative clock painted immediately left of the duration text.
     Clock,
+    /// Death-count glyph, consumed by the per-player death column (issue
+    /// #49). Sourced separately from the other toolbar icons below — see
+    /// `TOOLBAR_ICON_BYTES`'s doc comment.
+    Skull,
 }
 
-/// Every `ToolbarIcon` an embedded PNG exists for, sourced from
-/// neowutran/ShinraMeter's `resources/img/` (MIT) — see
-/// `THIRD_PARTY_NOTICES.md`. No pin/lock and no minimize icon exists in that
-/// repo (issue #41's scope note): minimize is instead drawn procedurally by
-/// `ui.rs`'s `minimize_button`, and pin/lock is out of scope entirely (no
-/// pinning feature exists yet).
+/// Every `ToolbarIcon` an embedded PNG exists for. `Settings`, `Reset`,
+/// `Close`, and `Clock` are sourced from neowutran/ShinraMeter's
+/// `resources/img/` (MIT); `Skull` is sourced separately, also from
+/// neowutran/ShinraMeter (MIT), verbatim and unrenamed — see
+/// `THIRD_PARTY_NOTICES.md`. No pin/lock and no minimize icon exists in
+/// that repo (issue #41's scope note): minimize is instead drawn
+/// procedurally by `ui.rs`'s `minimize_button`, and pin/lock is out of
+/// scope entirely (no pinning feature exists yet).
 const TOOLBAR_ICON_BYTES: &[(ToolbarIcon, &[u8])] = &[
     (
         ToolbarIcon::Settings,
@@ -189,6 +217,10 @@ const TOOLBAR_ICON_BYTES: &[(ToolbarIcon, &[u8])] = &[
     (
         ToolbarIcon::Clock,
         include_bytes!("../assets/icons/clock.png"),
+    ),
+    (
+        ToolbarIcon::Skull,
+        include_bytes!("../assets/icons/skull.png"),
     ),
 ];
 
@@ -223,51 +255,34 @@ impl ToolbarIcons {
 mod tests {
     use super::*;
 
-    /// Every class this crate can render an icon for. Kept as an explicit
-    /// list (rather than iterating a derive) because `Class` has no
-    /// enumerator of its own — this is also the totality check: if a new
-    /// `Class` variant is added without pairing it here (or explicitly
-    /// excluding it, like `Unknown`), this test's length assertion below
-    /// catches the mismatch.
-    const ALL_CLASSES: &[Class] = &[
-        Class::Stormblade,
-        Class::FrostMage,
-        Class::TwinStriker,
-        Class::WindKnight,
-        Class::VerdantOracle,
-        Class::HeavyGuardian,
-        Class::Marksman,
-        Class::ShieldKnight,
-        Class::BeatPerformer,
-    ];
+    // -- class icons (issue #52) ------------------------------------------
 
     #[test]
-    fn every_known_class_has_an_embedded_icon() {
-        assert_eq!(
-            CLASS_ICON_BYTES.len(),
-            ALL_CLASSES.len(),
-            "CLASS_ICON_BYTES must have exactly one entry per known class"
-        );
-        for class in ALL_CLASSES {
+    fn unknown_class_has_no_embedded_icon() {
+        assert!(class_icon_bytes(Class::Unknown).is_none());
+    }
+
+    #[test]
+    fn every_loadable_classes_icon_decodes() {
+        for &class in LOADABLE_CLASSES {
+            let bytes = class_icon_bytes(class).expect("LOADABLE_CLASSES entries must be Some");
             assert!(
-                CLASS_ICON_BYTES.iter().any(|(c, _)| c == class),
-                "{class:?} has no embedded icon"
+                decode(&format!("class icon {class:?}"), bytes).is_some(),
+                "{class:?}'s icon failed to decode"
             );
         }
     }
 
     #[test]
-    fn unknown_class_has_no_embedded_icon() {
-        assert!(!CLASS_ICON_BYTES.iter().any(|(c, _)| *c == Class::Unknown));
-    }
-
-    #[test]
-    fn every_embedded_icon_decodes() {
-        for (class, bytes) in CLASS_ICON_BYTES {
-            assert!(
-                decode(&format!("class icon {class:?}"), bytes).is_some(),
-                "{class:?}'s icon failed to decode"
-            );
+    fn no_two_classes_share_the_same_icon_asset() {
+        for (i, &a) in LOADABLE_CLASSES.iter().enumerate() {
+            for &b in &LOADABLE_CLASSES[i + 1..] {
+                assert_ne!(
+                    class_icon_bytes(a),
+                    class_icon_bytes(b),
+                    "{a:?} and {b:?} embed the same icon bytes"
+                );
+            }
         }
     }
 
@@ -277,6 +292,18 @@ mod tests {
         assert!(decode("test", &[]).is_none());
     }
 
+    #[test]
+    fn class_icons_get_is_defined_for_every_loadable_class() {
+        let ctx = egui::Context::default();
+        let icons = ClassIcons::load(&ctx);
+        for &class in LOADABLE_CLASSES {
+            assert!(
+                icons.get(class).is_some(),
+                "{class:?} has no loaded texture"
+            );
+        }
+    }
+
     // -- toolbar icons (issue #41) ----------------------------------------
 
     const ALL_TOOLBAR_ICONS: &[ToolbarIcon] = &[
@@ -284,6 +311,7 @@ mod tests {
         ToolbarIcon::Reset,
         ToolbarIcon::Close,
         ToolbarIcon::Clock,
+        ToolbarIcon::Skull,
     ];
 
     #[test]

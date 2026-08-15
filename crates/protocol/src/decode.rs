@@ -171,6 +171,10 @@ fn on_aoi_sync_delta(
             target_uid,
             target_kind,
             timestamp_ms: now_ms,
+            // `dmg.is_dead` (SyncDamageInfo tag 17) flags that `target_uid`
+            // died from this hit — a victim-side signal, not an
+            // attacker-side kill count (issue #49).
+            is_dead: dmg.is_dead,
         }));
     }
 }
@@ -454,6 +458,29 @@ mod tests {
         let ev = only_damage(out);
         assert_eq!(ev.value, 250);
         assert!(ev.lucky);
+    }
+
+    #[test]
+    fn is_dead_flag_survives_decode() {
+        // Issue #49: `SyncDamageInfo.is_dead` (tag 17) must reach the
+        // decoded `DamageEvent` unchanged — it is the wire signal a
+        // per-player death count is built on.
+        let dmg = pb::SyncDamageInfo {
+            is_dead: true,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(only_damage(out).is_dead);
+    }
+
+    #[test]
+    fn is_dead_false_by_default() {
+        let n = notify_for_damage(base_damage());
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(!only_damage(out).is_dead);
     }
 
     #[test]

@@ -82,6 +82,12 @@ fn main() -> eframe::Result {
     // the time it returns.
     let tx_command_shutdown = tx_command.clone();
 
+    // Issue #53: the tray's "Reset Window" command restores the overlay to
+    // the size `ui::viewport` opens at on a first launch. Read back off a
+    // default builder rather than re-deriving it, so `ui`'s private layout
+    // constants stay private and the two can't drift apart.
+    let default_inner_size = ui::viewport(None).inner_size;
+
     let native_options = eframe::NativeOptions {
         viewport: ui::viewport(settings.window_position),
         ..Default::default()
@@ -95,6 +101,7 @@ fn main() -> eframe::Result {
             ui::apply_theme(&cc.egui_ctx);
             platform::disable_aero_snap(cc);
             platform::install_snap_blocker(cc);
+            platform::install_tray(cc, default_inner_size);
             platform::clamp_window_to_visible_area(cc);
             Ok(Box::new(
                 OverlayApp::new(rx_snapshot, tx_command, tx_settings, settings).with_status(status),

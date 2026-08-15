@@ -115,4 +115,13 @@ Ported packet-format knowledge from these open-source trackers (all GPL-compatib
 - https://github.com/resonance-logs/resonance-logs
 
 UI design inspiration from:
-- https://github.com/neowutran/ShinraMeter
+- https://github.com/neowutran/ShinraMeter/tree/mvvm_refactor_wip
+
+Note the branch. `master` is the released ShinraMeter and stopped at its final
+TERA-era commit in November 2022; its toolbar art is solid white glyphs and its
+mark is the kanji 神羅. The look this project styles toward — the rounded
+translucent card, the oval stat pills, the thin outline glyphs, the collapse
+chevron, the horned-emblem header gutter — is the unreleased `mvvm_refactor_wip`
+UI rewrite (last touched April 2024, no tags or releases). Its icon vocabulary
+lives in `DamageMeter.UI/Resources/SVG.xaml` as SVG path data, a file that does
+not exist on `master`. Look there first when matching a reference render.
