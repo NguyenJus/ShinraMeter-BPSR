@@ -589,16 +589,10 @@ pub fn scene_name(id: u32) -> Option<&'static str> {
 /// of membership here; only `boss_name`/`is_boss` (set in `Meter::snapshot`)
 /// are gated by it.
 ///
-/// Hand-vendored from `MonsterNameBoss.json`, shipped identically by the
-/// `bpsr-logs` and `resonance-logs` community trackers (both GPL-3.0, the
-/// same licence as this project); see `THIRD_PARTY_NOTICES.md`. Unlike the
-/// rest of this file, this table is NOT produced by
-/// `scripts/gen-name-tables.py` — a boolean id set doesn't fit that script's
-/// name-table emitter, and that script overwrites this whole file
-/// (`OUT.write_text` on every run), so **regenerating the name tables will
-/// silently delete this block** until the generator is taught about it.
-/// Refresh by hand from the same upstream JSON if the community boss list
-/// grows.
+/// Generated from `crates/meter/data/MonsterNameBoss.json`, shipped
+/// identically by the `bpsr-logs` and `resonance-logs` community trackers
+/// (both GPL-3.0, the same licence as this project); see
+/// `THIRD_PARTY_NOTICES.md`.
 ///
 /// Sorted ascending; `is_boss_monster` binary-searches it.
 #[rustfmt::skip]
