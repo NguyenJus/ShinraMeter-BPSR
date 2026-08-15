@@ -35,7 +35,10 @@ WinDivert's LGPL-3.0 option is compatible.
 ## ShinraMeter toolbar icons
 
 - Files: `crates/app/assets/icons/*.png`
-- Upstream: <https://github.com/neowutran/ShinraMeter> (`resources/img/`)
+- Upstream: <https://github.com/neowutran/ShinraMeter> (`master` branch,
+  `resources/img/`). The branch matters: `master` carries these as PNGs, while
+  the unreleased `mvvm_refactor_wip` branch replaces them with SVG path data in
+  `DamageMeter.UI/Resources/SVG.xaml`. These files are the PNGs.
 - License: MIT
 - Embedded verbatim (compiled into the executable via `include_bytes!` in
   `crates/app/src/icons.rs`), unmodified, at build time. `settings.png` is
