@@ -260,7 +260,10 @@ impl eframe::App for OverlayApp {
 
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::default().fill(egui::Color32::from_rgba_unmultiplied(18, 18, 22, 200)),
+                egui::Frame::default()
+                    .fill(PANEL_FILL)
+                    .stroke(egui::Stroke::new(PANEL_BORDER_WIDTH, PANEL_BORDER_COLOR))
+                    .corner_radius(egui::CornerRadius::same(PANEL_CORNER_RADIUS)),
             )
             .show(ui, |ui| {
                 // First, so the header buttons drawn afterwards stay on top of
@@ -1867,6 +1870,13 @@ fn resized_window_rect(
 }
 
 /// Width of the invisible edge strips that start a resize, in points.
+///
+/// Unaffected by the rounded `PANEL_CORNER_RADIUS` chrome: the rounding is
+/// *painted* only — no OS window region is set, so the window is still a
+/// rectangle to winit and to this hit test. The corner squares below still
+/// cover a live grab area, so a user aiming just outside the visible arc
+/// still resizes, and the 1pt border sits inside this 6pt north strip, so
+/// dragging the visible border edge resizes, which is what a user expects.
 const RESIZE_EDGE: f32 = 6.0;
 /// Side of the invisible corner squares, which resize on both axes at once.
 const RESIZE_CORNER: f32 = 14.0;
@@ -1949,6 +1959,12 @@ fn draw_resize_handles(ui: &mut egui::Ui, ctx: &egui::Context, gesture: &mut Win
 /// and handing both sets down as one argument keeps `draw_row` from growing
 /// a second icon parameter.
 fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot, columns: &[ColumnKind], icons: &Icons) {
+    // True contiguous 30pt rows (decision 3): scoped to this function only,
+    // so the header and menus keep `apply_theme`'s `item_spacing` — rows'
+    // hover bands and accent lines must sit flush against their neighbors
+    // with no gap, which a nonzero `item_spacing.y` would reintroduce.
+    ui.spacing_mut().item_spacing.y = 0.0;
+
     // The enabled-column set (and therefore the column widths and their
     // anchors) is identical for every row in a frame, so both are computed
     // once here rather than once per row inside `draw_row`.
@@ -2153,18 +2169,35 @@ fn draw_row(
     icons: &Icons,
 ) {
     let desired_size = egui::vec2(ui.available_width(), ROW_HEIGHT);
-    let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
 
     // Proportional background bar scaled by this player's damage share.
     // Painted before (i.e. under) the icon and name, and still spans the
     // row's full width — the icon slot is reserved on top of it, not cut
-    // out of it. Split into a subtle wash plus a crisp bottom underline
-    // (issue #43) rather than one flat fill, matching the reference meter.
+    // out of it. A vertically graded fill plus a full-width, horizontally
+    // graded accent line along the bottom edge, matching the reference
+    // meter's gradients exactly (square corners — no rounding).
     let paints = share_bar_paints(rect, row.share_pct, row.class);
-    ui.painter()
-        .rect_filled(paints.wash_rect, 2.0, paints.wash_color);
-    ui.painter()
-        .rect_filled(paints.underline_rect, 0.0, paints.underline_color);
+    ui.painter().add(egui::Shape::mesh(vertical_gradient_mesh(
+        paints.fill_rect,
+        egui::Color32::TRANSPARENT,
+        paints.fill_bottom,
+    )));
+    ui.painter().add(egui::Shape::mesh(horizontal_gradient_mesh(
+        paints.accent_rect,
+        paints.accent_left,
+        paints.accent_right,
+    )));
+
+    // Per-row hover highlight (decision 7): a horizontal gradient peaking
+    // near the row's left edge, painted over the share bar and under the
+    // icon/name/columns.
+    if response.hovered() {
+        for (quad, left, right) in row_hover_quads(rect) {
+            ui.painter()
+                .add(egui::Shape::mesh(horizontal_gradient_mesh(quad, left, right)));
+        }
+    }
 
     // The icon slot (issue #9) is reserved at a fixed offset regardless of
     // whether this row's class has an icon, so names stay left-aligned in a
@@ -2173,7 +2206,7 @@ fn draw_row(
     let (icon_rect, name_offset) = icon_slot(rect);
     if let Some(texture) = row.class.and_then(|class| icons.classes.get(class)) {
         ui.painter()
-            .image(texture.id(), icon_rect, UV_FULL, egui::Color32::WHITE);
+            .image(texture.id(), icon_rect, UV_FULL, CLASS_ICON_TINT);
     }
 
     // Bold and proportional (issue #56): the reference renders names in the
@@ -2285,16 +2318,16 @@ fn counter_pill_rect(row: egui::Rect, anchor: f32, size: egui::Vec2) -> egui::Re
 
 /// Per-role base RGB of the damage-share bar (issue #44: healer -> green,
 /// tank -> blue, damage -> red). Split out from the alpha constants below
-/// (issue #43) so the wash/underline alpha split and underline thickness
-/// stay fixed regardless of which color a role uses — only the hue varies.
+/// (issue #43) so the fill/accent alpha split and accent thickness stay
+/// fixed regardless of which color a role uses — only the hue varies.
 ///
-/// Chosen for legibility at the wash's low alpha (`SHARE_BAR_WASH_ALPHA` =
-/// 60 of 255) painted over the overlay's dark translucent panel fill
-/// (`rgba(18, 18, 22, 200)`, see `apply_theme`): each hue keeps enough
-/// saturation and mid-range brightness that the ~24% overall wash opacity
-/// still reads as a distinct color rather than fading to gray, while the
-/// underline's much higher alpha (220) makes the same RGB read as a
-/// near-solid, clearly role-colored strip.
+/// Chosen for legibility at the fill's low bottom alpha
+/// (`SHARE_BAR_FILL_BOTTOM_ALPHA` = 46 of 255, fading to 0 at the top)
+/// painted over the panel fill (`PANEL_FILL`, see `apply_theme`): each hue
+/// keeps enough saturation and mid-range brightness that the fill still
+/// reads as a distinct color rather than fading to gray, while the accent
+/// line's much higher alpha (26 -> 255 left to right) makes the same RGB
+/// read as a near-solid, clearly role-colored strip at its right edge.
 const SHARE_BAR_RGB_HEALER: (u8, u8, u8) = (70, 200, 120);
 const SHARE_BAR_RGB_TANK: (u8, u8, u8) = (60, 120, 220);
 const SHARE_BAR_RGB_DAMAGE: (u8, u8, u8) = (220, 80, 70);
@@ -2319,34 +2352,87 @@ pub(crate) const CRIT_PCT_RGB: (u8, u8, u8) = (240, 128, 128);
 /// inventing a new hue.
 pub(crate) const LUCKY_PCT_RGB: (u8, u8, u8) = (70, 200, 120);
 
-/// Alpha of the translucent wash covering the full width of `bar_rect`
-/// (issue #43). Deliberately lower than the old single flat fill's alpha
-/// (120) — the wash now only needs to read as a subtle backdrop, since the
-/// underline below is what carries the crisp share boundary.
-const SHARE_BAR_WASH_ALPHA: u8 = 60;
+/// Alpha at the *bottom* of the bar fill's vertical gradient — the source's
+/// `Opacity=".18"` bottom stop. The top stop is 0 (fully transparent).
+const SHARE_BAR_FILL_BOTTOM_ALPHA: u8 = 46;
 
-/// Alpha of the thin strip along `bar_rect`'s bottom edge (issue #43).
-/// Markedly more opaque than the wash so the share boundary still reads
-/// clearly at a glance even though the rest of the bar is subtle, matching
-/// the reference meter (`docs/reference/tera_shinrameter_ex.png`).
-const SHARE_BAR_UNDERLINE_ALPHA: u8 = 220;
+/// Alpha at the *left* end of the accent line's horizontal gradient — the
+/// source's `Opacity=".1"` left stop. The right stop is fully opaque (255).
+const SHARE_BAR_ACCENT_LEFT_ALPHA: u8 = 26;
 
-/// Thickness of the bottom underline strip (issue #43). `share_bar_paints`
-/// clamps this against the row height so it stays sane — never taller than
-/// the row itself — at small row heights.
-const SHARE_BAR_UNDERLINE_THICKNESS: f32 = 2.0;
+/// Thickness of the accent line along the row's bottom edge (issue #43;
+/// source `Height="2"`). `share_bar_paints` clamps this against the row
+/// height so it stays sane — never taller than the row itself — at small
+/// row heights.
+const SHARE_BAR_ACCENT_THICKNESS: f32 = 2.0;
 
-/// The two paints that make up a row's damage-share bar (issue #43): a
-/// translucent wash across the full share-scaled width, and a thin,
-/// more-opaque underline strip along its bottom edge. Named fields rather
-/// than a positional tuple so a wash/underline (or rect/color) mix-up at the
-/// `draw_row` call site fails to compile instead of silently swapping which
-/// paint lands where.
+/// A two-triangle gradient quad. egui has no gradient brush, so the
+/// source's `LinearGradientBrush`es are reproduced as meshes with
+/// per-vertex colors — exact, one draw call, and cheaper than the strip-
+/// stacking `title_separator_segments` uses.
+fn gradient_mesh(
+    rect: egui::Rect,
+    tl: egui::Color32,
+    tr: egui::Color32,
+    bl: egui::Color32,
+    br: egui::Color32,
+) -> egui::Mesh {
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), tl);
+    mesh.colored_vertex(rect.right_top(), tr);
+    mesh.colored_vertex(rect.left_bottom(), bl);
+    mesh.colored_vertex(rect.right_bottom(), br);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(1, 3, 2);
+    mesh
+}
+
+fn vertical_gradient_mesh(rect: egui::Rect, top: egui::Color32, bottom: egui::Color32) -> egui::Mesh {
+    gradient_mesh(rect, top, top, bottom, bottom)
+}
+
+fn horizontal_gradient_mesh(rect: egui::Rect, left: egui::Color32, right: egui::Color32) -> egui::Mesh {
+    gradient_mesh(rect, left, right, left, right)
+}
+
+/// The source's per-row hover band: a horizontal gradient from transparent,
+/// up to `#1fff` at 15% across, and back to transparent at the right edge —
+/// a highlight that peaks near the row's left edge rather than a flat fill.
+const ROW_HOVER_PEAK_ALPHA: u8 = 17;
+const ROW_HOVER_PEAK_OFFSET: f32 = 0.15;
+
+/// The two gradient quads a hovered row's highlight is made of: transparent
+/// -> peak over the first `ROW_HOVER_PEAK_OFFSET` of the width, then peak ->
+/// transparent over the rest. Pure, so the split point is unit-testable
+/// without a live `Ui` — same reasoning as `share_bar_paints`.
+fn row_hover_quads(rect: egui::Rect) -> [(egui::Rect, egui::Color32, egui::Color32); 2] {
+    let peak = egui::Color32::from_rgba_unmultiplied(255, 255, 255, ROW_HOVER_PEAK_ALPHA);
+    let split_x = rect.left() + rect.width() * ROW_HOVER_PEAK_OFFSET;
+    let left_quad = egui::Rect::from_min_max(rect.left_top(), egui::pos2(split_x, rect.bottom()));
+    let right_quad =
+        egui::Rect::from_min_max(egui::pos2(split_x, rect.top()), rect.right_bottom());
+    [
+        (left_quad, egui::Color32::TRANSPARENT, peak),
+        (right_quad, peak, egui::Color32::TRANSPARENT),
+    ]
+}
+
+/// The two paints that make up a row's damage-share bar: a share-scaled
+/// fill, vertically graded transparent -> `fill_bottom`, and a full-row-
+/// width accent line, horizontally graded `accent_left` -> `accent_right`.
+/// Named fields rather than a positional tuple so a fill/accent (or
+/// rect/color) mix-up at the `draw_row` call site fails to compile instead
+/// of silently swapping which paint lands where.
 struct ShareBarPaints {
-    wash_rect: egui::Rect,
-    underline_rect: egui::Rect,
-    wash_color: egui::Color32,
-    underline_color: egui::Color32,
+    /// The share-scaled fill, vertically graded transparent -> `fill_bottom`.
+    fill_rect: egui::Rect,
+    fill_bottom: egui::Color32,
+    /// The accent line. Always the **full** row width — in the source it is
+    /// a sibling of the bar fill, not a child, so it is decoupled from the
+    /// player's share.
+    accent_rect: egui::Rect,
+    accent_left: egui::Color32,
+    accent_right: egui::Color32,
 }
 
 /// Maps a row's `Class` to its share-bar hue (issue #44). `None` — either no
@@ -2361,46 +2447,56 @@ fn share_bar_rgb(class: Option<Class>) -> (u8, u8, u8) {
     }
 }
 
-/// Computes the two paints that make up a row's damage-share bar (issue
-/// #43): a translucent wash across the full share-scaled width, and a thin,
-/// more-opaque underline strip along its bottom edge so the share boundary
-/// reads crisply even though the wash itself is subtle. Both paints share
-/// the same role-derived hue (`share_bar_rgb`, issue #44) and differ only in
-/// alpha — issue #44's open question on whether the role color should apply
-/// to both the wash and the underline is answered yes, one hue, two alphas.
+/// Computes the two paints that make up a row's damage-share bar: a
+/// share-scaled fill, vertically graded transparent -> `fill_bottom`, and a
+/// full-row-width accent line, horizontally graded `accent_left` ->
+/// `accent_right` along its bottom edge. The fill's width already matches
+/// the source (`share_pct` is share of total encounter damage); it is the
+/// accent line that is decoupled from it — in the source it is a sibling of
+/// the bar fill, not a child, so it always spans the row's full width
+/// regardless of this player's share. Both paints share the same
+/// role-derived hue (`share_bar_rgb`, issue #44) and differ only in alpha.
 /// Pure geometry/color math with no `egui::Ui` dependency, so it's
 /// unit-testable on its own — `draw_row` just paints whatever it returns.
 fn share_bar_paints(rect: egui::Rect, share_pct: f32, class: Option<Class>) -> ShareBarPaints {
     let bar_frac = (share_pct / 100.0).clamp(0.0, 1.0);
     let bar_width = rect.width() * bar_frac;
 
-    let wash_rect = egui::Rect::from_min_size(rect.min, egui::vec2(bar_width, rect.height()));
+    let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(bar_width, rect.height()));
 
-    let thickness = SHARE_BAR_UNDERLINE_THICKNESS.min(rect.height());
-    let underline_rect = egui::Rect::from_min_size(
+    let thickness = SHARE_BAR_ACCENT_THICKNESS.min(rect.height());
+    let accent_rect = egui::Rect::from_min_size(
         egui::pos2(rect.min.x, rect.max.y - thickness),
-        egui::vec2(bar_width, thickness),
+        egui::vec2(rect.width(), thickness),
     );
 
     let (r, g, b) = share_bar_rgb(class);
-    let wash_color = egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_WASH_ALPHA);
-    let underline_color = egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_UNDERLINE_ALPHA);
+    let fill_bottom =
+        egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_FILL_BOTTOM_ALPHA);
+    let accent_left = egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_ACCENT_LEFT_ALPHA);
+    let accent_right = egui::Color32::from_rgba_unmultiplied(r, g, b, 255);
 
     ShareBarPaints {
-        wash_rect,
-        underline_rect,
-        wash_color,
-        underline_color,
+        fill_rect,
+        fill_bottom,
+        accent_rect,
+        accent_left,
+        accent_right,
     }
 }
 
-/// Square side of the per-row class icon (issue #9), roughly the row's text
-/// height.
-const ICON_SIZE: f32 = 16.0;
+/// Square side of the per-row class icon (issue #9). Matches the source's
+/// `Path 18x18`.
+const ICON_SIZE: f32 = 18.0;
 
 /// Gap on both sides of the icon: between the row's left edge and the icon,
-/// and between the icon and the name that follows it.
-const ICON_MARGIN: f32 = 3.0;
+/// and between the icon and the name that follows it. `3.5` so
+/// `ICON_GUTTER_WIDTH` lands exactly on `25.0` — the source's 18px glyph
+/// centered in a fixed 25px `SharedSizeGroup="p0"` column.
+const ICON_MARGIN: f32 = 3.5;
+
+/// Class icon tint (source `Fill="#ddd"`).
+const CLASS_ICON_TINT: egui::Color32 = egui::Color32::from_rgb(0xDD, 0xDD, 0xDD);
 
 /// Fixed left-hand gutter `draw_row` reserves for the class icon slot: a
 /// margin, the icon itself, then a matching margin — reserved whether or
@@ -2477,8 +2573,11 @@ pub fn fmt_share(share_pct: f32) -> String {
 const DEFAULT_VISIBLE_ROWS: usize = 20;
 
 /// `draw_row`'s fixed row height (its `desired_size.y`), named here so the
-/// default-size math and the row painter can never drift apart.
-const ROW_HEIGHT: f32 = 20.0;
+/// default-size math and the row painter can never drift apart. Matches the
+/// source's `Height="30"` exactly: `draw_rows` zeroes the vertical item
+/// spacing for the row-list scope (decision 3), so rows are truly
+/// contiguous — there is no separate inter-row gap to add on top of this.
+const ROW_HEIGHT: f32 = 30.0;
 
 /// egui's fixed height for `ui.separator()`'s own painted line
 /// (`Style::separator_style`'s `spacing: 6.0`) — a constant of egui's, not
@@ -2497,7 +2596,7 @@ const ITEM_SPACING_Y: f32 = 2.0;
 /// the icon slot — this used to be measured from the row's own left edge —
 /// but keeps its name since it's still the same "breathing room before the
 /// name" budget.
-const NAME_LEFT_PAD: f32 = 4.0;
+const NAME_LEFT_PAD: f32 = 2.0;
 
 /// Budgeted width for the name itself. `draw_row` paints names unclipped,
 /// bold and proportional at `FONT_SIZE_ROW_NAME` (issue #56) —
@@ -2509,7 +2608,7 @@ const NAME_LEFT_PAD: f32 = 4.0;
 const NAME_WIDTH_BUDGET: f32 = 150.0;
 
 /// Breathing room between the name budget and the first stat column.
-const NAME_COLUMN_GAP: f32 = 12.0;
+const NAME_COLUMN_GAP: f32 = 10.0;
 
 /// Right-edge margin, matching the `margin` `draw_rows` passes to
 /// `column_anchors` for the rightmost column's anchor.
@@ -2517,19 +2616,23 @@ const COLUMN_RIGHT_MARGIN: f32 = 4.0;
 
 /// Default opening height (issue #26; extended by issue #9 slice 2's title
 /// line): the header's title line + timer/DPS/buttons row + separator + a
-/// full 20-row raid roster, plus the `ITEM_SPACING_Y` gap egui's layout
-/// inserts between each of those 23 widgets (22 gaps), so no scrolling is
-/// needed on first launch. The subtitle line is deliberately excluded — it
-/// is conditional (only rendered once a scene name/id is known,
-/// `encounter_subtitle`), and the default assumes it is absent.
+/// full 20-row raid roster, so no scrolling is needed on first launch. The
+/// subtitle line is deliberately excluded — it is conditional (only
+/// rendered once a scene name/id is known, `encounter_subtitle`), and the
+/// default assumes it is absent.
 ///
-///   title (20.0) + header row (18.0) + separator (6.0) + 20 rows * 20.0 (400.0)
-///     + 22 gaps * 2.0 (44.0) = 488.0
+/// Decision 3: `draw_rows` zeroes `item_spacing.y` for its own scope, so
+/// rows are truly contiguous (`ROW_HEIGHT` is the full 30pt pitch, no
+/// separate gap) and there is no gap between the separator and the first
+/// row either. Only the two gaps *above* the row list — title->header and
+/// header->separator — still pay `ITEM_SPACING_Y`.
+///
+///   title (20.0) + header row (22.0) + separator (6.0) + 20 rows * 30.0 (600.0)
+///     + 2 gaps * 2.0 (4.0) = 652.0
 fn default_inner_height() -> f32 {
-    let header_row = egui::Style::default().spacing.interact_size.y;
     let rows = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
-    let gaps = (DEFAULT_VISIBLE_ROWS + 2) as f32 * ITEM_SPACING_Y;
-    TITLE_LINE_HEIGHT + header_row + SEPARATOR_HEIGHT + rows + gaps
+    let gaps = 2.0 * ITEM_SPACING_Y;
+    TITLE_LINE_HEIGHT + BUTTON_ROW_HEIGHT + SEPARATOR_HEIGHT + rows + gaps
 }
 
 /// Default opening width (issue #26, widened for issue #9's icon gutter): a
@@ -2540,10 +2643,10 @@ fn default_inner_height() -> f32 {
 /// doesn't squeeze the name budget or the stat columns relative to before
 /// issue #9.
 ///
-///   icon gutter (3.0 + 16.0 + 3.0 = 22.0) + left pad (4.0)
-///     + name budget (150.0) + gap (12.0)
+///   icon gutter (3.5 + 18.0 + 3.5 = 25.0) + left pad (2.0)
+///     + name budget (150.0) + gap (10.0)
 ///     + columns (DPS 80.0 + crit 56.0 + lucky 56.0 + deaths 48.0 = 240.0)
-///     + right margin (4.0) = 432.0
+///     + right margin (4.0) = 431.0
 ///
 /// The columns term grew with issue #49's death column joining the default
 /// set; because it is summed rather than written down, the default window
@@ -2580,16 +2683,45 @@ pub fn viewport(window_position: Option<[f32; 2]>) -> egui::ViewportBuilder {
     builder
 }
 
+/// Panel fill: the source's `WindowData.DefaultBackgroundColor` `#232830`
+/// under the shared `WindowOpacity` default of 0.5. Fixed constants
+/// deliberately — the source binds all three of these to a settings VM, and
+/// user-configurable chrome is out of scope.
+const PANEL_FILL: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0x23, 0x28, 0x30, 128);
+/// Panel border: `DefaultBorderColor` `#717b85`, at the same 0.5 opacity the
+/// source applies to the whole Border (fill and stroke alike).
+const PANEL_BORDER_COLOR: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0x71, 0x7b, 0x85, 128);
+/// `TopmostBorderStyle`'s `BorderThickness="1"`.
+const PANEL_BORDER_WIDTH: f32 = 1.0;
+/// `TopmostBorderStyle`'s `CornerRadius="8"`.
+const PANEL_CORNER_RADIUS: u8 = 8;
+/// Height of `draw_header`'s stat-pill / window-control row — the source's
+/// `Height="22"` stat pills. Named because `apply_theme` installs it as
+/// `interact_size.y` *and* `default_inner_height` budgets for it; reading
+/// `egui::Style::default()` there (as this used to) silently used egui's 18.0
+/// instead of the themed value.
+const BUTTON_ROW_HEIGHT: f32 = 22.0;
+
 /// Dark, compact visuals with monospace numerals for the overlay.
 pub fn apply_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = egui::Color32::from_rgba_unmultiplied(18, 18, 22, 200);
-    visuals.window_fill = visuals.panel_fill;
+    // The `Frame` `OverlayApp::ui` wraps the `CentralPanel` in now owns the
+    // fill (`PANEL_FILL`) — leaving this non-transparent would double-paint
+    // it.
+    visuals.panel_fill = egui::Color32::TRANSPARENT;
+    // The source's `DarkBarColor` popup background, used by the settings
+    // menu (not the same as the panel fill above).
+    visuals.window_fill = egui::Color32::from_rgb(0x11, 0x11, 0x17);
+    visuals.window_corner_radius = egui::CornerRadius::same(PANEL_CORNER_RADIUS);
     ctx.set_visuals(visuals);
 
     ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = egui::vec2(6.0, 2.0);
-        style.spacing.button_padding = egui::vec2(4.0, 2.0);
+        style.spacing.interact_size.y = BUTTON_ROW_HEIGHT;
+        // `TOOLBAR_ICON_SIZE (14) + 2*4 == BUTTON_ROW_HEIGHT (22)`.
+        style.spacing.button_padding = egui::vec2(4.0, 4.0);
         // Labels sense click-and-drag when selectable, which would swallow the
         // header drag as a text selection. Nothing here is worth selecting.
         style.interaction.selectable_labels = false;
@@ -3840,88 +3972,154 @@ mod tests {
     fn share_bar_full_share_spans_the_full_width() {
         let rect = share_bar_rect();
         let paints = share_bar_paints(rect, 100.0, None);
-        assert_eq!(paints.wash_rect.width(), rect.width());
-        assert_eq!(paints.underline_rect.width(), rect.width());
+        assert_eq!(paints.fill_rect.width(), rect.width());
+        assert_eq!(paints.accent_rect.width(), rect.width());
     }
 
+    /// The fill's width still tracks share (`bar_frac`), but the accent
+    /// line is a sibling of the fill in the source, not a child — it always
+    /// spans the row's full width regardless of a zero share.
     #[test]
-    fn share_bar_zero_share_has_no_width() {
+    fn share_bar_zero_share_has_no_fill_but_a_full_accent_line() {
         let rect = share_bar_rect();
         let paints = share_bar_paints(rect, 0.0, None);
-        assert_eq!(paints.wash_rect.width(), 0.0);
-        assert_eq!(paints.underline_rect.width(), 0.0);
+        assert_eq!(paints.fill_rect.width(), 0.0);
+        assert_eq!(paints.accent_rect.width(), rect.width());
     }
 
     #[test]
-    fn share_bar_partial_share_scales_both_rects_identically() {
+    fn share_bar_accent_line_is_decoupled_from_the_fill() {
         let rect = share_bar_rect();
         let paints = share_bar_paints(rect, 40.0, None);
-        assert_eq!(paints.wash_rect.width(), rect.width() * 0.4);
-        assert_eq!(paints.underline_rect.width(), rect.width() * 0.4);
+        assert_eq!(paints.fill_rect.width(), rect.width() * 0.4);
+        assert_eq!(paints.accent_rect.width(), rect.width());
     }
 
-    /// The underline is what makes the share boundary read crisply (issue
-    /// #43), so it must hug `rect`'s bottom edge rather than float somewhere
-    /// inside the bar.
+    /// The accent line is what makes the share boundary read crisply, so it
+    /// must hug `rect`'s bottom edge rather than float somewhere inside the
+    /// bar.
     #[test]
-    fn share_bar_underline_sits_at_the_bottom_edge() {
+    fn share_bar_accent_line_sits_at_the_bottom_edge() {
         let rect = share_bar_rect();
         let paints = share_bar_paints(rect, 50.0, None);
-        assert_eq!(paints.underline_rect.bottom(), rect.bottom());
-        assert_eq!(
-            paints.underline_rect.height(),
-            SHARE_BAR_UNDERLINE_THICKNESS
-        );
+        assert_eq!(paints.accent_rect.bottom(), rect.bottom());
+        assert_eq!(paints.accent_rect.height(), SHARE_BAR_ACCENT_THICKNESS);
     }
 
-    /// A row short enough that the fixed underline thickness would exceed
-    /// its height must clamp the underline down to the row height instead
-    /// of spilling past the row's top edge.
+    /// A row short enough that the fixed accent thickness would exceed its
+    /// height must clamp the accent line down to the row height instead of
+    /// spilling past the row's top edge.
     #[test]
-    fn share_bar_underline_thickness_clamps_at_a_tiny_row_height() {
+    fn share_bar_accent_thickness_clamps_at_a_tiny_row_height() {
         let tiny_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 1.0));
         let paints = share_bar_paints(tiny_rect, 50.0, None);
-        assert!(paints.underline_rect.height() <= tiny_rect.height());
-        assert_eq!(paints.underline_rect.top(), tiny_rect.top());
+        assert!(paints.accent_rect.height() <= tiny_rect.height());
+        assert_eq!(paints.accent_rect.top(), tiny_rect.top());
     }
 
-    /// The wash must stay markedly more translucent than the underline
-    /// (issue #43) — that alpha gap is what lets the underline carry the
-    /// crisp share boundary while the wash reads as a subtle backdrop.
+    /// The fill must stay markedly more translucent than the accent line's
+    /// right (fully opaque) end — that alpha gap is what lets the accent
+    /// line carry the crisp share boundary while the fill reads as a subtle
+    /// backdrop.
     #[test]
-    fn share_bar_wash_alpha_is_lower_than_underline_alpha() {
+    fn share_bar_fill_is_fainter_than_its_accent_line() {
         let rect = share_bar_rect();
         let paints = share_bar_paints(rect, 50.0, None);
-        assert!(paints.wash_color.a() < paints.underline_color.a());
+        assert!(paints.fill_bottom.a() < paints.accent_right.a());
+    }
+
+    #[test]
+    fn share_bar_fill_grades_from_transparent_to_its_bottom_alpha() {
+        let paints = share_bar_paints(share_bar_rect(), 50.0, None);
+        let mesh = vertical_gradient_mesh(
+            paints.fill_rect,
+            egui::Color32::TRANSPARENT,
+            paints.fill_bottom,
+        );
+        assert_eq!(mesh.vertices.len(), 4);
+        // left_top, right_top, left_bottom, right_bottom (`gradient_mesh`'s
+        // vertex order): the two top vertices are transparent, the two
+        // bottom ones are `fill_bottom`.
+        assert_eq!(mesh.vertices[0].color.a(), 0);
+        assert_eq!(mesh.vertices[1].color.a(), 0);
+        assert_eq!(mesh.vertices[2].color.a(), paints.fill_bottom.a());
+        assert_eq!(mesh.vertices[3].color.a(), paints.fill_bottom.a());
+    }
+
+    #[test]
+    fn share_bar_accent_grades_left_to_right() {
+        let paints = share_bar_paints(share_bar_rect(), 50.0, None);
+        let mesh = horizontal_gradient_mesh(paints.accent_rect, paints.accent_left, paints.accent_right);
+        assert_eq!(mesh.vertices.len(), 4);
+        assert_eq!(mesh.vertices[0].color.a(), paints.accent_left.a());
+        assert_eq!(mesh.vertices[2].color.a(), paints.accent_left.a());
+        assert_eq!(mesh.vertices[1].color.a(), paints.accent_right.a());
+        assert_eq!(mesh.vertices[3].color.a(), paints.accent_right.a());
+    }
+
+    /// The two quads must be contiguous (no gap, no overlap) and meet at the
+    /// peak offset with the peak color on both sides of the seam.
+    #[test]
+    fn row_hover_quads_meet_at_the_peak_offset() {
+        let rect = share_bar_rect();
+        let quads = row_hover_quads(rect);
+        let split_x = rect.left() + rect.width() * ROW_HOVER_PEAK_OFFSET;
+
+        let (first_rect, first_left, first_right) = quads[0];
+        assert_eq!(first_rect.left(), rect.left());
+        assert_eq!(first_rect.right(), split_x);
+        assert_eq!(first_left, egui::Color32::TRANSPARENT);
+
+        let (second_rect, second_left, second_right) = quads[1];
+        assert_eq!(second_rect.left(), split_x);
+        assert_eq!(second_rect.right(), rect.right());
+        assert_eq!(second_right, egui::Color32::TRANSPARENT);
+
+        // Shared seam is the peak color on both sides.
+        assert_eq!(first_right, second_left);
+        assert_eq!(first_right.a(), ROW_HOVER_PEAK_ALPHA);
+    }
+
+    /// Runtime reads, not const-vs-const compares (clippy's
+    /// `assertions_on_constants`) — same trick
+    /// `font_scale_is_ordered_largest_to_smallest` uses.
+    #[test]
+    fn chrome_border_and_fill_are_translucent() {
+        for alpha in [PANEL_FILL.a(), PANEL_BORDER_COLOR.a()] {
+            assert_eq!(alpha, 128);
+        }
     }
 
     // -- share bar role coloring (issue #44) --------------------------------
     //
     // Confirms the answer to issue #44's second open question directly:
-    // the wash and underline share the exact same role-derived RGB and
-    // differ only in alpha (`SHARE_BAR_WASH_ALPHA` vs
-    // `SHARE_BAR_UNDERLINE_ALPHA`, unchanged from issue #43) — one hue, two
-    // alphas, not two independently-colored paints.
+    // the fill and accent line share the exact same role-derived RGB and
+    // differ only in alpha (`SHARE_BAR_FILL_BOTTOM_ALPHA` vs the accent
+    // line's left/right stops) — one hue, multiple alphas, not two
+    // independently-colored paints.
     /// Compares against colors built the same way `share_bar_paints` builds
     /// them (`Color32::from_rgba_unmultiplied` on the same `(r, g, b)`, just
     /// a different alpha per paint) rather than trying to recover `(r, g,
     /// b)` back out of the painted `Color32`: `Color32` stores premultiplied
     /// components internally, so unmultiplying is lossy at a low alpha like
-    /// the wash's (60 of 255) and would make this assertion flaky by up to a
+    /// the fill's (46 of 255) and would make this assertion flaky by up to a
     /// couple of units. Constructing both sides identically instead makes
     /// the comparison exact, and — since both expected colors are built
     /// from the one `expected_rgb` — directly proves "same RGB, alpha
-    /// differs only by the fixed wash/underline split".
+    /// differs only by the fixed fill/accent split".
     fn assert_bar_hue(class: Option<Class>, expected_rgb: (u8, u8, u8)) {
         let paints = share_bar_paints(share_bar_rect(), 50.0, class);
         let (r, g, b) = expected_rgb;
-        let expected_wash = egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_WASH_ALPHA);
-        let expected_underline =
-            egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_UNDERLINE_ALPHA);
-        assert_eq!(paints.wash_color, expected_wash, "wash color for {class:?}");
+        let expected_fill_bottom =
+            egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_FILL_BOTTOM_ALPHA);
+        let expected_accent_right = egui::Color32::from_rgba_unmultiplied(r, g, b, 255);
         assert_eq!(
-            paints.underline_color, expected_underline,
-            "underline color for {class:?}"
+            paints.fill_bottom, expected_fill_bottom,
+            "fill color for {class:?}"
+        );
+        assert_eq!(
+            paints.accent_right, expected_accent_right,
+            "accent color for {class:?}"
         );
     }
 
@@ -4066,7 +4264,7 @@ mod tests {
 
     #[test]
     fn default_inner_height_fits_twenty_rows_without_scrolling() {
-        // The row-content budget alone (20 rows * 20pt) must fit inside the
+        // The row-content budget alone (20 rows * 30pt) must fit inside the
         // computed default height, with room left over for the header band
         // and separator on top of it.
         let rows_only = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
@@ -4080,11 +4278,14 @@ mod tests {
 
     #[test]
     fn default_inner_height_matches_title_plus_header_plus_separator_plus_rows_plus_gaps() {
-        let header_row = egui::Style::default().spacing.interact_size.y;
         let rows = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
-        let gaps = (DEFAULT_VISIBLE_ROWS + 2) as f32 * ITEM_SPACING_Y;
-        let expected = TITLE_LINE_HEIGHT + header_row + SEPARATOR_HEIGHT + rows + gaps;
+        // Decision 3: only the title->header and header->separator gaps
+        // remain — `draw_rows` zeroes `item_spacing.y` for its own scope,
+        // so there is no gap before the first row or between rows.
+        let gaps = 2.0 * ITEM_SPACING_Y;
+        let expected = TITLE_LINE_HEIGHT + BUTTON_ROW_HEIGHT + SEPARATOR_HEIGHT + rows + gaps;
         assert_eq!(default_inner_height(), expected);
+        assert_eq!(default_inner_height(), 652.0);
     }
 
     #[test]
@@ -4100,6 +4301,7 @@ mod tests {
             + columns_width
             + COLUMN_RIGHT_MARGIN;
         assert_eq!(default_inner_width(), expected);
+        assert_eq!(default_inner_width(), 431.0);
     }
 
     #[test]
@@ -4713,7 +4915,7 @@ mod tests {
     /// is exactly why the min-inner-size floor has to move with the state.
     #[test]
     fn a_collapsed_overlay_is_shorter_than_the_normal_minimum_height() {
-        let button_row = egui::Style::default().spacing.interact_size.y;
+        let button_row = BUTTON_ROW_HEIGHT;
         for has_subtitle in [false, true] {
             let band = header_band_height(has_subtitle, button_row);
             assert!(
