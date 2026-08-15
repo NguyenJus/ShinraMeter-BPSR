@@ -12,7 +12,7 @@ use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 
 use crate::fonts;
-use crate::icons::{ClassIcons, ToolbarIcon, ToolbarIcons};
+use crate::icons::{ClassIcons, GlyphIcon, GlyphIcons, ToolbarIcon, ToolbarIcons};
 use crate::settings::{ColumnKind, Settings};
 
 // -- typography scale (issue #56, issue #62) ----------------------------
@@ -171,6 +171,7 @@ pub struct OverlayApp {
 struct Icons {
     classes: ClassIcons,
     toolbar: ToolbarIcons,
+    glyphs: GlyphIcons,
 }
 
 impl Icons {
@@ -178,6 +179,7 @@ impl Icons {
         Self {
             classes: ClassIcons::load(ctx),
             toolbar: ToolbarIcons::load(ctx),
+            glyphs: GlyphIcons::load(ctx),
         }
     }
 }
@@ -272,7 +274,7 @@ impl eframe::App for OverlayApp {
                         settings: &mut self.settings,
                         tx_settings: &self.tx_settings,
                     },
-                    &icons.toolbar,
+                    icons,
                     ChromeHandle {
                         gesture: &mut self.window_gesture,
                         collapse: &mut self.collapse,
@@ -394,7 +396,7 @@ fn draw_header(
     snapshot: &Snapshot,
     tx_command: &Sender<UiCommand>,
     settings: SettingsHandle<'_>,
-    toolbar: &ToolbarIcons,
+    icons: &Icons,
     chrome: ChromeHandle<'_>,
 ) {
     let title = encounter_title(&snapshot.encounter);
@@ -404,18 +406,37 @@ fn draw_header(
     // construction rather than by a hardcoded constant that could drift.
     let band_height = header_band_height(subtitle.is_some(), ui.spacing().interact_size.y);
 
+    // The panel's own full-width rect, captured before the band below
+    // narrows it to the drag band's height — the background wash (issue #59,
+    // #62) is sized off the panel, not the band, since it runs taller than
+    // the band does on its own (`HEADER_WASH_HEIGHT` vs `band_height`).
+    let panel = ui.available_rect_before_wrap();
+    // The header band's full paint extent — `panel` truncated to
+    // `band_height`, with no top adjustment. Used to clip anything painted
+    // in the header (the gutter emblem) so it cannot bleed into the rows
+    // below, without also chopping off the bleed *above* the row that
+    // `HEADER_EMBLEM_OFFSET` deliberately produces — `RESIZE_EDGE` is a
+    // hit-test-only concern (see `band` below), not a paint boundary; the
+    // panel's own fill/border already cover that strip.
+    let header_paint_clip =
+        egui::Rect::from_min_size(panel.min, egui::vec2(panel.width(), band_height));
     // The whole header band is the drag surface — title line, the optional
     // subtitle line, and the timer/DPS/buttons row — registered *before* the
     // row's contents so the buttons drawn into it end up on top and still get
     // their clicks. Grabbing a single glyph was too small a target to hit.
     let band = {
-        let mut rect = ui.available_rect_before_wrap();
-        rect.max.y = rect.min.y + band_height;
+        let mut rect = header_paint_clip;
         // Leave the top resize strip alone — a drag surface spanning it would
         // win the hit test and swallow every north-edge resize.
         rect.min.y += RESIZE_EDGE;
         rect
     };
+
+    // The decorative background wash, painted before anything else in the
+    // band so every later layer — emblem, title, separator, chevron,
+    // subtitle, stat row — sits on top of it.
+    draw_header_wash(ui, panel, icons);
+
     let drag_surface = ui.interact(band, ui.id().with("title_bar"), egui::Sense::drag());
     if drag_surface.hovered() {
         ctx.set_cursor_icon(egui::CursorIcon::Grab);
@@ -431,7 +452,18 @@ fn draw_header(
     // entirely — not rendered blank — when the scene is unknown (issue #9
     // slice 2).
     let title_row = draw_title_line(ui, &title);
-    for (segment_rect, color) in title_separator_segments(header_text_rect(title_row)) {
+    // The gutter emblem (issue #59): bled off the left edge and above the
+    // row's top, clipped to the header's own paint extent so it stays clear
+    // of the rows below without cropping the intentional bleed above.
+    if let Some(emblem) = icons.glyphs.get(GlyphIcon::Emblem) {
+        ui.painter().with_clip_rect(header_paint_clip).image(
+            emblem.id(),
+            header_emblem_rect(title_row),
+            UV_FULL,
+            HEADER_EMBLEM_COLOR,
+        );
+    }
+    for (segment_rect, color) in title_separator_segments(title_separator_rect(title_row)) {
         ui.painter().rect_filled(segment_rect, 0.0, color);
     }
     // The collapse control (issue #54), in the strip at the right of the
@@ -481,7 +513,7 @@ fn draw_header(
             // ✕/gear ⚙/etc. glyph (issue #14's tofu-square problem), the
             // same reason the old "×"/"S" glyphs here were themselves picked
             // for font coverage rather than looks.
-            if icon_button(ui, toolbar.get(ToolbarIcon::Close), "×", "Close").clicked() {
+            if icon_button(ui, icons.toolbar.get(ToolbarIcon::Close), "×", "Close").clicked() {
                 let _ = tx_command.try_send(UiCommand::Quit);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -500,14 +532,14 @@ fn draw_header(
             if minimize_button(ui).clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
-            if icon_button(ui, toolbar.get(ToolbarIcon::Reset), "Reset", "Reset").clicked() {
+            if icon_button(ui, icons.toolbar.get(ToolbarIcon::Reset), "Reset", "Reset").clicked() {
                 let _ = tx_command.try_send(UiCommand::Reset);
             }
             draw_settings_menu(
                 ui,
                 settings.settings,
                 settings.tx_settings,
-                toolbar.get(ToolbarIcon::Settings),
+                icons.toolbar.get(ToolbarIcon::Settings),
             );
         });
     });
@@ -631,13 +663,17 @@ fn minimize_button(ui: &mut egui::Ui) -> egui::Response {
 /// so it reads as one of the window controls rather than as decoration.
 const CHEVRON_SIZE: f32 = TOOLBAR_ICON_SIZE;
 
-/// Half-width of the painted V, as a fraction of its box. The reference's
-/// chevron is wide and shallow — a wide-angle V, not an arrowhead.
-const CHEVRON_HALF_WIDTH: f32 = 0.34;
+/// Painted width of the V. The source's `ComboBoxToggleButton` chevron is a
+/// `Path Width="10"`; the hit box stays `CHEVRON_SIZE` so the target is still
+/// comfortable.
+const CHEVRON_PAINT_WIDTH: f32 = 10.0;
 
-/// Half-height of the painted V, as a fraction of its box. Deliberately much
-/// smaller than the half-width: that ratio is the shallow angle.
-const CHEVRON_HALF_HEIGHT: f32 = 0.15;
+/// Painted height of the V — a wide, shallow chevron, not an arrowhead.
+const CHEVRON_PAINT_HEIGHT: f32 = 5.0;
+
+/// The source's `Fill="#cfff"`.
+const CHEVRON_COLOR: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0xCC);
 
 /// Stroke width of the chevron. Thin, matching the reference's hairline
 /// strokes, and a touch heavier than a hairline so it survives at 14pt.
@@ -670,8 +706,8 @@ fn chevron_rect(title_row: egui::Rect) -> egui::Rect {
 /// unfold" (collapsed). Pure, so the mirroring is unit-testable without a
 /// painter — same reasoning as `arc_points`/`heart_points`.
 fn chevron_points(rect: egui::Rect, pointing_down: bool) -> [egui::Pos2; 3] {
-    let half_width = rect.width() * CHEVRON_HALF_WIDTH;
-    let half_height = rect.height() * CHEVRON_HALF_HEIGHT;
+    let half_width = CHEVRON_PAINT_WIDTH / 2.0;
+    let half_height = CHEVRON_PAINT_HEIGHT / 2.0;
     let center = rect.center();
     let tip_dy = if pointing_down {
         half_height
@@ -702,10 +738,9 @@ fn collapse_chevron(ui: &mut egui::Ui, rect: egui::Rect, collapsed: bool) -> egu
     let label = if collapsed { "Expand" } else { "Collapse" };
     let response = ui.interact(rect, ui.id().with("collapse_chevron"), egui::Sense::click());
     if ui.is_rect_visible(rect) {
-        let visuals = ui.style().interact(&response);
         ui.painter().add(egui::Shape::line(
             chevron_points(rect, !collapsed).to_vec(),
-            egui::Stroke::new(CHEVRON_STROKE, visuals.fg_stroke.color),
+            egui::Stroke::new(CHEVRON_STROKE, CHEVRON_COLOR),
         ));
     }
     response.widget_info(|| {
@@ -1200,63 +1235,48 @@ const TITLE_TEXT_COLOR: egui::Color32 = egui::Color32::WHITE;
 /// Height of the header's subtitle line. Not part of `default_inner_height`
 /// — the subtitle is conditional and the default window assumes it is
 /// absent (see `default_inner_height`'s doc).
-const SUBTITLE_LINE_HEIGHT: f32 = 16.0;
+///
+/// `TITLE_LINE_HEIGHT (20) + ITEM_SPACING_Y (2) + SUBTITLE_LINE_HEIGHT (14)
+/// == 36.0`, the source's `Height="36"` header grid, exactly.
+const SUBTITLE_LINE_HEIGHT: f32 = 14.0;
 
 /// Subtitle text color — the source's `#5fff`, white at ~1/3 alpha.
 const SUBTITLE_TEXT_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x55);
 
-// -- header text gutter (issue #56) ------------------------------------
+// -- header text gutter (issue #59, #62) --------------------------------
 //
-// In the reference render the boss name and the dungeon name are tabbed in
-// from the window's left edge by roughly a fifth of its width, leaving a
-// gutter that holds a decorative emblem (a blue horned-beast head) with a
-// thin accent stroke sweeping right out of it under the title.
-//
-/// **The gutter art itself is deliberately not implemented, and the gutter
-/// is deliberately left empty.** That emblem exists in no source this
-/// project draws from — it is not in neowutran/ShinraMeter (whose logo is
-/// the kanji 神羅, an entirely different mark), nor in BPSR-ZDPS, bpsr-logs,
-/// or resonance-logs — so there is nothing to vendor and inventing a
-/// substitute would be worse than the empty space. Only the *layout* it
-/// implies is implemented: this indent, and the accent separator stroke
-/// (`title_separator_segments`) that starts at it.
-///
-/// The indent is a fraction of the available width, clamped: a raw fifth
-/// would be 76pt at the default 380pt width — most of a boss name's room —
-/// and only 44pt at `MIN_INNER_SIZE`'s 220pt, so the proportion alone is
-/// wrong at both ends. The clamp keeps it a believable gutter at every size
-/// the window can be dragged to.
-const HEADER_INDENT_FRACTION: f32 = 0.18;
-/// Floor for the indent, at the narrowest the window can go.
-const HEADER_INDENT_MIN: f32 = 24.0;
-/// Ceiling for the indent: past this the gutter starts eating boss names
-/// rather than framing them.
-const HEADER_INDENT_MAX: f32 = 44.0;
+// The reference render tabs the boss name and dungeon name in from the
+// window's left edge, leaving a gutter that holds the emblem (see
+// `HEADER_EMBLEM_SIZE` below) and the accent separator stroke sweeping
+// right out of it under the title.
 
-/// Width reserved at the *right* end of the title/subtitle rows: one
-/// `TOOLBAR_ICON_SIZE` glyph plus a small margin, kept clear so a long boss
-/// name is clipped short of it rather than colliding with it.
+/// Left gutter the header emblem occupies, in points: the source's 60pt
+/// `Svg.HPBar` at `Margin="-26 0 0 -8"`, i.e. `60 - 26 = 34` visible points
+/// before the title column starts. A fixed width, not a fraction of the
+/// window: in the source the emblem is a fixed-size `Path` in an `Auto`
+/// column, so the gutter does not breathe with the window.
+const HEADER_GUTTER_WIDTH: f32 = 34.0;
+/// The source title/subtitle `Margin="2 … 0 0"` — a hair of air between the
+/// gutter and the text.
+const HEADER_TEXT_PAD_X: f32 = 2.0;
+
+/// Width reserved at the *right* end of the title/subtitle rows — the
+/// source's `ComboBoxToggleButton` chevron column, `Width="32"`.
 ///
 /// Issue #54's collapse chevron is what occupies that strip — `chevron_rect`
 /// centers its box in exactly this width, on the title row.
-const HEADER_RIGHT_CONTROL_WIDTH: f32 = TOOLBAR_ICON_SIZE + 4.0;
-
-/// The title/subtitle indent for a header row `available_width` wide — see
-/// `HEADER_INDENT_FRACTION` for why it is a clamped fraction rather than
-/// either a raw proportion or a bare constant.
-fn header_text_indent(available_width: f32) -> f32 {
-    (available_width * HEADER_INDENT_FRACTION).clamp(HEADER_INDENT_MIN, HEADER_INDENT_MAX)
-}
+const HEADER_RIGHT_CONTROL_WIDTH: f32 = 32.0;
 
 /// The sub-rect of a header row that title/subtitle text may actually paint
-/// into: indented on the left by `header_text_indent`, and stopping short of
-/// the right edge by `HEADER_RIGHT_CONTROL_WIDTH`. Never inverted — at an
-/// absurdly narrow width the right edge collapses onto the left one, giving
-/// an empty (not negative) rect, which clips the text away entirely rather
-/// than painting it backwards.
+/// into: indented on the left by the fixed `HEADER_GUTTER_WIDTH` +
+/// `HEADER_TEXT_PAD_X`, and stopping short of the right edge by
+/// `HEADER_RIGHT_CONTROL_WIDTH`. Never inverted — at an absurdly narrow
+/// width the right edge collapses onto the left one, giving an empty (not
+/// negative) rect, which clips the text away entirely rather than painting
+/// it backwards.
 fn header_text_rect(row: egui::Rect) -> egui::Rect {
-    let left = row.left() + header_text_indent(row.width());
+    let left = row.left() + HEADER_GUTTER_WIDTH + HEADER_TEXT_PAD_X;
     let right = (row.right() - HEADER_RIGHT_CONTROL_WIDTH).max(left);
     egui::Rect::from_min_max(egui::pos2(left, row.top()), egui::pos2(right, row.bottom()))
 }
@@ -1283,13 +1303,13 @@ fn header_band_height(has_subtitle: bool, button_row_height: f32) -> f32 {
 /// an `allocate_exact_size`d rect instead of an auto-sized `ui.label`.
 ///
 /// Returns the *whole allocated row* rect, from which `draw_header` derives
-/// both of the things it paints inside it without allocating any extra
-/// vertical space: the accent separator (`title_separator_segments` over
-/// `header_text_rect`, issue #56), which starts at the same indent the title
-/// does and sits flush against its bottom edge, and the collapse chevron
-/// (`chevron_rect`, issue #54), which sits in the reserved strip at the row's
-/// right end. The row rather than the text rect, because the text rect has
-/// the chevron's own strip already cut off it.
+/// every other thing it paints inside it without allocating any extra
+/// vertical space: the gutter emblem (`header_emblem_rect`, issue #59), the
+/// accent separator (`title_separator_segments` over `title_separator_rect`,
+/// issue #62), and the collapse chevron (`chevron_rect`, issue #54), which
+/// sits in the reserved strip at the row's right end. The row rather than
+/// the text rect, because the text rect has the chevron's own strip already
+/// cut off it.
 ///
 /// The title's paint is clipped to the text rect, so an overlong boss name
 /// loses its tail instead of running into that strip.
@@ -1308,39 +1328,142 @@ fn draw_title_line(ui: &mut egui::Ui, text: &str) -> egui::Rect {
     row
 }
 
+// -- header gutter emblem (issue #59) ------------------------------------
+
+/// The source's `Svg.HPBar` beside the encounter name: 60x60, bled off the
+/// left edge by `Margin="-26 0 0 -8"` and clipped to the header band, so only
+/// its right two-thirds are ever on screen.
+const HEADER_EMBLEM_SIZE: f32 = 60.0;
+/// The WPF centering resolves to a top edge 8pt above the band (available
+/// height `36 - (-8) = 44`, offset `(44 - 60)/2 = -8`), which is exactly
+/// `row.top() - 8.0` — hence this single offset vector covering both axes.
+const HEADER_EMBLEM_OFFSET: egui::Vec2 = egui::vec2(-26.0, -8.0);
+/// `Fill="SlateGray"`.
+const HEADER_EMBLEM_COLOR: egui::Color32 = egui::Color32::from_rgb(0x70, 0x80, 0x90);
+
+/// Where the header emblem's 60x60 box sits for a title row of `row`. Pure
+/// geometry, so the negative-margin bleed is unit-testable without a
+/// painter.
+fn header_emblem_rect(row: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        row.min + HEADER_EMBLEM_OFFSET,
+        egui::Vec2::splat(HEADER_EMBLEM_SIZE),
+    )
+}
+
+// -- header background wash (issue #59, #62) -----------------------------
+
+/// The decorative panel behind the header rows: a diagonal SlateGray
+/// gradient (`#50708090` -> transparent) with a very faint, oversized
+/// `Svg.HPBar` bleeding off its right edge. The source additionally applies
+/// a vertical `OpacityMask` (white -> transparent at .9); egui has no
+/// opacity masks, and the diagonal gradient already falls to zero by the
+/// bottom-right, so the mask is deliberately not reproduced.
+const HEADER_WASH_HEIGHT: f32 = 98.0;
+/// Inset from the panel's edges the wash is painted at, so its square
+/// corners never poke past the panel's own `PANEL_CORNER_RADIUS`-rounded,
+/// `PANEL_BORDER_WIDTH`-thick border.
+const HEADER_WASH_INSET: f32 = 1.0;
+/// Alpha at the wash gradient's brightest (top-left) stop — `Opacity=".5"`.
+const HEADER_WASH_TOP_ALPHA: u8 = 0x50;
+const HEADER_WASH_EMBLEM_SIZE: f32 = 200.0;
+/// `Opacity=".05"` on a SlateGray fill.
+const HEADER_WASH_EMBLEM_COLOR: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0x70, 0x80, 0x90, 13);
+
+/// Paints the header's decorative background wash — a diagonal gradient
+/// panel with a huge, nearly-invisible emblem bleeding off its right edge —
+/// clipped to its own rect so it can never bleed into the rows below or over
+/// the panel's rounded corners. `panel` is the whole central panel's rect
+/// (not the drag band): the wash runs to `HEADER_WASH_HEIGHT`, which is
+/// taller than the band itself.
+///
+/// The source rounds the wash's top corners (`CornerRadius="7 7 0 0"`); egui
+/// cannot clip to a rounded rect this cheaply, so the wash keeps square
+/// corners — at alpha `0x50` under the panel's own 8pt-rounded, 1pt border
+/// the difference is sub-pixel.
+fn draw_header_wash(ui: &egui::Ui, panel: egui::Rect, icons: &Icons) {
+    let wash_rect = egui::Rect::from_min_size(
+        panel.min + egui::Vec2::splat(HEADER_WASH_INSET),
+        egui::vec2(panel.width() - 2.0 * HEADER_WASH_INSET, HEADER_WASH_HEIGHT),
+    );
+    let painter = ui.painter().with_clip_rect(wash_rect);
+
+    // Top-left brightest, fading to zero at the bottom-right — the source's
+    // `LinearGradientBrush` with no explicit start/end points defaults to
+    // that diagonal.
+    let slate = |a: u8| egui::Color32::from_rgba_unmultiplied(0x70, 0x80, 0x90, a);
+    let mid_alpha = HEADER_WASH_TOP_ALPHA / 2;
+    painter.add(egui::Shape::mesh(gradient_mesh(
+        wash_rect,
+        slate(HEADER_WASH_TOP_ALPHA),
+        slate(mid_alpha),
+        slate(mid_alpha),
+        slate(0),
+    )));
+
+    if let Some(emblem) = icons.glyphs.get(GlyphIcon::Emblem) {
+        let emblem_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                wash_rect.right() + 25.0 - HEADER_WASH_EMBLEM_SIZE,
+                wash_rect.center().y - HEADER_WASH_EMBLEM_SIZE / 2.0,
+            ),
+            egui::Vec2::splat(HEADER_WASH_EMBLEM_SIZE),
+        );
+        painter.image(emblem.id(), emblem_rect, UV_FULL, HEADER_WASH_EMBLEM_COLOR);
+    }
+}
+
 /// Color of the fading separator line painted under the header title
-/// (`title_separator_segments`). The reference render's divider is the same
-/// light steel blue as its stat icons (issue #56), not the grayer slate this
-/// used before it.
-const TITLE_SEPARATOR_RGB: (u8, u8, u8) = (0x7E, 0x9C, 0xBF);
+/// (`title_separator_segments`) — the source's `#708090`.
+const TITLE_SEPARATOR_RGB: (u8, u8, u8) = (0x70, 0x80, 0x90);
 
-/// Alpha the separator starts at, at its left (indented) end. The reference
-/// stroke is a hairline accent, not a rule: fully opaque reads as a border
-/// splitting the header in two.
-const TITLE_SEPARATOR_MAX_ALPHA: u8 = 150;
+/// Alpha the separator starts at, at its left (indented) end — the source's
+/// left stop is a fully opaque `#708090`.
+const TITLE_SEPARATOR_MAX_ALPHA: u8 = 255;
 
-/// Thickness, in points, of the title separator line.
-const TITLE_SEPARATOR_THICKNESS: f32 = 1.0;
+/// Thickness, in points, of the title separator line — `StrokeThickness="2"`.
+const TITLE_SEPARATOR_THICKNESS: f32 = 2.0;
+
+/// The source's `Margin="-5 7.5 32 0"`: the separator starts 5pt to the left
+/// of the title's own left edge (bleeding partway back into the gutter) and
+/// 7.5pt below the row's top.
+const TITLE_SEPARATOR_LEFT_BLEED: f32 = 5.0;
+const TITLE_SEPARATOR_TOP_OFFSET: f32 = 7.5;
 
 /// Number of thin strips `title_separator_segments` divides the fade into.
 /// High enough to read as a smooth gradient, modest enough to stay cheap to
 /// paint every frame.
 const TITLE_SEPARATOR_SEGMENTS: usize = 24;
 
+/// The rect the fading title separator is painted over, for a title row
+/// `title_row`: it bleeds `TITLE_SEPARATOR_LEFT_BLEED` back into the gutter
+/// from the title's own left edge and clears the chevron's reserved strip on
+/// the right, sitting `TITLE_SEPARATOR_TOP_OFFSET` below the row's top.
+fn title_separator_rect(title_row: egui::Rect) -> egui::Rect {
+    let left = title_row.left() + HEADER_GUTTER_WIDTH - TITLE_SEPARATOR_LEFT_BLEED;
+    let right = (title_row.right() - HEADER_RIGHT_CONTROL_WIDTH).max(left);
+    let top = title_row.top() + TITLE_SEPARATOR_TOP_OFFSET;
+    egui::Rect::from_min_max(
+        egui::pos2(left, top),
+        egui::pos2(right, top + TITLE_SEPARATOR_THICKNESS),
+    )
+}
+
 /// Builds the fading title-underline as a series of thin filled rects:
 /// egui has no built-in gradient stroke, so the "sweeps out of the gutter
 /// and fades away to the right" stroke from the reference render is
 /// approximated with segments whose alpha steps down linearly from
 /// `TITLE_SEPARATOR_MAX_ALPHA` at `rect`'s left edge to zero at its right
-/// one. `rect` is the *indented* title text rect (`draw_title_line`), so the
-/// stroke starts where the title does — at the gutter's inner edge — exactly
-/// as the reference's does, and runs the width of the title rather than
-/// stopping at its midpoint. Extracted as a pure function, same reasoning as
-/// `share_bar_paints`: unit-testable without a live `egui::Ui`.
+/// one. `rect` is `title_separator_rect`'s output, so the stroke starts
+/// where the source's does — bled back into the gutter — and runs the width
+/// of the title rather than stopping at its midpoint. Extracted as a pure
+/// function, same reasoning as `share_bar_paints`: unit-testable without a
+/// live `egui::Ui`.
 fn title_separator_segments(rect: egui::Rect) -> Vec<(egui::Rect, egui::Color32)> {
     let (r, g, b) = TITLE_SEPARATOR_RGB;
     let segment_width = rect.width() / TITLE_SEPARATOR_SEGMENTS as f32;
-    let y = rect.bottom() - TITLE_SEPARATOR_THICKNESS;
+    let y = rect.top();
 
     (0..TITLE_SEPARATOR_SEGMENTS)
         .map(|i| {
@@ -2186,8 +2309,9 @@ fn draw_row(
     // icon/name/columns.
     if response.hovered() {
         for (quad, left, right) in row_hover_quads(rect) {
-            ui.painter()
-                .add(egui::Shape::mesh(horizontal_gradient_mesh(quad, left, right)));
+            ui.painter().add(egui::Shape::mesh(horizontal_gradient_mesh(
+                quad, left, right,
+            )));
         }
     }
 
@@ -2386,11 +2510,19 @@ fn gradient_mesh(
     mesh
 }
 
-fn vertical_gradient_mesh(rect: egui::Rect, top: egui::Color32, bottom: egui::Color32) -> egui::Mesh {
+fn vertical_gradient_mesh(
+    rect: egui::Rect,
+    top: egui::Color32,
+    bottom: egui::Color32,
+) -> egui::Mesh {
     gradient_mesh(rect, top, top, bottom, bottom)
 }
 
-fn horizontal_gradient_mesh(rect: egui::Rect, left: egui::Color32, right: egui::Color32) -> egui::Mesh {
+fn horizontal_gradient_mesh(
+    rect: egui::Rect,
+    left: egui::Color32,
+    right: egui::Color32,
+) -> egui::Mesh {
     gradient_mesh(rect, left, right, left, right)
 }
 
@@ -2408,8 +2540,7 @@ fn row_hover_quads(rect: egui::Rect) -> [(egui::Rect, egui::Color32, egui::Color
     let peak = egui::Color32::from_rgba_unmultiplied(255, 255, 255, ROW_HOVER_PEAK_ALPHA);
     let split_x = rect.left() + rect.width() * ROW_HOVER_PEAK_OFFSET;
     let left_quad = egui::Rect::from_min_max(rect.left_top(), egui::pos2(split_x, rect.bottom()));
-    let right_quad =
-        egui::Rect::from_min_max(egui::pos2(split_x, rect.top()), rect.right_bottom());
+    let right_quad = egui::Rect::from_min_max(egui::pos2(split_x, rect.top()), rect.right_bottom());
     [
         (left_quad, egui::Color32::TRANSPARENT, peak),
         (right_quad, peak, egui::Color32::TRANSPARENT),
@@ -2470,8 +2601,7 @@ fn share_bar_paints(rect: egui::Rect, share_pct: f32, class: Option<Class>) -> S
     );
 
     let (r, g, b) = share_bar_rgb(class);
-    let fill_bottom =
-        egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_FILL_BOTTOM_ALPHA);
+    let fill_bottom = egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_FILL_BOTTOM_ALPHA);
     let accent_left = egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_ACCENT_LEFT_ALPHA);
     let accent_right = egui::Color32::from_rgba_unmultiplied(r, g, b, 255);
 
@@ -2823,7 +2953,7 @@ mod tests {
     fn header_rendered_texts(snapshot: &Snapshot) -> Vec<String> {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
-        let toolbar = ToolbarIcons::load(&ctx);
+        let icons = Icons::load(&ctx);
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
         let mut settings = Settings::default();
@@ -2838,7 +2968,7 @@ mod tests {
                     settings: &mut settings,
                     tx_settings: &tx_settings,
                 },
-                &toolbar,
+                &icons,
                 ChromeHandle {
                     gesture: &mut WindowGesture::default(),
                     collapse: &mut CollapseState::default(),
@@ -2888,7 +3018,7 @@ mod tests {
         let snapshot = header_test_snapshot(30_100_000_000);
         let ctx = egui::Context::default();
         apply_theme(&ctx);
-        let toolbar = ToolbarIcons::load(&ctx);
+        let icons = Icons::load(&ctx);
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
         let mut settings = Settings::default();
@@ -2905,7 +3035,7 @@ mod tests {
                     settings: &mut settings,
                     tx_settings: &tx_settings,
                 },
-                &toolbar,
+                &icons,
                 ChromeHandle {
                     gesture: &mut WindowGesture::default(),
                     collapse: &mut CollapseState::default(),
@@ -3310,39 +3440,35 @@ mod tests {
         );
     }
 
-    // -- header text gutter (issue #56) -----------------------------------
+    // -- header text gutter (issue #59, #62) -------------------------------
 
-    /// The indent tracks the window width between its bounds, so the gutter
-    /// looks proportional at ordinary sizes...
+    /// The gutter is a fixed width, not a proportion of the window — unlike
+    /// the old fractional indent, a narrow and a wide row must produce
+    /// exactly the same left edge.
     #[test]
-    fn header_indent_follows_the_width_between_its_bounds() {
-        let width = 200.0;
-        assert_eq!(
-            header_text_indent(width),
-            width * HEADER_INDENT_FRACTION,
-            "an indent inside the clamp should be the raw fraction"
-        );
+    fn header_gutter_is_a_fixed_width_regardless_of_the_window() {
+        for width in [MIN_INNER_SIZE.x, default_inner_width(), 1_200.0] {
+            let row = egui::Rect::from_min_size(egui::pos2(7.0, 3.0), egui::vec2(width, 20.0));
+            let rect = header_text_rect(row);
+            assert_eq!(
+                rect.left() - row.left(),
+                HEADER_GUTTER_WIDTH + HEADER_TEXT_PAD_X
+            );
+        }
     }
 
-    /// ...but is clamped at both ends: a raw fifth of the default 380pt
-    /// width would eat most of a boss name, and a fifth of a narrow window
-    /// would be no gutter at all.
-    #[test]
-    fn header_indent_is_clamped_at_both_ends() {
-        assert_eq!(header_text_indent(4_000.0), HEADER_INDENT_MAX);
-        assert_eq!(header_text_indent(10.0), HEADER_INDENT_MIN);
-        assert_eq!(header_text_indent(default_inner_width()), HEADER_INDENT_MAX);
-    }
-
-    /// The title/subtitle text rect starts at the indent and stops short of
-    /// the strip reserved for issue #54's chevron, at every width the window
-    /// can be dragged to.
+    /// The title/subtitle text rect starts at the fixed gutter width and
+    /// stops short of the strip reserved for issue #54's chevron, at every
+    /// width the window can be dragged to.
     #[test]
     fn header_text_rect_is_indented_and_clears_the_right_control() {
         for width in [MIN_INNER_SIZE.x, default_inner_width(), 1_200.0] {
             let row = egui::Rect::from_min_size(egui::pos2(7.0, 3.0), egui::vec2(width, 20.0));
             let rect = header_text_rect(row);
-            assert_eq!(rect.left(), row.left() + header_text_indent(width));
+            assert_eq!(
+                rect.left(),
+                row.left() + HEADER_GUTTER_WIDTH + HEADER_TEXT_PAD_X
+            );
             assert_eq!(rect.right(), row.right() - HEADER_RIGHT_CONTROL_WIDTH);
             assert!(
                 rect.width() > 0.0,
@@ -3364,16 +3490,23 @@ mod tests {
         assert_eq!(rect.width(), 0.0);
     }
 
-    /// The separator is the gutter's only surviving decoration (the emblem
-    /// itself is unavailable — see `HEADER_INDENT_FRACTION`), so it has to
-    /// start where the title does rather than at the window edge.
+    /// The separator bleeds `TITLE_SEPARATOR_LEFT_BLEED` back into the
+    /// gutter from the title's own left edge (the source's `Margin="-5 ..."`)
+    /// and clears the chevron's reserved strip on the right.
     #[test]
-    fn title_separator_starts_at_the_title_indent() {
+    fn title_separator_bleeds_left_of_the_title_and_clears_the_chevron() {
         let row = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, 20.0));
-        let rect = header_text_rect(row);
+        let rect = title_separator_rect(row);
         let segments = title_separator_segments(rect);
-        assert_eq!(segments.first().unwrap().0.left(), rect.left());
-        assert!(rect.left() >= HEADER_INDENT_MIN);
+        assert_eq!(
+            segments.first().unwrap().0.left(),
+            row.left() + HEADER_GUTTER_WIDTH - TITLE_SEPARATOR_LEFT_BLEED
+        );
+        assert!(
+            (segments.last().unwrap().0.right() - (row.right() - HEADER_RIGHT_CONTROL_WIDTH)).abs()
+                < 0.01
+        );
+        assert_eq!(rect.top(), row.top() + TITLE_SEPARATOR_TOP_OFFSET);
     }
 
     #[test]
@@ -3643,6 +3776,29 @@ mod tests {
         let without = header_band_height(false, button_row_height);
         let with = header_band_height(true, button_row_height);
         assert_eq!(with - without, SUBTITLE_LINE_HEIGHT + ITEM_SPACING_Y);
+    }
+
+    /// `TITLE_LINE_HEIGHT + ITEM_SPACING_Y + SUBTITLE_LINE_HEIGHT` is the
+    /// source's `Height="36"` header grid — pinned as a sum, not three
+    /// separate literals, so a future edit to any one constant can't drift
+    /// from the source without this test catching it.
+    #[test]
+    fn the_title_and_subtitle_lines_add_up_to_the_source_header_grid() {
+        let total = TITLE_LINE_HEIGHT + ITEM_SPACING_Y + SUBTITLE_LINE_HEIGHT;
+        assert_eq!(total, 36.0);
+    }
+
+    /// The emblem is bled off the title row's left edge and extends above
+    /// its top (`HEADER_EMBLEM_OFFSET`'s negative x/y), so it must be
+    /// clipped to the header band (not the title row alone) when painted.
+    #[test]
+    fn the_header_emblem_bleeds_off_the_left_edge_and_is_taller_than_the_band() {
+        let row = egui::Rect::from_min_size(egui::pos2(10.0, 40.0), egui::vec2(380.0, 20.0));
+        let rect = header_emblem_rect(row);
+        assert!(rect.left() < row.left());
+        assert!(rect.top() < row.top());
+        assert_eq!(rect.width(), HEADER_EMBLEM_SIZE);
+        assert_eq!(rect.height(), HEADER_EMBLEM_SIZE);
     }
 
     // -- column_anchors (issue #8) --------------------------------------
@@ -4023,7 +4179,8 @@ mod tests {
     #[test]
     fn share_bar_accent_grades_left_to_right() {
         let paints = share_bar_paints(share_bar_rect(), 50.0, None);
-        let mesh = horizontal_gradient_mesh(paints.accent_rect, paints.accent_left, paints.accent_right);
+        let mesh =
+            horizontal_gradient_mesh(paints.accent_rect, paints.accent_left, paints.accent_right);
         assert_eq!(mesh.vertices.len(), 4);
         assert_eq!(mesh.vertices[0].color.a(), paints.accent_left.a());
         assert_eq!(mesh.vertices[2].color.a(), paints.accent_left.a());
@@ -5260,7 +5417,7 @@ mod tests {
         }
     }
 
-    /// The V is wide and shallow, matching the reference's hairline chevron
+    /// The V is wide and shallow, matching the source's `Width="10"` chevron
     /// rather than an arrowhead, and it stays inside its box.
     #[test]
     fn the_chevron_is_a_wide_shallow_v_inside_its_box() {
@@ -5271,7 +5428,9 @@ mod tests {
         }
         let width = points[2].x - points[0].x;
         let depth = points[1].y - points[0].y;
-        assert!(width > depth * 2.0, "{width}pt wide vs {depth}pt deep");
+        assert_eq!(width, CHEVRON_PAINT_WIDTH);
+        assert_eq!(depth, CHEVRON_PAINT_HEIGHT);
+        assert!(width >= depth * 2.0, "{width}pt wide vs {depth}pt deep");
     }
 
     /// Same accessibility regression `minimize_button` guards against: a raw
