@@ -624,12 +624,13 @@ fn draw_row(
 const SHARE_BAR_RGB_HEALER: (u8, u8, u8) = (70, 200, 120);
 const SHARE_BAR_RGB_TANK: (u8, u8, u8) = (60, 120, 220);
 const SHARE_BAR_RGB_DAMAGE: (u8, u8, u8) = (220, 80, 70);
-/// Fallback for `Class::Unknown` (or a row with no `Class` at all) — the
-/// exact RGB the bar used unconditionally before issue #44, kept unchanged
-/// so an unclassified player stays visually neutral rather than being
-/// mis-attributed to a role it was never confirmed to have (issue #44's
+/// Fallback for `Class::Unknown` (or a row with no `Class` at all). A
+/// desaturated grey rather than any role's hue: reusing a role color here
+/// (as this once did with `SHARE_BAR_RGB_TANK`'s blue) would make an
+/// unclassified row indistinguishable from a confirmed row of that role, so
+/// this must stay visually distinct from all three colors above (issue #44's
 /// second open question).
-const SHARE_BAR_RGB_UNKNOWN: (u8, u8, u8) = (60, 120, 220);
+const SHARE_BAR_RGB_UNKNOWN: (u8, u8, u8) = (140, 140, 140);
 
 /// Alpha of the translucent wash covering the full width of `bar_rect`
 /// (issue #43). Deliberately lower than the old single flat fill's alpha
@@ -663,7 +664,7 @@ struct ShareBarPaints {
 
 /// Maps a row's `Class` to its share-bar hue (issue #44). `None` — either no
 /// `Class` at all or `Class::Unknown` (which has no `Role`,
-/// `Class::role`) — falls back to `SHARE_BAR_RGB_UNKNOWN`, the pre-#44 blue.
+/// `Class::role`) — falls back to `SHARE_BAR_RGB_UNKNOWN`, the neutral grey.
 fn share_bar_rgb(class: Option<Class>) -> (u8, u8, u8) {
     match class.and_then(|c| c.role()) {
         Some(Role::Healer) => SHARE_BAR_RGB_HEALER,
@@ -1524,11 +1525,15 @@ mod tests {
         assert_bar_hue(None, SHARE_BAR_RGB_UNKNOWN);
     }
 
-    /// Pins the fallback to the exact pre-#44 blue so an unclassified player
-    /// keeps looking the same as before this issue, not merely "some blue".
+    /// Guards against the fallback colliding with any role hue — such a
+    /// collision would make an unclassified row silently look like a
+    /// confirmed row of that role (this once happened with
+    /// `SHARE_BAR_RGB_TANK`'s blue, before this test existed).
     #[test]
-    fn share_bar_fallback_hue_matches_the_pre_issue_44_blue() {
-        assert_eq!(SHARE_BAR_RGB_UNKNOWN, (60, 120, 220));
+    fn share_bar_fallback_hue_differs_from_every_role_hue() {
+        assert_ne!(SHARE_BAR_RGB_UNKNOWN, SHARE_BAR_RGB_HEALER);
+        assert_ne!(SHARE_BAR_RGB_UNKNOWN, SHARE_BAR_RGB_TANK);
+        assert_ne!(SHARE_BAR_RGB_UNKNOWN, SHARE_BAR_RGB_DAMAGE);
     }
 
     // -- class -> asset mapping totality (issue #9) ------------------------
