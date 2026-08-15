@@ -2,3 +2,9 @@
    Spelled numerically so the script needs no Windows SDK headers, which the
    mingw cross-build does not have. */
 1 24 "shinra-bpsr.manifest"
+
+/* Resource id 2 (`platform::APP_ICON_RESOURCE_ID`), type 3 (RT_ICON) via the
+   `ICON` statement, which expands the .ico's images into a group. Explorer and
+   the taskbar pick this up automatically; `platform::tray_icon_handle` looks it
+   up by this id for the notification area. */
+2 ICON "assets/shinra.ico"

@@ -46,6 +46,17 @@ WinDivert's LGPL-3.0 option is compatible.
   renamed here to match what each is used for in this project — no pixel
   data changed.
 
+## ShinraMeter application icon
+
+- Files: `crates/app/assets/shinra.ico`
+- Upstream: <https://github.com/neowutran/ShinraMeter> (`resources/img/shinra.ico`)
+- License: MIT
+- Embedded verbatim and unmodified as resource id 2 by
+  `crates/app/shinra-bpsr.rc`, and used as the executable's Explorer/taskbar
+  icon and the notification-area icon. It is upstream's 神羅 mark, carried over
+  deliberately: this project is a Blue Protocol port of ShinraMeter and shares
+  its name.
+
 ## Monster and scene name tables
 
 - Files: `crates/meter/data/MonsterName.json`, `crates/meter/data/SceneName.json`
