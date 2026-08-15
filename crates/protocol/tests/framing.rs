@@ -178,6 +178,72 @@ fn container_data_zero_fight_point_is_no_ability_score() {
     }
 }
 
+/// `attr_id::SEASON_LEVEL` / `attr_id::SEASON_STRENGTH` on an entity's attr
+/// list (the only confirmed source for season data — see `attrs.rs`'s
+/// provenance comment) decode into `PlayerInfo.season_level` /
+/// `PlayerInfo.season_strength`, for an arbitrary nearby entity, not just the
+/// local player.
+#[test]
+fn season_attrs_on_entity_decode_into_player_info() {
+    let player = appear_entity(
+        ATTACKER_UUID,
+        10,
+        vec![
+            varint_attr(bpsr_protocol::attrs::attr_id::SEASON_LEVEL, 42),
+            varint_attr(bpsr_protocol::attrs::attr_id::SEASON_STRENGTH, 12_345),
+        ],
+    );
+    let payload = sync_near_entities_payload(vec![player]);
+    let stream = notify(
+        bpsr_protocol::decode::opcode::SYNC_NEAR_ENTITIES,
+        &payload,
+        false,
+    );
+
+    let mut decoder = Decoder::new();
+    let events = decoder.push_stream(&stream, 1);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ProtocolEvent::Player(p) => {
+            assert_eq!(p.season_level, Some(42));
+            assert_eq!(p.season_strength, Some(12_345));
+        }
+        other => panic!("expected Player, got {other:?}"),
+    }
+}
+
+/// A zero raw value for either season attr (the wire default when the server
+/// hasn't populated the field) is treated as absent, matching `FIGHT_POINT`'s
+/// zero-is-absent treatment.
+#[test]
+fn zero_season_attrs_yield_no_season_data() {
+    let player = appear_entity(
+        ATTACKER_UUID,
+        10,
+        vec![
+            varint_attr(bpsr_protocol::attrs::attr_id::SEASON_LEVEL, 0),
+            varint_attr(bpsr_protocol::attrs::attr_id::SEASON_STRENGTH, 0),
+        ],
+    );
+    let payload = sync_near_entities_payload(vec![player]);
+    let stream = notify(
+        bpsr_protocol::decode::opcode::SYNC_NEAR_ENTITIES,
+        &payload,
+        false,
+    );
+
+    let mut decoder = Decoder::new();
+    let events = decoder.push_stream(&stream, 1);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ProtocolEvent::Player(p) => {
+            assert_eq!(p.season_level, None);
+            assert_eq!(p.season_strength, None);
+        }
+        other => panic!("expected Player, got {other:?}"),
+    }
+}
+
 /// A `SyncToMeDeltaInfo` (opcode `0x2e`) carries the entity's identity on the
 /// *outer* `AoiSyncToMeDelta.uuid`; `base_delta.uuid` is 0. The decoder must
 /// read the outer uuid, otherwise every to-me update decodes as uid 0 /

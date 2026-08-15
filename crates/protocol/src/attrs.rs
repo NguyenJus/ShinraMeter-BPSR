@@ -17,6 +17,20 @@ pub mod attr_id {
     pub const MAX_HP: i32 = 0x2C38;
     pub const PROFESSION_ID: i32 = 0xDC;
     pub const FIGHT_POINT: i32 = 0x272E;
+    /// Reference-derived, **not yet verified against live traffic** (issue
+    /// #15): reimplemented from BPSR-ZDPS's `EnumEAttrType.cs`
+    /// (`AttrSeasonLevel = 10070`) because no packet capture was available.
+    /// Every other id in this module was confirmed against captured traffic
+    /// per `docs/packet-inspection.md`'s "Recording a result" convention —
+    /// this one, and `SEASON_STRENGTH` below, are the repo owner's sanctioned
+    /// exception to that rule. Re-verify against a real capture if one ever
+    /// becomes available.
+    pub const SEASON_LEVEL: i32 = 0x2756;
+    /// Reference-derived, **not yet verified against live traffic** (issue
+    /// #15): reimplemented from BPSR-ZDPS's `EnumEAttrType.cs`
+    /// (`AttrSeasonStrength = 11440`) because no packet capture was
+    /// available. See `SEASON_LEVEL`'s doc comment for the full caveat.
+    pub const SEASON_STRENGTH: i32 = 0x2CB0;
 }
 
 /// protobuf varint → `u64`; `None` on empty/malformed input. The widest
@@ -71,12 +85,13 @@ pub fn decode_name(raw: &[u8]) -> Option<String> {
 }
 
 /// Builds a `PlayerInfo` from an entity's `Attr` list, reading `NAME`,
-/// `PROFESSION_ID`, and `FIGHT_POINT` (ability score). Empty `raw_data` and
-/// `id == 0` are always skipped outright — no decoding, no sink call. Every
-/// other id, when `sink` is set (issue #25 diagnostic mode), is reported via
-/// `InspectSink::on_attr` — known ids (the three above) as well as unknown
-/// ones, each tagged with whether we decode it, instead of only unknown ids
-/// reaching the sink (slice B widened this from an unknowns-only hook).
+/// `PROFESSION_ID`, `FIGHT_POINT` (ability score), `SEASON_LEVEL`, and
+/// `SEASON_STRENGTH`. Empty `raw_data` and `id == 0` are always skipped
+/// outright — no decoding, no sink call. Every other id, when `sink` is set
+/// (issue #25 diagnostic mode), is reported via `InspectSink::on_attr` —
+/// known ids (the five above) as well as unknown ones, each tagged with
+/// whether we decode it, instead of only unknown ids reaching the sink
+/// (slice B widened this from an unknowns-only hook).
 pub fn player_info_from_attrs(
     uid: i64,
     attrs: &[pb::Attr],
@@ -85,6 +100,8 @@ pub fn player_info_from_attrs(
     let mut name = None;
     let mut class = None;
     let mut ability_score = None;
+    let mut season_level = None;
+    let mut season_strength = None;
     for attr in attrs {
         if attr.raw_data.is_empty() || attr.id == 0 {
             continue;
@@ -92,7 +109,11 @@ pub fn player_info_from_attrs(
         if let Some(sink) = sink {
             let known = matches!(
                 attr.id,
-                attr_id::NAME | attr_id::PROFESSION_ID | attr_id::FIGHT_POINT
+                attr_id::NAME
+                    | attr_id::PROFESSION_ID
+                    | attr_id::FIGHT_POINT
+                    | attr_id::SEASON_LEVEL
+                    | attr_id::SEASON_STRENGTH
             );
             sink.on_attr(uid, attr.id, &attr.raw_data, known);
         }
@@ -116,6 +137,17 @@ pub fn player_info_from_attrs(
                     ability_score = Some(v);
                 }
             }
+            attr_id::SEASON_LEVEL => {
+                // Same absent-vs-zero treatment as FIGHT_POINT above.
+                if let Some(v) = decode_varint_u32(&attr.raw_data).filter(|&v| v > 0) {
+                    season_level = Some(v);
+                }
+            }
+            attr_id::SEASON_STRENGTH => {
+                if let Some(v) = decode_varint_u32(&attr.raw_data).filter(|&v| v > 0) {
+                    season_strength = Some(v);
+                }
+            }
             _ => {}
         }
     }
@@ -124,6 +156,8 @@ pub fn player_info_from_attrs(
         name,
         class,
         ability_score,
+        season_level,
+        season_strength,
     }
 }
 
