@@ -24,8 +24,8 @@
 //! second, message-level defense — a `SetWindowSubclass` hook (chained with
 //! `DefSubclassProc`, not a `GWLP_WNDPROC` swap) that rejects snap-shaped
 //! `WM_WINDOWPOSCHANGING` proposals and swallows `WM_SYSCOMMAND`/
-//! `SC_MAXIMIZE` as a backstop. See its doc comment and `is_snap_shaped`'s
-//! for the actual decision logic.
+//! `SC_MAXIMIZE` as a backstop. See its doc comment, and `should_veto_snap`'s
+//! and `is_snap_shaped`'s, for the actual decision logic.
 //!
 //! `WS_THICKFRAME` is untouched by any of this, so the window stays
 //! resizable; the subclass tells a legitimate app-driven reposition apart
@@ -129,8 +129,17 @@ pub fn disable_aero_snap(cc: &eframe::CreationContext<'_>) {
     // (e.g. a resize) forces a frame update. `SWP_NOMOVE | SWP_NOSIZE`
     // means this call only asks for the frame-change side effect, not an
     // actual move/resize, so the position/size arguments are ignored.
+    //
+    // Wrapped in `app_driven_reposition` like every other direct
+    // `SetWindowPos` in this crate. The wrapper is inert *today* — this runs
+    // before `install_snap_blocker` in `main.rs`, and `SWP_NOMOVE |
+    // SWP_NOSIZE` would trip `window_proc`'s `already_pinned` check even if
+    // it didn't — but the invariant is the point: reordering `main.rs` (a
+    // "reset window" feature re-running this, say), or copying this call as
+    // a template for one that really does move the window, must not
+    // reintroduce an unwrapped, vetoable call.
     // SAFETY: same as above.
-    let framechanged = unsafe {
+    let framechanged = app_driven_reposition(|| unsafe {
         SetWindowPos(
             hwnd,
             HWND(0),
@@ -140,7 +149,7 @@ pub fn disable_aero_snap(cc: &eframe::CreationContext<'_>) {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         )
-    };
+    });
     if !framechanged.as_bool() {
         log::warn!(
             "SetWindowPos(SWP_FRAMECHANGED) failed; the window may keep painting opaque until resized"
@@ -269,6 +278,31 @@ fn band_is_reachable(band: Rect, monitors: &[Rect]) -> bool {
     widest >= MIN_VISIBLE_WIDTH
 }
 
+/// The strip of `window` that `ui::draw_header` registers as the drag
+/// surface: the top `HEADER_BAND_HEIGHT` physical pixels across the full
+/// width.
+#[cfg(any(windows, test))]
+fn header_band(window: Rect) -> Rect {
+    Rect {
+        left: window.left,
+        top: window.top,
+        right: window.right,
+        bottom: window.top + HEADER_BAND_HEIGHT,
+    }
+}
+
+/// Whether `window` is somewhere the user can still grab and drag it on the
+/// current monitor layout — i.e. enough of its header band lands inside the
+/// union of the monitors' work areas (see `band_is_reachable`).
+///
+/// Used at both ends of this module: `corrected_position` decides whether a
+/// *restored* position needs correcting, and `should_veto_snap` decides
+/// whether pinning the window where it currently sits is safe.
+#[cfg(any(windows, test))]
+fn window_is_reachable(window: Rect, monitors: &[Rect]) -> bool {
+    band_is_reachable(header_band(window), monitors)
+}
+
 /// Issue #30: decides whether `window`'s current position needs correcting
 /// given the monitors currently attached (`monitors`, each that monitor's
 /// *work area* — `MONITORINFO.rcWork`, excluding the taskbar, since a
@@ -313,13 +347,7 @@ fn corrected_position(window: Rect, monitors: &[Rect]) -> Option<(i32, i32)> {
         return None;
     }
 
-    let band = Rect {
-        left: window.left,
-        top: window.top,
-        right: window.right,
-        bottom: window.top + HEADER_BAND_HEIGHT,
-    };
-    if band_is_reachable(band, monitors) {
+    if window_is_reachable(window, monitors) {
         return None;
     }
 
@@ -679,6 +707,52 @@ fn is_snap_shaped(proposed: Rect, monitors: &[Rect]) -> bool {
     })
 }
 
+/// Whether `window_proc` should countermand a `WM_WINDOWPOSCHANGING`
+/// proposal (`proposed`) for a window currently at `current`, given the
+/// monitors currently attached.
+///
+/// # Why shape alone isn't enough
+///
+/// `is_snap_shaped` is pure geometry: it can't tell a real Snap from any
+/// other non-app-driven `SetWindowPos` that happens to land on a monitor
+/// half/quarter/full rect. The case that actually bites is Windows' own
+/// orphaned-window recovery: unplug the monitor the overlay was living on
+/// and the shell repositions it onto a surviving display. If that target
+/// coincidentally matches a half or quarter, vetoing it pins the window
+/// where it is — off-screen, on a monitor that no longer exists, with no
+/// header left to grab and no way back short of hand-editing settings.json.
+///
+/// So the veto also requires that pinning the window is *survivable*: the
+/// rect it would be pinned at has to still be reachable (`window_is_reachable`
+/// — the same "can the user grab the header band" test `corrected_position`
+/// uses at startup). A window that is already stranded has nothing to lose
+/// by accepting the reposition, and everything to lose by refusing it.
+///
+/// This is deliberately ordering-independent rather than keyed off
+/// `WM_DISPLAYCHANGE`: the recovery `SetWindowPos` can arrive either side of
+/// that notification, but by the time it does the dead monitor is already
+/// out of `enumerate_monitor_work_areas`, so the reachability test sees the
+/// stranding either way. It also needs no timer and no suspension state that
+/// could leak and disable the veto for the rest of the session.
+///
+/// # Residual gap
+///
+/// A non-Snap, non-app-driven reposition of a window that *is* currently
+/// reachable, onto a rect that happens to match a half/quarter within
+/// `SNAP_SHAPE_TOLERANCE`, is still vetoed. Closing that would need a
+/// positive signal that a Snap gesture is in flight, and none exists for the
+/// paths this has to block: `WM_SYSCOMMAND`/`SC_MOVE`/`SC_SIZE` and
+/// `WM_ENTERSIZEMOVE` mark the OS's modal move/resize loops, which Win+Arrow
+/// and shell maximize never enter (and which `ui.rs`'s pointer-delta header
+/// drag and resize handles deliberately never enter either, so gating on
+/// them would block nothing and break nothing — it would just turn the veto
+/// off). The consequence of the remaining false positive is bounded: the
+/// window stays put somewhere the user can still drag it.
+#[cfg(any(windows, test))]
+fn should_veto_snap(current: Rect, proposed: Rect, monitors: &[Rect]) -> bool {
+    is_snap_shaped(proposed, monitors) && window_is_reachable(current, monitors)
+}
+
 /// Subclass ID passed to `SetWindowSubclass`; unique among any subclasses
 /// this crate installs on the same `HWND` (there's currently only this
 /// one).
@@ -696,11 +770,14 @@ const SNAP_BLOCKER_SUBCLASS_ID: usize = 1;
 ///   style bit at all — they show up here as a `WINDOWPOS` proposal whose
 ///   rect happens to be a monitor half/quarter (`is_snap_shaped`, reusing
 ///   `enumerate_monitor_work_areas`, the same monitor enumeration
-///   `clamp_window_to_visible_area` uses). Legitimate app-driven
-///   repositioning is exempted via `app_driven_reposition` (one
-///   `SetWindowPos` call) or `begin_app_driven_reposition` (a whole
-///   `ui.rs` move/resize gesture) — every such site must hold one, or it
-///   risks being vetoed here.
+///   `clamp_window_to_visible_area` uses) *and* the window is currently
+///   somewhere refusing the move still leaves it draggable
+///   (`should_veto_snap`, which keeps this from stranding the overlay when
+///   the shell is rescuing it off a monitor that just got unplugged).
+///   Legitimate app-driven repositioning is exempted via
+///   `app_driven_reposition` (one `SetWindowPos` call) or
+///   `begin_app_driven_reposition` (a whole `ui.rs` move/resize gesture) —
+///   every such site must hold one, or it risks being vetoed here.
 /// - `WM_SYSCOMMAND` / `SC_MAXIMIZE`: a backstop for the shell's maximize
 ///   command directly, independent of whatever rect it would propose.
 ///
@@ -756,9 +833,11 @@ unsafe extern "system" fn window_proc(
     _uidsubclass: usize,
     _dwrefdata: usize,
 ) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::Shell::DefSubclassProc;
     use windows::Win32::UI::WindowsAndMessaging::{
-        SC_MAXIMIZE, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING,
+        GetWindowRect, SC_MAXIMIZE, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS, WM_SYSCOMMAND,
+        WM_WINDOWPOSCHANGING,
     };
 
     if msg == WM_WINDOWPOSCHANGING && !app_driven_reposition_active() {
@@ -779,8 +858,31 @@ unsafe extern "system" fn window_proc(
                 right: windowpos.x + windowpos.cx,
                 bottom: windowpos.y + windowpos.cy,
             };
-            if is_snap_shaped(proposed, &enumerate_monitor_work_areas()) {
-                windowpos.flags = windowpos.flags | SWP_NOMOVE | SWP_NOSIZE;
+            // The veto pins the window at wherever it currently sits, so
+            // where that is decides whether refusing is safe — see
+            // `should_veto_snap` for the reasoning and for the residual
+            // false-positive window this still leaves open.
+            // SAFETY: `hwnd` is the window this subclass is installed on,
+            // alive and on the current thread for the duration of this
+            // callback; `current` is a valid, correctly-sized out-param.
+            let mut current = RECT::default();
+            if !unsafe { GetWindowRect(hwnd, &mut current) }.as_bool() {
+                // Without the current rect there's no way to tell a veto
+                // from a stranding, and letting a Snap through is the
+                // cheaper mistake of the two.
+                log::warn!(
+                    "GetWindowRect failed in the Snap blocker; letting this reposition through"
+                );
+            } else {
+                let current = Rect {
+                    left: current.left,
+                    top: current.top,
+                    right: current.right,
+                    bottom: current.bottom,
+                };
+                if should_veto_snap(current, proposed, &enumerate_monitor_work_areas()) {
+                    windowpos.flags = windowpos.flags | SWP_NOMOVE | SWP_NOSIZE;
+                }
             }
         }
     } else if msg == WM_SYSCOMMAND {
@@ -1050,5 +1152,49 @@ mod tests {
     fn no_monitors_is_never_snap_shaped() {
         let proposal = rect(0, 0, 960, 1040);
         assert!(!is_snap_shaped(proposal, &[]));
+    }
+
+    #[test]
+    fn snap_from_a_reachable_position_is_vetoed() {
+        // The shipped behaviour: the overlay sits somewhere ordinary, a
+        // Win+Arrow/shell snap proposes the left half, and it's refused.
+        let monitor = rect(0, 0, 1920, 1040);
+        let current = rect(400, 300, 800, 600);
+        let proposal = rect(0, 0, 960, 1040);
+        assert!(should_veto_snap(current, proposal, &[monitor]));
+    }
+
+    #[test]
+    fn snap_shaped_rescue_of_a_stranded_window_is_not_vetoed() {
+        // Regression guard for the veto's one damaging false positive: the
+        // overlay was sized to roughly half the screen on a second monitor,
+        // that monitor was unplugged, and Windows is repositioning it onto
+        // the survivor at a rect that happens to match that monitor's left
+        // half. Vetoing here would pin the window on the monitor that no
+        // longer exists, with no header to grab.
+        let survivor = rect(0, 0, 1920, 1040);
+        let current = rect(-1920, 0, -960, 1040);
+        let proposal = rect(0, 0, 960, 1040);
+        // Shape alone would say "veto"; the reachability precondition is
+        // the only thing standing between this proposal and a stranding.
+        assert!(is_snap_shaped(proposal, &[survivor]));
+        assert!(!should_veto_snap(current, proposal, &[survivor]));
+    }
+
+    #[test]
+    fn an_ordinary_reposition_is_never_vetoed() {
+        let monitor = rect(0, 0, 1920, 1040);
+        let current = rect(400, 300, 800, 600);
+        let proposal = rect(450, 320, 850, 620);
+        assert!(!should_veto_snap(current, proposal, &[monitor]));
+    }
+
+    #[test]
+    fn a_stranded_window_is_never_vetoed_even_for_a_maximize_shape() {
+        let monitor = rect(0, 0, 1920, 1040);
+        // Parked at Windows' minimize coordinates: nothing grabbable.
+        let current = rect(-32000, -32000, -31600, -31700);
+        let proposal = rect(0, 0, 1920, 1040);
+        assert!(!should_veto_snap(current, proposal, &[monitor]));
     }
 }
