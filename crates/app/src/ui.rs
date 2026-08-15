@@ -11,7 +11,7 @@ use bpsr_meter::{EncounterInfo, PlayerRow, Snapshot};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 
-use crate::icons::ClassIcons;
+use crate::icons::{ClassIcons, ToolbarIcon, ToolbarIcons};
 use crate::settings::{ColumnKind, Settings};
 
 /// Commands the overlay emits for the app layer to consume.
@@ -37,11 +37,28 @@ pub struct OverlayApp {
     rx_snapshot: Receiver<Snapshot>,
     tx_command: Sender<UiCommand>,
     tx_settings: Sender<Settings>,
-    /// Class icon textures (issue #9). `None` until the first `ui()` call —
-    /// `ClassIcons::load` needs an `egui::Context`, which does not exist yet
-    /// at `OverlayApp::new` — then loaded exactly once for the process's
-    /// life.
-    icons: Option<ClassIcons>,
+    /// Class icon and toolbar icon textures (issues #9, #41), bundled behind
+    /// one `Option` so there is a single lazy-init site (see `Icons::load`)
+    /// rather than one per icon set. `None` until the first `ui()` call —
+    /// texture loading needs an `egui::Context`, which does not exist yet at
+    /// `OverlayApp::new` — then loaded exactly once for the process's life.
+    icons: Option<Icons>,
+}
+
+/// All icon textures the overlay paints, bundled so `OverlayApp` has exactly
+/// one lazily-loaded field for them instead of one per icon set (issue #41).
+struct Icons {
+    classes: ClassIcons,
+    toolbar: ToolbarIcons,
+}
+
+impl Icons {
+    fn load(ctx: &egui::Context) -> Self {
+        Self {
+            classes: ClassIcons::load(ctx),
+            toolbar: ToolbarIcons::load(ctx),
+        }
+    }
 }
 
 impl OverlayApp {
@@ -96,8 +113,8 @@ impl eframe::App for OverlayApp {
 
         // Loaded once, lazily: the `egui::Context` above isn't available yet
         // at `OverlayApp::new`, so the first frame is what actually uploads
-        // the icon textures (issue #9); every later frame reuses them.
-        let icons = self.icons.get_or_insert_with(|| ClassIcons::load(&ctx));
+        // the icon textures (issues #9, #41); every later frame reuses them.
+        let icons = self.icons.get_or_insert_with(|| Icons::load(&ctx));
 
         egui::CentralPanel::default()
             .frame(
@@ -114,6 +131,7 @@ impl eframe::App for OverlayApp {
                     &self.tx_command,
                     &mut self.settings,
                     &self.tx_settings,
+                    &icons.toolbar,
                 );
 
                 if let StatusLine::Error(msg) = &self.status {
@@ -121,7 +139,12 @@ impl eframe::App for OverlayApp {
                 }
 
                 ui.separator();
-                draw_rows(ui, &self.snapshot, &self.settings.ordered_columns(), icons);
+                draw_rows(
+                    ui,
+                    &self.snapshot,
+                    &self.settings.ordered_columns(),
+                    &icons.classes,
+                );
             });
 
         track_window_position(&ctx, &mut self.settings, &self.tx_settings);
@@ -188,6 +211,7 @@ fn draw_header(
     tx_command: &Sender<UiCommand>,
     settings: &mut Settings,
     tx_settings: &Sender<Settings>,
+    toolbar: &ToolbarIcons,
 ) {
     let title = encounter_title(&snapshot.encounter);
     let subtitle = encounter_subtitle(&snapshot.encounter);
@@ -228,19 +252,31 @@ fn draw_header(
         // Purely an affordance — the band above is what actually drags.
         ui.label("☰");
 
+        // Decorative — painted immediately left of the duration text, no
+        // click target and no tooltip of its own (issue #41). Skipped
+        // entirely if the PNG somehow failed to decode, same as a row's
+        // class icon (`draw_row`) skips painting rather than leaving a
+        // broken-image placeholder.
+        if let Some(clock) = toolbar.get(ToolbarIcon::Clock) {
+            ui.add(toolbar_icon_image(clock));
+        }
         ui.label(fmt_duration(snapshot.duration_ms));
         ui.label(format!("{} DPS", fmt_short(snapshot.total_dps as i64)));
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // U+2715 (✕) isn't covered by any vendored `epaint_default_fonts`
-            // TTF and rendered as a tofu square (issue #14). U+00D7 (×) is
-            // covered by the default proportional font (Ubuntu-Light /
-            // Hack-Regular), which is what this button actually uses.
-            if ui.button("×").clicked() {
+            // Raster PNG icons throughout this row (issue #41), not glyphs —
+            // neither vendored `epaint_default_fonts` TTF covers a close
+            // ✕/gear ⚙/etc. glyph (issue #14's tofu-square problem), the
+            // same reason the old "×"/"S" glyphs here were themselves picked
+            // for font coverage rather than looks.
+            if icon_button(ui, toolbar.get(ToolbarIcon::Close), "×", "Close").clicked() {
                 let _ = tx_command.try_send(UiCommand::Quit);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            // Plain ASCII, covered by every vendored font (issue #14).
+            // No minimize icon exists in the upstream ShinraMeter icon set
+            // this issue draws from (issue #41's scope note), so this one is
+            // painted procedurally — a short horizontal line — rather than
+            // left as the old "_" glyph or reusing an unrelated asset.
             //
             // There's no tray icon and no other in-app restore path: this
             // relies entirely on the OS taskbar entry to un-minimize.
@@ -250,17 +286,88 @@ fn draw_header(
             // borderless and always-on-top. If `viewport()` ever gains a
             // taskbar-hiding or tool-window setting, this button needs a
             // real restore mechanism first.
-            if ui.button("_").clicked() {
+            if minimize_button(ui).clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
-            if ui.button("Reset").clicked() {
+            if icon_button(ui, toolbar.get(ToolbarIcon::Reset), "Reset", "Reset").clicked() {
                 let _ = tx_command.try_send(UiCommand::Reset);
             }
-            // Plain ASCII, covered by every vendored font (issue #14) —
-            // the gear glyph (U+2699) isn't in either bundled TTF.
-            draw_settings_menu(ui, settings, tx_settings);
+            draw_settings_menu(
+                ui,
+                settings,
+                tx_settings,
+                toolbar.get(ToolbarIcon::Settings),
+            );
         });
     });
+}
+
+/// Fixed display size, in points, every toolbar icon (issue #41) is drawn
+/// at — independent of the source PNGs' own resolution (48x48 in the
+/// upstream ShinraMeter set), so a texture swap can never change a button's
+/// footprint. Chosen to land `icon_button`'s total height (icon plus
+/// `apply_theme`'s `button_padding.y` on both sides) exactly on
+/// `egui::Style::default().spacing.interact_size.y` (18.0), the same height
+/// `header_band_height` already budgets for the button row — see
+/// `north_strip_is_not_swallowed_by_the_header`-style header-band tests, and
+/// this module's own `toolbar_icon_button_height_matches_interact_size`.
+const TOOLBAR_ICON_SIZE: f32 = 14.0;
+
+/// Builds an `egui::Image` for a loaded toolbar icon texture at the fixed
+/// `TOOLBAR_ICON_SIZE`, overriding whatever size the source PNG itself
+/// carries (`SizedTexture::from_handle` would use the PNG's native 48x48
+/// instead).
+fn toolbar_icon_image(handle: &egui::TextureHandle) -> egui::Image<'static> {
+    egui::Image::from_texture(egui::load::SizedTexture::new(
+        handle.id(),
+        egui::Vec2::splat(TOOLBAR_ICON_SIZE),
+    ))
+}
+
+/// Paints one toolbar icon button and attaches its tooltip in one place
+/// (issue #41's "meaning is not lost" requirement) so every call site gets
+/// both without repeating either. Falls back to `fallback_glyph` — the
+/// original text/glyph button this replaces — when `texture` is `None`
+/// (belt-and-braces: `ToolbarIcons`' bytes are compile-time constants,
+/// never actually expected to fail to decode, same reasoning as
+/// `ClassIcons::get`).
+fn icon_button(
+    ui: &mut egui::Ui,
+    texture: Option<&egui::TextureHandle>,
+    fallback_glyph: &str,
+    tooltip: &str,
+) -> egui::Response {
+    let response = match texture {
+        Some(handle) => ui.add(egui::Button::image(toolbar_icon_image(handle))),
+        None => ui.button(fallback_glyph),
+    };
+    response.on_hover_text(tooltip)
+}
+
+/// Paints the minimize button: no icon asset for it exists in the upstream
+/// ShinraMeter set (issue #41), so this draws a short horizontal line with
+/// `ui.painter()` directly rather than via a texture. The allocated rect
+/// matches `icon_button`'s footprint exactly — `TOOLBAR_ICON_SIZE` plus
+/// `apply_theme`'s `button_padding` on all sides — so this button doesn't
+/// stand out as a different size in the row, and `header_band_height` stays
+/// correct without special-casing it.
+fn minimize_button(ui: &mut egui::Ui) -> egui::Response {
+    let padding = ui.spacing().button_padding;
+    let size = egui::Vec2::splat(TOOLBAR_ICON_SIZE) + 2.0 * padding;
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let half_width = TOOLBAR_ICON_SIZE / 2.0;
+        let y = rect.center().y;
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.center().x - half_width, y),
+                egui::pos2(rect.center().x + half_width, y),
+            ],
+            egui::Stroke::new(1.5, visuals.fg_stroke.color),
+        );
+    }
+    response.on_hover_text("Minimize")
 }
 
 /// Header title text (issue #9 slice 2; gated to boss fights by issue #42):
@@ -368,11 +475,21 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
     );
 }
 
-/// The settings menu: a compact dropdown (egui's `menu_button`, so it needs
-/// no extra open/closed state of its own) letting the user toggle which
-/// stat columns render (issue #13).
-fn draw_settings_menu(ui: &mut egui::Ui, settings: &mut Settings, tx_settings: &Sender<Settings>) {
-    ui.menu_button("S", |ui| {
+/// The settings menu: a compact dropdown (egui's `menu_button`/
+/// `menu_image_button`, so it needs no extra open/closed state of its own)
+/// letting the user toggle which stat columns render (issue #13). The
+/// trigger is the gear icon (issue #41) when its texture decoded, else the
+/// original `"S"` glyph — same fallback `icon_button` uses, but
+/// `menu_button`/`menu_image_button` aren't unifiable behind one helper the
+/// way plain buttons are (they return different widget types), so the
+/// `match` is inlined here instead.
+fn draw_settings_menu(
+    ui: &mut egui::Ui,
+    settings: &mut Settings,
+    tx_settings: &Sender<Settings>,
+    icon: Option<&egui::TextureHandle>,
+) {
+    let add_contents = |ui: &mut egui::Ui| {
         ui.label("Columns");
         let mut changed = false;
         for col in ColumnKind::ALL {
@@ -402,7 +519,16 @@ fn draw_settings_menu(ui: &mut egui::Ui, settings: &mut Settings, tx_settings: &
             // correct for the rest of this session.
             let _ = tx_settings.send(settings.clone());
         }
-    });
+    };
+
+    let trigger = match icon {
+        Some(handle) => {
+            ui.menu_image_button(toolbar_icon_image(handle), add_contents)
+                .response
+        }
+        None => ui.menu_button("S", add_contents).response,
+    };
+    trigger.on_hover_text("Settings");
 }
 
 /// Width of the invisible edge strips that start a resize, in points.
@@ -1718,6 +1844,62 @@ mod tests {
 
         assert!(sent.is_empty(), "a bogus position must not send");
         assert_eq!(settings.window_position, Some([100.0, 200.0]));
+    }
+
+    // -- toolbar icon buttons (issue #41) ----------------------------------
+
+    /// `icon_button`'s and `minimize_button`'s footprint must land exactly
+    /// on `interact_size.y` — the height `header_band_height` already
+    /// budgets the button row at — or the header band and the actually
+    /// rendered row would drift apart (the same class of bug the
+    /// `header_band_height_*` tests above guard against for the subtitle).
+    #[test]
+    fn toolbar_icon_button_height_matches_interact_size() {
+        // `apply_theme` is what actually sets `button_padding` at runtime
+        // (`egui::Style::default()`'s own padding is a different value) —
+        // exercise that, not the untouched default, or this test would
+        // check a style `draw_header` never actually runs under.
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut padding = egui::Vec2::ZERO;
+        let mut interact_size_y = 0.0;
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            padding = ui.spacing().button_padding;
+            interact_size_y = ui.spacing().interact_size.y;
+        })
+        .drop_without_applying_deltas();
+        let button_height = TOOLBAR_ICON_SIZE + 2.0 * padding.y;
+        assert_eq!(button_height, interact_size_y);
+    }
+
+    /// `icon_button` must fall back to the original glyph, not paint
+    /// nothing or panic, when the texture failed to decode (belt-and-braces,
+    /// mirrors `ClassIcons::get`'s `None` case).
+    #[test]
+    fn icon_button_falls_back_to_glyph_when_texture_is_none() {
+        let ctx = egui::Context::default();
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let response = icon_button(ui, None, "×", "Close");
+            // A real widget was allocated — a non-zero rect — not a no-op.
+            assert!(response.rect.width() > 0.0);
+            assert!(response.rect.height() > 0.0);
+        })
+        .drop_without_applying_deltas();
+    }
+
+    /// `minimize_button`'s allocated rect must match `icon_button`'s
+    /// footprint exactly (`TOOLBAR_ICON_SIZE` plus `button_padding` on all
+    /// sides), so it doesn't stand out as an oddly-sized button in the row.
+    #[test]
+    fn minimize_button_footprint_matches_icon_button_size() {
+        let ctx = egui::Context::default();
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let response = minimize_button(ui);
+            let padding = ui.spacing().button_padding;
+            let expected = TOOLBAR_ICON_SIZE + 2.0 * padding.y;
+            assert_eq!(response.rect.height(), expected);
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
