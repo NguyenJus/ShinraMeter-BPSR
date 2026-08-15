@@ -1,4 +1,4 @@
-//! `shinra-bpsr` — capture -> protocol -> meter -> overlay (plan §T4.2).
+//! `ShinraMeter-BPSR` — capture -> protocol -> meter -> overlay (plan §T4.2).
 //!
 //! A capture failure is never fatal: the overlay still runs and shows
 //! `CaptureError::user_message()` in its status banner.
@@ -26,7 +26,7 @@ const EVENT_CAPACITY: usize = 4096;
 const COMMAND_CAPACITY: usize = 64;
 
 /// Where the cross-session uid -> (name, class) cache (issue #12) lives:
-/// `%APPDATA%\shinra-bpsr\names.json`. `bpsr-meter` deliberately knows
+/// `%APPDATA%\ShinraMeter-BPSR\names.json`. `bpsr-meter` deliberately knows
 /// nothing about this path (it's caller-supplied, no Windows-specific
 /// assumptions, no `directories` crate) — the app crate owns picking it.
 /// Falls back to a current-directory file, logged, if `APPDATA` isn't set
@@ -34,13 +34,13 @@ const COMMAND_CAPACITY: usize = 64;
 fn names_cache_path() -> PathBuf {
     match std::env::var("APPDATA") {
         Ok(appdata) if !appdata.is_empty() => PathBuf::from(appdata)
-            .join("shinra-bpsr")
+            .join("ShinraMeter-BPSR")
             .join("names.json"),
         _ => {
             log::warn!(
                 "APPDATA is not set; falling back to a working-directory file for the name cache"
             );
-            PathBuf::from("shinra-bpsr-names.json")
+            PathBuf::from("ShinraMeter-BPSR-names.json")
         }
     }
 }
@@ -94,7 +94,7 @@ fn main() -> eframe::Result {
     };
 
     let result = eframe::run_native(
-        "shinra-bpsr",
+        "ShinraMeter-BPSR",
         native_options,
         Box::new(move |cc| {
             fonts::install_cjk_fallback(&cc.egui_ctx);

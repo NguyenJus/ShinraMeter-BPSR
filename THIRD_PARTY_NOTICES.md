@@ -1,6 +1,6 @@
 # Third-party notices
 
-`shinra-bpsr` redistributes the following third-party software inside its
+`ShinraMeter-BPSR` redistributes the following third-party software inside its
 executable.
 
 ## WinDivert 2.2.2
@@ -16,12 +16,12 @@ executable.
 
 Both files are the official pre-built, digitally signed x64 release binaries,
 embedded verbatim and unmodified. They are unpacked to
-`%LOCALAPPDATA%\shinra-bpsr\windivert\<version>\` at runtime and the library
+`%LOCALAPPDATA%\ShinraMeter-BPSR\windivert\<version>\` at runtime and the library
 is loaded dynamically from there, so the WinDivert components remain separate,
 replaceable files: substituting your own build of the same version requires
 only replacing them in that directory.
 
-`shinra-bpsr` itself is licensed GPL-3.0-only (see `LICENSE`), with which
+`ShinraMeter-BPSR` itself is licensed GPL-3.0-only (see `LICENSE`), with which
 WinDivert's LGPL-3.0 option is compatible.
 
 ## BPSR-ZDPS class icons
@@ -100,7 +100,7 @@ WinDivert's LGPL-3.0 option is compatible.
 - Files: `crates/app/assets/shinra.ico`
 - Upstream: <https://github.com/neowutran/ShinraMeter> (`resources/img/shinra.ico`)
 - License: MIT
-- Embedded as resource id 2 by `crates/app/shinra-bpsr.rc`, and used as the
+- Embedded as resource id 2 by `crates/app/ShinraMeter-BPSR.rc`, and used as the
   executable's Explorer/taskbar icon and the notification-area icon. It is
   upstream's 神羅 mark, carried over deliberately: this project is a Blue
   Protocol port of ShinraMeter and shares its name. The upstream .ico ships

@@ -9,8 +9,8 @@
 //! notification area and which Explorer and the taskbar pick up on their own.
 
 fn main() {
-    println!("cargo:rerun-if-changed=shinra-bpsr.rc");
-    println!("cargo:rerun-if-changed=shinra-bpsr.manifest");
+    println!("cargo:rerun-if-changed=ShinraMeter-BPSR.rc");
+    println!("cargo:rerun-if-changed=ShinraMeter-BPSR.manifest");
     println!("cargo:rerun-if-changed=assets/shinra.ico");
 
     // Only Windows binaries have a resource section; on a host build (the
@@ -22,7 +22,7 @@ fn main() {
     // `manifest_required` fails the build rather than silently producing an
     // executable that never elevates — a UAC prompt that quietly went missing
     // would surface much later as an unexplained capture failure.
-    embed_resource::compile("shinra-bpsr.rc", embed_resource::NONE)
+    embed_resource::compile("ShinraMeter-BPSR.rc", embed_resource::NONE)
         .manifest_required()
         .expect("embedding the application manifest");
 }

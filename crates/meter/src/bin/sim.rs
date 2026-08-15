@@ -6,7 +6,7 @@
 //!
 //! ## Why a `bpsr-meter` binary, not an `crates/app` flag
 //!
-//! `crates/app` (`shinra-bpsr`) pulls in `eframe`/GUI deps and is excluded
+//! `crates/app` (`ShinraMeter-BPSR`) pulls in `eframe`/GUI deps and is excluded
 //! from `cargo test --workspace` in CI (see
 //! `crates/protocol/src/bin/inspect-replay.rs`'s doc comment for the same
 //! reasoning applied there). A `src/bin/` binary in `bpsr-meter` needs no

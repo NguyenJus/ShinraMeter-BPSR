@@ -245,7 +245,7 @@ mod tests {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "shinra-bpsr-inspect-test-{tag}-{}-{n}.jsonl",
+            "ShinraMeter-BPSR-inspect-test-{tag}-{}-{n}.jsonl",
             std::process::id()
         ))
     }
@@ -289,7 +289,7 @@ mod tests {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "shinra-bpsr-inspect-test-nested-{}-{n}",
+            "ShinraMeter-BPSR-inspect-test-nested-{}-{n}",
             std::process::id()
         ));
         let path = dir.join("dump.jsonl");

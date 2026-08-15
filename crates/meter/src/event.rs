@@ -6,7 +6,7 @@
 //! decoupling them lets each be implemented and tested in isolation). These
 //! types intentionally mirror the shape, field names, and semantics the plan
 //! pins for the protocol -> meter boundary (`ProtocolEvent` / `DamageEvent` /
-//! `PlayerInfo` / `EnemyHp` / `Class`); the `shinra-bpsr` app crate is
+//! `PlayerInfo` / `EnemyHp` / `Class`); the `ShinraMeter-BPSR` app crate is
 //! responsible for mapping `bpsr_protocol::*` events onto these before
 //! calling `Meter::apply`.
 

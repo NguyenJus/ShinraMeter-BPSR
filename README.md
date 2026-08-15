@@ -1,4 +1,4 @@
-# shinra-bpsr
+# ShinraMeter-BPSR
 
 Minimal damage tracker for Blue Protocol: Star Resonance. A borderless, always-on-top overlay displaying per-player damage totals, DPS, contribution %, crit rate, and hit count. Styled after ShinraMeter. Designed for Windows with packet sniffing via WinDivert; developed cross-platform on WSL.
 
@@ -8,7 +8,7 @@ The pipeline flows: **protocol crate** (frame splitting, decompression, protobuf
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│ shinra-bpsr (app)                                       │
+│ ShinraMeter-BPSR (app)                                  │
 │   egui overlay ◄─── Snapshot (dps, damage, player rows) │
 │      │                                                   │
 │      ├─ Pipeline (meter state, per-100ms snapshots)     │
@@ -54,17 +54,17 @@ Full build for Windows:
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-The binary lands at `target/x86_64-pc-windows-gnu/release/shinra-bpsr.exe`.
+The binary lands at `target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe`.
 
 ### Windows Runtime
 
-Nothing to install: `shinra-bpsr.exe` is self-contained. Download it, double-click it, and accept the UAC prompt.
+Nothing to install: `ShinraMeter-BPSR.exe` is self-contained. Download it, double-click it, and accept the UAC prompt.
 
-The WinDivert 2.2.2 runtime (`WinDivert.dll` and the signed `WinDivert64.sys` kernel driver) is embedded in the executable and unpacked to `%LOCALAPPDATA%\shinra-bpsr\windivert\2.2.2\` on first run — the driver has to exist as a real file because Windows loads kernel drivers by path, but the user never handles it. Subsequent runs reuse the unpacked copy and write nothing.
+The WinDivert 2.2.2 runtime (`WinDivert.dll` and the signed `WinDivert64.sys` kernel driver) is embedded in the executable and unpacked to `%LOCALAPPDATA%\ShinraMeter-BPSR\windivert\2.2.2\` on first run — the driver has to exist as a real file because Windows loads kernel drivers by path, but the user never handles it. Subsequent runs reuse the unpacked copy and write nothing.
 
 The exe carries a manifest requesting `requireAdministrator`, so Windows prompts for elevation on launch; WinDivert installs its driver through the Service Control Manager, which is administrator-only.
 
-To uninstall, delete the exe and `%LOCALAPPDATA%\shinra-bpsr\`.
+To uninstall, delete the exe and `%LOCALAPPDATA%\ShinraMeter-BPSR\`.
 
 #### Updating the bundled WinDivert
 
@@ -78,7 +78,7 @@ Run all unit tests on the host:
 cargo test --workspace
 ```
 
-The `bpsr-protocol`, `bpsr-meter`, and `bpsr-capture` (tcp/detect) crates are fully testable on Linux; `shinra-bpsr` tests only pure formatting helpers.
+The `bpsr-protocol`, `bpsr-meter`, and `bpsr-capture` (tcp/detect) crates are fully testable on Linux; `ShinraMeter-BPSR` tests only pure formatting helpers.
 
 ## Troubleshooting
 
@@ -94,7 +94,7 @@ Another packet-capture tool holds an older WinDivert. Close it, or reboot, and r
 Start it: `services.msc` → Base Filtering Engine → Start.
 
 ### "Windows could not find the WinDivert driver file"
-The driver is unpacked to `%LOCALAPPDATA%\shinra-bpsr\windivert\<version>\` at startup; this means it is not there when WinDivert looks. Check that antivirus is not quarantining it, then delete that folder to force a clean unpack.
+The driver is unpacked to `%LOCALAPPDATA%\ShinraMeter-BPSR\windivert\<version>\` at startup; this means it is not there when WinDivert looks. Check that antivirus is not quarantining it, then delete that folder to force a clean unpack.
 
 ### "Run as Administrator"
 The manifest normally makes Windows prompt for this automatically, so seeing this means elevation was declined or stripped. Right-click the exe → Run as administrator.

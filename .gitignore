@@ -13,12 +13,12 @@ docs/reference/
 
 # The name cache `main.rs` falls back to when there is no %APPDATA% — i.e. any
 # time the overlay is run on a dev box rather than on Windows.
-/shinra-bpsr-names.json
+/ShinraMeter-BPSR-names.json
 
 # Packet-inspection diagnostic dumps (issue #25, SHINRA_INSPECT=1). These
 # contain player names and other identifying traffic captured from a live
 # session — never commit one or attach it to an issue/PR; mint a minimal
 # synthetic fixture instead.
-shinra-bpsr-inspect-dump-*.jsonl
+ShinraMeter-BPSR-inspect-dump-*.jsonl
 inspect-dumps/
 *.inspect-dump.jsonl

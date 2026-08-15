@@ -3,6 +3,27 @@
 version = 4
 
 [[package]]
+name = "ShinraMeter-BPSR"
+version = "0.1.0"
+dependencies = [
+ "bpsr-capture",
+ "bpsr-meter",
+ "bpsr-protocol",
+ "bpsr-test-support",
+ "crossbeam-channel",
+ "eframe",
+ "egui",
+ "embed-resource",
+ "env_logger",
+ "image",
+ "log",
+ "raw-window-handle",
+ "serde",
+ "serde_json",
+ "windows 0.48.0",
+]
+
+[[package]]
 name = "ab_glyph"
 version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3025,27 +3046,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
-]
-
-[[package]]
-name = "shinra-bpsr"
-version = "0.1.0"
-dependencies = [
- "bpsr-capture",
- "bpsr-meter",
- "bpsr-protocol",
- "bpsr-test-support",
- "crossbeam-channel",
- "eframe",
- "egui",
- "embed-resource",
- "env_logger",
- "image",
- "log",
- "raw-window-handle",
- "serde",
- "serde_json",
- "windows 0.48.0",
 ]
 
 [[package]]

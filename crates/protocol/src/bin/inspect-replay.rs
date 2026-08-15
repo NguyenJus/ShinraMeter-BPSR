@@ -16,8 +16,8 @@
 //!
 //! ## Why this lives here (`crates/protocol/src/bin/`), not the app crate
 //!
-//! CI runs `cargo test --workspace --exclude shinra-bpsr` — the app crate
-//! (`shinra-bpsr`) is excluded because `eframe` drags in GUI deps that don't
+//! CI runs `cargo test --workspace --exclude ShinraMeter-BPSR` — the app crate
+//! (`ShinraMeter-BPSR`) is excluded because `eframe` drags in GUI deps that don't
 //! build/test cleanly in a headless CI environment. This binary must stay
 //! host-runnable and host-testable there, and it only needs
 //! `bpsr_protocol::{decode, frame, inspect, pb}`, all of which already live
