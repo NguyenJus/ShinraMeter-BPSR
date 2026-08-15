@@ -263,15 +263,24 @@ fn draw_header(
     });
 }
 
-/// Header title text (issue #9 slice 2): the boss name when known, else its
-/// raw monster id, else a dim placeholder. Always returns something —
-/// `draw_header` renders this line unconditionally so the header's height
-/// never jitters between frames depending on whether a target is known.
+/// Header title text (issue #9 slice 2; gated to boss fights by issue #42):
+/// the boss name when the current target is a recognized boss, else blank
+/// for a non-boss pull, else "No target" when nothing has been hit yet.
+/// Always returns something (never omits the line) so `draw_header` can
+/// render it unconditionally and the header's height never jitters between
+/// frames depending on whether a target — or a name for it — is known.
+///
+/// "No target" is kept for the genuinely-empty-encounter case (no target at
+/// all), but a non-boss pull is a real target we're deliberately not naming
+/// — showing `Monster #{id}` there was dropped rather than kept as the
+/// non-boss fallback, since a raw id would read as an unresolved boss name
+/// rather than the intentional omission it actually is (the reference meter
+/// only names boss fights; see `tables::is_boss_monster`).
 fn encounter_title(e: &EncounterInfo) -> String {
-    match (e.boss_name, e.boss_monster_id) {
-        (Some(name), _) => name.to_string(),
-        (None, Some(id)) => format!("Monster #{id}"),
-        (None, None) => "No target".to_string(),
+    match e.boss_monster_id {
+        None => "No target".to_string(),
+        Some(_) if e.is_boss => e.boss_name.map(str::to_string).unwrap_or_default(),
+        Some(_) => String::new(),
     }
 }
 
@@ -871,23 +880,41 @@ mod tests {
     // -- encounter title/subtitle (issue #9 slice 2) -----------------------
 
     #[test]
-    fn title_shows_boss_name_when_known() {
+    fn title_shows_boss_name_when_known_boss() {
         let e = EncounterInfo {
             boss_monster_id: Some(103),
             boss_name: Some("Rathalos"),
+            is_boss: true,
             ..Default::default()
         };
         assert_eq!(encounter_title(&e), "Rathalos");
     }
 
     #[test]
-    fn title_shows_monster_id_when_name_unknown() {
+    fn title_blank_for_unnamed_non_boss_id() {
         let e = EncounterInfo {
             boss_monster_id: Some(999_999),
             boss_name: None,
+            is_boss: false,
             ..Default::default()
         };
-        assert_eq!(encounter_title(&e), "Monster #999999");
+        assert_eq!(encounter_title(&e), "");
+    }
+
+    #[test]
+    fn title_blank_for_named_but_non_boss_id() {
+        // issue #42: a trash/monster pull (non-boss `boss_uid` target) shows
+        // no name at all, even when the monster happens to have one in the
+        // community table — `Meter::snapshot` already nulls `boss_name` for
+        // this case, but this guards `encounter_title` itself against ever
+        // falling back to a name (or a raw id) for a known-non-boss target.
+        let e = EncounterInfo {
+            boss_monster_id: Some(10_900),
+            boss_name: None,
+            is_boss: false,
+            ..Default::default()
+        };
+        assert_eq!(encounter_title(&e), "");
     }
 
     #[test]
