@@ -58,6 +58,12 @@ pub struct PlayerInfo {
     /// or `CharBaseInfo.fight_point` — not every packet carries it, so this is
     /// `None` rather than `Some(0)` when absent (issue #15).
     pub ability_score: Option<u32>,
+    /// Season level, sourced from `attr_id::SEASON_LEVEL`. `None` rather than
+    /// `Some(0)` when absent (issue #15).
+    pub season_level: Option<u32>,
+    /// Season strength, sourced from `attr_id::SEASON_STRENGTH`. `None`
+    /// rather than `Some(0)` when absent (issue #15).
+    pub season_strength: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
