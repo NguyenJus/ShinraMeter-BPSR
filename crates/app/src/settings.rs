@@ -773,7 +773,11 @@ mod tests {
             ColumnKind::SharePct,
             ColumnKind::Hits,
         ] {
-            assert_eq!(kind.spec().color, Color32::WHITE, "{kind:?} should stay white");
+            assert_eq!(
+                kind.spec().color,
+                Color32::WHITE,
+                "{kind:?} should stay white"
+            );
         }
     }
 

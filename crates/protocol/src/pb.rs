@@ -353,10 +353,16 @@ mod tests {
     #[test]
     fn is_imagine_profession_id_matches_exactly_the_documented_four() {
         for id in IMAGINE_PROFESSION_IDS {
-            assert!(is_imagine_profession_id(id), "id {id} should be an Imagine id");
+            assert!(
+                is_imagine_profession_id(id),
+                "id {id} should be an Imagine id"
+            );
         }
         for id in [0, 1, 6, 7, 9, 13, 999] {
-            assert!(!is_imagine_profession_id(id), "id {id} should not be an Imagine id");
+            assert!(
+                !is_imagine_profession_id(id),
+                "id {id} should not be an Imagine id"
+            );
         }
     }
 }
