@@ -558,11 +558,11 @@ fn draw_row(
     // row's full width — the icon slot is reserved on top of it, not cut
     // out of it. Split into a subtle wash plus a crisp bottom underline
     // (issue #43) rather than one flat fill, matching the reference meter.
-    let (wash_rect, underline_rect, wash_color, underline_color) =
-        share_bar_paints(rect, row.share_pct);
-    ui.painter().rect_filled(wash_rect, 2.0, wash_color);
+    let paints = share_bar_paints(rect, row.share_pct);
     ui.painter()
-        .rect_filled(underline_rect, 0.0, underline_color);
+        .rect_filled(paints.wash_rect, 2.0, paints.wash_color);
+    ui.painter()
+        .rect_filled(paints.underline_rect, 0.0, paints.underline_color);
 
     // The icon slot (issue #9) is reserved at a fixed offset regardless of
     // whether this row's class has an icon, so names stay left-aligned in a
@@ -632,16 +632,26 @@ const SHARE_BAR_UNDERLINE_ALPHA: u8 = 220;
 /// the row itself — at small row heights.
 const SHARE_BAR_UNDERLINE_THICKNESS: f32 = 2.0;
 
+/// The two paints that make up a row's damage-share bar (issue #43): a
+/// translucent wash across the full share-scaled width, and a thin,
+/// more-opaque underline strip along its bottom edge. Named fields rather
+/// than a positional tuple so a wash/underline (or rect/color) mix-up at the
+/// `draw_row` call site fails to compile instead of silently swapping which
+/// paint lands where.
+struct ShareBarPaints {
+    wash_rect: egui::Rect,
+    underline_rect: egui::Rect,
+    wash_color: egui::Color32,
+    underline_color: egui::Color32,
+}
+
 /// Computes the two paints that make up a row's damage-share bar (issue
 /// #43): a translucent wash across the full share-scaled width, and a thin,
 /// more-opaque underline strip along its bottom edge so the share boundary
 /// reads crisply even though the wash itself is subtle. Pure geometry/color
 /// math with no `egui::Ui` dependency, so it's unit-testable on its own —
 /// `draw_row` just paints whatever it returns.
-fn share_bar_paints(
-    rect: egui::Rect,
-    share_pct: f32,
-) -> (egui::Rect, egui::Rect, egui::Color32, egui::Color32) {
+fn share_bar_paints(rect: egui::Rect, share_pct: f32) -> ShareBarPaints {
     let bar_frac = (share_pct / 100.0).clamp(0.0, 1.0);
     let bar_width = rect.width() * bar_frac;
 
@@ -657,7 +667,12 @@ fn share_bar_paints(
     let wash_color = egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_WASH_ALPHA);
     let underline_color = egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_UNDERLINE_ALPHA);
 
-    (wash_rect, underline_rect, wash_color, underline_color)
+    ShareBarPaints {
+        wash_rect,
+        underline_rect,
+        wash_color,
+        underline_color,
+    }
 }
 
 /// Square side of the per-row class icon (issue #9), roughly the row's text
@@ -1357,25 +1372,25 @@ mod tests {
     #[test]
     fn share_bar_full_share_spans_the_full_width() {
         let rect = share_bar_rect();
-        let (wash_rect, underline_rect, _, _) = share_bar_paints(rect, 100.0);
-        assert_eq!(wash_rect.width(), rect.width());
-        assert_eq!(underline_rect.width(), rect.width());
+        let paints = share_bar_paints(rect, 100.0);
+        assert_eq!(paints.wash_rect.width(), rect.width());
+        assert_eq!(paints.underline_rect.width(), rect.width());
     }
 
     #[test]
     fn share_bar_zero_share_has_no_width() {
         let rect = share_bar_rect();
-        let (wash_rect, underline_rect, _, _) = share_bar_paints(rect, 0.0);
-        assert_eq!(wash_rect.width(), 0.0);
-        assert_eq!(underline_rect.width(), 0.0);
+        let paints = share_bar_paints(rect, 0.0);
+        assert_eq!(paints.wash_rect.width(), 0.0);
+        assert_eq!(paints.underline_rect.width(), 0.0);
     }
 
     #[test]
     fn share_bar_partial_share_scales_both_rects_identically() {
         let rect = share_bar_rect();
-        let (wash_rect, underline_rect, _, _) = share_bar_paints(rect, 40.0);
-        assert_eq!(wash_rect.width(), rect.width() * 0.4);
-        assert_eq!(underline_rect.width(), rect.width() * 0.4);
+        let paints = share_bar_paints(rect, 40.0);
+        assert_eq!(paints.wash_rect.width(), rect.width() * 0.4);
+        assert_eq!(paints.underline_rect.width(), rect.width() * 0.4);
     }
 
     /// The underline is what makes the share boundary read crisply (issue
@@ -1384,9 +1399,12 @@ mod tests {
     #[test]
     fn share_bar_underline_sits_at_the_bottom_edge() {
         let rect = share_bar_rect();
-        let (_, underline_rect, _, _) = share_bar_paints(rect, 50.0);
-        assert_eq!(underline_rect.bottom(), rect.bottom());
-        assert_eq!(underline_rect.height(), SHARE_BAR_UNDERLINE_THICKNESS);
+        let paints = share_bar_paints(rect, 50.0);
+        assert_eq!(paints.underline_rect.bottom(), rect.bottom());
+        assert_eq!(
+            paints.underline_rect.height(),
+            SHARE_BAR_UNDERLINE_THICKNESS
+        );
     }
 
     /// A row short enough that the fixed underline thickness would exceed
@@ -1395,9 +1413,9 @@ mod tests {
     #[test]
     fn share_bar_underline_thickness_clamps_at_a_tiny_row_height() {
         let tiny_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 1.0));
-        let (_, underline_rect, _, _) = share_bar_paints(tiny_rect, 50.0);
-        assert!(underline_rect.height() <= tiny_rect.height());
-        assert_eq!(underline_rect.top(), tiny_rect.top());
+        let paints = share_bar_paints(tiny_rect, 50.0);
+        assert!(paints.underline_rect.height() <= tiny_rect.height());
+        assert_eq!(paints.underline_rect.top(), tiny_rect.top());
     }
 
     /// The wash must stay markedly more translucent than the underline
@@ -1406,8 +1424,8 @@ mod tests {
     #[test]
     fn share_bar_wash_alpha_is_lower_than_underline_alpha() {
         let rect = share_bar_rect();
-        let (_, _, wash_color, underline_color) = share_bar_paints(rect, 50.0);
-        assert!(wash_color.a() < underline_color.a());
+        let paints = share_bar_paints(rect, 50.0);
+        assert!(paints.wash_color.a() < paints.underline_color.a());
     }
 
     // -- class -> asset mapping totality (issue #9) ------------------------
