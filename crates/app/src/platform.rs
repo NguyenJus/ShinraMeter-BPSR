@@ -1305,11 +1305,9 @@ fn tray_icon_data(
     }
 }
 
-/// Resource id the application icon would be embedded under (`shinra-bpsr.rc`
-/// / `build.rs`). No `.ico` is embedded today — the `.rc` carries only the
-/// UAC manifest — so this lookup is expected to fail and fall back to the
-/// stock application icon; it's tried first so that embedding one later is a
-/// pure resource-file change with no code change here.
+/// Resource id the application icon is embedded under (`shinra-bpsr.rc` /
+/// `build.rs`, from `crates/app/assets/shinra.ico`). The fallback below stays
+/// because a host build has no resource section at all.
 #[cfg(windows)]
 const APP_ICON_RESOURCE_ID: u16 = 2;
 
