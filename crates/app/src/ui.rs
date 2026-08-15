@@ -862,7 +862,13 @@ fn collapse_chevron(ui: &mut egui::Ui, rect: egui::Rect, collapsed: bool) -> egu
 /// `const fn` in ecolor.
 const PILL_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(9, 9, 9, 9);
 
-/// Value text color inside a header/DPS/damage pill — the source's `#afff`.
+/// Value text color inside a header/DPS/damage pill — the source's `#afff`:
+/// white at ~2/3 alpha, the dimmer, partially transparent sibling of
+/// `TITLE_TEXT_COLOR`'s opaque white. The two are deliberately not the same
+/// value and must not be collapsed into one: the source keeps the encounter
+/// title as the header's visually heaviest element and steps the stat values
+/// down behind it, so painting the pills in full white would flatten that
+/// hierarchy.
 const PILL_VALUE_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0xAA);
 
@@ -1168,9 +1174,9 @@ const TITLE_LINE_HEIGHT: f32 = 20.0;
 /// White the title line is painted in — the source's inherited `White`
 /// title foreground, deliberately not `ui.visuals().text_color()` (the
 /// theme's default, dimmer body-text white) since the title needs to read
-/// as the visually heaviest element in the header. Also the header stat
-/// pills' value color (issue #56), which the reference paints in the same
-/// white.
+/// as the visually heaviest element in the header. `draw_title_line` is its
+/// only user: the header stat pills, which once shared it, are painted a
+/// step dimmer in `PILL_VALUE_COLOR` so the title still outweighs them.
 const TITLE_TEXT_COLOR: egui::Color32 = egui::Color32::WHITE;
 
 /// Height of the header's subtitle line. Not part of `default_inner_height`
@@ -1307,10 +1313,45 @@ const HEADER_WASH_HEIGHT: f32 = 98.0;
 const HEADER_WASH_INSET: f32 = 1.0;
 /// Alpha at the wash gradient's brightest (top-left) stop — `Opacity=".5"`.
 const HEADER_WASH_TOP_ALPHA: u8 = 0x50;
+/// Side of the wash's oversized `Svg.HPBar` box, in points — the same emblem
+/// the gutter draws at 60pt (`HEADER_EMBLEM_SIZE`), blown up as wallpaper.
 const HEADER_WASH_EMBLEM_SIZE: f32 = 200.0;
+/// How far the wash emblem's right edge overhangs the wash's own right edge,
+/// in points: the source right-aligns the wash `Svg.HPBar` with a `-25` right
+/// margin, so its last 25pt hang off the panel and the wash's clip rect cuts
+/// them away — the mirror of the gutter emblem's `-26` left bleed
+/// (`HEADER_EMBLEM_OFFSET`).
+const HEADER_WASH_EMBLEM_BLEED: f32 = 25.0;
 /// `Opacity=".05"` on a SlateGray fill.
 const HEADER_WASH_EMBLEM_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(0x70, 0x80, 0x90, 13);
+
+/// Where the wash panel sits for a central panel of `panel`: inset from the
+/// panel's left, top and right edges by `HEADER_WASH_INSET`, and running down
+/// to its own fixed `HEADER_WASH_HEIGHT` rather than to the panel's bottom.
+/// Pure geometry, so the inset and the fixed height are unit-testable without
+/// a painter — the same factoring as `header_emblem_rect`.
+fn header_wash_rect(panel: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        panel.min + egui::Vec2::splat(HEADER_WASH_INSET),
+        egui::vec2(panel.width() - 2.0 * HEADER_WASH_INSET, HEADER_WASH_HEIGHT),
+    )
+}
+
+/// Where the wash's oversized emblem sits inside a wash of `wash`: vertically
+/// centered on it and right-aligned so exactly `HEADER_WASH_EMBLEM_BLEED`
+/// points overhang its right edge. Taller than the wash as well as wider, so
+/// both the overhang and the top/bottom overflow rely on the caller's clip
+/// rect.
+fn header_wash_emblem_rect(wash: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(
+            wash.right() + HEADER_WASH_EMBLEM_BLEED - HEADER_WASH_EMBLEM_SIZE,
+            wash.center().y - HEADER_WASH_EMBLEM_SIZE / 2.0,
+        ),
+        egui::Vec2::splat(HEADER_WASH_EMBLEM_SIZE),
+    )
+}
 
 /// Paints the header's decorative background wash — a diagonal gradient
 /// panel with a huge, nearly-invisible emblem bleeding off its right edge —
@@ -1324,10 +1365,7 @@ const HEADER_WASH_EMBLEM_COLOR: egui::Color32 =
 /// corners — at alpha `0x50` under the panel's own 8pt-rounded, 1pt border
 /// the difference is sub-pixel.
 fn draw_header_wash(ui: &egui::Ui, panel: egui::Rect, icons: &Icons) {
-    let wash_rect = egui::Rect::from_min_size(
-        panel.min + egui::Vec2::splat(HEADER_WASH_INSET),
-        egui::vec2(panel.width() - 2.0 * HEADER_WASH_INSET, HEADER_WASH_HEIGHT),
-    );
+    let wash_rect = header_wash_rect(panel);
     let painter = ui.painter().with_clip_rect(wash_rect);
 
     // Top-left brightest, fading to zero at the bottom-right — the source's
@@ -1344,13 +1382,7 @@ fn draw_header_wash(ui: &egui::Ui, panel: egui::Rect, icons: &Icons) {
     )));
 
     if let Some(emblem) = icons.glyphs.get(GlyphIcon::Emblem) {
-        let emblem_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                wash_rect.right() + 25.0 - HEADER_WASH_EMBLEM_SIZE,
-                wash_rect.center().y - HEADER_WASH_EMBLEM_SIZE / 2.0,
-            ),
-            egui::Vec2::splat(HEADER_WASH_EMBLEM_SIZE),
-        );
+        let emblem_rect = header_wash_emblem_rect(wash_rect);
         painter.image(emblem.id(), emblem_rect, UV_FULL, HEADER_WASH_EMBLEM_COLOR);
     }
 }
@@ -3806,6 +3838,57 @@ mod tests {
         assert!(rect.top() < row.top());
         assert_eq!(rect.width(), HEADER_EMBLEM_SIZE);
         assert_eq!(rect.height(), HEADER_EMBLEM_SIZE);
+    }
+
+    // -- header background wash (issue #59, #62) ------------------------
+
+    /// A stand-in central-panel rect for the wash geometry tests — wider and
+    /// far taller than the wash itself, like the real panel.
+    fn wash_test_panel() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(12.0, 30.0), egui::vec2(400.0, 300.0))
+    }
+
+    /// The wash is inset from the panel on both sides and its top so its
+    /// square corners stay inside the panel's rounded border, and it runs to
+    /// its own fixed height rather than the panel's — it is decoration behind
+    /// the header rows, not a full-height background.
+    #[test]
+    fn the_header_wash_is_inset_from_the_panel_and_keeps_its_own_fixed_height() {
+        let panel = wash_test_panel();
+        let wash = header_wash_rect(panel);
+        assert_eq!(wash.left() - panel.left(), HEADER_WASH_INSET);
+        assert_eq!(panel.right() - wash.right(), HEADER_WASH_INSET);
+        assert_eq!(wash.top() - panel.top(), HEADER_WASH_INSET);
+        assert_eq!(wash.width(), panel.width() - 2.0 * HEADER_WASH_INSET);
+        assert_eq!(wash.height(), HEADER_WASH_HEIGHT);
+        assert!(wash.bottom() < panel.bottom());
+    }
+
+    /// The wash emblem hangs off the wash's right edge by exactly the
+    /// source's `-25` right margin, and is vertically centered on the wash —
+    /// the mirror of the gutter emblem's left-edge bleed, and the reason the
+    /// wash must be painted through its own clip rect.
+    #[test]
+    fn the_wash_emblem_bleeds_off_the_right_edge_by_the_named_overhang() {
+        let wash = header_wash_rect(wash_test_panel());
+        let emblem = header_wash_emblem_rect(wash);
+        assert_eq!(emblem.right() - wash.right(), HEADER_WASH_EMBLEM_BLEED);
+        assert!(emblem.left() > wash.left());
+        assert_eq!(emblem.center().y, wash.center().y);
+        assert_eq!(emblem.width(), HEADER_WASH_EMBLEM_SIZE);
+        assert_eq!(emblem.height(), HEADER_WASH_EMBLEM_SIZE);
+    }
+
+    /// The wash emblem is drawn far larger than the band it decorates, so it
+    /// overflows the wash vertically too — a change that made it fit would
+    /// mean it had stopped reading as an oversized watermark.
+    #[test]
+    fn the_wash_emblem_is_taller_than_the_wash_it_sits_in() {
+        let wash = header_wash_rect(wash_test_panel());
+        let emblem = header_wash_emblem_rect(wash);
+        assert!(emblem.height() > wash.height());
+        assert!(emblem.top() < wash.top());
+        assert!(emblem.bottom() > wash.bottom());
     }
 
     // -- column_anchors (issue #8) --------------------------------------
