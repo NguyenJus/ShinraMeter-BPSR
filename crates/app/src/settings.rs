@@ -21,6 +21,8 @@ use crate::ui::{StatColumn, fmt_share, fmt_short};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ColumnKind {
     AbilityScore,
+    SeasonLevel,
+    SeasonStrength,
     Damage,
     Dps,
     SharePct,
@@ -32,13 +34,16 @@ pub enum ColumnKind {
 impl ColumnKind {
     /// Every selectable column, in canonical left-to-right order.
     ///
-    /// `AbilityScore` leads the list rather than sitting among the
-    /// combat-derived columns: it's a static per-player character stat (a
-    /// gear-score snapshot, not something that accrues over the fight like
-    /// damage/hits do), so it reads better next to the row's name than
+    /// `AbilityScore`, `SeasonLevel`, and `SeasonStrength` lead the list
+    /// rather than sitting among the combat-derived columns: each is a
+    /// static per-player character stat (a gear-score/season-progression
+    /// snapshot, not something that accrues over the fight like
+    /// damage/hits do), so they read better next to the row's name than
     /// mixed in with `Damage`/`Dps`/etc.
-    pub const ALL: [ColumnKind; 7] = [
+    pub const ALL: [ColumnKind; 9] = [
         ColumnKind::AbilityScore,
+        ColumnKind::SeasonLevel,
+        ColumnKind::SeasonStrength,
         ColumnKind::Damage,
         ColumnKind::Dps,
         ColumnKind::SharePct,
@@ -51,6 +56,8 @@ impl ColumnKind {
     pub fn label(self) -> &'static str {
         match self {
             ColumnKind::AbilityScore => "Ability Score",
+            ColumnKind::SeasonLevel => "Season Level",
+            ColumnKind::SeasonStrength => "Season Strength",
             ColumnKind::Damage => "Damage",
             ColumnKind::Dps => "DPS",
             ColumnKind::SharePct => "Share %",
@@ -79,6 +86,24 @@ impl ColumnKind {
             ColumnKind::AbilityScore => StatColumn {
                 width: 56.0,
                 text: |row| match row.ability_score {
+                    Some(v) => fmt_short(v as i64),
+                    None => String::new(),
+                },
+            },
+            // Same `None`-is-blank / 56.0-width convention as
+            // `AbilityScore` above: a missing reading is not "0", and
+            // `fmt_short`'s ≤7-char budget applies whenever a value is
+            // present.
+            ColumnKind::SeasonLevel => StatColumn {
+                width: 56.0,
+                text: |row| match row.season_level {
+                    Some(v) => fmt_short(v as i64),
+                    None => String::new(),
+                },
+            },
+            ColumnKind::SeasonStrength => StatColumn {
+                width: 56.0,
+                text: |row| match row.season_strength {
                     Some(v) => fmt_short(v as i64),
                     None => String::new(),
                 },
@@ -436,6 +461,56 @@ mod tests {
 
         assert_eq!(loaded, Settings::default());
         assert!(!loaded.is_visible(ColumnKind::AbilityScore));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn season_level_is_not_visible_by_default() {
+        assert!(!Settings::default().is_visible(ColumnKind::SeasonLevel));
+    }
+
+    #[test]
+    fn season_strength_is_not_visible_by_default() {
+        assert!(!Settings::default().is_visible(ColumnKind::SeasonStrength));
+    }
+
+    #[test]
+    fn season_level_column_round_trips() {
+        let path = temp_settings_path("season-level-roundtrip");
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::SeasonLevel);
+        save_to(&path, &settings);
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded, settings);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn season_strength_column_round_trips() {
+        let path = temp_settings_path("season-strength-roundtrip");
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::SeasonStrength);
+        save_to(&path, &settings);
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded, settings);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn settings_json_without_season_columns_still_deserializes() {
+        let path = temp_settings_path("legacy-no-season-columns");
+        fs::write(&path, br#"{"visible_columns":["Damage","Dps","SharePct"]}"#)
+            .expect("write legacy fixture");
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded, Settings::default());
+        assert!(!loaded.is_visible(ColumnKind::SeasonLevel));
+        assert!(!loaded.is_visible(ColumnKind::SeasonStrength));
         let _ = fs::remove_file(&path);
     }
 

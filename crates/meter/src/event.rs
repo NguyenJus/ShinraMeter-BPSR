@@ -113,6 +113,12 @@ pub struct PlayerInfo {
     /// Ability score (a.k.a. combat power). Mirrors
     /// `bpsr_protocol::PlayerInfo::ability_score` (issue #15).
     pub ability_score: Option<u32>,
+    /// Season level. Mirrors `bpsr_protocol::PlayerInfo::season_level`
+    /// (issue #15).
+    pub season_level: Option<u32>,
+    /// Season strength. Mirrors `bpsr_protocol::PlayerInfo::season_strength`
+    /// (issue #15).
+    pub season_strength: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

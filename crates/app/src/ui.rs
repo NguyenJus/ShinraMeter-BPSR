@@ -698,6 +698,16 @@ mod tests {
             lucky_pct: 0.0,
             hits: 0,
             ability_score,
+            season_level: None,
+            season_strength: None,
+        }
+    }
+
+    fn sample_season_row(season_level: Option<u32>, season_strength: Option<u32>) -> PlayerRow {
+        PlayerRow {
+            season_level,
+            season_strength,
+            ..sample_row(None)
         }
     }
 
@@ -712,6 +722,34 @@ mod tests {
     fn ability_score_column_formats_value_when_some() {
         let row = sample_row(Some(12_345));
         let column = ColumnKind::AbilityScore.spec();
+        assert_eq!((column.text)(&row), fmt_short(12_345));
+    }
+
+    #[test]
+    fn season_level_column_blank_when_none() {
+        let row = sample_season_row(None, None);
+        let column = ColumnKind::SeasonLevel.spec();
+        assert_eq!((column.text)(&row), "");
+    }
+
+    #[test]
+    fn season_level_column_formats_value_when_some() {
+        let row = sample_season_row(Some(42), None);
+        let column = ColumnKind::SeasonLevel.spec();
+        assert_eq!((column.text)(&row), fmt_short(42));
+    }
+
+    #[test]
+    fn season_strength_column_blank_when_none() {
+        let row = sample_season_row(None, None);
+        let column = ColumnKind::SeasonStrength.spec();
+        assert_eq!((column.text)(&row), "");
+    }
+
+    #[test]
+    fn season_strength_column_formats_value_when_some() {
+        let row = sample_season_row(None, Some(12_345));
+        let column = ColumnKind::SeasonStrength.spec();
         assert_eq!((column.text)(&row), fmt_short(12_345));
     }
 
@@ -910,6 +948,8 @@ mod tests {
             lucky_pct: 100.0,
             hits: 999_950,
             ability_score: Some(999_950),
+            season_level: Some(999_950),
+            season_strength: Some(999_950),
         };
 
         for (kind, column) in ColumnKind::ALL
