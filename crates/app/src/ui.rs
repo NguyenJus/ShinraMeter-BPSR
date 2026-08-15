@@ -331,17 +331,35 @@ fn toolbar_icon_image(handle: &egui::TextureHandle) -> egui::Image<'static> {
 /// (belt-and-braces: `ToolbarIcons`' bytes are compile-time constants,
 /// never actually expected to fail to decode, same reasoning as
 /// `ClassIcons::get`).
+///
+/// `label` doubles as both the hover tooltip and the accessible name: an
+/// image-only `Button` carries no text atom, so — verified against the
+/// vendored egui source (`Button::atom_ui`, `button.rs`) — it never puts
+/// anything into `WidgetInfo` on its own, and `Response::on_hover_text`
+/// only shows a tooltip, it never touches accessibility info either
+/// (`response.rs`). Without the explicit `widget_info` call below, a
+/// screen-reader user would hear an unlabeled "button" here. The `None`
+/// (glyph) branch already gets a label for free from `ui.button`'s own text
+/// atom, so only the image branch needs it — but both share the same
+/// `label` argument, so the tooltip and the accessible name can never
+/// drift apart.
 fn icon_button(
     ui: &mut egui::Ui,
     texture: Option<&egui::TextureHandle>,
     fallback_glyph: &str,
-    tooltip: &str,
+    label: &str,
 ) -> egui::Response {
     let response = match texture {
-        Some(handle) => ui.add(egui::Button::image(toolbar_icon_image(handle))),
+        Some(handle) => {
+            let response = ui.add(egui::Button::image(toolbar_icon_image(handle)));
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label)
+            });
+            response
+        }
         None => ui.button(fallback_glyph),
     };
-    response.on_hover_text(tooltip)
+    response.on_hover_text(label)
 }
 
 /// Paints the minimize button: no icon asset for it exists in the upstream
@@ -351,7 +369,15 @@ fn icon_button(
 /// `apply_theme`'s `button_padding` on all sides — so this button doesn't
 /// stand out as a different size in the row, and `header_band_height` stays
 /// correct without special-casing it.
+///
+/// Unlike `icon_button`, this bypasses `Button` entirely — `allocate_exact_
+/// size`'s raw `Response` gets no `WidgetInfo` from anywhere, so both the
+/// accessible name and the tooltip below have to be supplied by hand (see
+/// `icon_button`'s doc comment for why the accessible name matters). Kept
+/// as one `label` local rather than two literals so the two calls can't
+/// drift apart.
 fn minimize_button(ui: &mut egui::Ui) -> egui::Response {
+    let label = "Minimize";
     let padding = ui.spacing().button_padding;
     let size = egui::Vec2::splat(TOOLBAR_ICON_SIZE) + 2.0 * padding;
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -367,7 +393,10 @@ fn minimize_button(ui: &mut egui::Ui) -> egui::Response {
             egui::Stroke::new(1.5, visuals.fg_stroke.color),
         );
     }
-    response.on_hover_text("Minimize")
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label)
+    });
+    response.on_hover_text(label)
 }
 
 /// Header title text (issue #9 slice 2; gated to boss fights by issue #42):
@@ -479,10 +508,16 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
 /// `menu_image_button`, so it needs no extra open/closed state of its own)
 /// letting the user toggle which stat columns render (issue #13). The
 /// trigger is the gear icon (issue #41) when its texture decoded, else the
-/// original `"S"` glyph — same fallback `icon_button` uses, but
-/// `menu_button`/`menu_image_button` aren't unifiable behind one helper the
-/// way plain buttons are (they return different widget types), so the
-/// `match` is inlined here instead.
+/// original `"S"` glyph — same fallback `icon_button` uses. `menu_button`
+/// and `menu_image_button` do both return `InnerResponse<Option<R>>`
+/// (verified against the vendored egui source, `ui.rs`), so that's not
+/// actually why this isn't routed through one helper the way `icon_button`
+/// is: the two build their trigger `Button` differently under the hood —
+/// `menu_button` via `Button::new(atoms)`, `menu_image_button` via
+/// `Button::image(image)`, which additionally caps the image to the
+/// default font height (`Button::image`'s own doc comment) — so folding
+/// them into one call could silently change how an oversized icon gets
+/// sized. The `match` stays inlined here rather than risk that.
 fn draw_settings_menu(
     ui: &mut egui::Ui,
     settings: &mut Settings,
@@ -1900,6 +1935,76 @@ mod tests {
             assert_eq!(response.rect.height(), expected);
         })
         .drop_without_applying_deltas();
+    }
+
+    /// Reads back the accessible ("label") name AccessKit would announce for
+    /// `id`, out of a full frame's `FullOutput::platform_output::
+    /// accesskit_update`. `None`
+    /// covers both "no accesskit update at all" and "a node exists but
+    /// carries no label" — both mean a screen-reader user hears nothing.
+    fn accessible_label(update: &egui::accesskit::TreeUpdate, id: egui::Id) -> Option<String> {
+        update
+            .nodes
+            .iter()
+            .find(|(node_id, _)| *node_id == id.accesskit_id())
+            .and_then(|(_, node)| node.label())
+            .map(str::to_string)
+    }
+
+    /// Regression test for the review finding that replacing the "×"/"_"/
+    /// "Reset" text buttons with image-only ones dropped their accessible
+    /// name: `Button::image` carries no text atom, so — verified against
+    /// the vendored egui source — nothing on the default path ever calls
+    /// `widget_info` with a label for it, and `on_hover_text` alone never
+    /// touches accessibility info either. `icon_button`'s explicit
+    /// `widget_info` call is what puts the label back.
+    #[test]
+    fn icon_button_with_a_texture_has_an_accessible_label_matching_the_tooltip() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let texture = ctx.load_texture(
+            "test-icon",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+
+        let mut id = egui::Id::NULL;
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            id = icon_button(ui, Some(&texture), "×", "Close").id;
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let label = accessible_label(&update, id);
+        output.drop_without_applying_deltas();
+
+        assert_eq!(label.as_deref(), Some("Close"));
+    }
+
+    /// Same regression, for `minimize_button`: it bypasses `Button`
+    /// entirely (a hand-painted line on a raw `allocate_exact_size`
+    /// response), so it has no `widget_info` call to inherit from anywhere
+    /// — its own explicit call is the only source of a label.
+    #[test]
+    fn minimize_button_has_an_accessible_label() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let mut id = egui::Id::NULL;
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            id = minimize_button(ui).id;
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let label = accessible_label(&update, id);
+        output.drop_without_applying_deltas();
+
+        assert_eq!(label.as_deref(), Some("Minimize"));
     }
 
     #[test]
