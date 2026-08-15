@@ -15,21 +15,17 @@ use crate::fonts;
 use crate::icons::{ClassIcons, ToolbarIcon, ToolbarIcons};
 use crate::settings::{ColumnKind, Settings};
 
-// -- typography scale (issue #56) --------------------------------------
+// -- typography scale (issue #56, issue #62) ----------------------------
 //
 // Every text paint in this module goes through `regular`/`bold` plus one of
-// the sizes below — no ad-hoc `egui::FontId` at a call site — so the
-// hierarchy the reference render (`docs/reference/new-shinra-ex.webp`)
-// establishes lives in exactly one place and can be re-tuned as a whole.
+// the sizes below — no ad-hoc `egui::FontId` at a call site — so the scale
+// lives in exactly one place and can be re-tuned as a whole.
 //
-// Largest to smallest, matching that render:
-//
-//   boss title (bold) > row DPS value (bold) > pill value ≈ player name
-//     (bold) > row stat > row percentage ≈ subtitle > counters
-//
-// Sizes are points at the overlay's real size (the reference is a 287x215
-// render, i.e. roughly 1:1 with it), nudged up from the raw measurements
-// where a value has to stay readable against the share-bar wash behind it.
+// These sizes come from `mvvm_refactor_wip`'s XAML, not from eyeballing the
+// render: the source's `MetricTextBlockStyle` is a flat `FontSize="13"` for
+// the row name and every metric column, with no `FontWeight`, so the row
+// scale is deliberately flat. Row hierarchy is carried by *color*, not size
+// or weight — see `ColumnKind::spec`'s `STAT_TEXT_RGB`/`CRIT_PCT_RGB`/etc.
 //
 // There is no `TextStyle`/`Style::text_styles` override anywhere in this
 // app: egui's defaults only cover its own widgets (the settings menu), and
@@ -37,31 +33,29 @@ use crate::settings::{ColumnKind, Settings};
 // `FontId`, so a style table would be a second, silently-diverging source of
 // truth rather than a shared one.
 
-/// Boss/encounter title — bold, the largest text in the UI.
-const FONT_SIZE_TITLE: f32 = 15.0;
-/// A row's DPS value (`55.3M/s`) — bold, and deliberately a notch larger
-/// than every other row text: it is the number the meter exists to show.
-const FONT_SIZE_ROW_VALUE: f32 = 13.5;
-/// The value inside a header stat pill (`02:39`, `188M/s`, `30.1B`) — bold.
-const FONT_SIZE_PILL_VALUE: f32 = 12.5;
-/// Player name — bold, and (unlike before issue #56) proportional: the
-/// reference is plainly set in a proportional face, and nothing about a name
-/// needs column alignment.
-const FONT_SIZE_ROW_NAME: f32 = 12.5;
-/// Any row stat column that is neither the DPS value nor a percentage
-/// (damage, hits, ability score, …) — regular weight, one notch under the
-/// name so it reads as supporting detail.
-const FONT_SIZE_ROW_STAT: f32 = 12.0;
-/// A row's percentage columns (share/crit/lucky) — colored, regular, and
-/// visibly smaller than the DPS value beside it.
-const FONT_SIZE_ROW_PCT: f32 = 11.5;
-/// Dungeon/scene subtitle — regular, muted gray.
-const FONT_SIZE_SUBTITLE: f32 = 11.0;
-/// Small dim counters — the death-count column (issue #49), painted inside a
-/// `stat_pill` at the row's right edge. The smallest, dimmest text in the
-/// reference render, and deliberately so: a wipe count is context, not a
-/// number anyone reads the meter *for*.
-const FONT_SIZE_COUNTER: f32 = 10.0;
+/// Boss/encounter title — the source's `FontSize="13" FontWeight="DemiBold"`.
+const FONT_SIZE_TITLE: f32 = 13.0;
+/// The value inside the timer half-pill — the source's `FontSize="16"
+/// FontWeight="DemiBold"`, the largest text in the UI. Unused until slice 4
+/// wires up the timer half-pill; `#[allow(dead_code)]` rather than leaving
+/// it out, so the full scale lands in one place (see
+/// `font_scale_matches_the_source_metrics`, which already pins its value).
+#[allow(dead_code)]
+const FONT_SIZE_TIMER: f32 = 16.0;
+/// Every text in a player row — name and every metric column alike. The
+/// source's `MetricTextBlockStyle` is a flat `FontSize="13"` with no
+/// `FontWeight`: its rows carry their hierarchy in *color* (white DPS,
+/// `#aaa` plain stats, LightCoral crit) rather than in size or weight, so
+/// this replaces the four separate row sizes issue #56 approximated off the
+/// render.
+const FONT_SIZE_ROW: f32 = 13.0;
+/// The value inside a header stat pill — `GeneralStatTextStyle`'s default.
+const FONT_SIZE_PILL_VALUE: f32 = 12.0;
+/// Dungeon/scene subtitle — the source's `FontSize="10"`.
+const FONT_SIZE_SUBTITLE: f32 = 10.0;
+/// The death counter inside its pill — `DeathsDT` is `MetricTextBlockStyle`
+/// like every other column, so it is the row metric, not a smaller size.
+const FONT_SIZE_COUNTER: f32 = FONT_SIZE_ROW;
 
 /// Horizontal offset (points) a bold-intended text is repainted at, on top
 /// of the first paint, to fake a heavier weight. Only used when no real bold
@@ -530,16 +524,17 @@ fn draw_header(
 /// this module's own `toolbar_icon_button_height_matches_interact_size`.
 const TOOLBAR_ICON_SIZE: f32 = 14.0;
 
-/// Slate-blue-gray tint applied to every toolbar/stat icon (reference
-/// render's uniform icon family) — the source PNGs are otherwise painted in
-/// whatever native color they were authored in, which doesn't match.
-const TOOLBAR_ICON_TINT: egui::Color32 = egui::Color32::from_rgb(0x70, 0x80, 0x90);
+/// Tint applied to every toolbar/stat icon — the source's footer buttons are
+/// `Fill="White"` at content `Opacity=".5"`, i.e. white at half alpha, not a
+/// slate-blue-gray recolor.
+const TOOLBAR_ICON_TINT: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 128);
 
 /// Builds an `egui::Image` for a loaded toolbar icon texture at the fixed
 /// `TOOLBAR_ICON_SIZE`, overriding whatever size the source PNG itself
 /// carries (`SizedTexture::from_handle` would use the PNG's native 48x48
-/// instead), and multiplied by `TOOLBAR_ICON_TINT` so every icon reads as
-/// the same slate-blue-gray family regardless of its source color.
+/// instead), and multiplied by `TOOLBAR_ICON_TINT` so every icon reads at
+/// the same half-white opacity regardless of its source color.
 fn toolbar_icon_image(handle: &egui::TextureHandle) -> egui::Image<'static> {
     egui::Image::from_texture(egui::load::SizedTexture::new(
         handle.id(),
@@ -868,12 +863,13 @@ impl<'a> StatPill<'a> {
 /// de-emphasized detail, dimmer even than the count beside it.
 const COUNTER_ICON_COLOR: egui::Color32 = egui::Color32::from_rgb(0x8A, 0x8A, 0x8A);
 
-/// RGB of the death count's digits (issue #49) — `ColumnKind::spec`'s color
-/// for `ColumnKind::Deaths`, declared here with `CRIT_PCT_RGB`/
-/// `LUCKY_PCT_RGB` so every column color lives in the painting module.
-/// A light gray: dimmer than the white stat columns, brighter than the skull
-/// beside it, matching the reference render's ordering of the two.
-pub(crate) const DEATH_COUNT_RGB: (u8, u8, u8) = (0xB4, 0xB4, 0xB4);
+/// RGB of the death count's digits (issue #49, issue #62) —
+/// `ColumnKind::spec`'s color for `ColumnKind::Deaths`, declared here with
+/// `CRIT_PCT_RGB`/`LUCKY_PCT_RGB` so every column color lives in the
+/// painting module. The source's `DeathsDT` is plain `Foreground="White"` —
+/// the pill's own `#1fff` background is what separates it, not a dimmer
+/// digit color.
+pub(crate) const DEATH_COUNT_RGB: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
 
 /// Side length of a pill's icon box for a value text of `text_height` line
 /// height — see `PILL_ICON_CAP_RATIO`. Rounded to whole points so a 1.2pt
@@ -1193,17 +1189,22 @@ fn encounter_subtitle(e: &EncounterInfo) -> Option<String> {
 /// the same pattern `ROW_HEIGHT` follows for player rows.
 const TITLE_LINE_HEIGHT: f32 = 20.0;
 
-/// Bright white the title line is painted in, matching the reference
-/// render — deliberately not `ui.visuals().text_color()` (the theme's
-/// default, dimmer body-text white) since the title needs to read as the
-/// visually heaviest element in the header. Also the header stat pills'
-/// value color (issue #56), which the reference paints in the same white.
-const TITLE_TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(0xF5, 0xF5, 0xF5);
+/// White the title line is painted in — the source's inherited `White`
+/// title foreground, deliberately not `ui.visuals().text_color()` (the
+/// theme's default, dimmer body-text white) since the title needs to read
+/// as the visually heaviest element in the header. Also the header stat
+/// pills' value color (issue #56), which the reference paints in the same
+/// white.
+const TITLE_TEXT_COLOR: egui::Color32 = egui::Color32::WHITE;
 
 /// Height of the header's subtitle line. Not part of `default_inner_height`
 /// — the subtitle is conditional and the default window assumes it is
 /// absent (see `default_inner_height`'s doc).
 const SUBTITLE_LINE_HEIGHT: f32 = 16.0;
+
+/// Subtitle text color — the source's `#5fff`, white at ~1/3 alpha.
+const SUBTITLE_TEXT_COLOR: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x55);
 
 // -- header text gutter (issue #56) ------------------------------------
 //
@@ -1373,7 +1374,7 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
         egui::Align2::LEFT_CENTER,
         text,
         regular(FONT_SIZE_SUBTITLE),
-        ui.visuals().weak_text_color(),
+        SUBTITLE_TEXT_COLOR,
     );
 }
 
@@ -1986,29 +1987,28 @@ fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot, columns: &[ColumnKind], ico
 /// the column's width and formatter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ColumnEmphasis {
-    /// The headline number: bold, the largest text in the row.
+    /// The headline number, e.g. DPS.
     Value,
-    /// A plain stat: regular weight, mid-scale.
+    /// A plain stat, e.g. damage.
     Stat,
-    /// A percentage: regular weight, smallest, and already colored by
-    /// `StatColumn::color`.
+    /// A percentage, already colored by `StatColumn::color`.
     Percent,
-    /// A counter (issue #49's death count): the smallest text in the row,
-    /// and the one level that is **not painted as bare text** — `draw_row`
-    /// wraps it in the same oval `stat_pill` chrome the header stats use,
-    /// icon first. This is the dispatch point for that: `StatColumn` can
-    /// only describe a string (a width, a formatter and a color), so the
-    /// "paint this one differently" decision belongs with the typography,
-    /// next to the sizes it shares, rather than as a bare `if kind ==
-    /// ColumnKind::Deaths` in the paint loop.
+    /// A counter (issue #49's death count): the one level that is **not
+    /// painted as bare text** — `draw_row` wraps it in the same oval
+    /// `stat_pill` chrome the header stats use, icon first. This is the
+    /// dispatch point for that: `StatColumn` can only describe a string (a
+    /// width, a formatter and a color), so the "paint this one differently"
+    /// decision belongs with the typography, next to the sizes it shares,
+    /// rather than as a bare `if kind == ColumnKind::Deaths` in the paint
+    /// loop.
     Counter,
 }
 
 impl ColumnEmphasis {
-    /// The font this emphasis level paints in. Single source of truth with
-    /// `is_bold` below — the two are always asked together (see `draw_row`),
-    /// so they live on one type instead of as two free functions that could
-    /// disagree about which columns are bold.
+    /// The font this emphasis level paints in. Every level is `FONT_SIZE_ROW`
+    /// (the source's flat `MetricTextBlockStyle`) — row hierarchy is carried
+    /// by color, not by size or weight, so this exists to keep the "which
+    /// size" question centralized rather than to actually vary it.
     ///
     /// `Counter` reports the font its *pill* lays the value out in
     /// (`stat_pill` -> `pill_text_size` -> `bold(pill.size)`), not a font
@@ -2017,19 +2017,9 @@ impl ColumnEmphasis {
     /// every other one.
     fn font(self) -> egui::FontId {
         match self {
-            Self::Value => bold(FONT_SIZE_ROW_VALUE),
-            Self::Stat => regular(FONT_SIZE_ROW_STAT),
-            Self::Percent => regular(FONT_SIZE_ROW_PCT),
+            Self::Value | Self::Stat | Self::Percent => regular(FONT_SIZE_ROW),
             Self::Counter => bold(FONT_SIZE_COUNTER),
         }
-    }
-
-    /// Whether the faux-bold second pass applies at this level when no real
-    /// bold font is installed — `paint_text`'s argument for the bare-text
-    /// levels, and (via `paint_stat_pill`'s `paint_bold_text`) already true
-    /// by construction for `Counter`.
-    fn is_bold(self) -> bool {
-        matches!(self, Self::Value | Self::Counter)
     }
 
     /// Whether `draw_row` paints this column as a pill rather than as text.
@@ -2067,9 +2057,11 @@ fn column_emphasis(kind: ColumnKind) -> ColumnEmphasis {
 pub struct StatColumn {
     pub width: f32,
     pub text: fn(&PlayerRow) -> String,
-    /// Text color this column is painted with. Most columns are plain
-    /// white; `CritPct`/`LuckyPct` use `CRIT_PCT_RGB`/`LUCKY_PCT_RGB` to
-    /// stand out the way the reference meter colors them.
+    /// Text color this column is painted with. Only the DPS column (and
+    /// the two unbudgeted stats with no source counterpart) stay pure
+    /// white; plain stats use `STAT_TEXT_RGB` and `CritPct`/`LuckyPct` use
+    /// `CRIT_PCT_RGB`/`LUCKY_PCT_RGB` to stand out the way the reference
+    /// meter colors them.
     pub color: egui::Color32,
 }
 
@@ -2209,17 +2201,19 @@ fn draw_row(
             .image(texture.id(), icon_rect, UV_FULL, CLASS_ICON_TINT);
     }
 
-    // Bold and proportional (issue #56): the reference renders names in the
-    // same humanist sans as everything else, and the name is the row's
-    // second-most-prominent element after its DPS value.
+    // Regular weight, at the row's flat metric size (issue #62): the
+    // source's row text carries no `FontWeight`, name included — hierarchy
+    // comes from color, and the name is already the brightest thing left of
+    // the stat columns at plain white.
     let name = row_name(row);
-    paint_bold_text(
+    paint_text(
         ui.painter(),
         rect.left_center() + egui::vec2(name_offset, 0.0),
         egui::Align2::LEFT_CENTER,
         &name,
-        FONT_SIZE_ROW_NAME,
+        regular(FONT_SIZE_ROW),
         egui::Color32::WHITE,
+        false,
     );
 
     // Each stat gets its own fixed-width column (issue #8) so a
@@ -2276,7 +2270,7 @@ fn draw_row(
                 &text,
                 emphasis.font(),
                 column.color,
-                emphasis.is_bold(),
+                false,
             );
         }
     }
@@ -2351,6 +2345,11 @@ pub(crate) const CRIT_PCT_RGB: (u8, u8, u8) = (240, 128, 128);
 /// existing convention for "this stat is good, color it green" rather than
 /// inventing a new hue.
 pub(crate) const LUCKY_PCT_RGB: (u8, u8, u8) = (70, 200, 120);
+/// RGB of the plain (non-headline, non-percentage) stat columns — the
+/// source's `DamagePercDT`/`DamageDT` `Foreground="#aaa"`. Only the DPS
+/// column stays pure white; everything unremarkable is stepped down a
+/// notch.
+pub(crate) const STAT_TEXT_RGB: (u8, u8, u8) = (0xAA, 0xAA, 0xAA);
 
 /// Alpha at the *bottom* of the bar fill's vertical gradient — the source's
 /// `Opacity=".18"` bottom stop. The top stop is 0 (fully transparent).
@@ -2599,7 +2598,7 @@ const ITEM_SPACING_Y: f32 = 2.0;
 const NAME_LEFT_PAD: f32 = 2.0;
 
 /// Budgeted width for the name itself. `draw_row` paints names unclipped,
-/// bold and proportional at `FONT_SIZE_ROW_NAME` (issue #56) —
+/// regular weight and proportional at `FONT_SIZE_ROW` (issues #56, #62) —
 /// truncation/ellipsis is explicitly out of scope for issue #26 — so this is
 /// not a hard cap, just enough room (roughly 20 proportional characters at
 /// that size, more than the ~15 monospace ones it used to buy) that a
@@ -2970,13 +2969,13 @@ mod tests {
         }
     }
 
-    // -- toolbar icon tint (slate-blue-gray family, matching reference) ---
+    // -- toolbar icon tint (half-white, matching the source) --------------
 
     /// `toolbar_icon_image` must multiply every toolbar/stat icon by the
-    /// reference render's slate-blue-gray family instead of leaving the
-    /// source PNG's native color untouched.
+    /// source's half-white tint instead of leaving the source PNG's native
+    /// color untouched.
     #[test]
-    fn toolbar_icon_image_applies_slate_tint() {
+    fn toolbar_icon_image_applies_the_half_white_tint() {
         let ctx = egui::Context::default();
         let texture = ctx.load_texture(
             "test-icon-tint",
@@ -2987,42 +2986,27 @@ mod tests {
         assert_eq!(image.image_options().tint, TOOLBAR_ICON_TINT);
     }
 
-    // -- typography scale (issue #56) -------------------------------------
+    // -- typography scale (issue #62) --------------------------------------
 
-    /// The scale has to stay *a* scale: the reference's hierarchy is boss
-    /// title > row DPS value > pill value ≈ player name > row stat > row
-    /// percentage ≈ subtitle > counter. Sizes may be re-tuned; their order
-    /// may not, since that order is the whole point of having one block of
-    /// constants instead of per-call-site numbers.
+    /// The scale is pulled straight from `mvvm_refactor_wip`'s XAML, not
+    /// re-derived from the render, so this pins the numbers rather than an
+    /// ordering — the source's row scale is deliberately flat (`FONT_SIZE_ROW
+    /// == FONT_SIZE_COUNTER`), so there is no "largest to smallest" chain
+    /// left to assert.
     #[test]
-    fn font_scale_is_ordered_largest_to_smallest() {
-        // Walked as a slice rather than asserted pair by pair: comparing two
-        // constants directly is a compile-time-constant assertion (clippy's
-        // `assertions_on_constants`), which proves nothing at runtime.
+    fn font_scale_matches_the_source_metrics() {
+        // Walked as a slice rather than asserted pair by pair: comparing a
+        // constant directly to a literal is fine at runtime, but doing it
+        // one-by-one for five constants is what this loop avoids repeating.
         let scale = [
-            ("title", FONT_SIZE_TITLE),
-            ("row value", FONT_SIZE_ROW_VALUE),
-            ("pill value", FONT_SIZE_PILL_VALUE),
-            ("row name", FONT_SIZE_ROW_NAME),
-            ("row stat", FONT_SIZE_ROW_STAT),
-            ("row percent", FONT_SIZE_ROW_PCT),
-            ("subtitle", FONT_SIZE_SUBTITLE),
-            ("counter", FONT_SIZE_COUNTER),
+            FONT_SIZE_TIMER,
+            FONT_SIZE_TITLE,
+            FONT_SIZE_ROW,
+            FONT_SIZE_PILL_VALUE,
+            FONT_SIZE_SUBTITLE,
         ];
-        for pair in scale.windows(2) {
-            let (larger, smaller) = (pair[0], pair[1]);
-            assert!(
-                larger.1 >= smaller.1,
-                "{} ({}) must not be smaller than {} ({})",
-                larger.0,
-                larger.1,
-                smaller.0,
-                smaller.1
-            );
-        }
-        // The one deliberate tie in that sequence: a pill value and a player
-        // name are the same size in the reference.
-        assert_eq!(FONT_SIZE_PILL_VALUE, FONT_SIZE_ROW_NAME);
+        assert_eq!(scale, [16.0, 13.0, 13.0, 12.0, 10.0]);
+        assert_eq!(FONT_SIZE_COUNTER, FONT_SIZE_ROW);
     }
 
     /// `regular` is always the plain proportional family.
@@ -3070,37 +3054,27 @@ mod tests {
         );
     }
 
-    /// Per-column emphasis (issue #56): the DPS value is the row's headline
-    /// number, percentages are the smallest, everything else sits between.
-    ///
-    /// Issue #49's counter is the one other bold level, but it is bold
-    /// *inside a pill* at the smallest size in the scale — it can never
-    /// compete with the DPS value for attention, which is what this test
-    /// actually protects.
+    /// Per-column emphasis (issue #62): the source's row scale is flat, so
+    /// every metric column — DPS included — shares `FONT_SIZE_ROW`. `Dps` is
+    /// still its own `ColumnEmphasis::Value` (a distinct level for future
+    /// hooks), it just no longer maps to a different font.
     #[test]
-    fn column_emphasis_makes_dps_the_largest_and_boldest_column() {
+    fn every_metric_column_shares_the_source_row_metric() {
         assert_eq!(column_emphasis(ColumnKind::Dps), ColumnEmphasis::Value);
-        assert!(ColumnEmphasis::Value.is_bold());
         assert!(!ColumnEmphasis::Value.is_pill());
         for kind in ColumnKind::ALL {
-            if kind == ColumnKind::Dps {
-                continue;
-            }
-            let emphasis = column_emphasis(kind);
-            assert!(
-                !emphasis.is_bold() || emphasis.is_pill(),
-                "{kind:?} should not be bold unless it is a pill"
-            );
-            assert!(
-                emphasis.font().size < ColumnEmphasis::Value.font().size,
-                "{kind:?} should be smaller than the DPS value"
+            assert_eq!(
+                column_emphasis(kind).font().size,
+                FONT_SIZE_ROW,
+                "{kind:?} should share the row's flat metric size"
             );
         }
     }
 
-    /// Percentage columns are the ones the reference colors and shrinks.
+    /// Percentage columns are distinguished by color, not size — the source
+    /// carries no separate `FontSize` for them.
     #[test]
-    fn column_emphasis_shrinks_the_percentage_columns() {
+    fn percentage_columns_are_distinguished_by_color_not_size() {
         for kind in [
             ColumnKind::SharePct,
             ColumnKind::CritPct,
@@ -3108,9 +3082,9 @@ mod tests {
         ] {
             assert_eq!(column_emphasis(kind), ColumnEmphasis::Percent);
         }
-        assert!(
-            ColumnEmphasis::Percent.font().size < ColumnEmphasis::Stat.font().size,
-            "percentages should read smaller than plain stats"
+        assert_ne!(
+            ColumnKind::CritPct.spec().color,
+            ColumnKind::Dps.spec().color
         );
     }
 
@@ -4082,7 +4056,7 @@ mod tests {
 
     /// Runtime reads, not const-vs-const compares (clippy's
     /// `assertions_on_constants`) — same trick
-    /// `font_scale_is_ordered_largest_to_smallest` uses.
+    /// `font_scale_matches_the_source_metrics` uses.
     #[test]
     fn chrome_border_and_fill_are_translucent() {
         for alpha in [PANEL_FILL.a(), PANEL_BORDER_COLOR.a()] {
@@ -4694,21 +4668,20 @@ mod tests {
         assert_eq!(pills, vec![ColumnKind::Deaths]);
     }
 
-    /// The counter is the smallest text in the row (issue #56's hierarchy),
-    /// which is the whole reason `FONT_SIZE_COUNTER` exists.
+    /// The counter shares the row's flat metric size (issue #62) — it is the
+    /// only emphasis level painted as a pill rather than as bare text.
     #[test]
-    fn the_counter_is_the_smallest_text_in_a_row() {
+    fn the_counter_shares_the_row_metric_and_is_the_only_pill() {
+        assert_eq!(ColumnEmphasis::Counter.font().size, FONT_SIZE_ROW);
+        assert_eq!(FONT_SIZE_COUNTER, FONT_SIZE_ROW);
+        assert!(ColumnEmphasis::Counter.is_pill());
         for other in [
             ColumnEmphasis::Value,
             ColumnEmphasis::Stat,
             ColumnEmphasis::Percent,
         ] {
-            assert!(
-                ColumnEmphasis::Counter.font().size < other.font().size,
-                "{other:?} should be larger than the counter"
-            );
+            assert!(!other.is_pill(), "{other:?} should not be a pill");
         }
-        assert_eq!(ColumnEmphasis::Counter.font().size, FONT_SIZE_COUNTER);
     }
 
     /// `widest_formatted_text_fits_its_column_width_budget` measures *text*
@@ -4818,10 +4791,12 @@ mod tests {
     }
 
     /// The counter's own styling, as the reference render shows it: skull
-    /// first, then the count; the smallest size in the scale; and a skull
-    /// dimmer than the digits beside it, both dimmer than white.
+    /// first, then the count; the row's flat metric size; and a skull
+    /// dimmer than the digits beside it (issue #62: the digits are now
+    /// plain white, `DEATH_COUNT_RGB`, so the pill's `#1fff` background is
+    /// what separates the counter from the row, not a dimmer digit color).
     #[test]
-    fn counter_pill_leads_with_a_dim_skull() {
+    fn counter_pill_leads_with_a_dimmed_skull() {
         let color =
             egui::Color32::from_rgb(DEATH_COUNT_RGB.0, DEATH_COUNT_RGB.1, DEATH_COUNT_RGB.2);
         let pill = StatPill::counter("3", PillIcon::Skull(None), color);
@@ -4830,9 +4805,8 @@ mod tests {
         assert_eq!(pill.size, FONT_SIZE_COUNTER);
         assert_eq!(pill.value_color, color);
         assert_eq!(pill.icon_color, COUNTER_ICON_COLOR);
-        // Dimmer than the digits, which are themselves dimmer than white.
+        // The skull stays dimmer than the (now white) digits beside it.
         assert!(COUNTER_ICON_COLOR.r() < color.r());
-        assert!(color.r() < egui::Color32::WHITE.r());
         // And not the header's accent blue — the row's skull is chrome, not
         // an accent (see `COUNTER_ICON_COLOR`).
         assert_ne!(pill.icon_color, PILL_ICON_COLOR);

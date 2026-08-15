@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use egui::Color32;
 
-use crate::ui::{CRIT_PCT_RGB, DEATH_COUNT_RGB, LUCKY_PCT_RGB, StatColumn, fmt_share, fmt_short};
+use crate::ui::{
+    CRIT_PCT_RGB, DEATH_COUNT_RGB, LUCKY_PCT_RGB, STAT_TEXT_RGB, StatColumn, fmt_share, fmt_short,
+};
 
 /// One selectable stat column. Declaration order here is also the
 /// canonical left-to-right column order used whenever more than one is
@@ -132,7 +134,7 @@ impl ColumnKind {
             ColumnKind::Damage => StatColumn {
                 width: 56.0,
                 text: |row| fmt_short(row.damage),
-                color: Color32::WHITE,
+                color: Color32::from_rgb(STAT_TEXT_RGB.0, STAT_TEXT_RGB.1, STAT_TEXT_RGB.2),
             },
             // `fmt_short`'s ≤7 chars plus the 2-char "/s" suffix = ≤9
             // chars, so this column needs more room than the others.
@@ -144,7 +146,7 @@ impl ColumnKind {
             ColumnKind::SharePct => StatColumn {
                 width: 56.0,
                 text: |row| fmt_share(row.share_pct),
-                color: Color32::WHITE,
+                color: Color32::from_rgb(STAT_TEXT_RGB.0, STAT_TEXT_RGB.1, STAT_TEXT_RGB.2),
             },
             ColumnKind::CritPct => StatColumn {
                 width: 56.0,
@@ -827,20 +829,35 @@ mod tests {
         );
     }
 
+    /// `AbilityScore`, `SeasonStrength` and `Hits` have no counterpart in the
+    /// source's fixed column sets, so they stay white. `Dps` is the source's
+    /// one headline column and stays white too (decision 4).
     #[test]
-    fn other_columns_stay_white() {
+    fn unbudgeted_columns_and_dps_stay_white() {
         for kind in [
             ColumnKind::AbilityScore,
             ColumnKind::SeasonStrength,
-            ColumnKind::Damage,
             ColumnKind::Dps,
-            ColumnKind::SharePct,
             ColumnKind::Hits,
         ] {
             assert_eq!(
                 kind.spec().color,
                 Color32::WHITE,
                 "{kind:?} should stay white"
+            );
+        }
+    }
+
+    /// `Damage`/`SharePct` are plain stats in the source (`DamagePercDT`/
+    /// `DamageDT`, `Foreground="#aaa"`), stepped down from white (decision 4,
+    /// issue #62).
+    #[test]
+    fn plain_stat_columns_use_the_dim_stat_color() {
+        for kind in [ColumnKind::Damage, ColumnKind::SharePct] {
+            assert_eq!(
+                kind.spec().color,
+                Color32::from_rgb(STAT_TEXT_RGB.0, STAT_TEXT_RGB.1, STAT_TEXT_RGB.2),
+                "{kind:?} should use STAT_TEXT_RGB"
             );
         }
     }
@@ -903,17 +920,18 @@ mod tests {
         assert_eq!((ColumnKind::Deaths.spec().text)(&row), "12");
     }
 
-    /// The counter is the dimmest text in a row (issue #56's type
-    /// hierarchy), so it is deliberately not `Color32::WHITE` like the plain
-    /// stat columns.
+    /// The death count's digits are plain white (decision 4, issue #62): the
+    /// source's `DeathsDT` is `Foreground="White"`, and the pill's own
+    /// `#1fff` background is what separates the counter from the row rather
+    /// than a dimmer digit color.
     #[test]
-    fn deaths_spec_is_dim_gray() {
+    fn deaths_spec_is_white() {
         let color = ColumnKind::Deaths.spec().color;
         assert_eq!(
             color,
             Color32::from_rgb(DEATH_COUNT_RGB.0, DEATH_COUNT_RGB.1, DEATH_COUNT_RGB.2)
         );
-        assert_ne!(color, Color32::WHITE);
+        assert_eq!(color, Color32::WHITE);
     }
 
     #[test]
