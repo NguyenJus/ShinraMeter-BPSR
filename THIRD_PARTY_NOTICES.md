@@ -32,6 +32,17 @@ WinDivert's LGPL-3.0 option is compatible.
 - Embedded verbatim (compiled into the executable via `include_bytes!` in
   `crates/app/src/icons.rs`), unmodified, at build time.
 
+## ShinraMeter toolbar icons
+
+- Files: `crates/app/assets/icons/*.png`
+- Upstream: <https://github.com/neowutran/ShinraMeter> (`resources/img/`)
+- License: MIT
+- Embedded verbatim (compiled into the executable via `include_bytes!` in
+  `crates/app/src/icons.rs`), unmodified, at build time. `settings.png` is
+  upstream's `config.png` and `clock.png` is upstream's `historic.png`,
+  renamed here to match what each is used for in this project — no pixel
+  data changed.
+
 ## Monster and scene name tables
 
 - Files: `crates/meter/data/MonsterName.json`, `crates/meter/data/SceneName.json`
