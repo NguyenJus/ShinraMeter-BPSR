@@ -198,10 +198,7 @@ fn draw_header(
     // their clicks. Grabbing a single glyph was too small a target to hit.
     let band = {
         let mut rect = ui.available_rect_before_wrap();
-        let mut height = TITLE_LINE_HEIGHT + ui.spacing().interact_size.y;
-        if subtitle.is_some() {
-            height += SUBTITLE_LINE_HEIGHT;
-        }
+        let height = header_band_height(subtitle.is_some(), ui.spacing().interact_size.y);
         rect.max.y = rect.min.y + height;
         // Leave the top resize strip alone — a drag surface spanning it would
         // win the hit test and swallow every north-edge resize.
@@ -304,6 +301,22 @@ const SUBTITLE_LINE_HEIGHT: f32 = 16.0;
 /// Font size for the subtitle line — smaller than the title, dimmed via
 /// `ui.visuals().weak_text_color()` rather than a new hard-coded colour.
 const SUBTITLE_FONT_SIZE: f32 = 11.0;
+
+/// Height of `draw_header`'s drag band: the title line, the optional
+/// subtitle line, and the button row (`button_row_height`, egui's
+/// `interact_size.y`), plus one `ITEM_SPACING_Y` gap for every adjacent pair
+/// egui's vertical layout stacks them as — 1 gap (title -> button row) when
+/// there's no subtitle, 2 (title -> subtitle -> button row) when there is.
+/// Extracted from `draw_header` so the two cases are unit-testable without a
+/// live `egui::Ui`.
+fn header_band_height(has_subtitle: bool, button_row_height: f32) -> f32 {
+    let gap_count = if has_subtitle { 2 } else { 1 };
+    let mut height = TITLE_LINE_HEIGHT + button_row_height + gap_count as f32 * ITEM_SPACING_Y;
+    if has_subtitle {
+        height += SUBTITLE_LINE_HEIGHT;
+    }
+    height
+}
 
 /// Paints the header's title line (boss name/id/placeholder) at a fixed
 /// height so `draw_header`'s drag band and `default_inner_height` can both
@@ -1050,6 +1063,39 @@ mod tests {
         let (north, ..) = resize_zones(win)[0];
         assert_eq!(north.height(), RESIZE_EDGE);
         assert_eq!(north.top(), win.top());
+    }
+
+    // -- header_band_height (drag band must cover the rendered header) ----
+
+    /// No subtitle: egui stacks title + button row, one gap between them.
+    #[test]
+    fn header_band_height_with_no_subtitle_covers_title_gap_and_button_row() {
+        let button_row_height = 18.0;
+        let expected = TITLE_LINE_HEIGHT + button_row_height + ITEM_SPACING_Y;
+        assert_eq!(header_band_height(false, button_row_height), expected);
+    }
+
+    /// With a subtitle: egui stacks title + subtitle + button row, so there
+    /// are two gaps, not one — the bug this guards against undercounted by
+    /// exactly one `ITEM_SPACING_Y` here.
+    #[test]
+    fn header_band_height_with_subtitle_covers_both_gaps() {
+        let button_row_height = 18.0;
+        let expected =
+            TITLE_LINE_HEIGHT + SUBTITLE_LINE_HEIGHT + button_row_height + 2.0 * ITEM_SPACING_Y;
+        assert_eq!(header_band_height(true, button_row_height), expected);
+    }
+
+    /// Adding the subtitle must grow the band by exactly the subtitle's own
+    /// height plus the extra gap it introduces — not by a smaller amount
+    /// (the original bug: gaps were never added, so a subtitle only grew the
+    /// band by `SUBTITLE_LINE_HEIGHT`, leaving the band 4px short).
+    #[test]
+    fn subtitle_grows_band_by_its_height_plus_one_extra_gap() {
+        let button_row_height = 18.0;
+        let without = header_band_height(false, button_row_height);
+        let with = header_band_height(true, button_row_height);
+        assert_eq!(with - without, SUBTITLE_LINE_HEIGHT + ITEM_SPACING_Y);
     }
 
     // -- column_anchors (issue #8) --------------------------------------

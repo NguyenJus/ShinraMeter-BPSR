@@ -48,7 +48,14 @@ mod tests {
     }
 
     #[test]
-    fn crowdsourced_names_win_over_the_bulk_table() {
+    fn crowdsourced_entries_are_present_in_the_generated_table() {
+        // NB: this only proves `MonsterNameCrowdsource.json` entries make it
+        // into the table at all — every id that currently overlaps between
+        // `MonsterName.json` and `MonsterNameCrowdsource.json` holds a
+        // byte-identical value, so this table can't express (and this test
+        // can't exercise) which side wins on a real disagreement. That
+        // precedence is covered where it's actually decided:
+        // `merge_monster_names`'s self-test in `scripts/gen-name-tables.py`.
         assert_eq!(monster_name(10086), Some("Goblin King"));
     }
 
@@ -67,7 +74,66 @@ mod tests {
 
 
 def esc(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"')
+    """Escape `s` for embedding in a Rust `&'static str` literal.
+
+    Order matters: backslash is escaped first, so the escapes this function
+    inserts below are never themselves re-escaped. `\\r`, `\\n`, and `\\t`
+    get Rust's short forms; every other control character gets Rust's
+    `\\u{...}` form, so a bare CR (or any other control byte) in a future
+    refresh of the vendored community JSON can never produce a `tables.rs`
+    that fails to compile with "bare CR not allowed in string" or similar.
+    """
+    s = s.replace("\\", "\\\\").replace('"', '\\"')
+    out = []
+    for ch in s:
+        if ch == "\r":
+            out.append("\\r")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{{{ord(ch):x}}}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def merge_monster_names(bulk: dict[int, str], curated: dict[int, str]) -> dict[int, str]:
+    """Merge the bulk community table with the hand-checked crowdsourced one.
+
+    The crowdsourced list is hand-checked, so it must win where the two
+    disagree: `curated` is applied on top of `bulk`, never the reverse.
+    Pulled out as its own function so `_self_test` can exercise the
+    precedence directly — today's two vendored JSON files agree on every id
+    they share, so a generated `tables.rs` (and the Rust test that reads
+    from it) can't tell a correct merge from a silently flipped one.
+    """
+    merged = dict(bulk)
+    merged.update(curated)
+    return merged
+
+
+def _self_test() -> None:
+    """Fast synthetic checks run on every generation. There is no Python
+    test harness elsewhere in this repo (no pytest config, no CI job that
+    runs Python — see `scripts/` and `.github/workflows/`), so this hard-fails
+    inline instead of living in an untested, never-run test file.
+    """
+    merged = merge_monster_names({1: "Bulk Only", 2: "Bulk Version"}, {2: "Curated Version"})
+    assert merged == {1: "Bulk Only", 2: "Curated Version"}, (
+        "curated entries must win over the bulk table when ids overlap"
+    )
+
+    assert esc('a\\b"c') == 'a\\\\b\\"c'
+    assert esc("line1\rline2") == "line1\\rline2"
+    assert esc("line1\nline2") == "line1\\nline2"
+    assert esc("a\tb") == "a\\tb"
+    assert esc("\x01") == "\\u{1}"
+    assert esc("\x7f") == "\\u{7f}"
+    # Order: backslash-escaping must not re-escape a literal `\r` that was
+    # already produced for a real carriage return.
+    assert esc("\\\r") == "\\\\\\r"
 
 
 def emit(out: io.StringIO, doc: str, fn: str, table: dict) -> None:
@@ -79,13 +145,16 @@ def emit(out: io.StringIO, doc: str, fn: str, table: dict) -> None:
 
 
 def main() -> None:
+    _self_test()
+
     bulk = json.loads((DATA / "MonsterName.json").read_text())
     curated = json.loads((DATA / "MonsterNameCrowdsource.json").read_text())
     scenes = json.loads((DATA / "SceneName.json").read_text())
 
-    monsters = {int(k): v for k, v in bulk.items()}
-    # The crowdsourced list is hand-checked, so it wins where the two disagree.
-    monsters.update({int(k): v for k, v in curated.items()})
+    monsters = merge_monster_names(
+        {int(k): v for k, v in bulk.items()},
+        {int(k): v for k, v in curated.items()},
+    )
 
     out = io.StringIO()
     out.write(HEADER)

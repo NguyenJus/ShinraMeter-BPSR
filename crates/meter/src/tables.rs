@@ -589,7 +589,14 @@ mod tests {
     }
 
     #[test]
-    fn crowdsourced_names_win_over_the_bulk_table() {
+    fn crowdsourced_entries_are_present_in_the_generated_table() {
+        // NB: this only proves `MonsterNameCrowdsource.json` entries make it
+        // into the table at all — every id that currently overlaps between
+        // `MonsterName.json` and `MonsterNameCrowdsource.json` holds a
+        // byte-identical value, so this table can't express (and this test
+        // can't exercise) which side wins on a real disagreement. That
+        // precedence is covered where it's actually decided:
+        // `merge_monster_names`'s self-test in `scripts/gen-name-tables.py`.
         assert_eq!(monster_name(10086), Some("Goblin King"));
     }
 

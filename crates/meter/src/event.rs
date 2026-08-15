@@ -76,7 +76,7 @@ impl Class {
         match self {
             Class::Stormblade => "Stormblade",
             Class::FrostMage => "FrostMage",
-            Class::TwinStriker => "Twin Striker",
+            Class::TwinStriker => "TwinStriker",
             Class::WindKnight => "WindKnight",
             Class::VerdantOracle => "VerdantOracle",
             Class::HeavyGuardian => "HeavyGuardian",
