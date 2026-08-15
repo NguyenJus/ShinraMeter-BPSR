@@ -1,15 +1,21 @@
 //! Windows-only startup tweaks that egui/winit don't expose a cross-platform
 //! way to do.
 //!
-//! Issue #11: dragging the borderless overlay via
-//! `ViewportCommand::StartDrag` (see `ui::draw_header`) enters winit's
-//! native move loop, and Windows applies Aero Snap to that gesture the same
-//! way it would a real title-bar drag. That *drag-triggered* snap path is
-//! driven by the `WS_MAXIMIZEBOX` window style, not by whether the window
-//! has decorations, so `disable_aero_snap` clears that bit directly on the
-//! raw `HWND` right after the window is created (and, since a `GWL_STYLE`
-//! change alone doesn't take visible effect, forces a frame-change
-//! notification so DWM actually picks it up).
+//! Issue #11: Windows' Snap subsystem only engages inside the OS's own
+//! modal move/resize loops, which `ViewportCommand::StartDrag` (`SC_MOVE`)
+//! and `ViewportCommand::BeginResize` (`SC_SIZE`) used to enter. `ui.rs`
+//! no longer uses either: `ui::draw_header` and `ui::draw_resize_handles`
+//! now track the pointer themselves and drive the window with
+//! `ViewportCommand::OuterPosition`/`InnerSize`, so no native loop — and
+//! therefore no drag-triggered Snap — is ever entered. The three defenses
+//! below are kept as belt-and-braces for the paths that never went
+//! through a drag at all.
+//!
+//! The *drag-triggered* snap path is driven by the `WS_MAXIMIZEBOX` window
+//! style, not by whether the window has decorations, so `disable_aero_snap`
+//! clears that bit directly on the raw `HWND` right after the window is
+//! created (and, since a `GWL_STYLE` change alone doesn't take visible
+//! effect, forces a frame-change notification so DWM actually picks it up).
 //!
 //! That style bit doesn't reach every path to Snap, though: Win+Arrow
 //! keyboard snap and the shell's own maximize command are shell/DWM-
@@ -21,12 +27,14 @@
 //! `SC_MAXIMIZE` as a backstop. See its doc comment and `is_snap_shaped`'s
 //! for the actual decision logic.
 //!
-//! `WS_THICKFRAME` — which `ui::draw_resize_handles` relies on for
-//! edge-drag resizing via `BeginResize` — is untouched by any of this, so
-//! manual resize keeps working; the subclass tells a legitimate app-driven
-//! reposition (this file's own `clamp_window_to_visible_area`, and manual
-//! move/resize in `ui.rs`) apart from a shell-initiated Snap via
-//! `app_driven_reposition`, which every such call site must be wrapped in.
+//! `WS_THICKFRAME` is untouched by any of this, so the window stays
+//! resizable; the subclass tells a legitimate app-driven reposition apart
+//! from a shell-initiated Snap by an exemption flag with two scopes:
+//! `app_driven_reposition` for a single `SetWindowPos` call (this file's
+//! own `clamp_window_to_visible_area`), and `begin_app_driven_reposition`
+//! for a whole `ui.rs` move/resize gesture, whose queued viewport commands
+//! winit turns into `SetWindowPos` calls of its own long after any closure
+//! would have returned.
 //!
 //! Not verified against a real Windows session: these workarounds can only
 //! be confirmed by actually dragging/Win+Arrow-snapping the overlay near a
@@ -273,8 +281,8 @@ fn band_is_reachable(band: Rect, monitors: &[Rect]) -> bool {
 ///
 /// The overlay is borderless, and the drag surface in `ui::draw_header` —
 /// the top `HEADER_BAND_HEIGHT` px across the window's full width — is the
-/// *only* way the user can move it (see `ViewportCommand::StartDrag`
-/// there). So "acceptable" isn't "fully on some monitor": a window sitting
+/// *only* way the user can move it (which it does by tracking the pointer
+/// itself, not via any OS move loop). So "acceptable" isn't "fully on some monitor": a window sitting
 /// mostly off a monitor's edge, with just enough header showing to grab, is
 /// already recoverable by the user, and correcting it anyway would fight a
 /// deliberate multi-monitor layout (e.g. parked mostly off-screen in a
@@ -507,49 +515,76 @@ fn enumerate_monitor_work_areas() -> Vec<Rect> {
     monitors
 }
 
-/// Wraps an app-initiated `SetWindowPos` call — this module's own
-/// `clamp_window_to_visible_area` above, and manual move/resize in
-/// `ui.rs` — so the snap-blocking subclass installed by
-/// `install_snap_blocker` can tell "the app moved itself" apart from a
-/// shell/DWM-initiated Windows Snap and only veto the latter.
+/// Wraps a *single* app-initiated `SetWindowPos` call — this module's own
+/// `clamp_window_to_visible_area` above — so the snap-blocking subclass
+/// installed by `install_snap_blocker` can tell "the app moved itself"
+/// apart from a shell/DWM-initiated Windows Snap and only veto the latter.
 ///
 /// Every direct `SetWindowPos` call anywhere in this crate MUST be
 /// wrapped in this. An unwrapped call risks being rejected by
 /// `window_proc`'s `WM_WINDOWPOSCHANGING` handling below whenever it
-/// happens to propose a snap-shaped rect — e.g. a manual resize that
-/// lands on exactly half the screen, or this module's own position clamp.
+/// happens to propose a snap-shaped rect — e.g. this module's own
+/// position clamp landing on exactly half the screen.
 ///
-/// The flag this sets (`APP_DRIVEN_REPOSITION`) is process-wide, not
-/// per-window, so keep `f` scoped tightly to the `SetWindowPos` call(s)
-/// that need to bypass the guard, not unrelated work that happens to run
-/// alongside it.
-#[cfg(windows)]
+/// This closure form is *not* enough for the manual move/resize gestures
+/// in `ui.rs`: those don't call `SetWindowPos` themselves, they queue
+/// `ViewportCommand::OuterPosition`/`InnerSize`, which winit applies
+/// later in the frame — long after any closure here would have returned.
+/// Those use `begin_app_driven_reposition` below instead, which holds the
+/// same exemption open across the whole gesture.
+///
+/// The exemption is process-wide, not per-window, so keep `f` scoped
+/// tightly to the `SetWindowPos` call(s) that need to bypass the guard,
+/// not unrelated work that happens to run alongside it.
 pub fn app_driven_reposition<R>(f: impl FnOnce() -> R) -> R {
-    use std::sync::atomic::Ordering;
+    let _guard = begin_app_driven_reposition();
+    f()
+}
 
-    // RAII so the flag is cleared even if `f` panics and unwinds through
-    // this call, rather than leaving Snap permanently blocked.
-    struct ClearOnDrop;
-    impl Drop for ClearOnDrop {
-        fn drop(&mut self) {
-            APP_DRIVEN_REPOSITION.store(false, Ordering::SeqCst);
-        }
+/// Opens an app-driven-reposition exemption that lasts until the returned
+/// guard is dropped, rather than for one closure call. This is what a
+/// manual move/resize gesture in `ui.rs` holds for its whole duration:
+/// the `ViewportCommand`s it queues are applied by winit later in the
+/// frame, so every `SetWindowPos` winit issues in between has to be
+/// exempt, not just the moment the command was queued.
+///
+/// Dropping the guard is the *only* way the exemption is released, so the
+/// caller must make sure that happens on every exit path — pointer
+/// released, drag cancelled, window unfocused. A leaked guard leaves
+/// `window_proc`'s snap veto disabled for the rest of the session.
+#[must_use = "the exemption lasts exactly as long as the returned guard"]
+pub fn begin_app_driven_reposition() -> RepositionGuard {
+    APP_DRIVEN_REPOSITION_DEPTH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    RepositionGuard { _private: () }
+}
+
+/// RAII handle for the exemption `begin_app_driven_reposition` opens.
+#[derive(Debug)]
+pub struct RepositionGuard {
+    /// Keeps the guard unconstructible outside this module, so the only
+    /// way to get one is the `fetch_add` in `begin_app_driven_reposition`
+    /// that its `Drop` pairs with.
+    _private: (),
+}
+
+impl Drop for RepositionGuard {
+    fn drop(&mut self) {
+        APP_DRIVEN_REPOSITION_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
-
-    APP_DRIVEN_REPOSITION.store(true, Ordering::SeqCst);
-    let _clear = ClearOnDrop;
-    f()
 }
 
-#[cfg(not(windows))]
-pub fn app_driven_reposition<R>(f: impl FnOnce() -> R) -> R {
-    f()
+/// Whether any exemption is currently open; `window_proc` skips its snap
+/// veto while this holds.
+#[cfg(any(windows, test))]
+fn app_driven_reposition_active() -> bool {
+    APP_DRIVEN_REPOSITION_DEPTH.load(std::sync::atomic::Ordering::SeqCst) > 0
 }
 
-/// Set for the duration of an `app_driven_reposition` call; see there.
-#[cfg(windows)]
-static APP_DRIVEN_REPOSITION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// How many `RepositionGuard`s are alive. A refcount rather than a flag so
+/// a short closure-scoped exemption nested inside a long gesture-scoped
+/// one doesn't clear the outer one's on the way out.
+static APP_DRIVEN_REPOSITION_DEPTH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Tolerance, in physical pixels, when matching a proposed rect against a
 /// monitor-half/quarter/full shape in `is_snap_shaped`. Windows computes
@@ -662,8 +697,10 @@ const SNAP_BLOCKER_SUBCLASS_ID: usize = 1;
 ///   rect happens to be a monitor half/quarter (`is_snap_shaped`, reusing
 ///   `enumerate_monitor_work_areas`, the same monitor enumeration
 ///   `clamp_window_to_visible_area` uses). Legitimate app-driven
-///   repositioning is exempted via `app_driven_reposition` — every call
-///   site must be wrapped in it, or it risks being vetoed here.
+///   repositioning is exempted via `app_driven_reposition` (one
+///   `SetWindowPos` call) or `begin_app_driven_reposition` (a whole
+///   `ui.rs` move/resize gesture) — every such site must hold one, or it
+///   risks being vetoed here.
 /// - `WM_SYSCOMMAND` / `SC_MAXIMIZE`: a backstop for the shell's maximize
 ///   command directly, independent of whatever rect it would propose.
 ///
@@ -719,13 +756,12 @@ unsafe extern "system" fn window_proc(
     _uidsubclass: usize,
     _dwrefdata: usize,
 ) -> windows::Win32::Foundation::LRESULT {
-    use std::sync::atomic::Ordering;
     use windows::Win32::UI::Shell::DefSubclassProc;
     use windows::Win32::UI::WindowsAndMessaging::{
         SC_MAXIMIZE, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING,
     };
 
-    if msg == WM_WINDOWPOSCHANGING && !APP_DRIVEN_REPOSITION.load(Ordering::SeqCst) {
+    if msg == WM_WINDOWPOSCHANGING && !app_driven_reposition_active() {
         // SAFETY: for `WM_WINDOWPOSCHANGING`, `lparam` is a valid pointer
         // to a `WINDOWPOS` the sender owns for the duration of this call;
         // mutating it in place before forwarding to `DefSubclassProc` is
@@ -776,6 +812,30 @@ mod tests {
     const WS_POPUP: isize = 0x8000_0000;
     const WS_VISIBLE: isize = 0x1000_0000;
     const WS_THICKFRAME: isize = 0x0004_0000;
+
+    /// The exemption has to survive a whole manual gesture (many frames,
+    /// many winit-issued `SetWindowPos` calls), so it is refcounted rather
+    /// than a plain flag: a nested `app_driven_reposition` closure must not
+    /// drop the exemption an outstanding gesture guard is holding open.
+    #[test]
+    fn the_app_driven_exemption_covers_both_guards_and_closures() {
+        assert!(!app_driven_reposition_active());
+
+        let gesture = begin_app_driven_reposition();
+        assert!(app_driven_reposition_active());
+
+        // A nested closure-scoped exemption comes and goes without
+        // disturbing the gesture-scoped one.
+        app_driven_reposition(|| assert!(app_driven_reposition_active()));
+        assert!(app_driven_reposition_active());
+
+        let nested = begin_app_driven_reposition();
+        drop(nested);
+        assert!(app_driven_reposition_active());
+
+        drop(gesture);
+        assert!(!app_driven_reposition_active());
+    }
 
     #[test]
     fn clears_maximize_box() {

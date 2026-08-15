@@ -43,6 +43,11 @@ pub struct OverlayApp {
     /// texture loading needs an `egui::Context`, which does not exist yet at
     /// `OverlayApp::new` — then loaded exactly once for the process's life.
     icons: Option<Icons>,
+    /// The manual window move/resize gesture in flight, if any (issue #11);
+    /// see `WindowGesture`. Lives on the app rather than in egui memory
+    /// because it owns the reposition exemption guard, whose lifetime has
+    /// to be explicit.
+    window_gesture: WindowGesture,
 }
 
 /// All icon textures the overlay paints, bundled so `OverlayApp` has exactly
@@ -88,6 +93,7 @@ impl OverlayApp {
             tx_command,
             tx_settings,
             icons: None,
+            window_gesture: WindowGesture::default(),
         }
     }
 
@@ -123,7 +129,7 @@ impl eframe::App for OverlayApp {
             .show(ui, |ui| {
                 // First, so the header buttons drawn afterwards stay on top of
                 // the corner zones they overlap.
-                draw_resize_handles(ui, &ctx);
+                draw_resize_handles(ui, &ctx, &mut self.window_gesture);
                 draw_header(
                     ui,
                     &ctx,
@@ -132,7 +138,12 @@ impl eframe::App for OverlayApp {
                     &mut self.settings,
                     &self.tx_settings,
                     &icons.toolbar,
+                    &mut self.window_gesture,
                 );
+                // After both, so a gesture that started this frame is
+                // already anchored — and, being outside them, it is the one
+                // place a gesture can end no matter which zone began it.
+                drive_window_gesture(&ctx, &mut self.window_gesture);
 
                 if let StatusLine::Error(msg) = &self.status {
                     ui.colored_label(egui::Color32::from_rgb(220, 80, 80), msg.as_str());
@@ -212,6 +223,7 @@ fn draw_header(
     settings: &mut Settings,
     tx_settings: &Sender<Settings>,
     toolbar: &ToolbarIcons,
+    gesture: &mut WindowGesture,
 ) {
     let title = encounter_title(&snapshot.encounter);
     let subtitle = encounter_subtitle(&snapshot.encounter);
@@ -233,10 +245,10 @@ fn draw_header(
     if drag_surface.hovered() {
         ctx.set_cursor_icon(egui::CursorIcon::Grab);
     }
-    // Once per gesture: `drag_window` starts a modal move loop on the OS side,
-    // so re-sending it every frame while the drag is held is at best redundant.
+    // Once per gesture: this only captures the anchor the drag is measured
+    // against. The actual per-frame repositioning is `drive_window_gesture`.
     if drag_surface.drag_started_by(egui::PointerButton::Primary) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        begin_window_gesture(ctx, gesture, GestureKind::Move);
     }
 
     // Title is always rendered (even as the "No target" placeholder) so the
@@ -653,6 +665,216 @@ fn draw_settings_menu(
     trigger.on_hover_text("Settings");
 }
 
+/// Smallest inner size the overlay may be resized to, in points. Shared by
+/// `viewport`'s `with_min_inner_size` — which is what stops winit/the OS
+/// going smaller — and `resized_window_rect`'s clamp, so a manual resize
+/// stops at exactly the same size the window would have been pinned to
+/// anyway (a mismatch would leave the dragged edge visibly detached from
+/// the pointer).
+const MIN_INNER_SIZE: egui::Vec2 = egui::vec2(220.0, 90.0);
+
+/// How far, in points, a gesture's target rect must differ from where the
+/// window already is before a viewport command is worth sending. Purely to
+/// keep a held-still drag from re-queueing identical commands every frame.
+const GESTURE_EPSILON: f32 = 0.5;
+
+/// What a manual window gesture is currently driving.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GestureKind {
+    /// The header drag band: the whole window follows the pointer.
+    Move,
+    /// One of `resize_zones`' eight strips.
+    Resize(egui::ResizeDirection),
+}
+
+/// A manual, app-driven window move or resize in progress (issue #11).
+///
+/// The OS-loop commands (`ViewportCommand::StartDrag` / `BeginResize`) are
+/// deliberately *not* used: they hand the gesture to Windows' `SC_MOVE` /
+/// `SC_SIZE` modal loops, which is the only place Aero Snap engages. So the
+/// overlay tracks the pointer itself and repositions/resizes the window
+/// frame by frame instead, and Snap never gets a loop to hook.
+///
+/// One instance is shared by the header and all eight resize zones, since
+/// egui only ever drags one widget at a time — which also means there is
+/// exactly one owner of the reposition exemption.
+#[derive(Debug, Default)]
+pub struct WindowGesture {
+    active: Option<ActiveGesture>,
+}
+
+#[derive(Debug)]
+struct ActiveGesture {
+    kind: GestureKind,
+    /// Pointer position in *screen* points when the gesture began.
+    start_pointer: egui::Pos2,
+    /// The window's outer rect, in points, when the gesture began. Every
+    /// frame's target is computed from this plus the total pointer delta,
+    /// never from the previous frame's rect, so rounding in what winit
+    /// actually applied can't accumulate over a long drag.
+    start_rect: egui::Rect,
+    /// Held for the whole gesture so the snap-blocking subclass in
+    /// `platform` doesn't veto our own repositioning when it happens to
+    /// land within a couple of pixels of a monitor half. A per-call
+    /// closure would be useless here: the viewport commands below are
+    /// queued, and winit turns them into `SetWindowPos` later in the
+    /// frame. Dropped by `WindowGesture::end`.
+    _exemption: crate::platform::RepositionGuard,
+}
+
+impl WindowGesture {
+    fn kind(&self) -> Option<GestureKind> {
+        self.active.as_ref().map(|active| active.kind)
+    }
+
+    fn begin(&mut self, kind: GestureKind, start_pointer: egui::Pos2, start_rect: egui::Rect) {
+        // Release whatever was running first, so a gesture that somehow
+        // started without the previous one ending can't stack exemptions.
+        self.end();
+        self.active = Some(ActiveGesture {
+            kind,
+            start_pointer,
+            start_rect,
+            _exemption: crate::platform::begin_app_driven_reposition(),
+        });
+    }
+
+    /// Ends the gesture and drops its exemption guard. Idempotent, because
+    /// it is called from every exit path (see `drive_window_gesture`).
+    fn end(&mut self) {
+        self.active = None;
+    }
+}
+
+/// The window's outer rect and the pointer, both in screen points.
+///
+/// Screen space is the only frame of reference a manual gesture can use:
+/// egui reports the pointer in window-local coordinates, and as the window
+/// follows the pointer that local position stays put — a local per-frame
+/// delta would cancel itself out and leave the window juddering in place.
+/// Adding the window's own origin back undoes that.
+fn window_and_pointer(ctx: &egui::Context) -> Option<(egui::Rect, egui::Pos2)> {
+    ctx.input(|i| {
+        let window = i.viewport().outer_rect?;
+        let pointer = i.pointer.latest_pos()?;
+        Some((window, window.min + pointer.to_vec2()))
+    })
+}
+
+/// Starts `kind` from wherever the pointer and window are right now.
+fn begin_window_gesture(ctx: &egui::Context, gesture: &mut WindowGesture, kind: GestureKind) {
+    // No position reported yet (a frame before winit has placed the
+    // window) means there's no anchor to measure against; skipping just
+    // costs the user one re-grab.
+    if let Some((window, pointer)) = window_and_pointer(ctx) {
+        gesture.begin(kind, pointer, window);
+    }
+}
+
+/// Advances the in-flight gesture by one frame, or ends it. Called once per
+/// frame after the header and resize zones have had their chance to start
+/// one.
+fn drive_window_gesture(ctx: &egui::Context, gesture: &mut WindowGesture) {
+    let Some((kind, start_pointer, start_rect)) = gesture
+        .active
+        .as_ref()
+        .map(|active| (active.kind, active.start_pointer, active.start_rect))
+    else {
+        return;
+    };
+
+    // The single release point for every way a gesture can end — pointer
+    // released, drag cancelled, or the window losing focus mid-drag (an
+    // alt-tab or the game grabbing focus back), which stops delivering
+    // pointer state and would otherwise strand the exemption guard for the
+    // rest of the session.
+    let holding = ctx.input(|i| i.pointer.primary_down() && i.viewport().focused.unwrap_or(true));
+    if !holding {
+        gesture.end();
+        return;
+    }
+
+    let Some((window, pointer)) = window_and_pointer(ctx) else {
+        return;
+    };
+    let delta = pointer - start_pointer;
+    let target = match kind {
+        GestureKind::Move => {
+            egui::Rect::from_min_size(moved_window_origin(start_rect, delta), start_rect.size())
+        }
+        GestureKind::Resize(direction) => {
+            resized_window_rect(start_rect, direction, delta, MIN_INNER_SIZE)
+        }
+    };
+
+    if target.min.distance(window.min) > GESTURE_EPSILON {
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target.min));
+    }
+    // The overlay is borderless, so its outer and inner rects are the same
+    // size; `InnerSize` is just the command egui exposes for setting it.
+    if (target.size() - window.size()).length() > GESTURE_EPSILON {
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
+    }
+}
+
+/// Where the window's top-left corner goes for a move gesture: straight
+/// offset by the total pointer delta since the drag began.
+fn moved_window_origin(start: egui::Rect, delta: egui::Vec2) -> egui::Pos2 {
+    start.min + delta
+}
+
+/// The window rect a resize gesture is asking for: `start` with the edges
+/// `direction` names moved by `delta`, clamped so neither axis goes below
+/// `min_size`.
+///
+/// Dragging a west/north edge changes the origin as well as the size, and
+/// the clamp deliberately pushes back the edge the user is *holding* rather
+/// than the one they aren't — otherwise a drag past the minimum would keep
+/// shoving the anchored edge across the screen.
+fn resized_window_rect(
+    start: egui::Rect,
+    direction: egui::ResizeDirection,
+    delta: egui::Vec2,
+    min_size: egui::Vec2,
+) -> egui::Rect {
+    use egui::ResizeDirection as Dir;
+
+    let west = matches!(direction, Dir::West | Dir::NorthWest | Dir::SouthWest);
+    let east = matches!(direction, Dir::East | Dir::NorthEast | Dir::SouthEast);
+    let north = matches!(direction, Dir::North | Dir::NorthEast | Dir::NorthWest);
+    let south = matches!(direction, Dir::South | Dir::SouthEast | Dir::SouthWest);
+
+    let mut rect = start;
+    if west {
+        rect.min.x += delta.x;
+    }
+    if east {
+        rect.max.x += delta.x;
+    }
+    if north {
+        rect.min.y += delta.y;
+    }
+    if south {
+        rect.max.y += delta.y;
+    }
+
+    if rect.width() < min_size.x {
+        if west {
+            rect.min.x = rect.max.x - min_size.x;
+        } else {
+            rect.max.x = rect.min.x + min_size.x;
+        }
+    }
+    if rect.height() < min_size.y {
+        if north {
+            rect.min.y = rect.max.y - min_size.y;
+        } else {
+            rect.max.y = rect.min.y + min_size.y;
+        }
+    }
+    rect
+}
+
 /// Width of the invisible edge strips that start a resize, in points.
 const RESIZE_EDGE: f32 = 6.0;
 /// Side of the invisible corner squares, which resize on both axes at once.
@@ -711,9 +933,10 @@ fn resize_zones(rect: egui::Rect) -> [(egui::Rect, egui::ResizeDirection, egui::
 }
 
 /// A borderless window gets no OS resize frame, so the overlay supplies its
-/// own: invisible strips along the edges that hand the gesture back to the
-/// window manager via `BeginResize`.
-fn draw_resize_handles(ui: &mut egui::Ui, ctx: &egui::Context) {
+/// own: invisible strips along the edges that start a manual resize gesture
+/// (`WindowGesture`) rather than handing the window manager a native resize
+/// loop, which on Windows is where Snap would engage.
+fn draw_resize_handles(ui: &mut egui::Ui, ctx: &egui::Context, gesture: &mut WindowGesture) {
     let window = ctx.input(|i| i.viewport_rect());
     // `ResizeDirection` is not `Hash`, so the zone's position in the array is
     // what keeps the eight ids distinct.
@@ -722,10 +945,10 @@ fn draw_resize_handles(ui: &mut egui::Ui, ctx: &egui::Context) {
         if handle.hovered() {
             ctx.set_cursor_icon(cursor);
         }
-        // Same as the title-bar drag: this opens a modal loop on the OS side,
-        // so it must fire once per gesture, not once per frame.
+        // Same as the title-bar drag: the anchor is captured once, then
+        // `drive_window_gesture` does the per-frame work.
         if handle.drag_started_by(egui::PointerButton::Primary) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+            begin_window_gesture(ctx, gesture, GestureKind::Resize(direction));
         }
     }
 }
@@ -1163,7 +1386,7 @@ pub fn viewport(window_position: Option<[f32; 2]>) -> egui::ViewportBuilder {
         .with_transparent(true)
         .with_resizable(true)
         .with_inner_size([default_inner_width(), default_inner_height()])
-        .with_min_inner_size([220.0, 90.0]);
+        .with_min_inner_size(MIN_INNER_SIZE);
     if let Some(position) = window_position {
         builder = builder.with_position(position);
     }
@@ -1296,6 +1519,7 @@ mod tests {
                 &mut settings,
                 &tx_settings,
                 &toolbar,
+                &mut WindowGesture::default(),
             );
         });
         let mut texts = Vec::new();
@@ -1357,6 +1581,7 @@ mod tests {
                 &mut settings,
                 &tx_settings,
                 &toolbar,
+                &mut WindowGesture::default(),
             );
             interact_size_y = ui.spacing().interact_size.y;
             rendered_height = ui.min_rect().height();
@@ -2432,5 +2657,126 @@ mod tests {
         let anchors_a = column_anchors(0.0, 300.0, &stat_columns_for(&a.ordered_columns()), 4.0);
         let anchors_b = column_anchors(0.0, 300.0, &stat_columns_for(&b.ordered_columns()), 4.0);
         assert_eq!(anchors_a, anchors_b);
+    }
+
+    // --- Manual (app-driven) window move/resize gestures, issue #11 ---
+
+    /// A stand-in window rect, deliberately larger than `MIN_INNER_SIZE` on
+    /// both axes and off the origin so a drift in either edge shows up.
+    fn window_rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(400.0, 300.0))
+    }
+
+    #[test]
+    fn a_move_offsets_the_origin_by_the_whole_pointer_delta() {
+        assert_eq!(
+            moved_window_origin(window_rect(), egui::vec2(20.0, -10.0)),
+            egui::pos2(120.0, 40.0)
+        );
+    }
+
+    #[test]
+    fn dragging_the_east_edge_moves_only_the_right_edge() {
+        let start = window_rect();
+        let resized = resized_window_rect(
+            start,
+            egui::ResizeDirection::East,
+            egui::vec2(30.0, 77.0),
+            MIN_INNER_SIZE,
+        );
+        assert_eq!(resized.min, start.min);
+        assert_eq!(resized.size(), egui::vec2(430.0, 300.0));
+    }
+
+    #[test]
+    fn dragging_the_west_edge_moves_the_origin_and_anchors_the_right_edge() {
+        let start = window_rect();
+        let resized = resized_window_rect(
+            start,
+            egui::ResizeDirection::West,
+            egui::vec2(-30.0, 40.0),
+            MIN_INNER_SIZE,
+        );
+        assert_eq!(resized.min, egui::pos2(70.0, 50.0));
+        assert_eq!(resized.max, start.max);
+    }
+
+    #[test]
+    fn dragging_a_corner_resizes_on_both_axes_at_once() {
+        let resized = resized_window_rect(
+            window_rect(),
+            egui::ResizeDirection::NorthEast,
+            egui::vec2(25.0, -15.0),
+            MIN_INNER_SIZE,
+        );
+        assert_eq!(
+            resized,
+            egui::Rect::from_min_max(egui::pos2(100.0, 35.0), egui::pos2(525.0, 350.0))
+        );
+    }
+
+    #[test]
+    fn a_trailing_edge_drag_never_shrinks_past_the_minimum_inner_size() {
+        let start = window_rect();
+        let resized = resized_window_rect(
+            start,
+            egui::ResizeDirection::SouthEast,
+            egui::vec2(-1000.0, -1000.0),
+            MIN_INNER_SIZE,
+        );
+        assert_eq!(resized.size(), MIN_INNER_SIZE);
+        // The dragged edges are the trailing ones, so the origin is the
+        // anchor and must not have moved.
+        assert_eq!(resized.min, start.min);
+    }
+
+    #[test]
+    fn clamping_a_leading_edge_drag_leaves_the_anchored_edges_put() {
+        let start = window_rect();
+        let resized = resized_window_rect(
+            start,
+            egui::ResizeDirection::NorthWest,
+            egui::vec2(1000.0, 1000.0),
+            MIN_INNER_SIZE,
+        );
+        assert_eq!(resized.size(), MIN_INNER_SIZE);
+        // Dragging the left/top edges past the minimum must pin them at the
+        // minimum, not push the right/bottom edges along with them.
+        assert_eq!(resized.max, start.max);
+        assert_eq!(resized.min, start.max - MIN_INNER_SIZE);
+    }
+
+    #[test]
+    fn a_gesture_stays_active_until_it_is_ended() {
+        let mut gesture = WindowGesture::default();
+        assert_eq!(gesture.kind(), None);
+        gesture.begin(GestureKind::Move, egui::pos2(10.0, 10.0), window_rect());
+        assert_eq!(gesture.kind(), Some(GestureKind::Move));
+        gesture.end();
+        assert_eq!(gesture.kind(), None);
+    }
+
+    #[test]
+    fn beginning_a_gesture_supersedes_one_still_running() {
+        let mut gesture = WindowGesture::default();
+        gesture.begin(GestureKind::Move, egui::pos2(10.0, 10.0), window_rect());
+        let resize = GestureKind::Resize(egui::ResizeDirection::West);
+        gesture.begin(resize, egui::pos2(0.0, 0.0), window_rect());
+        assert_eq!(gesture.kind(), Some(resize));
+        gesture.end();
+        assert_eq!(gesture.kind(), None);
+    }
+
+    #[test]
+    fn ending_an_idle_gesture_is_a_no_op() {
+        // `end` runs on several exit paths (pointer released, focus lost,
+        // drag cancelled), so it has to be safely repeatable — a second
+        // release must not drop the exemption guard twice.
+        let mut gesture = WindowGesture::default();
+        gesture.end();
+        gesture.begin(GestureKind::Move, egui::pos2(10.0, 10.0), window_rect());
+        gesture.end();
+        gesture.end();
+        assert_eq!(gesture.kind(), None);
     }
 }
