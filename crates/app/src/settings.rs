@@ -13,7 +13,9 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use serde::{Deserialize, Serialize};
 
-use crate::ui::{StatColumn, fmt_share, fmt_short};
+use egui::Color32;
+
+use crate::ui::{CRIT_PCT_RGB, LUCKY_PCT_RGB, StatColumn, fmt_share, fmt_short};
 
 /// One selectable stat column. Declaration order here is also the
 /// canonical left-to-right column order used whenever more than one is
@@ -21,7 +23,6 @@ use crate::ui::{StatColumn, fmt_share, fmt_short};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ColumnKind {
     AbilityScore,
-    SeasonLevel,
     SeasonStrength,
     Damage,
     Dps,
@@ -34,15 +35,14 @@ pub enum ColumnKind {
 impl ColumnKind {
     /// Every selectable column, in canonical left-to-right order.
     ///
-    /// `AbilityScore`, `SeasonLevel`, and `SeasonStrength` lead the list
-    /// rather than sitting among the combat-derived columns: each is a
-    /// static per-player character stat (a gear-score/season-progression
+    /// `AbilityScore` and `SeasonStrength` lead the list rather than
+    /// sitting among the combat-derived columns: each is a static
+    /// per-player character stat (a gear-score/season-progression
     /// snapshot, not something that accrues over the fight like
     /// damage/hits do), so they read better next to the row's name than
     /// mixed in with `Damage`/`Dps`/etc.
-    pub const ALL: [ColumnKind; 9] = [
+    pub const ALL: [ColumnKind; 8] = [
         ColumnKind::AbilityScore,
-        ColumnKind::SeasonLevel,
         ColumnKind::SeasonStrength,
         ColumnKind::Damage,
         ColumnKind::Dps,
@@ -56,7 +56,6 @@ impl ColumnKind {
     pub fn label(self) -> &'static str {
         match self {
             ColumnKind::AbilityScore => "Ability Score",
-            ColumnKind::SeasonLevel => "Season Level",
             ColumnKind::SeasonStrength => "Season Strength",
             ColumnKind::Damage => "Damage",
             ColumnKind::Dps => "DPS",
@@ -80,55 +79,60 @@ impl ColumnKind {
         match self {
             // `None` (no FIGHT_POINT packet seen yet for this player) is a
             // blank cell, not "0" — a missing reading is not the same as a
-            // zero score. `fmt_short`'s ≤7-char budget applies whenever a
-            // value is present, so this shares the 56.0 width with
-            // `Damage`/`Hits`.
+            // zero score. Full, un-abbreviated figure (owner requirement)
+            // rather than `fmt_short`'s compact form — a player's ability
+            // score is a single static number worth reading exactly, not a
+            // rate/total where a rounded "12.3M" is good enough. No
+            // thousands separator: the codebase has no existing formatter
+            // for one, and this slice isn't the place to add one. `width`
+            // is sized to `u32::MAX`'s 10-digit worst case
+            // (`ability_score`'s own field type ceiling, measured at
+            // 78.28pt in `widest_formatted_text_fits_its_column_width_budget`),
+            // not a guessed/observed game value.
             ColumnKind::AbilityScore => StatColumn {
-                width: 56.0,
+                width: 80.0,
                 text: |row| match row.ability_score {
-                    Some(v) => fmt_short(v as i64),
+                    Some(v) => v.to_string(),
                     None => String::new(),
                 },
+                color: Color32::WHITE,
             },
-            // Same `None`-is-blank / 56.0-width convention as
-            // `AbilityScore` above: a missing reading is not "0", and
-            // `fmt_short`'s ≤7-char budget applies whenever a value is
-            // present.
-            ColumnKind::SeasonLevel => StatColumn {
-                width: 56.0,
-                text: |row| match row.season_level {
-                    Some(v) => fmt_short(v as i64),
-                    None => String::new(),
-                },
-            },
+            // Same full-figure requirement and width reasoning as
+            // `AbilityScore` above.
             ColumnKind::SeasonStrength => StatColumn {
-                width: 56.0,
+                width: 80.0,
                 text: |row| match row.season_strength {
-                    Some(v) => fmt_short(v as i64),
+                    Some(v) => v.to_string(),
                     None => String::new(),
                 },
+                color: Color32::WHITE,
             },
             ColumnKind::Damage => StatColumn {
                 width: 56.0,
                 text: |row| fmt_short(row.damage),
+                color: Color32::WHITE,
             },
             // `fmt_short`'s ≤7 chars plus the 2-char "/s" suffix = ≤9
             // chars, so this column needs more room than the others.
             ColumnKind::Dps => StatColumn {
-                width: 76.0,
+                width: 80.0,
                 text: |row| format!("{}/s", fmt_short(row.dps as i64)),
+                color: Color32::WHITE,
             },
             ColumnKind::SharePct => StatColumn {
                 width: 56.0,
                 text: |row| fmt_share(row.share_pct),
+                color: Color32::WHITE,
             },
             ColumnKind::CritPct => StatColumn {
                 width: 56.0,
                 text: |row| fmt_share(row.crit_pct),
+                color: Color32::from_rgb(CRIT_PCT_RGB.0, CRIT_PCT_RGB.1, CRIT_PCT_RGB.2),
             },
             ColumnKind::LuckyPct => StatColumn {
                 width: 56.0,
                 text: |row| fmt_share(row.lucky_pct),
+                color: Color32::from_rgb(LUCKY_PCT_RGB.0, LUCKY_PCT_RGB.1, LUCKY_PCT_RGB.2),
             },
             // `fmt_short` bounds this to ~7 chars regardless of how many
             // hits land, so it shares `Damage`/`Dps`'s width instead of
@@ -139,6 +143,7 @@ impl ColumnKind {
             ColumnKind::Hits => StatColumn {
                 width: 56.0,
                 text: |row| fmt_short(row.hits as i64),
+                color: Color32::WHITE,
             },
         }
     }
@@ -162,7 +167,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            visible_columns: vec![ColumnKind::Damage, ColumnKind::Dps, ColumnKind::SharePct],
+            visible_columns: vec![ColumnKind::Dps, ColumnKind::CritPct, ColumnKind::LuckyPct],
             window_position: None,
         }
     }
@@ -459,32 +464,20 @@ mod tests {
 
         let loaded = load_from(&path);
 
-        assert_eq!(loaded, Settings::default());
+        // Not `Settings::default()`: the fixture pins an explicit legacy
+        // column list, and the default's own columns have since changed
+        // independently of this ability-score backward-compat check.
+        assert_eq!(
+            loaded.visible_columns,
+            vec![ColumnKind::Damage, ColumnKind::Dps, ColumnKind::SharePct]
+        );
         assert!(!loaded.is_visible(ColumnKind::AbilityScore));
         let _ = fs::remove_file(&path);
     }
 
     #[test]
-    fn season_level_is_not_visible_by_default() {
-        assert!(!Settings::default().is_visible(ColumnKind::SeasonLevel));
-    }
-
-    #[test]
     fn season_strength_is_not_visible_by_default() {
         assert!(!Settings::default().is_visible(ColumnKind::SeasonStrength));
-    }
-
-    #[test]
-    fn season_level_column_round_trips() {
-        let path = temp_settings_path("season-level-roundtrip");
-        let mut settings = Settings::default();
-        settings.toggle(ColumnKind::SeasonLevel);
-        save_to(&path, &settings);
-
-        let loaded = load_from(&path);
-
-        assert_eq!(loaded, settings);
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -508,8 +501,13 @@ mod tests {
 
         let loaded = load_from(&path);
 
-        assert_eq!(loaded, Settings::default());
-        assert!(!loaded.is_visible(ColumnKind::SeasonLevel));
+        // Not `Settings::default()`: the fixture pins an explicit legacy
+        // column list, and the default's own columns have since changed
+        // independently of this season-columns backward-compat check.
+        assert_eq!(
+            loaded.visible_columns,
+            vec![ColumnKind::Damage, ColumnKind::Dps, ColumnKind::SharePct]
+        );
         assert!(!loaded.is_visible(ColumnKind::SeasonStrength));
         let _ = fs::remove_file(&path);
     }
@@ -638,7 +636,12 @@ mod tests {
         let loaded = load_from(&path);
 
         assert_eq!(loaded.window_position, None);
-        assert_eq!(loaded.visible_columns, Settings::default().visible_columns);
+        // Not `Settings::default().visible_columns`: the fixture pins an
+        // explicit legacy column list, independent of the current default.
+        assert_eq!(
+            loaded.visible_columns,
+            vec![ColumnKind::Damage, ColumnKind::Dps, ColumnKind::SharePct]
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -732,5 +735,51 @@ mod tests {
             a.ordered_columns(),
             vec![ColumnKind::Damage, ColumnKind::CritPct, ColumnKind::Hits]
         );
+    }
+
+    // -- default-columns rework: Dps/CritPct/LuckyPct, with color ---------
+
+    #[test]
+    fn default_columns_are_dps_crit_lucky_in_order() {
+        assert_eq!(
+            Settings::default().visible_columns,
+            vec![ColumnKind::Dps, ColumnKind::CritPct, ColumnKind::LuckyPct]
+        );
+    }
+
+    #[test]
+    fn crit_pct_spec_is_colored_red() {
+        assert_eq!(
+            ColumnKind::CritPct.spec().color,
+            Color32::from_rgb(CRIT_PCT_RGB.0, CRIT_PCT_RGB.1, CRIT_PCT_RGB.2)
+        );
+    }
+
+    #[test]
+    fn lucky_pct_spec_is_colored_green() {
+        assert_eq!(
+            ColumnKind::LuckyPct.spec().color,
+            Color32::from_rgb(LUCKY_PCT_RGB.0, LUCKY_PCT_RGB.1, LUCKY_PCT_RGB.2)
+        );
+    }
+
+    #[test]
+    fn other_columns_stay_white() {
+        for kind in [
+            ColumnKind::AbilityScore,
+            ColumnKind::SeasonStrength,
+            ColumnKind::Damage,
+            ColumnKind::Dps,
+            ColumnKind::SharePct,
+            ColumnKind::Hits,
+        ] {
+            assert_eq!(kind.spec().color, Color32::WHITE, "{kind:?} should stay white");
+        }
+    }
+
+    #[test]
+    fn season_level_variant_no_longer_exists_in_all() {
+        assert_eq!(ColumnKind::ALL.len(), 8);
+        assert!(ColumnKind::ALL.iter().all(|c| c.label() != "Season Level"));
     }
 }

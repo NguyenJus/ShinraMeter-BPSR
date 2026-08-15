@@ -668,6 +668,10 @@ fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot, columns: &[ColumnKind], ico
 pub struct StatColumn {
     pub width: f32,
     pub text: fn(&PlayerRow) -> String,
+    /// Text color this column is painted with. Most columns are plain
+    /// white; `CritPct`/`LuckyPct` use `CRIT_PCT_RGB`/`LUCKY_PCT_RGB` to
+    /// stand out the way the reference meter colors them.
+    pub color: egui::Color32,
 }
 
 /// Builds the column specs for `column_anchors` out of the currently
@@ -783,7 +787,7 @@ fn draw_row(
             egui::Align2::RIGHT_CENTER,
             text,
             egui::FontId::monospace(13.0),
-            egui::Color32::WHITE,
+            column.color,
         );
     }
 }
@@ -810,6 +814,19 @@ const SHARE_BAR_RGB_DAMAGE: (u8, u8, u8) = (220, 80, 70);
 /// this must stay visually distinct from all three colors above (issue #44's
 /// second open question).
 const SHARE_BAR_RGB_UNKNOWN: (u8, u8, u8) = (140, 140, 140);
+
+/// RGB for the `CritPct` stat column's text. Sampled directly from the
+/// reference meter screenshots — `docs/reference/new-shinra-ex.webp` and
+/// `docs/reference/tera_shinrameter_ex.png` both render their crit-%
+/// column in this exact hex (`#F08080`, CSS "lightcoral"), so this is not
+/// a guess.
+pub(crate) const CRIT_PCT_RGB: (u8, u8, u8) = (240, 128, 128);
+/// RGB for the `LuckyPct` stat column's text. Neither reference screenshot
+/// has a visibly colored lucky-% column to sample, so this is *not*
+/// sampled — it reuses `SHARE_BAR_RGB_HEALER`'s green as the nearest
+/// existing convention for "this stat is good, color it green" rather than
+/// inventing a new hue.
+pub(crate) const LUCKY_PCT_RGB: (u8, u8, u8) = (70, 200, 120);
 
 /// Alpha of the translucent wash covering the full width of `bar_rect`
 /// (issue #43). Deliberately lower than the old single flat fill's alpha
@@ -1267,23 +1284,12 @@ mod tests {
 
     #[test]
     fn ability_score_column_formats_value_when_some() {
-        let row = sample_row(Some(12_345));
+        // A value that `fmt_short` would abbreviate to "12.3M" — the full
+        // digit string must be rendered instead (owner requirement: ability
+        // score and season strength always show the complete figure).
+        let row = sample_row(Some(12_345_678));
         let column = ColumnKind::AbilityScore.spec();
-        assert_eq!((column.text)(&row), fmt_short(12_345));
-    }
-
-    #[test]
-    fn season_level_column_blank_when_none() {
-        let row = sample_season_row(None, None);
-        let column = ColumnKind::SeasonLevel.spec();
-        assert_eq!((column.text)(&row), "");
-    }
-
-    #[test]
-    fn season_level_column_formats_value_when_some() {
-        let row = sample_season_row(Some(42), None);
-        let column = ColumnKind::SeasonLevel.spec();
-        assert_eq!((column.text)(&row), fmt_short(42));
+        assert_eq!((column.text)(&row), "12345678");
     }
 
     #[test]
@@ -1295,9 +1301,10 @@ mod tests {
 
     #[test]
     fn season_strength_column_formats_value_when_some() {
-        let row = sample_season_row(None, Some(12_345));
+        // Same full-digit requirement as ability score above.
+        let row = sample_season_row(None, Some(12_345_678));
         let column = ColumnKind::SeasonStrength.spec();
-        assert_eq!((column.text)(&row), fmt_short(12_345));
+        assert_eq!((column.text)(&row), "12345678");
     }
 
     fn window() -> egui::Rect {
@@ -1417,14 +1424,17 @@ mod tests {
         StatColumn {
             width: 56.0,
             text: |row| fmt_short(row.damage),
+            color: egui::Color32::WHITE,
         },
         StatColumn {
             width: 56.0,
             text: |row| format!("{}/s", fmt_short(row.dps as i64)),
+            color: egui::Color32::WHITE,
         },
         StatColumn {
             width: 44.0,
             text: |row| fmt_share(row.share_pct),
+            color: egui::Color32::WHITE,
         },
     ];
 
@@ -1515,6 +1525,10 @@ mod tests {
         // Widest plausible value for every field any column formats:
         // `fmt_short`'s 7-char maximum (rounds up across a K/M/B
         // threshold, e.g. 999_950 -> "1000.0K") and `fmt_share`'s.
+        // `ability_score`/`season_strength` are the two exceptions: they
+        // render the full, un-abbreviated digit string (owner requirement),
+        // so their widest plausible input is their field type's own
+        // ceiling — `u32::MAX` — rather than a `fmt_short`-derived value.
         assert_eq!(fmt_short(999_950), "1000.0K");
         assert_eq!(fmt_share(100.0), "100.0%");
         let widest_row = PlayerRow {
@@ -1527,9 +1541,9 @@ mod tests {
             crit_pct: 100.0,
             lucky_pct: 100.0,
             hits: 999_950,
-            ability_score: Some(999_950),
+            ability_score: Some(u32::MAX),
             season_level: Some(999_950),
-            season_strength: Some(999_950),
+            season_strength: Some(u32::MAX),
         };
 
         for (kind, column) in ColumnKind::ALL
@@ -1805,7 +1819,11 @@ mod tests {
             4.0,
         );
 
-        settings.toggle(ColumnKind::CritPct);
+        // Both start disabled under the new default (`Dps`, `CritPct`,
+        // `LuckyPct`), so toggling them is guaranteed to grow the set —
+        // toggling `CritPct` itself would instead shrink it now that it's
+        // on by default.
+        settings.toggle(ColumnKind::AbilityScore);
         settings.toggle(ColumnKind::Hits);
         let after = column_anchors(
             0.0,
