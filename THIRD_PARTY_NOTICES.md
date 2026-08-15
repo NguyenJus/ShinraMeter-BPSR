@@ -38,13 +38,62 @@ WinDivert's LGPL-3.0 option is compatible.
 - Upstream: <https://github.com/neowutran/ShinraMeter> (`master` branch,
   `resources/img/`). The branch matters: `master` carries these as PNGs, while
   the unreleased `mvvm_refactor_wip` branch replaces them with SVG path data in
-  `DamageMeter.UI/Resources/SVG.xaml`. These files are the PNGs.
+  `DamageMeter.UI/Resources/SVG.xaml`. These files are the PNGs; the SVG-derived
+  glyphs are covered by the three sections below.
 - License: MIT
 - Embedded verbatim (compiled into the executable via `include_bytes!` in
   `crates/app/src/icons.rs`), unmodified, at build time. `settings.png` is
-  upstream's `config.png` and `clock.png` is upstream's `historic.png`,
-  renamed here to match what each is used for in this project — no pixel
-  data changed.
+  upstream's `config.png`, renamed here to match what it is used for in this
+  project — no pixel data changed.
+
+## ShinraMeter encounter emblem
+
+- Files: `crates/app/assets/icons/svg/emblem.svg`,
+  `crates/app/assets/icons/glyphs/emblem.png`
+- Upstream: <https://github.com/neowutran/ShinraMeter> (`mvvm_refactor_wip`
+  branch, `DamageMeter.UI/Resources/SVG.xaml`, the `Svg.HPBar` `PathGeometry`)
+- License: MIT
+- The horned-beast-in-a-diamond mark behind the header's encounter name. Its
+  path data is reproduced verbatim; the only change is the SVG wrapper needed to
+  rasterize it — a computed `viewBox` (the WPF `PathGeometry` declares none),
+  an explicit `fill="#ffffff"` so this project's own paint-time tint controls
+  the color, and `fill-rule="nonzero"` (WPF `PathGeometry` defaults to EvenOdd,
+  which renders this path incorrectly). The PNG is generated from that SVG by
+  `scripts/rasterize-icons.sh` and committed alongside it.
+- This mark is ShinraMeter's own artwork, unlike the Material glyphs below.
+
+## Google Material Symbols
+
+- Files: `crates/app/assets/icons/svg/{timer,speed,heart,cloud_off,check}.svg`
+  and the correspondingly named PNGs under
+  `crates/app/assets/icons/glyphs/`
+- Upstream: <https://github.com/google/material-design-icons> — the
+  `timer`, `speed`, `favorite`, `cloud_off` and `check` symbols
+- Copyright (c) Google LLC
+- License: Apache License 2.0, which is compatible with this project's
+  GPL-3.0-only licence.
+- Reached this project via ShinraMeter's `mvvm_refactor_wip`
+  `DamageMeter.UI/Resources/SVG.xaml`, which carries them as bare
+  `PathGeometry` resources with no attribution of its own. The path data is
+  unmistakably Material Symbols — the 960-unit `0 -960 960 960` coordinate
+  system and `M400-840q…` compression are that project's export format — so the
+  grant recorded here is Google's, not ShinraMeter's. Embedded verbatim; the
+  only changes are the SVG wrapper described above.
+
+## Material Design Icons (Pictogrammers)
+
+- Files: `crates/app/assets/icons/svg/{skull,mouse_off}.svg` and the
+  correspondingly named PNGs under `crates/app/assets/icons/glyphs/`
+- Upstream: <https://github.com/Templarian/MaterialDesign> — the `skull` and
+  `cursor-default-click-outline` (struck-through) icons
+- Copyright (c) Austin Andrews and the Pictogrammers contributors
+- License: Apache License 2.0, which is compatible with this project's
+  GPL-3.0-only licence.
+- Same provenance note as the Material Symbols above: they arrive via
+  ShinraMeter's uncredited `SVG.xaml`, but their 24-unit `0 0 24 24` coordinate
+  system identifies them as Material Design Icons, so the grant recorded here is
+  Pictogrammers', not ShinraMeter's. Embedded verbatim, with the same SVG
+  wrapper.
 
 ## ShinraMeter application icon
 
