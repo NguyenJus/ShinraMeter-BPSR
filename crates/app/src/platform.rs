@@ -159,6 +159,62 @@ const MIN_VISIBLE_WIDTH: i32 = 160;
 #[cfg(any(windows, test))]
 const MIN_VISIBLE_HEIGHT: i32 = 24;
 
+/// Whether at least `MIN_VISIBLE_WIDTH` x `MIN_VISIBLE_HEIGHT` physical
+/// pixels of the overlay's header `band` land inside the *union* of the
+/// monitors' work areas.
+///
+/// Measuring per-monitor would be wrong: two edge-adjacent monitors (say
+/// x∈[0, 1920) and x∈[1920, 3840)) can each cover only half of a band that
+/// is nonetheless fully on screen and perfectly draggable, and judging that
+/// band unreachable would force-relocate a deliberately placed window. So
+/// the monitors' horizontal contributions to the band are coalesced first,
+/// and the test is whether any single contiguous run of that union is at
+/// least `MIN_VISIBLE_WIDTH` wide.
+///
+/// Pure integer-rect geometry with no windows-crate types, for the same
+/// unit-testability reason as `Rect` itself.
+#[cfg(any(windows, test))]
+fn band_is_reachable(band: Rect, monitors: &[Rect]) -> bool {
+    // Only monitors that overlap the band vertically by at least
+    // MIN_VISIBLE_HEIGHT contribute a horizontal span. Applying that filter
+    // *before* merging is the conservative rule the merge depends on:
+    // otherwise two monitors stacked so each covers a different partial
+    // sliver of the band's height would be merged horizontally as if either
+    // one covered the band's full height, which neither does.
+    let mut spans: Vec<(i32, i32)> = monitors
+        .iter()
+        .filter(|m| band.bottom.min(m.bottom) - band.top.max(m.top) >= MIN_VISIBLE_HEIGHT)
+        .filter_map(|m| {
+            let left = band.left.max(m.left);
+            let right = band.right.min(m.right);
+            (right > left).then_some((left, right))
+        })
+        .collect();
+
+    // Coalesce into contiguous runs. Spans that merely touch
+    // (`start == end`) count as contiguous, since edge-adjacent monitors
+    // share a boundary coordinate with no gap between them; a real gap in
+    // the layout leaves `start > end` and correctly breaks the run.
+    spans.sort_unstable();
+    let mut widest = 0;
+    let mut run: Option<(i32, i32)> = None;
+    for (start, end) in spans {
+        run = match run {
+            Some((run_start, run_end)) if start <= run_end => Some((run_start, run_end.max(end))),
+            Some((run_start, run_end)) => {
+                widest = widest.max(run_end - run_start);
+                Some((start, end))
+            }
+            None => Some((start, end)),
+        };
+    }
+    if let Some((run_start, run_end)) = run {
+        widest = widest.max(run_end - run_start);
+    }
+
+    widest >= MIN_VISIBLE_WIDTH
+}
+
 /// Issue #30: decides whether `window`'s current position needs correcting
 /// given the monitors currently attached (`monitors`, each that monitor's
 /// *work area* — `MONITORINFO.rcWork`, excluding the taskbar, since a
@@ -177,8 +233,10 @@ const MIN_VISIBLE_HEIGHT: i32 = 24;
 /// already recoverable by the user, and correcting it anyway would fight a
 /// deliberate multi-monitor layout (e.g. parked mostly off-screen in a
 /// corner on purpose). The bar is instead: does at least `MIN_VISIBLE_WIDTH`
-/// x `MIN_VISIBLE_HEIGHT` physical pixels of that band overlap *some*
-/// monitor's work area.
+/// x `MIN_VISIBLE_HEIGHT` physical pixels of that band overlap the *union*
+/// of the monitors' work areas — see `band_is_reachable`, which measures
+/// against the union rather than each monitor alone so a band straddling
+/// two edge-adjacent monitors isn't wrongly judged unreachable.
 ///
 /// # Why the nearest monitor when it doesn't
 ///
@@ -207,12 +265,7 @@ fn corrected_position(window: Rect, monitors: &[Rect]) -> Option<(i32, i32)> {
         right: window.right,
         bottom: window.top + HEADER_BAND_HEIGHT,
     };
-    let reachable = monitors.iter().any(|m| {
-        let overlap_width = band.right.min(m.right) - band.left.max(m.left);
-        let overlap_height = band.bottom.min(m.bottom) - band.top.max(m.top);
-        overlap_width >= MIN_VISIBLE_WIDTH && overlap_height >= MIN_VISIBLE_HEIGHT
-    });
-    if reachable {
+    if band_is_reachable(band, monitors) {
         return None;
     }
 
@@ -315,13 +368,19 @@ pub fn clamp_window_to_visible_area(cc: &eframe::CreationContext<'_>) {
     // monitors`, a local that outlives the call, so the callback's
     // raw-pointer round-trip back to `&mut Vec<Rect>` is valid on every
     // invocation.
-    unsafe {
+    let enumerated = unsafe {
         EnumDisplayMonitors(
             HDC(0),
             None,
             Some(monitor_enum_callback),
             LPARAM(std::ptr::addr_of_mut!(monitors) as isize),
-        );
+        )
+    };
+    if !enumerated.as_bool() {
+        // Keep going with whatever the callback did collect: a partial list
+        // still beats no clamp at all, and the `is_empty` guard below covers
+        // total failure.
+        log::warn!("EnumDisplayMonitors failed; the monitor list may be partial");
     }
     if monitors.is_empty() {
         log::warn!("no monitors enumerated; skipping the position clamp");
@@ -477,6 +536,45 @@ mod tests {
         let monitor = rect(0, 0, 1920, 1040);
         let window = rect(1920 - MIN_VISIBLE_WIDTH, 100, 2160, 400);
         assert_eq!(corrected_position(window, &[monitor]), None);
+    }
+
+    #[test]
+    fn header_straddling_two_contiguous_monitors_needs_no_correction() {
+        // Regression guard: the band is 160px wide (exactly
+        // MIN_VISIBLE_WIDTH), fully on screen and perfectly draggable, but
+        // split 80/80 across the seam between two edge-adjacent monitors.
+        // Testing each monitor on its own would call that unreachable and
+        // force-relocate a deliberately placed window.
+        let left_monitor = rect(0, 0, 1920, 1040);
+        let right_monitor = rect(1920, 0, 3840, 1040);
+        let window = rect(1920 - 80, 100, 1920 + 80, 400);
+        assert_eq!(
+            corrected_position(window, &[left_monitor, right_monitor]),
+            None
+        );
+    }
+
+    #[test]
+    fn header_spanning_a_gap_between_monitors_is_corrected() {
+        // Same 80/80 split, but the monitors aren't contiguous — there's an
+        // 80px hole between them that no display covers. The merge must not
+        // bridge it.
+        let left_monitor = rect(0, 0, 1920, 1040);
+        let right_monitor = rect(2000, 0, 3920, 1040);
+        let window = rect(1840, 100, 2080, 400);
+        assert!(corrected_position(window, &[left_monitor, right_monitor]).is_some());
+    }
+
+    #[test]
+    fn monitors_with_too_little_vertical_overlap_dont_merge() {
+        // Each monitor covers half the band's width, so merging them would
+        // clear MIN_VISIBLE_WIDTH — but neither overlaps the band
+        // vertically by MIN_VISIBLE_HEIGHT (10px and 12px), so neither
+        // contributes a grabbable strip and the band is unreachable.
+        let top_monitor = rect(0, 0, 1920, 110);
+        let bottom_monitor = rect(1920, 120, 3840, 1040);
+        let window = rect(1840, 100, 2000, 400);
+        assert!(corrected_position(window, &[top_monitor, bottom_monitor]).is_some());
     }
 
     #[test]
