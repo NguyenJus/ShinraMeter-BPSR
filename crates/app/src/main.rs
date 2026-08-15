@@ -7,6 +7,7 @@
 
 mod dump;
 mod fonts;
+mod icons;
 mod inspect;
 mod pipeline;
 mod platform;
