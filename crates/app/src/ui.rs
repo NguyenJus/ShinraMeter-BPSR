@@ -556,15 +556,13 @@ fn draw_row(
     // Proportional background bar scaled by this player's damage share.
     // Painted before (i.e. under) the icon and name, and still spans the
     // row's full width — the icon slot is reserved on top of it, not cut
-    // out of it.
-    let bar_frac = (row.share_pct / 100.0).clamp(0.0, 1.0);
-    let bar_rect =
-        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * bar_frac, rect.height()));
-    ui.painter().rect_filled(
-        bar_rect,
-        2.0,
-        egui::Color32::from_rgba_unmultiplied(60, 120, 220, 120),
-    );
+    // out of it. Split into a subtle wash plus a crisp bottom underline
+    // (issue #43) rather than one flat fill, matching the reference meter.
+    let paints = share_bar_paints(rect, row.share_pct);
+    ui.painter()
+        .rect_filled(paints.wash_rect, 2.0, paints.wash_color);
+    ui.painter()
+        .rect_filled(paints.underline_rect, 0.0, paints.underline_color);
 
     // The icon slot (issue #9) is reserved at a fixed offset regardless of
     // whether this row's class has an icon, so names stay left-aligned in a
@@ -608,6 +606,72 @@ fn draw_row(
             egui::FontId::monospace(13.0),
             egui::Color32::WHITE,
         );
+    }
+}
+
+/// Base RGB of the damage-share bar (issue #43). Split out from the alpha
+/// constants below so a follow-up issue (#44, role-based bar color) can vary
+/// only the hue — the wash/underline alpha split and underline thickness
+/// stay fixed regardless of which color a role ends up using.
+const SHARE_BAR_RGB: (u8, u8, u8) = (60, 120, 220);
+
+/// Alpha of the translucent wash covering the full width of `bar_rect`
+/// (issue #43). Deliberately lower than the old single flat fill's alpha
+/// (120) — the wash now only needs to read as a subtle backdrop, since the
+/// underline below is what carries the crisp share boundary.
+const SHARE_BAR_WASH_ALPHA: u8 = 60;
+
+/// Alpha of the thin strip along `bar_rect`'s bottom edge (issue #43).
+/// Markedly more opaque than the wash so the share boundary still reads
+/// clearly at a glance even though the rest of the bar is subtle, matching
+/// the reference meter (`docs/reference/tera_shinrameter_ex.png`).
+const SHARE_BAR_UNDERLINE_ALPHA: u8 = 220;
+
+/// Thickness of the bottom underline strip (issue #43). `share_bar_paints`
+/// clamps this against the row height so it stays sane — never taller than
+/// the row itself — at small row heights.
+const SHARE_BAR_UNDERLINE_THICKNESS: f32 = 2.0;
+
+/// The two paints that make up a row's damage-share bar (issue #43): a
+/// translucent wash across the full share-scaled width, and a thin,
+/// more-opaque underline strip along its bottom edge. Named fields rather
+/// than a positional tuple so a wash/underline (or rect/color) mix-up at the
+/// `draw_row` call site fails to compile instead of silently swapping which
+/// paint lands where.
+struct ShareBarPaints {
+    wash_rect: egui::Rect,
+    underline_rect: egui::Rect,
+    wash_color: egui::Color32,
+    underline_color: egui::Color32,
+}
+
+/// Computes the two paints that make up a row's damage-share bar (issue
+/// #43): a translucent wash across the full share-scaled width, and a thin,
+/// more-opaque underline strip along its bottom edge so the share boundary
+/// reads crisply even though the wash itself is subtle. Pure geometry/color
+/// math with no `egui::Ui` dependency, so it's unit-testable on its own —
+/// `draw_row` just paints whatever it returns.
+fn share_bar_paints(rect: egui::Rect, share_pct: f32) -> ShareBarPaints {
+    let bar_frac = (share_pct / 100.0).clamp(0.0, 1.0);
+    let bar_width = rect.width() * bar_frac;
+
+    let wash_rect = egui::Rect::from_min_size(rect.min, egui::vec2(bar_width, rect.height()));
+
+    let thickness = SHARE_BAR_UNDERLINE_THICKNESS.min(rect.height());
+    let underline_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.min.x, rect.max.y - thickness),
+        egui::vec2(bar_width, thickness),
+    );
+
+    let (r, g, b) = SHARE_BAR_RGB;
+    let wash_color = egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_WASH_ALPHA);
+    let underline_color = egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_UNDERLINE_ALPHA);
+
+    ShareBarPaints {
+        wash_rect,
+        underline_rect,
+        wash_color,
+        underline_color,
     }
 }
 
@@ -1297,6 +1361,71 @@ mod tests {
         let wide =
             egui::Rect::from_min_size(egui::pos2(10.0, 100.0), egui::vec2(500.0, ROW_HEIGHT));
         assert_eq!(icon_slot(narrow), icon_slot(wide));
+    }
+
+    // -- damage-share bar paints (issue #43) --------------------------------
+
+    fn share_bar_rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(300.0, ROW_HEIGHT))
+    }
+
+    #[test]
+    fn share_bar_full_share_spans_the_full_width() {
+        let rect = share_bar_rect();
+        let paints = share_bar_paints(rect, 100.0);
+        assert_eq!(paints.wash_rect.width(), rect.width());
+        assert_eq!(paints.underline_rect.width(), rect.width());
+    }
+
+    #[test]
+    fn share_bar_zero_share_has_no_width() {
+        let rect = share_bar_rect();
+        let paints = share_bar_paints(rect, 0.0);
+        assert_eq!(paints.wash_rect.width(), 0.0);
+        assert_eq!(paints.underline_rect.width(), 0.0);
+    }
+
+    #[test]
+    fn share_bar_partial_share_scales_both_rects_identically() {
+        let rect = share_bar_rect();
+        let paints = share_bar_paints(rect, 40.0);
+        assert_eq!(paints.wash_rect.width(), rect.width() * 0.4);
+        assert_eq!(paints.underline_rect.width(), rect.width() * 0.4);
+    }
+
+    /// The underline is what makes the share boundary read crisply (issue
+    /// #43), so it must hug `rect`'s bottom edge rather than float somewhere
+    /// inside the bar.
+    #[test]
+    fn share_bar_underline_sits_at_the_bottom_edge() {
+        let rect = share_bar_rect();
+        let paints = share_bar_paints(rect, 50.0);
+        assert_eq!(paints.underline_rect.bottom(), rect.bottom());
+        assert_eq!(
+            paints.underline_rect.height(),
+            SHARE_BAR_UNDERLINE_THICKNESS
+        );
+    }
+
+    /// A row short enough that the fixed underline thickness would exceed
+    /// its height must clamp the underline down to the row height instead
+    /// of spilling past the row's top edge.
+    #[test]
+    fn share_bar_underline_thickness_clamps_at_a_tiny_row_height() {
+        let tiny_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 1.0));
+        let paints = share_bar_paints(tiny_rect, 50.0);
+        assert!(paints.underline_rect.height() <= tiny_rect.height());
+        assert_eq!(paints.underline_rect.top(), tiny_rect.top());
+    }
+
+    /// The wash must stay markedly more translucent than the underline
+    /// (issue #43) — that alpha gap is what lets the underline carry the
+    /// crisp share boundary while the wash reads as a subtle backdrop.
+    #[test]
+    fn share_bar_wash_alpha_is_lower_than_underline_alpha() {
+        let rect = share_bar_rect();
+        let paints = share_bar_paints(rect, 50.0);
+        assert!(paints.wash_color.a() < paints.underline_color.a());
     }
 
     // -- class -> asset mapping totality (issue #9) ------------------------
