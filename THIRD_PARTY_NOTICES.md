@@ -37,10 +37,25 @@ WinDivert's LGPL-3.0 option is compatible.
 - Files: `crates/meter/data/MonsterName.json`, `crates/meter/data/SceneName.json`
   (from `resonance-logs/resonance-logs`, GPL-3.0) and
   `crates/meter/data/MonsterNameCrowdsource.json` (from `winjwinj/bpsr-logs`,
-  GPL-3.0)
+  GPL-3.0). See "Boss-monster id list" below for
+  `crates/meter/data/MonsterNameBoss.json`.
 - Upstream: <https://github.com/resonance-logs/resonance-logs>,
   <https://github.com/winjwinj/bpsr-logs>
 - License: GPL-3.0, matching this project's own licence
 - Not shipped as files: compiled into `crates/meter/src/tables.rs` by
   `scripts/gen-name-tables.py` at development time, then built into the
   executable as Rust source.
+
+## Boss-monster id list
+
+- Files: `crates/meter/data/MonsterNameBoss.json`
+- Upstream: <https://github.com/winjwinj/bpsr-logs> (also shipped identically
+  by <https://github.com/resonance-logs/resonance-logs>)
+- License: GPL-3.0, matching this project's own licence
+- Compiled into the `BOSS_MONSTER_IDS` constant and `is_boss_monster` in
+  `crates/meter/src/tables.rs` by `scripts/gen-name-tables.py`, the same as
+  the tables above. Used to gate the top-bar encounter name to boss fights
+  only (issue #42): `Meter::recompute_boss` has no boss/trash classification
+  of its own, so this id set is consulted at display time to decide whether
+  the resolved target is a real boss worth naming, rather than a large trash
+  pull.
