@@ -90,6 +90,13 @@ pub struct PlayerRow {
 pub struct EncounterInfo {
     pub boss_monster_id: Option<u32>,
     pub boss_name: Option<&'static str>,
+    /// Whether `boss_monster_id` is a recognized boss (issue #42), i.e.
+    /// whether the header should ever show a name for it. Kept separate from
+    /// `boss_name.is_some()` because a boss can be in `tables::BOSS_MONSTER_IDS`
+    /// without a resolved name (the two vendored lists aren't guaranteed to
+    /// agree) — `is_boss` is the single source of truth for the display
+    /// gate, `boss_name` for the text.
+    pub is_boss: bool,
     pub scene_id: Option<u32>,
     pub scene_name: Option<&'static str>,
 }

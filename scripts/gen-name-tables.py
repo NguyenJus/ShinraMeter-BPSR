@@ -14,6 +14,8 @@ To refresh, re-download the sources into `crates/meter/data/` and run this:
       https://raw.githubusercontent.com/resonance-logs/resonance-logs/main/src-tauri/meter-data/SceneName.json
     curl -sLo crates/meter/data/MonsterNameCrowdsource.json \\
       https://raw.githubusercontent.com/winjwinj/bpsr-logs/main/src/lib/data/json/MonsterNameCrowdsource.json
+    curl -sLo crates/meter/data/MonsterNameBoss.json \\
+      https://raw.githubusercontent.com/winjwinj/bpsr-logs/main/src/lib/data/json/MonsterNameBoss.json
     python3 scripts/gen-name-tables.py && cargo fmt -p bpsr-meter
 """
 
@@ -45,6 +47,27 @@ mod tests {
     #[test]
     fn names_a_known_raid_boss() {
         assert_eq!(monster_name(1013), Some("Rathalos"));
+    }
+
+    #[test]
+    fn is_boss_monster_true_for_a_known_boss_id() {
+        assert!(is_boss_monster(103));
+    }
+
+    #[test]
+    fn is_boss_monster_false_for_a_known_non_boss_monster_id() {
+        // "Golden Nappo" (10900) has a name in `monster_name` but is not in
+        // `MonsterNameBoss.json` — a named-but-non-boss id must not read as
+        // a boss just because the community table happens to know its name.
+        assert!(!is_boss_monster(10_900));
+    }
+
+    #[test]
+    fn is_boss_monster_boundary_ids() {
+        assert!(is_boss_monster(103)); // lowest id in the set
+        assert!(is_boss_monster(7_700_001)); // highest id in the set
+        assert!(!is_boss_monster(102)); // just below the lowest
+        assert!(!is_boss_monster(7_700_002)); // just above the highest
     }
 
     #[test]
@@ -144,17 +167,65 @@ def emit(out: io.StringIO, doc: str, fn: str, table: dict) -> None:
     out.write("        _ => return None,\n    })\n}\n")
 
 
+BOSS_IDS_DOC = """/// Boss-monster template ids (issue #42): the top-bar encounter name should
+/// only ever appear for a genuine boss fight. `Meter::recompute_boss`
+/// (`crates/meter/src/encounter.rs`) picks whichever damaged enemy has the
+/// largest known `max_hp` — a pure heuristic with no boss/trash
+/// classification — so without this list a big trash mob would flash its
+/// name in the header exactly like a real boss. This gates *display* only:
+/// `EncounterInfo::boss_monster_id` stays populated for every pull regardless
+/// of membership here; only `boss_name`/`is_boss` (set in `Meter::snapshot`)
+/// are gated by it.
+///
+/// Generated from `crates/meter/data/MonsterNameBoss.json`, shipped
+/// identically by the `bpsr-logs` and `resonance-logs` community trackers
+/// (both GPL-3.0, the same licence as this project); see
+/// `THIRD_PARTY_NOTICES.md`.
+///
+/// Sorted ascending; `is_boss_monster` binary-searches it."""
+
+# rustfmt's own array-literal packing: greedily fill each line up to this
+# width (indent included) before wrapping, matching the `#[rustfmt::skip]`
+# formatting the array was originally written with so a diff against a
+# hand-formatted file stays empty.
+_BOSS_IDS_LINE_WIDTH = 96
+_BOSS_IDS_INDENT = "    "
+
+
+def emit_boss_ids(out: io.StringIO, ids: list[int]) -> None:
+    out.write(f"\n{BOSS_IDS_DOC}\n#[rustfmt::skip]\nconst BOSS_MONSTER_IDS: &[u32] = &[\n")
+    line = _BOSS_IDS_INDENT
+    for n in ids:
+        piece = f"{n}, "
+        if line != _BOSS_IDS_INDENT and len(line) + len(piece) > _BOSS_IDS_LINE_WIDTH:
+            out.write(line.rstrip() + "\n")
+            line = _BOSS_IDS_INDENT
+        line += piece
+    if line != _BOSS_IDS_INDENT:
+        out.write(line.rstrip() + "\n")
+    out.write("];\n")
+    out.write(
+        "\n/// Whether `id` is a known boss-monster template id (issue #42) — i.e.\n"
+        "/// whether the encounter name should ever be surfaced for it.\n"
+        "pub fn is_boss_monster(id: u32) -> bool {\n"
+        "    BOSS_MONSTER_IDS.binary_search(&id).is_ok()\n"
+        "}\n"
+    )
+
+
 def main() -> None:
     _self_test()
 
     bulk = json.loads((DATA / "MonsterName.json").read_text())
     curated = json.loads((DATA / "MonsterNameCrowdsource.json").read_text())
     scenes = json.loads((DATA / "SceneName.json").read_text())
+    bosses = json.loads((DATA / "MonsterNameBoss.json").read_text())
 
     monsters = merge_monster_names(
         {int(k): v for k, v in bulk.items()},
         {int(k): v for k, v in curated.items()},
     )
+    boss_ids = sorted(int(k) for k in bosses)
 
     out = io.StringIO()
     out.write(HEADER)
@@ -170,9 +241,13 @@ def main() -> None:
         "scene_name",
         {int(k): v for k, v in scenes.items()},
     )
+    emit_boss_ids(out, boss_ids)
     out.write(FOOTER)
     OUT.write_text(out.getvalue())
-    print(f"wrote {OUT}: {len(monsters)} monsters, {len(scenes)} scenes")
+    print(
+        f"wrote {OUT}: {len(monsters)} monsters, {len(scenes)} scenes, "
+        f"{len(boss_ids)} boss ids"
+    )
 
 
 if __name__ == "__main__":

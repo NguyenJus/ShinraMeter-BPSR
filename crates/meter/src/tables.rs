@@ -579,6 +579,49 @@ pub fn scene_name(id: u32) -> Option<&'static str> {
     })
 }
 
+/// Boss-monster template ids (issue #42): the top-bar encounter name should
+/// only ever appear for a genuine boss fight. `Meter::recompute_boss`
+/// (`crates/meter/src/encounter.rs`) picks whichever damaged enemy has the
+/// largest known `max_hp` — a pure heuristic with no boss/trash
+/// classification — so without this list a big trash mob would flash its
+/// name in the header exactly like a real boss. This gates *display* only:
+/// `EncounterInfo::boss_monster_id` stays populated for every pull regardless
+/// of membership here; only `boss_name`/`is_boss` (set in `Meter::snapshot`)
+/// are gated by it.
+///
+/// Generated from `crates/meter/data/MonsterNameBoss.json`, shipped
+/// identically by the `bpsr-logs` and `resonance-logs` community trackers
+/// (both GPL-3.0, the same licence as this project); see
+/// `THIRD_PARTY_NOTICES.md`.
+///
+/// Sorted ascending; `is_boss_monster` binary-searches it.
+#[rustfmt::skip]
+const BOSS_MONSTER_IDS: &[u32] = &[
+    103, 107, 108, 109, 112, 116, 117, 118, 119, 120, 203, 204, 1012, 1013, 1110, 1150, 1174,
+    1215, 1230, 1232, 1309, 1317, 1360, 1400, 1401, 1407, 1410, 1437, 1701, 1702, 1703, 1705,
+    3000, 3002, 3049, 3050, 3996, 3997, 3998, 4002, 4003, 4033, 4201, 7001, 7006, 10007, 10009,
+    10010, 10018, 10029, 10032, 10041, 10056, 10059, 10069, 10077, 10081, 10084, 10085, 10086,
+    11007, 11014, 11019, 11024, 11031, 11032, 11037, 11038, 11043, 11044, 11110, 17001, 17004,
+    17008, 17010, 20004, 20020, 20021, 20024, 20026, 20027, 20028, 20029, 20070, 20071, 20072,
+    20073, 20086, 20087, 20088, 20092, 20100, 20107, 20108, 20125, 20127, 30100, 30810, 31101,
+    33201, 33301, 33401, 35000, 35050, 40010, 40026, 40027, 40394, 40400, 40403, 40404, 40408,
+    40409, 60021, 60141, 60151, 60216, 60237, 60416, 60742, 60745, 61220, 61221, 70063, 70064,
+    70065, 70066, 70067, 70068, 70070, 70071, 70072, 70073, 70173, 70174, 70175, 70263, 70264,
+    70265, 70266, 70267, 70268, 70270, 70271, 70272, 70273, 70274, 70275, 70276, 81000, 81003,
+    102101, 102102, 102104, 102105, 102401, 102402, 102450, 102451, 102701, 102720, 102721,
+    130110, 530354, 540111, 540303, 552020, 612401, 920011, 920012, 920013, 1205001, 2000104,
+    2000105, 2000109, 2000110, 2000113, 2000115, 2000116, 2000121, 2000123, 2000124, 2000127,
+    2000128, 2000129, 2000131, 2000132, 2000133, 2000134, 2000135, 2000137, 2000138, 2000139,
+    2000140, 2000141, 2000199, 2004109, 2004120, 2004126, 2004131, 2004152, 2004171, 2004172,
+    3000000, 3000001, 3000003, 3000006, 3000007, 5026001, 6116001, 7700001,
+];
+
+/// Whether `id` is a known boss-monster template id (issue #42) — i.e.
+/// whether the encounter name should ever be surfaced for it.
+pub fn is_boss_monster(id: u32) -> bool {
+    BOSS_MONSTER_IDS.binary_search(&id).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,6 +629,27 @@ mod tests {
     #[test]
     fn names_a_known_raid_boss() {
         assert_eq!(monster_name(1013), Some("Rathalos"));
+    }
+
+    #[test]
+    fn is_boss_monster_true_for_a_known_boss_id() {
+        assert!(is_boss_monster(103));
+    }
+
+    #[test]
+    fn is_boss_monster_false_for_a_known_non_boss_monster_id() {
+        // "Golden Nappo" (10900) has a name in `monster_name` but is not in
+        // `MonsterNameBoss.json` — a named-but-non-boss id must not read as
+        // a boss just because the community table happens to know its name.
+        assert!(!is_boss_monster(10_900));
+    }
+
+    #[test]
+    fn is_boss_monster_boundary_ids() {
+        assert!(is_boss_monster(103)); // lowest id in the set
+        assert!(is_boss_monster(7_700_001)); // highest id in the set
+        assert!(!is_boss_monster(102)); // just below the lowest
+        assert!(!is_boss_monster(7_700_002)); // just above the highest
     }
 
     #[test]

@@ -454,9 +454,21 @@ impl Meter {
             .boss_uid
             .and_then(|uid| self.enemies.get(&uid))
             .and_then(|e| e.monster_id);
+        // issue #42: `recompute_boss` is a pure largest-max-hp heuristic with
+        // no boss/trash classification, so `boss_monster_id` alone can't
+        // tell a real boss from a big trash mob. Gate the *display* fields
+        // on `tables::is_boss_monster`; `boss_monster_id` itself stays
+        // populated for every pull since it's real data, not a display
+        // choice.
+        let is_boss = boss_monster_id.is_some_and(tables::is_boss_monster);
         let encounter = EncounterInfo {
             boss_monster_id,
-            boss_name: boss_monster_id.and_then(tables::monster_name),
+            boss_name: if is_boss {
+                boss_monster_id.and_then(tables::monster_name)
+            } else {
+                None
+            },
+            is_boss,
             scene_id: self.scene_id,
             scene_name: self.scene_id.and_then(tables::scene_name),
         };
@@ -1128,13 +1140,14 @@ mod tests {
         }
 
         #[test]
-        fn boss_name_resolves_for_a_known_monster_id() {
+        fn boss_name_resolves_for_a_known_boss_id() {
             let mut m = Meter::new();
             m.apply(&boss_hit(10, 0));
             m.apply(&hp(10, 100, 100, Some(103), 0));
             let snap = m.snapshot(1000);
             assert_eq!(snap.encounter.boss_monster_id, Some(103));
             assert_eq!(snap.encounter.boss_name, Some("Rathalos"));
+            assert!(snap.encounter.is_boss);
         }
 
         #[test]
@@ -1145,6 +1158,23 @@ mod tests {
             let snap = m.snapshot(1000);
             assert_eq!(snap.encounter.boss_monster_id, Some(999_999));
             assert_eq!(snap.encounter.boss_name, None);
+            assert!(!snap.encounter.is_boss);
+        }
+
+        #[test]
+        fn non_boss_monster_id_yields_no_name_even_when_the_id_is_known() {
+            // issue #42: 10900 ("Golden Nappo") has a name in the community
+            // table but is not in `tables::BOSS_MONSTER_IDS` — a trash pull
+            // must not surface a name just because the id happens to be
+            // catalogued. `boss_monster_id` still reflects the real target;
+            // only the display fields (`boss_name`, `is_boss`) are gated.
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 100, 100, Some(10_900), 0));
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.boss_monster_id, Some(10_900));
+            assert_eq!(snap.encounter.boss_name, None);
+            assert!(!snap.encounter.is_boss);
         }
 
         #[test]
@@ -1153,6 +1183,7 @@ mod tests {
             let snap = m.snapshot(1000);
             assert_eq!(snap.encounter.boss_monster_id, None);
             assert_eq!(snap.encounter.boss_name, None);
+            assert!(!snap.encounter.is_boss);
         }
 
         #[test]
