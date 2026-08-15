@@ -86,6 +86,45 @@ impl Class {
             Class::Unknown => "Unknown",
         }
     }
+
+    /// Role classification for the row share-bar color (issue #44).
+    /// `Class::Unknown` has no role (`None`) — the meter couldn't determine
+    /// what this player is, so it can't say what role they fill either.
+    ///
+    /// Mapping source: `Blue-Protocol-Source/BPSR-ZDPS` (already credited in
+    /// this project's README and `THIRD_PARTY_NOTICES.md`),
+    /// `DataTypes/Enums/Professions.cs` (`enum ERoleType { None=0, Tank=1,
+    /// Healer=2, DPS=3 }`) and `DataTypes/Professions.cs::GetRoleFromBaseProfessionId`:
+    /// `HeavyGuardian`/`ShieldKnight` -> Tank, `VerdantOracle`/`BeatPerformer`
+    /// -> Healer, `Stormblade`/`FrostMage`/`TwinStriker`/`WindKnight`/`Marksman`
+    /// -> Damage.
+    ///
+    /// Deliberately an exhaustive match with **no wildcard arm**: adding a
+    /// future `Class` variant without also updating this match is a compile
+    /// error, not a silent fall-through into whichever arm happens to be
+    /// listed last.
+    pub fn role(&self) -> Option<Role> {
+        match self {
+            Class::HeavyGuardian | Class::ShieldKnight => Some(Role::Tank),
+            Class::VerdantOracle | Class::BeatPerformer => Some(Role::Healer),
+            Class::Stormblade
+            | Class::FrostMage
+            | Class::TwinStriker
+            | Class::WindKnight
+            | Class::Marksman => Some(Role::Damage),
+            Class::Unknown => None,
+        }
+    }
+}
+
+/// Combat role a `Class` fills (issue #44): drives the row share-bar's hue
+/// in the UI (`crates/app/src/ui.rs`). See `Class::role` for the mapping and
+/// its source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Role {
+    Tank,
+    Healer,
+    Damage,
 }
 
 /// A single damage (or miss/heal) event, already fully resolved by the
@@ -149,4 +188,96 @@ pub enum ProtocolEvent {
     ServerChanged {
         timestamp_ms: u64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- Class::role (issue #44) ------------------------------------------
+    //
+    // Every variant asserted explicitly (rather than looped over an array of
+    // pairs) so the mapping is pinned: a reviewer can see the whole table at
+    // a glance, and a copy/paste mistake in a table would be just as easy to
+    // miss as one in the `match` it's meant to check.
+
+    #[test]
+    fn heavy_guardian_is_tank() {
+        assert_eq!(Class::HeavyGuardian.role(), Some(Role::Tank));
+    }
+
+    #[test]
+    fn shield_knight_is_tank() {
+        assert_eq!(Class::ShieldKnight.role(), Some(Role::Tank));
+    }
+
+    #[test]
+    fn verdant_oracle_is_healer() {
+        assert_eq!(Class::VerdantOracle.role(), Some(Role::Healer));
+    }
+
+    #[test]
+    fn beat_performer_is_healer() {
+        assert_eq!(Class::BeatPerformer.role(), Some(Role::Healer));
+    }
+
+    #[test]
+    fn stormblade_is_damage() {
+        assert_eq!(Class::Stormblade.role(), Some(Role::Damage));
+    }
+
+    #[test]
+    fn frost_mage_is_damage() {
+        assert_eq!(Class::FrostMage.role(), Some(Role::Damage));
+    }
+
+    #[test]
+    fn twin_striker_is_damage() {
+        assert_eq!(Class::TwinStriker.role(), Some(Role::Damage));
+    }
+
+    #[test]
+    fn wind_knight_is_damage() {
+        assert_eq!(Class::WindKnight.role(), Some(Role::Damage));
+    }
+
+    #[test]
+    fn marksman_is_damage() {
+        assert_eq!(Class::Marksman.role(), Some(Role::Damage));
+    }
+
+    #[test]
+    fn unknown_has_no_role() {
+        assert_eq!(Class::Unknown.role(), None);
+    }
+
+    // -- profession-id round trip (issue #44) ------------------------------
+    //
+    // Exercises `Class::from(id).role()` for every id `From<i32>` maps to a
+    // named class, so a future edit to either the id table or the role
+    // mapping that silently breaks the pairing gets caught here too, not
+    // just in the two tables above independently.
+
+    #[test]
+    fn profession_id_round_trip_matches_documented_role() {
+        let cases: [(i32, Option<Role>); 10] = [
+            (1, Some(Role::Damage)),  // Stormblade
+            (2, Some(Role::Damage)),  // FrostMage
+            (3, Some(Role::Damage)),  // TwinStriker
+            (4, Some(Role::Damage)),  // WindKnight
+            (5, Some(Role::Healer)),  // VerdantOracle
+            (9, Some(Role::Tank)),    // HeavyGuardian
+            (11, Some(Role::Damage)), // Marksman
+            (12, Some(Role::Tank)),   // ShieldKnight
+            (13, Some(Role::Healer)), // BeatPerformer
+            (999, None),              // unmapped id -> Class::Unknown
+        ];
+        for (id, expected) in cases {
+            assert_eq!(
+                Class::from(id).role(),
+                expected,
+                "profession id {id} round-tripped to the wrong role"
+            );
+        }
+    }
 }
