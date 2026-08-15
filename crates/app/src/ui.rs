@@ -7,10 +7,11 @@
 
 use std::time::Duration;
 
-use bpsr_meter::{PlayerRow, Snapshot};
+use bpsr_meter::{EncounterInfo, PlayerRow, Snapshot};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 
+use crate::icons::ClassIcons;
 use crate::settings::{ColumnKind, Settings};
 
 /// Commands the overlay emits for the app layer to consume.
@@ -36,6 +37,11 @@ pub struct OverlayApp {
     rx_snapshot: Receiver<Snapshot>,
     tx_command: Sender<UiCommand>,
     tx_settings: Sender<Settings>,
+    /// Class icon textures (issue #9). `None` until the first `ui()` call —
+    /// `ClassIcons::load` needs an `egui::Context`, which does not exist yet
+    /// at `OverlayApp::new` — then loaded exactly once for the process's
+    /// life.
+    icons: Option<ClassIcons>,
 }
 
 impl OverlayApp {
@@ -57,12 +63,14 @@ impl OverlayApp {
                 total_damage: 0,
                 total_dps: 0.0,
                 rows: Vec::new(),
+                encounter: EncounterInfo::default(),
             },
             status: StatusLine::Ok,
             settings,
             rx_snapshot,
             tx_command,
             tx_settings,
+            icons: None,
         }
     }
 
@@ -86,6 +94,11 @@ impl eframe::App for OverlayApp {
         let ctx = ui.ctx().clone();
         apply_theme(&ctx);
 
+        // Loaded once, lazily: the `egui::Context` above isn't available yet
+        // at `OverlayApp::new`, so the first frame is what actually uploads
+        // the icon textures (issue #9); every later frame reuses them.
+        let icons = self.icons.get_or_insert_with(|| ClassIcons::load(&ctx));
+
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default().fill(egui::Color32::from_rgba_unmultiplied(18, 18, 22, 200)),
@@ -108,7 +121,7 @@ impl eframe::App for OverlayApp {
                 }
 
                 ui.separator();
-                draw_rows(ui, &self.snapshot, &self.settings.ordered_columns());
+                draw_rows(ui, &self.snapshot, &self.settings.ordered_columns(), icons);
             });
 
         track_window_position(&ctx, &mut self.settings, &self.tx_settings);
@@ -176,12 +189,17 @@ fn draw_header(
     settings: &mut Settings,
     tx_settings: &Sender<Settings>,
 ) {
-    // The whole header band is the drag surface, registered *before* the row's
-    // contents so the buttons drawn into it end up on top and still get their
-    // clicks. Grabbing a single glyph was too small a target to hit.
+    let title = encounter_title(&snapshot.encounter);
+    let subtitle = encounter_subtitle(&snapshot.encounter);
+
+    // The whole header band is the drag surface — title line, the optional
+    // subtitle line, and the timer/DPS/buttons row — registered *before* the
+    // row's contents so the buttons drawn into it end up on top and still get
+    // their clicks. Grabbing a single glyph was too small a target to hit.
     let band = {
         let mut rect = ui.available_rect_before_wrap();
-        rect.max.y = rect.min.y + ui.spacing().interact_size.y;
+        let height = header_band_height(subtitle.is_some(), ui.spacing().interact_size.y);
+        rect.max.y = rect.min.y + height;
         // Leave the top resize strip alone — a drag surface spanning it would
         // win the hit test and swallow every north-edge resize.
         rect.min.y += RESIZE_EDGE;
@@ -195,6 +213,15 @@ fn draw_header(
     // so re-sending it every frame while the drag is held is at best redundant.
     if drag_surface.drag_started_by(egui::PointerButton::Primary) {
         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+
+    // Title is always rendered (even as the "No target" placeholder) so the
+    // header's height never jitters between frames; the subtitle is omitted
+    // entirely — not rendered blank — when the scene is unknown (issue #9
+    // slice 2).
+    draw_title_line(ui, &title);
+    if let Some(subtitle) = &subtitle {
+        draw_subtitle_line(ui, subtitle);
     }
 
     ui.horizontal(|ui| {
@@ -234,6 +261,93 @@ fn draw_header(
             draw_settings_menu(ui, settings, tx_settings);
         });
     });
+}
+
+/// Header title text (issue #9 slice 2): the boss name when known, else its
+/// raw monster id, else a dim placeholder. Always returns something —
+/// `draw_header` renders this line unconditionally so the header's height
+/// never jitters between frames depending on whether a target is known.
+fn encounter_title(e: &EncounterInfo) -> String {
+    match (e.boss_name, e.boss_monster_id) {
+        (Some(name), _) => name.to_string(),
+        (None, Some(id)) => format!("Monster #{id}"),
+        (None, None) => "No target".to_string(),
+    }
+}
+
+/// Header subtitle text (issue #9 slice 2): the scene name when known, else
+/// its raw scene id, else `None` — `draw_header` omits the subtitle line
+/// entirely in that case rather than reserving space for nothing.
+fn encounter_subtitle(e: &EncounterInfo) -> Option<String> {
+    match (e.scene_name, e.scene_id) {
+        (Some(name), _) => Some(name.to_string()),
+        (None, Some(id)) => Some(format!("Scene #{id}")),
+        (None, None) => None,
+    }
+}
+
+/// Height of the header's title line, reused by both `draw_header`'s
+/// drag-band sizing and `default_inner_height` so they can't drift apart —
+/// the same pattern `ROW_HEIGHT` follows for player rows.
+const TITLE_LINE_HEIGHT: f32 = 20.0;
+/// Font size for the title line — larger than the default row text, full-
+/// strength colour, matching the reference screenshot (issue #9 slice 2).
+const TITLE_FONT_SIZE: f32 = 15.0;
+
+/// Height of the header's subtitle line. Not part of `default_inner_height`
+/// — the subtitle is conditional and the default window assumes it is
+/// absent (see `default_inner_height`'s doc).
+const SUBTITLE_LINE_HEIGHT: f32 = 16.0;
+/// Font size for the subtitle line — smaller than the title, dimmed via
+/// `ui.visuals().weak_text_color()` rather than a new hard-coded colour.
+const SUBTITLE_FONT_SIZE: f32 = 11.0;
+
+/// Height of `draw_header`'s drag band: the title line, the optional
+/// subtitle line, and the button row (`button_row_height`, egui's
+/// `interact_size.y`), plus one `ITEM_SPACING_Y` gap for every adjacent pair
+/// egui's vertical layout stacks them as — 1 gap (title -> button row) when
+/// there's no subtitle, 2 (title -> subtitle -> button row) when there is.
+/// Extracted from `draw_header` so the two cases are unit-testable without a
+/// live `egui::Ui`.
+fn header_band_height(has_subtitle: bool, button_row_height: f32) -> f32 {
+    let gap_count = if has_subtitle { 2 } else { 1 };
+    let mut height = TITLE_LINE_HEIGHT + button_row_height + gap_count as f32 * ITEM_SPACING_Y;
+    if has_subtitle {
+        height += SUBTITLE_LINE_HEIGHT;
+    }
+    height
+}
+
+/// Paints the header's title line (boss name/id/placeholder) at a fixed
+/// height so `draw_header`'s drag band and `default_inner_height` can both
+/// reason about it exactly, the same way `draw_row` paints stat text inside
+/// an `allocate_exact_size`d rect instead of an auto-sized `ui.label`.
+fn draw_title_line(ui: &mut egui::Ui, text: &str) {
+    let desired_size = egui::vec2(ui.available_width(), TITLE_LINE_HEIGHT);
+    let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    ui.painter().text(
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(TITLE_FONT_SIZE),
+        ui.visuals().text_color(),
+    );
+}
+
+/// Paints the header's subtitle line (scene name/id), dimmed. Only called
+/// when `encounter_subtitle` returned `Some` — the caller skips this
+/// entirely, rather than calling it with empty text, so no space is
+/// reserved when the scene is unknown.
+fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
+    let desired_size = egui::vec2(ui.available_width(), SUBTITLE_LINE_HEIGHT);
+    let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    ui.painter().text(
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(SUBTITLE_FONT_SIZE),
+        ui.visuals().weak_text_color(),
+    );
 }
 
 /// The settings menu: a compact dropdown (egui's `menu_button`, so it needs
@@ -350,7 +464,7 @@ fn draw_resize_handles(ui: &mut egui::Ui, ctx: &egui::Context) {
     }
 }
 
-fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot, columns: &[ColumnKind]) {
+fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot, columns: &[ColumnKind], icons: &ClassIcons) {
     // The enabled-column set (and therefore the column widths and their
     // anchors) is identical for every row in a frame, so both are computed
     // once here rather than once per row inside `draw_row`.
@@ -359,7 +473,7 @@ fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot, columns: &[ColumnKind]) {
     let anchors = column_anchors(avail.left(), avail.right(), &stat_columns, 4.0);
 
     for row in &snapshot.rows {
-        draw_row(ui, row, &stat_columns, &anchors);
+        draw_row(ui, row, &stat_columns, &anchors, icons);
     }
 }
 
@@ -429,11 +543,20 @@ pub fn column_anchors(
     anchors
 }
 
-fn draw_row(ui: &mut egui::Ui, row: &PlayerRow, columns: &[StatColumn], anchors: &[f32]) {
+fn draw_row(
+    ui: &mut egui::Ui,
+    row: &PlayerRow,
+    columns: &[StatColumn],
+    anchors: &[f32],
+    icons: &ClassIcons,
+) {
     let desired_size = egui::vec2(ui.available_width(), ROW_HEIGHT);
     let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
 
     // Proportional background bar scaled by this player's damage share.
+    // Painted before (i.e. under) the icon and name, and still spans the
+    // row's full width — the icon slot is reserved on top of it, not cut
+    // out of it.
     let bar_frac = (row.share_pct / 100.0).clamp(0.0, 1.0);
     let bar_rect =
         egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * bar_frac, rect.height()));
@@ -443,9 +566,23 @@ fn draw_row(ui: &mut egui::Ui, row: &PlayerRow, columns: &[StatColumn], anchors:
         egui::Color32::from_rgba_unmultiplied(60, 120, 220, 120),
     );
 
+    // The icon slot (issue #9) is reserved at a fixed offset regardless of
+    // whether this row's class has an icon, so names stay left-aligned in a
+    // column across rows either way — only the painting below is
+    // conditional.
+    let (icon_rect, name_offset) = icon_slot(rect);
+    if let Some(texture) = row.class.and_then(|class| icons.get(class)) {
+        ui.painter().image(
+            texture.id(),
+            icon_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+
     let name = row_name(row);
     ui.painter().text(
-        rect.left_center() + egui::vec2(4.0, 0.0),
+        rect.left_center() + egui::vec2(name_offset, 0.0),
         egui::Align2::LEFT_CENTER,
         name,
         egui::FontId::monospace(13.0),
@@ -472,6 +609,35 @@ fn draw_row(ui: &mut egui::Ui, row: &PlayerRow, columns: &[StatColumn], anchors:
             egui::Color32::WHITE,
         );
     }
+}
+
+/// Square side of the per-row class icon (issue #9), roughly the row's text
+/// height.
+const ICON_SIZE: f32 = 16.0;
+
+/// Gap on both sides of the icon: between the row's left edge and the icon,
+/// and between the icon and the name that follows it.
+const ICON_MARGIN: f32 = 3.0;
+
+/// Fixed left-hand gutter `draw_row` reserves for the class icon slot: a
+/// margin, the icon itself, then a matching margin — reserved whether or
+/// not this particular row has an icon to paint into it, so every row's
+/// name still starts at the same x (see `icon_slot`).
+const ICON_GUTTER_WIDTH: f32 = ICON_MARGIN + ICON_SIZE + ICON_MARGIN;
+
+/// Computes a row's icon slot (a square, vertically centered in `rect`,
+/// inset from the left edge by `ICON_MARGIN`) and the x-offset from
+/// `rect`'s left edge at which the player name should then start. Pure
+/// geometry — it never looks at whether this row actually has a class icon
+/// to paint — so the slot, and therefore the name's start position, is
+/// identical across every row regardless of which classes have icons.
+fn icon_slot(rect: egui::Rect) -> (egui::Rect, f32) {
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + ICON_MARGIN, rect.center().y - ICON_SIZE / 2.0),
+        egui::vec2(ICON_SIZE, ICON_SIZE),
+    );
+    let name_offset = ICON_GUTTER_WIDTH + NAME_LEFT_PAD;
+    (icon_rect, name_offset)
 }
 
 /// `bpsr_meter` already fills unknown names with `Player {uid}`; this is a
@@ -543,8 +709,11 @@ const SEPARATOR_HEIGHT: f32 = 6.0;
 /// between every consecutive pair of them.
 const ITEM_SPACING_Y: f32 = 2.0;
 
-/// Left-anchored space `draw_row` paints a player's name into before the
-/// row's own left edge (`draw_row`'s `rect.left_center() + vec2(4.0, 0.0)`).
+/// Gap `draw_row` leaves between the icon slot (issue #9's `ICON_GUTTER_WIDTH`)
+/// and where the player name starts (`icon_slot`'s `name_offset`). Predates
+/// the icon slot — this used to be measured from the row's own left edge —
+/// but keeps its name since it's still the same "breathing room before the
+/// name" budget.
 const NAME_LEFT_PAD: f32 = 4.0;
 
 /// Budgeted width for the name itself. `draw_row` paints names unclipped in
@@ -562,33 +731,45 @@ const NAME_COLUMN_GAP: f32 = 12.0;
 /// `column_anchors` for the rightmost column's anchor.
 const COLUMN_RIGHT_MARGIN: f32 = 4.0;
 
-/// Default opening height (issue #26): header band + separator + a full
-/// 20-row raid roster, plus the `ITEM_SPACING_Y` gap egui's layout inserts
-/// between each of those 22 widgets (21 gaps), so no scrolling is needed on
-/// first launch.
+/// Default opening height (issue #26; extended by issue #9 slice 2's title
+/// line): the header's title line + timer/DPS/buttons row + separator + a
+/// full 20-row raid roster, plus the `ITEM_SPACING_Y` gap egui's layout
+/// inserts between each of those 23 widgets (22 gaps), so no scrolling is
+/// needed on first launch. The subtitle line is deliberately excluded — it
+/// is conditional (only rendered once a scene name/id is known,
+/// `encounter_subtitle`), and the default assumes it is absent.
 ///
-///   header (18.0) + separator (6.0) + 20 rows * 20.0 (400.0)
-///     + 21 gaps * 2.0 (42.0) = 466.0
+///   title (20.0) + header row (18.0) + separator (6.0) + 20 rows * 20.0 (400.0)
+///     + 22 gaps * 2.0 (44.0) = 488.0
 fn default_inner_height() -> f32 {
-    let header = egui::Style::default().spacing.interact_size.y;
+    let header_row = egui::Style::default().spacing.interact_size.y;
     let rows = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
-    let gaps = (DEFAULT_VISIBLE_ROWS + 1) as f32 * ITEM_SPACING_Y;
-    header + SEPARATOR_HEIGHT + rows + gaps
+    let gaps = (DEFAULT_VISIBLE_ROWS + 2) as f32 * ITEM_SPACING_Y;
+    TITLE_LINE_HEIGHT + header_row + SEPARATOR_HEIGHT + rows + gaps
 }
 
-/// Default opening width (issue #26): a name budget in front of the default
-/// stat columns' combined fixed width (`Settings::default`'s Damage + DPS +
-/// Share % = 188pt total, from `ColumnKind::spec` in `settings.rs`), so
-/// names don't visually collide with them.
+/// Default opening width (issue #26, widened for issue #9's icon gutter): a
+/// name budget in front of the default stat columns' combined fixed width
+/// (`Settings::default`'s Damage + DPS + Share % = 188pt total, from
+/// `ColumnKind::spec` in `settings.rs`), so names don't visually collide
+/// with them — plus the fixed icon gutter now reserved at the row's left
+/// edge, so adding it doesn't squeeze the name budget or the stat columns
+/// relative to before issue #9.
 ///
-///   left pad (4.0) + name budget (150.0) + gap (12.0)
-///     + columns (56.0 + 76.0 + 56.0 = 188.0) + right margin (4.0) = 358.0
+///   icon gutter (3.0 + 16.0 + 3.0 = 22.0) + left pad (4.0)
+///     + name budget (150.0) + gap (12.0)
+///     + columns (56.0 + 76.0 + 56.0 = 188.0) + right margin (4.0) = 380.0
 fn default_inner_width() -> f32 {
     let columns_width: f32 = stat_columns_for(&Settings::default().ordered_columns())
         .iter()
         .map(|c| c.width)
         .sum();
-    NAME_LEFT_PAD + NAME_WIDTH_BUDGET + NAME_COLUMN_GAP + columns_width + COLUMN_RIGHT_MARGIN
+    ICON_GUTTER_WIDTH
+        + NAME_LEFT_PAD
+        + NAME_WIDTH_BUDGET
+        + NAME_COLUMN_GAP
+        + columns_width
+        + COLUMN_RIGHT_MARGIN
 }
 
 /// Overlay window shape: always-on-top, borderless, transparent, sized to
@@ -630,6 +811,7 @@ pub fn apply_theme(ctx: &egui::Context) {
 mod tests {
     use super::*;
     use crate::settings::{ColumnKind, Settings};
+    use bpsr_meter::Class;
 
     #[test]
     fn fmt_short_below_thousand_is_plain() {
@@ -684,6 +866,61 @@ mod tests {
     #[test]
     fn fmt_share_full() {
         assert_eq!(fmt_share(100.0), "100.0%");
+    }
+
+    // -- encounter title/subtitle (issue #9 slice 2) -----------------------
+
+    #[test]
+    fn title_shows_boss_name_when_known() {
+        let e = EncounterInfo {
+            boss_monster_id: Some(103),
+            boss_name: Some("Rathalos"),
+            ..Default::default()
+        };
+        assert_eq!(encounter_title(&e), "Rathalos");
+    }
+
+    #[test]
+    fn title_shows_monster_id_when_name_unknown() {
+        let e = EncounterInfo {
+            boss_monster_id: Some(999_999),
+            boss_name: None,
+            ..Default::default()
+        };
+        assert_eq!(encounter_title(&e), "Monster #999999");
+    }
+
+    #[test]
+    fn title_shows_placeholder_when_nothing_known() {
+        assert_eq!(encounter_title(&EncounterInfo::default()), "No target");
+    }
+
+    #[test]
+    fn subtitle_shows_scene_name_when_known() {
+        let e = EncounterInfo {
+            scene_id: Some(1001),
+            scene_name: Some("Frozen Bahaar's Sanctum"),
+            ..Default::default()
+        };
+        assert_eq!(
+            encounter_subtitle(&e),
+            Some("Frozen Bahaar's Sanctum".to_string())
+        );
+    }
+
+    #[test]
+    fn subtitle_shows_scene_id_when_name_unknown() {
+        let e = EncounterInfo {
+            scene_id: Some(4242),
+            scene_name: None,
+            ..Default::default()
+        };
+        assert_eq!(encounter_subtitle(&e), Some("Scene #4242".to_string()));
+    }
+
+    #[test]
+    fn subtitle_omitted_when_scene_unknown() {
+        assert_eq!(encounter_subtitle(&EncounterInfo::default()), None);
     }
 
     fn sample_row(ability_score: Option<u32>) -> PlayerRow {
@@ -826,6 +1063,39 @@ mod tests {
         let (north, ..) = resize_zones(win)[0];
         assert_eq!(north.height(), RESIZE_EDGE);
         assert_eq!(north.top(), win.top());
+    }
+
+    // -- header_band_height (drag band must cover the rendered header) ----
+
+    /// No subtitle: egui stacks title + button row, one gap between them.
+    #[test]
+    fn header_band_height_with_no_subtitle_covers_title_gap_and_button_row() {
+        let button_row_height = 18.0;
+        let expected = TITLE_LINE_HEIGHT + button_row_height + ITEM_SPACING_Y;
+        assert_eq!(header_band_height(false, button_row_height), expected);
+    }
+
+    /// With a subtitle: egui stacks title + subtitle + button row, so there
+    /// are two gaps, not one — the bug this guards against undercounted by
+    /// exactly one `ITEM_SPACING_Y` here.
+    #[test]
+    fn header_band_height_with_subtitle_covers_both_gaps() {
+        let button_row_height = 18.0;
+        let expected =
+            TITLE_LINE_HEIGHT + SUBTITLE_LINE_HEIGHT + button_row_height + 2.0 * ITEM_SPACING_Y;
+        assert_eq!(header_band_height(true, button_row_height), expected);
+    }
+
+    /// Adding the subtitle must grow the band by exactly the subtitle's own
+    /// height plus the extra gap it introduces — not by a smaller amount
+    /// (the original bug: gaps were never added, so a subtitle only grew the
+    /// band by `SUBTITLE_LINE_HEIGHT`, leaving the band 4px short).
+    #[test]
+    fn subtitle_grows_band_by_its_height_plus_one_extra_gap() {
+        let button_row_height = 18.0;
+        let without = header_band_height(false, button_row_height);
+        let with = header_band_height(true, button_row_height);
+        assert_eq!(with - without, SUBTITLE_LINE_HEIGHT + ITEM_SPACING_Y);
     }
 
     // -- column_anchors (issue #8) --------------------------------------
@@ -974,6 +1244,89 @@ mod tests {
         }
     }
 
+    // -- icon slot geometry (issue #9) ------------------------------------
+
+    fn row_rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(10.0, 100.0), egui::vec2(300.0, ROW_HEIGHT))
+    }
+
+    #[test]
+    fn icon_slot_is_square() {
+        let (icon_rect, _) = icon_slot(row_rect());
+        assert_eq!(icon_rect.width(), ICON_SIZE);
+        assert_eq!(icon_rect.height(), ICON_SIZE);
+    }
+
+    #[test]
+    fn icon_slot_is_inset_from_the_rows_left_edge_by_the_margin() {
+        let rect = row_rect();
+        let (icon_rect, _) = icon_slot(rect);
+        assert_eq!(icon_rect.left(), rect.left() + ICON_MARGIN);
+    }
+
+    #[test]
+    fn icon_slot_is_vertically_centered_in_the_row() {
+        let rect = row_rect();
+        let (icon_rect, _) = icon_slot(rect);
+        assert_eq!(icon_rect.center().y, rect.center().y);
+    }
+
+    #[test]
+    fn icon_slot_name_offset_clears_the_icon_with_its_own_margin() {
+        let (icon_rect, name_offset) = icon_slot(row_rect());
+        let rect = row_rect();
+        // The name must start at or after the icon's right edge plus its own
+        // margin gap — never overlapping the icon.
+        assert!(rect.left() + name_offset >= icon_rect.right() + ICON_MARGIN);
+    }
+
+    #[test]
+    fn icon_slot_name_offset_equals_the_gutter_plus_name_pad() {
+        let (_, name_offset) = icon_slot(row_rect());
+        assert_eq!(name_offset, ICON_GUTTER_WIDTH + NAME_LEFT_PAD);
+    }
+
+    /// The slot is reserved unconditionally: its geometry depends only on
+    /// the row rect, never on anything row-specific like whether this
+    /// player's class actually has an icon — so identical rects must always
+    /// yield identical slots.
+    #[test]
+    fn icon_slot_is_independent_of_row_width() {
+        let narrow =
+            egui::Rect::from_min_size(egui::pos2(10.0, 100.0), egui::vec2(50.0, ROW_HEIGHT));
+        let wide =
+            egui::Rect::from_min_size(egui::pos2(10.0, 100.0), egui::vec2(500.0, ROW_HEIGHT));
+        assert_eq!(icon_slot(narrow), icon_slot(wide));
+    }
+
+    // -- class -> asset mapping totality (issue #9) ------------------------
+    //
+    // `ClassIcons` (in `crate::icons`) has its own totality test over
+    // `CLASS_ICON_BYTES`; this one checks the same property from the
+    // rendering side: every non-`Unknown` `Class` a row can carry resolves
+    // to *some* icon lookup outcome without panicking, and `Unknown`
+    // resolves to none.
+    #[test]
+    fn class_icons_get_is_defined_for_every_class_including_unknown() {
+        let ctx = egui::Context::default();
+        let icons = ClassIcons::load(&ctx);
+
+        for class in [
+            Class::Stormblade,
+            Class::FrostMage,
+            Class::TwinStriker,
+            Class::WindKnight,
+            Class::VerdantOracle,
+            Class::HeavyGuardian,
+            Class::Marksman,
+            Class::ShieldKnight,
+            Class::BeatPerformer,
+        ] {
+            assert!(icons.get(class).is_some(), "{class:?} has no icon");
+        }
+        assert!(icons.get(Class::Unknown).is_none());
+    }
+
     // -- dynamic columns from settings (issue #13) -----------------------
     //
     // `stat_columns_for` (production, above) builds column specs from the
@@ -1049,12 +1402,27 @@ mod tests {
     }
 
     #[test]
-    fn default_inner_height_matches_header_plus_separator_plus_rows_plus_gaps() {
-        let header = egui::Style::default().spacing.interact_size.y;
+    fn default_inner_height_matches_title_plus_header_plus_separator_plus_rows_plus_gaps() {
+        let header_row = egui::Style::default().spacing.interact_size.y;
         let rows = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
-        let gaps = (DEFAULT_VISIBLE_ROWS + 1) as f32 * ITEM_SPACING_Y;
-        let expected = header + SEPARATOR_HEIGHT + rows + gaps;
+        let gaps = (DEFAULT_VISIBLE_ROWS + 2) as f32 * ITEM_SPACING_Y;
+        let expected = TITLE_LINE_HEIGHT + header_row + SEPARATOR_HEIGHT + rows + gaps;
         assert_eq!(default_inner_height(), expected);
+    }
+
+    #[test]
+    fn default_inner_width_matches_icon_gutter_plus_name_budget_plus_columns() {
+        let columns_width: f32 = stat_columns_for(&Settings::default().ordered_columns())
+            .iter()
+            .map(|c| c.width)
+            .sum();
+        let expected = ICON_GUTTER_WIDTH
+            + NAME_LEFT_PAD
+            + NAME_WIDTH_BUDGET
+            + NAME_COLUMN_GAP
+            + columns_width
+            + COLUMN_RIGHT_MARGIN;
+        assert_eq!(default_inner_width(), expected);
     }
 
     #[test]

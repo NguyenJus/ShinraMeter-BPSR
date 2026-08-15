@@ -44,6 +44,7 @@ pub fn kind_of(uuid: i64) -> EntityKind {
 pub enum Class {
     Stormblade,
     FrostMage,
+    TwinStriker,
     WindKnight,
     VerdantOracle,
     HeavyGuardian,
@@ -58,6 +59,7 @@ impl From<i32> for Class {
         match id {
             1 => Class::Stormblade,
             2 => Class::FrostMage,
+            3 => Class::TwinStriker,
             4 => Class::WindKnight,
             5 => Class::VerdantOracle,
             9 => Class::HeavyGuardian,
@@ -74,6 +76,7 @@ impl Class {
         match self {
             Class::Stormblade => "Stormblade",
             Class::FrostMage => "FrostMage",
+            Class::TwinStriker => "TwinStriker",
             Class::WindKnight => "WindKnight",
             Class::VerdantOracle => "VerdantOracle",
             Class::HeavyGuardian => "HeavyGuardian",
@@ -135,6 +138,11 @@ pub enum ProtocolEvent {
     Damage(DamageEvent),
     Player(PlayerInfo),
     EnemyHp(EnemyHp),
+    /// The dungeon/instance id, mirrors `bpsr_protocol::ProtocolEvent::Scene`
+    /// (issue #9 slice 2).
+    Scene {
+        level_map_id: u32,
+    },
     /// `timestamp_ms` is the caller-supplied "now" at detection time (this
     /// event carries no other timing signal of its own) — used to anchor the
     /// post-reset cooldown so it isn't stamped with a stale prior event time.

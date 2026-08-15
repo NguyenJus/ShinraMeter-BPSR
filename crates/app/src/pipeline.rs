@@ -45,6 +45,7 @@ pub fn map_class(class: proto::Class) -> meter::Class {
     match class {
         proto::Class::Stormblade => meter::Class::Stormblade,
         proto::Class::FrostMage => meter::Class::FrostMage,
+        proto::Class::TwinStriker => meter::Class::TwinStriker,
         proto::Class::WindKnight => meter::Class::WindKnight,
         proto::Class::VerdantOracle => meter::Class::VerdantOracle,
         proto::Class::HeavyGuardian => meter::Class::HeavyGuardian,
@@ -87,6 +88,9 @@ pub fn map_event(ev: proto::ProtocolEvent) -> meter::ProtocolEvent {
             monster_id: e.monster_id,
             timestamp_ms: e.timestamp_ms,
         }),
+        proto::ProtocolEvent::Scene { level_map_id } => {
+            meter::ProtocolEvent::Scene { level_map_id }
+        }
         proto::ProtocolEvent::ServerChanged => meter::ProtocolEvent::ServerChanged {
             timestamp_ms: now_ms(),
         },
@@ -362,6 +366,7 @@ mod tests {
         let pairs = [
             (proto::Class::Stormblade, meter::Class::Stormblade),
             (proto::Class::FrostMage, meter::Class::FrostMage),
+            (proto::Class::TwinStriker, meter::Class::TwinStriker),
             (proto::Class::WindKnight, meter::Class::WindKnight),
             (proto::Class::VerdantOracle, meter::Class::VerdantOracle),
             (proto::Class::HeavyGuardian, meter::Class::HeavyGuardian),
@@ -438,6 +443,12 @@ mod tests {
                 timestamp_ms: 1_234,
             })
         );
+    }
+
+    #[test]
+    fn maps_scene_event() {
+        let mapped = map_event(proto::ProtocolEvent::Scene { level_map_id: 4242 });
+        assert_eq!(mapped, meter::ProtocolEvent::Scene { level_map_id: 4242 });
     }
 
     #[test]

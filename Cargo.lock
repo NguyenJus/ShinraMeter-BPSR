@@ -3040,6 +3040,7 @@ dependencies = [
  "egui",
  "embed-resource",
  "env_logger",
+ "image",
  "log",
  "raw-window-handle",
  "serde",

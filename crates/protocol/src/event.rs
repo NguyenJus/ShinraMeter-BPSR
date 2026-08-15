@@ -80,6 +80,14 @@ pub enum ProtocolEvent {
     Damage(DamageEvent),
     Player(PlayerInfo),
     EnemyHp(EnemyHp),
+    /// The dungeon/instance id, decoded from `CharSerialize.scene_data`
+    /// (issue #9 slice 2). `SocialData.scene_data`, the other path the
+    /// reference implementation reaches this through, is not wired up: the
+    /// decoder has no handler for `NotifySocialData`'s opcode today (see
+    /// `decode.rs`), and no capture is available here to learn it.
+    Scene {
+        level_map_id: u32,
+    },
     ServerChanged,
 }
 

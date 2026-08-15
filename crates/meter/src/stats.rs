@@ -83,6 +83,17 @@ pub struct PlayerRow {
     pub hits: u64,
 }
 
+/// What the meter believes is being fought, as far as the packet stream reveals
+/// it. Every field is independently unknown-able: a scene id can arrive before
+/// any boss is identified, and a boss can be identified in an unnamed scene.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EncounterInfo {
+    pub boss_monster_id: Option<u32>,
+    pub boss_name: Option<&'static str>,
+    pub scene_id: Option<u32>,
+    pub scene_name: Option<&'static str>,
+}
+
 /// Cheap, immutable snapshot of the current encounter, sorted by damage
 /// descending.
 #[derive(Debug, Clone)]
@@ -95,6 +106,9 @@ pub struct Snapshot {
     /// first tick, or the header decaying while idle).
     pub total_dps: f64,
     pub rows: Vec<PlayerRow>,
+    /// What is being fought, if the packet stream has revealed it (issue #9
+    /// slice 2).
+    pub encounter: EncounterInfo,
 }
 
 #[cfg(test)]

@@ -31,6 +31,10 @@ pub struct EnemyState {
     pub max_hp: Option<u64>,
     pub lowest_pct: Option<f64>,
     pub took_damage: bool,
+    /// Monster template id, from `EnemyHp::monster_id` (issue #9 slice 2).
+    /// Survives `Meter::reset` like the rest of `EnemyState` — only a
+    /// `ServerChange` clears the enemy map itself.
+    pub monster_id: Option<u32>,
 }
 
 impl EnemyState {
@@ -65,6 +69,7 @@ mod tests {
             max_hp: Some(max_hp),
             lowest_pct,
             took_damage: true,
+            monster_id: None,
         }
     }
 
