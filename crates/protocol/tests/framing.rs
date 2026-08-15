@@ -178,6 +178,46 @@ fn container_data_zero_fight_point_is_no_ability_score() {
     }
 }
 
+/// A player transforming into an Imagine (issue #37) then reverting: the
+/// transform packet (`cur_profession_id` 8, Dorothy) must decode to
+/// `class: None` — never `Some(Class::Unknown)` — and the revert packet must
+/// decode back to the player's real class, both for the same uid.
+#[test]
+fn container_data_imagine_transform_then_revert_round_trips() {
+    let mut stream = Vec::new();
+    stream.extend(notify(
+        bpsr_protocol::decode::opcode::SYNC_CONTAINER_DATA,
+        &sync_container_data_payload(13, "Ren", 1, 0), // Stormblade
+        false,
+    ));
+    stream.extend(notify(
+        bpsr_protocol::decode::opcode::SYNC_CONTAINER_DATA,
+        &sync_container_data_payload(13, "Ren", 8, 0), // Dorothy (Imagine)
+        false,
+    ));
+    stream.extend(notify(
+        bpsr_protocol::decode::opcode::SYNC_CONTAINER_DATA,
+        &sync_container_data_payload(13, "Ren", 1, 0), // reverts to Stormblade
+        false,
+    ));
+
+    let mut decoder = Decoder::new();
+    let events = decoder.push_stream(&stream, 5);
+    assert_eq!(events.len(), 3);
+    match &events[0] {
+        ProtocolEvent::Player(p) => assert_eq!(p.class, Some(bpsr_protocol::Class::Stormblade)),
+        other => panic!("expected Player, got {other:?}"),
+    }
+    match &events[1] {
+        ProtocolEvent::Player(p) => assert_eq!(p.class, None),
+        other => panic!("expected Player, got {other:?}"),
+    }
+    match &events[2] {
+        ProtocolEvent::Player(p) => assert_eq!(p.class, Some(bpsr_protocol::Class::Stormblade)),
+        other => panic!("expected Player, got {other:?}"),
+    }
+}
+
 /// `attr_id::SEASON_LEVEL` / `attr_id::SEASON_STRENGTH` on an entity's attr
 /// list (the only confirmed source for season data — see `attrs.rs`'s
 /// provenance comment) decode into `PlayerInfo.season_level` /

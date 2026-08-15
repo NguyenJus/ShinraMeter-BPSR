@@ -30,6 +30,11 @@ raw-window-handle = { workspace = true }
 windows = { workspace = true, features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
+    # `SetWindowSubclass`/`DefSubclassProc` for the Snap-blocking subclass
+    # in `src/platform.rs` (`install_snap_blocker`) — despite living in
+    # comctl32 at the C-API level, win32metadata places these under the
+    # `Shell` namespace, not `Controls`.
+    "Win32_UI_Shell",
 ] }
 
 [build-dependencies]

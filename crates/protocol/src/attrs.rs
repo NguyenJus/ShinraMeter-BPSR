@@ -8,7 +8,7 @@ use std::io::Cursor;
 
 use crate::event::{EnemyHp, PlayerInfo};
 use crate::inspect::InspectSink;
-use crate::pb::{self, Class};
+use crate::pb;
 
 pub mod attr_id {
     pub const NAME: i32 = 0x01;
@@ -125,7 +125,12 @@ pub fn player_info_from_attrs(
             }
             attr_id::PROFESSION_ID => {
                 if let Some(id) = decode_varint_i32(&attr.raw_data) {
-                    class = Some(Class::from(id));
+                    // An Imagine transform id (issue #37) yields `None` here
+                    // rather than overwriting `class` with `Unknown` — see
+                    // `pb::class_of_profession_id`'s doc comment.
+                    if let Some(c) = pb::class_of_profession_id(id) {
+                        class = Some(c);
+                    }
                 }
             }
             attr_id::FIGHT_POINT => {
@@ -281,6 +286,35 @@ mod tests {
             raw_data: varint(0x1_0000_0001),
         }];
         assert_eq!(player_info_from_attrs(1, &attrs, None).class, None);
+    }
+
+    // -- Imagine profession ids (issue #37) --------------------------------
+
+    #[test]
+    fn imagine_profession_id_yields_no_class() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::PROFESSION_ID,
+            raw_data: varint(8), // Dorothy
+        }];
+        assert_eq!(player_info_from_attrs(1, &attrs, None).class, None);
+    }
+
+    #[test]
+    fn imagine_profession_id_does_not_clobber_a_class_read_earlier_in_the_same_attr_list() {
+        let attrs = vec![
+            pb::Attr {
+                id: attr_id::PROFESSION_ID,
+                raw_data: varint(1), // Stormblade
+            },
+            pb::Attr {
+                id: attr_id::PROFESSION_ID,
+                raw_data: varint(8), // Dorothy (Imagine) — must not overwrite
+            },
+        ];
+        assert_eq!(
+            player_info_from_attrs(1, &attrs, None).class,
+            Some(pb::Class::Stormblade)
+        );
     }
 
     #[test]

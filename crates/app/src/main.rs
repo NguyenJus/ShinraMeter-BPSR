@@ -94,6 +94,7 @@ fn main() -> eframe::Result {
             fonts::install_cjk_fallback(&cc.egui_ctx);
             ui::apply_theme(&cc.egui_ctx);
             platform::disable_aero_snap(cc);
+            platform::install_snap_blocker(cc);
             platform::clamp_window_to_visible_area(cc);
             Ok(Box::new(
                 OverlayApp::new(rx_snapshot, tx_command, tx_settings, settings).with_status(status),

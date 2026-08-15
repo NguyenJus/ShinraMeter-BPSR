@@ -43,6 +43,11 @@ pub struct OverlayApp {
     /// texture loading needs an `egui::Context`, which does not exist yet at
     /// `OverlayApp::new` — then loaded exactly once for the process's life.
     icons: Option<Icons>,
+    /// The manual window move/resize gesture in flight, if any (issue #11);
+    /// see `WindowGesture`. Lives on the app rather than in egui memory
+    /// because it owns the reposition exemption guard, whose lifetime has
+    /// to be explicit.
+    window_gesture: WindowGesture,
 }
 
 /// All icon textures the overlay paints, bundled so `OverlayApp` has exactly
@@ -88,6 +93,7 @@ impl OverlayApp {
             tx_command,
             tx_settings,
             icons: None,
+            window_gesture: WindowGesture::default(),
         }
     }
 
@@ -123,16 +129,23 @@ impl eframe::App for OverlayApp {
             .show(ui, |ui| {
                 // First, so the header buttons drawn afterwards stay on top of
                 // the corner zones they overlap.
-                draw_resize_handles(ui, &ctx);
+                draw_resize_handles(ui, &ctx, &mut self.window_gesture);
                 draw_header(
                     ui,
                     &ctx,
                     &self.snapshot,
                     &self.tx_command,
-                    &mut self.settings,
-                    &self.tx_settings,
+                    SettingsHandle {
+                        settings: &mut self.settings,
+                        tx_settings: &self.tx_settings,
+                    },
                     &icons.toolbar,
+                    &mut self.window_gesture,
                 );
+                // After both, so a gesture that started this frame is
+                // already anchored — and, being outside them, it is the one
+                // place a gesture can end no matter which zone began it.
+                drive_window_gesture(&ctx, &mut self.window_gesture);
 
                 if let StatusLine::Error(msg) = &self.status {
                     ui.colored_label(egui::Color32::from_rgb(220, 80, 80), msg.as_str());
@@ -204,14 +217,25 @@ fn is_plausible_position(position: egui::Pos2) -> bool {
 /// spot for minimized windows.
 const MIN_PLAUSIBLE_COORD: f32 = -20_000.0;
 
+/// The persisted settings plus the channel that persists changes to disk,
+/// bundled because every draw site that touches settings needs both —
+/// mutating `settings` in place without also sending the update through
+/// `tx_settings` would silently drop the change instead of writing it (see
+/// `draw_settings_menu`). Also what keeps `draw_header` under clippy's
+/// too-many-arguments limit now that it takes a `WindowGesture` too.
+struct SettingsHandle<'a> {
+    settings: &'a mut Settings,
+    tx_settings: &'a Sender<Settings>,
+}
+
 fn draw_header(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     snapshot: &Snapshot,
     tx_command: &Sender<UiCommand>,
-    settings: &mut Settings,
-    tx_settings: &Sender<Settings>,
+    settings: SettingsHandle<'_>,
     toolbar: &ToolbarIcons,
+    gesture: &mut WindowGesture,
 ) {
     let title = encounter_title(&snapshot.encounter);
     let subtitle = encounter_subtitle(&snapshot.encounter);
@@ -233,25 +257,25 @@ fn draw_header(
     if drag_surface.hovered() {
         ctx.set_cursor_icon(egui::CursorIcon::Grab);
     }
-    // Once per gesture: `drag_window` starts a modal move loop on the OS side,
-    // so re-sending it every frame while the drag is held is at best redundant.
+    // Once per gesture: this only captures the anchor the drag is measured
+    // against. The actual per-frame repositioning is `drive_window_gesture`.
     if drag_surface.drag_started_by(egui::PointerButton::Primary) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        begin_window_gesture(ctx, gesture, GestureKind::Move);
     }
 
     // Title is always rendered (even as the "No target" placeholder) so the
     // header's height never jitters between frames; the subtitle is omitted
     // entirely — not rendered blank — when the scene is unknown (issue #9
     // slice 2).
-    draw_title_line(ui, &title);
+    let title_rect = draw_title_line(ui, &title);
+    for (segment_rect, color) in title_separator_segments(title_rect) {
+        ui.painter().rect_filled(segment_rect, 0.0, color);
+    }
     if let Some(subtitle) = &subtitle {
         draw_subtitle_line(ui, subtitle);
     }
 
     ui.horizontal(|ui| {
-        // Purely an affordance — the band above is what actually drags.
-        ui.label("☰");
-
         // Decorative — painted immediately left of the duration text, no
         // click target and no tooltip of its own (issue #41). Skipped
         // entirely if the PNG somehow failed to decode, same as a row's
@@ -262,6 +286,13 @@ fn draw_header(
         }
         ui.label(fmt_duration(snapshot.duration_ms));
         ui.label(format!("{} DPS", fmt_short(snapshot.total_dps as i64)));
+        // Total damage for the fight (reference render's e.g. "30.1B"
+        // beside a heart icon). `snapshot.total_damage` already existed but
+        // went unpainted; no gauge/heart icon asset exists in the upstream
+        // ShinraMeter icon set this project draws from (see
+        // `THIRD_PARTY_NOTICES.md`), so this ships text-only rather than
+        // inventing a substitute glyph.
+        ui.label(format!("{} DMG", fmt_short(snapshot.total_damage)));
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Raster PNG icons throughout this row (issue #41), not glyphs —
@@ -294,8 +325,8 @@ fn draw_header(
             }
             draw_settings_menu(
                 ui,
-                settings,
-                tx_settings,
+                settings.settings,
+                settings.tx_settings,
                 toolbar.get(ToolbarIcon::Settings),
             );
         });
@@ -313,15 +344,22 @@ fn draw_header(
 /// this module's own `toolbar_icon_button_height_matches_interact_size`.
 const TOOLBAR_ICON_SIZE: f32 = 14.0;
 
+/// Slate-blue-gray tint applied to every toolbar/stat icon (reference
+/// render's uniform icon family) — the source PNGs are otherwise painted in
+/// whatever native color they were authored in, which doesn't match.
+const TOOLBAR_ICON_TINT: egui::Color32 = egui::Color32::from_rgb(0x70, 0x80, 0x90);
+
 /// Builds an `egui::Image` for a loaded toolbar icon texture at the fixed
 /// `TOOLBAR_ICON_SIZE`, overriding whatever size the source PNG itself
 /// carries (`SizedTexture::from_handle` would use the PNG's native 48x48
-/// instead).
+/// instead), and multiplied by `TOOLBAR_ICON_TINT` so every icon reads as
+/// the same slate-blue-gray family regardless of its source color.
 fn toolbar_icon_image(handle: &egui::TextureHandle) -> egui::Image<'static> {
     egui::Image::from_texture(egui::load::SizedTexture::new(
         handle.id(),
         egui::Vec2::splat(TOOLBAR_ICON_SIZE),
     ))
+    .tint(TOOLBAR_ICON_TINT)
 }
 
 /// Paints one toolbar icon button and attaches its tooltip in one place
@@ -448,6 +486,20 @@ const TITLE_LINE_HEIGHT: f32 = 20.0;
 /// strength colour, matching the reference screenshot (issue #9 slice 2).
 const TITLE_FONT_SIZE: f32 = 15.0;
 
+/// Bright white the title line is painted in, matching the reference
+/// render — deliberately not `ui.visuals().text_color()` (the theme's
+/// default, dimmer body-text white) since the title needs to read as the
+/// visually heaviest element in the header.
+const TITLE_TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(0xF5, 0xF5, 0xF5);
+
+/// Horizontal offset (points) `draw_title_line` repaints the title at, on
+/// top of the first paint, to fake a heavier weight. No bold variant of the
+/// vendored font exists (`fonts.rs` installs a single weight into both
+/// egui font families), so this is the cheapest way to read visually
+/// heavier than the row text without embedding a second font file for one
+/// label.
+const TITLE_FAUX_BOLD_OFFSET: f32 = 0.6;
+
 /// Height of the header's subtitle line. Not part of `default_inner_height`
 /// — the subtitle is conditional and the default window assumes it is
 /// absent (see `default_inner_height`'s doc).
@@ -476,16 +528,75 @@ fn header_band_height(has_subtitle: bool, button_row_height: f32) -> f32 {
 /// height so `draw_header`'s drag band and `default_inner_height` can both
 /// reason about it exactly, the same way `draw_row` paints stat text inside
 /// an `allocate_exact_size`d rect instead of an auto-sized `ui.label`.
-fn draw_title_line(ui: &mut egui::Ui, text: &str) {
+/// Returns the allocated rect so `draw_header` can paint the fading
+/// separator (`title_separator_segments`) flush against its bottom edge
+/// without allocating any extra vertical space of its own.
+fn draw_title_line(ui: &mut egui::Ui, text: &str) -> egui::Rect {
     let desired_size = egui::vec2(ui.available_width(), TITLE_LINE_HEIGHT);
     let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    let font = egui::FontId::proportional(TITLE_FONT_SIZE);
+    // Painted twice, offset by `TITLE_FAUX_BOLD_OFFSET` — see its doc
+    // comment for why there's no real bold font to reach for instead.
+    ui.painter().text(
+        rect.left_center() + egui::vec2(TITLE_FAUX_BOLD_OFFSET, 0.0),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font.clone(),
+        TITLE_TEXT_COLOR,
+    );
     ui.painter().text(
         rect.left_center(),
         egui::Align2::LEFT_CENTER,
         text,
-        egui::FontId::proportional(TITLE_FONT_SIZE),
-        ui.visuals().text_color(),
+        font,
+        TITLE_TEXT_COLOR,
     );
+    rect
+}
+
+/// Color of the fading separator line painted under the header title
+/// (`title_separator_segments`), matching the reference render's slate-blue
+/// divider.
+const TITLE_SEPARATOR_RGB: (u8, u8, u8) = (0x70, 0x7F, 0x90);
+
+/// Thickness, in points, of the title separator line.
+const TITLE_SEPARATOR_THICKNESS: f32 = 1.0;
+
+/// Number of thin strips `title_separator_segments` divides the fade into.
+/// High enough to read as a smooth gradient, modest enough to stay cheap to
+/// paint every frame.
+const TITLE_SEPARATOR_SEGMENTS: usize = 24;
+
+/// Builds the fading title-underline as a series of thin filled rects:
+/// egui has no built-in gradient stroke, so the "fades toward the
+/// background" effect from the reference render is approximated with
+/// segments whose alpha steps down linearly from opaque at `rect`'s left
+/// edge to fully transparent at its horizontal midpoint — nothing is
+/// painted past that, so the line visibly fades out by roughly mid-width
+/// rather than running the full title row. Extracted as a pure function,
+/// same reasoning as `share_bar_paints`: unit-testable without a live
+/// `egui::Ui`.
+fn title_separator_segments(rect: egui::Rect) -> Vec<(egui::Rect, egui::Color32)> {
+    let (r, g, b) = TITLE_SEPARATOR_RGB;
+    let fade_width = rect.width() / 2.0;
+    let segment_width = fade_width / TITLE_SEPARATOR_SEGMENTS as f32;
+    let y = rect.bottom() - TITLE_SEPARATOR_THICKNESS;
+
+    (0..TITLE_SEPARATOR_SEGMENTS)
+        .map(|i| {
+            let t = i as f32 / (TITLE_SEPARATOR_SEGMENTS - 1) as f32; // 0.0 ..= 1.0
+            let alpha = ((1.0 - t) * 255.0).round() as u8;
+            let x0 = rect.left() + i as f32 * segment_width;
+            let segment_rect = egui::Rect::from_min_size(
+                egui::pos2(x0, y),
+                egui::vec2(segment_width, TITLE_SEPARATOR_THICKNESS),
+            );
+            (
+                segment_rect,
+                egui::Color32::from_rgba_unmultiplied(r, g, b, alpha),
+            )
+        })
+        .collect()
 }
 
 /// Paints the header's subtitle line (scene name/id), dimmed. Only called
@@ -566,6 +677,219 @@ fn draw_settings_menu(
     trigger.on_hover_text("Settings");
 }
 
+/// Smallest inner size the overlay may be resized to, in points. Shared by
+/// `viewport`'s `with_min_inner_size` — which is what stops winit/the OS
+/// going smaller — and `resized_window_rect`'s clamp, so a manual resize
+/// stops at exactly the same size the window would have been pinned to
+/// anyway (a mismatch would leave the dragged edge visibly detached from
+/// the pointer).
+const MIN_INNER_SIZE: egui::Vec2 = egui::vec2(220.0, 90.0);
+
+/// How far, in points, a gesture's target rect must differ from where the
+/// window already is before a viewport command is worth sending. Purely to
+/// keep a held-still drag from re-queueing identical commands every frame.
+const GESTURE_EPSILON: f32 = 0.5;
+
+/// What a manual window gesture is currently driving.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GestureKind {
+    /// The header drag band: the whole window follows the pointer.
+    Move,
+    /// One of `resize_zones`' eight strips.
+    Resize(egui::ResizeDirection),
+}
+
+/// A manual, app-driven window move or resize in progress (issue #11).
+///
+/// The OS-loop commands (`ViewportCommand::StartDrag` / `BeginResize`) are
+/// deliberately *not* used: they hand the gesture to Windows' `SC_MOVE` /
+/// `SC_SIZE` modal loops, which is the only place Aero Snap engages. So the
+/// overlay tracks the pointer itself and repositions/resizes the window
+/// frame by frame instead, and Snap never gets a loop to hook.
+///
+/// One instance is shared by the header and all eight resize zones, since
+/// egui only ever drags one widget at a time — which also means there is
+/// exactly one owner of the reposition exemption.
+#[derive(Debug, Default)]
+pub struct WindowGesture {
+    active: Option<ActiveGesture>,
+}
+
+#[derive(Debug)]
+struct ActiveGesture {
+    kind: GestureKind,
+    /// Pointer position in *screen* points when the gesture began.
+    start_pointer: egui::Pos2,
+    /// The window's outer rect, in points, when the gesture began. Every
+    /// frame's target is computed from this plus the total pointer delta,
+    /// never from the previous frame's rect, so rounding in what winit
+    /// actually applied can't accumulate over a long drag.
+    start_rect: egui::Rect,
+    /// Held for the whole gesture so the snap-blocking subclass in
+    /// `platform` doesn't veto our own repositioning when it happens to
+    /// land within a couple of pixels of a monitor half. A per-call
+    /// closure would be useless here: the viewport commands below are
+    /// queued, and winit turns them into `SetWindowPos` later in the
+    /// frame. Dropped by `WindowGesture::end`.
+    _exemption: crate::platform::RepositionGuard,
+}
+
+impl WindowGesture {
+    fn kind(&self) -> Option<GestureKind> {
+        self.active.as_ref().map(|active| active.kind)
+    }
+
+    fn begin(&mut self, kind: GestureKind, start_pointer: egui::Pos2, start_rect: egui::Rect) {
+        // Release whatever was running first, so a gesture that somehow
+        // started without the previous one ending can't stack exemptions.
+        self.end();
+        self.active = Some(ActiveGesture {
+            kind,
+            start_pointer,
+            start_rect,
+            _exemption: crate::platform::begin_app_driven_reposition(),
+        });
+    }
+
+    /// Ends the gesture and drops its exemption guard. Idempotent, because
+    /// it is called from every exit path (see `drive_window_gesture`).
+    fn end(&mut self) {
+        self.active = None;
+    }
+}
+
+/// The window's outer rect and the pointer, both in screen points.
+///
+/// Screen space is the only frame of reference a manual gesture can use:
+/// egui reports the pointer in window-local coordinates, and as the window
+/// follows the pointer that local position stays put — a local per-frame
+/// delta would cancel itself out and leave the window juddering in place.
+/// Adding the window's own origin back undoes that.
+fn window_and_pointer(ctx: &egui::Context) -> Option<(egui::Rect, egui::Pos2)> {
+    ctx.input(|i| {
+        let window = i.viewport().outer_rect?;
+        let pointer = i.pointer.latest_pos()?;
+        Some((window, window.min + pointer.to_vec2()))
+    })
+}
+
+/// Starts `kind` from wherever the pointer and window are right now.
+fn begin_window_gesture(ctx: &egui::Context, gesture: &mut WindowGesture, kind: GestureKind) {
+    // No position reported yet (a frame before winit has placed the
+    // window) means there's no anchor to measure against; skipping just
+    // costs the user one re-grab.
+    if let Some((window, pointer)) = window_and_pointer(ctx) {
+        gesture.begin(kind, pointer, window);
+    }
+}
+
+/// Advances the in-flight gesture by one frame, or ends it. Called once per
+/// frame after the header and resize zones have had their chance to start
+/// one.
+fn drive_window_gesture(ctx: &egui::Context, gesture: &mut WindowGesture) {
+    let Some(kind) = gesture.kind() else {
+        return;
+    };
+    let Some((start_pointer, start_rect)) = gesture
+        .active
+        .as_ref()
+        .map(|active| (active.start_pointer, active.start_rect))
+    else {
+        return;
+    };
+
+    // The single release point for every way a gesture can end — pointer
+    // released, drag cancelled, or the window losing focus mid-drag (an
+    // alt-tab or the game grabbing focus back), which stops delivering
+    // pointer state and would otherwise strand the exemption guard for the
+    // rest of the session.
+    let holding = ctx.input(|i| i.pointer.primary_down() && i.viewport().focused.unwrap_or(true));
+    if !holding {
+        gesture.end();
+        return;
+    }
+
+    let Some((window, pointer)) = window_and_pointer(ctx) else {
+        return;
+    };
+    let delta = pointer - start_pointer;
+    let target = match kind {
+        GestureKind::Move => {
+            egui::Rect::from_min_size(moved_window_origin(start_rect, delta), start_rect.size())
+        }
+        GestureKind::Resize(direction) => {
+            resized_window_rect(start_rect, direction, delta, MIN_INNER_SIZE)
+        }
+    };
+
+    if target.min.distance(window.min) > GESTURE_EPSILON {
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target.min));
+    }
+    // The overlay is borderless, so its outer and inner rects are the same
+    // size; `InnerSize` is just the command egui exposes for setting it.
+    if (target.size() - window.size()).length() > GESTURE_EPSILON {
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
+    }
+}
+
+/// Where the window's top-left corner goes for a move gesture: straight
+/// offset by the total pointer delta since the drag began.
+fn moved_window_origin(start: egui::Rect, delta: egui::Vec2) -> egui::Pos2 {
+    start.min + delta
+}
+
+/// The window rect a resize gesture is asking for: `start` with the edges
+/// `direction` names moved by `delta`, clamped so neither axis goes below
+/// `min_size`.
+///
+/// Dragging a west/north edge changes the origin as well as the size, and
+/// the clamp deliberately pushes back the edge the user is *holding* rather
+/// than the one they aren't — otherwise a drag past the minimum would keep
+/// shoving the anchored edge across the screen.
+fn resized_window_rect(
+    start: egui::Rect,
+    direction: egui::ResizeDirection,
+    delta: egui::Vec2,
+    min_size: egui::Vec2,
+) -> egui::Rect {
+    use egui::ResizeDirection as Dir;
+
+    let west = matches!(direction, Dir::West | Dir::NorthWest | Dir::SouthWest);
+    let east = matches!(direction, Dir::East | Dir::NorthEast | Dir::SouthEast);
+    let north = matches!(direction, Dir::North | Dir::NorthEast | Dir::NorthWest);
+    let south = matches!(direction, Dir::South | Dir::SouthEast | Dir::SouthWest);
+
+    let mut rect = start;
+    if west {
+        rect.min.x += delta.x;
+    }
+    if east {
+        rect.max.x += delta.x;
+    }
+    if north {
+        rect.min.y += delta.y;
+    }
+    if south {
+        rect.max.y += delta.y;
+    }
+
+    if rect.width() < min_size.x {
+        if west {
+            rect.min.x = rect.max.x - min_size.x;
+        } else {
+            rect.max.x = rect.min.x + min_size.x;
+        }
+    }
+    if rect.height() < min_size.y {
+        if north {
+            rect.min.y = rect.max.y - min_size.y;
+        } else {
+            rect.max.y = rect.min.y + min_size.y;
+        }
+    }
+    rect
+}
+
 /// Width of the invisible edge strips that start a resize, in points.
 const RESIZE_EDGE: f32 = 6.0;
 /// Side of the invisible corner squares, which resize on both axes at once.
@@ -624,9 +948,10 @@ fn resize_zones(rect: egui::Rect) -> [(egui::Rect, egui::ResizeDirection, egui::
 }
 
 /// A borderless window gets no OS resize frame, so the overlay supplies its
-/// own: invisible strips along the edges that hand the gesture back to the
-/// window manager via `BeginResize`.
-fn draw_resize_handles(ui: &mut egui::Ui, ctx: &egui::Context) {
+/// own: invisible strips along the edges that start a manual resize gesture
+/// (`WindowGesture`) rather than handing the window manager a native resize
+/// loop, which on Windows is where Snap would engage.
+fn draw_resize_handles(ui: &mut egui::Ui, ctx: &egui::Context, gesture: &mut WindowGesture) {
     let window = ctx.input(|i| i.viewport_rect());
     // `ResizeDirection` is not `Hash`, so the zone's position in the array is
     // what keeps the eight ids distinct.
@@ -635,10 +960,10 @@ fn draw_resize_handles(ui: &mut egui::Ui, ctx: &egui::Context) {
         if handle.hovered() {
             ctx.set_cursor_icon(cursor);
         }
-        // Same as the title-bar drag: this opens a modal loop on the OS side,
-        // so it must fire once per gesture, not once per frame.
+        // Same as the title-bar drag: the anchor is captured once, then
+        // `drive_window_gesture` does the per-frame work.
         if handle.drag_started_by(egui::PointerButton::Primary) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+            begin_window_gesture(ctx, gesture, GestureKind::Resize(direction));
         }
     }
 }
@@ -668,6 +993,10 @@ fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot, columns: &[ColumnKind], ico
 pub struct StatColumn {
     pub width: f32,
     pub text: fn(&PlayerRow) -> String,
+    /// Text color this column is painted with. Most columns are plain
+    /// white; `CritPct`/`LuckyPct` use `CRIT_PCT_RGB`/`LUCKY_PCT_RGB` to
+    /// stand out the way the reference meter colors them.
+    pub color: egui::Color32,
 }
 
 /// Builds the column specs for `column_anchors` out of the currently
@@ -720,6 +1049,41 @@ pub fn column_anchors(
     }
     anchors.reverse();
     anchors
+}
+
+/// The horizontal clip rect for one stat column's painted text: bounded on
+/// the right by that column's anchor (where its right-aligned text ends)
+/// and on the left by exactly one nominal `width` — the budget in-range
+/// text for the column is designed, and tested
+/// (`widest_formatted_text_fits_its_column_width_budget`), to fit.
+///
+/// This is what keeps an out-of-range value (e.g. a packet-decoded
+/// `ability_score`/`season_strength` past the in-game ceiling `StatColumn`'s
+/// `width` budget assumes — see `ColumnKind::spec`) from painting
+/// arbitrarily far left across the row: `draw_row` clips every column's text
+/// draw to this rect rather than trusting the formatted string to fit
+/// `width`, so an overlong string loses its leading glyphs after one
+/// column's worth instead of running over its neighbors.
+///
+/// The slot is the *nominal* `width`, deliberately not the gap between this
+/// column's anchor and the previous one. The two are identical whenever the
+/// row is wide enough to hold every column at full width; in a narrower row
+/// `column_anchors` scales those gaps down (see there), and clipping to a
+/// scaled gap would cut ordinary in-range values short — right-aligned text
+/// is clipped from the *left*, so a clipped `1000.0K` reads as a smaller
+/// number rather than as damage. In that compressed case the slots overlap
+/// and an overflowing value can bleed into its neighbor, which is exactly
+/// what a too-narrow window did before any clipping existed; visible
+/// overlap beats silently hiding digits. So the clip is a no-op only for
+/// values that fit their budget in a row wide enough not to be compressed.
+///
+/// `Painter::with_clip_rect` intersects with the parent's clip rect, so a
+/// slot reaching past the row's own left edge is still bounded by the ui.
+fn column_clip_rect(rect: egui::Rect, anchor: f32, width: f32) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(anchor - width, rect.top()),
+        egui::pos2(anchor, rect.bottom()),
+    )
 }
 
 fn draw_row(
@@ -778,13 +1142,20 @@ fn draw_row(
     // `StatColumn` carries its own formatter.
     for (anchor_x, column) in anchors.iter().zip(columns) {
         let text = (column.text)(row);
-        ui.painter().text(
-            egui::pos2(*anchor_x, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            text,
-            egui::FontId::monospace(13.0),
-            egui::Color32::WHITE,
-        );
+        // Clipped to this column's own slot (`column_clip_rect`) so a value
+        // wider than the column's width budget (e.g. an out-of-range
+        // `ability_score`/`season_strength` straight off the packet, with
+        // no clamp anywhere upstream) is cut off after one column's worth
+        // rather than painted across the columns to its left.
+        ui.painter()
+            .with_clip_rect(column_clip_rect(rect, *anchor_x, column.width))
+            .text(
+                egui::pos2(*anchor_x, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                text,
+                egui::FontId::monospace(13.0),
+                column.color,
+            );
     }
 }
 
@@ -810,6 +1181,19 @@ const SHARE_BAR_RGB_DAMAGE: (u8, u8, u8) = (220, 80, 70);
 /// this must stay visually distinct from all three colors above (issue #44's
 /// second open question).
 const SHARE_BAR_RGB_UNKNOWN: (u8, u8, u8) = (140, 140, 140);
+
+/// RGB for the `CritPct` stat column's text. Sampled directly from the
+/// reference meter screenshots — `docs/reference/new-shinra-ex.webp` and
+/// `docs/reference/tera_shinrameter_ex.png` both render their crit-%
+/// column in this exact hex (`#F08080`, CSS "lightcoral"), so this is not
+/// a guess.
+pub(crate) const CRIT_PCT_RGB: (u8, u8, u8) = (240, 128, 128);
+/// RGB for the `LuckyPct` stat column's text. Neither reference screenshot
+/// has a visibly colored lucky-% column to sample, so this is *not*
+/// sampled — it reuses `SHARE_BAR_RGB_HEALER`'s green as the nearest
+/// existing convention for "this stat is good, color it green" rather than
+/// inventing a new hue.
+pub(crate) const LUCKY_PCT_RGB: (u8, u8, u8) = (70, 200, 120);
 
 /// Alpha of the translucent wash covering the full width of `bar_rect`
 /// (issue #43). Deliberately lower than the old single flat fill's alpha
@@ -1059,7 +1443,7 @@ pub fn viewport(window_position: Option<[f32; 2]>) -> egui::ViewportBuilder {
         .with_transparent(true)
         .with_resizable(true)
         .with_inner_size([default_inner_width(), default_inner_height()])
-        .with_min_inner_size([220.0, 90.0]);
+        .with_min_inner_size(MIN_INNER_SIZE);
     if let Some(position) = window_position {
         builder = builder.with_position(position);
     }
@@ -1126,6 +1510,211 @@ mod tests {
     #[test]
     fn fmt_duration_no_hour_rollover() {
         assert_eq!(fmt_duration(3_600_000), "60:00");
+    }
+
+    // -- header restyle (top-bar restyle: hamburger removal, total-damage
+    // stat, title separator, icon tint) ------------------------------------
+
+    /// Builds a minimal `Snapshot` for header-rendering tests: a resolved
+    /// boss name (so `encounter_title` returns non-empty text) and a
+    /// distinctive `total_damage` so the formatted figure is unambiguous in
+    /// assertions below.
+    fn header_test_snapshot(total_damage: i64) -> Snapshot {
+        Snapshot {
+            duration_ms: 90_000,
+            total_damage,
+            total_dps: 12_345.0,
+            rows: Vec::new(),
+            encounter: EncounterInfo {
+                boss_monster_id: Some(1),
+                is_boss: true,
+                boss_name: Some("Bahaar"),
+                scene_id: None,
+                scene_name: None,
+            },
+        }
+    }
+
+    /// Walks a painted `Shape`, collecting the text of every `Shape::Text`
+    /// found — recursing into `Shape::Vec` since egui groups a layout's
+    /// child shapes (e.g. `ui.horizontal`'s row) that way. `Galley`
+    /// dereferences to `str` (`Deref<Target = str>`), so `galley.text()`
+    /// hands back exactly the string that was laid out.
+    fn collect_text_shapes(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text_shape) => out.push(text_shape.galley.text().to_string()),
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_text_shapes(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Renders `draw_header` and returns the text of every string it
+    /// painted this frame (title, subtitle, and every `ui.label` in the
+    /// button row) by walking the frame's raw `FullOutput::shapes` — the
+    /// title/subtitle are painted directly via `ui.painter().text`, which
+    /// never reaches accesskit, so this reads the same ground truth for
+    /// both painter-drawn and widget-drawn text instead of two different
+    /// mechanisms.
+    fn header_rendered_texts(snapshot: &Snapshot) -> Vec<String> {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let toolbar = ToolbarIcons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header(
+                ui,
+                &ctx,
+                snapshot,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &toolbar,
+                &mut WindowGesture::default(),
+            );
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text_shapes(&clipped.shape, &mut texts);
+        }
+        output.drop_without_applying_deltas();
+        texts
+    }
+
+    /// The stray `☰` hamburger label had no counterpart in the reference
+    /// render and no behavior of its own (the whole header band is already
+    /// the drag surface) — it must not appear anywhere in the rendered
+    /// header.
+    #[test]
+    fn draw_header_omits_hamburger_glyph() {
+        let texts = header_rendered_texts(&header_test_snapshot(30_100_000_000));
+        assert!(!texts.iter().any(|text| text == "☰"));
+    }
+
+    /// The reference render shows a total-damage figure alongside the DPS
+    /// figure (e.g. "30.1B"), abbreviated with the same `fmt_short` used
+    /// everywhere else — `snapshot.total_damage` existed but was never
+    /// painted before this change.
+    #[test]
+    fn draw_header_shows_total_damage_abbreviated() {
+        let texts = header_rendered_texts(&header_test_snapshot(30_100_000_000));
+        let expected = fmt_short(30_100_000_000);
+        assert_eq!(expected, "30.1B");
+        assert!(
+            texts.iter().any(|text| text.contains(&expected)),
+            "expected a painted text containing {expected:?}, got {texts:?}"
+        );
+    }
+
+    /// The header band's height budget (`header_band_height`) must still
+    /// cover everything `draw_header` actually paints even after adding the
+    /// total-damage stat to the button row and the fading separator under
+    /// the title — neither should make the rendered content taller than the
+    /// band `draw_header` already computes as its drag surface.
+    #[test]
+    fn draw_header_fits_within_its_own_band_height() {
+        let snapshot = header_test_snapshot(30_100_000_000);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let toolbar = ToolbarIcons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+
+        let mut rendered_height = 0.0;
+        let mut interact_size_y = 0.0;
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header(
+                ui,
+                &ctx,
+                &snapshot,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &toolbar,
+                &mut WindowGesture::default(),
+            );
+            interact_size_y = ui.spacing().interact_size.y;
+            rendered_height = ui.min_rect().height();
+        });
+        output.drop_without_applying_deltas();
+
+        let has_subtitle = encounter_subtitle(&snapshot.encounter).is_some();
+        let band = header_band_height(has_subtitle, interact_size_y);
+        assert!(
+            rendered_height <= band,
+            "rendered header ({rendered_height}) overflowed its band ({band})"
+        );
+    }
+
+    // -- title separator (fading slate-blue divider under the title) ------
+
+    /// Pure-function version of the fade math (same reasoning as
+    /// `share_bar_paints`): the leftmost segment must be at (or very near)
+    /// full opacity and alpha must fall off monotonically toward zero by
+    /// roughly the midpoint, never rising back up.
+    #[test]
+    fn title_separator_segments_fade_monotonically_from_full_to_zero() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 20.0));
+        let segments = title_separator_segments(rect);
+
+        assert!(!segments.is_empty());
+        let first_alpha = segments.first().unwrap().1.a();
+        let last_alpha = segments.last().unwrap().1.a();
+        assert!(
+            first_alpha >= 250,
+            "leftmost segment should be near-opaque, got {first_alpha}"
+        );
+        assert_eq!(
+            last_alpha, 0,
+            "rightmost segment should have faded to nothing"
+        );
+
+        let mut previous = 255;
+        for (_, color) in &segments {
+            assert!(color.a() <= previous, "alpha rose instead of fading");
+            previous = color.a();
+        }
+    }
+
+    /// The fade must not extend past the title row's own width — the whole
+    /// point is that it fades out by roughly mid-width, not that it runs the
+    /// full row.
+    #[test]
+    fn title_separator_segments_stay_within_rect_width() {
+        let rect = egui::Rect::from_min_size(egui::pos2(5.0, 0.0), egui::vec2(200.0, 20.0));
+        let segments = title_separator_segments(rect);
+        for (seg_rect, _) in &segments {
+            assert!(seg_rect.left() >= rect.left());
+            assert!(seg_rect.right() <= rect.right() + 1.0);
+        }
+    }
+
+    // -- toolbar icon tint (slate-blue-gray family, matching reference) ---
+
+    /// `toolbar_icon_image` must multiply every toolbar/stat icon by the
+    /// reference render's slate-blue-gray family instead of leaving the
+    /// source PNG's native color untouched.
+    #[test]
+    fn toolbar_icon_image_applies_slate_tint() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "test-icon-tint",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        let image = toolbar_icon_image(&texture);
+        assert_eq!(image.image_options().tint, TOOLBAR_ICON_TINT);
     }
 
     #[test]
@@ -1267,23 +1856,12 @@ mod tests {
 
     #[test]
     fn ability_score_column_formats_value_when_some() {
-        let row = sample_row(Some(12_345));
+        // A value that `fmt_short` would abbreviate to "12.3M" — the full
+        // digit string must be rendered instead (owner requirement: ability
+        // score and season strength always show the complete figure).
+        let row = sample_row(Some(12_345_678));
         let column = ColumnKind::AbilityScore.spec();
-        assert_eq!((column.text)(&row), fmt_short(12_345));
-    }
-
-    #[test]
-    fn season_level_column_blank_when_none() {
-        let row = sample_season_row(None, None);
-        let column = ColumnKind::SeasonLevel.spec();
-        assert_eq!((column.text)(&row), "");
-    }
-
-    #[test]
-    fn season_level_column_formats_value_when_some() {
-        let row = sample_season_row(Some(42), None);
-        let column = ColumnKind::SeasonLevel.spec();
-        assert_eq!((column.text)(&row), fmt_short(42));
+        assert_eq!((column.text)(&row), "12345678");
     }
 
     #[test]
@@ -1295,9 +1873,10 @@ mod tests {
 
     #[test]
     fn season_strength_column_formats_value_when_some() {
-        let row = sample_season_row(None, Some(12_345));
+        // Same full-digit requirement as ability score above.
+        let row = sample_season_row(None, Some(12_345_678));
         let column = ColumnKind::SeasonStrength.spec();
-        assert_eq!((column.text)(&row), fmt_short(12_345));
+        assert_eq!((column.text)(&row), "12345678");
     }
 
     fn window() -> egui::Rect {
@@ -1417,14 +1996,17 @@ mod tests {
         StatColumn {
             width: 56.0,
             text: |row| fmt_short(row.damage),
+            color: egui::Color32::WHITE,
         },
         StatColumn {
             width: 56.0,
             text: |row| format!("{}/s", fmt_short(row.dps as i64)),
+            color: egui::Color32::WHITE,
         },
         StatColumn {
             width: 44.0,
             text: |row| fmt_share(row.share_pct),
+            color: egui::Color32::WHITE,
         },
     ];
 
@@ -1492,6 +2074,78 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    // -- column_clip_rect (stat text can overflow its fixed column width) --
+
+    /// A narrow row (`MIN_INNER_SIZE` is 220x90 and up to
+    /// `ColumnKind::ALL.len()` columns can be enabled, so this is reachable
+    /// in normal use) makes `column_anchors` scale the gap between adjacent
+    /// anchors below the columns' nominal widths. Clipping to that scaled
+    /// gap would hide the *leading* characters of perfectly in-range text —
+    /// right-aligned text is clipped from the left, so a truncated number
+    /// reads as a smaller one. Every column's slot must therefore admit its
+    /// full nominal `width` no matter how compressed the row is, so that a
+    /// value already known to fit its budget
+    /// (`widest_formatted_text_fits_its_column_width_budget`) is never cut.
+    #[test]
+    fn column_clip_rect_admits_the_full_column_budget_even_in_a_compressed_row() {
+        let total: f32 = TEST_COLUMNS.iter().map(|c| c.width).sum();
+        let rect = row_rect();
+        // Roomy, exactly-fitting, and two compressed rows (the last one
+        // narrower than a single column's width).
+        for right in [rect.right(), rect.left() + total + 4.0, total * 0.5, 40.0] {
+            let anchors = column_anchors(rect.left(), right, &TEST_COLUMNS, 4.0);
+            for (i, column) in TEST_COLUMNS.iter().enumerate() {
+                let clip = column_clip_rect(rect, anchors[i], column.width);
+                assert!(
+                    clip.width() >= column.width,
+                    "row right {right}, column {i}: clip width {} is narrower than \
+                     its own {}pt budget, so in-range text loses leading glyphs",
+                    clip.width(),
+                    column.width
+                );
+                // The anchor is where the text is painted from; a slot that
+                // did not contain it would clip everything.
+                assert_eq!(clip.right(), anchors[i]);
+            }
+        }
+    }
+
+    /// The clip must still *bound* an overflowing value — the whole point of
+    /// clipping at all. An out-of-range `ability_score`/`season_strength`
+    /// gets cut off after one column's worth of glyphs instead of painting
+    /// arbitrarily far left across the row, and where the row is wide enough
+    /// for full-width columns that bound is exactly the previous column's
+    /// anchor, so no neighbor is overpainted.
+    #[test]
+    fn column_clip_rect_bounds_overflow_to_one_column_width() {
+        let rect = row_rect();
+        let anchors = column_anchors(rect.left(), rect.right(), &TEST_COLUMNS, 4.0);
+        for (i, column) in TEST_COLUMNS.iter().enumerate() {
+            let clip = column_clip_rect(rect, anchors[i], column.width);
+            assert_eq!(clip.width(), column.width);
+            if i > 0 {
+                assert_eq!(clip.left(), anchors[i - 1]);
+            }
+        }
+    }
+
+    /// The leftmost column has no earlier anchor to bound it, but is bounded
+    /// all the same: its own width budget keeps an overflowing value off the
+    /// player name to its left, well inside the row rect rather than running
+    /// to (or past) the row's left edge.
+    #[test]
+    fn column_clip_rect_bounds_the_leftmost_column_short_of_the_row_edge() {
+        let rect = row_rect();
+        let anchors = column_anchors(rect.left(), rect.right(), &TEST_COLUMNS, 4.0);
+        let clip = column_clip_rect(rect, anchors[0], TEST_COLUMNS[0].width);
+        assert!(
+            clip.left() > rect.left(),
+            "leftmost clip {} should stop short of the row's left edge {}",
+            clip.left(),
+            rect.left()
+        );
+    }
+
     /// The geometry tests above only check anchor placement; none of them
     /// confirm the *painted text* actually fits inside its column's width
     /// budget. This builds the widest plausible row, renders every
@@ -1515,6 +2169,13 @@ mod tests {
         // Widest plausible value for every field any column formats:
         // `fmt_short`'s 7-char maximum (rounds up across a K/M/B
         // threshold, e.g. 999_950 -> "1000.0K") and `fmt_share`'s.
+        // `ability_score`/`season_strength` are the two exceptions: they
+        // render the full, un-abbreviated digit string (owner requirement),
+        // so their widest plausible input is their real in-game ceiling —
+        // ability score is a 5-digit stat (max 99_999) and season strength
+        // is a 4-digit stat (max 9_999), per the repo owner — rather than
+        // the field type's own ceiling (`u32::MAX`) or a `fmt_short`-derived
+        // value. Do not "fix" these back to `u32::MAX`.
         assert_eq!(fmt_short(999_950), "1000.0K");
         assert_eq!(fmt_share(100.0), "100.0%");
         let widest_row = PlayerRow {
@@ -1527,9 +2188,9 @@ mod tests {
             crit_pct: 100.0,
             lucky_pct: 100.0,
             hits: 999_950,
-            ability_score: Some(999_950),
+            ability_score: Some(99_999),
             season_level: Some(999_950),
-            season_strength: Some(999_950),
+            season_strength: Some(9_999),
         };
 
         for (kind, column) in ColumnKind::ALL
@@ -1805,7 +2466,11 @@ mod tests {
             4.0,
         );
 
-        settings.toggle(ColumnKind::CritPct);
+        // Both start disabled under the new default (`Dps`, `CritPct`,
+        // `LuckyPct`), so toggling them is guaranteed to grow the set —
+        // toggling `CritPct` itself would instead shrink it now that it's
+        // on by default.
+        settings.toggle(ColumnKind::AbilityScore);
         settings.toggle(ColumnKind::Hits);
         let after = column_anchors(
             0.0,
@@ -2128,5 +2793,126 @@ mod tests {
         let anchors_a = column_anchors(0.0, 300.0, &stat_columns_for(&a.ordered_columns()), 4.0);
         let anchors_b = column_anchors(0.0, 300.0, &stat_columns_for(&b.ordered_columns()), 4.0);
         assert_eq!(anchors_a, anchors_b);
+    }
+
+    // --- Manual (app-driven) window move/resize gestures, issue #11 ---
+
+    /// A stand-in window rect, deliberately larger than `MIN_INNER_SIZE` on
+    /// both axes and off the origin so a drift in either edge shows up.
+    fn window_rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(400.0, 300.0))
+    }
+
+    #[test]
+    fn a_move_offsets_the_origin_by_the_whole_pointer_delta() {
+        assert_eq!(
+            moved_window_origin(window_rect(), egui::vec2(20.0, -10.0)),
+            egui::pos2(120.0, 40.0)
+        );
+    }
+
+    #[test]
+    fn dragging_the_east_edge_moves_only_the_right_edge() {
+        let start = window_rect();
+        let resized = resized_window_rect(
+            start,
+            egui::ResizeDirection::East,
+            egui::vec2(30.0, 77.0),
+            MIN_INNER_SIZE,
+        );
+        assert_eq!(resized.min, start.min);
+        assert_eq!(resized.size(), egui::vec2(430.0, 300.0));
+    }
+
+    #[test]
+    fn dragging_the_west_edge_moves_the_origin_and_anchors_the_right_edge() {
+        let start = window_rect();
+        let resized = resized_window_rect(
+            start,
+            egui::ResizeDirection::West,
+            egui::vec2(-30.0, 40.0),
+            MIN_INNER_SIZE,
+        );
+        assert_eq!(resized.min, egui::pos2(70.0, 50.0));
+        assert_eq!(resized.max, start.max);
+    }
+
+    #[test]
+    fn dragging_a_corner_resizes_on_both_axes_at_once() {
+        let resized = resized_window_rect(
+            window_rect(),
+            egui::ResizeDirection::NorthEast,
+            egui::vec2(25.0, -15.0),
+            MIN_INNER_SIZE,
+        );
+        assert_eq!(
+            resized,
+            egui::Rect::from_min_max(egui::pos2(100.0, 35.0), egui::pos2(525.0, 350.0))
+        );
+    }
+
+    #[test]
+    fn a_trailing_edge_drag_never_shrinks_past_the_minimum_inner_size() {
+        let start = window_rect();
+        let resized = resized_window_rect(
+            start,
+            egui::ResizeDirection::SouthEast,
+            egui::vec2(-1000.0, -1000.0),
+            MIN_INNER_SIZE,
+        );
+        assert_eq!(resized.size(), MIN_INNER_SIZE);
+        // The dragged edges are the trailing ones, so the origin is the
+        // anchor and must not have moved.
+        assert_eq!(resized.min, start.min);
+    }
+
+    #[test]
+    fn clamping_a_leading_edge_drag_leaves_the_anchored_edges_put() {
+        let start = window_rect();
+        let resized = resized_window_rect(
+            start,
+            egui::ResizeDirection::NorthWest,
+            egui::vec2(1000.0, 1000.0),
+            MIN_INNER_SIZE,
+        );
+        assert_eq!(resized.size(), MIN_INNER_SIZE);
+        // Dragging the left/top edges past the minimum must pin them at the
+        // minimum, not push the right/bottom edges along with them.
+        assert_eq!(resized.max, start.max);
+        assert_eq!(resized.min, start.max - MIN_INNER_SIZE);
+    }
+
+    #[test]
+    fn a_gesture_stays_active_until_it_is_ended() {
+        let mut gesture = WindowGesture::default();
+        assert_eq!(gesture.kind(), None);
+        gesture.begin(GestureKind::Move, egui::pos2(10.0, 10.0), window_rect());
+        assert_eq!(gesture.kind(), Some(GestureKind::Move));
+        gesture.end();
+        assert_eq!(gesture.kind(), None);
+    }
+
+    #[test]
+    fn beginning_a_gesture_supersedes_one_still_running() {
+        let mut gesture = WindowGesture::default();
+        gesture.begin(GestureKind::Move, egui::pos2(10.0, 10.0), window_rect());
+        let resize = GestureKind::Resize(egui::ResizeDirection::West);
+        gesture.begin(resize, egui::pos2(0.0, 0.0), window_rect());
+        assert_eq!(gesture.kind(), Some(resize));
+        gesture.end();
+        assert_eq!(gesture.kind(), None);
+    }
+
+    #[test]
+    fn ending_an_idle_gesture_is_a_no_op() {
+        // `end` runs on several exit paths (pointer released, focus lost,
+        // drag cancelled), so it has to be safely repeatable — a second
+        // release must not drop the exemption guard twice.
+        let mut gesture = WindowGesture::default();
+        gesture.end();
+        gesture.begin(GestureKind::Move, egui::pos2(10.0, 10.0), window_rect());
+        gesture.end();
+        gesture.end();
+        assert_eq!(gesture.kind(), None);
     }
 }
