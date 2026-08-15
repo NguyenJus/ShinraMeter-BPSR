@@ -26,7 +26,7 @@ jobs:
       - name: Assert the executable is self-contained
         run: |
           set -euo pipefail
-          exe=target/x86_64-pc-windows-gnu/release/shinra-bpsr.exe
+          exe=target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe
           if x86_64-w64-mingw32-objdump -p "$exe" | grep -qi 'DLL Name: WinDivert'; then
             echo "::error::WinDivert is linked at load time; the exe needs WinDivert.dll beside it"
             exit 1
@@ -41,8 +41,8 @@ jobs:
       - name: Stage the release asset
         run: |
           set -euo pipefail
-          cp target/x86_64-pc-windows-gnu/release/shinra-bpsr.exe \
-             "shinra-bpsr-${GITHUB_REF_NAME}-windows-x64.exe"
+          cp target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe \
+             "ShinraMeter-BPSR-${GITHUB_REF_NAME}-windows-x64.exe"
 
       # Tags carrying a pre-release suffix (v0.2.0-rc1) publish as pre-releases
       # so they stay off the repository's "latest release" link.
@@ -54,7 +54,7 @@ jobs:
           prerelease=""
           case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" \
-            "shinra-bpsr-${GITHUB_REF_NAME}-windows-x64.exe" \
+            "ShinraMeter-BPSR-${GITHUB_REF_NAME}-windows-x64.exe" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
             $prerelease

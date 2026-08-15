@@ -52,7 +52,7 @@ jobs:
       - name: Assert the executable is self-contained
         run: |
           set -euo pipefail
-          exe=target/x86_64-pc-windows-gnu/release/shinra-bpsr.exe
+          exe=target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe
           if x86_64-w64-mingw32-objdump -p "$exe" | grep -qi 'DLL Name: WinDivert'; then
             echo "::error::WinDivert is linked at load time; the exe needs WinDivert.dll beside it"
             exit 1
@@ -63,8 +63,8 @@ jobs:
           fi
       - uses: actions/upload-artifact@v4
         with:
-          name: shinra-bpsr-windows-x64
-          path: target/x86_64-pc-windows-gnu/release/shinra-bpsr.exe
+          name: ShinraMeter-BPSR-windows-x64
+          path: target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe
 
   # Host-target tests for the pure crates. The app crate is egui/eframe and
   # would drag in Linux GUI system deps, so it is excluded.
@@ -73,4 +73,4 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --exclude shinra-bpsr
+      - run: cargo test --workspace --exclude ShinraMeter-BPSR

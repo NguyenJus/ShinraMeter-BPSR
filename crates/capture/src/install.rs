@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 /// older build left behind — and so a driver still resident from a previous
 /// version is not silently overwritten underneath the kernel.
 pub fn runtime_dir(base: &Path, version: &str) -> PathBuf {
-    base.join("shinra-bpsr").join("windivert").join(version)
+    base.join("ShinraMeter-BPSR")
+        .join("windivert")
+        .join(version)
 }
 
 /// Writes `want` to `path` unless the file already holds exactly those bytes.
@@ -83,7 +85,7 @@ mod tests {
     #[test]
     fn runtime_dir_is_versioned_under_the_base() {
         let dir = runtime_dir(Path::new("/base"), "2.2.2");
-        assert!(dir.ends_with("shinra-bpsr/windivert/2.2.2"));
+        assert!(dir.ends_with("ShinraMeter-BPSR/windivert/2.2.2"));
     }
 
     #[test]

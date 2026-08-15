@@ -195,7 +195,7 @@ impl ColumnKind {
     }
 }
 
-/// User-configurable settings, persisted to `%APPDATA%\shinra-bpsr\settings.json`.
+/// User-configurable settings, persisted to `%APPDATA%\ShinraMeter-BPSR\settings.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub visible_columns: Vec<ColumnKind>,
@@ -296,18 +296,18 @@ impl Settings {
     }
 }
 
-/// `%APPDATA%\shinra-bpsr\settings.json`, or `None` if `APPDATA` isn't set
+/// `%APPDATA%\ShinraMeter-BPSR\settings.json`, or `None` if `APPDATA` isn't set
 /// (e.g. running outside Windows).
 fn settings_path() -> Option<PathBuf> {
     let appdata = std::env::var("APPDATA").ok()?;
     Some(
         PathBuf::from(appdata)
-            .join("shinra-bpsr")
+            .join("ShinraMeter-BPSR")
             .join("settings.json"),
     )
 }
 
-/// Loads settings from `%APPDATA%\shinra-bpsr\settings.json`. Falls back to
+/// Loads settings from `%APPDATA%\ShinraMeter-BPSR\settings.json`. Falls back to
 /// defaults if `APPDATA` isn't set, the file is missing, or it fails to
 /// parse — never panics.
 pub fn load() -> Settings {
@@ -320,7 +320,7 @@ pub fn load() -> Settings {
     }
 }
 
-/// Persists settings to `%APPDATA%\shinra-bpsr\settings.json`. Logs and
+/// Persists settings to `%APPDATA%\ShinraMeter-BPSR\settings.json`. Logs and
 /// gives up on any IO error — never panics, never blocks the UI thread on
 /// failure.
 pub fn save(settings: &Settings) {
@@ -434,7 +434,7 @@ mod tests {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "shinra-bpsr-test-{tag}-{}-{n}.json",
+            "ShinraMeter-BPSR-test-{tag}-{}-{n}.json",
             std::process::id()
         ))
     }
@@ -473,7 +473,7 @@ mod tests {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "shinra-bpsr-test-nested-{}-{n}",
+            "ShinraMeter-BPSR-test-nested-{}-{n}",
             std::process::id()
         ));
         let path = dir.join("settings.json");
