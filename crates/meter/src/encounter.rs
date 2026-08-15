@@ -224,6 +224,16 @@ impl Meter {
     }
 
     fn apply_damage(&mut self, d: &DamageEvent) -> Option<ResetReason> {
+        // `d.is_dead` flags that `target_uid` (the victim, not the
+        // attacker) died from this hit — count it against the target
+        // regardless of who or what dealt the blow (issue #49), and
+        // regardless of whether the killing packet is heal-typed (e.g. a
+        // negative/lethal heal). This must run before the `is_heal` early
+        // return below so heal-typed death packets still record deaths.
+        if d.is_dead && d.target_kind == EntityKind::Player {
+            self.record_death(d.target_uid, d.timestamp_ms);
+        }
+
         // Healing view is a non-goal: heal events never touch damage totals
         // or fight timing.
         if d.is_heal {
@@ -234,13 +244,6 @@ impl Meter {
             let enemy = self.enemies.entry(d.target_uid).or_default();
             enemy.took_damage = true;
             self.recompute_boss();
-        }
-
-        // `d.is_dead` flags that `target_uid` (the victim, not the
-        // attacker) died from this hit — count it against the target
-        // regardless of who or what dealt the blow (issue #49).
-        if d.is_dead && d.target_kind == EntityKind::Player {
-            self.record_death(d.target_uid, d.timestamp_ms);
         }
 
         self.last_event_ms = self.last_event_ms.max(d.timestamp_ms);
@@ -812,6 +815,27 @@ mod tests {
             m.apply(&death_hit(1, 2, 1000 + DEATH_DEBOUNCE_MS));
             let snap = m.snapshot(2000 + DEATH_DEBOUNCE_MS);
             assert_eq!(snap.rows.iter().find(|r| r.uid == 2).unwrap().deaths, 2);
+        }
+
+        #[test]
+        fn heal_typed_dead_player_event_still_records_death() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: 2,
+                target_kind: EntityKind::Player,
+                value: 100,
+                is_heal: true,
+                is_dead: true,
+                timestamp_ms: 1000,
+                ..Default::default()
+            }));
+            let snap = m.snapshot(2000);
+            let row = snap.rows.iter().find(|r| r.uid == 2).unwrap();
+            assert_eq!(row.deaths, 1);
+            assert_eq!(row.damage, 0);
+            assert_eq!(row.hits, 0);
         }
 
         #[test]

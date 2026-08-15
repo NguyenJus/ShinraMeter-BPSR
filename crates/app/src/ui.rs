@@ -245,18 +245,18 @@ impl eframe::App for OverlayApp {
         // the icon textures (issues #9, #41); every later frame reuses them.
         let icons = self.icons.get_or_insert_with(|| Icons::load(&ctx));
 
-        // Reconcile the collapse (issue #54) before anything is painted, so
-        // this frame's decision to skip the rows is made against an
-        // up-to-date state — including the "somebody else resized us, expand"
-        // case that issue #53's tray "Reset Window" reaches. The band height
-        // is the collapsed window's whole inner height, and `draw_header`
-        // derives the same number from the same call.
+        // Reconcile the collapse (issue #54) before anything is painted —
+        // including the "somebody else resized us, expand" case that issue
+        // #53's tray "Reset Window" reaches. The band height is the
+        // collapsed window's whole inner height, and `draw_header` derives
+        // the same number from the same call. The actual collapsed/expanded
+        // read used to gate row-painting happens after `draw_header` below,
+        // since that call can itself flip the state this frame.
         let band_height = header_band_height(
             encounter_subtitle(&self.snapshot.encounter).is_some(),
             ui.spacing().interact_size.y,
         );
         self.collapse.sync(&ctx, band_height);
-        let collapsed = self.collapse.is_collapsed();
 
         egui::CentralPanel::default()
             .frame(
@@ -281,6 +281,12 @@ impl eframe::App for OverlayApp {
                         collapse: &mut self.collapse,
                     },
                 );
+                // Read after `draw_header` returns, not before: the chevron
+                // click it handles can flip the collapse state via
+                // `chrome.collapse.toggle`, and gating row-painting below on
+                // a value read before that call would still paint rows for
+                // one extra frame after the click that just collapsed us.
+                let collapsed = self.collapse.is_collapsed();
                 // After both, so a gesture that started this frame is
                 // already anchored — and, being outside them, it is the one
                 // place a gesture can end no matter which zone began it.

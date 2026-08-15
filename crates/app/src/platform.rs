@@ -1233,9 +1233,15 @@ unsafe extern "system" fn tray_window_proc(
     use windows::Win32::UI::WindowsAndMessaging::{SIZE_MINIMIZED, WM_NCDESTROY, WM_SIZE};
 
     if msg == TRAY_CALLBACK_MESSAGE {
-        // The shell packs the mouse message into the *low* word of `lParam`
-        // and the icon's `uID` into the high word; the notification is for
-        // this process's only icon either way.
+        // `add_tray_icon`/`install_tray` only ever call `Shell_NotifyIconW`
+        // with `NIM_ADD` — `NIM_SETVERSION` is never sent, so the icon stays
+        // on the legacy (pre-`NOTIFYICON_VERSION_4`) callback convention,
+        // where `lParam` is just the raw mouse message (e.g.
+        // `WM_LBUTTONUP`), not the mouse-message/uID pair packed into the
+        // low/high words that `NOTIFYICON_VERSION_4` would use. The `&
+        // 0xFFFF` mask below is therefore a no-op — mouse messages are all
+        // well under `0x10000` — kept only because it's harmless and would
+        // become load-bearing if this ever opts into version 4.
         match tray_action_for((lparam.0 as u32) & 0xFFFF) {
             Some(TrayAction::ShowMenu) => show_tray_menu(hwnd),
             Some(TrayAction::Restore) => restore_from_tray(hwnd),
