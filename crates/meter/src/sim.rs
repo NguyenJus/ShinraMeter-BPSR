@@ -92,6 +92,13 @@ pub enum Scenario {
 
 const BOSS_UID: i64 = 9000;
 
+/// The real class ids `Class::from` (crates/meter/src/event.rs) maps to a
+/// non-`Unknown` class. Not a contiguous `1..=9` range — 6/7/8 are unmapped
+/// and fall through to `Class::Unknown`, which has no icon (crates/app/src/
+/// icons.rs) — so scenario code must cycle over this list rather than an
+/// arithmetic range to guarantee every simulated row gets a real class.
+const REAL_CLASS_IDS: [i32; 9] = [1, 2, 3, 4, 5, 9, 11, 12, 13];
+
 impl Scenario {
     pub fn name(&self) -> &'static str {
         match self {
@@ -118,7 +125,9 @@ fn player_info_event(uid: i64, ts: u64) -> SimEvent {
         event: ProtocolEvent::Player(PlayerInfo {
             uid,
             name: Some(format!("Player{uid}")),
-            class: Some(crate::event::Class::from(((uid % 9) + 1) as i32)),
+            class: Some(crate::event::Class::from(
+                REAL_CLASS_IDS[(uid as usize - 1) % REAL_CLASS_IDS.len()],
+            )),
             ability_score: Some(1000 + uid as u32 * 10),
             season_level: Some(1),
             season_strength: Some(1),
@@ -126,20 +135,20 @@ fn player_info_event(uid: i64, ts: u64) -> SimEvent {
     }
 }
 
-fn boss_hp_event(curr: u64, max: u64, ts: u64) -> SimEvent {
+fn boss_hp_event(boss_uid: i64, monster_id: u32, curr: u64, max: u64, ts: u64) -> SimEvent {
     SimEvent {
         timestamp_ms: ts,
         event: ProtocolEvent::EnemyHp(crate::event::EnemyHp {
-            uid: BOSS_UID,
+            uid: boss_uid,
             curr_hp: Some(curr),
             max_hp: Some(max),
-            monster_id: Some(1),
+            monster_id: Some(monster_id),
             timestamp_ms: ts,
         }),
     }
 }
 
-fn hit_event(attacker_uid: i64, ts: u64, rng: &mut Rng) -> SimEvent {
+fn hit_event(attacker_uid: i64, boss_uid: i64, ts: u64, rng: &mut Rng) -> SimEvent {
     let crit = rng.chance(20);
     let lucky = !crit && rng.chance(10);
     let base = rng.range(50, 500);
@@ -156,7 +165,7 @@ fn hit_event(attacker_uid: i64, ts: u64, rng: &mut Rng) -> SimEvent {
             hp_lessen: value,
             is_miss: false,
             is_heal: false,
-            target_uid: BOSS_UID,
+            target_uid: boss_uid,
             target_kind: EntityKind::Monster,
             timestamp_ms: ts,
         }),
@@ -172,7 +181,7 @@ fn party_fight(
     party_size: i64,
     duration_ms: u64,
     boss_uid: i64,
-    _monster_id: u32,
+    monster_id: u32,
 ) -> Vec<SimEvent> {
     let mut rng = Rng::new(seed);
     let mut events = Vec::new();
@@ -196,13 +205,12 @@ fn party_fight(
         // ~70% chance per player, for a plausible uneven damage spread.
         for uid in 1..=party_size {
             if tick == 0 || rng.chance(70) {
-                events.push(hit_event(uid, ts, &mut rng));
+                events.push(hit_event(uid, boss_uid, ts, &mut rng));
             }
         }
         let remaining_pct = 100.0 - (tick as f64 / ticks as f64 * 100.0);
         let curr = (boss_max_hp as f64 * remaining_pct / 100.0).max(0.0) as u64;
-        events.push(boss_hp_event(curr, boss_max_hp, ts));
-        let _ = boss_uid; // BOSS_UID constant is used directly in hit_event/boss_hp_event
+        events.push(boss_hp_event(boss_uid, monster_id, curr, boss_max_hp, ts));
     }
 
     events
@@ -236,9 +244,15 @@ fn disconnect_rejoin(seed: u64) -> Vec<SimEvent> {
     for tick in 0..(PRE_MS / 1000) {
         let ts = tick * 1000;
         for uid in 1..=PARTY {
-            events.push(hit_event(uid, ts, &mut rng));
+            events.push(hit_event(uid, BOSS_UID, ts, &mut rng));
         }
-        events.push(boss_hp_event(900_000 - tick * 10_000, 1_000_000, ts));
+        events.push(boss_hp_event(
+            BOSS_UID,
+            1,
+            900_000 - tick * 10_000,
+            1_000_000,
+            ts,
+        ));
     }
 
     // Disconnect.
@@ -261,9 +275,11 @@ fn disconnect_rejoin(seed: u64) -> Vec<SimEvent> {
     for tick in (POST_START_MS / 1000)..(POST_MS / 1000) {
         let ts = tick * 1000;
         for uid in 1..=PARTY {
-            events.push(hit_event(uid, ts, &mut rng));
+            events.push(hit_event(uid, BOSS_UID, ts, &mut rng));
         }
         events.push(boss_hp_event(
+            BOSS_UID,
+            1,
             1_000_000 - (tick - POST_START_MS / 1000) * 10_000,
             1_000_000,
             ts,
@@ -337,6 +353,29 @@ mod tests {
             "total share_pct {total_share} not within 1.0 of 100"
         );
         assert!(snapshot.rows.iter().all(|r| r.hits > 0));
+        assert!(
+            snapshot
+                .rows
+                .iter()
+                .all(|r| r.class.is_some_and(|c| c != crate::event::Class::Unknown)),
+            "every sim-generated row must resolve to a real class, not Unknown"
+        );
+    }
+
+    #[test]
+    fn scenarios_report_distinct_boss_identity() {
+        // NormalParty and Raid20 both fight `BOSS_UID`, but pass distinct
+        // `monster_id`s (1101/1102) to `party_fight` — regression coverage
+        // for the doc comment's claim that `monster_id` distinguishes boss
+        // identity between presets (issue #40).
+        let (_, normal) = run(Scenario::NormalParty, 1);
+        let (_, raid) = run(Scenario::Raid20, 1);
+        assert_eq!(normal.encounter.boss_monster_id, Some(1101));
+        assert_eq!(raid.encounter.boss_monster_id, Some(1102));
+        assert_ne!(
+            normal.encounter.boss_monster_id,
+            raid.encounter.boss_monster_id
+        );
     }
 
     #[test]
