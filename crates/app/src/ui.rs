@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use bpsr_meter::{EncounterInfo, PlayerRow, Snapshot};
+use bpsr_meter::{Class, EncounterInfo, PlayerRow, Role, Snapshot};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 
@@ -558,7 +558,7 @@ fn draw_row(
     // row's full width — the icon slot is reserved on top of it, not cut
     // out of it. Split into a subtle wash plus a crisp bottom underline
     // (issue #43) rather than one flat fill, matching the reference meter.
-    let paints = share_bar_paints(rect, row.share_pct);
+    let paints = share_bar_paints(rect, row.share_pct, row.class);
     ui.painter()
         .rect_filled(paints.wash_rect, 2.0, paints.wash_color);
     ui.painter()
@@ -609,11 +609,27 @@ fn draw_row(
     }
 }
 
-/// Base RGB of the damage-share bar (issue #43). Split out from the alpha
-/// constants below so a follow-up issue (#44, role-based bar color) can vary
-/// only the hue — the wash/underline alpha split and underline thickness
-/// stay fixed regardless of which color a role ends up using.
-const SHARE_BAR_RGB: (u8, u8, u8) = (60, 120, 220);
+/// Per-role base RGB of the damage-share bar (issue #44: healer -> green,
+/// tank -> blue, damage -> red). Split out from the alpha constants below
+/// (issue #43) so the wash/underline alpha split and underline thickness
+/// stay fixed regardless of which color a role uses — only the hue varies.
+///
+/// Chosen for legibility at the wash's low alpha (`SHARE_BAR_WASH_ALPHA` =
+/// 60 of 255) painted over the overlay's dark translucent panel fill
+/// (`rgba(18, 18, 22, 200)`, see `apply_theme`): each hue keeps enough
+/// saturation and mid-range brightness that the ~24% overall wash opacity
+/// still reads as a distinct color rather than fading to gray, while the
+/// underline's much higher alpha (220) makes the same RGB read as a
+/// near-solid, clearly role-colored strip.
+const SHARE_BAR_RGB_HEALER: (u8, u8, u8) = (70, 200, 120);
+const SHARE_BAR_RGB_TANK: (u8, u8, u8) = (60, 120, 220);
+const SHARE_BAR_RGB_DAMAGE: (u8, u8, u8) = (220, 80, 70);
+/// Fallback for `Class::Unknown` (or a row with no `Class` at all) — the
+/// exact RGB the bar used unconditionally before issue #44, kept unchanged
+/// so an unclassified player stays visually neutral rather than being
+/// mis-attributed to a role it was never confirmed to have (issue #44's
+/// second open question).
+const SHARE_BAR_RGB_UNKNOWN: (u8, u8, u8) = (60, 120, 220);
 
 /// Alpha of the translucent wash covering the full width of `bar_rect`
 /// (issue #43). Deliberately lower than the old single flat fill's alpha
@@ -645,13 +661,28 @@ struct ShareBarPaints {
     underline_color: egui::Color32,
 }
 
+/// Maps a row's `Class` to its share-bar hue (issue #44). `None` — either no
+/// `Class` at all or `Class::Unknown` (which has no `Role`,
+/// `Class::role`) — falls back to `SHARE_BAR_RGB_UNKNOWN`, the pre-#44 blue.
+fn share_bar_rgb(class: Option<Class>) -> (u8, u8, u8) {
+    match class.and_then(|c| c.role()) {
+        Some(Role::Healer) => SHARE_BAR_RGB_HEALER,
+        Some(Role::Tank) => SHARE_BAR_RGB_TANK,
+        Some(Role::Damage) => SHARE_BAR_RGB_DAMAGE,
+        None => SHARE_BAR_RGB_UNKNOWN,
+    }
+}
+
 /// Computes the two paints that make up a row's damage-share bar (issue
 /// #43): a translucent wash across the full share-scaled width, and a thin,
 /// more-opaque underline strip along its bottom edge so the share boundary
-/// reads crisply even though the wash itself is subtle. Pure geometry/color
-/// math with no `egui::Ui` dependency, so it's unit-testable on its own —
-/// `draw_row` just paints whatever it returns.
-fn share_bar_paints(rect: egui::Rect, share_pct: f32) -> ShareBarPaints {
+/// reads crisply even though the wash itself is subtle. Both paints share
+/// the same role-derived hue (`share_bar_rgb`, issue #44) and differ only in
+/// alpha — issue #44's open question on whether the role color should apply
+/// to both the wash and the underline is answered yes, one hue, two alphas.
+/// Pure geometry/color math with no `egui::Ui` dependency, so it's
+/// unit-testable on its own — `draw_row` just paints whatever it returns.
+fn share_bar_paints(rect: egui::Rect, share_pct: f32, class: Option<Class>) -> ShareBarPaints {
     let bar_frac = (share_pct / 100.0).clamp(0.0, 1.0);
     let bar_width = rect.width() * bar_frac;
 
@@ -663,7 +694,7 @@ fn share_bar_paints(rect: egui::Rect, share_pct: f32) -> ShareBarPaints {
         egui::vec2(bar_width, thickness),
     );
 
-    let (r, g, b) = SHARE_BAR_RGB;
+    let (r, g, b) = share_bar_rgb(class);
     let wash_color = egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_WASH_ALPHA);
     let underline_color = egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_UNDERLINE_ALPHA);
 
@@ -1372,7 +1403,7 @@ mod tests {
     #[test]
     fn share_bar_full_share_spans_the_full_width() {
         let rect = share_bar_rect();
-        let paints = share_bar_paints(rect, 100.0);
+        let paints = share_bar_paints(rect, 100.0, None);
         assert_eq!(paints.wash_rect.width(), rect.width());
         assert_eq!(paints.underline_rect.width(), rect.width());
     }
@@ -1380,7 +1411,7 @@ mod tests {
     #[test]
     fn share_bar_zero_share_has_no_width() {
         let rect = share_bar_rect();
-        let paints = share_bar_paints(rect, 0.0);
+        let paints = share_bar_paints(rect, 0.0, None);
         assert_eq!(paints.wash_rect.width(), 0.0);
         assert_eq!(paints.underline_rect.width(), 0.0);
     }
@@ -1388,7 +1419,7 @@ mod tests {
     #[test]
     fn share_bar_partial_share_scales_both_rects_identically() {
         let rect = share_bar_rect();
-        let paints = share_bar_paints(rect, 40.0);
+        let paints = share_bar_paints(rect, 40.0, None);
         assert_eq!(paints.wash_rect.width(), rect.width() * 0.4);
         assert_eq!(paints.underline_rect.width(), rect.width() * 0.4);
     }
@@ -1399,7 +1430,7 @@ mod tests {
     #[test]
     fn share_bar_underline_sits_at_the_bottom_edge() {
         let rect = share_bar_rect();
-        let paints = share_bar_paints(rect, 50.0);
+        let paints = share_bar_paints(rect, 50.0, None);
         assert_eq!(paints.underline_rect.bottom(), rect.bottom());
         assert_eq!(
             paints.underline_rect.height(),
@@ -1413,7 +1444,7 @@ mod tests {
     #[test]
     fn share_bar_underline_thickness_clamps_at_a_tiny_row_height() {
         let tiny_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 1.0));
-        let paints = share_bar_paints(tiny_rect, 50.0);
+        let paints = share_bar_paints(tiny_rect, 50.0, None);
         assert!(paints.underline_rect.height() <= tiny_rect.height());
         assert_eq!(paints.underline_rect.top(), tiny_rect.top());
     }
@@ -1424,8 +1455,80 @@ mod tests {
     #[test]
     fn share_bar_wash_alpha_is_lower_than_underline_alpha() {
         let rect = share_bar_rect();
-        let paints = share_bar_paints(rect, 50.0);
+        let paints = share_bar_paints(rect, 50.0, None);
         assert!(paints.wash_color.a() < paints.underline_color.a());
+    }
+
+    // -- share bar role coloring (issue #44) --------------------------------
+    //
+    // Confirms the answer to issue #44's second open question directly:
+    // the wash and underline share the exact same role-derived RGB and
+    // differ only in alpha (`SHARE_BAR_WASH_ALPHA` vs
+    // `SHARE_BAR_UNDERLINE_ALPHA`, unchanged from issue #43) — one hue, two
+    // alphas, not two independently-colored paints.
+    /// Compares against colors built the same way `share_bar_paints` builds
+    /// them (`Color32::from_rgba_unmultiplied` on the same `(r, g, b)`, just
+    /// a different alpha per paint) rather than trying to recover `(r, g,
+    /// b)` back out of the painted `Color32`: `Color32` stores premultiplied
+    /// components internally, so unmultiplying is lossy at a low alpha like
+    /// the wash's (60 of 255) and would make this assertion flaky by up to a
+    /// couple of units. Constructing both sides identically instead makes
+    /// the comparison exact, and — since both expected colors are built
+    /// from the one `expected_rgb` — directly proves "same RGB, alpha
+    /// differs only by the fixed wash/underline split".
+    fn assert_bar_hue(class: Option<Class>, expected_rgb: (u8, u8, u8)) {
+        let paints = share_bar_paints(share_bar_rect(), 50.0, class);
+        let (r, g, b) = expected_rgb;
+        let expected_wash = egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_WASH_ALPHA);
+        let expected_underline =
+            egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_UNDERLINE_ALPHA);
+        assert_eq!(paints.wash_color, expected_wash, "wash color for {class:?}");
+        assert_eq!(
+            paints.underline_color, expected_underline,
+            "underline color for {class:?}"
+        );
+    }
+
+    #[test]
+    fn share_bar_uses_healer_hue_for_verdant_oracle() {
+        assert_bar_hue(Some(Class::VerdantOracle), SHARE_BAR_RGB_HEALER);
+    }
+
+    #[test]
+    fn share_bar_uses_healer_hue_for_beat_performer() {
+        assert_bar_hue(Some(Class::BeatPerformer), SHARE_BAR_RGB_HEALER);
+    }
+
+    #[test]
+    fn share_bar_uses_tank_hue_for_heavy_guardian() {
+        assert_bar_hue(Some(Class::HeavyGuardian), SHARE_BAR_RGB_TANK);
+    }
+
+    #[test]
+    fn share_bar_uses_tank_hue_for_shield_knight() {
+        assert_bar_hue(Some(Class::ShieldKnight), SHARE_BAR_RGB_TANK);
+    }
+
+    #[test]
+    fn share_bar_uses_damage_hue_for_stormblade() {
+        assert_bar_hue(Some(Class::Stormblade), SHARE_BAR_RGB_DAMAGE);
+    }
+
+    #[test]
+    fn share_bar_uses_fallback_hue_for_unknown_class() {
+        assert_bar_hue(Some(Class::Unknown), SHARE_BAR_RGB_UNKNOWN);
+    }
+
+    #[test]
+    fn share_bar_uses_fallback_hue_when_no_class_is_known() {
+        assert_bar_hue(None, SHARE_BAR_RGB_UNKNOWN);
+    }
+
+    /// Pins the fallback to the exact pre-#44 blue so an unclassified player
+    /// keeps looking the same as before this issue, not merely "some blue".
+    #[test]
+    fn share_bar_fallback_hue_matches_the_pre_issue_44_blue() {
+        assert_eq!(SHARE_BAR_RGB_UNKNOWN, (60, 120, 220));
     }
 
     // -- class -> asset mapping totality (issue #9) ------------------------
