@@ -1051,6 +1051,41 @@ pub fn column_anchors(
     anchors
 }
 
+/// The horizontal clip rect for one stat column's painted text: bounded on
+/// the right by that column's anchor (where its right-aligned text ends)
+/// and on the left by exactly one nominal `width` — the budget in-range
+/// text for the column is designed, and tested
+/// (`widest_formatted_text_fits_its_column_width_budget`), to fit.
+///
+/// This is what keeps an out-of-range value (e.g. a packet-decoded
+/// `ability_score`/`season_strength` past the in-game ceiling `StatColumn`'s
+/// `width` budget assumes — see `ColumnKind::spec`) from painting
+/// arbitrarily far left across the row: `draw_row` clips every column's text
+/// draw to this rect rather than trusting the formatted string to fit
+/// `width`, so an overlong string loses its leading glyphs after one
+/// column's worth instead of running over its neighbors.
+///
+/// The slot is the *nominal* `width`, deliberately not the gap between this
+/// column's anchor and the previous one. The two are identical whenever the
+/// row is wide enough to hold every column at full width; in a narrower row
+/// `column_anchors` scales those gaps down (see there), and clipping to a
+/// scaled gap would cut ordinary in-range values short — right-aligned text
+/// is clipped from the *left*, so a clipped `1000.0K` reads as a smaller
+/// number rather than as damage. In that compressed case the slots overlap
+/// and an overflowing value can bleed into its neighbor, which is exactly
+/// what a too-narrow window did before any clipping existed; visible
+/// overlap beats silently hiding digits. So the clip is a no-op only for
+/// values that fit their budget in a row wide enough not to be compressed.
+///
+/// `Painter::with_clip_rect` intersects with the parent's clip rect, so a
+/// slot reaching past the row's own left edge is still bounded by the ui.
+fn column_clip_rect(rect: egui::Rect, anchor: f32, width: f32) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(anchor - width, rect.top()),
+        egui::pos2(anchor, rect.bottom()),
+    )
+}
+
 fn draw_row(
     ui: &mut egui::Ui,
     row: &PlayerRow,
@@ -1107,13 +1142,20 @@ fn draw_row(
     // `StatColumn` carries its own formatter.
     for (anchor_x, column) in anchors.iter().zip(columns) {
         let text = (column.text)(row);
-        ui.painter().text(
-            egui::pos2(*anchor_x, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            text,
-            egui::FontId::monospace(13.0),
-            column.color,
-        );
+        // Clipped to this column's own slot (`column_clip_rect`) so a value
+        // wider than the column's width budget (e.g. an out-of-range
+        // `ability_score`/`season_strength` straight off the packet, with
+        // no clamp anywhere upstream) is cut off after one column's worth
+        // rather than painted across the columns to its left.
+        ui.painter()
+            .with_clip_rect(column_clip_rect(rect, *anchor_x, column.width))
+            .text(
+                egui::pos2(*anchor_x, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                text,
+                egui::FontId::monospace(13.0),
+                column.color,
+            );
     }
 }
 
@@ -2030,6 +2072,78 @@ mod tests {
         let a = column_anchors(0.0, 300.0, &TEST_COLUMNS, 4.0);
         let b = column_anchors(50.0, 300.0, &TEST_COLUMNS, 4.0);
         assert_eq!(a, b);
+    }
+
+    // -- column_clip_rect (stat text can overflow its fixed column width) --
+
+    /// A narrow row (`MIN_INNER_SIZE` is 220x90 and up to
+    /// `ColumnKind::ALL.len()` columns can be enabled, so this is reachable
+    /// in normal use) makes `column_anchors` scale the gap between adjacent
+    /// anchors below the columns' nominal widths. Clipping to that scaled
+    /// gap would hide the *leading* characters of perfectly in-range text —
+    /// right-aligned text is clipped from the left, so a truncated number
+    /// reads as a smaller one. Every column's slot must therefore admit its
+    /// full nominal `width` no matter how compressed the row is, so that a
+    /// value already known to fit its budget
+    /// (`widest_formatted_text_fits_its_column_width_budget`) is never cut.
+    #[test]
+    fn column_clip_rect_admits_the_full_column_budget_even_in_a_compressed_row() {
+        let total: f32 = TEST_COLUMNS.iter().map(|c| c.width).sum();
+        let rect = row_rect();
+        // Roomy, exactly-fitting, and two compressed rows (the last one
+        // narrower than a single column's width).
+        for right in [rect.right(), rect.left() + total + 4.0, total * 0.5, 40.0] {
+            let anchors = column_anchors(rect.left(), right, &TEST_COLUMNS, 4.0);
+            for (i, column) in TEST_COLUMNS.iter().enumerate() {
+                let clip = column_clip_rect(rect, anchors[i], column.width);
+                assert!(
+                    clip.width() >= column.width,
+                    "row right {right}, column {i}: clip width {} is narrower than \
+                     its own {}pt budget, so in-range text loses leading glyphs",
+                    clip.width(),
+                    column.width
+                );
+                // The anchor is where the text is painted from; a slot that
+                // did not contain it would clip everything.
+                assert_eq!(clip.right(), anchors[i]);
+            }
+        }
+    }
+
+    /// The clip must still *bound* an overflowing value — the whole point of
+    /// clipping at all. An out-of-range `ability_score`/`season_strength`
+    /// gets cut off after one column's worth of glyphs instead of painting
+    /// arbitrarily far left across the row, and where the row is wide enough
+    /// for full-width columns that bound is exactly the previous column's
+    /// anchor, so no neighbor is overpainted.
+    #[test]
+    fn column_clip_rect_bounds_overflow_to_one_column_width() {
+        let rect = row_rect();
+        let anchors = column_anchors(rect.left(), rect.right(), &TEST_COLUMNS, 4.0);
+        for (i, column) in TEST_COLUMNS.iter().enumerate() {
+            let clip = column_clip_rect(rect, anchors[i], column.width);
+            assert_eq!(clip.width(), column.width);
+            if i > 0 {
+                assert_eq!(clip.left(), anchors[i - 1]);
+            }
+        }
+    }
+
+    /// The leftmost column has no earlier anchor to bound it, but is bounded
+    /// all the same: its own width budget keeps an overflowing value off the
+    /// player name to its left, well inside the row rect rather than running
+    /// to (or past) the row's left edge.
+    #[test]
+    fn column_clip_rect_bounds_the_leftmost_column_short_of_the_row_edge() {
+        let rect = row_rect();
+        let anchors = column_anchors(rect.left(), rect.right(), &TEST_COLUMNS, 4.0);
+        let clip = column_clip_rect(rect, anchors[0], TEST_COLUMNS[0].width);
+        assert!(
+            clip.left() > rect.left(),
+            "leftmost clip {} should stop short of the row's left edge {}",
+            clip.left(),
+            rect.left()
+        );
     }
 
     /// The geometry tests above only check anchor placement; none of them

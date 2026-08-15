@@ -90,7 +90,12 @@ impl ColumnKind {
             // own `u32::MAX` ceiling — measured at 39.125pt in
             // `widest_formatted_text_fits_its_column_width_budget` and
             // rounded up to the next multiple of 8, the same small-margin
-            // convention `Damage`/`Hits` below use.
+            // convention `Damage`/`Hits` below use. The field is decoded
+            // straight off the packet with no clamp, so a value past this
+            // assumed ceiling is still possible; `draw_row` clips each
+            // column's paint to its own slot (`column_clip_rect`) so that
+            // case degrades to a cut-off string instead of overlapping the
+            // next column.
             ColumnKind::AbilityScore => StatColumn {
                 width: 40.0,
                 text: |row| match row.ability_score {
@@ -103,7 +108,8 @@ impl ColumnKind {
             // own independent width: season strength's real in-game
             // ceiling is a 4-digit stat, max 9_999, per the repo owner,
             // measured at 31.3125pt and rounded up to the next multiple of
-            // 8.
+            // 8. Same unclamped-packet caveat as `AbilityScore` above, and
+            // the same `draw_row` clip covers it.
             ColumnKind::SeasonStrength => StatColumn {
                 width: 32.0,
                 text: |row| match row.season_strength {
@@ -141,10 +147,11 @@ impl ColumnKind {
             },
             // `fmt_short` bounds this to ~7 chars regardless of how many
             // hits land, so it shares `Damage`/`Dps`'s width instead of
-            // growing without limit like a raw `to_string()` would (it
-            // could otherwise overflow this column's fixed-width slot into
-            // its neighbor's, since `draw_row`'s painter text is
-            // unclipped).
+            // growing without limit like a raw `to_string()` would. (A
+            // wider-than-budget value would still be safe — `draw_row`
+            // clips each column's paint to its own slot — but staying
+            // within budget is what keeps the text from being cut off in
+            // the first place.)
             ColumnKind::Hits => StatColumn {
                 width: 56.0,
                 text: |row| fmt_short(row.hits as i64),
