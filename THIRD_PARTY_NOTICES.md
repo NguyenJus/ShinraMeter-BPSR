@@ -51,11 +51,15 @@ WinDivert's LGPL-3.0 option is compatible.
 - Files: `crates/app/assets/shinra.ico`
 - Upstream: <https://github.com/neowutran/ShinraMeter> (`resources/img/shinra.ico`)
 - License: MIT
-- Embedded verbatim and unmodified as resource id 2 by
-  `crates/app/shinra-bpsr.rc`, and used as the executable's Explorer/taskbar
-  icon and the notification-area icon. It is upstream's 神羅 mark, carried over
-  deliberately: this project is a Blue Protocol port of ShinraMeter and shares
-  its name.
+- Embedded as resource id 2 by `crates/app/shinra-bpsr.rc`, and used as the
+  executable's Explorer/taskbar icon and the notification-area icon. It is
+  upstream's 神羅 mark, carried over deliberately: this project is a Blue
+  Protocol port of ShinraMeter and shares its name. The upstream .ico ships
+  16x16, 48x48, and 256x256 frames; a 32x32 frame was added here, downscaled
+  from the original 256x256 image with Lanczos resampling, so Windows surfaces
+  that render at 32px (Explorer's "Large icons" view, Alt+Tab, some tray DPI
+  scalings) don't have to stretch a neighbouring frame. No other pixel data
+  was changed.
 
 ## Monster and scene name tables
 
