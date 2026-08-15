@@ -14,7 +14,7 @@
 //! actual file IO belong entirely to the sink implementation, which lives
 //! outside this crate — see `crates/app/src/inspect.rs`. Keeping that split
 //! is what lets `bpsr-protocol` stay host-testable and free of GUI/app
-//! dependencies (`cargo test --workspace --exclude shinra-bpsr`).
+//! dependencies (`cargo test --workspace --exclude ShinraMeter-BPSR`).
 
 /// Receives what the decoder would otherwise drop or pass over in silence.
 /// Every method is a synchronous, fire-and-forget observation call made from

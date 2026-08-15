@@ -17,8 +17,8 @@
 //! - the first time an attr id with no known constant is seen for a given
 //!   entity uid it is logged the same way, keyed by uid (slice A item 3).
 //!
-//! The dump path defaults to `%APPDATA%\shinra-bpsr\inspect\dump-<pid>.jsonl`
-//! (or `shinra-bpsr-inspect-dump-<pid>.jsonl` in the working directory if
+//! The dump path defaults to `%APPDATA%\ShinraMeter-BPSR\inspect\dump-<pid>.jsonl`
+//! (or `ShinraMeter-BPSR-inspect-dump-<pid>.jsonl` in the working directory if
 //! `APPDATA` is unset — e.g. this Linux dev host), overridable with
 //! `SHINRA_INSPECT_DUMP=<path>`.
 //!
@@ -67,13 +67,13 @@ fn dump_path_from(inspect_dump: Option<&str>, appdata: Option<&str>) -> PathBuf 
     }
     match appdata {
         Some(appdata) if !appdata.is_empty() => PathBuf::from(appdata)
-            .join("shinra-bpsr")
+            .join("ShinraMeter-BPSR")
             .join("inspect")
             .join(format!("dump-{}.jsonl", std::process::id())),
         _ => {
             log::warn!("APPDATA is not set; falling back to a working-directory dump file");
             PathBuf::from(format!(
-                "shinra-bpsr-inspect-dump-{}.jsonl",
+                "ShinraMeter-BPSR-inspect-dump-{}.jsonl",
                 std::process::id()
             ))
         }
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn dump_path_falls_back_to_appdata_when_unset() {
         let path = dump_path_from(None, Some("/appdata"));
-        assert!(path.starts_with("/appdata/shinra-bpsr/inspect"));
+        assert!(path.starts_with("/appdata/ShinraMeter-BPSR/inspect"));
         assert!(path.to_string_lossy().ends_with(".jsonl"));
     }
 
@@ -295,7 +295,7 @@ mod tests {
         let path = dump_path_from(None, None);
         assert!(
             path.to_string_lossy()
-                .starts_with("shinra-bpsr-inspect-dump-")
+                .starts_with("ShinraMeter-BPSR-inspect-dump-")
         );
     }
 

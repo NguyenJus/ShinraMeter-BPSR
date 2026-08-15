@@ -4,7 +4,7 @@ Issue #25 built the observation tooling (opt-in diagnostic mode, unrecognized
 service/method id logging, unknown attr id logging, and a raw frame dump for
 offline replay). That tooling only makes observation *possible* — turning an
 observation into a confirmed constant still requires a deliberate procedure
-against live game traffic on a Windows box running `shinra-bpsr`. This is
+against live game traffic on a Windows box running `ShinraMeter-BPSR`. This is
 that procedure. It has not been run yet (no Windows box was available while
 building slice A); this doc is what to follow the first time someone does.
 
@@ -15,9 +15,9 @@ the minimal bytes needed as a synthetic fixture under
 
 ## Setup
 
-1. Set `SHINRA_INSPECT=1` before launching `shinra-bpsr.exe` (optionally also
+1. Set `SHINRA_INSPECT=1` before launching `ShinraMeter-BPSR.exe` (optionally also
    `SHINRA_INSPECT_DUMP=<path>` to control where the dump lands; otherwise it
-   defaults to `%APPDATA%\shinra-bpsr\inspect\dump-<pid>.jsonl`).
+   defaults to `%APPDATA%\ShinraMeter-BPSR\inspect\dump-<pid>.jsonl`).
 2. Play normally. Every unrecognized service uuid and every unknown attr id
    — on enemy entities as well as player ones — gets logged
    (`packet-inspect: new ...`) the first time it's seen, with a running

@@ -1305,7 +1305,7 @@ fn tray_icon_data(
     }
 }
 
-/// Resource id the application icon is embedded under (`shinra-bpsr.rc` /
+/// Resource id the application icon is embedded under (`ShinraMeter-BPSR.rc` /
 /// `build.rs`, from `crates/app/assets/shinra.ico`). The fallback below stays
 /// because a host build has no resource section at all.
 #[cfg(windows)]
@@ -1371,7 +1371,7 @@ fn add_tray_icon(hwnd: windows::Win32::Foundation::HWND) -> bool {
     for (slot, unit) in data
         .szTip
         .iter_mut()
-        .zip("shinra-bpsr".encode_utf16().chain(std::iter::once(0)))
+        .zip("ShinraMeter-BPSR".encode_utf16().chain(std::iter::once(0)))
     {
         *slot = unit;
     }
