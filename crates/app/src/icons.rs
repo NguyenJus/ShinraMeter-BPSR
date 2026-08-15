@@ -185,17 +185,15 @@ pub enum ToolbarIcon {
     Reset,
     /// Close button, replacing the `"×"` glyph button.
     Close,
-    /// Decorative clock painted immediately left of the duration text.
-    Clock,
     /// Death-count glyph, consumed by the per-player death column (issue
     /// #49). Sourced separately from the other toolbar icons below — see
     /// `TOOLBAR_ICON_BYTES`'s doc comment.
     Skull,
 }
 
-/// Every `ToolbarIcon` an embedded PNG exists for. `Settings`, `Reset`,
-/// `Close`, and `Clock` are sourced from neowutran/ShinraMeter's
-/// `resources/img/` (MIT); `Skull` is sourced separately, also from
+/// Every `ToolbarIcon` an embedded PNG exists for. `Settings`, `Reset`, and
+/// `Close` are sourced from neowutran/ShinraMeter's `resources/img/` (MIT);
+/// `Skull` is sourced separately, also from
 /// neowutran/ShinraMeter (MIT), verbatim and unrenamed — see
 /// `THIRD_PARTY_NOTICES.md`. No pin/lock and no minimize icon exists in
 /// that repo (issue #41's scope note): minimize is instead drawn
@@ -213,10 +211,6 @@ const TOOLBAR_ICON_BYTES: &[(ToolbarIcon, &[u8])] = &[
     (
         ToolbarIcon::Close,
         include_bytes!("../assets/icons/close.png"),
-    ),
-    (
-        ToolbarIcon::Clock,
-        include_bytes!("../assets/icons/clock.png"),
     ),
     (
         ToolbarIcon::Skull,
@@ -247,6 +241,86 @@ impl ToolbarIcons {
     /// constants — but callers fall back to the original glyph rather than
     /// paint nothing; see `ui.rs`'s `icon_button`).
     pub fn get(&self, icon: ToolbarIcon) -> Option<&egui::TextureHandle> {
+        self.0.get(icon)
+    }
+}
+
+/// One vendored SVG glyph (issue #59), rasterized to PNG by
+/// `scripts/rasterize-icons.sh`. Separate from `ToolbarIcon` because these
+/// are painted through `Painter::image` at caller-derived sizes and tints
+/// (see `ui.rs`'s `paint_stat_pill`), not through `toolbar_icon_image`'s
+/// fixed size and fixed tint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlyphIcon {
+    Emblem,
+    Timer,
+    Speed,
+    Heart,
+    Skull,
+    MouseOff,
+    CloudOff,
+    Check,
+}
+
+/// Every `GlyphIcon` an embedded PNG exists for. Provenance is split three
+/// ways — see `THIRD_PARTY_NOTICES.md`'s "ShinraMeter encounter emblem",
+/// "Google Material Symbols", and "Material Design Icons (Pictogrammers)"
+/// sections: `Emblem` is ShinraMeter's own artwork; `Timer`, `Speed`,
+/// `Heart`, `CloudOff`, and `Check` are Google Material Symbols; `Skull` and
+/// `MouseOff` are Pictogrammers' Material Design Icons.
+const GLYPH_ICON_BYTES: &[(GlyphIcon, &[u8])] = &[
+    (
+        GlyphIcon::Emblem,
+        include_bytes!("../assets/icons/glyphs/emblem.png"),
+    ),
+    (
+        GlyphIcon::Timer,
+        include_bytes!("../assets/icons/glyphs/timer.png"),
+    ),
+    (
+        GlyphIcon::Speed,
+        include_bytes!("../assets/icons/glyphs/speed.png"),
+    ),
+    (
+        GlyphIcon::Heart,
+        include_bytes!("../assets/icons/glyphs/heart.png"),
+    ),
+    (
+        GlyphIcon::Skull,
+        include_bytes!("../assets/icons/glyphs/skull.png"),
+    ),
+    (
+        GlyphIcon::MouseOff,
+        include_bytes!("../assets/icons/glyphs/mouse_off.png"),
+    ),
+    (
+        GlyphIcon::CloudOff,
+        include_bytes!("../assets/icons/glyphs/cloud_off.png"),
+    ),
+    (
+        GlyphIcon::Check,
+        include_bytes!("../assets/icons/glyphs/check.png"),
+    ),
+];
+
+/// Textures for the vendored glyph icons, uploaded once via
+/// `GlyphIcons::load`. Same lazy-load, load-once-per-process pattern as
+/// `ClassIcons`/`ToolbarIcons` — see `ClassIcons`'s doc comment.
+pub struct GlyphIcons(IconSet<GlyphIcon>);
+
+impl GlyphIcons {
+    pub fn load(ctx: &egui::Context) -> Self {
+        Self(IconSet::load(
+            ctx,
+            GLYPH_ICON_BYTES,
+            |icon| format!("glyph-icon-{icon:?}"),
+            |icon| format!("glyph icon {icon:?}"),
+        ))
+    }
+
+    /// The texture for `icon`, or `None` if its PNG failed to decode (never
+    /// expected in practice — `GLYPH_ICON_BYTES` are compile-time constants).
+    pub fn get(&self, icon: GlyphIcon) -> Option<&egui::TextureHandle> {
         self.0.get(icon)
     }
 }
@@ -310,7 +384,6 @@ mod tests {
         ToolbarIcon::Settings,
         ToolbarIcon::Reset,
         ToolbarIcon::Close,
-        ToolbarIcon::Clock,
         ToolbarIcon::Skull,
     ];
 
@@ -346,5 +419,70 @@ mod tests {
         for icon in ALL_TOOLBAR_ICONS {
             assert!(icons.get(*icon).is_some(), "{icon:?} has no loaded texture");
         }
+    }
+
+    // -- glyph icons (issue #59) --------------------------------------------
+
+    const ALL_GLYPH_ICONS: &[GlyphIcon] = &[
+        GlyphIcon::Emblem,
+        GlyphIcon::Timer,
+        GlyphIcon::Speed,
+        GlyphIcon::Heart,
+        GlyphIcon::Skull,
+        GlyphIcon::MouseOff,
+        GlyphIcon::CloudOff,
+        GlyphIcon::Check,
+    ];
+
+    #[test]
+    fn every_glyph_icon_id_has_an_embedded_entry() {
+        assert_eq!(
+            GLYPH_ICON_BYTES.len(),
+            ALL_GLYPH_ICONS.len(),
+            "GLYPH_ICON_BYTES must have exactly one entry per GlyphIcon variant"
+        );
+        for icon in ALL_GLYPH_ICONS {
+            assert!(
+                GLYPH_ICON_BYTES.iter().any(|(i, _)| i == icon),
+                "{icon:?} has no embedded icon"
+            );
+        }
+    }
+
+    #[test]
+    fn every_embedded_glyph_icon_decodes() {
+        for (icon, bytes) in GLYPH_ICON_BYTES {
+            assert!(
+                decode(&format!("glyph icon {icon:?}"), bytes).is_some(),
+                "{icon:?}'s icon failed to decode"
+            );
+        }
+    }
+
+    #[test]
+    fn glyph_icons_get_is_defined_for_every_glyph_icon() {
+        let ctx = egui::Context::default();
+        let icons = GlyphIcons::load(&ctx);
+        for icon in ALL_GLYPH_ICONS {
+            assert!(icons.get(*icon).is_some(), "{icon:?} has no loaded texture");
+        }
+    }
+
+    #[test]
+    fn the_emblem_is_rastered_larger_than_the_small_glyphs() {
+        let emblem_bytes = GLYPH_ICON_BYTES
+            .iter()
+            .find(|(icon, _)| *icon == GlyphIcon::Emblem)
+            .map(|(_, bytes)| *bytes)
+            .expect("Emblem must be in GLYPH_ICON_BYTES");
+        let timer_bytes = GLYPH_ICON_BYTES
+            .iter()
+            .find(|(icon, _)| *icon == GlyphIcon::Timer)
+            .map(|(_, bytes)| *bytes)
+            .expect("Timer must be in GLYPH_ICON_BYTES");
+        let emblem = image::load_from_memory(emblem_bytes).expect("emblem.png must decode");
+        let timer = image::load_from_memory(timer_bytes).expect("timer.png must decode");
+        assert_eq!(emblem.width(), 512);
+        assert_eq!(timer.width(), 64);
     }
 }

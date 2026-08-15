@@ -781,11 +781,10 @@ const PILL_ICON_SEGMENTS: usize = 24;
 /// fixed-tint `toolbar_icon_image` texture cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PillIcon {
-    /// Encounter duration. Painted rather than reusing `ToolbarIcon::Clock`:
-    /// that PNG is a wall clock (and is locked to `TOOLBAR_ICON_SIZE` and
-    /// `TOOLBAR_ICON_TINT` by `toolbar_icon_image`), while the reference
-    /// here is unmistakably a stopwatch — round body, crown and stem on top,
-    /// single hand.
+    /// Encounter duration. Painted rather than reusing a toolbar-style icon:
+    /// toolbar icons are locked to `TOOLBAR_ICON_SIZE` and `TOOLBAR_ICON_TINT`
+    /// by `toolbar_icon_image`, while the reference here is unmistakably a
+    /// stopwatch — round body, crown and stem on top, single hand.
     Stopwatch,
     /// Total party DPS.
     Speedometer,
