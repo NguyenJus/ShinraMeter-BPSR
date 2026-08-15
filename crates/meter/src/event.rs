@@ -145,6 +145,11 @@ pub struct DamageEvent {
     pub target_uid: i64,
     pub target_kind: EntityKind,
     pub timestamp_ms: u64,
+    /// Whether `target_uid` died from this hit. Mirrors
+    /// `bpsr_protocol::DamageEvent::is_dead`, sourced from
+    /// `pb::SyncDamageInfo` tag 17 — a victim-side signal, not an
+    /// attacker-side kill count (issue #49).
+    pub is_dead: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -155,9 +160,6 @@ pub struct PlayerInfo {
     /// Ability score (a.k.a. combat power). Mirrors
     /// `bpsr_protocol::PlayerInfo::ability_score` (issue #15).
     pub ability_score: Option<u32>,
-    /// Season level. Mirrors `bpsr_protocol::PlayerInfo::season_level`
-    /// (issue #15).
-    pub season_level: Option<u32>,
     /// Season strength. Mirrors `bpsr_protocol::PlayerInfo::season_strength`
     /// (issue #15).
     pub season_strength: Option<u32>,

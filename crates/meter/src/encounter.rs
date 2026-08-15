@@ -8,6 +8,14 @@ use crate::reset::{EnemyState, ResetConfig, ResetReason, check_hp_rollback};
 use crate::stats::{EncounterInfo, PlayerRow, PlayerStats, Snapshot};
 use crate::tables;
 
+/// Debounce window for `DamageEvent::is_dead`: a death for the same uid
+/// counted within this many milliseconds of the last one is treated as a
+/// duplicate (this repo's TCP reassembly tolerates retransmits, so a delta
+/// packet can legitimately arrive twice) rather than a second, real death.
+/// 2000ms, matching resonance-logs' reference value for the same signal
+/// (issue #49).
+const DEATH_DEBOUNCE_MS: u64 = 2000;
+
 /// One player-identity cache entry. `seq` is a monotonic touch counter (set
 /// on both read and write) used purely to order entries by recency for
 /// [`Meter::names_for_save`] — it is never persisted itself, only the
@@ -16,29 +24,27 @@ use crate::tables;
 struct NameEntry {
     name: Option<String>,
     class: Option<Class>,
-    /// Ability score (a.k.a. combat power), season level, and season
-    /// strength. Kept in-memory alongside name/class so each survives a
-    /// `reset` the same way they do (issue #15). Deliberately **not** part
-    /// of the on-disk cache (`names_cache.rs`): unlike name/class these can
-    /// drift across sessions (gear changes, season progression), so
-    /// persisting a stale value risks being more misleading than showing
-    /// nothing until a fresh packet arrives.
+    /// Ability score (a.k.a. combat power) and season strength. Kept
+    /// in-memory alongside name/class so each survives a `reset` the same
+    /// way they do (issue #15). Deliberately **not** part of the on-disk
+    /// cache (`names_cache.rs`): unlike name/class these can drift across
+    /// sessions (gear changes, season progression), so persisting a stale
+    /// value risks being more misleading than showing nothing until a fresh
+    /// packet arrives.
     ability_score: Option<u32>,
-    season_level: Option<u32>,
     season_strength: Option<u32>,
     seq: u64,
 }
 
 /// The identity/stat fields threaded through `name_lookup`/`name_upsert`.
 /// Grouping these as a named struct, rather than a positional tuple, avoids
-/// transposing same-typed fields (three of these five are `Option<u32>`) at
+/// transposing same-typed fields (two of these four are `Option<u32>`) at
 /// a call site.
 #[derive(Clone, Debug, Default)]
 struct CachedAttrs {
     name: Option<String>,
     class: Option<Class>,
     ability_score: Option<u32>,
-    season_level: Option<u32>,
     season_strength: Option<u32>,
 }
 
@@ -119,7 +125,6 @@ impl Meter {
                     name,
                     class,
                     ability_score: None,
-                    season_level: None,
                     season_strength: None,
                     seq,
                 },
@@ -140,7 +145,6 @@ impl Meter {
                 name: entry.name.clone(),
                 class: entry.class,
                 ability_score: entry.ability_score,
-                season_level: entry.season_level,
                 season_strength: entry.season_strength,
             }
         })
@@ -163,9 +167,6 @@ impl Meter {
         if incoming.ability_score.is_some() {
             entry.ability_score = incoming.ability_score;
         }
-        if incoming.season_level.is_some() {
-            entry.season_level = incoming.season_level;
-        }
         if incoming.season_strength.is_some() {
             entry.season_strength = incoming.season_strength;
         }
@@ -174,7 +175,6 @@ impl Meter {
             name: entry.name.clone(),
             class: entry.class,
             ability_score: entry.ability_score,
-            season_level: entry.season_level,
             season_strength: entry.season_strength,
         }
     }
@@ -224,6 +224,16 @@ impl Meter {
     }
 
     fn apply_damage(&mut self, d: &DamageEvent) -> Option<ResetReason> {
+        // `d.is_dead` flags that `target_uid` (the victim, not the
+        // attacker) died from this hit — count it against the target
+        // regardless of who or what dealt the blow (issue #49), and
+        // regardless of whether the killing packet is heal-typed (e.g. a
+        // negative/lethal heal). This must run before the `is_heal` early
+        // return below so heal-typed death packets still record deaths.
+        if d.is_dead && d.target_kind == EntityKind::Player {
+            self.record_death(d.target_uid, d.timestamp_ms);
+        }
+
         // Healing view is a non-goal: heal events never touch damage totals
         // or fight timing.
         if d.is_heal {
@@ -266,9 +276,6 @@ impl Meter {
             if stats.ability_score.is_none() {
                 stats.ability_score = cached.ability_score;
             }
-            if stats.season_level.is_none() {
-                stats.season_level = cached.season_level;
-            }
             if stats.season_strength.is_none() {
                 stats.season_strength = cached.season_strength;
             }
@@ -290,6 +297,27 @@ impl Meter {
         None
     }
 
+    /// Counts one death for `target_uid`, debounced by `DEATH_DEBOUNCE_MS`
+    /// against the last death counted for the same uid (issue #49). Lazily
+    /// creates the target's `PlayerStats` entry — a player can die without
+    /// ever having attacked (e.g. a healer or a fresh join), so this cannot
+    /// rely on an entry the attacker-side path in `apply_damage` already
+    /// made.
+    fn record_death(&mut self, target_uid: i64, timestamp_ms: u64) {
+        let stats = self
+            .players
+            .entry(target_uid)
+            .or_insert_with(|| PlayerStats::new(target_uid));
+        let debounced = stats
+            .last_death_ms
+            .is_some_and(|last| timestamp_ms.saturating_sub(last) < DEATH_DEBOUNCE_MS);
+        if debounced {
+            return;
+        }
+        stats.deaths += 1;
+        stats.last_death_ms = Some(timestamp_ms);
+    }
+
     fn apply_player(&mut self, p: &PlayerInfo) {
         let merged = self.name_upsert(
             p.uid,
@@ -297,7 +325,6 @@ impl Meter {
                 name: p.name.clone(),
                 class: p.class,
                 ability_score: p.ability_score,
-                season_level: p.season_level,
                 season_strength: p.season_strength,
             },
         );
@@ -310,9 +337,6 @@ impl Meter {
             }
             if merged.ability_score.is_some() {
                 stats.ability_score = merged.ability_score;
-            }
-            if merged.season_level.is_some() {
-                stats.season_level = merged.season_level;
             }
             if merged.season_strength.is_some() {
                 stats.season_strength = merged.season_strength;
@@ -386,7 +410,10 @@ impl Meter {
             .map(|(uid, _)| uid);
     }
 
-    /// Clears `players` and per-enemy `lowest_pct`; keeps `names`.
+    /// Clears `players` and per-enemy `lowest_pct`; keeps `names`. Deaths
+    /// are per-encounter (issue #49): `players.clear()` drops the whole
+    /// `PlayerStats` entry per uid, taking `deaths`/`last_death_ms` with it,
+    /// so no separate clearing step is needed here.
     pub fn reset(&mut self, _reason: ResetReason, now_ms: u64) {
         self.players.clear();
         for enemy in self.enemies.values_mut() {
@@ -435,7 +462,6 @@ impl Meter {
                         .unwrap_or_else(|| format!("Player {}", p.uid)),
                     class: p.class,
                     ability_score: p.ability_score,
-                    season_level: p.season_level,
                     season_strength: p.season_strength,
                     damage: p.total_damage,
                     dps,
@@ -443,6 +469,7 @@ impl Meter {
                     crit_pct: p.crit_pct(),
                     lucky_pct: p.lucky_pct(),
                     hits: p.hits,
+                    deaths: p.deaths,
                 }
             })
             .collect();
@@ -565,7 +592,6 @@ mod tests {
             name: Some("Foo".to_string()),
             class: Some(Class::Stormblade),
             ability_score: None,
-            season_level: None,
             season_strength: None,
         }));
         let snap = m.snapshot(2000);
@@ -582,7 +608,6 @@ mod tests {
             name: None,
             class: None,
             ability_score: Some(45_000),
-            season_level: None,
             season_strength: None,
         }));
         let snap = m.snapshot(2000);
@@ -597,7 +622,6 @@ mod tests {
             name: Some("Foo".to_string()),
             class: None,
             ability_score: Some(1000),
-            season_level: None,
             season_strength: None,
         }));
         m.apply(&dmg(3, 100, 0));
@@ -608,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn player_info_season_data_reaches_row() {
+    fn player_info_season_strength_reaches_row() {
         let mut m = Meter::new();
         m.apply(&dmg(8, 100, 1000));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
@@ -616,30 +640,26 @@ mod tests {
             name: None,
             class: None,
             ability_score: None,
-            season_level: Some(42),
             season_strength: Some(12_345),
         }));
         let snap = m.snapshot(2000);
-        assert_eq!(snap.rows[0].season_level, Some(42));
         assert_eq!(snap.rows[0].season_strength, Some(12_345));
     }
 
     #[test]
-    fn season_data_survives_reset_like_name_and_class() {
+    fn season_strength_survives_reset_like_name_and_class() {
         let mut m = Meter::new();
         m.apply(&ProtocolEvent::Player(PlayerInfo {
             uid: 4,
             name: Some("Foo".to_string()),
             class: None,
             ability_score: None,
-            season_level: Some(7),
             season_strength: Some(999),
         }));
         m.apply(&dmg(4, 100, 0));
         m.reset(ResetReason::Manual, 1000);
         m.apply(&dmg(4, 50, 2000));
         let snap = m.snapshot(3000);
-        assert_eq!(snap.rows[0].season_level, Some(7));
         assert_eq!(snap.rows[0].season_strength, Some(999));
     }
 
@@ -735,6 +755,100 @@ mod tests {
         assert!(snap.rows.is_empty());
     }
 
+    mod deaths {
+        use super::*;
+
+        fn death_hit(attacker_uid: i64, target_uid: i64, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::Damage(DamageEvent {
+                attacker_uid,
+                attacker_kind: EntityKind::Player,
+                target_uid,
+                target_kind: EntityKind::Player,
+                value: 100,
+                is_dead: true,
+                timestamp_ms: ts,
+                ..Default::default()
+            })
+        }
+
+        #[test]
+        fn dead_player_target_increments_the_targets_death_count_not_the_attackers() {
+            let mut m = Meter::new();
+            m.apply(&death_hit(1, 2, 1000));
+            let snap = m.snapshot(2000);
+            let row = |uid| snap.rows.iter().find(|r| r.uid == uid).unwrap();
+            assert_eq!(row(2).deaths, 1);
+            assert_eq!(row(1).deaths, 0);
+        }
+
+        #[test]
+        fn is_dead_on_a_monster_target_increments_nobody() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: 10,
+                target_kind: EntityKind::Monster,
+                value: 100,
+                is_dead: true,
+                timestamp_ms: 1000,
+                ..Default::default()
+            }));
+            let snap = m.snapshot(2000);
+            assert_eq!(snap.rows.len(), 1);
+            assert_eq!(snap.rows[0].deaths, 0);
+        }
+
+        #[test]
+        fn duplicate_death_within_debounce_window_counts_once() {
+            let mut m = Meter::new();
+            m.apply(&death_hit(1, 2, 1000));
+            m.apply(&death_hit(1, 2, 1000 + DEATH_DEBOUNCE_MS - 1));
+            let snap = m.snapshot(2000);
+            assert_eq!(snap.rows.iter().find(|r| r.uid == 2).unwrap().deaths, 1);
+        }
+
+        #[test]
+        fn death_outside_debounce_window_counts_again() {
+            let mut m = Meter::new();
+            m.apply(&death_hit(1, 2, 1000));
+            m.apply(&death_hit(1, 2, 1000 + DEATH_DEBOUNCE_MS));
+            let snap = m.snapshot(2000 + DEATH_DEBOUNCE_MS);
+            assert_eq!(snap.rows.iter().find(|r| r.uid == 2).unwrap().deaths, 2);
+        }
+
+        #[test]
+        fn heal_typed_dead_player_event_still_records_death() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: 2,
+                target_kind: EntityKind::Player,
+                value: 100,
+                is_heal: true,
+                is_dead: true,
+                timestamp_ms: 1000,
+                ..Default::default()
+            }));
+            let snap = m.snapshot(2000);
+            let row = snap.rows.iter().find(|r| r.uid == 2).unwrap();
+            assert_eq!(row.deaths, 1);
+            assert_eq!(row.damage, 0);
+            assert_eq!(row.hits, 0);
+        }
+
+        #[test]
+        fn reset_clears_deaths() {
+            let mut m = Meter::new();
+            m.apply(&death_hit(1, 2, 1000));
+            m.reset(ResetReason::Manual, 2000);
+            m.apply(&dmg(2, 50, 3000));
+            let snap = m.snapshot(4000);
+            assert_eq!(snap.rows.iter().find(|r| r.uid == 2).unwrap().deaths, 0);
+        }
+    }
+
     mod names_cache {
         use super::*;
 
@@ -761,7 +875,6 @@ mod tests {
                 name: Some("Fresh".to_string()),
                 class: Some(Class::FrostMage),
                 ability_score: None,
-                season_level: None,
                 season_strength: None,
             }));
             m.apply(&dmg(5, 100, 1000));
@@ -782,7 +895,6 @@ mod tests {
                 name: Some("Renamed".to_string()),
                 class: None,
                 ability_score: None,
-                season_level: None,
                 season_strength: None,
             }));
             m.apply(&dmg(5, 100, 1000));
@@ -808,7 +920,6 @@ mod tests {
                 name: Some("Ren".to_string()),
                 class: Some(Class::Stormblade),
                 ability_score: None,
-                season_level: None,
                 season_strength: None,
             }));
             m.apply(&dmg(5, 100, 1000));
@@ -820,7 +931,6 @@ mod tests {
                 name: None,
                 class: None,
                 ability_score: None,
-                season_level: None,
                 season_strength: None,
             }));
 
@@ -871,7 +981,6 @@ mod tests {
                 name: Some("A".to_string()),
                 class: None,
                 ability_score: None,
-                season_level: None,
                 season_strength: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
@@ -879,7 +988,6 @@ mod tests {
                 name: Some("B".to_string()),
                 class: None,
                 ability_score: None,
-                season_level: None,
                 season_strength: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
@@ -887,7 +995,6 @@ mod tests {
                 name: Some("C".to_string()),
                 class: None,
                 ability_score: None,
-                season_level: None,
                 season_strength: None,
             }));
             // Re-touch uid 1 so it becomes the most recently used, ahead of
@@ -897,7 +1004,6 @@ mod tests {
                 name: Some("A".to_string()),
                 class: None,
                 ability_score: None,
-                season_level: None,
                 season_strength: None,
             }));
 
@@ -924,7 +1030,6 @@ mod tests {
                 name: Some("First".to_string()),
                 class: None,
                 ability_score: None,
-                season_level: None,
                 season_strength: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
@@ -932,7 +1037,6 @@ mod tests {
                 name: Some("Second".to_string()),
                 class: None,
                 ability_score: None,
-                season_level: None,
                 season_strength: None,
             }));
 
@@ -949,7 +1053,6 @@ mod tests {
                 name: Some("Foo".to_string()),
                 class: None,
                 ability_score: None,
-                season_level: None,
                 season_strength: None,
             }));
             m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 1000 });
@@ -1139,7 +1242,6 @@ mod tests {
                 name: Some("Foo".to_string()),
                 class: None,
                 ability_score: None,
-                season_level: None,
                 season_strength: None,
             }));
             m.apply(&dmg(1, 100, 0));

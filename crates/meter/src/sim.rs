@@ -129,7 +129,6 @@ fn player_info_event(uid: i64, ts: u64) -> SimEvent {
                 REAL_CLASS_IDS[(uid as usize - 1) % REAL_CLASS_IDS.len()],
             )),
             ability_score: Some(1000 + uid as u32 * 10),
-            season_level: Some(1),
             season_strength: Some(1),
         }),
     }
@@ -168,6 +167,9 @@ fn hit_event(attacker_uid: i64, boss_uid: i64, ts: u64, rng: &mut Rng) -> SimEve
             target_uid: boss_uid,
             target_kind: EntityKind::Monster,
             timestamp_ms: ts,
+            // The synthetic sim never kills a player, so every simulated
+            // hit is a non-fatal one (issue #49).
+            is_dead: false,
         }),
     }
 }
