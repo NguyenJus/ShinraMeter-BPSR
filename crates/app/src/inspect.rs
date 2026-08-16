@@ -60,24 +60,18 @@ fn dump_path() -> PathBuf {
 }
 
 fn dump_path_from(inspect_dump: Option<&str>, appdata: Option<&str>) -> PathBuf {
-    if let Some(path) = inspect_dump
-        && !path.is_empty()
-    {
-        return PathBuf::from(path);
+    let pid = std::process::id();
+    let (path, warning) = crate::paths::resolve(
+        inspect_dump,
+        appdata,
+        &["ShinraMeter-BPSR", "inspect", &format!("dump-{pid}.jsonl")],
+        &format!("ShinraMeter-BPSR-inspect-dump-{pid}.jsonl"),
+        "APPDATA is not set; falling back to a working-directory dump file",
+    );
+    if let Some(warning) = warning {
+        log::warn!("{warning}");
     }
-    match appdata {
-        Some(appdata) if !appdata.is_empty() => PathBuf::from(appdata)
-            .join("ShinraMeter-BPSR")
-            .join("inspect")
-            .join(format!("dump-{}.jsonl", std::process::id())),
-        _ => {
-            log::warn!("APPDATA is not set; falling back to a working-directory dump file");
-            PathBuf::from(format!(
-                "ShinraMeter-BPSR-inspect-dump-{}.jsonl",
-                std::process::id()
-            ))
-        }
-    }
+    path
 }
 
 /// Returned by [`init`] when diagnostics are on: the sink to hand to

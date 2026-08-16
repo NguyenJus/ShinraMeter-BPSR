@@ -105,6 +105,11 @@ The manifest normally makes Windows prompt for this automatically, so seeing thi
 3. Restart the meter and try again.
 4. Confirm the game server is being detected — watch the overlay for `ServerChanged` events in debug logs if enabled.
 
+### Logs
+Logging (issue #69) is on by default at `info`, since the app carries no console to print to (`windows_subsystem = "windows"`) and stderr alone would go nowhere. Logs are written to `%APPDATA%\ShinraMeter-BPSR\logs\ShinraMeter-BPSR.log`, overridable with `SHINRA_LOG_FILE=<path>` (falling back to `ShinraMeter-BPSR.log` in the working directory if `APPDATA` is unset, e.g. a non-Windows dev host). Raise the verbosity with the standard `RUST_LOG` env var, e.g. `RUST_LOG=debug`. The file is rotated once at startup — renamed to `<path>.1`, replacing any previous one — once it reaches 5 MiB, so a long-lived overlay can't grow it unbounded.
+
+Logs may contain player names and other identifying traffic — never attach one to an issue or PR; mint a minimal synthetic repro instead.
+
 ## License
 
 This project is licensed under the GNU General Public License v3.0 (GPL-3.0-only).
