@@ -407,8 +407,9 @@ fn draw_header(
 
     // The panel's own full-width rect, captured before the band below
     // narrows it to the drag band's height — the background wash (issue #59,
-    // #62) is sized off the panel, not the band, since it runs taller than
-    // the band does on its own (`HEADER_WASH_HEIGHT` vs `band_height`).
+    // #62, #81) is anchored off the panel's left/top/right edges, sized to
+    // `text_band_height` rather than the drag band, so it stops above the
+    // stat-pill row instead of running into it.
     let panel = ui.available_rect_before_wrap();
     // The header band's full paint extent — `panel` truncated to
     // `band_height`, with no top adjustment. `RESIZE_EDGE` is a
@@ -439,8 +440,11 @@ fn draw_header(
 
     // The decorative background wash, painted before anything else in the
     // band so every later layer — emblem, title, separator, chevron,
-    // subtitle, stat row — sits on top of it.
-    draw_header_wash(ui, panel, icons);
+    // subtitle, stat row — sits on top of it. Sized to the text rows alone
+    // (issue #81), not the fixed-98pt run it used to be, so it stops clear
+    // of the stat-pill row painted below it rather than bleeding into it.
+    let wash_height = text_band_height - HEADER_WASH_INSET;
+    draw_header_wash(ui, panel, icons, wash_height);
 
     let drag_surface = ui.interact(band, ui.id().with("title_bar"), egui::Sense::drag());
     if drag_surface.hovered() {
@@ -512,7 +516,7 @@ fn draw_header(
         stat_pill(
             ui,
             StatPill::header(
-                &format!("{}/s", fmt_short(snapshot.total_dps as i64)),
+                &format!("{}/s", fmt_dps(snapshot.total_dps as i64)),
                 icons.glyphs.get(GlyphIcon::Speed).map(|t| t.id()),
             ),
         );
@@ -1265,7 +1269,16 @@ fn header_emblem_rect(row: egui::Rect, text_band_height: f32) -> egui::Rect {
 /// a vertical `OpacityMask` (white -> transparent at .9); egui has no
 /// opacity masks, and the diagonal gradient already falls to zero by the
 /// bottom-right, so the mask is deliberately not reproduced.
-const HEADER_WASH_HEIGHT: f32 = 98.0;
+///
+/// Issue #81: this used to be a fixed `98.0`pt run against the whole panel,
+/// taller than the ~58-64pt drag band (`header_band_height`) that actually
+/// holds the title/subtitle/stat-pill row — so the wash's tail painted
+/// straight through the stat-pill row instead of stopping above it, unlike
+/// the reference render. `draw_header` now sizes the wash to
+/// `header_text_band_height` (the title + optional subtitle rows only, not
+/// the stat-pill row below them) instead, via `header_wash_rect`'s `height`
+/// argument — no fixed constant left to drift out of sync with the content
+/// it sits behind.
 /// Inset from the panel's edges the wash is painted at, so its square
 /// corners never poke past the panel's own `PANEL_CORNER_RADIUS`-rounded,
 /// `PANEL_BORDER_WIDTH`-thick border.
@@ -1287,13 +1300,15 @@ const HEADER_WASH_EMBLEM_COLOR: egui::Color32 =
 
 /// Where the wash panel sits for a central panel of `panel`: inset from the
 /// panel's left, top and right edges by `HEADER_WASH_INSET`, and running down
-/// to its own fixed `HEADER_WASH_HEIGHT` rather than to the panel's bottom.
-/// Pure geometry, so the inset and the fixed height are unit-testable without
-/// a painter — the same factoring as `header_emblem_rect`.
-fn header_wash_rect(panel: egui::Rect) -> egui::Rect {
+/// `height` points rather than to the panel's bottom. Pure geometry, so the
+/// inset is unit-testable without a painter — the same factoring as
+/// `header_emblem_rect`. `height` is the caller's to pick (`draw_header`
+/// passes `header_text_band_height`, issue #81) rather than a fixed
+/// constant here, so the wash can never outgrow the content it decorates.
+fn header_wash_rect(panel: egui::Rect, height: f32) -> egui::Rect {
     egui::Rect::from_min_size(
         panel.min + egui::Vec2::splat(HEADER_WASH_INSET),
-        egui::vec2(panel.width() - 2.0 * HEADER_WASH_INSET, HEADER_WASH_HEIGHT),
+        egui::vec2(panel.width() - 2.0 * HEADER_WASH_INSET, height),
     )
 }
 
@@ -1316,15 +1331,17 @@ fn header_wash_emblem_rect(wash: egui::Rect) -> egui::Rect {
 /// panel with a huge, nearly-invisible emblem bleeding off its right edge —
 /// clipped to its own rect so it can never bleed into the rows below or over
 /// the panel's rounded corners. `panel` is the whole central panel's rect
-/// (not the drag band): the wash runs to `HEADER_WASH_HEIGHT`, which is
-/// taller than the band itself.
+/// (not the drag band); `height` (issue #81, `header_text_band_height`) is
+/// what actually bounds the wash — the title + optional subtitle rows only,
+/// stopping clear of the stat-pill row below so the two never share paint
+/// space (`wash_does_not_reach_the_stat_pill_row`).
 ///
 /// The source rounds the wash's top corners (`CornerRadius="7 7 0 0"`); egui
 /// cannot clip to a rounded rect this cheaply, so the wash keeps square
 /// corners — at alpha `0x50` under the panel's own 8pt-rounded, 1pt border
 /// the difference is sub-pixel.
-fn draw_header_wash(ui: &egui::Ui, panel: egui::Rect, icons: &Icons) {
-    let wash_rect = header_wash_rect(panel);
+fn draw_header_wash(ui: &egui::Ui, panel: egui::Rect, icons: &Icons, height: f32) {
+    let wash_rect = header_wash_rect(panel, height);
     let painter = ui.painter().with_clip_rect(wash_rect);
 
     // Top-left brightest, fading to zero at the bottom-right — the source's
@@ -2800,6 +2817,47 @@ pub fn fmt_share(share_pct: f32) -> String {
     format!("{share_pct:.1}%")
 }
 
+/// Crit/Lucky percentage as a whole number, `73%` (issue #80.2) — unlike
+/// `fmt_share`'s one decimal, the reference render
+/// (`docs/reference/new-shinra-ex.webp`) shows these two with none.
+pub fn fmt_pct0(pct: f32) -> String {
+    format!("{pct:.0}%")
+}
+
+/// DPS-specific compact abbreviation (issue #80.3). Reuses `fmt_short`'s
+/// K/M/B thresholds, but once a magnitude is scaled its decimal count keeps
+/// the digit run a consistent width instead of `fmt_short`'s always-one:
+/// zero decimals once the scaled value has already reached 3 digits
+/// (`>= 100`, e.g. `188M`), one decimal below that (e.g. `55.3M`, `10.3M`).
+/// Matches the reference render's header pill (`188M/s`) and row values
+/// (`55.3M/s` .. `10.3M/s`) exactly. Raw sub-1000 values are left alone —
+/// always a plain integer — since a DPS figure that low never occurs in
+/// practice and a lone decimal there (`45.0`) would read oddly for a count
+/// of whole damage/sec.
+pub fn fmt_dps(v: i64) -> String {
+    let sign = if v < 0 { "-" } else { "" };
+    let av = v.unsigned_abs();
+
+    fn scaled(sign: &str, av: u64, divisor: f64, suffix: &str) -> String {
+        let value = av as f64 / divisor;
+        if value >= 100.0 {
+            format!("{sign}{value:.0}{suffix}")
+        } else {
+            format!("{sign}{value:.1}{suffix}")
+        }
+    }
+
+    if av >= 1_000_000_000 {
+        scaled(sign, av, 1_000_000_000.0, "B")
+    } else if av >= 1_000_000 {
+        scaled(sign, av, 1_000_000.0, "M")
+    } else if av >= 1_000 {
+        scaled(sign, av, 1_000.0, "K")
+    } else {
+        format!("{sign}{av}")
+    }
+}
+
 // -- default window size (issue #26) -----------------------------------
 //
 // The old default, `[340.0, 220.0]`, was sized for ~8-9 rows and left no
@@ -4098,6 +4156,37 @@ mod tests {
         assert_eq!(fmt_share(100.0), "100.0%");
     }
 
+    /// Issue #80.2: `fmt_pct0` is `fmt_share` minus the decimal place —
+    /// same rounding, same trailing `%`, just `{:.0}` instead of `{:.1}`.
+    #[test]
+    fn fmt_pct0_drops_the_decimal_place() {
+        let cases = [(0.0, "0%"), (12.34, "12%"), (12.6, "13%"), (100.0, "100%")];
+        for (input, expected) in cases {
+            assert_eq!(fmt_pct0(input), expected, "fmt_pct0({input})");
+        }
+    }
+
+    /// Issue #80.3: `fmt_dps` keeps a K/M/B-scaled value's digit run a
+    /// consistent width by dropping the decimal once the scaled value
+    /// reaches 3 digits, matching the reference render's header pill
+    /// (`188M`) and row values (`55.3M` .. `10.3M`) exactly.
+    #[test]
+    fn fmt_dps_table() {
+        let cases: [(i64, &str); 8] = [
+            (999, "999"),
+            (1_000, "1.0K"),
+            (10_300_000, "10.3M"),
+            (17_800_000, "17.8M"),
+            (55_300_000, "55.3M"),
+            (188_000_000, "188M"),
+            (999_950, "1000K"),
+            (-55_300_000, "-55.3M"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(fmt_dps(input), expected, "fmt_dps({input})");
+        }
+    }
+
     // -- encounter title/subtitle (issue #9 slice 2) -----------------------
 
     #[test]
@@ -4420,7 +4509,7 @@ mod tests {
         assert_eq!(header_text_band_height(true), 36.0);
     }
 
-    // -- header background wash (issue #59, #62) ------------------------
+    // -- header background wash (issue #59, #62, #81) --------------------
 
     /// A stand-in central-panel rect for the wash geometry tests — wider and
     /// far taller than the wash itself, like the real panel.
@@ -4428,19 +4517,26 @@ mod tests {
         egui::Rect::from_min_size(egui::pos2(12.0, 30.0), egui::vec2(400.0, 300.0))
     }
 
+    /// A stand-in wash height for the geometry tests below — issue #81 made
+    /// this the caller's to choose (`draw_header` derives it from
+    /// `header_text_band_height`) rather than a fixed constant, so these
+    /// tests exercise the geometry with an arbitrary value of their own.
+    const WASH_TEST_HEIGHT: f32 = 34.0;
+
     /// The wash is inset from the panel on both sides and its top so its
-    /// square corners stay inside the panel's rounded border, and it runs to
-    /// its own fixed height rather than the panel's — it is decoration behind
-    /// the header rows, not a full-height background.
+    /// square corners stay inside the panel's rounded border, and it runs
+    /// down exactly the `height` it is given rather than to the panel's —
+    /// it is decoration behind the header rows, not a full-height
+    /// background.
     #[test]
-    fn the_header_wash_is_inset_from_the_panel_and_keeps_its_own_fixed_height() {
+    fn the_header_wash_is_inset_from_the_panel_and_keeps_its_given_height() {
         let panel = wash_test_panel();
-        let wash = header_wash_rect(panel);
+        let wash = header_wash_rect(panel, WASH_TEST_HEIGHT);
         assert_eq!(wash.left() - panel.left(), HEADER_WASH_INSET);
         assert_eq!(panel.right() - wash.right(), HEADER_WASH_INSET);
         assert_eq!(wash.top() - panel.top(), HEADER_WASH_INSET);
         assert_eq!(wash.width(), panel.width() - 2.0 * HEADER_WASH_INSET);
-        assert_eq!(wash.height(), HEADER_WASH_HEIGHT);
+        assert_eq!(wash.height(), WASH_TEST_HEIGHT);
         assert!(wash.bottom() < panel.bottom());
     }
 
@@ -4450,7 +4546,7 @@ mod tests {
     /// wash must be painted through its own clip rect.
     #[test]
     fn the_wash_emblem_bleeds_off_the_right_edge_by_the_named_overhang() {
-        let wash = header_wash_rect(wash_test_panel());
+        let wash = header_wash_rect(wash_test_panel(), WASH_TEST_HEIGHT);
         let emblem = header_wash_emblem_rect(wash);
         assert_eq!(emblem.right() - wash.right(), HEADER_WASH_EMBLEM_BLEED);
         assert!(emblem.left() > wash.left());
@@ -4464,11 +4560,42 @@ mod tests {
     /// mean it had stopped reading as an oversized watermark.
     #[test]
     fn the_wash_emblem_is_taller_than_the_wash_it_sits_in() {
-        let wash = header_wash_rect(wash_test_panel());
+        let wash = header_wash_rect(wash_test_panel(), WASH_TEST_HEIGHT);
         let emblem = header_wash_emblem_rect(wash);
         assert!(emblem.height() > wash.height());
         assert!(emblem.top() < wash.top());
         assert!(emblem.bottom() > wash.bottom());
+    }
+
+    /// Issue #81: the wash must never reach into the stat-pill row painted
+    /// below it. `draw_header` sizes the wash to
+    /// `text_band_height - HEADER_WASH_INSET`, so its painted bottom edge
+    /// sits above where the stat-pill row starts (`text_band_height +
+    /// ITEM_SPACING_Y` down from the panel top, the same geometry
+    /// `header_band_height` is built from) for both the with- and
+    /// without-subtitle cases — unlike the old fixed `98.0`pt wash, which
+    /// was taller than the whole drag band and painted straight through it.
+    #[test]
+    fn wash_does_not_reach_the_stat_pill_row() {
+        let panel = wash_test_panel();
+        let button_row_height = 18.0;
+        for has_subtitle in [false, true] {
+            let text_band = header_text_band_height(has_subtitle);
+            let wash_height = text_band - HEADER_WASH_INSET;
+            let wash = header_wash_rect(panel, wash_height);
+            let stat_pill_row_top = panel.top() + text_band + ITEM_SPACING_Y;
+            let stat_pill_row_bottom = stat_pill_row_top + button_row_height;
+            assert!(
+                wash.bottom() <= stat_pill_row_top,
+                "wash bottom {} (has_subtitle={has_subtitle}) reaches into the \
+                 stat-pill row starting at {stat_pill_row_top}",
+                wash.bottom()
+            );
+            // Sanity: the two rects really are disjoint on the y axis, not
+            // just touching at a coincidental boundary.
+            assert!(wash.top() < stat_pill_row_bottom);
+            assert!(wash.bottom() < stat_pill_row_bottom);
+        }
     }
 
     // -- column_anchors (issue #8) --------------------------------------
@@ -4652,7 +4779,10 @@ mod tests {
 
         // Widest plausible value for every field any column formats:
         // `fmt_short`'s 7-char maximum (rounds up across a K/M/B
-        // threshold, e.g. 999_950 -> "1000.0K") and `fmt_share`'s.
+        // threshold, e.g. 999_950 -> "1000.0K"), `fmt_dps`'s narrower
+        // 5-char maximum (issue #80.3 drops the decimal once the scaled
+        // value rounds up to 3 digits, e.g. 999_950 -> "1000K"),
+        // `fmt_share`'s, and `fmt_pct0`'s (issue #80.2's 0-decimal variant).
         // `ability_score`/`season_strength` are the two exceptions: they
         // render the full, un-abbreviated digit string (owner requirement),
         // so their widest plausible input is their real in-game ceiling —
@@ -4661,7 +4791,9 @@ mod tests {
         // the field type's own ceiling (`u32::MAX`) or a `fmt_short`-derived
         // value. Do not "fix" these back to `u32::MAX`.
         assert_eq!(fmt_short(999_950), "1000.0K");
+        assert_eq!(fmt_dps(999_950), "1000K");
         assert_eq!(fmt_share(100.0), "100.0%");
+        assert_eq!(fmt_pct0(100.0), "100%");
         let widest_row = PlayerRow {
             uid: 1,
             name: String::new(),
@@ -5147,7 +5279,9 @@ mod tests {
             + COLUMN_RIGHT_MARGIN
             + HEADER_ROW_EXTRA_WIDTH;
         assert_eq!(default_inner_width(), expected);
-        assert_eq!(default_inner_width(), 451.0);
+        // Issue #80.1 tightened the default columns' widths (`Dps`,
+        // `CritPct`, `LuckyPct`), shrinking this from its old `451.0`.
+        assert_eq!(default_inner_width(), 387.0);
     }
 
     #[test]
