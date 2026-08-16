@@ -160,6 +160,10 @@ pub struct OverlayApp {
     /// deliberately not persisted to `Settings`; see the `CollapseState`
     /// section comment.
     collapse: CollapseState,
+    /// Issue #83: last-logged `(pixels_per_point, zoom_factor)`, so the
+    /// per-frame DPI probe in `ui()` only writes to the log when the value
+    /// actually changes rather than every ~10Hz frame.
+    last_dpi_probe: Option<(f32, f32)>,
 }
 
 /// All icon textures the overlay paints, bundled so `OverlayApp` has exactly
@@ -209,6 +213,7 @@ impl OverlayApp {
             icons: None,
             window_gesture: WindowGesture::default(),
             collapse: CollapseState::default(),
+            last_dpi_probe: None,
         }
     }
 
@@ -231,6 +236,28 @@ impl eframe::App for OverlayApp {
 
         let ctx = ui.ctx().clone();
         apply_theme(&ctx);
+
+        // Issue #83: a prior investigation of "player rows render shorter/
+        // more compact than the reference" found no code-level defect —
+        // `ROW_HEIGHT`, `FONT_SIZE_ROW` and the row-painting math all check
+        // out — but couldn't rule out a runtime DPI effect on the
+        // reporter's real Windows box; no screenshot was obtainable in this
+        // environment to compare directly. Logged only when the value
+        // changes, so a stuck-open overlay repainting at ~10Hz doesn't spam
+        // the log file. A suspicious reading looks like `pixels_per_point`
+        // not matching the display's actual OS scaling (e.g. staying `1.0`
+        // on a 150%-scaled monitor) or a `zoom_factor` other than `1.0` —
+        // either would shrink everything the overlay paints, rows included,
+        // without needing a defect in this file at all.
+        let dpi_probe = (ctx.pixels_per_point(), ctx.zoom_factor());
+        if self.last_dpi_probe != Some(dpi_probe) {
+            log::debug!(
+                "issue #83 probe: pixels_per_point={:.3} zoom_factor={:.3}",
+                dpi_probe.0,
+                dpi_probe.1
+            );
+            self.last_dpi_probe = Some(dpi_probe);
+        }
 
         // Picks up the Share button's screenshot reply, if this frame has
         // one (issue #82: `toggle_cluster` fired the request one or more
@@ -2254,31 +2281,107 @@ fn draw_resize_handles(ui: &mut egui::Ui, ctx: &egui::Context, gesture: &mut Win
 /// #49 a row paints a toolbar-set texture too (the death counter's skull),
 /// and handing both sets down as one argument keeps `draw_row` from growing
 /// a second icon parameter.
-fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot, columns: &[ColumnKind], icons: &Icons) {
-    // True contiguous 30pt rows (decision 3): scoped to this function only,
-    // so the header and menus keep `apply_theme`'s `item_spacing` — rows'
-    // hover bands and accent lines must sit flush against their neighbors
-    // with no gap, which a nonzero `item_spacing.y` would reintroduce.
-    ui.spacing_mut().item_spacing.y = 0.0;
+/// Issue #84's shrink-vs-scroll decision, as a pure function of the
+/// viewport width and the enabled stat columns' combined width — extracted
+/// so the floor is unit-testable without a live `Ui`/`ScrollArea`, the same
+/// reasoning `column_anchors`, `share_bar_paints` etc. already follow.
+///
+/// `column_anchors`'s own `scale` factor already shrinks every column
+/// proportionally when the row is narrower than the columns' combined
+/// width — that stays the *first* response to a narrow window, so mild
+/// narrowing still looks exactly like it did before this issue. But that
+/// shrink had no floor of its own, so a badly narrow window used to
+/// compress column text into illegibility. `MIN_COLUMN_SCALE` gives it one:
+/// the returned width is what row content is actually laid out at, and it
+/// never drops below the width at which `column_anchors` would shrink
+/// columns past that floor (i.e. below `stat_columns_total *
+/// MIN_COLUMN_SCALE`, plus `COLUMN_RIGHT_MARGIN` since `column_anchors`
+/// reserves that margin off the right edge before it ever sees a column
+/// width). Once the viewport is narrower than that floor, the returned
+/// width stays pinned at the floor — wider than the viewport — and the
+/// caller's `ScrollArea` picks up the remaining overflow as horizontal
+/// scroll instead of compressing columns any further.
+fn row_content_width(viewport_width: f32, stat_columns_total: f32) -> f32 {
+    let floor_width = stat_columns_total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
+    viewport_width.max(floor_width)
+}
 
-    // The enabled-column set (and therefore the column widths and their
-    // anchors) is identical for every row in a frame, so both are computed
-    // once here rather than once per row inside `draw_row`.
+/// Returns the `ScrollArea`'s reported content size — larger than the
+/// viewport on whichever axis actually needed to scroll this frame — purely
+/// so tests can observe that without reaching into egui's persisted scroll
+/// state; `OverlayApp::ui` (the only production caller) ignores it.
+fn draw_rows(
+    ui: &mut egui::Ui,
+    snapshot: &Snapshot,
+    columns: &[ColumnKind],
+    icons: &Icons,
+) -> egui::Vec2 {
+    // The enabled-column set (and therefore the column widths) is identical
+    // for every row in a frame, so it's computed once here rather than once
+    // per row inside `draw_row`.
     let stat_columns = stat_columns_for(columns);
-    let avail = ui.available_rect_before_wrap();
-    let anchors = column_anchors(avail.left(), avail.right(), &stat_columns, 4.0);
+    let stat_columns_total: f32 = stat_columns.iter().map(|c| c.width).sum();
+    let content_width = row_content_width(ui.available_width(), stat_columns_total);
 
-    // Issue #73: each row's damage-share bar is now scaled to the *top
-    // row's* damage rather than to its share of total encounter damage, so
-    // the highest-damage row always fills the full bar width. `snapshot.rows`
-    // is already sorted descending by damage (`Encounter::snapshot`), so the
-    // top row's damage is just the first row's, computed once here rather
-    // than once per row inside `draw_row`.
-    let top_damage = snapshot.rows.first().map(|r| r.damage).unwrap_or(0);
+    let output = egui::ScrollArea::both()
+        // Same footprint as a plain, unwrapped layout: the scroll area
+        // always fills the space `CentralPanel` gives it rather than
+        // shrinking to the content's size, so wrapping rows in it changes
+        // nothing when everything already fits.
+        .auto_shrink([false, false])
+        // Hidden entirely — no reserved gutter, no visible track — unless
+        // the content actually overflows, so a window sized to show every
+        // row and every column at full width paints pixel-identically to
+        // today's unscrolled layout. `apply_theme` never touches
+        // `style.spacing.scroll`, so this also inherits egui's default
+        // `ScrollStyle::floating()`: a thin, translucent bar that only
+        // fades in on hover and reserves no layout space even while
+        // visible — already the unobtrusive styling the row list needs,
+        // with nothing further to configure here.
+        .scroll_bar_visibility(
+            egui::containers::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+        )
+        .show(ui, |ui| {
+            // True contiguous 30pt rows (decision 3): scoped to the scroll
+            // area's own content `Ui`, so the header and menus keep
+            // `apply_theme`'s `item_spacing` — rows' hover bands and accent
+            // lines must sit flush against their neighbors with no gap,
+            // which a nonzero `item_spacing.y` would reintroduce.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            // A horizontal `ScrollArea` measures how much there is to
+            // scroll from what its content `Ui` actually ends up using; an
+            // empty `snapshot.rows` would otherwise paint nothing and
+            // report zero content width even when `content_width` (the
+            // floor above) exceeds the viewport.
+            ui.set_min_width(content_width);
 
-    for row in &snapshot.rows {
-        draw_row(ui, row, columns, &stat_columns, &anchors, icons, top_damage);
-    }
+            let avail = ui.available_rect_before_wrap();
+            let anchors = column_anchors(
+                avail.left(),
+                avail.left() + content_width,
+                &stat_columns,
+                COLUMN_RIGHT_MARGIN,
+            );
+            let layout = RowLayout {
+                kinds: columns,
+                columns: &stat_columns,
+                anchors: &anchors,
+            };
+
+            // Issue #73: each row's damage-share bar is now scaled to the
+            // *top row's* damage rather than to its share of total
+            // encounter damage, so the highest-damage row always fills the
+            // full bar width. `snapshot.rows` is already sorted descending
+            // by damage (`Encounter::snapshot`), so the top row's damage is
+            // just the first row's, computed once here rather than once
+            // per row inside `draw_row`.
+            let top_damage = snapshot.rows.first().map(|r| r.damage).unwrap_or(0);
+
+            for row in &snapshot.rows {
+                draw_row(ui, row, &layout, icons, top_damage, content_width);
+            }
+        });
+    output.content_size
 }
 
 /// How prominently one stat column's text is painted (issue #56). The
@@ -2455,16 +2558,34 @@ fn column_clip_rect(rect: egui::Rect, anchor: f32, width: f32) -> egui::Rect {
     )
 }
 
+/// Row layout that's identical across every row in a frame — the enabled
+/// column kinds, their `StatColumn` specs, and the anchors `column_anchors`
+/// derived from them — computed once by `draw_rows` and handed to every
+/// `draw_row` call rather than recomputed per row. Bundled into one struct
+/// for the same reason `SettingsHandle`/`ChromeHandle` are (issue #71,
+/// #54): three arguments that are always needed together and always travel
+/// together push `draw_row` over clippy's argument limit on their own,
+/// especially once issue #84 adds `row_width`.
+struct RowLayout<'a> {
+    kinds: &'a [ColumnKind],
+    columns: &'a [StatColumn],
+    anchors: &'a [f32],
+}
+
 fn draw_row(
     ui: &mut egui::Ui,
     row: &PlayerRow,
-    kinds: &[ColumnKind],
-    columns: &[StatColumn],
-    anchors: &[f32],
+    layout: &RowLayout<'_>,
     icons: &Icons,
     top_damage: i64,
+    // Issue #84: the width every row is laid out at, computed once by
+    // `draw_rows` (`content_width`) rather than read from
+    // `ui.available_width()` here — inside a horizontal `ScrollArea` that
+    // can report an unbounded width, which is not what a row should paint
+    // itself at.
+    row_width: f32,
 ) {
-    let desired_size = egui::vec2(ui.available_width(), ROW_HEIGHT);
+    let desired_size = egui::vec2(row_width, ROW_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
 
     // Background bar scaled by this row's damage relative to the *top row's*
@@ -2541,7 +2662,7 @@ fn draw_row(
     // constants) degrades to an empty icon box, see `StatPill::icon`.
     let skull = icons.glyphs.get(GlyphIcon::Skull).map(|t| t.id());
 
-    for ((anchor_x, column), kind) in anchors.iter().zip(columns).zip(kinds) {
+    for ((anchor_x, column), kind) in layout.anchors.iter().zip(layout.columns).zip(layout.kinds) {
         let text = (column.text)(row);
         // Each column's own weight/size (issue #56, `column_emphasis`), not
         // one flat font for the whole row: the DPS value is the headline
@@ -2979,6 +3100,16 @@ const NAME_COLUMN_GAP: f32 = 10.0;
 /// Right-edge margin, matching the `margin` `draw_rows` passes to
 /// `column_anchors` for the rightmost column's anchor.
 const COLUMN_RIGHT_MARGIN: f32 = 4.0;
+
+/// Issue #84: the floor `draw_rows` holds `column_anchors`' shrink-to-fit
+/// `scale` factor at once a narrow viewport would otherwise push it lower.
+/// Below this floor, `draw_rows` stops shrinking columns and switches to
+/// horizontal scrolling for the remaining overflow instead — see
+/// `draw_rows`' `content_width`. `0.6` keeps every column's text legible
+/// (a DPS column at `Dps` width 48 still budgets ~29pt, comfortably wider
+/// than `FONT_SIZE_ROW`'s tallest digit) while still absorbing a fair
+/// amount of narrowing before scrolling kicks in.
+const MIN_COLUMN_SCALE: f32 = 0.6;
 
 /// Default opening height (issue #26; extended by issue #9 slice 2's title
 /// line): the header's title line + timer/DPS/buttons row + separator + a
@@ -5531,6 +5662,261 @@ mod tests {
         // the default opening size must never start below its own floor.
         assert!(default_inner_width() >= 220.0);
         assert!(default_inner_height() >= 90.0);
+    }
+
+    // -- draw_rows scrolling (issue #84) and the row-pitch/centering
+    // regression harness (issue #83) ---------------------------------------
+
+    #[test]
+    fn row_content_width_matches_the_viewport_when_columns_need_no_shrinking() {
+        let total = 200.0;
+        let viewport = total + COLUMN_RIGHT_MARGIN + 50.0;
+        assert_eq!(row_content_width(viewport, total), viewport);
+    }
+
+    #[test]
+    fn row_content_width_still_tracks_a_narrowing_viewport_above_the_floor() {
+        let total = 200.0;
+        let floor = total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
+        let viewport = floor + 10.0;
+        assert_eq!(row_content_width(viewport, total), viewport);
+    }
+
+    #[test]
+    fn row_content_width_pins_to_the_floor_once_the_viewport_drops_below_it() {
+        let total = 200.0;
+        let floor = total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
+        let viewport = floor - 20.0;
+        let content = row_content_width(viewport, total);
+        assert_eq!(content, floor);
+        assert!(
+            content > viewport,
+            "content {content} must exceed the {viewport}pt viewport, or the ScrollArea has nothing to scroll to"
+        );
+    }
+
+    /// Every row shares the same damage, so `row_bar_frac` (relative to the
+    /// top row) is exactly `1.0` for all of them and `share_bar_paints`'
+    /// `fill_rect` therefore equals the *full* row rect for every row — the
+    /// only painted shape wide enough to use as each row's ground-truth
+    /// rect in `RowFrame::row_rects`.
+    fn rows_test_snapshot(n: usize) -> Snapshot {
+        Snapshot {
+            duration_ms: 90_000,
+            total_damage: 1_000 * n as i64,
+            total_dps: 12_345.0,
+            rows: (0..n)
+                .map(|i| PlayerRow {
+                    name: format!("P{i}"),
+                    damage: 1_000,
+                    ..sample_row(None)
+                })
+                .collect(),
+            encounter: EncounterInfo::default(),
+        }
+    }
+
+    /// One `draw_rows` frame's painted text and mesh geometry — mirrors
+    /// `HeaderFrame`/`collect_painted_boxes` (issue #75) but for the row
+    /// list (issue #83's regression harness): meshes rather than filled
+    /// rects, because `draw_row` paints the share bar and hover highlight
+    /// as gradient meshes (`Shape::Mesh`), never a flat `Shape::Rect`.
+    struct RowFrame {
+        texts: Vec<(String, egui::Rect)>,
+        meshes: Vec<egui::Rect>,
+    }
+
+    impl RowFrame {
+        /// The union of every text shape painted for `value` (a player
+        /// name here).
+        fn text_box(&self, value: &str) -> egui::Rect {
+            self.texts
+                .iter()
+                .filter(|(painted, _)| painted == value)
+                .map(|(_, rect)| *rect)
+                .reduce(egui::Rect::union)
+                .unwrap_or_else(|| panic!("draw_rows never painted {value:?}: {:?}", self.texts))
+        }
+
+        /// Every row's own rect, identified by `rows_test_snapshot`'s
+        /// equal-damage trick: nothing else `draw_row` paints is
+        /// `ROW_HEIGHT` tall — the accent line is
+        /// `SHARE_BAR_ACCENT_THICKNESS`, the hover highlight only paints
+        /// while hovered (never true in a static render), and the class
+        /// icon is `ICON_SIZE`. Sorted top-to-bottom so index `i` here
+        /// really is row `i`.
+        fn row_rects(&self) -> Vec<egui::Rect> {
+            let mut rects: Vec<egui::Rect> = self
+                .meshes
+                .iter()
+                .copied()
+                .filter(|r| (r.height() - ROW_HEIGHT).abs() < 0.01)
+                .collect();
+            rects.sort_by(|a, b| a.top().partial_cmp(&b.top()).unwrap());
+            rects
+        }
+    }
+
+    fn collect_row_boxes(shape: &egui::Shape, clip: egui::Rect, frame: &mut RowFrame) {
+        match shape {
+            egui::Shape::Text(text) => frame.texts.push((
+                text.galley.text().to_string(),
+                egui::Rect::from_min_size(text.pos, text.galley.size()).intersect(clip),
+            )),
+            egui::Shape::Mesh(mesh) => frame.meshes.push(mesh.calc_bounds().intersect(clip)),
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_row_boxes(s, clip, frame);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Renders `draw_rows` in a `screen_rect` of `width` x `height` and
+    /// hands back everything it painted — same pattern as
+    /// `header_painted_boxes` (issue #75), generalized to a caller-chosen
+    /// size so both the default-size regression harness (issue #83) and
+    /// the overflow/scroll tests below (issue #84) can reuse it. Measures
+    /// *inside* the `ScrollArea`'s own viewport clip, since
+    /// `collect_row_boxes` intersects every shape with the clip rect it was
+    /// actually painted under — exactly like `collect_painted_boxes` does.
+    fn rows_painted_boxes(snapshot: &Snapshot, width: f32, height: f32) -> RowFrame {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, height),
+            )),
+            ..Default::default()
+        };
+
+        let mut frame = RowFrame {
+            texts: Vec::new(),
+            meshes: Vec::new(),
+        };
+        let output = ctx.run_ui(input, |ui| {
+            draw_rows(ui, snapshot, &Settings::default().ordered_columns(), &icons);
+        });
+        for clipped in &output.shapes {
+            collect_row_boxes(&clipped.shape, clipped.clip_rect, &mut frame);
+        }
+        output.drop_without_applying_deltas();
+        frame
+    }
+
+    /// Just `draw_rows`' `ScrollArea` content size for a render at `width`
+    /// x `height` — the numeric half of the harness above, for tests that
+    /// only care whether scrolling was needed (issue #84), not the painted
+    /// geometry.
+    fn rows_content_size(snapshot: &Snapshot, width: f32, height: f32) -> egui::Vec2 {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, height),
+            )),
+            ..Default::default()
+        };
+        let mut content_size = egui::Vec2::ZERO;
+        let output = ctx.run_ui(input, |ui| {
+            content_size = draw_rows(ui, snapshot, &Settings::default().ordered_columns(), &icons);
+        });
+        output.drop_without_applying_deltas();
+        content_size
+    }
+
+    #[test]
+    fn no_scrolling_needed_when_the_default_window_fits_every_row() {
+        let snapshot = rows_test_snapshot(DEFAULT_VISIBLE_ROWS);
+        let content = rows_content_size(&snapshot, default_inner_width(), default_inner_height());
+        assert!(
+            content.x <= default_inner_width() + 0.01,
+            "content {content:?} must not exceed the {}pt default width",
+            default_inner_width()
+        );
+        assert!(
+            content.y <= default_inner_height() + 0.01,
+            "content {content:?} must not exceed the {}pt default height",
+            default_inner_height()
+        );
+    }
+
+    #[test]
+    fn scrolling_is_needed_once_rows_exceed_the_viewport_height() {
+        let snapshot = rows_test_snapshot(DEFAULT_VISIBLE_ROWS + 5);
+        let viewport_height = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
+        let content = rows_content_size(&snapshot, default_inner_width(), viewport_height);
+        assert!(
+            content.y > viewport_height,
+            "content {content:?} must exceed the {viewport_height}pt viewport for a scrollbar to be needed"
+        );
+    }
+
+    #[test]
+    fn scrolling_is_needed_once_the_viewport_narrows_past_the_column_scale_floor() {
+        let snapshot = rows_test_snapshot(1);
+        let stat_columns_total: f32 = stat_columns_for(&Settings::default().ordered_columns())
+            .iter()
+            .map(|c| c.width)
+            .sum();
+        let floor = stat_columns_total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
+        let narrow_viewport = floor - 20.0;
+        let content = rows_content_size(&snapshot, narrow_viewport, ROW_HEIGHT * 2.0);
+        assert!(
+            content.x > narrow_viewport,
+            "content {content:?} must exceed the narrowed {narrow_viewport}pt viewport once columns hit the {MIN_COLUMN_SCALE} floor"
+        );
+        assert!((content.x - floor).abs() < 0.5);
+    }
+
+    /// Issue #83's regression harness: proves `draw_rows`' pitch and
+    /// per-row centering directly from what it *paints*, mirroring
+    /// `HeaderFrame`/`header_painted_boxes` (issue #75) rather than trusting
+    /// that `ROW_HEIGHT`/`allocate_exact_size` never drift from what
+    /// actually lands on screen. Renders inside the `ScrollArea` issue #84
+    /// adds — `rows_painted_boxes` measures shapes intersected with the
+    /// clip rect they actually painted under, whatever that clip came from.
+    #[test]
+    fn rows_painted_boxes_are_exactly_row_height_apart() {
+        let snapshot = rows_test_snapshot(DEFAULT_VISIBLE_ROWS);
+        let frame = rows_painted_boxes(&snapshot, default_inner_width(), default_inner_height());
+        let rows = frame.row_rects();
+        assert_eq!(
+            rows.len(),
+            DEFAULT_VISIBLE_ROWS,
+            "expected one row rect per player row: {rows:?}"
+        );
+        for pair in rows.windows(2) {
+            let gap = pair[1].top() - pair[0].top();
+            assert!(
+                (gap - ROW_HEIGHT).abs() < 0.01,
+                "consecutive rows {pair:?} are {gap}pt apart, not {ROW_HEIGHT}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_rows_name_text_is_vertically_centered_in_its_row() {
+        let snapshot = rows_test_snapshot(DEFAULT_VISIBLE_ROWS);
+        let frame = rows_painted_boxes(&snapshot, default_inner_width(), default_inner_height());
+        let rows = frame.row_rects();
+        assert_eq!(rows.len(), DEFAULT_VISIBLE_ROWS);
+        for (i, row_rect) in rows.iter().enumerate() {
+            let name = format!("P{i}");
+            let text_rect = frame.text_box(&name);
+            let diff = (text_rect.center().y - row_rect.center().y).abs();
+            assert!(
+                diff < 0.5,
+                "row {i}: name center.y {} vs row center.y {} (diff {diff})",
+                text_rect.center().y,
+                row_rect.center().y
+            );
+        }
     }
 
     // -- window position tracking (issue #27) -----------------------------
