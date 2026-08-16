@@ -102,6 +102,14 @@ pub fn disable_aero_snap(cc: &eframe::CreationContext<'_>) {
     };
 
     let hwnd = HWND(win32.hwnd.get());
+    // Cached so `force_frame_recompute` — called from `ui.rs`, which only
+    // ever has an `egui::Context`, never a window handle — can find this
+    // window later without resorting to `GetForegroundWindow` or
+    // thread-window enumeration, either of which can resolve to the wrong
+    // window. Stored unconditionally, even if the rest of this function
+    // bails out below, since a partial Aero Snap workaround is still the
+    // same live window `force_frame_recompute` needs to reach.
+    OVERLAY_HWND.store(hwnd.0, std::sync::atomic::Ordering::SeqCst);
     // SAFETY: `hwnd` is winit's own handle for the window that owns this
     // `CreationContext`, which is alive and on the current thread for the
     // duration of this call.
@@ -168,6 +176,91 @@ pub fn disable_aero_snap(cc: &eframe::CreationContext<'_>) {
 
 #[cfg(not(windows))]
 pub fn disable_aero_snap(_cc: &eframe::CreationContext<'_>) {}
+
+/// The overlay's `HWND`, cached by `disable_aero_snap` at startup so
+/// `force_frame_recompute` below can find the window later. `0` means "not
+/// yet cached" (or `disable_aero_snap` never resolved a handle), which
+/// `force_frame_recompute` treats as a safe no-op.
+///
+/// A cached value rather than a fresh lookup at call time deliberately:
+/// `force_frame_recompute` runs from `ui.rs` call sites that only have an
+/// `egui::Context`, and both `GetForegroundWindow` and enumerating this
+/// thread's windows risk resolving to a *different* window (another
+/// always-on-top overlay, or whatever has focus mid-gesture) instead of this
+/// one.
+#[cfg(windows)]
+static OVERLAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Issue #74: forces DWM to recompute the overlay's frame, the same
+/// `SWP_FRAMECHANGED` `SetWindowPos` `disable_aero_snap` issues once at
+/// startup — see that function's comment for *why* this is needed at all
+/// (DWM keeps compositing against its opaque redirection surface, ignoring
+/// the per-pixel alpha `DwmEnableBlurBehindWindow` set up, until something
+/// forces this recompute).
+///
+/// Since issue #11's rework, every app-driven resize after startup
+/// (`ui.rs`'s manual drag-resize and the header collapse/expand) goes
+/// through `ViewportCommand::OuterPosition`/`InnerSize`/`MinInnerSize`
+/// instead of a raw `SetWindowPos`, so nothing after startup ever re-issued
+/// `SWP_FRAMECHANGED` — leaving the header opaque gray until some other
+/// resize happened to force a recompute. This is the call those `ui.rs`
+/// sites make once their resize has actually landed, using the `HWND`
+/// `disable_aero_snap` cached in `OVERLAY_HWND` above rather than a handle
+/// of their own (they don't have one).
+///
+/// `SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE` means this
+/// changes nothing but the frame, exactly like `disable_aero_snap`'s own
+/// call. Wrapped in `app_driven_reposition` for the same reason every direct
+/// `SetWindowPos` in this crate is: the no-op flags make it an unlikely veto
+/// target, but the invariant is "every call is wrapped", not "only the ones
+/// that could plausibly be vetoed".
+///
+/// Callers must fire this once per completed resize (gesture end, or a
+/// settled collapse/expand), never every frame of an in-progress one — the
+/// whole issue #11/#68 rework exists to keep manual resize out of native
+/// Win32 loops, and a `SetWindowPos` on every frame of an active drag risks
+/// feeding back into egui's own viewport sizing and reproducing #68's resize
+/// runaway.
+#[cfg(windows)]
+pub fn force_frame_recompute() {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+    };
+
+    let raw = OVERLAY_HWND.load(std::sync::atomic::Ordering::SeqCst);
+    if raw == 0 {
+        // Not yet cached — e.g. called before `disable_aero_snap` ran, which
+        // shouldn't happen but costs nothing to guard against instead of
+        // handing `SetWindowPos` a null handle.
+        return;
+    }
+    let hwnd = HWND(raw);
+
+    // SAFETY: `hwnd` was cached from winit's own handle for this window in
+    // `disable_aero_snap`; the window lives for the whole process, so the
+    // handle is still valid. `SWP_NOMOVE | SWP_NOSIZE` means the
+    // position/size arguments below are ignored.
+    let framechanged = app_driven_reposition(|| unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND(0),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )
+    });
+    if !framechanged.as_bool() {
+        log::warn!(
+            "SetWindowPos(SWP_FRAMECHANGED) failed after an app-driven resize; the window may keep painting opaque"
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn force_frame_recompute() {}
 
 /// A monitor's or window's rectangle in physical pixels / virtual-screen
 /// coordinates — so a monitor to the left of or above the primary one has

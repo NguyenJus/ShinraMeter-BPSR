@@ -12,19 +12,27 @@ use crate::pb;
 
 pub mod attr_id {
     pub const NAME: i32 = 0x01;
+    /// **Unverified** against live traffic. Critical to issue #76 ("No
+    /// target" in header). Confirm via `docs/packet-inspection.md`.
     pub const MONSTER_ID: i32 = 0x0A;
+    /// **Unverified** against live traffic. Critical to issue #76 ("No
+    /// target" in header). Confirm via `docs/packet-inspection.md`.
     pub const HP: i32 = 0x2C2E;
+    /// **Unverified** against live traffic. Critical to issue #76 ("No
+    /// target" in header). Confirm via `docs/packet-inspection.md`.
     pub const MAX_HP: i32 = 0x2C38;
     pub const PROFESSION_ID: i32 = 0xDC;
     pub const FIGHT_POINT: i32 = 0x272E;
     /// Reference-derived, **not yet verified against live traffic** (issue
     /// #15): reimplemented from BPSR-ZDPS's `EnumEAttrType.cs`
     /// (`AttrSeasonLevel = 10070`) because no packet capture was available.
-    /// Every other id in this module was confirmed against captured traffic
-    /// per `docs/packet-inspection.md`'s "Recording a result" convention —
-    /// this one, and `SEASON_STRENGTH` below, are the repo owner's sanctioned
-    /// exception to that rule. Re-verify against a real capture if one ever
-    /// becomes available.
+    /// Only `FIGHT_POINT` in this module has been confirmed against captured
+    /// traffic per `docs/packet-inspection.md`'s "Recording a result"
+    /// convention. The attr ids `MONSTER_ID`, `HP`, `MAX_HP` (above), and
+    /// this constant, along with `SEASON_STRENGTH` (below), are unverified
+    /// reference-derived guesses. Issue #76 tracks the impact of unverified
+    /// `MONSTER_ID` and `MAX_HP`. Re-verify against a real capture if one
+    /// ever becomes available.
     pub const SEASON_LEVEL: i32 = 0x2756;
     /// Reference-derived, **not yet verified against live traffic** (issue
     /// #15): reimplemented from BPSR-ZDPS's `EnumEAttrType.cs`
