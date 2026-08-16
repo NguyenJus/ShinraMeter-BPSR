@@ -1834,6 +1834,42 @@ fn cursor_points(x: i32, y: i32, pixels_per_point: f32) -> egui::Pos2 {
     egui::Pos2::new(x as f32 / scale, y as f32 / scale)
 }
 
+/// Writes `image` to the system clipboard as an image (issue #82's Share
+/// button — `ui.rs`'s `handle_screenshot_events` calls this once an
+/// `Event::Screenshot` reply arrives). Windows-gated like the rest of this
+/// module, per the app's own convention: it only ships on Windows in
+/// practice, and a failed clipboard write is a `log::warn!`, not a panic —
+/// there is no user-visible failure mode worth surfacing beyond the log for
+/// something this incidental.
+///
+/// `arboard::Clipboard::new` opens (and implicitly closes, on `Drop`) a
+/// fresh clipboard handle per call rather than caching one on `OverlayApp`:
+/// this fires at most once per click, so the overhead is irrelevant, and a
+/// short-lived handle can never be blamed for holding the system clipboard
+/// open across frames.
+#[cfg(windows)]
+pub fn write_clipboard_image(image: &egui::ColorImage) {
+    let [width, height] = image.size;
+    let data = arboard::ImageData {
+        width,
+        height,
+        bytes: std::borrow::Cow::Borrowed(image.as_raw()),
+    };
+    match arboard::Clipboard::new() {
+        Ok(mut clipboard) => {
+            if let Err(err) = clipboard.set_image(data) {
+                log::warn!("failed to write the screenshot to the clipboard: {err}");
+            }
+        }
+        Err(err) => log::warn!("failed to open the system clipboard: {err}"),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn write_clipboard_image(_image: &egui::ColorImage) {
+    log::warn!("clipboard image write is not supported on this platform");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

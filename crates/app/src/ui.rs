@@ -232,6 +232,15 @@ impl eframe::App for OverlayApp {
         let ctx = ui.ctx().clone();
         apply_theme(&ctx);
 
+        // Picks up the Share button's screenshot reply, if this frame has
+        // one (issue #82: `toggle_cluster` fired the request one or more
+        // frames ago via `ViewportCommand::Screenshot`; the round trip is
+        // asynchronous, so it can land on any later frame). Checked every
+        // frame, unconditionally, rather than only while collapsed/expanded
+        // state would suggest — a screenshot can be requested at any point
+        // in the header, which is always painted.
+        handle_screenshot_events(&ctx, crate::platform::write_clipboard_image);
+
         // Loaded once, lazily: the `egui::Context` above isn't available yet
         // at `OverlayApp::new`, so the first frame is what actually uploads
         // the icon textures (issues #9, #41); every later frame reuses them.
@@ -531,27 +540,35 @@ fn draw_header(
                 icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
             ),
         );
-        toggle_cluster(ui, icons);
+        toggle_cluster(ui, tx_command, icons);
     });
 }
 
-// -- status indicators (issue #62) ---------------------------------------
+// -- status indicators (issue #62, #82) -----------------------------------
 //
 // The source's fourth stat-row cell: a click-through LED, a cloud-upload LED
-// and a queue gauge, in a 22pt pill. We have none of those features, so
-// these render **in their off state and are inert** — no click handling, no
-// settings, no tooltip. Rendering them off is the honest reading: the
-// source's `OffBrush` is `#1fff` for both LEDs, and an empty queue gauge is
-// a bare ring with its check glyph, which is exactly the state a meter with
-// no upload queue is in. Rendering them *on* would claim capabilities that
-// do not exist. Issue #62 is explicit that no click-through or
-// cloud-upload feature exists and a use for these slots will be decided
-// later.
+// and a queue gauge, in a 22pt pill. We had none of those features, so all
+// three used to render **in their off state and inert** — no click
+// handling, no settings, no tooltip. Issue #62 was explicit that a use for
+// these slots would be decided later; issue #82 decides two of them: the
+// click-through and cloud-upload LEDs are repurposed as real buttons
+// (Share — copy a screenshot to the clipboard — and Reset, moved out of the
+// header dropdown), leaving only the queue gauge ring inert, since there is
+// still no upload queue for it to show.
 
-/// Tint every inert toggle glyph and the queue ring are painted with — the
-/// source's `OffBrush="#1fff"`.
+/// Tint the still-inert queue ring (and its check glyph) is painted with —
+/// the source's `OffBrush="#1fff"`.
 const TOGGLE_OFF_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x11);
+/// Tint the toggle cluster's two real buttons are painted with — the same
+/// half-white `TOOLBAR_ICON_TINT` every other clickable icon in this module
+/// uses, now that these two read as active controls rather than inert
+/// decoration.
+const TOGGLE_ACTIVE_COLOR: egui::Color32 = TOOLBAR_ICON_TINT;
+/// Circular hover wash painted behind a toggle-cluster button, matching the
+/// oval pill's own shape rather than a foreign square badge.
+const TOGGLE_HOVER_FILL: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 30);
 const TOGGLE_MOUSE_SIDE: f32 = 12.0;
 const TOGGLE_CLOUD_SIDE: f32 = 14.0;
 const TOGGLE_QUEUE_SIDE: f32 = 14.0;
@@ -559,17 +576,36 @@ const TOGGLE_QUEUE_GLYPH_SIDE: f32 = 6.0;
 const TOGGLE_GAP: f32 = 5.0;
 const TOGGLE_PAD_X: f32 = 4.0;
 
-/// Paints the three inert status toggles: a click-through LED (mouse-off), a
-/// cloud-upload LED (cloud-off), and a queue gauge (an empty ring with a
-/// check glyph — the source's backlog `Arc` overlay has nothing to draw with
-/// no queue). All in one `PILL_FILL` oval, matching the DPS/damage pills'
-/// chrome.
-///
-/// Allocated with `Sense::hover()` and its `Response` discarded — deliberately
-/// no `on_hover_text`, no `widget_info`: a labelled inert control is worse
-/// than an unlabelled decoration, since a screen reader announcing a
-/// tooltip for a control that does nothing would be actively misleading.
-fn toggle_cluster(ui: &mut egui::Ui, icons: &Icons) {
+/// One toggle-cluster button's hit box, hover highlight and accessible
+/// label. The painted glyph itself is the caller's job — Share and Reset
+/// draw from two different icon sets (`GlyphIcon` and `ToolbarIcon`) — so
+/// this only owns the interaction chrome shared by both. Same
+/// hand-supplied `widget_info`/`on_hover_text` shape as `menu_chevron`, and
+/// for the same reason: a raw `interact` `Response` carries no `WidgetInfo`
+/// from anywhere.
+fn toggle_button(ui: &egui::Ui, rect: egui::Rect, label: &str) -> egui::Response {
+    let response = ui.interact(
+        rect,
+        ui.id().with(("toggle_cluster", label)),
+        egui::Sense::click(),
+    );
+    if response.hovered() {
+        ui.painter()
+            .circle_filled(rect.center(), rect.width() / 2.0 + 2.0, TOGGLE_HOVER_FILL);
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label)
+    });
+    response.on_hover_text(label)
+}
+
+/// Paints the toggle cluster: the Share and Reset buttons (issue #82) and
+/// the still-inert queue gauge ring (an empty ring — the source's `Ellipse
+/// 14x14 Fill="#0aaa"` has alpha 0, so only the stroke is drawn — with the
+/// check glyph centered in it; no backlog arc, since there is still no
+/// queue for it to show). All in one `PILL_FILL` oval, matching the
+/// DPS/damage pills' chrome.
+fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Icons) {
     let height = ui.spacing().interact_size.y;
     let width = 2.0 * TOGGLE_PAD_X
         + TOGGLE_MOUSE_SIDE
@@ -578,42 +614,55 @@ fn toggle_cluster(ui: &mut egui::Ui, icons: &Icons) {
         + TOGGLE_GAP
         + TOGGLE_QUEUE_SIDE;
     let (rect, _response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    // deliberately no tooltip / no widget_info — see the section comment
-    // above.
 
     if !ui.is_rect_visible(rect) {
         return;
     }
-    let painter = ui.painter();
-    painter.rect_filled(rect, rect.height() / 2.0, PILL_FILL);
+    ui.painter()
+        .rect_filled(rect, rect.height() / 2.0, PILL_FILL);
 
     let mut x = rect.left() + TOGGLE_PAD_X;
     let y = rect.center().y;
 
-    if let Some(mouse_off) = icons.glyphs.get(GlyphIcon::MouseOff) {
-        let icon_rect = egui::Rect::from_center_size(
-            egui::pos2(x + TOGGLE_MOUSE_SIDE / 2.0, y),
-            egui::Vec2::splat(TOGGLE_MOUSE_SIDE),
-        );
-        painter.image(mouse_off.id(), icon_rect, UV_FULL, TOGGLE_OFF_COLOR);
+    // Share (issue #82): captures the app window as rendered this instant
+    // and copies it to the system clipboard as an image, replacing a manual
+    // screenshot. The capture is asynchronous — this only fires the
+    // request; `handle_screenshot_events` picks up the resulting
+    // `Event::Screenshot` on a later frame and does the actual clipboard
+    // write.
+    let share_rect = egui::Rect::from_center_size(
+        egui::pos2(x + TOGGLE_MOUSE_SIDE / 2.0, y),
+        egui::Vec2::splat(TOGGLE_MOUSE_SIDE),
+    );
+    if toggle_button(ui, share_rect, "Copy screenshot to clipboard").clicked() {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+    }
+    if let Some(share) = icons.glyphs.get(GlyphIcon::Share) {
+        ui.painter()
+            .image(share.id(), share_rect, UV_FULL, TOGGLE_ACTIVE_COLOR);
     }
     x += TOGGLE_MOUSE_SIDE + TOGGLE_GAP;
 
-    if let Some(cloud_off) = icons.glyphs.get(GlyphIcon::CloudOff) {
-        let icon_rect = egui::Rect::from_center_size(
-            egui::pos2(x + TOGGLE_CLOUD_SIDE / 2.0, y),
-            egui::Vec2::splat(TOGGLE_CLOUD_SIDE),
-        );
-        painter.image(cloud_off.id(), icon_rect, UV_FULL, TOGGLE_OFF_COLOR);
+    // Reset (issue #82): moved out of the header dropdown — `draw_header_menu`
+    // used to be its only trigger — into a one-click slot here, reusing the
+    // same `ToolbarIcon::Reset` texture and the same `UiCommand::Reset`.
+    let reset_rect = egui::Rect::from_center_size(
+        egui::pos2(x + TOGGLE_CLOUD_SIDE / 2.0, y),
+        egui::Vec2::splat(TOGGLE_CLOUD_SIDE),
+    );
+    if toggle_button(ui, reset_rect, "Reset").clicked() {
+        let _ = tx_command.try_send(UiCommand::Reset);
+    }
+    if let Some(reset) = icons.toolbar.get(ToolbarIcon::Reset) {
+        ui.painter()
+            .image(reset.id(), reset_rect, UV_FULL, TOGGLE_ACTIVE_COLOR);
     }
     x += TOGGLE_CLOUD_SIDE + TOGGLE_GAP;
 
-    // The queue gauge: an empty ring (the source's `Ellipse 14x14
-    // Fill="#0aaa"` has alpha 0, so only the stroke is drawn) with the check
-    // glyph centered in it. No backlog arc — with no queue there is nothing
-    // for it to show.
+    // The queue gauge stays inert — see the section comment above.
     let queue_center = egui::pos2(x + TOGGLE_QUEUE_SIDE / 2.0, y);
-    painter.circle_stroke(
+    ui.painter().circle_stroke(
         queue_center,
         TOGGLE_QUEUE_SIDE / 2.0,
         egui::Stroke::new(1.0, TOGGLE_OFF_COLOR),
@@ -621,8 +670,31 @@ fn toggle_cluster(ui: &mut egui::Ui, icons: &Icons) {
     if let Some(check) = icons.glyphs.get(GlyphIcon::Check) {
         let icon_rect =
             egui::Rect::from_center_size(queue_center, egui::Vec2::splat(TOGGLE_QUEUE_GLYPH_SIDE));
-        painter.image(check.id(), icon_rect, UV_FULL, TOGGLE_OFF_COLOR);
+        ui.painter()
+            .image(check.id(), icon_rect, UV_FULL, TOGGLE_OFF_COLOR);
     }
+}
+
+/// Scans this frame's input events for the reply to a screenshot request
+/// fired by the Share button (`toggle_cluster`'s
+/// `ViewportCommand::Screenshot`) and hands the captured image to `write`.
+/// Split out from the actual clipboard call so the routing — "a
+/// `Screenshot` event reaches the writer" — is unit-testable with a fake
+/// `write` and no live window or clipboard; the real call site
+/// (`OverlayApp::ui`) passes `platform::write_clipboard_image`.
+///
+/// A `Screenshot` event can only be `Event::Screenshot` in practice, but
+/// nothing stops another viewport's reply from showing up in a multi-
+/// viewport app; this app only ever has the root viewport, so every event
+/// this frame is implicitly ours.
+fn handle_screenshot_events(ctx: &egui::Context, mut write: impl FnMut(&egui::ColorImage)) {
+    ctx.input(|input| {
+        for event in &input.events {
+            if let egui::Event::Screenshot { image, .. } = event {
+                write(image);
+            }
+        }
+    });
 }
 
 /// Fixed display size, in points, every toolbar icon (issue #41) is drawn
@@ -1467,14 +1539,17 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
 /// helper per item, since egui's own `menu_button`/`SubMenuButton` already
 /// give every item free open/close state management.
 ///
-/// Order matches the spec: Reset, a Columns submenu (issue #13's stat
-/// column toggles, unchanged in behavior — just relocated), a separator,
+/// Order matches the spec: a Columns submenu (issue #13's stat column
+/// toggles, unchanged in behavior — just relocated), a separator,
 /// Collapse/Expand (issue #54's collapse-to-header, still driven by
 /// `CollapseState::toggle`), Minimize to tray, a separator, then Close.
+/// Reset used to be the first item here but moved into the header's toggle
+/// cluster (issue #82; see `toggle_cluster`), leaving this menu with no
+/// reset trigger of its own.
 ///
 /// The Columns submenu is given `PopupCloseBehavior::CloseOnClickOutside`
 /// explicitly: the *root* popup's default `CloseOnClick` is fine for the
-/// other items (a click on Reset/Collapse/Minimize/Close should dismiss the
+/// other items (a click on Collapse/Minimize/Close should dismiss the
 /// whole menu), but the same default on the submenu would dismiss the
 /// entire dropdown on every single checkbox toggle — verified against the
 /// vendored egui source (`containers/menu.rs`'s `SubMenu::show`): the root
@@ -1493,15 +1568,6 @@ fn draw_header_menu(
         settings,
         tx_settings,
     } = settings;
-    if ui
-        .add(menu_item_button(
-            icons.toolbar.get(ToolbarIcon::Reset),
-            "Reset",
-        ))
-        .clicked()
-    {
-        let _ = tx_command.try_send(UiCommand::Reset);
-    }
 
     let columns_button = menu_item_button(icons.toolbar.get(ToolbarIcon::Settings), "Columns")
         .right_text(egui::containers::menu::SubMenuButton::RIGHT_ARROW);
@@ -3434,11 +3500,13 @@ mod tests {
     }
 
     /// Issue #71: the window-control icon-button cluster (Close/Minimize/
-    /// Reset/Settings) no longer renders directly in the header's stat row
-    /// — those actions moved into the chevron's dropdown menu, which paints
+    /// Settings) no longer renders directly in the header's stat row —
+    /// those actions moved into the chevron's dropdown menu, which paints
     /// nothing until opened. A closed-menu frame must carry no accessible
     /// node labeled for any of the old buttons, only the chevron's own
-    /// "Menu" label.
+    /// "Menu" label. Reset is the one exception: issue #82 moved it back
+    /// out of the dropdown into the toggle cluster, so it (and the new
+    /// Share button) are expected to render directly now.
     #[test]
     fn draw_header_no_longer_renders_the_window_control_cluster() {
         let ctx = egui::Context::default();
@@ -3479,7 +3547,7 @@ mod tests {
             .collect();
         output.drop_without_applying_deltas();
 
-        for stale in ["Close", "Reset", "Settings", "Minimize"] {
+        for stale in ["Close", "Settings", "Minimize"] {
             assert!(
                 !labels.iter().any(|l| l == stale),
                 "stale window-control label {stale:?} still renders directly in the header: {labels:?}"
@@ -3488,6 +3556,14 @@ mod tests {
         assert!(
             labels.iter().any(|l| l == "Menu"),
             "expected the chevron's own \"Menu\" label, got {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "Reset"),
+            "expected the toggle cluster's Reset button, got {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "Copy screenshot to clipboard"),
+            "expected the toggle cluster's Share button, got {labels:?}"
         );
     }
 
@@ -3926,7 +4002,7 @@ mod tests {
             row_height,
         )
         .x;
-        // The three inert status toggles (decision 5): a fixed-width pill,
+        // The toggle cluster (decision 5, issue #82): a fixed-width pill,
         // not measured text.
         let toggles = 2.0 * TOGGLE_PAD_X
             + TOGGLE_MOUSE_SIDE
@@ -3947,56 +4023,63 @@ mod tests {
         );
     }
 
-    /// The source's `OffBrush="#1fff"`: every glyph the cluster blits — the
-    /// mouse-off LED, the cloud-off LED, and the queue gauge's check glyph —
-    /// is tinted `TOGGLE_OFF_COLOR`, never an "on" color, since none of
-    /// those features exist (decision 5).
+    /// Share and Reset (issue #82) are real buttons now, painted at
+    /// `TOGGLE_ACTIVE_COLOR`; only the still-inert queue gauge's check
+    /// glyph keeps the source's `OffBrush="#1fff"` tint.
     #[test]
-    fn the_status_toggles_render_in_their_off_state() {
+    fn the_toggle_cluster_renders_two_active_buttons_and_one_inert_gauge() {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         ctx.run_ui(egui::RawInput::default(), |_ui| {})
             .drop_without_applying_deltas();
         let icons = Icons::load(&ctx);
-        let mouse_off = icons.glyphs.get(GlyphIcon::MouseOff).unwrap().id();
-        let cloud_off = icons.glyphs.get(GlyphIcon::CloudOff).unwrap().id();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let share = icons.glyphs.get(GlyphIcon::Share).unwrap().id();
+        let reset = icons.toolbar.get(ToolbarIcon::Reset).unwrap().id();
         let check = icons.glyphs.get(GlyphIcon::Check).unwrap().id();
 
         let mut blits = Vec::new();
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &icons);
+            toggle_cluster(ui, &tx_command, &icons);
         });
         for clipped in &output.shapes {
             collect_image_texture_tints(&clipped.shape, &mut blits);
         }
         output.drop_without_applying_deltas();
 
-        for expected in [mouse_off, cloud_off, check] {
+        for expected in [share, reset] {
             let tint = blits
                 .iter()
                 .find(|(id, _)| *id == expected)
                 .map(|(_, c)| *c);
             assert_eq!(
                 tint,
-                Some(TOGGLE_OFF_COLOR),
-                "{expected:?} was not blitted at TOGGLE_OFF_COLOR: {blits:?}"
+                Some(TOGGLE_ACTIVE_COLOR),
+                "{expected:?} was not blitted at TOGGLE_ACTIVE_COLOR: {blits:?}"
             );
         }
+        let check_tint = blits.iter().find(|(id, _)| *id == check).map(|(_, c)| *c);
+        assert_eq!(
+            check_tint,
+            Some(TOGGLE_OFF_COLOR),
+            "the queue gauge's check glyph was not blitted at TOGGLE_OFF_COLOR: {blits:?}"
+        );
     }
 
-    /// The three status toggles are strictly non-interactive (decision 5,
-    /// issue #62): no click handling, no hover cursor, no tooltip that
-    /// implies they work. `widget_info` is never called for them, so no
-    /// accesskit node in the tree may claim a `Button` role.
+    /// The queue gauge stays strictly non-interactive (issue #62, #82): no
+    /// click handling, no hover cursor, no tooltip that implies it works.
+    /// Share and Reset, by contrast, must each expose exactly one `Button`
+    /// accesskit node — so the tree has exactly two, never three.
     #[test]
-    fn the_status_toggles_are_inert() {
+    fn the_queue_gauge_stays_inert_while_share_and_reset_are_real_buttons() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
 
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &icons);
+            toggle_cluster(ui, &tx_command, &icons);
         });
         let update = output
             .platform_output
@@ -4005,12 +4088,157 @@ mod tests {
             .expect("accesskit was enabled for this frame");
         output.drop_without_applying_deltas();
 
+        let button_count = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == egui::accesskit::Role::Button)
+            .count();
+        assert_eq!(
+            button_count, 2,
+            "expected exactly Share and Reset to expose a Button role, got {button_count}"
+        );
+    }
+
+    /// Clicking the Share button fires the screenshot capture request; the
+    /// clipboard write itself happens later, off `Event::Screenshot` (see
+    /// `handle_screenshot_events_routes_a_screenshot_event_to_the_writer`).
+    #[test]
+    fn clicking_share_sends_a_screenshot_viewport_command() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            toggle_cluster(ui, &tx_command, &icons);
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let share_pos = accessible_rect_for_label(&update, "Copy screenshot to clipboard").center();
+        layout.drop_without_applying_deltas();
+
+        let output = ctx.run_ui(click_at(share_pos), |ui| {
+            toggle_cluster(ui, &tx_command, &icons);
+        });
+        let commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
+        output.drop_without_applying_deltas();
+
         assert!(
-            update
-                .nodes
+            commands
                 .iter()
-                .all(|(_, node)| node.role() != egui::accesskit::Role::Button),
-            "the inert status toggles must never expose a Button role"
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::Screenshot(_))),
+            "Share must request a screenshot: {commands:?}"
+        );
+        assert!(
+            rx_command.try_recv().is_err(),
+            "Share must not also send a UiCommand"
+        );
+    }
+
+    /// Clicking the Reset button, now that it lives in the toggle cluster
+    /// instead of the header dropdown (issue #82), sends the same
+    /// `UiCommand::Reset` the old dropdown item did.
+    #[test]
+    fn clicking_reset_sends_the_reset_command() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            toggle_cluster(ui, &tx_command, &icons);
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let reset_pos = accessible_rect_for_label(&update, "Reset").center();
+        layout.drop_without_applying_deltas();
+
+        let output = ctx.run_ui(click_at(reset_pos), |ui| {
+            toggle_cluster(ui, &tx_command, &icons);
+        });
+        let commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            rx_command.try_recv().expect("Reset must send a command"),
+            UiCommand::Reset
+        );
+        assert!(
+            rx_command.try_recv().is_err(),
+            "Reset must not also queue a second command"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::Screenshot(_))),
+            "Reset must not also request a screenshot: {commands:?}"
+        );
+    }
+
+    /// `handle_screenshot_events` is the routing half of the Share round
+    /// trip: it must find a synthesized `Event::Screenshot` in this frame's
+    /// input and hand its image to the writer, without needing a live
+    /// window or a real clipboard.
+    #[test]
+    fn handle_screenshot_events_routes_a_screenshot_event_to_the_writer() {
+        let ctx = egui::Context::default();
+        let image = std::sync::Arc::new(egui::ColorImage::filled(
+            [2, 2],
+            egui::Color32::from_rgb(1, 2, 3),
+        ));
+        let input = egui::RawInput {
+            events: vec![egui::Event::Screenshot {
+                viewport_id: egui::ViewportId::ROOT,
+                user_data: egui::UserData::default(),
+                image: image.clone(),
+            }],
+            ..Default::default()
+        };
+
+        let mut written: Vec<egui::ColorImage> = Vec::new();
+        let output = ctx.run_ui(input, |_ui| {
+            handle_screenshot_events(&ctx, |img| written.push(img.clone()));
+        });
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            written.len(),
+            1,
+            "the screenshot event must reach the writer exactly once"
+        );
+        assert_eq!(written[0].size, [2, 2]);
+    }
+
+    /// A frame with no `Event::Screenshot` in it must never call the
+    /// writer — otherwise every idle frame would overwrite the clipboard.
+    #[test]
+    fn handle_screenshot_events_does_nothing_without_a_screenshot_event() {
+        let ctx = egui::Context::default();
+        let mut called = false;
+        let output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            handle_screenshot_events(&ctx, |_img| called = true);
+        });
+        output.drop_without_applying_deltas();
+
+        assert!(
+            !called,
+            "the writer must not run without a Screenshot event"
         );
     }
 
@@ -5529,17 +5757,13 @@ mod tests {
         }
     }
 
-    /// Reset and Close are built from structurally near-identical blocks in
-    /// `draw_header_menu` — icon, label, `.clicked()` guard, command
-    /// dispatch — exactly the shape a copy-paste slip could swap without
-    /// the compiler ever noticing. This drives real clicks through
-    /// `Response::clicked()`, the same path `draw_header_menu` itself
-    /// checks, rather than calling `tx_command.try_send` or
-    /// `ctx.send_viewport_cmd` directly — a swapped pairing between the two
-    /// blocks would still pass a test that only inspected the call sites in
-    /// isolation.
+    /// Reset moved out of this menu into the toggle cluster (issue #82;
+    /// see `clicking_reset_sends_the_reset_command`), leaving Close as the
+    /// only command this menu itself still dispatches. This drives a real
+    /// click through `Response::clicked()`, the same path `draw_header_menu`
+    /// itself checks, rather than calling `ctx.send_viewport_cmd` directly.
     #[test]
-    fn draw_header_menu_dispatches_reset_and_close_to_the_right_commands() {
+    fn draw_header_menu_dispatches_close_to_the_right_command() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         apply_theme(&ctx);
@@ -5550,8 +5774,8 @@ mod tests {
         let mut collapse = CollapseState::default();
 
         // Frame 1: lay the menu out with no input, and read back where
-        // AccessKit says "Reset" and "Close" actually painted — neither
-        // button's rect is knowable ahead of a real `draw_header_menu` run.
+        // AccessKit says "Close" actually painted — its rect isn't knowable
+        // ahead of a real `draw_header_menu` run.
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
             draw_header_menu(
                 ui,
@@ -5571,46 +5795,10 @@ mod tests {
             .accesskit_update
             .clone()
             .expect("accesskit was enabled for this frame");
-        let reset_pos = accessible_rect_for_label(&update, "Reset").center();
         let close_pos = accessible_rect_for_label(&update, "Close").center();
         layout.drop_without_applying_deltas();
 
-        // Frame 2: click Reset.
-        let output = ctx.run_ui(click_at(reset_pos), |ui| {
-            draw_header_menu(
-                ui,
-                &ctx,
-                &tx_command,
-                SettingsHandle {
-                    settings: &mut settings,
-                    tx_settings: &tx_settings,
-                },
-                &icons,
-                &mut collapse,
-                40.0,
-            );
-        });
-        let reset_commands = output
-            .viewport_output
-            .get(&egui::ViewportId::ROOT)
-            .map(|viewport| viewport.commands.clone())
-            .unwrap_or_default();
-        output.drop_without_applying_deltas();
-
-        assert_eq!(
-            rx_command.try_recv().expect("Reset must send a command"),
-            UiCommand::Reset
-        );
-        assert!(
-            rx_command.try_recv().is_err(),
-            "Reset must not also queue a second command"
-        );
-        assert!(
-            !reset_commands.contains(&egui::ViewportCommand::Close),
-            "Reset must not also close the window: {reset_commands:?}"
-        );
-
-        // Frame 3: click Close.
+        // Frame 2: click Close.
         let output = ctx.run_ui(click_at(close_pos), |ui| {
             draw_header_menu(
                 ui,
