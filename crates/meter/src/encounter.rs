@@ -437,7 +437,7 @@ impl Meter {
         // fight is running (the tail of a pull the user just reset away)
         // can't leave a stale end time latched for the *next* fight to trip
         // over.
-        if recognized && self.fight_start_ms.is_some() {
+        if recognized && self.fight_start_ms.is_some() && self.fight_end_ms.is_none() {
             self.fight_end_ms = Some(now_ms);
         }
     }
@@ -1676,6 +1676,27 @@ mod tests {
             m.apply(&hp(10, 0, Some(103), 1_000));
 
             assert_eq!(m.fight_state(1_100), FightState::Ended);
+        }
+
+        #[test]
+        fn a_second_zero_hp_sync_does_not_drift_the_latched_end() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0, false));
+            m.apply(&hp(10, 50, Some(103), 500));
+            m.apply(&hp(10, 0, Some(103), 1_000));
+
+            let held = m.snapshot(60_000);
+            assert_eq!(held.duration_ms, 1_000);
+
+            // A duplicate zero-HP sync for the same, already-dead boss,
+            // arriving long after the fight was latched as ended: the
+            // latch must be once-only, or this re-enters
+            // `end_fight_on_boss_death` and drags `fight_end_ms` (and thus
+            // the frozen duration) forward.
+            m.apply(&hp(10, 0, Some(103), 500_000));
+
+            let later = m.snapshot(600_000);
+            assert_eq!(later.duration_ms, held.duration_ms);
         }
 
         #[test]
