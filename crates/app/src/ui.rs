@@ -403,6 +403,7 @@ fn draw_header(
     // leaves exactly this band on screen, so the two are the same number by
     // construction rather than by a hardcoded constant that could drift.
     let band_height = header_band_height(subtitle.is_some(), ui.spacing().interact_size.y);
+    let text_band_height = header_text_band_height(subtitle.is_some());
 
     // The panel's own full-width rect, captured before the band below
     // narrows it to the drag band's height — the background wash (issue #59,
@@ -410,14 +411,20 @@ fn draw_header(
     // the band does on its own (`HEADER_WASH_HEIGHT` vs `band_height`).
     let panel = ui.available_rect_before_wrap();
     // The header band's full paint extent — `panel` truncated to
-    // `band_height`, with no top adjustment. Used to clip anything painted
-    // in the header (the gutter emblem) so it cannot bleed into the rows
-    // below, without also chopping off the bleed *above* the row that
-    // `HEADER_EMBLEM_OFFSET` deliberately produces — `RESIZE_EDGE` is a
+    // `band_height`, with no top adjustment. `RESIZE_EDGE` is a
     // hit-test-only concern (see `band` below), not a paint boundary; the
     // panel's own fill/border already cover that strip.
     let header_paint_clip =
         egui::Rect::from_min_size(panel.min, egui::vec2(panel.width(), band_height));
+    // What the gutter emblem may paint into (issue #75): the header's *text*
+    // rows only, not the whole band. Its 60pt box hangs well below a 20pt
+    // title row, and the stat-pill row underneath has no gutter to hang into
+    // — the timer half-pill is flush against the same left border — so ink
+    // reaching that row lands straight on the pill, under a 6%-alpha fill
+    // and behind a clock glyph tinted at a third alpha. Clipping to the
+    // text band still keeps the intentional bleed off the left edge.
+    let emblem_clip =
+        egui::Rect::from_min_size(panel.min, egui::vec2(panel.width(), text_band_height));
     // The whole header band is the drag surface — title line, the optional
     // subtitle line, and the timer/DPS/buttons row — registered *before* the
     // row's contents so the buttons drawn into it end up on top and still get
@@ -450,13 +457,13 @@ fn draw_header(
     // entirely — not rendered blank — when the scene is unknown (issue #9
     // slice 2).
     let title_row = draw_title_line(ui, &title);
-    // The gutter emblem (issue #59): bled off the left edge and above the
-    // row's top, clipped to the header's own paint extent so it stays clear
-    // of the rows below without cropping the intentional bleed above.
+    // The gutter emblem (issue #59): bled off the left edge and centered on
+    // the header's text rows, clipped to them (`emblem_clip`, issue #75) so
+    // it stays clear of the stat-pill row below.
     if let Some(emblem) = icons.glyphs.get(GlyphIcon::Emblem) {
-        ui.painter().with_clip_rect(header_paint_clip).image(
+        ui.painter().with_clip_rect(emblem_clip).image(
             emblem.id(),
-            header_emblem_rect(title_row),
+            header_emblem_rect(title_row, text_band_height),
             UV_FULL,
             HEADER_EMBLEM_COLOR,
         );
@@ -1000,10 +1007,20 @@ fn stat_pill(ui: &mut egui::Ui, pill: StatPill<'_>) -> egui::Response {
 /// own to allocate from, it paints into a row rect that was already
 /// allocated, at an x the column anchors dictate.
 fn pill_text_size(painter: &egui::Painter, pill: &StatPill<'_>) -> egui::Vec2 {
-    painter
+    let mut size = painter
         .layout_no_wrap(pill.value.to_owned(), bold(pill.size), pill.value_color)
         .rect
-        .size()
+        .size();
+    // The value is painted through `paint_bold_text`, which on the faux-bold
+    // path lays the same galley down twice, the second pass `FAUX_BOLD_OFFSET`
+    // to the right — so what lands on screen is that much wider than what
+    // epaint measured. Counting it here keeps the pill's width and its
+    // icon's x (both derived from this) matching the ink instead of eating
+    // the difference out of `PILL_ICON_GAP`.
+    if !fonts::has_real_bold() {
+        size.x += FAUX_BOLD_OFFSET;
+    }
+    size
 }
 
 /// Paints a pill's fill, optional stroke, value and icon into `rect`. The
@@ -1149,12 +1166,27 @@ fn header_text_rect(row: egui::Rect) -> egui::Rect {
 /// Extracted from `draw_header` so the two cases are unit-testable without a
 /// live `egui::Ui`.
 fn header_band_height(has_subtitle: bool, button_row_height: f32) -> f32 {
-    let gap_count = if has_subtitle { 2 } else { 1 };
-    let mut height = TITLE_LINE_HEIGHT + button_row_height + gap_count as f32 * ITEM_SPACING_Y;
+    header_text_band_height(has_subtitle) + ITEM_SPACING_Y + button_row_height
+}
+
+/// Height of the header's *text* rows alone: the title line plus, when the
+/// scene is known, the gap and the subtitle line under it — the source's
+/// `Height="36"` header grid.
+///
+/// This, not the whole drag band, is the block the left gutter belongs to:
+/// `header_text_rect` indents these rows by `HEADER_GUTTER_WIDTH` to leave
+/// room for the emblem, while the stat-pill row below them has no gutter at
+/// all — its timer half-pill is deliberately flush against the panel's left
+/// border, in exactly the column the emblem occupies. So the emblem is both
+/// centered in this height and clipped to it (issue #75); a clip to the full
+/// band instead let its ink paint straight through the timer pill, whose
+/// fill is 6% alpha and whose clock glyph is tinted at a third alpha.
+fn header_text_band_height(has_subtitle: bool) -> f32 {
     if has_subtitle {
-        height += SUBTITLE_LINE_HEIGHT;
+        TITLE_LINE_HEIGHT + ITEM_SPACING_Y + SUBTITLE_LINE_HEIGHT
+    } else {
+        TITLE_LINE_HEIGHT
     }
-    height
 }
 
 /// Paints the header's title line (boss name/id/placeholder) at a fixed
@@ -1194,19 +1226,33 @@ fn draw_title_line(ui: &mut egui::Ui, text: &str) -> egui::Rect {
 /// left edge by `Margin="-26 0 0 -8"` and clipped to the header band, so only
 /// its right two-thirds are ever on screen.
 const HEADER_EMBLEM_SIZE: f32 = 60.0;
-/// The WPF centering resolves to a top edge 8pt above the band (available
-/// height `36 - (-8) = 44`, offset `(44 - 60)/2 = -8`), which is exactly
-/// `row.top() - 8.0` — hence this single offset vector covering both axes.
-const HEADER_EMBLEM_OFFSET: egui::Vec2 = egui::vec2(-26.0, -8.0);
+/// The `Margin`'s left component: the emblem hangs 26pt off the left edge of
+/// the header rows, so only its right `60 - 26 = 34`pt — one
+/// `HEADER_GUTTER_WIDTH` — is ever on screen.
+const HEADER_EMBLEM_LEFT_BLEED: f32 = -26.0;
+/// The `Margin`'s bottom component (`-8`): a *negative* bottom margin, which
+/// in WPF adds to the height the emblem is centered in rather than moving
+/// it. With the source's 36pt header grid that gives `(36 + 8 - 60)/2 = -8`,
+/// i.e. a top edge 8pt above the grid — but the grid is only 36pt tall when
+/// the subtitle line is present, so `header_emblem_rect` recomputes the
+/// centering from the text band it is actually given instead of baking that
+/// one case in (issue #75).
+const HEADER_EMBLEM_BOTTOM_BLEED: f32 = 8.0;
 /// `Fill="SlateGray"`.
 const HEADER_EMBLEM_COLOR: egui::Color32 = egui::Color32::from_rgb(0x70, 0x80, 0x90);
 
-/// Where the header emblem's 60x60 box sits for a title row of `row`. Pure
-/// geometry, so the negative-margin bleed is unit-testable without a
-/// painter.
-fn header_emblem_rect(row: egui::Rect) -> egui::Rect {
+/// Where the header emblem's 60x60 box sits: bled off the left of the title
+/// row `row`, and vertically centered on the header's text band
+/// (`text_band_height`, plus the source's negative bottom margin) that
+/// starts at that row's top. Pure geometry, so the negative-margin bleed is
+/// unit-testable without a painter.
+fn header_emblem_rect(row: egui::Rect, text_band_height: f32) -> egui::Rect {
+    let available = text_band_height + HEADER_EMBLEM_BOTTOM_BLEED;
     egui::Rect::from_min_size(
-        row.min + HEADER_EMBLEM_OFFSET,
+        egui::pos2(
+            row.left() + HEADER_EMBLEM_LEFT_BLEED,
+            row.top() + (available - HEADER_EMBLEM_SIZE) / 2.0,
+        ),
         egui::Vec2::splat(HEADER_EMBLEM_SIZE),
     )
 }
@@ -1677,6 +1723,12 @@ impl CollapseState {
                     inner.width(),
                     collapsed.restore_height,
                 )));
+                // Issue #74: an app-driven resize outside `disable_aero_snap`'s
+                // one startup call never re-triggers DWM's frame recompute on
+                // its own, leaving the header opaque gray. Fired once here —
+                // `toggle` runs once per chevron click, never per frame — see
+                // `platform::force_frame_recompute`'s doc comment.
+                crate::platform::force_frame_recompute();
             }
             None => {
                 self.collapsed = Some(Collapsed {
@@ -1733,6 +1785,11 @@ impl CollapseState {
             height,
         )));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, height)));
+        // Issue #74: see the identical call (and comment) in `toggle` above.
+        // This fires once per call here too — `sync`'s `CollapseSync::Request`
+        // branch that reaches this only runs when the band height has
+        // actually changed, not every frame while collapsed.
+        crate::platform::force_frame_recompute();
     }
 }
 
@@ -1874,6 +1931,20 @@ fn gesture_pointer(
     os_cursor.unwrap_or_else(|| window.min + local.to_vec2())
 }
 
+/// Issue #74: whether a gesture of `kind` ending should force a DWM frame
+/// recompute (`platform::force_frame_recompute`). Only resizes actually
+/// change the window's size, and the opaque-gray symptom this works around
+/// is a DWM composition artifact left behind by a resize — a pure `Move`
+/// gesture ending has nothing to recompute a frame for.
+///
+/// Pulled out of `drive_window_gesture` as a pure function, the same way
+/// `row_bar_frac`/`share_bar_paints`/`column_anchors` extract pure decisions
+/// out of `Ui`-dependent code elsewhere in this file, so this call-site
+/// choice is unit-testable without a window.
+fn gesture_end_needs_frame_recompute(kind: GestureKind) -> bool {
+    matches!(kind, GestureKind::Resize(_))
+}
+
 /// Starts `kind` from wherever the pointer and window are right now.
 fn begin_window_gesture(ctx: &egui::Context, gesture: &mut WindowGesture, kind: GestureKind) {
     // No position reported yet (a frame before winit has placed the
@@ -1918,6 +1989,15 @@ fn drive_window_gesture(ctx: &egui::Context, gesture: &mut WindowGesture, min_si
     if !holding {
         log::debug!("drive_window_gesture: ending {kind:?}");
         gesture.end();
+        // Issue #74: fired exactly once here, on the single frame a gesture
+        // transitions from active to ended — the next frame `gesture.kind()`
+        // is `None` and this whole function returns before reaching this
+        // point again, so this can never fire on every frame of an
+        // in-progress drag (which would risk reproducing issue #68's resize
+        // runaway; see `platform::force_frame_recompute`'s doc comment).
+        if gesture_end_needs_frame_recompute(kind) {
+            crate::platform::force_frame_recompute();
+        }
         return;
     }
 
@@ -2105,8 +2185,16 @@ fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot, columns: &[ColumnKind], ico
     let avail = ui.available_rect_before_wrap();
     let anchors = column_anchors(avail.left(), avail.right(), &stat_columns, 4.0);
 
+    // Issue #73: each row's damage-share bar is now scaled to the *top
+    // row's* damage rather than to its share of total encounter damage, so
+    // the highest-damage row always fills the full bar width. `snapshot.rows`
+    // is already sorted descending by damage (`Encounter::snapshot`), so the
+    // top row's damage is just the first row's, computed once here rather
+    // than once per row inside `draw_row`.
+    let top_damage = snapshot.rows.first().map(|r| r.damage).unwrap_or(0);
+
     for row in &snapshot.rows {
-        draw_row(ui, row, columns, &stat_columns, &anchors, icons);
+        draw_row(ui, row, columns, &stat_columns, &anchors, icons, top_damage);
     }
 }
 
@@ -2291,17 +2379,21 @@ fn draw_row(
     columns: &[StatColumn],
     anchors: &[f32],
     icons: &Icons,
+    top_damage: i64,
 ) {
     let desired_size = egui::vec2(ui.available_width(), ROW_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
 
-    // Proportional background bar scaled by this player's damage share.
-    // Painted before (i.e. under) the icon and name, and still spans the
-    // row's full width — the icon slot is reserved on top of it, not cut
-    // out of it. A vertically graded fill plus a full-width, horizontally
-    // graded accent line along the bottom edge, matching the reference
-    // meter's gradients exactly (square corners — no rounding).
-    let paints = share_bar_paints(rect, row.share_pct, row.class);
+    // Background bar scaled by this row's damage relative to the *top row's*
+    // damage, not this row's share of total encounter damage (issue #73) —
+    // the highest-damage row always fills the full bar width. Painted before
+    // (i.e. under) the icon and name; the icon slot is reserved on top of
+    // it, not cut out of it. A vertically graded fill plus a horizontally
+    // graded accent line along the bottom edge — the accent now matches the
+    // fill's width rather than always spanning the full row — matching the
+    // reference meter's gradients exactly (square corners — no rounding).
+    let bar_frac = row_bar_frac(row.damage, top_damage);
+    let paints = share_bar_paints(rect, bar_frac, row.class);
     ui.painter().add(egui::Shape::mesh(vertical_gradient_mesh(
         paints.fill_rect,
         egui::Color32::TRANSPARENT,
@@ -2448,16 +2540,13 @@ fn counter_pill_rect(row: egui::Rect, anchor: f32, size: egui::Vec2) -> egui::Re
 /// (issue #43) so the fill/accent alpha split and accent thickness stay
 /// fixed regardless of which color a role uses — only the hue varies.
 ///
-/// Chosen for legibility at the fill's low bottom alpha
-/// (`SHARE_BAR_FILL_BOTTOM_ALPHA` = 46 of 255, fading to 0 at the top)
-/// painted over the panel fill (`PANEL_FILL`, see `apply_theme`): each hue
-/// keeps enough saturation and mid-range brightness that the fill still
-/// reads as a distinct color rather than fading to gray, while the accent
-/// line's much higher alpha (26 -> 255 left to right) makes the same RGB
-/// read as a near-solid, clearly role-colored strip at its right edge.
-const SHARE_BAR_RGB_HEALER: (u8, u8, u8) = (70, 200, 120);
-const SHARE_BAR_RGB_TANK: (u8, u8, u8) = (60, 120, 220);
-const SHARE_BAR_RGB_DAMAGE: (u8, u8, u8) = (220, 80, 70);
+/// Sampled directly from the game's own class-icon tints
+/// (`docs/reference/role-colors.webp`, issue #77) rather than hand-picked
+/// for legibility — these are the exact hues the game itself uses for each
+/// role's icon.
+const SHARE_BAR_RGB_HEALER: (u8, u8, u8) = (131, 196, 154);
+const SHARE_BAR_RGB_TANK: (u8, u8, u8) = (104, 166, 205);
+const SHARE_BAR_RGB_DAMAGE: (u8, u8, u8) = (219, 135, 135);
 /// Fallback for `Class::Unknown` (or a row with no `Class` at all). A
 /// desaturated grey rather than any role's hue: reusing a role color here
 /// (as this once did with `SHARE_BAR_RGB_TANK`'s blue) would make an
@@ -2557,8 +2646,8 @@ fn row_hover_quads(rect: egui::Rect) -> [(egui::Rect, egui::Color32, egui::Color
 }
 
 /// The two paints that make up a row's damage-share bar: a share-scaled
-/// fill, vertically graded transparent -> `fill_bottom`, and a full-row-
-/// width accent line, horizontally graded `accent_left` -> `accent_right`.
+/// fill, vertically graded transparent -> `fill_bottom`, and an accent line
+/// of the same width, horizontally graded `accent_left` -> `accent_right`.
 /// Named fields rather than a positional tuple so a fill/accent (or
 /// rect/color) mix-up at the `draw_row` call site fails to compile instead
 /// of silently swapping which paint lands where.
@@ -2566,9 +2655,9 @@ struct ShareBarPaints {
     /// The share-scaled fill, vertically graded transparent -> `fill_bottom`.
     fill_rect: egui::Rect,
     fill_bottom: egui::Color32,
-    /// The accent line. Always the **full** row width — in the source it is
-    /// a sibling of the bar fill, not a child, so it is decoupled from the
-    /// player's share.
+    /// The accent line. Issue #73: its width now matches `fill_rect`'s
+    /// width exactly, so the accent underline stops exactly where the
+    /// gradient fill stops rather than always spanning the full row.
     accent_rect: egui::Rect,
     accent_left: egui::Color32,
     accent_right: egui::Color32,
@@ -2586,19 +2675,34 @@ fn share_bar_rgb(class: Option<Class>) -> (u8, u8, u8) {
     }
 }
 
+/// Computes a row's damage-share bar fraction (issue #73): `damage` scaled
+/// against `top_damage` — the highest-damage row in the current snapshot —
+/// rather than against total encounter damage, so the top row's bar always
+/// fills the full width regardless of how dominant it is over the rest of
+/// the raid. Guards against a zero or negative `top_damage` (an empty or
+/// degenerate snapshot) by returning `0.0` rather than dividing.
+fn row_bar_frac(damage: i64, top_damage: i64) -> f32 {
+    if top_damage <= 0 {
+        0.0
+    } else {
+        (damage as f64 / top_damage as f64) as f32
+    }
+}
+
 /// Computes the two paints that make up a row's damage-share bar: a
-/// share-scaled fill, vertically graded transparent -> `fill_bottom`, and a
-/// full-row-width accent line, horizontally graded `accent_left` ->
-/// `accent_right` along its bottom edge. The fill's width already matches
-/// the source (`share_pct` is share of total encounter damage); it is the
-/// accent line that is decoupled from it — in the source it is a sibling of
-/// the bar fill, not a child, so it always spans the row's full width
-/// regardless of this player's share. Both paints share the same
-/// role-derived hue (`share_bar_rgb`, issue #44) and differ only in alpha.
-/// Pure geometry/color math with no `egui::Ui` dependency, so it's
-/// unit-testable on its own — `draw_row` just paints whatever it returns.
-fn share_bar_paints(rect: egui::Rect, share_pct: f32, class: Option<Class>) -> ShareBarPaints {
-    let bar_frac = (share_pct / 100.0).clamp(0.0, 1.0);
+/// `bar_frac`-scaled fill, vertically graded transparent -> `fill_bottom`,
+/// and an accent line of the same width, horizontally graded `accent_left`
+/// -> `accent_right` along its bottom edge (issue #73: the accent used to
+/// always span the row's full width; it now matches the fill exactly, so
+/// the underline stops where the gradient fill stops). `bar_frac` is a
+/// 0.0-1.0 fraction — `draw_row` derives it from `row_bar_frac`, i.e. this
+/// row's damage relative to the top row's, not this row's share of total
+/// encounter damage. Both paints share the same role-derived hue
+/// (`share_bar_rgb`, issue #44) and differ only in alpha. Pure geometry/
+/// color math with no `egui::Ui` dependency, so it's unit-testable on its
+/// own — `draw_row` just paints whatever it returns.
+fn share_bar_paints(rect: egui::Rect, bar_frac: f32, class: Option<Class>) -> ShareBarPaints {
+    let bar_frac = bar_frac.clamp(0.0, 1.0);
     let bar_width = rect.width() * bar_frac;
 
     let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(bar_width, rect.height()));
@@ -2606,7 +2710,7 @@ fn share_bar_paints(rect: egui::Rect, share_pct: f32, class: Option<Class>) -> S
     let thickness = SHARE_BAR_ACCENT_THICKNESS.min(rect.height());
     let accent_rect = egui::Rect::from_min_size(
         egui::pos2(rect.min.x, rect.max.y - thickness),
-        egui::vec2(rect.width(), thickness),
+        egui::vec2(bar_width, thickness),
     );
 
     let (r, g, b) = share_bar_rgb(class);
@@ -3071,6 +3175,196 @@ mod tests {
         texts
     }
 
+    /// One header frame's painted geometry: every text, image blit and
+    /// filled rect, each already intersected with the clip rect it was
+    /// painted under. Issue #75: without a screenshot of the Windows build,
+    /// measuring the boxes a frame really painted is the only way to check
+    /// what the header looks like — `collect_text_shapes` throws the
+    /// geometry away, and the pure-geometry pill tests only prove
+    /// `pill_size` and `pill_content_layout` agree with *each other*, not
+    /// that the paint agrees with them or that nothing else lands on top.
+    struct HeaderFrame {
+        texts: Vec<(String, egui::Rect)>,
+        images: Vec<(egui::TextureId, egui::Rect)>,
+        rects: Vec<(egui::Color32, egui::Rect)>,
+        glyphs: Vec<(GlyphIcon, egui::TextureId)>,
+    }
+
+    impl HeaderFrame {
+        /// The union of every text shape painted for `value` — plural
+        /// because the faux-bold pass paints the same string twice, and both
+        /// passes together are what the eye sees.
+        fn text_box(&self, value: &str) -> egui::Rect {
+            self.texts
+                .iter()
+                .filter(|(painted, _)| painted == value)
+                .map(|(_, rect)| *rect)
+                .reduce(egui::Rect::union)
+                .unwrap_or_else(|| panic!("the header never painted {value:?}: {:?}", self.texts))
+        }
+
+        /// Every *visible* box `glyph` was blitted into — blits clipped away
+        /// entirely are dropped, since an empty intersection is exactly what
+        /// "this never reached the screen" looks like.
+        fn glyph_boxes(&self, glyph: GlyphIcon) -> Vec<egui::Rect> {
+            let id = self
+                .glyphs
+                .iter()
+                .find(|(painted, _)| *painted == glyph)
+                .map(|(_, id)| *id)
+                .unwrap_or_else(|| panic!("{glyph:?} has no texture"));
+            self.images
+                .iter()
+                .filter(|(painted, rect)| *painted == id && rect.is_positive())
+                .map(|(_, rect)| *rect)
+                .collect()
+        }
+
+        /// The box of the (single) rect filled with `fill` — how a pill's
+        /// own chrome is identified, since each pill kind has its own fill.
+        fn fill_box(&self, fill: egui::Color32) -> egui::Rect {
+            self.rects
+                .iter()
+                .find(|(painted, _)| *painted == fill)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("the header never filled a {fill:?} rect"))
+        }
+    }
+
+    /// Walks a painted `Shape`, collecting the rect of every text, image and
+    /// filled rect in it, clipped to `clip` — the clip rect is half the
+    /// geometry for anything painted through `Painter::with_clip_rect`, so
+    /// ignoring it would measure boxes the screen never shows.
+    fn collect_painted_boxes(shape: &egui::Shape, clip: egui::Rect, frame: &mut HeaderFrame) {
+        match shape {
+            egui::Shape::Text(text) => frame.texts.push((
+                text.galley.text().to_string(),
+                egui::Rect::from_min_size(text.pos, text.galley.size()).intersect(clip),
+            )),
+            egui::Shape::Mesh(mesh) => frame
+                .images
+                .push((mesh.texture_id, mesh.calc_bounds().intersect(clip))),
+            egui::Shape::Rect(rect) => frame.rects.push((rect.fill, rect.rect.intersect(clip))),
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_painted_boxes(s, clip, frame);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Renders `draw_header` at the app's real default window size and hands
+    /// back everything it painted. The size matters: the header's decoration
+    /// is positioned off the panel's own edges, so the unbounded width a
+    /// bare `RawInput` implies would put it where the app never paints it.
+    fn header_painted_boxes(snapshot: &Snapshot) -> HeaderFrame {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let glyphs: Vec<(GlyphIcon, egui::TextureId)> = [
+            GlyphIcon::Emblem,
+            GlyphIcon::Timer,
+            GlyphIcon::Speed,
+            GlyphIcon::Heart,
+        ]
+        .into_iter()
+        .filter_map(|glyph| icons.glyphs.get(glyph).map(|texture| (glyph, texture.id())))
+        .collect();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(default_inner_width(), default_inner_height()),
+            )),
+            ..Default::default()
+        };
+
+        let mut frame = HeaderFrame {
+            texts: Vec::new(),
+            images: Vec::new(),
+            rects: Vec::new(),
+            glyphs,
+        };
+        let output = ctx.run_ui(input, |ui| {
+            draw_header(
+                ui,
+                &ctx,
+                snapshot,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                ChromeHandle {
+                    gesture: &mut WindowGesture::default(),
+                    collapse: &mut CollapseState::default(),
+                },
+            );
+        });
+        for clipped in &output.shapes {
+            collect_painted_boxes(&clipped.shape, clipped.clip_rect, &mut frame);
+        }
+        output.drop_without_applying_deltas();
+        frame
+    }
+
+    /// Issue #75: the timer half-pill's clock glyph must not overlap the
+    /// duration it leads, measured on the shapes `draw_header` *actually
+    /// paints*, and both must sit inside the pill's own filled box.
+    #[test]
+    fn the_timer_pills_clock_glyph_never_overlaps_its_value() {
+        let snapshot = header_test_snapshot(30_100_000_000);
+        let frame = header_painted_boxes(&snapshot);
+
+        let pill = frame.fill_box(TIMER_PILL_FILL);
+        let value = frame.text_box(&fmt_duration(snapshot.duration_ms));
+        let glyphs = frame.glyph_boxes(GlyphIcon::Timer);
+        assert_eq!(
+            glyphs.len(),
+            1,
+            "expected exactly one clock blit: {glyphs:?}"
+        );
+        let glyph = glyphs[0];
+
+        let gap = value.left() - glyph.right();
+        assert!(
+            gap >= PILL_ICON_GAP - 0.01,
+            "the clock glyph {glyph:?} and the value {value:?} are only {gap}pt apart \
+             (want {PILL_ICON_GAP}) inside pill {pill:?}"
+        );
+        for (what, rect) in [("glyph", glyph), ("value", value)] {
+            assert!(
+                pill.expand(0.01).contains_rect(rect),
+                "the timer pill's {what} {rect:?} spills out of the pill box {pill:?}"
+            );
+        }
+    }
+
+    /// Issue #75: the gutter emblem is decoration for the header's *text*
+    /// rows — the ones `header_text_rect` indents by `HEADER_GUTTER_WIDTH`
+    /// to make room for it. The stat-pill row has no such gutter: the timer
+    /// half-pill is deliberately flush against the panel's left border, in
+    /// exactly the column the emblem occupies. Since the emblem's box is
+    /// 60pt tall against a 20pt title row, only its clip keeps its ink out
+    /// of that row — and it must, or it paints straight through the pill,
+    /// under a 6%-alpha fill, behind a clock glyph tinted at a third alpha.
+    #[test]
+    fn the_gutter_emblem_never_reaches_the_stat_pill_row() {
+        let frame = header_painted_boxes(&header_test_snapshot(30_100_000_000));
+        let pill = frame.fill_box(TIMER_PILL_FILL);
+
+        for emblem in frame.glyph_boxes(GlyphIcon::Emblem) {
+            assert!(
+                !emblem.intersects(pill),
+                "emblem ink {emblem:?} lands on the timer pill {pill:?}"
+            );
+        }
+    }
+
     /// The stray `☰` hamburger label had no counterpart in the reference
     /// render and no behavior of its own (the whole header band is already
     /// the drag surface) — it must not appear anywhere in the rendered
@@ -3433,6 +3727,73 @@ mod tests {
             (rect.right() - PILL_PAD_X - (text_pos.x + text.x)).abs() < 0.01,
             "the value should end exactly one padding short of the right edge"
         );
+    }
+
+    /// Issue #75: the header's pills at their *production* parameters — real
+    /// font sizes, real `PILL_*` constants, real `interact_size.y` cap — must
+    /// lay their glyph and their value out disjointly, both fully inside the
+    /// pill box, with the pill exactly as wide as the sum of its parts. This
+    /// is the numeric stand-in for the screenshot we cannot take of the
+    /// Windows build: every "misplaced / overlapping" symptom the header can
+    /// have shows up as one of these four invariants failing.
+    #[test]
+    fn the_header_pills_lay_glyph_and_value_out_inside_their_box() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        // Lay a frame out first so the real (non-empty) fonts are loaded.
+        ctx.run_ui(egui::RawInput::default(), |_ui| {})
+            .drop_without_applying_deltas();
+
+        for (name, pill) in [
+            ("timer", StatPill::timer("02:39", None)),
+            ("dps", StatPill::header("1000.0K/s", None)),
+            ("damage", StatPill::header("30.1B", None)),
+        ] {
+            let text = ctx.fonts_mut(|f| {
+                f.layout_no_wrap(pill.value.to_owned(), bold(pill.size), pill.value_color)
+                    .rect
+                    .size()
+            });
+            let size = pill_size(text, pill.icon_side, BUTTON_ROW_HEIGHT);
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size);
+            let (text_pos, icon_rect) =
+                pill_content_layout(rect, text, pill.icon_side, pill.icon_first);
+            // `paint_bold_text` anchors LEFT_CENTER, so this is the box the
+            // value actually covers.
+            let text_rect =
+                egui::Rect::from_min_size(egui::pos2(text_pos.x, text_pos.y - text.y / 2.0), text);
+
+            assert!(
+                (size.x - (2.0 * PILL_PAD_X + text.x + PILL_ICON_GAP + pill.icon_side)).abs()
+                    < 0.01,
+                "{name}: pill width {} is not padding + text {} + gap + icon",
+                size.x,
+                text.x
+            );
+            let gap = if pill.icon_first {
+                text_rect.left() - icon_rect.right()
+            } else {
+                icon_rect.left() - text_rect.right()
+            };
+            assert!(
+                gap >= PILL_ICON_GAP - 0.01,
+                "{name}: glyph and value are only {gap}pt apart (want {PILL_ICON_GAP})"
+            );
+            assert!(
+                icon_rect.left() >= rect.left() - 0.01
+                    && icon_rect.right() <= rect.right() + 0.01
+                    && icon_rect.top() >= rect.top() - 0.01
+                    && icon_rect.bottom() <= rect.bottom() + 0.01,
+                "{name}: glyph box {icon_rect:?} spills out of the pill {rect:?}"
+            );
+            assert!(
+                text_rect.left() >= rect.left() - 0.01
+                    && text_rect.right() <= rect.right() + 0.01
+                    && text_rect.top() >= rect.top() - 0.01
+                    && text_rect.bottom() <= rect.bottom() + 0.01,
+                "{name}: value box {text_rect:?} (text {text:?}) spills out of the pill {rect:?}"
+            );
+        }
     }
 
     /// The DPS/damage pills are full ovals (corner radius at least half the
@@ -4001,17 +4362,62 @@ mod tests {
         assert_eq!(total, 36.0);
     }
 
-    /// The emblem is bled off the title row's left edge and extends above
-    /// its top (`HEADER_EMBLEM_OFFSET`'s negative x/y), so it must be
-    /// clipped to the header band (not the title row alone) when painted.
+    /// The emblem is bled off the title row's left edge and is taller than
+    /// the text band it decorates in both directions, so it only ever shows
+    /// through a clip. Rewritten for issue #75: it used to assert the box
+    /// merely started above the row (the hardcoded `-8` of the
+    /// subtitle-present case), which said nothing about the far bigger
+    /// overhang *below* — the one that was painting over the stat pills.
     #[test]
-    fn the_header_emblem_bleeds_off_the_left_edge_and_is_taller_than_the_band() {
+    fn the_header_emblem_bleeds_off_the_left_edge_and_out_of_the_text_band() {
         let row = egui::Rect::from_min_size(egui::pos2(10.0, 40.0), egui::vec2(380.0, 20.0));
-        let rect = header_emblem_rect(row);
-        assert!(rect.left() < row.left());
-        assert!(rect.top() < row.top());
-        assert_eq!(rect.width(), HEADER_EMBLEM_SIZE);
-        assert_eq!(rect.height(), HEADER_EMBLEM_SIZE);
+        for has_subtitle in [false, true] {
+            let band = header_text_band_height(has_subtitle);
+            let rect = header_emblem_rect(row, band);
+            assert!(rect.left() < row.left());
+            assert!(rect.top() < row.top());
+            assert!(rect.bottom() > row.top() + band);
+            assert_eq!(rect.width(), HEADER_EMBLEM_SIZE);
+            assert_eq!(rect.height(), HEADER_EMBLEM_SIZE);
+        }
+    }
+
+    /// The source's centering, reproduced exactly for the case it was read
+    /// off (`Height="36"` grid, `Margin="… -8"`): a top edge 8pt above the
+    /// grid. With no subtitle line the grid is only `TITLE_LINE_HEIGHT`
+    /// tall, and the same formula re-centers on it rather than leaving the
+    /// art hanging low (issue #75).
+    #[test]
+    fn the_header_emblem_is_centered_on_the_text_band_it_decorates() {
+        let row = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, 20.0));
+        assert_eq!(header_emblem_rect(row, 36.0).top(), -8.0);
+        for has_subtitle in [false, true] {
+            let band = header_text_band_height(has_subtitle);
+            let rect = header_emblem_rect(row, band);
+            let above = row.top() - rect.top();
+            let below = rect.bottom() - (row.top() + band);
+            assert!(
+                (below - (above + HEADER_EMBLEM_BOTTOM_BLEED)).abs() < 0.01,
+                "the negative bottom margin should hang the emblem \
+                 {HEADER_EMBLEM_BOTTOM_BLEED}pt further below the band than above it \
+                 (has_subtitle={has_subtitle}): above {above}, below {below}"
+            );
+        }
+    }
+
+    /// The band the drag surface covers is the text rows plus one gap plus
+    /// the stat-pill row — the emblem's clip (the text rows) is strictly
+    /// shorter, so confining the emblem to it cannot have moved the drag
+    /// surface or the collapsed window's height.
+    #[test]
+    fn the_text_band_is_the_drag_band_minus_the_stat_pill_row() {
+        for has_subtitle in [false, true] {
+            let text = header_text_band_height(has_subtitle);
+            let band = header_band_height(has_subtitle, BUTTON_ROW_HEIGHT);
+            assert_eq!(band, text + ITEM_SPACING_Y + BUTTON_ROW_HEIGHT);
+            assert!(text < band);
+        }
+        assert_eq!(header_text_band_height(true), 36.0);
     }
 
     // -- header background wash (issue #59, #62) ------------------------
@@ -4365,28 +4771,31 @@ mod tests {
     #[test]
     fn share_bar_full_share_spans_the_full_width() {
         let rect = share_bar_rect();
-        let paints = share_bar_paints(rect, 100.0, None);
+        let paints = share_bar_paints(rect, 1.0, None);
         assert_eq!(paints.fill_rect.width(), rect.width());
         assert_eq!(paints.accent_rect.width(), rect.width());
     }
 
-    /// The fill's width still tracks share (`bar_frac`), but the accent
-    /// line is a sibling of the fill in the source, not a child — it always
-    /// spans the row's full width regardless of a zero share.
+    /// Issue #73: the accent line's width now matches the fill's width
+    /// exactly, so a zero `bar_frac` collapses both to nothing rather than
+    /// leaving a full-width accent line behind.
     #[test]
-    fn share_bar_zero_share_has_no_fill_but_a_full_accent_line() {
+    fn share_bar_zero_frac_has_no_fill_and_no_accent_line() {
         let rect = share_bar_rect();
         let paints = share_bar_paints(rect, 0.0, None);
         assert_eq!(paints.fill_rect.width(), 0.0);
-        assert_eq!(paints.accent_rect.width(), rect.width());
+        assert_eq!(paints.accent_rect.width(), 0.0);
     }
 
+    /// Issue #73: the accent line used to always span the row's full width
+    /// regardless of `bar_frac`; it now matches the fill's width exactly, so
+    /// the underline stops exactly where the gradient fill stops.
     #[test]
-    fn share_bar_accent_line_is_decoupled_from_the_fill() {
+    fn share_bar_accent_line_matches_the_fill_width() {
         let rect = share_bar_rect();
-        let paints = share_bar_paints(rect, 40.0, None);
+        let paints = share_bar_paints(rect, 0.4, None);
         assert_eq!(paints.fill_rect.width(), rect.width() * 0.4);
-        assert_eq!(paints.accent_rect.width(), rect.width());
+        assert_eq!(paints.accent_rect.width(), paints.fill_rect.width());
     }
 
     /// The accent line is what makes the share boundary read crisply, so it
@@ -4395,7 +4804,7 @@ mod tests {
     #[test]
     fn share_bar_accent_line_sits_at_the_bottom_edge() {
         let rect = share_bar_rect();
-        let paints = share_bar_paints(rect, 50.0, None);
+        let paints = share_bar_paints(rect, 0.5, None);
         assert_eq!(paints.accent_rect.bottom(), rect.bottom());
         assert_eq!(paints.accent_rect.height(), SHARE_BAR_ACCENT_THICKNESS);
     }
@@ -4406,7 +4815,7 @@ mod tests {
     #[test]
     fn share_bar_accent_thickness_clamps_at_a_tiny_row_height() {
         let tiny_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 1.0));
-        let paints = share_bar_paints(tiny_rect, 50.0, None);
+        let paints = share_bar_paints(tiny_rect, 0.5, None);
         assert!(paints.accent_rect.height() <= tiny_rect.height());
         assert_eq!(paints.accent_rect.top(), tiny_rect.top());
     }
@@ -4418,13 +4827,13 @@ mod tests {
     #[test]
     fn share_bar_fill_is_fainter_than_its_accent_line() {
         let rect = share_bar_rect();
-        let paints = share_bar_paints(rect, 50.0, None);
+        let paints = share_bar_paints(rect, 0.5, None);
         assert!(paints.fill_bottom.a() < paints.accent_right.a());
     }
 
     #[test]
     fn share_bar_fill_grades_from_transparent_to_its_bottom_alpha() {
-        let paints = share_bar_paints(share_bar_rect(), 50.0, None);
+        let paints = share_bar_paints(share_bar_rect(), 0.5, None);
         let mesh = vertical_gradient_mesh(
             paints.fill_rect,
             egui::Color32::TRANSPARENT,
@@ -4442,7 +4851,7 @@ mod tests {
 
     #[test]
     fn share_bar_accent_grades_left_to_right() {
-        let paints = share_bar_paints(share_bar_rect(), 50.0, None);
+        let paints = share_bar_paints(share_bar_rect(), 0.5, None);
         let mesh =
             horizontal_gradient_mesh(paints.accent_rect, paints.accent_left, paints.accent_right);
         assert_eq!(mesh.vertices.len(), 4);
@@ -4450,6 +4859,35 @@ mod tests {
         assert_eq!(mesh.vertices[2].color.a(), paints.accent_left.a());
         assert_eq!(mesh.vertices[1].color.a(), paints.accent_right.a());
         assert_eq!(mesh.vertices[3].color.a(), paints.accent_right.a());
+    }
+
+    // -- top-row damage scaling (issue #73) ----------------------------------
+
+    /// Bars now scale to the *top row's* damage, not to each row's share of
+    /// total encounter damage: the top row's bar always fills the full
+    /// width, and a row with exactly half the top row's damage gets a
+    /// half-width bar — even when neither figure is 100%/50% of the
+    /// encounter's total damage (here the total across all rows would be
+    /// far more than `2 * top_damage`).
+    #[test]
+    fn bar_width_scales_to_top_row_damage_not_share_of_total() {
+        let rect = share_bar_rect();
+        let top_damage = 10_000_i64;
+        let half_damage = top_damage / 2;
+
+        let top_paints = share_bar_paints(rect, row_bar_frac(top_damage, top_damage), None);
+        let half_paints = share_bar_paints(rect, row_bar_frac(half_damage, top_damage), None);
+
+        assert_eq!(top_paints.fill_rect.width(), rect.width());
+        assert_eq!(half_paints.fill_rect.width(), rect.width() * 0.5);
+    }
+
+    /// An empty or degenerate snapshot (`top_damage` <= 0) must not divide
+    /// by zero or produce a NaN/negative fraction.
+    #[test]
+    fn row_bar_frac_guards_against_a_non_positive_top_damage() {
+        assert_eq!(row_bar_frac(500, 0), 0.0);
+        assert_eq!(row_bar_frac(500, -10), 0.0);
     }
 
     /// The two quads must be contiguous (no gap, no overlap) and meet at the
@@ -4515,7 +4953,7 @@ mod tests {
     /// from the one `expected_rgb` — directly proves "same RGB, alpha
     /// differs only by the fixed fill/accent split".
     fn assert_bar_hue(class: Option<Class>, expected_rgb: (u8, u8, u8)) {
-        let paints = share_bar_paints(share_bar_rect(), 50.0, class);
+        let paints = share_bar_paints(share_bar_rect(), 0.5, class);
         let (r, g, b) = expected_rgb;
         let expected_fill_bottom =
             egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_FILL_BOTTOM_ALPHA);
@@ -5208,6 +5646,21 @@ mod tests {
         gesture.end();
         gesture.end();
         assert_eq!(gesture.kind(), None);
+    }
+
+    #[test]
+    fn a_finished_resize_needs_a_frame_recompute() {
+        // Issue #74: a resize is the gesture kind that can leave DWM's frame
+        // stale, so its end must trigger `platform::force_frame_recompute`.
+        let resize = GestureKind::Resize(egui::ResizeDirection::West);
+        assert!(gesture_end_needs_frame_recompute(resize));
+    }
+
+    #[test]
+    fn a_finished_move_does_not_need_a_frame_recompute() {
+        // A pure move never changes the window's size, so there is nothing
+        // for a DWM frame recompute to fix.
+        assert!(!gesture_end_needs_frame_recompute(GestureKind::Move));
     }
 
     // --- death-count column (issue #49) ---------------------------------
