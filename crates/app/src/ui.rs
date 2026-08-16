@@ -368,7 +368,7 @@ const MIN_PLAUSIBLE_COORD: f32 = -20_000.0;
 /// bundled because every draw site that touches settings needs both —
 /// mutating `settings` in place without also sending the update through
 /// `tx_settings` would silently drop the change instead of writing it (see
-/// `draw_settings_menu`). Also what keeps `draw_header` under clippy's
+/// `draw_header_menu`). Also what keeps `draw_header` under clippy's
 /// too-many-arguments limit now that it takes a `WindowGesture` too.
 struct SettingsHandle<'a> {
     settings: &'a mut Settings,
@@ -378,7 +378,9 @@ struct SettingsHandle<'a> {
 /// The two pieces of window-chrome state `draw_header`'s controls drive: the
 /// in-flight manual move/resize gesture (issue #11, started by the title
 /// bar's drag surface) and the collapse-to-header state (issue #54, toggled
-/// by the chevron). Bundled for exactly the reason `SettingsHandle` is —
+/// by `draw_header_menu`'s Collapse/Expand item, not the chevron — the
+/// chevron just opens the menu the item lives in, issue #71). Bundled for
+/// exactly the reason `SettingsHandle` is —
 /// `draw_header` is already at clippy's argument limit, and these two are
 /// always needed together by the same function.
 struct ChromeHandle<'a> {
@@ -462,13 +464,23 @@ fn draw_header(
     for (segment_rect, color) in title_separator_segments(title_separator_rect(title_row)) {
         ui.painter().rect_filled(segment_rect, 0.0, color);
     }
-    // The collapse control (issue #54), in the strip at the right of the
+    // The menu control (issue #54, #71), in the strip at the right of the
     // title row that `header_text_rect` keeps clear. Registered after the
-    // title-bar drag surface above, so a click on it collapses the overlay
-    // instead of starting a window move.
-    if collapse_chevron(ui, chevron_rect(title_row), chrome.collapse.is_collapsed()).clicked() {
-        chrome.collapse.toggle(ctx, band_height);
-    }
+    // title-bar drag surface above, so a click on it opens the dropdown
+    // instead of starting a window move. Always points down — it is a menu
+    // affordance now, not a collapse-state indicator (see `menu_chevron`).
+    let chevron_response = menu_chevron(ui, chevron_rect(title_row));
+    egui::Popup::menu(&chevron_response).show(|ui| {
+        draw_header_menu(
+            ui,
+            ctx,
+            tx_command,
+            settings,
+            icons,
+            chrome.collapse,
+            band_height,
+        );
+    });
     if let Some(subtitle) = &subtitle {
         draw_subtitle_line(ui, subtitle);
     }
@@ -509,42 +521,6 @@ fn draw_header(
             ),
         );
         toggle_cluster(ui, icons);
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Raster PNG icons throughout this row (issue #41), not glyphs —
-            // neither vendored `epaint_default_fonts` TTF covers a close
-            // ✕/gear ⚙/etc. glyph (issue #14's tofu-square problem), the
-            // same reason the old "×"/"S" glyphs here were themselves picked
-            // for font coverage rather than looks.
-            if icon_button(ui, icons.toolbar.get(ToolbarIcon::Close), "×", "Close").clicked() {
-                let _ = tx_command.try_send(UiCommand::Quit);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            // No minimize icon exists in the upstream ShinraMeter icon set
-            // this issue draws from (issue #41's scope note), so this one is
-            // painted procedurally — a short horizontal line — rather than
-            // left as the old "_" glyph or reusing an unrelated asset.
-            //
-            // Issue #53: this minimize goes to the notification area, not
-            // the taskbar. `platform::install_tray`'s subclass intercepts
-            // the `WM_SIZE`/`SIZE_MINIMIZED` this command produces, adds a
-            // tray icon and hides the window, so no call-site change is
-            // needed here — but the tray icon is now the *only* way back,
-            // so don't route this through anything that bypasses a real
-            // minimize.
-            if minimize_button(ui).clicked() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            }
-            if icon_button(ui, icons.toolbar.get(ToolbarIcon::Reset), "Reset", "Reset").clicked() {
-                let _ = tx_command.try_send(UiCommand::Reset);
-            }
-            draw_settings_menu(
-                ui,
-                settings.settings,
-                settings.tx_settings,
-                icons.toolbar.get(ToolbarIcon::Settings),
-            );
-        });
     });
 }
 
@@ -640,13 +616,11 @@ fn toggle_cluster(ui: &mut egui::Ui, icons: &Icons) {
 
 /// Fixed display size, in points, every toolbar icon (issue #41) is drawn
 /// at — independent of the source PNGs' own resolution (48x48 in the
-/// upstream ShinraMeter set), so a texture swap can never change a button's
-/// footprint. Chosen to land `icon_button`'s total height (icon plus
-/// `apply_theme`'s `button_padding.y` on both sides) exactly on
-/// `egui::Style::default().spacing.interact_size.y` (18.0), the same height
-/// `header_band_height` already budgets for the button row — see
-/// `north_strip_is_not_swallowed_by_the_header`-style header-band tests, and
-/// this module's own `toolbar_icon_button_height_matches_interact_size`.
+/// upstream ShinraMeter set), so a texture swap can never change a menu
+/// item's or the chevron's footprint. Plus `apply_theme`'s
+/// `button_padding.y` on both sides, this lands on
+/// `egui::Style::default().spacing.interact_size.y` (18.0) — see this
+/// module's own `toolbar_icon_button_height_matches_interact_size`.
 const TOOLBAR_ICON_SIZE: f32 = 14.0;
 
 /// Tint applied to every toolbar/stat icon — the source's footer buttons are
@@ -668,89 +642,28 @@ fn toolbar_icon_image(handle: &egui::TextureHandle) -> egui::Image<'static> {
     .tint(TOOLBAR_ICON_TINT)
 }
 
-/// Paints one toolbar icon button and attaches its tooltip in one place
-/// (issue #41's "meaning is not lost" requirement) so every call site gets
-/// both without repeating either. Falls back to `fallback_glyph` — the
-/// original text/glyph button this replaces — when `texture` is `None`
-/// (belt-and-braces: `ToolbarIcons`' bytes are compile-time constants,
-/// never actually expected to fail to decode, same reasoning as
-/// `ClassIcons::get`).
-///
-/// `label` doubles as both the hover tooltip and the accessible name: an
-/// image-only `Button` carries no text atom, so — verified against the
-/// vendored egui source (`Button::atom_ui`, `button.rs`) — it never puts
-/// anything into `WidgetInfo` on its own, and `Response::on_hover_text`
-/// only shows a tooltip, it never touches accessibility info either
-/// (`response.rs`). Without the explicit `widget_info` call below, a
-/// screen-reader user would hear an unlabeled "button" here. The `None`
-/// (glyph) branch already gets a label for free from `ui.button`'s own text
-/// atom, so only the image branch needs it — but both share the same
-/// `label` argument, so the tooltip and the accessible name can never
-/// drift apart.
-fn icon_button(
-    ui: &mut egui::Ui,
-    texture: Option<&egui::TextureHandle>,
-    fallback_glyph: &str,
-    label: &str,
-) -> egui::Response {
-    let response = match texture {
-        Some(handle) => {
-            let response = ui.add(egui::Button::image(toolbar_icon_image(handle)));
-            response.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label)
-            });
-            response
-        }
-        None => ui.button(fallback_glyph),
-    };
-    response.on_hover_text(label)
-}
-
-/// Paints the minimize button: no icon asset for it exists in the upstream
-/// ShinraMeter set (issue #41), so this draws a short horizontal line with
-/// `ui.painter()` directly rather than via a texture. The allocated rect
-/// matches `icon_button`'s footprint exactly — `TOOLBAR_ICON_SIZE` plus
-/// `apply_theme`'s `button_padding` on all sides — so this button doesn't
-/// stand out as a different size in the row, and `header_band_height` stays
-/// correct without special-casing it.
-///
-/// Unlike `icon_button`, this bypasses `Button` entirely — `allocate_exact_
-/// size`'s raw `Response` gets no `WidgetInfo` from anywhere, so both the
-/// accessible name and the tooltip below have to be supplied by hand (see
-/// `icon_button`'s doc comment for why the accessible name matters). Kept
-/// as one `label` local rather than two literals so the two calls can't
-/// drift apart.
-fn minimize_button(ui: &mut egui::Ui) -> egui::Response {
-    let label = "Minimize";
-    let padding = ui.spacing().button_padding;
-    let size = egui::Vec2::splat(TOOLBAR_ICON_SIZE) + 2.0 * padding;
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    if ui.is_rect_visible(rect) {
-        let visuals = ui.style().interact(&response);
-        let half_width = TOOLBAR_ICON_SIZE / 2.0;
-        let y = rect.center().y;
-        ui.painter().line_segment(
-            [
-                egui::pos2(rect.center().x - half_width, y),
-                egui::pos2(rect.center().x + half_width, y),
-            ],
-            egui::Stroke::new(1.5, visuals.fg_stroke.color),
-        );
+/// Builds a menu-item `Button` for the header dropdown (issue #71): an
+/// image-and-text button using the toolbar icon's existing texture when
+/// `texture` is `Some`, or a plain text button — the same `Option` fallback
+/// shape the old `icon_button` used — when it is `None` (belt-and-braces:
+/// `ToolbarIcons`' bytes are compile-time constants, never actually expected
+/// to fail to decode, same reasoning as `ClassIcons::get`).
+fn menu_item_button<'a>(texture: Option<&egui::TextureHandle>, label: &'a str) -> egui::Button<'a> {
+    match texture {
+        Some(handle) => egui::Button::image_and_text(toolbar_icon_image(handle), label),
+        None => egui::Button::new(label),
     }
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label)
-    });
-    response.on_hover_text(label)
 }
 
-// -- collapse chevron (issue #54) --------------------------------------
+// -- header menu chevron (issue #54, #71) --------------------------------
 //
 // The reference render puts a thin chevron at the far right of the title row.
 // It is painted, not vendored: it is two strokes, no chevron exists in the
-// upstream ShinraMeter icon set (`icons.rs`'s `TOOLBAR_ICON_BYTES`), and
-// `minimize_button` above already set the precedent for a procedurally-drawn
-// window control. Painting also lets it be mirrored for the collapsed state
-// for free, which a texture would need a second asset for.
+// upstream ShinraMeter icon set (`icons.rs`'s `TOOLBAR_ICON_BYTES`).
+// Originally this toggled collapse-to-header directly; it now opens a
+// dropdown menu instead (issue #71), so it always points down — a menu
+// affordance, not a collapse-state indicator — and the menu itself carries
+// the Collapse/Expand action alongside the rest.
 
 /// Side of the chevron's square hit/paint box, matched to `TOOLBAR_ICON_SIZE`
 /// so it reads as one of the window controls rather than as decoration.
@@ -814,8 +727,8 @@ fn chevron_points(rect: egui::Rect, pointing_down: bool) -> [egui::Pos2; 3] {
     ]
 }
 
-/// Paints the collapse-to-header control (issue #54) into `rect` and returns
-/// its `Response`.
+/// Paints the header menu control (issue #54, #71) into `rect` and returns
+/// its `Response` — the trigger `Popup::menu` opens the dropdown from.
 ///
 /// Registered with `ui.interact` on an explicit rect rather than allocated,
 /// because it lives *inside* the title row `draw_title_line` already
@@ -823,16 +736,17 @@ fn chevron_points(rect: egui::Rect, pointing_down: bool) -> [egui::Pos2; 3] {
 /// registered after `draw_header`'s title-bar drag surface, so it wins the
 /// hit test over it and clicking the chevron never starts a window drag.
 ///
-/// Same hand-supplied accessible name and tooltip as `minimize_button`, and
-/// for the same reason: a raw `interact` `Response` carries no `WidgetInfo`
-/// from anywhere. The label names the *action*, not the state, so a screen
-/// reader announces what a click will do.
-fn collapse_chevron(ui: &mut egui::Ui, rect: egui::Rect, collapsed: bool) -> egui::Response {
-    let label = if collapsed { "Expand" } else { "Collapse" };
-    let response = ui.interact(rect, ui.id().with("collapse_chevron"), egui::Sense::click());
+/// Same hand-supplied accessible name and tooltip as `minimize_button` used
+/// to need, and for the same reason: a raw `interact` `Response` carries no
+/// `WidgetInfo` from anywhere. Always points down (`chevron_points(rect,
+/// true)`) — a menu affordance, not a collapse-state indicator — so the
+/// label names what a click does ("Menu"), not a state.
+fn menu_chevron(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
+    let label = "Menu";
+    let response = ui.interact(rect, ui.id().with("menu_chevron"), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         ui.painter().add(egui::Shape::line(
-            chevron_points(rect, !collapsed).to_vec(),
+            chevron_points(rect, true).to_vec(),
             egui::Stroke::new(CHEVRON_STROKE, CHEVRON_COLOR),
         ));
     }
@@ -1031,9 +945,8 @@ pub(crate) const DEATH_COUNT_RGB: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
 ///
 /// The cap is load-bearing rather than cosmetic: the pills live in
 /// `draw_header`'s button row, whose height `header_band_height` budgets as
-/// `BUTTON_ROW_HEIGHT` (the same height `icon_button`/`minimize_button`
-/// occupy). A pill taller than that would silently grow the header band past
-/// the drag surface `draw_header` registered for it.
+/// `BUTTON_ROW_HEIGHT`. A pill taller than that would silently grow the
+/// header band past the drag surface `draw_header` registered for it.
 fn pill_size(text_size: egui::Vec2, icon_side: f32, max_height: f32) -> egui::Vec2 {
     let width = 2.0 * PILL_PAD_X + text_size.x + PILL_ICON_GAP + icon_side;
     let height = (text_size.y + 2.0 * PILL_PAD_Y).min(max_height);
@@ -1398,11 +1311,19 @@ const TITLE_SEPARATOR_MAX_ALPHA: u8 = 255;
 /// Thickness, in points, of the title separator line — `StrokeThickness="2"`.
 const TITLE_SEPARATOR_THICKNESS: f32 = 2.0;
 
-/// The source's `Margin="-5 7.5 32 0"`: the separator starts 5pt to the left
-/// of the title's own left edge (bleeding partway back into the gutter) and
-/// 7.5pt below the row's top.
+/// The source's `Margin="-5 7.5 32 0"`: only the `-5` left bleed and the `32`
+/// right reserve survive from that margin (as `TITLE_SEPARATOR_LEFT_BLEED`
+/// and `HEADER_RIGHT_CONTROL_WIDTH` respectively). The margin's `7.5` is
+/// measured from the WPF source's own container, not from our title row, so
+/// taking it literally (as an earlier version of this constant did) put a
+/// 2pt opaque stroke at `row.top()+7.5..+9.5` — through the middle of the
+/// 13pt title glyphs. Pixel-measured against the reference render, the
+/// stroke actually sits in the gap between the title and subtitle rows: 5pt
+/// below the title baseline and ~5pt above the subtitle's cap-top, which for
+/// our geometry is exactly the title row's bottom edge (see
+/// `title_separator_rect`), inside the `ITEM_SPACING_Y` gap egui's vertical
+/// layout already leaves there.
 const TITLE_SEPARATOR_LEFT_BLEED: f32 = 5.0;
-const TITLE_SEPARATOR_TOP_OFFSET: f32 = 7.5;
 
 /// Number of thin strips `title_separator_segments` divides the fade into.
 /// High enough to read as a smooth gradient, modest enough to stay cheap to
@@ -1412,11 +1333,14 @@ const TITLE_SEPARATOR_SEGMENTS: usize = 24;
 /// The rect the fading title separator is painted over, for a title row
 /// `title_row`: it bleeds `TITLE_SEPARATOR_LEFT_BLEED` back into the gutter
 /// from the title's own left edge and clears the chevron's reserved strip on
-/// the right, sitting `TITLE_SEPARATOR_TOP_OFFSET` below the row's top.
+/// the right, sitting flush against the title row's bottom edge — the gap
+/// between the title and subtitle rows in the reference render (see the
+/// `TITLE_SEPARATOR_LEFT_BLEED` doc comment for why this isn't the source
+/// margin's literal `7.5`).
 fn title_separator_rect(title_row: egui::Rect) -> egui::Rect {
     let left = title_row.left() + HEADER_GUTTER_WIDTH - TITLE_SEPARATOR_LEFT_BLEED;
     let right = (title_row.right() - HEADER_RIGHT_CONTROL_WIDTH).max(left);
-    let top = title_row.top() + TITLE_SEPARATOR_TOP_OFFSET;
+    let top = title_row.bottom();
     egui::Rect::from_min_max(
         egui::pos2(left, top),
         egui::pos2(right, top + TITLE_SEPARATOR_THICKNESS),
@@ -1474,66 +1398,119 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
     );
 }
 
-/// The settings menu: a compact dropdown (egui's `menu_button`/
-/// `menu_image_button`, so it needs no extra open/closed state of its own)
-/// letting the user toggle which stat columns render (issue #13). The
-/// trigger is the gear icon (issue #41) when its texture decoded, else the
-/// original `"S"` glyph — same fallback `icon_button` uses. `menu_button`
-/// and `menu_image_button` do both return `InnerResponse<Option<R>>`
-/// (verified against the vendored egui source, `ui.rs`), so that's not
-/// actually why this isn't routed through one helper the way `icon_button`
-/// is: the two build their trigger `Button` differently under the hood —
-/// `menu_button` via `Button::new(atoms)`, `menu_image_button` via
-/// `Button::image(image)`, which additionally caps the image to the
-/// default font height (`Button::image`'s own doc comment) — so folding
-/// them into one call could silently change how an oversized icon gets
-/// sized. The `match` stays inlined here rather than risk that.
-fn draw_settings_menu(
+/// The header dropdown (issue #54, #71): opened from `menu_chevron` via
+/// `egui::Popup::menu`, replacing the old row of window-control icon
+/// buttons. Built from plain `Ui` menu widgets rather than one bespoke
+/// helper per item, since egui's own `menu_button`/`SubMenuButton` already
+/// give every item free open/close state management.
+///
+/// Order matches the spec: Reset, a Columns submenu (issue #13's stat
+/// column toggles, unchanged in behavior — just relocated), a separator,
+/// Collapse/Expand (issue #54's collapse-to-header, still driven by
+/// `CollapseState::toggle`), Minimize to tray, a separator, then Close.
+///
+/// The Columns submenu is given `PopupCloseBehavior::CloseOnClickOutside`
+/// explicitly: the *root* popup's default `CloseOnClick` is fine for the
+/// other items (a click on Reset/Collapse/Minimize/Close should dismiss the
+/// whole menu), but the same default on the submenu would dismiss the
+/// entire dropdown on every single checkbox toggle — verified against the
+/// vendored egui source (`containers/menu.rs`'s `SubMenu::show`): the root
+/// popup defers its own close decision to whichever submenu is open, so
+/// only the submenu's own config matters for clicks landing on a checkbox.
+fn draw_header_menu(
     ui: &mut egui::Ui,
-    settings: &mut Settings,
-    tx_settings: &Sender<Settings>,
-    icon: Option<&egui::TextureHandle>,
+    ctx: &egui::Context,
+    tx_command: &Sender<UiCommand>,
+    settings: SettingsHandle<'_>,
+    icons: &Icons,
+    collapse: &mut CollapseState,
+    band_height: f32,
 ) {
-    let add_contents = |ui: &mut egui::Ui| {
-        ui.label("Columns");
-        let mut changed = false;
-        for col in ColumnKind::ALL {
-            let is_visible = settings.is_visible(col);
-            // Disabling the last remaining column would leave the row with
-            // nothing to show, so its checkbox is greyed out and inert
-            // rather than letting the click land (issue #13's "keep the
-            // UI usable" guard).
-            let would_disable_last = is_visible && settings.visible_columns.len() <= 1;
-            let mut checked = is_visible;
-            let resp = ui.add_enabled(
-                !would_disable_last,
-                egui::Checkbox::new(&mut checked, col.label()),
-            );
-            if resp.changed() {
-                settings.toggle(col);
-                changed = true;
-            }
-        }
-        if changed {
-            // Persisting is blocking file IO (`fs::write` + `fs::rename`),
-            // so it must not run on this render thread — hand the new
-            // value to the dedicated settings-writer thread instead, same
-            // as `pipeline::spawn` owns the meter off this thread. A
-            // disconnected receiver (writer thread gone) is not fatal:
-            // the in-memory `settings` the UI already mutated stays
-            // correct for the rest of this session.
-            let _ = tx_settings.send(settings.clone());
-        }
-    };
+    let SettingsHandle {
+        settings,
+        tx_settings,
+    } = settings;
+    if ui
+        .add(menu_item_button(
+            icons.toolbar.get(ToolbarIcon::Reset),
+            "Reset",
+        ))
+        .clicked()
+    {
+        let _ = tx_command.try_send(UiCommand::Reset);
+    }
 
-    let trigger = match icon {
-        Some(handle) => {
-            ui.menu_image_button(toolbar_icon_image(handle), add_contents)
-                .response
-        }
-        None => ui.menu_button("S", add_contents).response,
+    let columns_button = menu_item_button(icons.toolbar.get(ToolbarIcon::Settings), "Columns")
+        .right_text(egui::containers::menu::SubMenuButton::RIGHT_ARROW);
+    egui::containers::menu::SubMenuButton::from_button(columns_button)
+        .config(
+            egui::containers::menu::MenuConfig::new()
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+        )
+        .ui(ui, |ui| {
+            let mut changed = false;
+            for col in ColumnKind::ALL {
+                let is_visible = settings.is_visible(col);
+                // Disabling the last remaining column would leave the row
+                // with nothing to show, so its checkbox is greyed out and
+                // inert rather than letting the click land (issue #13's
+                // "keep the UI usable" guard).
+                let would_disable_last = is_visible && settings.visible_columns.len() <= 1;
+                let mut checked = is_visible;
+                let resp = ui.add_enabled(
+                    !would_disable_last,
+                    egui::Checkbox::new(&mut checked, col.label()),
+                );
+                if resp.changed() {
+                    settings.toggle(col);
+                    changed = true;
+                }
+            }
+            if changed {
+                // Persisting is blocking file IO (`fs::write` + `fs::rename`),
+                // so it must not run on this render thread — hand the new
+                // value to the dedicated settings-writer thread instead,
+                // same as `pipeline::spawn` owns the meter off this thread.
+                // A disconnected receiver (writer thread gone) is not
+                // fatal: the in-memory `settings` the UI already mutated
+                // stays correct for the rest of this session.
+                let _ = tx_settings.send(settings.clone());
+            }
+        });
+
+    ui.separator();
+
+    let collapse_label = if collapse.is_collapsed() {
+        "Expand"
+    } else {
+        "Collapse"
     };
-    trigger.on_hover_text("Settings");
+    if ui.button(collapse_label).clicked() {
+        collapse.toggle(ctx, band_height);
+    }
+
+    // Issue #53: this minimize goes to the notification area, not the
+    // taskbar. `platform::install_tray`'s subclass intercepts the
+    // `WM_SIZE`/`SIZE_MINIMIZED` this command produces, adds a tray icon
+    // and hides the window, so no call-site change is needed here — but the
+    // tray icon is now the *only* way back, so don't route this through
+    // anything that bypasses a real minimize.
+    if ui.button("Minimize to tray").clicked() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+    }
+
+    ui.separator();
+
+    if ui
+        .add(menu_item_button(
+            icons.toolbar.get(ToolbarIcon::Close),
+            "Close",
+        ))
+        .clicked()
+    {
+        let _ = tx_command.try_send(UiCommand::Quit);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
 }
 
 /// Smallest inner size the overlay may be resized to, in points. Shared by
@@ -2800,11 +2777,10 @@ fn default_inner_height() -> f32 {
 /// budget below, so the window opens wide enough to lay out the header's
 /// stat row without wrapping. That row (issue #59's real rasterized pill
 /// glyphs, the timer half-pill, and issue #62's 58pt inert status-toggle
-/// cluster, alongside the four window controls) is measured independently
-/// by `the_stat_pills_and_window_controls_fit_the_default_window_width`,
-/// which is the ground truth this headroom exists to satisfy; 20pt clears
-/// the gap with room to spare across minor font-metric variance between
-/// environments.
+/// cluster) is measured independently by `the_stat_pills_fit_the_default_
+/// window_width`, which is the ground truth this headroom exists to
+/// satisfy; 20pt clears the gap with room to spare across minor
+/// font-metric variance between environments.
 const HEADER_ROW_EXTRA_WIDTH: f32 = 20.0;
 
 /// Default opening width (issue #26, widened for issue #9's icon gutter): a
@@ -2857,12 +2833,13 @@ pub fn viewport(window_position: Option<[f32; 2]>) -> egui::ViewportBuilder {
     builder
 }
 
-/// Panel fill: the source's `WindowData.DefaultBackgroundColor` `#232830`
-/// under the shared `WindowOpacity` default of 0.5. Fixed constants
-/// deliberately — the source binds all three of these to a settings VM, and
-/// user-configurable chrome is out of scope.
-const PANEL_FILL: egui::Color32 =
-    egui::Color32::from_rgba_unmultiplied_const(0x23, 0x28, 0x30, 128);
+/// Panel fill: translucent near-black, the overlay's own value rather than the
+/// source's `WindowData.DefaultBackgroundColor` `#232830` @ 0.5. That slate
+/// grey reads as washed-out over game footage; the original ShinraMeter
+/// silhouette is near-black, so we keep `#121216` at 200/255 here. Fixed
+/// constants deliberately — the source binds all three of these to a settings
+/// VM, and user-configurable chrome is out of scope for now.
+const PANEL_FILL: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(18, 18, 22, 200);
 /// Panel border: `DefaultBorderColor` `#717b85`, at the same 0.5 opacity the
 /// source applies to the whole Border (fill and stroke alike).
 const PANEL_BORDER_COLOR: egui::Color32 =
@@ -3102,6 +3079,64 @@ mod tests {
     fn draw_header_omits_hamburger_glyph() {
         let texts = header_rendered_texts(&header_test_snapshot(30_100_000_000));
         assert!(!texts.iter().any(|text| text == "☰"));
+    }
+
+    /// Issue #71: the window-control icon-button cluster (Close/Minimize/
+    /// Reset/Settings) no longer renders directly in the header's stat row
+    /// — those actions moved into the chevron's dropdown menu, which paints
+    /// nothing until opened. A closed-menu frame must carry no accessible
+    /// node labeled for any of the old buttons, only the chevron's own
+    /// "Menu" label.
+    #[test]
+    fn draw_header_no_longer_renders_the_window_control_cluster() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(30_100_000_000);
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header(
+                ui,
+                &ctx,
+                &snapshot,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                ChromeHandle {
+                    gesture: &mut WindowGesture::default(),
+                    collapse: &mut CollapseState::default(),
+                },
+            );
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let labels: Vec<String> = update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().map(str::to_string))
+            .collect();
+        output.drop_without_applying_deltas();
+
+        for stale in ["Close", "Reset", "Settings", "Minimize"] {
+            assert!(
+                !labels.iter().any(|l| l == stale),
+                "stale window-control label {stale:?} still renders directly in the header: {labels:?}"
+            );
+        }
+        assert!(
+            labels.iter().any(|l| l == "Menu"),
+            "expected the chevron's own \"Menu\" label, got {labels:?}"
+        );
     }
 
     /// The reference render shows a total-damage figure alongside the DPS
@@ -3430,13 +3465,15 @@ mod tests {
     }
 
     /// The stat row is one non-wrapping `ui.horizontal`: if the timer/DPS/
-    /// damage pills, the status-toggle cluster and the four window controls
-    /// ever stop fitting the default window width, the controls get pushed
-    /// off the right edge rather than wrapping. Measured with real font
-    /// metrics (the pills size themselves from their laid-out text) against
-    /// realistic worst-case values.
+    /// damage pills and the status-toggle cluster ever stop fitting the
+    /// default window width, the cluster gets pushed off the right edge
+    /// rather than wrapping. Measured with real font metrics (the pills
+    /// size themselves from their laid-out text) against realistic
+    /// worst-case values. The window-control buttons this test used to
+    /// budget for moved into the header dropdown (issue #71) and no longer
+    /// occupy this row.
     #[test]
-    fn the_stat_pills_and_window_controls_fit_the_default_window_width() {
+    fn the_stat_pills_fit_the_default_window_width() {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         // Lay a frame out first so the real (non-empty) fonts are loaded.
@@ -3479,15 +3516,11 @@ mod tests {
             + TOGGLE_GAP
             + TOGGLE_QUEUE_SIDE;
 
-        // Close, minimize, reset, settings — each an icon plus
-        // `apply_theme`'s horizontal button padding on both sides.
-        let controls = 4.0 * (TOOLBAR_ICON_SIZE + 2.0 * 4.0);
-        // Four gaps between the outer horizontal's five direct children
-        // (timer, dps, dmg, toggle cluster, control block) plus three more
-        // between the four controls inside that block.
-        let gaps = 4.0 * 6.0 + 3.0 * 6.0;
+        // Three gaps between the outer horizontal's four direct children
+        // (timer, dps, dmg, toggle cluster).
+        let gaps = 3.0 * 6.0;
 
-        let total = timer + dps + dmg + toggles + controls + gaps;
+        let total = timer + dps + dmg + toggles + gaps;
         assert!(
             total <= default_inner_width(),
             "stat row needs {total}pt but the default window is only {}pt wide",
@@ -3635,7 +3668,7 @@ mod tests {
     /// gutter from the title's own left edge (the source's `Margin="-5 ..."`)
     /// and clears the chevron's reserved strip on the right.
     #[test]
-    fn title_separator_bleeds_left_of_the_title_and_clears_the_chevron() {
+    fn title_separator_sits_below_the_title_row_and_clears_the_chevron() {
         let row = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, 20.0));
         let rect = title_separator_rect(row);
         let segments = title_separator_segments(rect);
@@ -3647,7 +3680,46 @@ mod tests {
             (segments.last().unwrap().0.right() - (row.right() - HEADER_RIGHT_CONTROL_WIDTH)).abs()
                 < 0.01
         );
-        assert_eq!(rect.top(), row.top() + TITLE_SEPARATOR_TOP_OFFSET);
+        assert_eq!(rect.top(), row.bottom());
+        assert_eq!(rect.bottom(), row.bottom() + TITLE_SEPARATOR_THICKNESS);
+    }
+
+    /// Regression for the misread WPF margin (`TITLE_SEPARATOR_TOP_OFFSET`,
+    /// now removed): laid out with the exact `FontId` `paint_bold_text` uses
+    /// for the title, a string with descenders must never have its ink
+    /// crossed by the separator stroke, and the stroke must stay inside the
+    /// `ITEM_SPACING_Y` gap between the title and subtitle rows rather than
+    /// drifting into the subtitle.
+    #[test]
+    fn the_title_separator_clears_the_title_and_subtitle_glyphs() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |_ui| {})
+            .drop_without_applying_deltas();
+
+        let row =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, TITLE_LINE_HEIGHT));
+        let galley = ctx.fonts_mut(|f| {
+            f.layout_no_wrap(
+                "Bahaargypj".to_owned(),
+                bold(FONT_SIZE_TITLE),
+                TITLE_TEXT_COLOR,
+            )
+        });
+        let ink_bottom =
+            row.top() + (row.height() - galley.rect.height()) / 2.0 + galley.rect.bottom();
+
+        let rect = title_separator_rect(row);
+        assert!(
+            rect.top() >= ink_bottom,
+            "separator top {} cuts through the title's ink bottom {ink_bottom}",
+            rect.top()
+        );
+        assert!(
+            rect.bottom() <= row.bottom() + ITEM_SPACING_Y,
+            "separator bottom {} drifts past the title/subtitle gap",
+            rect.bottom()
+        );
     }
 
     #[test]
@@ -4408,9 +4480,21 @@ mod tests {
     /// `font_scale_matches_the_source_metrics` uses.
     #[test]
     fn chrome_border_and_fill_are_translucent() {
-        for alpha in [PANEL_FILL.a(), PANEL_BORDER_COLOR.a()] {
-            assert_eq!(alpha, 128);
-        }
+        assert_eq!(PANEL_BORDER_COLOR.a(), 128);
+        let fill_alpha = PANEL_FILL.a();
+        assert!(fill_alpha > 0 && fill_alpha < 255, "{fill_alpha}");
+    }
+
+    /// The panel is deliberately *not* the source's slate `#232830` — that
+    /// reads as washed-out grey over game footage. Lock the near-black.
+    #[test]
+    fn panel_fill_is_near_black_not_slate() {
+        // Compare through the same constructor: `Color32` stores premultiplied
+        // channels, so `to_tuple()` would not round-trip the (18, 18, 22).
+        assert_eq!(
+            PANEL_FILL,
+            egui::Color32::from_rgba_unmultiplied(18, 18, 22, 200)
+        );
     }
 
     // -- share bar role coloring (issue #44) --------------------------------
@@ -4741,13 +4825,11 @@ mod tests {
         assert_eq!(settings.window_position, Some([100.0, 200.0]));
     }
 
-    // -- toolbar icon buttons (issue #41) ----------------------------------
+    // -- toolbar/menu icons (issue #41, #71) -------------------------------
 
-    /// `icon_button`'s and `minimize_button`'s footprint must land exactly
-    /// on `interact_size.y` — the height `header_band_height` already
-    /// budgets the button row at — or the header band and the actually
-    /// rendered row would drift apart (the same class of bug the
-    /// `header_band_height_*` tests above guard against for the subtitle).
+    /// `TOOLBAR_ICON_SIZE` plus `button_padding` must land exactly on
+    /// `interact_size.y` — `CHEVRON_SIZE` is defined off this, so a drift
+    /// here would desync the chevron's hit box from the rest of the theme.
     #[test]
     fn toolbar_icon_button_height_matches_interact_size() {
         // `apply_theme` is what actually sets `button_padding` at runtime
@@ -4767,14 +4849,14 @@ mod tests {
         assert_eq!(button_height, interact_size_y);
     }
 
-    /// `icon_button` must fall back to the original glyph, not paint
-    /// nothing or panic, when the texture failed to decode (belt-and-braces,
-    /// mirrors `ClassIcons::get`'s `None` case).
+    /// `menu_item_button` must fall back to a plain text button — not paint
+    /// nothing or panic — when the icon texture failed to decode
+    /// (belt-and-braces, mirrors `ClassIcons::get`'s `None` case).
     #[test]
-    fn icon_button_falls_back_to_glyph_when_texture_is_none() {
+    fn menu_item_button_falls_back_to_text_when_texture_is_none() {
         let ctx = egui::Context::default();
         ctx.run_ui(egui::RawInput::default(), |ui| {
-            let response = icon_button(ui, None, "×", "Close");
+            let response = ui.add(menu_item_button(None, "Close"));
             // A real widget was allocated — a non-zero rect — not a no-op.
             assert!(response.rect.width() > 0.0);
             assert!(response.rect.height() > 0.0);
@@ -4782,19 +4864,34 @@ mod tests {
         .drop_without_applying_deltas();
     }
 
-    /// `minimize_button`'s allocated rect must match `icon_button`'s
-    /// footprint exactly (`TOOLBAR_ICON_SIZE` plus `button_padding` on all
-    /// sides), so it doesn't stand out as an oddly-sized button in the row.
+    /// Unlike the old image-only `icon_button`, `menu_item_button` always
+    /// carries a text atom (`Button::image_and_text`/`Button::new`), so its
+    /// accessible name comes for free from the button's own text — no
+    /// hand-rolled `widget_info` call needed the way the old image-only
+    /// buttons required. Regression guard for that assumption.
     #[test]
-    fn minimize_button_footprint_matches_icon_button_size() {
+    fn menu_item_button_with_a_texture_has_an_accessible_label_matching_the_text() {
         let ctx = egui::Context::default();
-        ctx.run_ui(egui::RawInput::default(), |ui| {
-            let response = minimize_button(ui);
-            let padding = ui.spacing().button_padding;
-            let expected = TOOLBAR_ICON_SIZE + 2.0 * padding.y;
-            assert_eq!(response.rect.height(), expected);
-        })
-        .drop_without_applying_deltas();
+        ctx.enable_accesskit();
+        let texture = ctx.load_texture(
+            "test-icon",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+
+        let mut id = egui::Id::NULL;
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            id = ui.add(menu_item_button(Some(&texture), "Close")).id;
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let label = accessible_label(&update, id);
+        output.drop_without_applying_deltas();
+
+        assert_eq!(label.as_deref(), Some("Close"));
     }
 
     /// Reads back the accessible ("label") name AccessKit would announce for
@@ -4811,60 +4908,170 @@ mod tests {
             .map(str::to_string)
     }
 
-    /// Regression test for the review finding that replacing the "×"/"_"/
-    /// "Reset" text buttons with image-only ones dropped their accessible
-    /// name: `Button::image` carries no text atom, so — verified against
-    /// the vendored egui source — nothing on the default path ever calls
-    /// `widget_info` with a label for it, and `on_hover_text` alone never
-    /// touches accessibility info either. `icon_button`'s explicit
-    /// `widget_info` call is what puts the label back.
-    #[test]
-    fn icon_button_with_a_texture_has_an_accessible_label_matching_the_tooltip() {
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        let texture = ctx.load_texture(
-            "test-icon",
-            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
-            egui::TextureOptions::LINEAR,
-        );
-
-        let mut id = egui::Id::NULL;
-        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            id = icon_button(ui, Some(&texture), "×", "Close").id;
-        });
-        let update = output
-            .platform_output
-            .accesskit_update
-            .clone()
-            .expect("accesskit was enabled for this frame");
-        let label = accessible_label(&update, id);
-        output.drop_without_applying_deltas();
-
-        assert_eq!(label.as_deref(), Some("Close"));
+    /// Same idea as `accessible_label`, but reads back where AccessKit says
+    /// the labeled node painted. Every interactive `Response` fills in its
+    /// AccessKit bounds from its own `rect` for free
+    /// (`Response::fill_accesskit_node_common`), so this is what lets a test
+    /// click a specific `draw_header_menu` item without that function
+    /// handing back anything more than a `Ui` to paint into.
+    fn accessible_rect_for_label(update: &egui::accesskit::TreeUpdate, label: &str) -> egui::Rect {
+        let bounds = update
+            .nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.label() == Some(label))
+                    .then(|| node.bounds())
+                    .flatten()
+            })
+            .unwrap_or_else(|| panic!("no accessible node labeled {label:?} painted"));
+        egui::Rect::from_min_max(
+            egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+            egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+        )
     }
 
-    /// Same regression, for `minimize_button`: it bypasses `Button`
-    /// entirely (a hand-painted line on a raw `allocate_exact_size`
-    /// response), so it has no `widget_info` call to inherit from anywhere
-    /// — its own explicit call is the only source of a label.
+    /// A single left-click (move, press, release, all in one frame) at
+    /// `pos` — enough for `Response::clicked()` to fire on whatever gets
+    /// allocated at `pos` during the very frame this `RawInput` drives,
+    /// since `Context::run_ui` folds `new_input` into `InputState` before
+    /// the paint closure runs.
+    fn click_at(pos: egui::Pos2) -> egui::RawInput {
+        let modifiers = egui::Modifiers::NONE;
+        egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// Reset and Close are built from structurally near-identical blocks in
+    /// `draw_header_menu` — icon, label, `.clicked()` guard, command
+    /// dispatch — exactly the shape a copy-paste slip could swap without
+    /// the compiler ever noticing. This drives real clicks through
+    /// `Response::clicked()`, the same path `draw_header_menu` itself
+    /// checks, rather than calling `tx_command.try_send` or
+    /// `ctx.send_viewport_cmd` directly — a swapped pairing between the two
+    /// blocks would still pass a test that only inspected the call sites in
+    /// isolation.
     #[test]
-    fn minimize_button_has_an_accessible_label() {
+    fn draw_header_menu_dispatches_reset_and_close_to_the_right_commands() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let mut collapse = CollapseState::default();
 
-        let mut id = egui::Id::NULL;
-        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            id = minimize_button(ui).id;
+        // Frame 1: lay the menu out with no input, and read back where
+        // AccessKit says "Reset" and "Close" actually painted — neither
+        // button's rect is knowable ahead of a real `draw_header_menu` run.
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut collapse,
+                40.0,
+            );
         });
-        let update = output
+        let update = layout
             .platform_output
             .accesskit_update
             .clone()
             .expect("accesskit was enabled for this frame");
-        let label = accessible_label(&update, id);
+        let reset_pos = accessible_rect_for_label(&update, "Reset").center();
+        let close_pos = accessible_rect_for_label(&update, "Close").center();
+        layout.drop_without_applying_deltas();
+
+        // Frame 2: click Reset.
+        let output = ctx.run_ui(click_at(reset_pos), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut collapse,
+                40.0,
+            );
+        });
+        let reset_commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
         output.drop_without_applying_deltas();
 
-        assert_eq!(label.as_deref(), Some("Minimize"));
+        assert_eq!(
+            rx_command.try_recv().expect("Reset must send a command"),
+            UiCommand::Reset
+        );
+        assert!(
+            rx_command.try_recv().is_err(),
+            "Reset must not also queue a second command"
+        );
+        assert!(
+            !reset_commands.contains(&egui::ViewportCommand::Close),
+            "Reset must not also close the window: {reset_commands:?}"
+        );
+
+        // Frame 3: click Close.
+        let output = ctx.run_ui(click_at(close_pos), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut collapse,
+                40.0,
+            );
+        });
+        let close_commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            rx_command.try_recv().expect("Close must send a command"),
+            UiCommand::Quit
+        );
+        assert!(
+            rx_command.try_recv().is_err(),
+            "Close must not also queue a second command"
+        );
+        assert!(
+            close_commands.contains(&egui::ViewportCommand::Close),
+            "Close must also ask the viewport to close: {close_commands:?}"
+        );
     }
 
     #[test]
@@ -5578,8 +5785,8 @@ mod tests {
     }
 
     /// Its hit box is a `TOOLBAR_ICON_SIZE` square, the same footprint the
-    /// window controls in the row below have, so it is as easy to hit as
-    /// they are.
+    /// dropdown's own menu-item icons use, so it is as easy to hit as they
+    /// are.
     #[test]
     fn the_chevron_hit_box_is_a_toolbar_sized_square() {
         let chevron = chevron_rect(title_row());
@@ -5599,11 +5806,13 @@ mod tests {
         assert!(row.contains_rect(chevron));
     }
 
-    /// Expanded points down ("fold this away"), collapsed points up ("unfold
-    /// it") — a mirror of the same three points about the box's center line,
-    /// not a different glyph.
+    /// `chevron_points` still supports mirroring the V about the box's
+    /// center line for either direction — `menu_chevron` itself now only
+    /// ever asks for `true` (down, a menu affordance, never a
+    /// collapse-state indicator; see `the_chevron_always_points_down`), but
+    /// the pure function underneath stays general.
     #[test]
-    fn the_chevron_flips_between_collapsed_and_expanded() {
+    fn chevron_points_mirrors_up_and_down_about_its_center() {
         let rect = chevron_rect(title_row());
         let down = chevron_points(rect, true);
         let up = chevron_points(rect, false);
@@ -5637,29 +5846,41 @@ mod tests {
         assert!(width >= depth * 2.0, "{width}pt wide vs {depth}pt deep");
     }
 
-    /// Same accessibility regression `minimize_button` guards against: a raw
-    /// `interact` response carries no `WidgetInfo` from anywhere, so without
-    /// the explicit call a screen-reader user hears an unlabeled control.
-    /// The label names the action, so it flips with the state.
+    /// Same accessibility regression the old `minimize_button` guarded
+    /// against: a raw `interact` response carries no `WidgetInfo` from
+    /// anywhere, so without the explicit call a screen-reader user hears an
+    /// unlabeled control. Unlike the old collapse chevron, the label no
+    /// longer flips with any state — it always names the menu affordance.
     #[test]
-    fn the_chevron_has_an_accessible_label_that_names_the_action() {
-        for (collapsed, expected) in [(false, "Collapse"), (true, "Expand")] {
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
+    fn the_chevron_has_an_accessible_label_naming_the_menu() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
 
-            let mut id = egui::Id::NULL;
-            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                id = collapse_chevron(ui, chevron_rect(title_row()), collapsed).id;
-            });
-            let update = output
-                .platform_output
-                .accesskit_update
-                .clone()
-                .expect("accesskit was enabled for this frame");
-            let label = accessible_label(&update, id);
-            output.drop_without_applying_deltas();
+        let mut id = egui::Id::NULL;
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            id = menu_chevron(ui, chevron_rect(title_row())).id;
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let label = accessible_label(&update, id);
+        output.drop_without_applying_deltas();
 
-            assert_eq!(label.as_deref(), Some(expected));
-        }
+        assert_eq!(label.as_deref(), Some("Menu"));
+    }
+
+    /// `menu_chevron` always points down (issue #71) — it is a menu
+    /// affordance, not a collapse-state indicator, so it must not flip when
+    /// the overlay is collapsed.
+    #[test]
+    fn the_chevron_always_points_down() {
+        let rect = chevron_rect(title_row());
+        let points = chevron_points(rect, true);
+        // The tip is the middle point; the two ends sit opposite it, above
+        // the tip when pointing down.
+        assert!(points[1].y > points[0].y);
+        assert!(points[1].y > points[2].y);
     }
 }
