@@ -403,6 +403,7 @@ fn draw_header(
     // leaves exactly this band on screen, so the two are the same number by
     // construction rather than by a hardcoded constant that could drift.
     let band_height = header_band_height(subtitle.is_some(), ui.spacing().interact_size.y);
+    let text_band_height = header_text_band_height(subtitle.is_some());
 
     // The panel's own full-width rect, captured before the band below
     // narrows it to the drag band's height — the background wash (issue #59,
@@ -422,10 +423,8 @@ fn draw_header(
     // reaching that row lands straight on the pill, under a 6%-alpha fill
     // and behind a clock glyph tinted at a third alpha. Clipping to the
     // text band still keeps the intentional bleed off the left edge.
-    let emblem_clip = egui::Rect::from_min_size(
-        panel.min,
-        egui::vec2(panel.width(), header_text_band_height(subtitle.is_some())),
-    );
+    let emblem_clip =
+        egui::Rect::from_min_size(panel.min, egui::vec2(panel.width(), text_band_height));
     // The whole header band is the drag surface — title line, the optional
     // subtitle line, and the timer/DPS/buttons row — registered *before* the
     // row's contents so the buttons drawn into it end up on top and still get
@@ -464,7 +463,7 @@ fn draw_header(
     if let Some(emblem) = icons.glyphs.get(GlyphIcon::Emblem) {
         ui.painter().with_clip_rect(emblem_clip).image(
             emblem.id(),
-            header_emblem_rect(title_row, header_text_band_height(subtitle.is_some())),
+            header_emblem_rect(title_row, text_band_height),
             UV_FULL,
             HEADER_EMBLEM_COLOR,
         );
@@ -2686,7 +2685,7 @@ fn row_bar_frac(damage: i64, top_damage: i64) -> f32 {
     if top_damage <= 0 {
         0.0
     } else {
-        damage as f32 / top_damage as f32
+        (damage as f64 / top_damage as f64) as f32
     }
 }
 
