@@ -1762,7 +1762,10 @@ pub struct WindowGesture {
 #[derive(Debug)]
 struct ActiveGesture {
     kind: GestureKind,
-    /// Pointer position in *screen* points when the gesture began.
+    /// Pointer position in *screen* points when the gesture began, sourced
+    /// from the OS cursor (`platform::cursor_position`) rather than
+    /// reconstructed from the window's own rect — see `window_and_pointer`'s
+    /// doc comment (issue #68) for why the latter is a feedback loop.
     start_pointer: egui::Pos2,
     /// The window's outer rect, in points, when the gesture began. Every
     /// frame's target is computed from this plus the total pointer delta,
@@ -1804,17 +1807,69 @@ impl WindowGesture {
 
 /// The window's outer rect and the pointer, both in screen points.
 ///
-/// Screen space is the only frame of reference a manual gesture can use:
-/// egui reports the pointer in window-local coordinates, and as the window
-/// follows the pointer that local position stays put — a local per-frame
-/// delta would cancel itself out and leave the window juddering in place.
-/// Adding the window's own origin back undoes that.
+/// Screen space is the only frame of reference a manual gesture can use, but
+/// getting there needs care: egui reports the pointer in window-local
+/// coordinates, and as a gesture moves the window that local position can go
+/// stale for a whole frame or more — Windows doesn't synthesize a mouse-move
+/// message when a window moves under a stationary cursor. The old fix for
+/// that, `window.min + local`, was itself the bug (issue #68): it re-derives
+/// screen position from the very window the gesture is dragging, so on a
+/// frame where the local pointer is stale but `outer_rect.min` has already
+/// advanced, the reconstruction drifts by exactly that advance — and since
+/// `drive_window_gesture`'s delta feeds off this every frame, that drift
+/// compounds into runaway acceleration for any gesture that moves the
+/// window's origin (`Move`, and the resize directions that drag a
+/// corner/edge through it).
+///
+/// So the pointer is sourced from `platform::cursor_position` — the OS's own
+/// cursor position via `GetCursorPos`, which the window being dragged can't
+/// perturb — and the window-relative reconstruction is only a fallback for
+/// when that's unavailable (non-Windows dev hosts, where this gesture is
+/// cosmetic anyway). See `gesture_pointer` for the actual choice, kept pure
+/// and separate so it's testable without a window.
 fn window_and_pointer(ctx: &egui::Context) -> Option<(egui::Rect, egui::Pos2)> {
-    ctx.input(|i| {
-        let window = i.viewport().outer_rect?;
-        let pointer = i.pointer.latest_pos()?;
-        Some((window, window.min + pointer.to_vec2()))
-    })
+    // The closure below only *reads* out of `i` and returns — nothing in it
+    // may call back into `ctx`. `ctx.pixels_per_point()` is itself
+    // `ctx.input(|i| ...)`, and `platform::cursor_position` can `log::warn!`
+    // on failure, taking the logger lock; either one running while this
+    // closure still held the input lock would be a nested `ctx.input()` on
+    // the same thread, which egui warns can deadlock against a queued
+    // writer. So the three values this needs are copied out here (including
+    // the scale factor, read as the `InputState` field `ctx.pixels_per_point`
+    // would have gone back through `ctx.input` for), the lock is dropped, and
+    // the OS cursor is resolved afterward.
+    //
+    // That scale is the *effective* one — `zoom_factor * native` — because
+    // `outer_rect` is: egui-winit divides the window's physical rect by
+    // exactly this value to produce it. Converting `GetCursorPos`'s physical
+    // pixels with the bare native factor instead would put the OS cursor in a
+    // different space than the rect and the local pointer it is measured
+    // against the moment a zoom is ever applied.
+    let (window, local, pixels_per_point) = ctx.input(|i| {
+        (
+            i.viewport().outer_rect,
+            i.pointer.latest_pos(),
+            i.pixels_per_point,
+        )
+    });
+    let (window, local) = (window?, local?);
+    let os_cursor = crate::platform::cursor_position(pixels_per_point);
+    Some((window, gesture_pointer(os_cursor, window, local)))
+}
+
+/// The screen-space pointer position a gesture should measure against:
+/// `os_cursor` when the OS supplied one, otherwise `window`'s origin plus
+/// egui's window-local `local` position.
+///
+/// Pure and separate from `window_and_pointer` so the regression this closes
+/// (issue #68 — see `window_and_pointer`'s doc comment) is testable without
+/// an `egui::Context` or a real window.
+fn gesture_pointer(
+    os_cursor: Option<egui::Pos2>,
+    window: egui::Rect,
+    local: egui::Pos2,
+) -> egui::Pos2 {
+    os_cursor.unwrap_or_else(|| window.min + local.to_vec2())
 }
 
 /// Starts `kind` from wherever the pointer and window are right now.
@@ -1823,6 +1878,9 @@ fn begin_window_gesture(ctx: &egui::Context, gesture: &mut WindowGesture, kind: 
     // window) means there's no anchor to measure against; skipping just
     // costs the user one re-grab.
     if let Some((window, pointer)) = window_and_pointer(ctx) {
+        log::debug!(
+            "begin_window_gesture: {kind:?} start_rect={window:?} start_pointer={pointer:?}"
+        );
         gesture.begin(kind, pointer, window);
     }
 }
@@ -1856,6 +1914,7 @@ fn drive_window_gesture(ctx: &egui::Context, gesture: &mut WindowGesture, min_si
     // rest of the session.
     let holding = ctx.input(|i| i.pointer.primary_down() && i.viewport().focused.unwrap_or(true));
     if !holding {
+        log::debug!("drive_window_gesture: ending {kind:?}");
         gesture.end();
         return;
     }
@@ -2862,6 +2921,49 @@ mod tests {
     #[test]
     fn fmt_duration_no_hour_rollover() {
         assert_eq!(fmt_duration(3_600_000), "60:00");
+    }
+
+    // -- issue #68: gesture pointer sourced from the OS cursor, not the
+    // window being dragged --------------------------------------------------
+
+    #[test]
+    fn gesture_pointer_a_moving_window_cannot_drag_the_os_cursor_along_with_it() {
+        // The bug: `window.min + local` re-derives screen position from the
+        // very window the gesture just moved, so the reconstructed pointer
+        // drifts with the window even though the real cursor hasn't moved.
+        // With an OS-supplied cursor, two different window rects (as if the
+        // window moved between frames) must yield the identical screen
+        // position — proving the measured pointer can no longer be dragged
+        // along with the window, which is exactly what made `delta` grow
+        // every frame in the runaway.
+        let os_cursor = egui::pos2(500.0, 400.0);
+        let local = egui::pos2(50.0, 50.0);
+        let window_before =
+            egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(300.0, 200.0));
+        let window_after =
+            egui::Rect::from_min_size(egui::pos2(140.0, 130.0), egui::vec2(300.0, 200.0));
+
+        let before = gesture_pointer(Some(os_cursor), window_before, local);
+        let after = gesture_pointer(Some(os_cursor), window_after, local);
+
+        assert_eq!(before, os_cursor);
+        assert_eq!(after, os_cursor);
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn gesture_pointer_falls_back_to_the_window_origin_without_an_os_cursor() {
+        // Non-Windows dev hosts have no `GetCursorPos` equivalent wired up
+        // (`platform::cursor_position` returns `None` there), so this
+        // fallback just preserves the previous, pre-#68 behaviour on those
+        // dev-only hosts.
+        let window = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(300.0, 200.0));
+        let local = egui::pos2(50.0, 50.0);
+
+        assert_eq!(
+            gesture_pointer(None, window, local),
+            egui::pos2(150.0, 150.0)
+        );
     }
 
     // -- header restyle (top-bar restyle: hamburger removal, total-damage

@@ -9,6 +9,8 @@ mod dump;
 mod fonts;
 mod icons;
 mod inspect;
+mod logging;
+mod paths;
 mod pipeline;
 mod platform;
 mod settings;
@@ -32,21 +34,26 @@ const COMMAND_CAPACITY: usize = 64;
 /// Falls back to a current-directory file, logged, if `APPDATA` isn't set
 /// (e.g. non-Windows dev/CI environments).
 fn names_cache_path() -> PathBuf {
-    match std::env::var("APPDATA") {
-        Ok(appdata) if !appdata.is_empty() => PathBuf::from(appdata)
-            .join("ShinraMeter-BPSR")
-            .join("names.json"),
-        _ => {
-            log::warn!(
-                "APPDATA is not set; falling back to a working-directory file for the name cache"
-            );
-            PathBuf::from("ShinraMeter-BPSR-names.json")
-        }
+    let (path, warning) = paths::resolve(
+        None,
+        std::env::var("APPDATA").ok().as_deref(),
+        &["ShinraMeter-BPSR", "names.json"],
+        "ShinraMeter-BPSR-names.json",
+        "APPDATA is not set; falling back to a working-directory file for the name cache",
+    );
+    if let Some(warning) = warning {
+        log::warn!("{warning}");
     }
+    path
 }
 
 fn main() -> eframe::Result {
-    env_logger::init();
+    // `env_logger::init()` alone defaults to `error`-only and, since this
+    // binary carries `windows_subsystem = "windows"`, has no console for
+    // stderr to land on in a shipped build — so it was effectively silent.
+    // `logging::init` (issue #69) turns logging on by default and tees it to
+    // a file so a user hitting a bug can actually produce diagnostics.
+    logging::init();
 
     let (tx_events, rx_events) = bounded::<ProtocolEvent>(EVENT_CAPACITY);
     let (tx_command, rx_command) = bounded::<UiCommand>(COMMAND_CAPACITY);
