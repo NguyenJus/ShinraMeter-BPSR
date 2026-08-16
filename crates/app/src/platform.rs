@@ -1668,6 +1668,79 @@ fn show_tray_menu(hwnd: windows::Win32::Foundation::HWND) {
     }
 }
 
+/// The pointer's current position in screen space (egui points), sourced
+/// directly from the OS rather than reconstructed from the window `ui.rs` is
+/// itself moving.
+///
+/// Issue #68: `ui.rs`'s manual move/resize gestures (issue #11 — see this
+/// module's top-level doc comment for why they can't use
+/// `ViewportCommand::StartDrag`/`BeginResize`) used to derive the
+/// screen-space pointer as `outer_rect.min + pointer.latest_pos()`: the
+/// window's own origin plus egui's window-local pointer position. That
+/// reconstruction is a feedback loop for any gesture that moves the
+/// window's origin (`Move`, and the resize directions that drag a
+/// corner/edge through it) — Windows doesn't synthesize a mouse-move
+/// message when a window moves under a stationary cursor, so the
+/// window-local position egui reports stays frozen between real mouse
+/// events while `outer_rect.min` keeps advancing as the gesture itself
+/// drives the window. The reconstructed screen position therefore drifts by
+/// exactly the distance the window just moved on the previous frame, so
+/// `pointer - start_pointer` grows every single frame even with the mouse
+/// held perfectly still, and the gesture accelerates itself into runaway
+/// growth.
+///
+/// `GetCursorPos` sidesteps this entirely: it reads the OS's own cursor
+/// position, which nothing the window does can perturb. This is the same
+/// call winit itself makes in its own `handle_os_dragging` before entering a
+/// native `SC_MOVE`/`SC_SIZE` loop. `ui.rs`'s `window_and_pointer` calls this
+/// first and only falls back to the old window-relative reconstruction when
+/// it returns `None` — non-Windows dev hosts, where the gesture is cosmetic
+/// and the drift this fixes is harmless.
+///
+/// Returns `None` (after logging at `warn`) if `GetCursorPos` fails, which
+/// in practice is effectively impossible — it has no documented failure mode
+/// short of a broken process/desktop state — so the log call needs no
+/// rate-limiting.
+#[cfg(windows)]
+pub fn cursor_position(pixels_per_point: f32) -> Option<egui::Pos2> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut point = POINT::default();
+    // SAFETY: `point` is a valid, correctly-sized out-param for the
+    // duration of this call.
+    if !unsafe { GetCursorPos(&mut point) }.as_bool() {
+        log::warn!(
+            "GetCursorPos failed; falling back to the window-relative pointer reconstruction"
+        );
+        return None;
+    }
+    Some(cursor_points(point.x, point.y, pixels_per_point))
+}
+
+#[cfg(not(windows))]
+pub fn cursor_position(_pixels_per_point: f32) -> Option<egui::Pos2> {
+    None
+}
+
+/// Converts a physical-pixel cursor position, as `GetCursorPos` reports it,
+/// to egui points. Guards against a non-finite or non-positive
+/// `pixels_per_point` by treating it as `1.0` (identity conversion) instead
+/// of dividing by zero or producing a NaN/infinite coordinate that would
+/// send a gesture's delta flying.
+///
+/// Pure so the conversion is unit-testable off-Windows, the same way this
+/// module's other geometry helpers are.
+#[cfg(any(windows, test))]
+fn cursor_points(x: i32, y: i32, pixels_per_point: f32) -> egui::Pos2 {
+    let scale = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    egui::Pos2::new(x as f32 / scale, y as f32 / scale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2063,5 +2136,21 @@ mod tests {
         let current = rect(-32000, -32000, -31600, -31700);
         let proposal = rect(0, 0, 1920, 1040);
         assert!(!should_veto_snap(current, proposal, &[monitor]));
+    }
+
+    #[test]
+    fn cursor_points_at_unit_scale_is_identity() {
+        assert_eq!(cursor_points(100, 200, 1.0), egui::pos2(100.0, 200.0));
+    }
+
+    #[test]
+    fn cursor_points_divides_by_the_scale_factor() {
+        assert_eq!(cursor_points(150, 300, 1.5), egui::pos2(100.0, 200.0));
+    }
+
+    #[test]
+    fn cursor_points_treats_a_zero_or_nan_scale_as_1_0() {
+        assert_eq!(cursor_points(100, 200, 0.0), egui::pos2(100.0, 200.0));
+        assert_eq!(cursor_points(100, 200, f32::NAN), egui::pos2(100.0, 200.0));
     }
 }
