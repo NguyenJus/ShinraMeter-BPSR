@@ -227,6 +227,18 @@ impl Pipeline {
         self.meter.snapshot(now_ms)
     }
 
+    /// Advances the meter's wall-clock-driven fight state (issue #78) —
+    /// specifically, the idle timeout that ends a fight and freezes its
+    /// stats on screen. Called once per publish tick, immediately before
+    /// `snapshot`, because no packet arrives to mark the moment a fight goes
+    /// quiet.
+    /// Returns the resulting state, which the UI can use later to label a
+    /// held meter (`bpsr_meter::Meter::fight_state` answers the same question
+    /// without advancing anything).
+    pub fn tick(&mut self, now_ms: u64) -> meter::FightState {
+        self.meter.tick(now_ms)
+    }
+
     /// Stops the background cache-writer thread, blocking until it has
     /// written any pending snapshot to disk. Must be called before process
     /// exit (see `run`'s shutdown path) so the final save is never lost; a
@@ -298,7 +310,7 @@ fn run(
                 Ok(UiCommand::Quit) => break,
                 Err(_) => break,
             },
-            recv(ticker) -> _ => publish(&pipeline, &tx_snapshot, &stale),
+            recv(ticker) -> _ => publish(&mut pipeline, &tx_snapshot, &stale),
         }
     }
 
@@ -313,14 +325,18 @@ fn run(
 /// Publishes the latest snapshot, dropping the previous one if the UI has not
 /// consumed it yet.
 fn publish(
-    pipeline: &Pipeline,
+    pipeline: &mut Pipeline,
     tx_snapshot: &Sender<meter::Snapshot>,
     stale: &Receiver<meter::Snapshot>,
 ) {
-    let snap = pipeline.snapshot(now_ms());
+    // One `now` for the whole tick: the fight-state advance and the snapshot
+    // it feeds must agree on what time it is.
+    let now = now_ms();
+    pipeline.tick(now);
+    let snap = pipeline.snapshot(now);
     if tx_snapshot.try_send(snap).is_err() {
         let _ = stale.try_recv();
-        let _ = tx_snapshot.try_send(pipeline.snapshot(now_ms()));
+        let _ = tx_snapshot.try_send(pipeline.snapshot(now));
     }
 }
 
@@ -488,6 +504,37 @@ mod tests {
         assert_eq!(snap.total_damage, 1_000);
         assert_eq!(snap.rows.len(), 2);
         assert_eq!(snap.rows[0].uid, 1);
+    }
+
+    /// Issue #78: the pipeline's tick is what turns "no packets for a while"
+    /// into a frozen meter, so the wiring is worth pinning here and not only
+    /// in `bpsr-meter`.
+    #[test]
+    fn a_quiet_meter_ticks_into_the_ended_state_and_holds_its_snapshot() {
+        let idle = meter::FightConfig::default().idle_timeout_ms;
+        let mut p = Pipeline::new();
+        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)));
+
+        assert_eq!(p.tick(1_000 + idle - 1), meter::FightState::Active);
+        assert_eq!(p.tick(1_000 + idle), meter::FightState::Ended);
+        assert_eq!(p.tick(600_000), meter::FightState::Ended);
+
+        // Held: the elapsed timer and the totals stop moving.
+        let held = p.snapshot(600_000);
+        assert_eq!(held.total_damage, 700);
+        assert_eq!(held.duration_ms, 1);
+    }
+
+    #[test]
+    fn the_next_fights_first_hit_clears_a_held_snapshot() {
+        let mut p = Pipeline::new();
+        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)));
+        p.tick(600_000);
+
+        let reason = p.step(proto::ProtocolEvent::Damage(damage(1, 300, 600_000)));
+        assert_eq!(reason, Some(meter::ResetReason::NewFight));
+        assert_eq!(p.snapshot(601_000).total_damage, 300);
+        assert_eq!(p.tick(601_000), meter::FightState::Active);
     }
 
     #[test]

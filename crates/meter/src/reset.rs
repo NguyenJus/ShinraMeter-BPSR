@@ -6,6 +6,12 @@ pub enum ResetReason {
     Manual,
     BossHpRollback,
     ServerChange,
+    /// The previous fight had ended (see `crate::fight`) and its stats were
+    /// being held on screen; the first damage of the next fight clears them
+    /// (issue #78). Unlike the other reasons this one is *caused* by combat
+    /// resuming, so the reset and the new fight's first hit are the same
+    /// event.
+    NewFight,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
