@@ -3027,10 +3027,16 @@ pub fn fmt_dps(v: i64) -> String {
 
     fn scaled(sign: &str, av: u64, divisor: f64, suffix: &str) -> String {
         let value = av as f64 / divisor;
-        if value >= 100.0 {
-            format!("{sign}{value:.0}{suffix}")
+        // Branch on the value *after* rounding to the one-decimal branch's
+        // precision, not before: a raw value just under 100 (e.g. 99.999)
+        // still rounds up to "100.0" once formatted, which must take the
+        // no-decimal branch (`"100K"`) instead of overflowing the narrowed
+        // Dps column with a 6-char `"100.0K"`.
+        let rounded = (value * 10.0).round() / 10.0;
+        if rounded >= 100.0 {
+            format!("{sign}{rounded:.0}{suffix}")
         } else {
-            format!("{sign}{value:.1}{suffix}")
+            format!("{sign}{rounded:.1}{suffix}")
         }
     }
 
@@ -4543,6 +4549,30 @@ mod tests {
         ];
         for (input, expected) in cases {
             assert_eq!(fmt_dps(input), expected, "fmt_dps({input})");
+        }
+    }
+
+    /// Branch-before-rounding regression: a raw scaled value just under 100
+    /// (e.g. `99.999`) still rounds up to `100.0` once formatted to one
+    /// decimal, so it must take the no-decimal branch (`"100K"`, 4 chars)
+    /// rather than the one-decimal branch overflowing to `"100.0K"` (6
+    /// chars) — the narrowed Dps column is sized for the 7-char
+    /// `"1000K/s"` worst case, i.e. a 5-char budget before the `/s` suffix.
+    #[test]
+    fn fmt_dps_rounds_before_choosing_the_decimal_branch() {
+        let cases: [(i64, &str); 4] = [
+            (99_950, "100K"),
+            (99_999, "100K"),
+            (99_950_000, "100M"),
+            (99_999_999, "100M"),
+        ];
+        for (input, expected) in cases {
+            let out = fmt_dps(input);
+            assert_eq!(out, expected, "fmt_dps({input})");
+            assert!(
+                out.trim_start_matches('-').len() <= 5,
+                "fmt_dps({input}) = {out:?} exceeds the 5-char pre-suffix budget"
+            );
         }
     }
 
