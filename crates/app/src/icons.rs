@@ -254,14 +254,19 @@ pub enum GlyphIcon {
     MouseOff,
     CloudOff,
     Check,
+    /// The toggle cluster's Share button (issue #82) — MDI's `export`
+    /// glyph (an arrow lifting out of a tray), reused for "copy a
+    /// screenshot to the clipboard" since neither ShinraMeter's `SVG.xaml`
+    /// nor the existing vendored set has a dedicated share/copy icon.
+    Share,
 }
 
 /// Every `GlyphIcon` an embedded PNG exists for. Provenance is split three
 /// ways — see `THIRD_PARTY_NOTICES.md`'s "ShinraMeter encounter emblem",
 /// "Google Material Symbols", and "Material Design Icons (Pictogrammers)"
 /// sections: `Emblem` is ShinraMeter's own artwork; `Timer`, `Speed`,
-/// `Heart`, `CloudOff`, and `Check` are Google Material Symbols; `Skull` and
-/// `MouseOff` are Pictogrammers' Material Design Icons.
+/// `Heart`, `CloudOff`, and `Check` are Google Material Symbols; `Skull`,
+/// `MouseOff`, and `Share` are Pictogrammers' Material Design Icons.
 const GLYPH_ICON_BYTES: &[(GlyphIcon, &[u8])] = &[
     (
         GlyphIcon::Emblem,
@@ -294,6 +299,10 @@ const GLYPH_ICON_BYTES: &[(GlyphIcon, &[u8])] = &[
     (
         GlyphIcon::Check,
         include_bytes!("../assets/icons/glyphs/check.png"),
+    ),
+    (
+        GlyphIcon::Share,
+        include_bytes!("../assets/icons/glyphs/share.png"),
     ),
 ];
 
@@ -425,6 +434,7 @@ mod tests {
         GlyphIcon::MouseOff,
         GlyphIcon::CloudOff,
         GlyphIcon::Check,
+        GlyphIcon::Share,
     ];
 
     #[test]

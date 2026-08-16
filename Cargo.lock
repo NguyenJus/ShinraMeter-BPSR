@@ -6,6 +6,7 @@ version = 4
 name = "ShinraMeter-BPSR"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "bpsr-capture",
  "bpsr-meter",
  "bpsr-protocol",
