@@ -12,9 +12,10 @@
 //! `%APPDATA%\ShinraMeter-BPSR\logs\ShinraMeter-BPSR.log` (or
 //! `ShinraMeter-BPSR.log` in the working directory if `APPDATA` is unset —
 //! e.g. this Linux dev host), overridable with `SHINRA_LOG_FILE=<path>`. It
-//! is opened in append mode and, at startup, rotated to `<path>.1`
-//! (replacing any previous `.1`) if it has already grown past
-//! [`MAX_LOG_BYTES`] — so a long-lived overlay can't grow an unbounded log.
+//! is opened in append mode and rotated to `<path>.1` (replacing any
+//! previous `.1`) whenever it grows past [`MAX_LOG_BYTES`] — checked both at
+//! startup and, since an always-on overlay can run for days without one,
+//! while the process is live (see [`Tee`]), so the log can't grow unbounded.
 //!
 //! Logs may contain player names and other identifying traffic — never
 //! attach one to an issue or PR (see `.gitignore`).
@@ -23,7 +24,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-/// A log file at or above this size gets rotated to `<path>.1` at startup.
+/// A log file at or above this size gets rotated to `<path>.1`.
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Installs the global logger (stderr + file, `info` by default, `RUST_LOG`
@@ -56,7 +57,7 @@ pub fn init() {
     let env = env_logger::Env::default().default_filter_or("info");
     let mut builder = env_logger::Builder::from_env(env);
     match file {
-        Some(file) => builder.target(env_logger::Target::Pipe(Box::new(Tee::new(file)))),
+        Some(file) => builder.target(env_logger::Target::Pipe(Box::new(Tee::new(path, file)))),
         None => builder.target(env_logger::Target::Stderr),
     };
     builder.init();
@@ -97,29 +98,25 @@ fn log_file_path() -> (PathBuf, Option<String>) {
 /// logger doesn't exist yet at this point in `init`), so it's handed back
 /// to be replayed through `log::warn!` once the logger is live.
 fn log_file_path_from(log_file: Option<&str>, appdata: Option<&str>) -> (PathBuf, Option<String>) {
-    if let Some(path) = log_file
-        && !path.is_empty()
-    {
-        return (PathBuf::from(path), None);
-    }
-    match appdata {
-        Some(appdata) if !appdata.is_empty() => (
-            PathBuf::from(appdata)
-                .join("ShinraMeter-BPSR")
-                .join("logs")
-                .join("ShinraMeter-BPSR.log"),
-            None,
-        ),
-        _ => (
-            PathBuf::from("ShinraMeter-BPSR.log"),
-            Some("APPDATA is not set; falling back to a working-directory log file".to_string()),
-        ),
-    }
+    crate::paths::resolve(
+        log_file,
+        appdata,
+        &["ShinraMeter-BPSR", "logs", "ShinraMeter-BPSR.log"],
+        "ShinraMeter-BPSR.log",
+        "APPDATA is not set; falling back to a working-directory log file",
+    )
 }
 
-/// True once a log file has grown large enough to rotate at startup.
-fn should_rotate(len: u64) -> bool {
-    len >= MAX_LOG_BYTES
+/// True once a log file has grown large enough to rotate.
+fn should_rotate(len: u64, max_bytes: u64) -> bool {
+    len >= max_bytes
+}
+
+/// The `<path>.1` a rotation moves `path` to.
+fn rotated_path(path: &Path) -> PathBuf {
+    let mut rotated = path.as_os_str().to_owned();
+    rotated.push(".1");
+    PathBuf::from(rotated)
 }
 
 /// Renames `path` to `<path>.1` (replacing any previous `.1`) if `len` (its
@@ -127,12 +124,10 @@ fn should_rotate(len: u64) -> bool {
 /// failure is pushed onto `warnings` rather than acted on — losing rotation
 /// isn't worth aborting startup over.
 fn rotate_if_needed(path: &Path, len: u64, warnings: &mut Vec<String>) {
-    if !should_rotate(len) {
+    if !should_rotate(len, MAX_LOG_BYTES) {
         return;
     }
-    let mut rotated = path.as_os_str().to_owned();
-    rotated.push(".1");
-    let rotated = PathBuf::from(rotated);
+    let rotated = rotated_path(path);
     if let Err(err) = fs::rename(path, &rotated) {
         warnings.push(format!(
             "failed to rotate log file {} to {} ({err}); continuing without rotation",
@@ -157,17 +152,68 @@ fn open_log_file(path: &Path) -> io::Result<File> {
 /// to `env_logger` as an `io::Write` via `Target::Pipe` — deliberately not
 /// wrapped in a `BufWriter`, so each record hits disk as it's logged rather
 /// than sitting in an in-process buffer.
+///
+/// Also owns runtime rotation: the startup check in [`init`] alone would let
+/// an overlay that stays up for days grow one unbounded file, so the bytes
+/// written are counted here and the file is rotated and reopened in place
+/// the moment the running total crosses `max_bytes`. Counting rather than
+/// re-`stat`ing keeps that off the per-record path; `env_logger` serializes
+/// every call through its own lock, so the count needs no synchronization of
+/// its own.
 struct Tee {
+    path: PathBuf,
     file: File,
     stderr: io::Stderr,
+    /// Bytes in `file` right now — seeded from its length at open time (it
+    /// is appended to, so it may already hold a previous session's records)
+    /// and reset by each rotation.
+    written: u64,
+    max_bytes: u64,
 }
 
 impl Tee {
-    fn new(file: File) -> Self {
+    fn new(path: PathBuf, file: File) -> Self {
+        Self::with_max_bytes(path, file, MAX_LOG_BYTES)
+    }
+
+    fn with_max_bytes(path: PathBuf, file: File, max_bytes: u64) -> Self {
+        let written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
         Self {
+            path,
             file,
             stderr: io::stderr(),
+            written,
+            max_bytes,
         }
+    }
+
+    /// Moves the current file to `<path>.1` and reopens `path` empty.
+    ///
+    /// Best-effort, like the startup rotation, but the failure can't be
+    /// reported through `log::warn!`: this runs *inside* the logger's own
+    /// writer, so logging here would re-enter `env_logger` while it holds
+    /// the lock guarding this very `Tee`. The note goes straight down the
+    /// two streams instead. The byte count is reset either way, so a
+    /// persistently failing rotation is retried once per `max_bytes` rather
+    /// than on every subsequent record.
+    fn rotate(&mut self) {
+        let rotated = rotated_path(&self.path);
+        // The handle stays open across the rename (Rust opens files with
+        // `FILE_SHARE_DELETE` on Windows, so this is legal there too); it is
+        // dropped by the reopen below, which is the last write it could have
+        // taken anyway.
+        let result = fs::rename(&self.path, &rotated)
+            .and_then(|()| open_log_file(&self.path).map(|file| self.file = file));
+        if let Err(err) = result {
+            let note = format!(
+                "[log rotation] failed to rotate {} to {} ({err}); continuing in place\n",
+                self.path.display(),
+                rotated.display()
+            );
+            let _ = self.file.write_all(note.as_bytes());
+            let _ = self.stderr.write_all(note.as_bytes());
+        }
+        self.written = 0;
     }
 }
 
@@ -181,6 +227,10 @@ impl Write for Tee {
         // Best-effort: stderr having nowhere to go (no console under
         // `windows_subsystem = "windows"`) must never break file logging.
         let _ = self.stderr.write_all(buf);
+        self.written += buf.len() as u64;
+        if should_rotate(self.written, self.max_bytes) {
+            self.rotate();
+        }
         Ok(buf.len())
     }
 
@@ -215,6 +265,8 @@ fn install_panic_hook() {
 
 #[cfg(test)]
 mod tests {
+    use bpsr_test_support::scratch_path;
+
     use super::*;
 
     // -- log_file_path ----------------------------------------------------
@@ -251,13 +303,56 @@ mod tests {
 
     #[test]
     fn should_rotate_is_false_below_the_threshold() {
-        assert!(!should_rotate(MAX_LOG_BYTES - 1));
-        assert!(!should_rotate(0));
+        assert!(!should_rotate(MAX_LOG_BYTES - 1, MAX_LOG_BYTES));
+        assert!(!should_rotate(0, MAX_LOG_BYTES));
     }
 
     #[test]
     fn should_rotate_is_true_at_or_above_the_threshold() {
-        assert!(should_rotate(MAX_LOG_BYTES));
-        assert!(should_rotate(MAX_LOG_BYTES + 1));
+        assert!(should_rotate(MAX_LOG_BYTES, MAX_LOG_BYTES));
+        assert!(should_rotate(MAX_LOG_BYTES + 1, MAX_LOG_BYTES));
+    }
+
+    // -- Tee ----------------------------------------------------------------
+
+    /// The threshold is crossed by a running process, not just found crossed
+    /// at startup — an always-on overlay never restarts, so a startup-only
+    /// check would let its log grow forever.
+    #[test]
+    fn tee_rotates_when_the_running_total_crosses_the_threshold() {
+        let path = scratch_path("log-rotate");
+        let rotated = rotated_path(&path);
+        let mut tee = Tee::with_max_bytes(path.clone(), open_log_file(&path).unwrap(), 8);
+
+        tee.write_all(b"1234").unwrap();
+        assert!(!rotated.exists());
+
+        tee.write_all(b"5678").unwrap();
+        assert_eq!(fs::read(&rotated).unwrap(), b"12345678");
+
+        // The reopened file, not the rotated-away one, takes what follows.
+        tee.write_all(b"9").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"9");
+        assert_eq!(fs::read(&rotated).unwrap(), b"12345678");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&rotated);
+    }
+
+    /// The file is opened in append mode, so a previous session's records
+    /// count toward the threshold too.
+    #[test]
+    fn tee_seeds_its_count_from_the_file_it_appends_to() {
+        let path = scratch_path("log-seed");
+        let rotated = rotated_path(&path);
+        fs::write(&path, b"previous session").unwrap();
+        let mut tee = Tee::with_max_bytes(path.clone(), open_log_file(&path).unwrap(), 20);
+
+        tee.write_all(b"more").unwrap();
+        assert_eq!(fs::read(&rotated).unwrap(), b"previous sessionmore");
+        assert_eq!(fs::read(&path).unwrap(), b"");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&rotated);
     }
 }

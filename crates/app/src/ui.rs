@@ -1859,17 +1859,25 @@ fn window_and_pointer(ctx: &egui::Context) -> Option<(egui::Rect, egui::Pos2)> {
     // on failure, taking the logger lock; either one running while this
     // closure still held the input lock would be a nested `ctx.input()` on
     // the same thread, which egui warns can deadlock against a queued
-    // writer. So the three values this needs are copied out here, the lock
-    // is dropped, and the scale factor / OS cursor are resolved afterward.
-    let (window, local, native_pixels_per_point) = ctx.input(|i| {
+    // writer. So the three values this needs are copied out here (including
+    // the scale factor, read as the `InputState` field `ctx.pixels_per_point`
+    // would have gone back through `ctx.input` for), the lock is dropped, and
+    // the OS cursor is resolved afterward.
+    //
+    // That scale is the *effective* one — `zoom_factor * native` — because
+    // `outer_rect` is: egui-winit divides the window's physical rect by
+    // exactly this value to produce it. Converting `GetCursorPos`'s physical
+    // pixels with the bare native factor instead would put the OS cursor in a
+    // different space than the rect and the local pointer it is measured
+    // against the moment a zoom is ever applied.
+    let (window, local, pixels_per_point) = ctx.input(|i| {
         (
             i.viewport().outer_rect,
             i.pointer.latest_pos(),
-            i.viewport().native_pixels_per_point,
+            i.pixels_per_point,
         )
     });
     let (window, local) = (window?, local?);
-    let pixels_per_point = native_pixels_per_point.unwrap_or_else(|| ctx.pixels_per_point());
     let os_cursor = crate::platform::cursor_position(pixels_per_point);
     Some((window, gesture_pointer(os_cursor, window, local)))
 }
