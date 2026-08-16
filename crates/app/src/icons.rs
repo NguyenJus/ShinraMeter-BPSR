@@ -190,9 +190,10 @@ pub enum ToolbarIcon {
 /// Every `ToolbarIcon` an embedded PNG exists for. `Settings`, `Reset`, and
 /// `Close` are sourced from neowutran/ShinraMeter's `resources/img/` (MIT) —
 /// see `THIRD_PARTY_NOTICES.md`. No pin/lock and no minimize icon exists in
-/// that repo (issue #41's scope note): minimize is instead drawn
-/// procedurally by `ui.rs`'s `minimize_button`, and pin/lock is out of
-/// scope entirely (no pinning feature exists yet). The death-count glyph
+/// that repo (issue #41's scope note): the header dropdown's "Minimize to
+/// tray" item (issue #71) is plain text rather than an icon, and pin/lock is
+/// out of scope entirely (no pinning feature exists yet). The death-count
+/// glyph
 /// (formerly `ToolbarIcon::Skull`) moved to `GlyphIcon::Skull` (issue #59)
 /// once the pill row it feeds started painting rasterized glyphs
 /// throughout.
