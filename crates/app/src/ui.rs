@@ -160,6 +160,10 @@ pub struct OverlayApp {
     /// deliberately not persisted to `Settings`; see the `CollapseState`
     /// section comment.
     collapse: CollapseState,
+    /// Issue #83: last-logged `(pixels_per_point, zoom_factor)`, so the
+    /// per-frame DPI probe in `ui()` only writes to the log when the value
+    /// actually changes rather than every ~10Hz frame.
+    last_dpi_probe: Option<(f32, f32)>,
 }
 
 /// All icon textures the overlay paints, bundled so `OverlayApp` has exactly
@@ -209,6 +213,7 @@ impl OverlayApp {
             icons: None,
             window_gesture: WindowGesture::default(),
             collapse: CollapseState::default(),
+            last_dpi_probe: None,
         }
     }
 
@@ -231,6 +236,37 @@ impl eframe::App for OverlayApp {
 
         let ctx = ui.ctx().clone();
         apply_theme(&ctx);
+
+        // Issue #83: a prior investigation of "player rows render shorter/
+        // more compact than the reference" found no code-level defect —
+        // `ROW_HEIGHT`, `FONT_SIZE_ROW` and the row-painting math all check
+        // out — but couldn't rule out a runtime DPI effect on the
+        // reporter's real Windows box; no screenshot was obtainable in this
+        // environment to compare directly. Logged only when the value
+        // changes, so a stuck-open overlay repainting at ~10Hz doesn't spam
+        // the log file. A suspicious reading looks like `pixels_per_point`
+        // not matching the display's actual OS scaling (e.g. staying `1.0`
+        // on a 150%-scaled monitor) or a `zoom_factor` other than `1.0` —
+        // either would shrink everything the overlay paints, rows included,
+        // without needing a defect in this file at all.
+        let dpi_probe = (ctx.pixels_per_point(), ctx.zoom_factor());
+        if self.last_dpi_probe != Some(dpi_probe) {
+            log::debug!(
+                "issue #83 probe: pixels_per_point={:.3} zoom_factor={:.3}",
+                dpi_probe.0,
+                dpi_probe.1
+            );
+            self.last_dpi_probe = Some(dpi_probe);
+        }
+
+        // Picks up the Share button's screenshot reply, if this frame has
+        // one (issue #82: `toggle_cluster` fired the request one or more
+        // frames ago via `ViewportCommand::Screenshot`; the round trip is
+        // asynchronous, so it can land on any later frame). Checked every
+        // frame, unconditionally, rather than only while collapsed/expanded
+        // state would suggest — a screenshot can be requested at any point
+        // in the header, which is always painted.
+        handle_screenshot_events(&ctx, crate::platform::write_clipboard_image);
 
         // Loaded once, lazily: the `egui::Context` above isn't available yet
         // at `OverlayApp::new`, so the first frame is what actually uploads
@@ -407,8 +443,9 @@ fn draw_header(
 
     // The panel's own full-width rect, captured before the band below
     // narrows it to the drag band's height — the background wash (issue #59,
-    // #62) is sized off the panel, not the band, since it runs taller than
-    // the band does on its own (`HEADER_WASH_HEIGHT` vs `band_height`).
+    // #62, #81) is anchored off the panel's left/top/right edges, sized to
+    // `text_band_height` rather than the drag band, so it stops above the
+    // stat-pill row instead of running into it.
     let panel = ui.available_rect_before_wrap();
     // The header band's full paint extent — `panel` truncated to
     // `band_height`, with no top adjustment. `RESIZE_EDGE` is a
@@ -439,8 +476,11 @@ fn draw_header(
 
     // The decorative background wash, painted before anything else in the
     // band so every later layer — emblem, title, separator, chevron,
-    // subtitle, stat row — sits on top of it.
-    draw_header_wash(ui, panel, icons);
+    // subtitle, stat row — sits on top of it. Sized to the text rows alone
+    // (issue #81), not the fixed-98pt run it used to be, so it stops clear
+    // of the stat-pill row painted below it rather than bleeding into it.
+    let wash_height = text_band_height - HEADER_WASH_INSET;
+    draw_header_wash(ui, panel, icons, wash_height);
 
     let drag_surface = ui.interact(band, ui.id().with("title_bar"), egui::Sense::drag());
     if drag_surface.hovered() {
@@ -512,7 +552,7 @@ fn draw_header(
         stat_pill(
             ui,
             StatPill::header(
-                &format!("{}/s", fmt_short(snapshot.total_dps as i64)),
+                &format!("{}/s", fmt_dps(snapshot.total_dps as i64)),
                 icons.glyphs.get(GlyphIcon::Speed).map(|t| t.id()),
             ),
         );
@@ -527,27 +567,35 @@ fn draw_header(
                 icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
             ),
         );
-        toggle_cluster(ui, icons);
+        toggle_cluster(ui, tx_command, icons);
     });
 }
 
-// -- status indicators (issue #62) ---------------------------------------
+// -- status indicators (issue #62, #82) -----------------------------------
 //
 // The source's fourth stat-row cell: a click-through LED, a cloud-upload LED
-// and a queue gauge, in a 22pt pill. We have none of those features, so
-// these render **in their off state and are inert** — no click handling, no
-// settings, no tooltip. Rendering them off is the honest reading: the
-// source's `OffBrush` is `#1fff` for both LEDs, and an empty queue gauge is
-// a bare ring with its check glyph, which is exactly the state a meter with
-// no upload queue is in. Rendering them *on* would claim capabilities that
-// do not exist. Issue #62 is explicit that no click-through or
-// cloud-upload feature exists and a use for these slots will be decided
-// later.
+// and a queue gauge, in a 22pt pill. We had none of those features, so all
+// three used to render **in their off state and inert** — no click
+// handling, no settings, no tooltip. Issue #62 was explicit that a use for
+// these slots would be decided later; issue #82 decides two of them: the
+// click-through and cloud-upload LEDs are repurposed as real buttons
+// (Share — copy a screenshot to the clipboard — and Reset, moved out of the
+// header dropdown), leaving only the queue gauge ring inert, since there is
+// still no upload queue for it to show.
 
-/// Tint every inert toggle glyph and the queue ring are painted with — the
-/// source's `OffBrush="#1fff"`.
+/// Tint the still-inert queue ring (and its check glyph) is painted with —
+/// the source's `OffBrush="#1fff"`.
 const TOGGLE_OFF_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x11);
+/// Tint the toggle cluster's two real buttons are painted with — the same
+/// half-white `TOOLBAR_ICON_TINT` every other clickable icon in this module
+/// uses, now that these two read as active controls rather than inert
+/// decoration.
+const TOGGLE_ACTIVE_COLOR: egui::Color32 = TOOLBAR_ICON_TINT;
+/// Circular hover wash painted behind a toggle-cluster button, matching the
+/// oval pill's own shape rather than a foreign square badge.
+const TOGGLE_HOVER_FILL: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 30);
 const TOGGLE_MOUSE_SIDE: f32 = 12.0;
 const TOGGLE_CLOUD_SIDE: f32 = 14.0;
 const TOGGLE_QUEUE_SIDE: f32 = 14.0;
@@ -555,17 +603,36 @@ const TOGGLE_QUEUE_GLYPH_SIDE: f32 = 6.0;
 const TOGGLE_GAP: f32 = 5.0;
 const TOGGLE_PAD_X: f32 = 4.0;
 
-/// Paints the three inert status toggles: a click-through LED (mouse-off), a
-/// cloud-upload LED (cloud-off), and a queue gauge (an empty ring with a
-/// check glyph — the source's backlog `Arc` overlay has nothing to draw with
-/// no queue). All in one `PILL_FILL` oval, matching the DPS/damage pills'
-/// chrome.
-///
-/// Allocated with `Sense::hover()` and its `Response` discarded — deliberately
-/// no `on_hover_text`, no `widget_info`: a labelled inert control is worse
-/// than an unlabelled decoration, since a screen reader announcing a
-/// tooltip for a control that does nothing would be actively misleading.
-fn toggle_cluster(ui: &mut egui::Ui, icons: &Icons) {
+/// One toggle-cluster button's hit box, hover highlight and accessible
+/// label. The painted glyph itself is the caller's job — Share and Reset
+/// draw from two different icon sets (`GlyphIcon` and `ToolbarIcon`) — so
+/// this only owns the interaction chrome shared by both. Same
+/// hand-supplied `widget_info`/`on_hover_text` shape as `menu_chevron`, and
+/// for the same reason: a raw `interact` `Response` carries no `WidgetInfo`
+/// from anywhere.
+fn toggle_button(ui: &egui::Ui, rect: egui::Rect, label: &str) -> egui::Response {
+    let response = ui.interact(
+        rect,
+        ui.id().with(("toggle_cluster", label)),
+        egui::Sense::click(),
+    );
+    if response.hovered() {
+        ui.painter()
+            .circle_filled(rect.center(), rect.width() / 2.0 + 2.0, TOGGLE_HOVER_FILL);
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label)
+    });
+    response.on_hover_text(label)
+}
+
+/// Paints the toggle cluster: the Share and Reset buttons (issue #82) and
+/// the still-inert queue gauge ring (an empty ring — the source's `Ellipse
+/// 14x14 Fill="#0aaa"` has alpha 0, so only the stroke is drawn — with the
+/// check glyph centered in it; no backlog arc, since there is still no
+/// queue for it to show). All in one `PILL_FILL` oval, matching the
+/// DPS/damage pills' chrome.
+fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Icons) {
     let height = ui.spacing().interact_size.y;
     let width = 2.0 * TOGGLE_PAD_X
         + TOGGLE_MOUSE_SIDE
@@ -574,42 +641,55 @@ fn toggle_cluster(ui: &mut egui::Ui, icons: &Icons) {
         + TOGGLE_GAP
         + TOGGLE_QUEUE_SIDE;
     let (rect, _response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    // deliberately no tooltip / no widget_info — see the section comment
-    // above.
 
     if !ui.is_rect_visible(rect) {
         return;
     }
-    let painter = ui.painter();
-    painter.rect_filled(rect, rect.height() / 2.0, PILL_FILL);
+    ui.painter()
+        .rect_filled(rect, rect.height() / 2.0, PILL_FILL);
 
     let mut x = rect.left() + TOGGLE_PAD_X;
     let y = rect.center().y;
 
-    if let Some(mouse_off) = icons.glyphs.get(GlyphIcon::MouseOff) {
-        let icon_rect = egui::Rect::from_center_size(
-            egui::pos2(x + TOGGLE_MOUSE_SIDE / 2.0, y),
-            egui::Vec2::splat(TOGGLE_MOUSE_SIDE),
-        );
-        painter.image(mouse_off.id(), icon_rect, UV_FULL, TOGGLE_OFF_COLOR);
+    // Share (issue #82): captures the app window as rendered this instant
+    // and copies it to the system clipboard as an image, replacing a manual
+    // screenshot. The capture is asynchronous — this only fires the
+    // request; `handle_screenshot_events` picks up the resulting
+    // `Event::Screenshot` on a later frame and does the actual clipboard
+    // write.
+    let share_rect = egui::Rect::from_center_size(
+        egui::pos2(x + TOGGLE_MOUSE_SIDE / 2.0, y),
+        egui::Vec2::splat(TOGGLE_MOUSE_SIDE),
+    );
+    if toggle_button(ui, share_rect, "Copy screenshot to clipboard").clicked() {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+    }
+    if let Some(share) = icons.glyphs.get(GlyphIcon::Share) {
+        ui.painter()
+            .image(share.id(), share_rect, UV_FULL, TOGGLE_ACTIVE_COLOR);
     }
     x += TOGGLE_MOUSE_SIDE + TOGGLE_GAP;
 
-    if let Some(cloud_off) = icons.glyphs.get(GlyphIcon::CloudOff) {
-        let icon_rect = egui::Rect::from_center_size(
-            egui::pos2(x + TOGGLE_CLOUD_SIDE / 2.0, y),
-            egui::Vec2::splat(TOGGLE_CLOUD_SIDE),
-        );
-        painter.image(cloud_off.id(), icon_rect, UV_FULL, TOGGLE_OFF_COLOR);
+    // Reset (issue #82): moved out of the header dropdown — `draw_header_menu`
+    // used to be its only trigger — into a one-click slot here, reusing the
+    // same `ToolbarIcon::Reset` texture and the same `UiCommand::Reset`.
+    let reset_rect = egui::Rect::from_center_size(
+        egui::pos2(x + TOGGLE_CLOUD_SIDE / 2.0, y),
+        egui::Vec2::splat(TOGGLE_CLOUD_SIDE),
+    );
+    if toggle_button(ui, reset_rect, "Reset").clicked() {
+        let _ = tx_command.try_send(UiCommand::Reset);
+    }
+    if let Some(reset) = icons.toolbar.get(ToolbarIcon::Reset) {
+        ui.painter()
+            .image(reset.id(), reset_rect, UV_FULL, TOGGLE_ACTIVE_COLOR);
     }
     x += TOGGLE_CLOUD_SIDE + TOGGLE_GAP;
 
-    // The queue gauge: an empty ring (the source's `Ellipse 14x14
-    // Fill="#0aaa"` has alpha 0, so only the stroke is drawn) with the check
-    // glyph centered in it. No backlog arc — with no queue there is nothing
-    // for it to show.
+    // The queue gauge stays inert — see the section comment above.
     let queue_center = egui::pos2(x + TOGGLE_QUEUE_SIDE / 2.0, y);
-    painter.circle_stroke(
+    ui.painter().circle_stroke(
         queue_center,
         TOGGLE_QUEUE_SIDE / 2.0,
         egui::Stroke::new(1.0, TOGGLE_OFF_COLOR),
@@ -617,8 +697,31 @@ fn toggle_cluster(ui: &mut egui::Ui, icons: &Icons) {
     if let Some(check) = icons.glyphs.get(GlyphIcon::Check) {
         let icon_rect =
             egui::Rect::from_center_size(queue_center, egui::Vec2::splat(TOGGLE_QUEUE_GLYPH_SIDE));
-        painter.image(check.id(), icon_rect, UV_FULL, TOGGLE_OFF_COLOR);
+        ui.painter()
+            .image(check.id(), icon_rect, UV_FULL, TOGGLE_OFF_COLOR);
     }
+}
+
+/// Scans this frame's input events for the reply to a screenshot request
+/// fired by the Share button (`toggle_cluster`'s
+/// `ViewportCommand::Screenshot`) and hands the captured image to `write`.
+/// Split out from the actual clipboard call so the routing — "a
+/// `Screenshot` event reaches the writer" — is unit-testable with a fake
+/// `write` and no live window or clipboard; the real call site
+/// (`OverlayApp::ui`) passes `platform::write_clipboard_image`.
+///
+/// A `Screenshot` event can only be `Event::Screenshot` in practice, but
+/// nothing stops another viewport's reply from showing up in a multi-
+/// viewport app; this app only ever has the root viewport, so every event
+/// this frame is implicitly ours.
+fn handle_screenshot_events(ctx: &egui::Context, mut write: impl FnMut(&egui::ColorImage)) {
+    ctx.input(|input| {
+        for event in &input.events {
+            if let egui::Event::Screenshot { image, .. } = event {
+                write(image);
+            }
+        }
+    });
 }
 
 /// Fixed display size, in points, every toolbar icon (issue #41) is drawn
@@ -1265,7 +1368,16 @@ fn header_emblem_rect(row: egui::Rect, text_band_height: f32) -> egui::Rect {
 /// a vertical `OpacityMask` (white -> transparent at .9); egui has no
 /// opacity masks, and the diagonal gradient already falls to zero by the
 /// bottom-right, so the mask is deliberately not reproduced.
-const HEADER_WASH_HEIGHT: f32 = 98.0;
+///
+/// Issue #81: this used to be a fixed `98.0`pt run against the whole panel,
+/// taller than the ~58-64pt drag band (`header_band_height`) that actually
+/// holds the title/subtitle/stat-pill row — so the wash's tail painted
+/// straight through the stat-pill row instead of stopping above it, unlike
+/// the reference render. `draw_header` now sizes the wash to
+/// `header_text_band_height` (the title + optional subtitle rows only, not
+/// the stat-pill row below them) instead, via `header_wash_rect`'s `height`
+/// argument — no fixed constant left to drift out of sync with the content
+/// it sits behind.
 /// Inset from the panel's edges the wash is painted at, so its square
 /// corners never poke past the panel's own `PANEL_CORNER_RADIUS`-rounded,
 /// `PANEL_BORDER_WIDTH`-thick border.
@@ -1287,13 +1399,15 @@ const HEADER_WASH_EMBLEM_COLOR: egui::Color32 =
 
 /// Where the wash panel sits for a central panel of `panel`: inset from the
 /// panel's left, top and right edges by `HEADER_WASH_INSET`, and running down
-/// to its own fixed `HEADER_WASH_HEIGHT` rather than to the panel's bottom.
-/// Pure geometry, so the inset and the fixed height are unit-testable without
-/// a painter — the same factoring as `header_emblem_rect`.
-fn header_wash_rect(panel: egui::Rect) -> egui::Rect {
+/// `height` points rather than to the panel's bottom. Pure geometry, so the
+/// inset is unit-testable without a painter — the same factoring as
+/// `header_emblem_rect`. `height` is the caller's to pick (`draw_header`
+/// passes `header_text_band_height`, issue #81) rather than a fixed
+/// constant here, so the wash can never outgrow the content it decorates.
+fn header_wash_rect(panel: egui::Rect, height: f32) -> egui::Rect {
     egui::Rect::from_min_size(
         panel.min + egui::Vec2::splat(HEADER_WASH_INSET),
-        egui::vec2(panel.width() - 2.0 * HEADER_WASH_INSET, HEADER_WASH_HEIGHT),
+        egui::vec2(panel.width() - 2.0 * HEADER_WASH_INSET, height),
     )
 }
 
@@ -1316,15 +1430,17 @@ fn header_wash_emblem_rect(wash: egui::Rect) -> egui::Rect {
 /// panel with a huge, nearly-invisible emblem bleeding off its right edge —
 /// clipped to its own rect so it can never bleed into the rows below or over
 /// the panel's rounded corners. `panel` is the whole central panel's rect
-/// (not the drag band): the wash runs to `HEADER_WASH_HEIGHT`, which is
-/// taller than the band itself.
+/// (not the drag band); `height` (issue #81, `header_text_band_height`) is
+/// what actually bounds the wash — the title + optional subtitle rows only,
+/// stopping clear of the stat-pill row below so the two never share paint
+/// space (`wash_does_not_reach_the_stat_pill_row`).
 ///
 /// The source rounds the wash's top corners (`CornerRadius="7 7 0 0"`); egui
 /// cannot clip to a rounded rect this cheaply, so the wash keeps square
 /// corners — at alpha `0x50` under the panel's own 8pt-rounded, 1pt border
 /// the difference is sub-pixel.
-fn draw_header_wash(ui: &egui::Ui, panel: egui::Rect, icons: &Icons) {
-    let wash_rect = header_wash_rect(panel);
+fn draw_header_wash(ui: &egui::Ui, panel: egui::Rect, icons: &Icons, height: f32) {
+    let wash_rect = header_wash_rect(panel, height);
     let painter = ui.painter().with_clip_rect(wash_rect);
 
     // Top-left brightest, fading to zero at the bottom-right — the source's
@@ -1450,14 +1566,17 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
 /// helper per item, since egui's own `menu_button`/`SubMenuButton` already
 /// give every item free open/close state management.
 ///
-/// Order matches the spec: Reset, a Columns submenu (issue #13's stat
-/// column toggles, unchanged in behavior — just relocated), a separator,
+/// Order matches the spec: a Columns submenu (issue #13's stat column
+/// toggles, unchanged in behavior — just relocated), a separator,
 /// Collapse/Expand (issue #54's collapse-to-header, still driven by
 /// `CollapseState::toggle`), Minimize to tray, a separator, then Close.
+/// Reset used to be the first item here but moved into the header's toggle
+/// cluster (issue #82; see `toggle_cluster`), leaving this menu with no
+/// reset trigger of its own.
 ///
 /// The Columns submenu is given `PopupCloseBehavior::CloseOnClickOutside`
 /// explicitly: the *root* popup's default `CloseOnClick` is fine for the
-/// other items (a click on Reset/Collapse/Minimize/Close should dismiss the
+/// other items (a click on Collapse/Minimize/Close should dismiss the
 /// whole menu), but the same default on the submenu would dismiss the
 /// entire dropdown on every single checkbox toggle — verified against the
 /// vendored egui source (`containers/menu.rs`'s `SubMenu::show`): the root
@@ -1476,15 +1595,6 @@ fn draw_header_menu(
         settings,
         tx_settings,
     } = settings;
-    if ui
-        .add(menu_item_button(
-            icons.toolbar.get(ToolbarIcon::Reset),
-            "Reset",
-        ))
-        .clicked()
-    {
-        let _ = tx_command.try_send(UiCommand::Reset);
-    }
 
     let columns_button = menu_item_button(icons.toolbar.get(ToolbarIcon::Settings), "Columns")
         .right_text(egui::containers::menu::SubMenuButton::RIGHT_ARROW);
@@ -2171,31 +2281,107 @@ fn draw_resize_handles(ui: &mut egui::Ui, ctx: &egui::Context, gesture: &mut Win
 /// #49 a row paints a toolbar-set texture too (the death counter's skull),
 /// and handing both sets down as one argument keeps `draw_row` from growing
 /// a second icon parameter.
-fn draw_rows(ui: &mut egui::Ui, snapshot: &Snapshot, columns: &[ColumnKind], icons: &Icons) {
-    // True contiguous 30pt rows (decision 3): scoped to this function only,
-    // so the header and menus keep `apply_theme`'s `item_spacing` — rows'
-    // hover bands and accent lines must sit flush against their neighbors
-    // with no gap, which a nonzero `item_spacing.y` would reintroduce.
-    ui.spacing_mut().item_spacing.y = 0.0;
+/// Issue #84's shrink-vs-scroll decision, as a pure function of the
+/// viewport width and the enabled stat columns' combined width — extracted
+/// so the floor is unit-testable without a live `Ui`/`ScrollArea`, the same
+/// reasoning `column_anchors`, `share_bar_paints` etc. already follow.
+///
+/// `column_anchors`'s own `scale` factor already shrinks every column
+/// proportionally when the row is narrower than the columns' combined
+/// width — that stays the *first* response to a narrow window, so mild
+/// narrowing still looks exactly like it did before this issue. But that
+/// shrink had no floor of its own, so a badly narrow window used to
+/// compress column text into illegibility. `MIN_COLUMN_SCALE` gives it one:
+/// the returned width is what row content is actually laid out at, and it
+/// never drops below the width at which `column_anchors` would shrink
+/// columns past that floor (i.e. below `stat_columns_total *
+/// MIN_COLUMN_SCALE`, plus `COLUMN_RIGHT_MARGIN` since `column_anchors`
+/// reserves that margin off the right edge before it ever sees a column
+/// width). Once the viewport is narrower than that floor, the returned
+/// width stays pinned at the floor — wider than the viewport — and the
+/// caller's `ScrollArea` picks up the remaining overflow as horizontal
+/// scroll instead of compressing columns any further.
+fn row_content_width(viewport_width: f32, stat_columns_total: f32) -> f32 {
+    let floor_width = stat_columns_total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
+    viewport_width.max(floor_width)
+}
 
-    // The enabled-column set (and therefore the column widths and their
-    // anchors) is identical for every row in a frame, so both are computed
-    // once here rather than once per row inside `draw_row`.
+/// Returns the `ScrollArea`'s reported content size — larger than the
+/// viewport on whichever axis actually needed to scroll this frame — purely
+/// so tests can observe that without reaching into egui's persisted scroll
+/// state; `OverlayApp::ui` (the only production caller) ignores it.
+fn draw_rows(
+    ui: &mut egui::Ui,
+    snapshot: &Snapshot,
+    columns: &[ColumnKind],
+    icons: &Icons,
+) -> egui::Vec2 {
+    // The enabled-column set (and therefore the column widths) is identical
+    // for every row in a frame, so it's computed once here rather than once
+    // per row inside `draw_row`.
     let stat_columns = stat_columns_for(columns);
-    let avail = ui.available_rect_before_wrap();
-    let anchors = column_anchors(avail.left(), avail.right(), &stat_columns, 4.0);
+    let stat_columns_total: f32 = stat_columns.iter().map(|c| c.width).sum();
+    let content_width = row_content_width(ui.available_width(), stat_columns_total);
 
-    // Issue #73: each row's damage-share bar is now scaled to the *top
-    // row's* damage rather than to its share of total encounter damage, so
-    // the highest-damage row always fills the full bar width. `snapshot.rows`
-    // is already sorted descending by damage (`Encounter::snapshot`), so the
-    // top row's damage is just the first row's, computed once here rather
-    // than once per row inside `draw_row`.
-    let top_damage = snapshot.rows.first().map(|r| r.damage).unwrap_or(0);
+    let output = egui::ScrollArea::both()
+        // Same footprint as a plain, unwrapped layout: the scroll area
+        // always fills the space `CentralPanel` gives it rather than
+        // shrinking to the content's size, so wrapping rows in it changes
+        // nothing when everything already fits.
+        .auto_shrink([false, false])
+        // Hidden entirely — no reserved gutter, no visible track — unless
+        // the content actually overflows, so a window sized to show every
+        // row and every column at full width paints pixel-identically to
+        // today's unscrolled layout. `apply_theme` never touches
+        // `style.spacing.scroll`, so this also inherits egui's default
+        // `ScrollStyle::floating()`: a thin, translucent bar that only
+        // fades in on hover and reserves no layout space even while
+        // visible — already the unobtrusive styling the row list needs,
+        // with nothing further to configure here.
+        .scroll_bar_visibility(
+            egui::containers::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+        )
+        .show(ui, |ui| {
+            // True contiguous 30pt rows (decision 3): scoped to the scroll
+            // area's own content `Ui`, so the header and menus keep
+            // `apply_theme`'s `item_spacing` — rows' hover bands and accent
+            // lines must sit flush against their neighbors with no gap,
+            // which a nonzero `item_spacing.y` would reintroduce.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            // A horizontal `ScrollArea` measures how much there is to
+            // scroll from what its content `Ui` actually ends up using; an
+            // empty `snapshot.rows` would otherwise paint nothing and
+            // report zero content width even when `content_width` (the
+            // floor above) exceeds the viewport.
+            ui.set_min_width(content_width);
 
-    for row in &snapshot.rows {
-        draw_row(ui, row, columns, &stat_columns, &anchors, icons, top_damage);
-    }
+            let avail = ui.available_rect_before_wrap();
+            let anchors = column_anchors(
+                avail.left(),
+                avail.left() + content_width,
+                &stat_columns,
+                COLUMN_RIGHT_MARGIN,
+            );
+            let layout = RowLayout {
+                kinds: columns,
+                columns: &stat_columns,
+                anchors: &anchors,
+            };
+
+            // Issue #73: each row's damage-share bar is now scaled to the
+            // *top row's* damage rather than to its share of total
+            // encounter damage, so the highest-damage row always fills the
+            // full bar width. `snapshot.rows` is already sorted descending
+            // by damage (`Encounter::snapshot`), so the top row's damage is
+            // just the first row's, computed once here rather than once
+            // per row inside `draw_row`.
+            let top_damage = snapshot.rows.first().map(|r| r.damage).unwrap_or(0);
+
+            for row in &snapshot.rows {
+                draw_row(ui, row, &layout, icons, top_damage, content_width);
+            }
+        });
+    output.content_size
 }
 
 /// How prominently one stat column's text is painted (issue #56). The
@@ -2372,16 +2558,34 @@ fn column_clip_rect(rect: egui::Rect, anchor: f32, width: f32) -> egui::Rect {
     )
 }
 
+/// Row layout that's identical across every row in a frame — the enabled
+/// column kinds, their `StatColumn` specs, and the anchors `column_anchors`
+/// derived from them — computed once by `draw_rows` and handed to every
+/// `draw_row` call rather than recomputed per row. Bundled into one struct
+/// for the same reason `SettingsHandle`/`ChromeHandle` are (issue #71,
+/// #54): three arguments that are always needed together and always travel
+/// together push `draw_row` over clippy's argument limit on their own,
+/// especially once issue #84 adds `row_width`.
+struct RowLayout<'a> {
+    kinds: &'a [ColumnKind],
+    columns: &'a [StatColumn],
+    anchors: &'a [f32],
+}
+
 fn draw_row(
     ui: &mut egui::Ui,
     row: &PlayerRow,
-    kinds: &[ColumnKind],
-    columns: &[StatColumn],
-    anchors: &[f32],
+    layout: &RowLayout<'_>,
     icons: &Icons,
     top_damage: i64,
+    // Issue #84: the width every row is laid out at, computed once by
+    // `draw_rows` (`content_width`) rather than read from
+    // `ui.available_width()` here — inside a horizontal `ScrollArea` that
+    // can report an unbounded width, which is not what a row should paint
+    // itself at.
+    row_width: f32,
 ) {
-    let desired_size = egui::vec2(ui.available_width(), ROW_HEIGHT);
+    let desired_size = egui::vec2(row_width, ROW_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
 
     // Background bar scaled by this row's damage relative to the *top row's*
@@ -2458,7 +2662,7 @@ fn draw_row(
     // constants) degrades to an empty icon box, see `StatPill::icon`.
     let skull = icons.glyphs.get(GlyphIcon::Skull).map(|t| t.id());
 
-    for ((anchor_x, column), kind) in anchors.iter().zip(columns).zip(kinds) {
+    for ((anchor_x, column), kind) in layout.anchors.iter().zip(layout.columns).zip(layout.kinds) {
         let text = (column.text)(row);
         // Each column's own weight/size (issue #56, `column_emphasis`), not
         // one flat font for the whole row: the DPS value is the headline
@@ -2800,6 +3004,53 @@ pub fn fmt_share(share_pct: f32) -> String {
     format!("{share_pct:.1}%")
 }
 
+/// Crit/Lucky percentage as a whole number, `73%` (issue #80.2) — unlike
+/// `fmt_share`'s one decimal, the reference render
+/// (`docs/reference/new-shinra-ex.webp`) shows these two with none.
+pub fn fmt_pct0(pct: f32) -> String {
+    format!("{pct:.0}%")
+}
+
+/// DPS-specific compact abbreviation (issue #80.3). Reuses `fmt_short`'s
+/// K/M/B thresholds, but once a magnitude is scaled its decimal count keeps
+/// the digit run a consistent width instead of `fmt_short`'s always-one:
+/// zero decimals once the scaled value has already reached 3 digits
+/// (`>= 100`, e.g. `188M`), one decimal below that (e.g. `55.3M`, `10.3M`).
+/// Matches the reference render's header pill (`188M/s`) and row values
+/// (`55.3M/s` .. `10.3M/s`) exactly. Raw sub-1000 values are left alone —
+/// always a plain integer — since a DPS figure that low never occurs in
+/// practice and a lone decimal there (`45.0`) would read oddly for a count
+/// of whole damage/sec.
+pub fn fmt_dps(v: i64) -> String {
+    let sign = if v < 0 { "-" } else { "" };
+    let av = v.unsigned_abs();
+
+    fn scaled(sign: &str, av: u64, divisor: f64, suffix: &str) -> String {
+        let value = av as f64 / divisor;
+        // Branch on the value *after* rounding to the one-decimal branch's
+        // precision, not before: a raw value just under 100 (e.g. 99.999)
+        // still rounds up to "100.0" once formatted, which must take the
+        // no-decimal branch (`"100K"`) instead of overflowing the narrowed
+        // Dps column with a 6-char `"100.0K"`.
+        let rounded = (value * 10.0).round() / 10.0;
+        if rounded >= 100.0 {
+            format!("{sign}{rounded:.0}{suffix}")
+        } else {
+            format!("{sign}{rounded:.1}{suffix}")
+        }
+    }
+
+    if av >= 1_000_000_000 {
+        scaled(sign, av, 1_000_000_000.0, "B")
+    } else if av >= 1_000_000 {
+        scaled(sign, av, 1_000_000.0, "M")
+    } else if av >= 1_000 {
+        scaled(sign, av, 1_000.0, "K")
+    } else {
+        format!("{sign}{av}")
+    }
+}
+
 // -- default window size (issue #26) -----------------------------------
 //
 // The old default, `[340.0, 220.0]`, was sized for ~8-9 rows and left no
@@ -2855,6 +3106,16 @@ const NAME_COLUMN_GAP: f32 = 10.0;
 /// Right-edge margin, matching the `margin` `draw_rows` passes to
 /// `column_anchors` for the rightmost column's anchor.
 const COLUMN_RIGHT_MARGIN: f32 = 4.0;
+
+/// Issue #84: the floor `draw_rows` holds `column_anchors`' shrink-to-fit
+/// `scale` factor at once a narrow viewport would otherwise push it lower.
+/// Below this floor, `draw_rows` stops shrinking columns and switches to
+/// horizontal scrolling for the remaining overflow instead — see
+/// `draw_rows`' `content_width`. `0.6` keeps every column's text legible
+/// (a DPS column at `Dps` width 48 still budgets ~29pt, comfortably wider
+/// than `FONT_SIZE_ROW`'s tallest digit) while still absorbing a fair
+/// amount of narrowing before scrolling kicks in.
+const MIN_COLUMN_SCALE: f32 = 0.6;
 
 /// Default opening height (issue #26; extended by issue #9 slice 2's title
 /// line): the header's title line + timer/DPS/buttons row + separator + a
@@ -3376,11 +3637,13 @@ mod tests {
     }
 
     /// Issue #71: the window-control icon-button cluster (Close/Minimize/
-    /// Reset/Settings) no longer renders directly in the header's stat row
-    /// — those actions moved into the chevron's dropdown menu, which paints
+    /// Settings) no longer renders directly in the header's stat row —
+    /// those actions moved into the chevron's dropdown menu, which paints
     /// nothing until opened. A closed-menu frame must carry no accessible
     /// node labeled for any of the old buttons, only the chevron's own
-    /// "Menu" label.
+    /// "Menu" label. Reset is the one exception: issue #82 moved it back
+    /// out of the dropdown into the toggle cluster, so it (and the new
+    /// Share button) are expected to render directly now.
     #[test]
     fn draw_header_no_longer_renders_the_window_control_cluster() {
         let ctx = egui::Context::default();
@@ -3421,7 +3684,7 @@ mod tests {
             .collect();
         output.drop_without_applying_deltas();
 
-        for stale in ["Close", "Reset", "Settings", "Minimize"] {
+        for stale in ["Close", "Settings", "Minimize"] {
             assert!(
                 !labels.iter().any(|l| l == stale),
                 "stale window-control label {stale:?} still renders directly in the header: {labels:?}"
@@ -3430,6 +3693,14 @@ mod tests {
         assert!(
             labels.iter().any(|l| l == "Menu"),
             "expected the chevron's own \"Menu\" label, got {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "Reset"),
+            "expected the toggle cluster's Reset button, got {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "Copy screenshot to clipboard"),
+            "expected the toggle cluster's Share button, got {labels:?}"
         );
     }
 
@@ -3868,7 +4139,7 @@ mod tests {
             row_height,
         )
         .x;
-        // The three inert status toggles (decision 5): a fixed-width pill,
+        // The toggle cluster (decision 5, issue #82): a fixed-width pill,
         // not measured text.
         let toggles = 2.0 * TOGGLE_PAD_X
             + TOGGLE_MOUSE_SIDE
@@ -3889,56 +4160,63 @@ mod tests {
         );
     }
 
-    /// The source's `OffBrush="#1fff"`: every glyph the cluster blits — the
-    /// mouse-off LED, the cloud-off LED, and the queue gauge's check glyph —
-    /// is tinted `TOGGLE_OFF_COLOR`, never an "on" color, since none of
-    /// those features exist (decision 5).
+    /// Share and Reset (issue #82) are real buttons now, painted at
+    /// `TOGGLE_ACTIVE_COLOR`; only the still-inert queue gauge's check
+    /// glyph keeps the source's `OffBrush="#1fff"` tint.
     #[test]
-    fn the_status_toggles_render_in_their_off_state() {
+    fn the_toggle_cluster_renders_two_active_buttons_and_one_inert_gauge() {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         ctx.run_ui(egui::RawInput::default(), |_ui| {})
             .drop_without_applying_deltas();
         let icons = Icons::load(&ctx);
-        let mouse_off = icons.glyphs.get(GlyphIcon::MouseOff).unwrap().id();
-        let cloud_off = icons.glyphs.get(GlyphIcon::CloudOff).unwrap().id();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let share = icons.glyphs.get(GlyphIcon::Share).unwrap().id();
+        let reset = icons.toolbar.get(ToolbarIcon::Reset).unwrap().id();
         let check = icons.glyphs.get(GlyphIcon::Check).unwrap().id();
 
         let mut blits = Vec::new();
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &icons);
+            toggle_cluster(ui, &tx_command, &icons);
         });
         for clipped in &output.shapes {
             collect_image_texture_tints(&clipped.shape, &mut blits);
         }
         output.drop_without_applying_deltas();
 
-        for expected in [mouse_off, cloud_off, check] {
+        for expected in [share, reset] {
             let tint = blits
                 .iter()
                 .find(|(id, _)| *id == expected)
                 .map(|(_, c)| *c);
             assert_eq!(
                 tint,
-                Some(TOGGLE_OFF_COLOR),
-                "{expected:?} was not blitted at TOGGLE_OFF_COLOR: {blits:?}"
+                Some(TOGGLE_ACTIVE_COLOR),
+                "{expected:?} was not blitted at TOGGLE_ACTIVE_COLOR: {blits:?}"
             );
         }
+        let check_tint = blits.iter().find(|(id, _)| *id == check).map(|(_, c)| *c);
+        assert_eq!(
+            check_tint,
+            Some(TOGGLE_OFF_COLOR),
+            "the queue gauge's check glyph was not blitted at TOGGLE_OFF_COLOR: {blits:?}"
+        );
     }
 
-    /// The three status toggles are strictly non-interactive (decision 5,
-    /// issue #62): no click handling, no hover cursor, no tooltip that
-    /// implies they work. `widget_info` is never called for them, so no
-    /// accesskit node in the tree may claim a `Button` role.
+    /// The queue gauge stays strictly non-interactive (issue #62, #82): no
+    /// click handling, no hover cursor, no tooltip that implies it works.
+    /// Share and Reset, by contrast, must each expose exactly one `Button`
+    /// accesskit node — so the tree has exactly two, never three.
     #[test]
-    fn the_status_toggles_are_inert() {
+    fn the_queue_gauge_stays_inert_while_share_and_reset_are_real_buttons() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
 
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &icons);
+            toggle_cluster(ui, &tx_command, &icons);
         });
         let update = output
             .platform_output
@@ -3947,12 +4225,157 @@ mod tests {
             .expect("accesskit was enabled for this frame");
         output.drop_without_applying_deltas();
 
+        let button_count = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == egui::accesskit::Role::Button)
+            .count();
+        assert_eq!(
+            button_count, 2,
+            "expected exactly Share and Reset to expose a Button role, got {button_count}"
+        );
+    }
+
+    /// Clicking the Share button fires the screenshot capture request; the
+    /// clipboard write itself happens later, off `Event::Screenshot` (see
+    /// `handle_screenshot_events_routes_a_screenshot_event_to_the_writer`).
+    #[test]
+    fn clicking_share_sends_a_screenshot_viewport_command() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            toggle_cluster(ui, &tx_command, &icons);
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let share_pos = accessible_rect_for_label(&update, "Copy screenshot to clipboard").center();
+        layout.drop_without_applying_deltas();
+
+        let output = ctx.run_ui(click_at(share_pos), |ui| {
+            toggle_cluster(ui, &tx_command, &icons);
+        });
+        let commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
+        output.drop_without_applying_deltas();
+
         assert!(
-            update
-                .nodes
+            commands
                 .iter()
-                .all(|(_, node)| node.role() != egui::accesskit::Role::Button),
-            "the inert status toggles must never expose a Button role"
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::Screenshot(_))),
+            "Share must request a screenshot: {commands:?}"
+        );
+        assert!(
+            rx_command.try_recv().is_err(),
+            "Share must not also send a UiCommand"
+        );
+    }
+
+    /// Clicking the Reset button, now that it lives in the toggle cluster
+    /// instead of the header dropdown (issue #82), sends the same
+    /// `UiCommand::Reset` the old dropdown item did.
+    #[test]
+    fn clicking_reset_sends_the_reset_command() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            toggle_cluster(ui, &tx_command, &icons);
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let reset_pos = accessible_rect_for_label(&update, "Reset").center();
+        layout.drop_without_applying_deltas();
+
+        let output = ctx.run_ui(click_at(reset_pos), |ui| {
+            toggle_cluster(ui, &tx_command, &icons);
+        });
+        let commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            rx_command.try_recv().expect("Reset must send a command"),
+            UiCommand::Reset
+        );
+        assert!(
+            rx_command.try_recv().is_err(),
+            "Reset must not also queue a second command"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::Screenshot(_))),
+            "Reset must not also request a screenshot: {commands:?}"
+        );
+    }
+
+    /// `handle_screenshot_events` is the routing half of the Share round
+    /// trip: it must find a synthesized `Event::Screenshot` in this frame's
+    /// input and hand its image to the writer, without needing a live
+    /// window or a real clipboard.
+    #[test]
+    fn handle_screenshot_events_routes_a_screenshot_event_to_the_writer() {
+        let ctx = egui::Context::default();
+        let image = std::sync::Arc::new(egui::ColorImage::filled(
+            [2, 2],
+            egui::Color32::from_rgb(1, 2, 3),
+        ));
+        let input = egui::RawInput {
+            events: vec![egui::Event::Screenshot {
+                viewport_id: egui::ViewportId::ROOT,
+                user_data: egui::UserData::default(),
+                image: image.clone(),
+            }],
+            ..Default::default()
+        };
+
+        let mut written: Vec<egui::ColorImage> = Vec::new();
+        let output = ctx.run_ui(input, |_ui| {
+            handle_screenshot_events(&ctx, |img| written.push(img.clone()));
+        });
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            written.len(),
+            1,
+            "the screenshot event must reach the writer exactly once"
+        );
+        assert_eq!(written[0].size, [2, 2]);
+    }
+
+    /// A frame with no `Event::Screenshot` in it must never call the
+    /// writer — otherwise every idle frame would overwrite the clipboard.
+    #[test]
+    fn handle_screenshot_events_does_nothing_without_a_screenshot_event() {
+        let ctx = egui::Context::default();
+        let mut called = false;
+        let output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            handle_screenshot_events(&ctx, |_img| called = true);
+        });
+        output.drop_without_applying_deltas();
+
+        assert!(
+            !called,
+            "the writer must not run without a Screenshot event"
         );
     }
 
@@ -4096,6 +4519,61 @@ mod tests {
     #[test]
     fn fmt_share_full() {
         assert_eq!(fmt_share(100.0), "100.0%");
+    }
+
+    /// Issue #80.2: `fmt_pct0` is `fmt_share` minus the decimal place —
+    /// same rounding, same trailing `%`, just `{:.0}` instead of `{:.1}`.
+    #[test]
+    fn fmt_pct0_drops_the_decimal_place() {
+        let cases = [(0.0, "0%"), (12.34, "12%"), (12.6, "13%"), (100.0, "100%")];
+        for (input, expected) in cases {
+            assert_eq!(fmt_pct0(input), expected, "fmt_pct0({input})");
+        }
+    }
+
+    /// Issue #80.3: `fmt_dps` keeps a K/M/B-scaled value's digit run a
+    /// consistent width by dropping the decimal once the scaled value
+    /// reaches 3 digits, matching the reference render's header pill
+    /// (`188M`) and row values (`55.3M` .. `10.3M`) exactly.
+    #[test]
+    fn fmt_dps_table() {
+        let cases: [(i64, &str); 8] = [
+            (999, "999"),
+            (1_000, "1.0K"),
+            (10_300_000, "10.3M"),
+            (17_800_000, "17.8M"),
+            (55_300_000, "55.3M"),
+            (188_000_000, "188M"),
+            (999_950, "1000K"),
+            (-55_300_000, "-55.3M"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(fmt_dps(input), expected, "fmt_dps({input})");
+        }
+    }
+
+    /// Branch-before-rounding regression: a raw scaled value just under 100
+    /// (e.g. `99.999`) still rounds up to `100.0` once formatted to one
+    /// decimal, so it must take the no-decimal branch (`"100K"`, 4 chars)
+    /// rather than the one-decimal branch overflowing to `"100.0K"` (6
+    /// chars) — the narrowed Dps column is sized for the 7-char
+    /// `"1000K/s"` worst case, i.e. a 5-char budget before the `/s` suffix.
+    #[test]
+    fn fmt_dps_rounds_before_choosing_the_decimal_branch() {
+        let cases: [(i64, &str); 4] = [
+            (99_950, "100K"),
+            (99_999, "100K"),
+            (99_950_000, "100M"),
+            (99_999_999, "100M"),
+        ];
+        for (input, expected) in cases {
+            let out = fmt_dps(input);
+            assert_eq!(out, expected, "fmt_dps({input})");
+            assert!(
+                out.trim_start_matches('-').len() <= 5,
+                "fmt_dps({input}) = {out:?} exceeds the 5-char pre-suffix budget"
+            );
+        }
     }
 
     // -- encounter title/subtitle (issue #9 slice 2) -----------------------
@@ -4420,7 +4898,7 @@ mod tests {
         assert_eq!(header_text_band_height(true), 36.0);
     }
 
-    // -- header background wash (issue #59, #62) ------------------------
+    // -- header background wash (issue #59, #62, #81) --------------------
 
     /// A stand-in central-panel rect for the wash geometry tests — wider and
     /// far taller than the wash itself, like the real panel.
@@ -4428,19 +4906,26 @@ mod tests {
         egui::Rect::from_min_size(egui::pos2(12.0, 30.0), egui::vec2(400.0, 300.0))
     }
 
+    /// A stand-in wash height for the geometry tests below — issue #81 made
+    /// this the caller's to choose (`draw_header` derives it from
+    /// `header_text_band_height`) rather than a fixed constant, so these
+    /// tests exercise the geometry with an arbitrary value of their own.
+    const WASH_TEST_HEIGHT: f32 = 34.0;
+
     /// The wash is inset from the panel on both sides and its top so its
-    /// square corners stay inside the panel's rounded border, and it runs to
-    /// its own fixed height rather than the panel's — it is decoration behind
-    /// the header rows, not a full-height background.
+    /// square corners stay inside the panel's rounded border, and it runs
+    /// down exactly the `height` it is given rather than to the panel's —
+    /// it is decoration behind the header rows, not a full-height
+    /// background.
     #[test]
-    fn the_header_wash_is_inset_from_the_panel_and_keeps_its_own_fixed_height() {
+    fn the_header_wash_is_inset_from_the_panel_and_keeps_its_given_height() {
         let panel = wash_test_panel();
-        let wash = header_wash_rect(panel);
+        let wash = header_wash_rect(panel, WASH_TEST_HEIGHT);
         assert_eq!(wash.left() - panel.left(), HEADER_WASH_INSET);
         assert_eq!(panel.right() - wash.right(), HEADER_WASH_INSET);
         assert_eq!(wash.top() - panel.top(), HEADER_WASH_INSET);
         assert_eq!(wash.width(), panel.width() - 2.0 * HEADER_WASH_INSET);
-        assert_eq!(wash.height(), HEADER_WASH_HEIGHT);
+        assert_eq!(wash.height(), WASH_TEST_HEIGHT);
         assert!(wash.bottom() < panel.bottom());
     }
 
@@ -4450,7 +4935,7 @@ mod tests {
     /// wash must be painted through its own clip rect.
     #[test]
     fn the_wash_emblem_bleeds_off_the_right_edge_by_the_named_overhang() {
-        let wash = header_wash_rect(wash_test_panel());
+        let wash = header_wash_rect(wash_test_panel(), WASH_TEST_HEIGHT);
         let emblem = header_wash_emblem_rect(wash);
         assert_eq!(emblem.right() - wash.right(), HEADER_WASH_EMBLEM_BLEED);
         assert!(emblem.left() > wash.left());
@@ -4464,11 +4949,42 @@ mod tests {
     /// mean it had stopped reading as an oversized watermark.
     #[test]
     fn the_wash_emblem_is_taller_than_the_wash_it_sits_in() {
-        let wash = header_wash_rect(wash_test_panel());
+        let wash = header_wash_rect(wash_test_panel(), WASH_TEST_HEIGHT);
         let emblem = header_wash_emblem_rect(wash);
         assert!(emblem.height() > wash.height());
         assert!(emblem.top() < wash.top());
         assert!(emblem.bottom() > wash.bottom());
+    }
+
+    /// Issue #81: the wash must never reach into the stat-pill row painted
+    /// below it. `draw_header` sizes the wash to
+    /// `text_band_height - HEADER_WASH_INSET`, so its painted bottom edge
+    /// sits above where the stat-pill row starts (`text_band_height +
+    /// ITEM_SPACING_Y` down from the panel top, the same geometry
+    /// `header_band_height` is built from) for both the with- and
+    /// without-subtitle cases — unlike the old fixed `98.0`pt wash, which
+    /// was taller than the whole drag band and painted straight through it.
+    #[test]
+    fn wash_does_not_reach_the_stat_pill_row() {
+        let panel = wash_test_panel();
+        let button_row_height = 18.0;
+        for has_subtitle in [false, true] {
+            let text_band = header_text_band_height(has_subtitle);
+            let wash_height = text_band - HEADER_WASH_INSET;
+            let wash = header_wash_rect(panel, wash_height);
+            let stat_pill_row_top = panel.top() + text_band + ITEM_SPACING_Y;
+            let stat_pill_row_bottom = stat_pill_row_top + button_row_height;
+            assert!(
+                wash.bottom() <= stat_pill_row_top,
+                "wash bottom {} (has_subtitle={has_subtitle}) reaches into the \
+                 stat-pill row starting at {stat_pill_row_top}",
+                wash.bottom()
+            );
+            // Sanity: the two rects really are disjoint on the y axis, not
+            // just touching at a coincidental boundary.
+            assert!(wash.top() < stat_pill_row_bottom);
+            assert!(wash.bottom() < stat_pill_row_bottom);
+        }
     }
 
     // -- column_anchors (issue #8) --------------------------------------
@@ -4652,7 +5168,10 @@ mod tests {
 
         // Widest plausible value for every field any column formats:
         // `fmt_short`'s 7-char maximum (rounds up across a K/M/B
-        // threshold, e.g. 999_950 -> "1000.0K") and `fmt_share`'s.
+        // threshold, e.g. 999_950 -> "1000.0K"), `fmt_dps`'s narrower
+        // 5-char maximum (issue #80.3 drops the decimal once the scaled
+        // value rounds up to 3 digits, e.g. 999_950 -> "1000K"),
+        // `fmt_share`'s, and `fmt_pct0`'s (issue #80.2's 0-decimal variant).
         // `ability_score`/`season_strength` are the two exceptions: they
         // render the full, un-abbreviated digit string (owner requirement),
         // so their widest plausible input is their real in-game ceiling —
@@ -4661,7 +5180,9 @@ mod tests {
         // the field type's own ceiling (`u32::MAX`) or a `fmt_short`-derived
         // value. Do not "fix" these back to `u32::MAX`.
         assert_eq!(fmt_short(999_950), "1000.0K");
+        assert_eq!(fmt_dps(999_950), "1000K");
         assert_eq!(fmt_share(100.0), "100.0%");
+        assert_eq!(fmt_pct0(100.0), "100%");
         let widest_row = PlayerRow {
             uid: 1,
             name: String::new(),
@@ -5147,7 +5668,9 @@ mod tests {
             + COLUMN_RIGHT_MARGIN
             + HEADER_ROW_EXTRA_WIDTH;
         assert_eq!(default_inner_width(), expected);
-        assert_eq!(default_inner_width(), 451.0);
+        // Issue #80.1 tightened the default columns' widths (`Dps`,
+        // `CritPct`, `LuckyPct`), shrinking this from its old `451.0`.
+        assert_eq!(default_inner_width(), 387.0);
     }
 
     #[test]
@@ -5169,6 +5692,261 @@ mod tests {
         // the default opening size must never start below its own floor.
         assert!(default_inner_width() >= 220.0);
         assert!(default_inner_height() >= 90.0);
+    }
+
+    // -- draw_rows scrolling (issue #84) and the row-pitch/centering
+    // regression harness (issue #83) ---------------------------------------
+
+    #[test]
+    fn row_content_width_matches_the_viewport_when_columns_need_no_shrinking() {
+        let total = 200.0;
+        let viewport = total + COLUMN_RIGHT_MARGIN + 50.0;
+        assert_eq!(row_content_width(viewport, total), viewport);
+    }
+
+    #[test]
+    fn row_content_width_still_tracks_a_narrowing_viewport_above_the_floor() {
+        let total = 200.0;
+        let floor = total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
+        let viewport = floor + 10.0;
+        assert_eq!(row_content_width(viewport, total), viewport);
+    }
+
+    #[test]
+    fn row_content_width_pins_to_the_floor_once_the_viewport_drops_below_it() {
+        let total = 200.0;
+        let floor = total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
+        let viewport = floor - 20.0;
+        let content = row_content_width(viewport, total);
+        assert_eq!(content, floor);
+        assert!(
+            content > viewport,
+            "content {content} must exceed the {viewport}pt viewport, or the ScrollArea has nothing to scroll to"
+        );
+    }
+
+    /// Every row shares the same damage, so `row_bar_frac` (relative to the
+    /// top row) is exactly `1.0` for all of them and `share_bar_paints`'
+    /// `fill_rect` therefore equals the *full* row rect for every row — the
+    /// only painted shape wide enough to use as each row's ground-truth
+    /// rect in `RowFrame::row_rects`.
+    fn rows_test_snapshot(n: usize) -> Snapshot {
+        Snapshot {
+            duration_ms: 90_000,
+            total_damage: 1_000 * n as i64,
+            total_dps: 12_345.0,
+            rows: (0..n)
+                .map(|i| PlayerRow {
+                    name: format!("P{i}"),
+                    damage: 1_000,
+                    ..sample_row(None)
+                })
+                .collect(),
+            encounter: EncounterInfo::default(),
+        }
+    }
+
+    /// One `draw_rows` frame's painted text and mesh geometry — mirrors
+    /// `HeaderFrame`/`collect_painted_boxes` (issue #75) but for the row
+    /// list (issue #83's regression harness): meshes rather than filled
+    /// rects, because `draw_row` paints the share bar and hover highlight
+    /// as gradient meshes (`Shape::Mesh`), never a flat `Shape::Rect`.
+    struct RowFrame {
+        texts: Vec<(String, egui::Rect)>,
+        meshes: Vec<egui::Rect>,
+    }
+
+    impl RowFrame {
+        /// The union of every text shape painted for `value` (a player
+        /// name here).
+        fn text_box(&self, value: &str) -> egui::Rect {
+            self.texts
+                .iter()
+                .filter(|(painted, _)| painted == value)
+                .map(|(_, rect)| *rect)
+                .reduce(egui::Rect::union)
+                .unwrap_or_else(|| panic!("draw_rows never painted {value:?}: {:?}", self.texts))
+        }
+
+        /// Every row's own rect, identified by `rows_test_snapshot`'s
+        /// equal-damage trick: nothing else `draw_row` paints is
+        /// `ROW_HEIGHT` tall — the accent line is
+        /// `SHARE_BAR_ACCENT_THICKNESS`, the hover highlight only paints
+        /// while hovered (never true in a static render), and the class
+        /// icon is `ICON_SIZE`. Sorted top-to-bottom so index `i` here
+        /// really is row `i`.
+        fn row_rects(&self) -> Vec<egui::Rect> {
+            let mut rects: Vec<egui::Rect> = self
+                .meshes
+                .iter()
+                .copied()
+                .filter(|r| (r.height() - ROW_HEIGHT).abs() < 0.01)
+                .collect();
+            rects.sort_by(|a, b| a.top().partial_cmp(&b.top()).unwrap());
+            rects
+        }
+    }
+
+    fn collect_row_boxes(shape: &egui::Shape, clip: egui::Rect, frame: &mut RowFrame) {
+        match shape {
+            egui::Shape::Text(text) => frame.texts.push((
+                text.galley.text().to_string(),
+                egui::Rect::from_min_size(text.pos, text.galley.size()).intersect(clip),
+            )),
+            egui::Shape::Mesh(mesh) => frame.meshes.push(mesh.calc_bounds().intersect(clip)),
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_row_boxes(s, clip, frame);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Renders `draw_rows` in a `screen_rect` of `width` x `height` and
+    /// hands back everything it painted — same pattern as
+    /// `header_painted_boxes` (issue #75), generalized to a caller-chosen
+    /// size so both the default-size regression harness (issue #83) and
+    /// the overflow/scroll tests below (issue #84) can reuse it. Measures
+    /// *inside* the `ScrollArea`'s own viewport clip, since
+    /// `collect_row_boxes` intersects every shape with the clip rect it was
+    /// actually painted under — exactly like `collect_painted_boxes` does.
+    fn rows_painted_boxes(snapshot: &Snapshot, width: f32, height: f32) -> RowFrame {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, height),
+            )),
+            ..Default::default()
+        };
+
+        let mut frame = RowFrame {
+            texts: Vec::new(),
+            meshes: Vec::new(),
+        };
+        let output = ctx.run_ui(input, |ui| {
+            draw_rows(ui, snapshot, &Settings::default().ordered_columns(), &icons);
+        });
+        for clipped in &output.shapes {
+            collect_row_boxes(&clipped.shape, clipped.clip_rect, &mut frame);
+        }
+        output.drop_without_applying_deltas();
+        frame
+    }
+
+    /// Just `draw_rows`' `ScrollArea` content size for a render at `width`
+    /// x `height` — the numeric half of the harness above, for tests that
+    /// only care whether scrolling was needed (issue #84), not the painted
+    /// geometry.
+    fn rows_content_size(snapshot: &Snapshot, width: f32, height: f32) -> egui::Vec2 {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, height),
+            )),
+            ..Default::default()
+        };
+        let mut content_size = egui::Vec2::ZERO;
+        let output = ctx.run_ui(input, |ui| {
+            content_size = draw_rows(ui, snapshot, &Settings::default().ordered_columns(), &icons);
+        });
+        output.drop_without_applying_deltas();
+        content_size
+    }
+
+    #[test]
+    fn no_scrolling_needed_when_the_default_window_fits_every_row() {
+        let snapshot = rows_test_snapshot(DEFAULT_VISIBLE_ROWS);
+        let content = rows_content_size(&snapshot, default_inner_width(), default_inner_height());
+        assert!(
+            content.x <= default_inner_width() + 0.01,
+            "content {content:?} must not exceed the {}pt default width",
+            default_inner_width()
+        );
+        assert!(
+            content.y <= default_inner_height() + 0.01,
+            "content {content:?} must not exceed the {}pt default height",
+            default_inner_height()
+        );
+    }
+
+    #[test]
+    fn scrolling_is_needed_once_rows_exceed_the_viewport_height() {
+        let snapshot = rows_test_snapshot(DEFAULT_VISIBLE_ROWS + 5);
+        let viewport_height = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
+        let content = rows_content_size(&snapshot, default_inner_width(), viewport_height);
+        assert!(
+            content.y > viewport_height,
+            "content {content:?} must exceed the {viewport_height}pt viewport for a scrollbar to be needed"
+        );
+    }
+
+    #[test]
+    fn scrolling_is_needed_once_the_viewport_narrows_past_the_column_scale_floor() {
+        let snapshot = rows_test_snapshot(1);
+        let stat_columns_total: f32 = stat_columns_for(&Settings::default().ordered_columns())
+            .iter()
+            .map(|c| c.width)
+            .sum();
+        let floor = stat_columns_total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
+        let narrow_viewport = floor - 20.0;
+        let content = rows_content_size(&snapshot, narrow_viewport, ROW_HEIGHT * 2.0);
+        assert!(
+            content.x > narrow_viewport,
+            "content {content:?} must exceed the narrowed {narrow_viewport}pt viewport once columns hit the {MIN_COLUMN_SCALE} floor"
+        );
+        assert!((content.x - floor).abs() < 0.5);
+    }
+
+    /// Issue #83's regression harness: proves `draw_rows`' pitch and
+    /// per-row centering directly from what it *paints*, mirroring
+    /// `HeaderFrame`/`header_painted_boxes` (issue #75) rather than trusting
+    /// that `ROW_HEIGHT`/`allocate_exact_size` never drift from what
+    /// actually lands on screen. Renders inside the `ScrollArea` issue #84
+    /// adds — `rows_painted_boxes` measures shapes intersected with the
+    /// clip rect they actually painted under, whatever that clip came from.
+    #[test]
+    fn rows_painted_boxes_are_exactly_row_height_apart() {
+        let snapshot = rows_test_snapshot(DEFAULT_VISIBLE_ROWS);
+        let frame = rows_painted_boxes(&snapshot, default_inner_width(), default_inner_height());
+        let rows = frame.row_rects();
+        assert_eq!(
+            rows.len(),
+            DEFAULT_VISIBLE_ROWS,
+            "expected one row rect per player row: {rows:?}"
+        );
+        for pair in rows.windows(2) {
+            let gap = pair[1].top() - pair[0].top();
+            assert!(
+                (gap - ROW_HEIGHT).abs() < 0.01,
+                "consecutive rows {pair:?} are {gap}pt apart, not {ROW_HEIGHT}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_rows_name_text_is_vertically_centered_in_its_row() {
+        let snapshot = rows_test_snapshot(DEFAULT_VISIBLE_ROWS);
+        let frame = rows_painted_boxes(&snapshot, default_inner_width(), default_inner_height());
+        let rows = frame.row_rects();
+        assert_eq!(rows.len(), DEFAULT_VISIBLE_ROWS);
+        for (i, row_rect) in rows.iter().enumerate() {
+            let name = format!("P{i}");
+            let text_rect = frame.text_box(&name);
+            let diff = (text_rect.center().y - row_rect.center().y).abs();
+            assert!(
+                diff < 0.5,
+                "row {i}: name center.y {} vs row center.y {} (diff {diff})",
+                text_rect.center().y,
+                row_rect.center().y
+            );
+        }
     }
 
     // -- window position tracking (issue #27) -----------------------------
@@ -5395,17 +6173,13 @@ mod tests {
         }
     }
 
-    /// Reset and Close are built from structurally near-identical blocks in
-    /// `draw_header_menu` — icon, label, `.clicked()` guard, command
-    /// dispatch — exactly the shape a copy-paste slip could swap without
-    /// the compiler ever noticing. This drives real clicks through
-    /// `Response::clicked()`, the same path `draw_header_menu` itself
-    /// checks, rather than calling `tx_command.try_send` or
-    /// `ctx.send_viewport_cmd` directly — a swapped pairing between the two
-    /// blocks would still pass a test that only inspected the call sites in
-    /// isolation.
+    /// Reset moved out of this menu into the toggle cluster (issue #82;
+    /// see `clicking_reset_sends_the_reset_command`), leaving Close as the
+    /// only command this menu itself still dispatches. This drives a real
+    /// click through `Response::clicked()`, the same path `draw_header_menu`
+    /// itself checks, rather than calling `ctx.send_viewport_cmd` directly.
     #[test]
-    fn draw_header_menu_dispatches_reset_and_close_to_the_right_commands() {
+    fn draw_header_menu_dispatches_close_to_the_right_command() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         apply_theme(&ctx);
@@ -5416,8 +6190,8 @@ mod tests {
         let mut collapse = CollapseState::default();
 
         // Frame 1: lay the menu out with no input, and read back where
-        // AccessKit says "Reset" and "Close" actually painted — neither
-        // button's rect is knowable ahead of a real `draw_header_menu` run.
+        // AccessKit says "Close" actually painted — its rect isn't knowable
+        // ahead of a real `draw_header_menu` run.
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
             draw_header_menu(
                 ui,
@@ -5437,46 +6211,10 @@ mod tests {
             .accesskit_update
             .clone()
             .expect("accesskit was enabled for this frame");
-        let reset_pos = accessible_rect_for_label(&update, "Reset").center();
         let close_pos = accessible_rect_for_label(&update, "Close").center();
         layout.drop_without_applying_deltas();
 
-        // Frame 2: click Reset.
-        let output = ctx.run_ui(click_at(reset_pos), |ui| {
-            draw_header_menu(
-                ui,
-                &ctx,
-                &tx_command,
-                SettingsHandle {
-                    settings: &mut settings,
-                    tx_settings: &tx_settings,
-                },
-                &icons,
-                &mut collapse,
-                40.0,
-            );
-        });
-        let reset_commands = output
-            .viewport_output
-            .get(&egui::ViewportId::ROOT)
-            .map(|viewport| viewport.commands.clone())
-            .unwrap_or_default();
-        output.drop_without_applying_deltas();
-
-        assert_eq!(
-            rx_command.try_recv().expect("Reset must send a command"),
-            UiCommand::Reset
-        );
-        assert!(
-            rx_command.try_recv().is_err(),
-            "Reset must not also queue a second command"
-        );
-        assert!(
-            !reset_commands.contains(&egui::ViewportCommand::Close),
-            "Reset must not also close the window: {reset_commands:?}"
-        );
-
-        // Frame 3: click Close.
+        // Frame 2: click Close.
         let output = ctx.run_ui(click_at(close_pos), |ui| {
             draw_header_menu(
                 ui,

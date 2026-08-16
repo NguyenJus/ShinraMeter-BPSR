@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use crate::event::{Class, DamageEvent, EnemyHp, EntityKind, PlayerInfo, ProtocolEvent};
+use crate::fight::{FightConfig, FightState};
 use crate::reset::{EnemyState, ResetConfig, ResetReason, check_hp_rollback};
 use crate::stats::{EncounterInfo, PlayerRow, PlayerStats, Snapshot};
 use crate::tables;
@@ -75,7 +76,16 @@ pub struct Meter {
     /// boss-HP rollback both stay in the same dungeon); cleared only on
     /// `ServerChanged`, in `apply` directly rather than in `reset` itself.
     scene_id: Option<u32>,
+    /// When the current fight ended, if it has (issue #78). `Some(t)` puts
+    /// the meter in [`FightState::Ended`]: the snapshot is rendered as of
+    /// `t` rather than the caller's `now_ms`, so rows, totals and the
+    /// elapsed timer all hold still until the next fight (or a manual reset
+    /// / server change) clears them. Latched by an explicit end signal (a
+    /// boss death) or by [`Meter::tick`] once the idle timeout has elapsed;
+    /// cleared by `reset`.
+    fight_end_ms: Option<u64>,
     reset_cfg: ResetConfig,
+    fight_cfg: FightConfig,
 }
 
 impl Meter {
@@ -90,13 +100,22 @@ impl Meter {
             last_reset_ms: None,
             boss_uid: None,
             scene_id: None,
+            fight_end_ms: None,
             reset_cfg: ResetConfig::default(),
+            fight_cfg: FightConfig::default(),
         }
     }
 
     pub fn with_reset_config(cfg: ResetConfig) -> Self {
         Self {
             reset_cfg: cfg,
+            ..Self::new()
+        }
+    }
+
+    pub fn with_fight_config(cfg: FightConfig) -> Self {
+        Self {
+            fight_cfg: cfg,
             ..Self::new()
         }
     }
@@ -199,6 +218,76 @@ impl Meter {
         &self.reset_cfg
     }
 
+    pub fn set_fight_config(&mut self, cfg: FightConfig) {
+        self.fight_cfg = cfg;
+    }
+
+    pub fn fight_config(&self) -> &FightConfig {
+        &self.fight_cfg
+    }
+
+    /// The moment the current fight ended, or `None` while it is still
+    /// running (or while there is no fight at all).
+    ///
+    /// Two ways a fight ends (issue #78):
+    /// * an explicit end signal already latched into `fight_end_ms` — today
+    ///   only a recognized boss dying, see `FightConfig::end_on_boss_death`;
+    /// * the idle timeout: no damage event for `idle_timeout_ms`. That one is
+    ///   derived from `last_event_ms` on every call rather than requiring a
+    ///   `tick`, so a caller that only ever calls `snapshot` still gets the
+    ///   hold — `tick` merely pins it.
+    ///
+    /// The end time is the last damage event, not "now": the fight really
+    /// ended when the hitting stopped, and using it keeps the frozen elapsed
+    /// timer consistent with the DPS window (which is also last-damage
+    /// anchored).
+    fn fight_ended_at(&self, now_ms: u64) -> Option<u64> {
+        self.fight_start_ms?;
+        if let Some(end_ms) = self.fight_end_ms {
+            return Some(end_ms);
+        }
+        let idle = self.fight_cfg.idle_timeout_ms;
+        if idle > 0 && now_ms.saturating_sub(self.last_event_ms) >= idle {
+            Some(self.last_event_ms)
+        } else {
+            None
+        }
+    }
+
+    /// Where the meter is in the fight lifecycle as of `now_ms`.
+    pub fn fight_state(&self, now_ms: u64) -> FightState {
+        match self.fight_start_ms {
+            None => FightState::Idle,
+            Some(_) if self.fight_ended_at(now_ms).is_some() => FightState::Ended,
+            Some(_) => FightState::Active,
+        }
+    }
+
+    /// Whether the last fight's stats are being held on screen.
+    pub fn is_fight_ended(&self, now_ms: u64) -> bool {
+        self.fight_state(now_ms) == FightState::Ended
+    }
+
+    /// Advances wall-clock-driven fight state and returns the resulting
+    /// state. Call this once per UI tick before `snapshot`; it latches an
+    /// idle-detected end so the held snapshot can never drift afterwards
+    /// (e.g. if the idle timeout is reconfigured mid-hold).
+    ///
+    /// Deliberately does **not** clear anything: leaving [`FightState::Ended`]
+    /// is driven by combat activity (or an explicit reset), never by time
+    /// passing — idling in town must not wipe the numbers the user is trying
+    /// to screenshot.
+    pub fn tick(&mut self, now_ms: u64) -> FightState {
+        if let Some(end_ms) = self.fight_ended_at(now_ms) {
+            self.fight_end_ms = Some(end_ms);
+            FightState::Ended
+        } else if self.fight_start_ms.is_some() {
+            FightState::Active
+        } else {
+            FightState::Idle
+        }
+    }
+
     /// Routes an event into the encounter state. Returns `Some(reason)` when
     /// applying the event triggered a reset.
     pub fn apply(&mut self, ev: &ProtocolEvent) -> Option<ResetReason> {
@@ -224,6 +313,34 @@ impl Meter {
     }
 
     fn apply_damage(&mut self, d: &DamageEvent) -> Option<ResetReason> {
+        // issue #78: pin the end *before* this event touches the encounter's
+        // clocks — a monster's swing at a player extends `last_event_ms`
+        // without ever producing a row, which would otherwise drag an
+        // already-ended fight back into `Active`.
+        if let Some(end_ms) = self.fight_ended_at(d.timestamp_ms) {
+            self.fight_end_ms = Some(end_ms);
+        }
+
+        // Real combat activity — a player landing a hit — is the *only*
+        // thing that ends the hold, and it does so through the existing
+        // reset machinery, so this event lands in a clean encounter. Gated
+        // on the same condition that starts the fight clock below: a monster
+        // swinging at a player in town, or a heal, must not wipe the numbers
+        // the user is looking at.
+        let mut reason = None;
+        if self.fight_end_ms.is_some() && d.attacker_kind == EntityKind::Player && !d.is_heal {
+            self.reset(ResetReason::NewFight, d.timestamp_ms);
+            reason = Some(ResetReason::NewFight);
+        }
+
+        // Still held (the reset above clears `fight_end_ms`, so this can only
+        // be the "combat the user isn't part of" case): the displayed fight
+        // is frozen, so nothing this event carries — not damage, not deaths,
+        // not the event clock — may touch it.
+        if self.fight_end_ms.is_some() {
+            return None;
+        }
+
         // `d.is_dead` flags that `target_uid` (the victim, not the
         // attacker) died from this hit — count it against the target
         // regardless of who or what dealt the blow (issue #49), and
@@ -237,13 +354,20 @@ impl Meter {
         // Healing view is a non-goal: heal events never touch damage totals
         // or fight timing.
         if d.is_heal {
-            return None;
+            return reason;
         }
 
         if d.target_kind == EntityKind::Monster {
             let enemy = self.enemies.entry(d.target_uid).or_default();
             enemy.took_damage = true;
             self.recompute_boss();
+            // issue #78: a recognized boss dying ends the fight now, rather
+            // than after the idle timeout, so the meter freezes on the kill
+            // instead of on a straggler's last tick of DoT damage.
+            if self.fight_cfg.end_on_boss_death && d.is_dead && self.boss_uid == Some(d.target_uid)
+            {
+                self.end_fight_on_boss_death(d.target_uid, d.timestamp_ms);
+            }
         }
 
         self.last_event_ms = self.last_event_ms.max(d.timestamp_ms);
@@ -254,7 +378,7 @@ impl Meter {
         // attacking the tank before players open fire dilute every row's DPS
         // with idle time.
         if d.attacker_kind != EntityKind::Player {
-            return None;
+            return reason;
         }
 
         if self.fight_start_ms.is_none() {
@@ -294,7 +418,28 @@ impl Meter {
             }
         }
 
-        None
+        reason
+    }
+
+    /// Latches the fight end at `now_ms` if `uid` is a *recognized* boss
+    /// (issue #78). The `tables::is_boss_monster` gate is what makes this
+    /// signal usable: `recompute_boss` is a pure largest-max-hp heuristic, so
+    /// without it the biggest trash mob in a pull would end the fight every
+    /// time it died. An unrecognized (or not-yet-identified) monster falls
+    /// back to the idle timeout, which is always safe.
+    fn end_fight_on_boss_death(&mut self, uid: i64, now_ms: u64) {
+        let recognized = self
+            .enemies
+            .get(&uid)
+            .and_then(|e| e.monster_id)
+            .is_some_and(tables::is_boss_monster);
+        // Guarded on an in-progress fight so a kill packet arriving while no
+        // fight is running (the tail of a pull the user just reset away)
+        // can't leave a stale end time latched for the *next* fight to trip
+        // over.
+        if recognized && self.fight_start_ms.is_some() && self.fight_end_ms.is_none() {
+            self.fight_end_ms = Some(now_ms);
+        }
     }
 
     /// Counts one death for `target_uid`, debounced by `DEATH_DEBOUNCE_MS`
@@ -368,6 +513,15 @@ impl Meter {
         self.recompute_boss();
 
         if self.boss_uid == Some(e.uid) {
+            // issue #78: the boss's HP reaching 0 is the other end-of-fight
+            // signal (the death packet can be missed; an HP sync to 0 is
+            // hard to miss). Same recognized-boss gate as the death path.
+            if self.fight_cfg.end_on_boss_death
+                && self.enemies.get(&e.uid).and_then(|x| x.curr_hp) == Some(0)
+            {
+                self.end_fight_on_boss_death(e.uid, e.timestamp_ms);
+            }
+
             let cooldown_ok = match self.last_reset_ms {
                 Some(last) => e.timestamp_ms.saturating_sub(last) >= self.reset_cfg.cooldown_ms,
                 None => true,
@@ -376,15 +530,21 @@ impl Meter {
                 let enemy = &self.enemies[&e.uid];
                 check_hp_rollback(enemy, &self.reset_cfg)
             };
+            // issue #78: while the last fight's stats are held, a boss HP bar
+            // refilling (the corpse resyncing, or the next party pulling it)
+            // must not clear them. The hold is only ever ended by combat the
+            // *user* is part of, or by an explicit reset.
+            let held = self.fight_ended_at(e.timestamp_ms).is_some();
             if should_reset {
-                if cooldown_ok {
+                if cooldown_ok && !held {
                     self.reset(ResetReason::BossHpRollback, e.timestamp_ms);
                     return Some(ResetReason::BossHpRollback);
                 }
-                // The rollback shape was observed but suppressed by the
-                // cooldown gate. Latch it so the same rollback can't re-fire
-                // the instant the cooldown expires (it's level-triggered on
-                // `lowest_pct`, which only clears inside `reset`).
+                // The rollback shape was observed but suppressed (by the
+                // cooldown gate, or by the post-fight hold). Latch it so the
+                // same rollback can't re-fire the instant the cooldown
+                // expires (it's level-triggered on `lowest_pct`, which only
+                // clears inside `reset`).
                 if let Some(enemy) = self.enemies.get_mut(&e.uid) {
                     enemy.lowest_pct = None;
                 }
@@ -421,6 +581,10 @@ impl Meter {
             enemy.took_damage = false;
         }
         self.fight_start_ms = None;
+        // Every reset reason (manual, boss-HP rollback, server change, and
+        // the next fight's first hit) drops the post-fight hold: the numbers
+        // being held belong to the encounter that is being cleared.
+        self.fight_end_ms = None;
         self.last_reset_ms = Some(now_ms);
         // No enemy has `took_damage` anymore, so this clears `boss_uid`.
         // Otherwise a stale `boss_uid` from the previous pull would still
@@ -433,8 +597,14 @@ impl Meter {
     pub fn snapshot(&self, now_ms: u64) -> Snapshot {
         let total_damage: i64 = self.players.values().map(|p| p.total_damage).sum();
 
+        // issue #78: once the fight has ended the snapshot is rendered as of
+        // the fight's end, not the caller's clock, so the elapsed timer stops
+        // advancing and the display holds the last pull's numbers until the
+        // next fight starts.
+        let effective_now_ms = self.fight_ended_at(now_ms).unwrap_or(now_ms);
+
         let display_duration_ms = match self.fight_start_ms {
-            Some(start) => now_ms.saturating_sub(start).max(1),
+            Some(start) => effective_now_ms.saturating_sub(start).max(1),
             None => 0,
         };
         // DPS denominator: last-damage - first-damage, min 1s, so idle time
@@ -509,6 +679,9 @@ impl Meter {
         }
     }
 
+    /// Whether a fight's stats are on the board — true both while it is
+    /// running and while an ended fight is being held (issue #78). Use
+    /// [`Meter::fight_state`] to tell those two apart.
     pub fn is_active(&self) -> bool {
         self.fight_start_ms.is_some()
     }
@@ -674,8 +847,11 @@ mod tests {
     #[test]
     fn dps_uses_last_damage_minus_first_damage_window() {
         let mut m = Meter::new();
-        m.apply(&dmg(1, 5000, 0));
-        m.apply(&dmg(1, 5000, 10_000));
+        // Both hits inside the fight-end idle window (issue #78), so this is
+        // one fight: a gap longer than `FightConfig::idle_timeout_ms` would
+        // legitimately be two.
+        m.apply(&dmg(1, 2500, 0));
+        m.apply(&dmg(1, 2500, 5_000));
         // now_ms is far beyond the last hit; DPS must not be diluted by idle time.
         let snap = m.snapshot(60_000);
         assert!((snap.rows[0].dps - 1000.0).abs() < 0.01);
@@ -1250,6 +1426,337 @@ mod tests {
             m.apply(&dmg(1, 50, 2000));
             let snap = m.snapshot(3000);
             assert_eq!(snap.rows[0].name, "Foo");
+        }
+    }
+
+    /// Issue #78: a fight that has ended holds its stats on screen until the
+    /// next fight actually starts.
+    mod fight_end {
+        use super::*;
+
+        /// The default idle window, as a plain value so the cases below read
+        /// as "just inside / just outside the window".
+        fn idle() -> u64 {
+            FightConfig::default().idle_timeout_ms
+        }
+
+        /// A player hit on monster `uid`, optionally the killing blow.
+        fn boss_hit(uid: i64, ts: u64, is_dead: bool) -> ProtocolEvent {
+            ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: uid,
+                target_kind: EntityKind::Monster,
+                value: 100,
+                is_dead,
+                timestamp_ms: ts,
+                ..Default::default()
+            })
+        }
+
+        fn hp(uid: i64, curr: u64, monster_id: Option<u32>, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::EnemyHp(EnemyHp {
+                uid,
+                curr_hp: Some(curr),
+                max_hp: Some(100),
+                monster_id,
+                timestamp_ms: ts,
+            })
+        }
+
+        #[test]
+        fn fight_is_active_while_damage_keeps_arriving() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 100, 1_000));
+            assert_eq!(m.fight_state(1_000 + idle() - 1), FightState::Active);
+        }
+
+        #[test]
+        fn fight_ends_after_the_idle_window() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 100, 1_000));
+            assert_eq!(m.fight_state(1_000 + idle()), FightState::Ended);
+        }
+
+        #[test]
+        fn no_fight_at_all_stays_idle() {
+            let m = Meter::new();
+            assert_eq!(m.fight_state(600_000), FightState::Idle);
+        }
+
+        #[test]
+        fn stats_and_elapsed_timer_are_held_while_ended() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 5_000, 0));
+            m.apply(&dmg(1, 5_000, 5_000));
+
+            // Two snapshots five minutes apart, both after the fight ended.
+            let first = m.snapshot(5_000 + idle());
+            let later = m.snapshot(600_000);
+
+            assert_eq!(first.duration_ms, 5_000);
+            assert_eq!(later.duration_ms, first.duration_ms);
+            assert_eq!(later.total_damage, 10_000);
+            assert_eq!(later.rows.len(), 1);
+            assert!((later.rows[0].dps - first.rows[0].dps).abs() < 0.01);
+        }
+
+        #[test]
+        fn tick_latches_the_end_at_the_last_damage() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 100, 1_000));
+            assert_eq!(m.tick(1_000 + idle()), FightState::Ended);
+
+            // Re-widening the idle window must not un-end a latched fight.
+            m.set_fight_config(FightConfig {
+                idle_timeout_ms: 600_000,
+                ..FightConfig::default()
+            });
+            assert_eq!(m.fight_state(1_000 + idle()), FightState::Ended);
+            assert_eq!(m.snapshot(600_000).duration_ms, 1);
+        }
+
+        #[test]
+        fn tick_reports_active_and_idle_without_latching() {
+            let mut m = Meter::new();
+            assert_eq!(m.tick(1_000), FightState::Idle);
+            m.apply(&dmg(1, 100, 1_000));
+            assert_eq!(m.tick(2_000), FightState::Active);
+            assert_eq!(m.fight_state(600_000), FightState::Ended);
+        }
+
+        #[test]
+        fn a_zero_idle_timeout_disables_idle_detection() {
+            let mut m = Meter::with_fight_config(FightConfig {
+                idle_timeout_ms: 0,
+                ..FightConfig::default()
+            });
+            m.apply(&dmg(1, 100, 1_000));
+            assert_eq!(m.fight_state(600_000), FightState::Active);
+        }
+
+        #[test]
+        fn new_damage_after_the_hold_clears_and_starts_a_fresh_fight() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 5_000, 0));
+
+            let reason = m.apply(&dmg(1, 300, 100_000));
+            assert_eq!(reason, Some(ResetReason::NewFight));
+
+            let snap = m.snapshot(101_000);
+            assert_eq!(snap.total_damage, 300, "old fight's damage must be gone");
+            assert_eq!(m.fight_state(101_000), FightState::Active);
+            // The new fight's clock is anchored to its own first hit.
+            assert_eq!(snap.duration_ms, 1_000);
+        }
+
+        #[test]
+        fn damage_inside_the_idle_window_does_not_reset() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 5_000, 0));
+            let reason = m.apply(&dmg(1, 5_000, idle() - 1));
+            assert_eq!(reason, None);
+            assert_eq!(m.snapshot(idle()).total_damage, 10_000);
+        }
+
+        #[test]
+        fn a_monster_swinging_at_a_player_does_not_end_the_hold() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 5_000, 0));
+
+            // A mob aggroes the player in town long after the pull ended.
+            let reason = m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 99,
+                attacker_kind: EntityKind::Monster,
+                target_uid: 1,
+                target_kind: EntityKind::Player,
+                value: 200,
+                timestamp_ms: 100_000,
+                ..Default::default()
+            }));
+            assert_eq!(reason, None);
+            assert_eq!(m.snapshot(101_000).total_damage, 5_000);
+            assert_eq!(m.fight_state(101_000), FightState::Ended);
+        }
+
+        #[test]
+        fn a_heal_does_not_end_the_hold() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 5_000, 0));
+            let reason = m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                value: 400,
+                is_heal: true,
+                timestamp_ms: 100_000,
+                ..Default::default()
+            }));
+            assert_eq!(reason, None);
+            assert_eq!(m.snapshot(101_000).total_damage, 5_000);
+        }
+
+        #[test]
+        fn manual_reset_clears_immediately_from_the_ended_state() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 5_000, 0));
+            assert_eq!(m.tick(100_000), FightState::Ended);
+
+            m.reset(ResetReason::Manual, 100_000);
+
+            let snap = m.snapshot(101_000);
+            assert!(snap.rows.is_empty());
+            assert_eq!(snap.total_damage, 0);
+            assert_eq!(snap.duration_ms, 0);
+            assert_eq!(m.fight_state(101_000), FightState::Idle);
+        }
+
+        #[test]
+        fn server_change_clears_from_the_ended_state() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 5_000, 0));
+            assert_eq!(m.tick(100_000), FightState::Ended);
+
+            let reason = m.apply(&ProtocolEvent::ServerChanged {
+                timestamp_ms: 100_000,
+            });
+            assert_eq!(reason, Some(ResetReason::ServerChange));
+            assert!(m.snapshot(101_000).rows.is_empty());
+            assert_eq!(m.fight_state(101_000), FightState::Idle);
+        }
+
+        #[test]
+        fn a_recognized_boss_dying_ends_the_fight_immediately() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0, false));
+            m.apply(&hp(10, 50, Some(103), 0)); // 103 = a catalogued boss
+            m.apply(&boss_hit(10, 1_000, true));
+
+            assert_eq!(m.fight_state(1_100), FightState::Ended);
+            assert_eq!(m.snapshot(60_000).duration_ms, 1_000);
+        }
+
+        #[test]
+        fn a_trash_mob_dying_does_not_end_the_fight() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0, false));
+            m.apply(&hp(10, 50, Some(10_900), 0)); // named, but not a boss
+            m.apply(&boss_hit(10, 1_000, true));
+
+            assert_eq!(m.fight_state(1_100), FightState::Active);
+        }
+
+        #[test]
+        fn an_unidentified_monster_dying_does_not_end_the_fight() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0, false));
+            m.apply(&hp(10, 50, None, 0));
+            m.apply(&boss_hit(10, 1_000, true));
+
+            assert_eq!(m.fight_state(1_100), FightState::Active);
+        }
+
+        #[test]
+        fn boss_death_detection_can_be_disabled() {
+            let mut m = Meter::with_fight_config(FightConfig {
+                end_on_boss_death: false,
+                ..FightConfig::default()
+            });
+            m.apply(&boss_hit(10, 0, false));
+            m.apply(&hp(10, 50, Some(103), 0));
+            m.apply(&boss_hit(10, 1_000, true));
+
+            assert_eq!(m.fight_state(1_100), FightState::Active);
+        }
+
+        #[test]
+        fn boss_hp_reaching_zero_ends_the_fight() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0, false));
+            m.apply(&hp(10, 50, Some(103), 500));
+            m.apply(&hp(10, 0, Some(103), 1_000));
+
+            assert_eq!(m.fight_state(1_100), FightState::Ended);
+        }
+
+        #[test]
+        fn a_second_zero_hp_sync_does_not_drift_the_latched_end() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0, false));
+            m.apply(&hp(10, 50, Some(103), 500));
+            m.apply(&hp(10, 0, Some(103), 1_000));
+
+            let held = m.snapshot(60_000);
+            assert_eq!(held.duration_ms, 1_000);
+
+            // A duplicate zero-HP sync for the same, already-dead boss,
+            // arriving long after the fight was latched as ended: the
+            // latch must be once-only, or this re-enters
+            // `end_fight_on_boss_death` and drags `fight_end_ms` (and thus
+            // the frozen duration) forward.
+            m.apply(&hp(10, 0, Some(103), 500_000));
+
+            let later = m.snapshot(600_000);
+            assert_eq!(later.duration_ms, held.duration_ms);
+        }
+
+        #[test]
+        fn a_boss_hp_rollback_cannot_clear_a_held_fight() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0, false));
+            m.apply(&hp(10, 100, Some(103), 0));
+            m.apply(&hp(10, 55, Some(103), 100));
+
+            // The pull ends; the meter is holding its stats.
+            assert_eq!(m.tick(100_000), FightState::Ended);
+
+            // The corpse (or the next party's pull) refills the HP bar: the
+            // classic rollback shape, which must not wipe the held numbers.
+            let reason = m.apply(&hp(10, 95, Some(103), 120_000));
+            assert_eq!(reason, None);
+            assert_eq!(m.snapshot(121_000).total_damage, 100);
+            assert_eq!(m.fight_state(121_000), FightState::Ended);
+        }
+
+        #[test]
+        fn a_boss_hp_rollback_still_resets_during_a_live_fight() {
+            // Guards the change above from over-reaching: an in-progress
+            // wipe/rollback must keep resetting exactly as before.
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0, false));
+            m.apply(&hp(10, 100, None, 0));
+            m.apply(&hp(10, 55, None, 100));
+            let reason = m.apply(&hp(10, 95, None, 200));
+            assert_eq!(reason, Some(ResetReason::BossHpRollback));
+        }
+
+        #[test]
+        fn the_next_fight_after_a_boss_kill_clears_the_held_stats() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0, false));
+            m.apply(&hp(10, 50, Some(103), 0));
+            m.apply(&boss_hit(10, 1_000, true));
+            assert_eq!(m.fight_state(1_100), FightState::Ended);
+
+            // Next pull, only two seconds later — well inside the idle
+            // window, but the fight already ended, so this starts a new one.
+            let reason = m.apply(&dmg(1, 700, 3_000));
+            assert_eq!(reason, Some(ResetReason::NewFight));
+            assert_eq!(m.snapshot(4_000).total_damage, 700);
+        }
+
+        #[test]
+        fn names_survive_the_new_fight_reset() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Player(PlayerInfo {
+                uid: 1,
+                name: Some("Foo".to_string()),
+                class: None,
+                ability_score: None,
+                season_strength: None,
+            }));
+            m.apply(&dmg(1, 100, 0));
+            m.apply(&dmg(1, 100, 100_000));
+            assert_eq!(m.snapshot(101_000).rows[0].name, "Foo");
         }
     }
 

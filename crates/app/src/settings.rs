@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use egui::Color32;
 
 use crate::ui::{
-    CRIT_PCT_RGB, DEATH_COUNT_RGB, LUCKY_PCT_RGB, STAT_TEXT_RGB, StatColumn, fmt_share, fmt_short,
+    CRIT_PCT_RGB, DEATH_COUNT_RGB, LUCKY_PCT_RGB, STAT_TEXT_RGB, StatColumn, fmt_dps, fmt_pct0,
+    fmt_share, fmt_short,
 };
 
 /// One selectable stat column. Declaration order here is also the
@@ -136,26 +137,40 @@ impl ColumnKind {
                 text: |row| fmt_short(row.damage),
                 color: Color32::from_rgb(STAT_TEXT_RGB.0, STAT_TEXT_RGB.1, STAT_TEXT_RGB.2),
             },
-            // `fmt_short`'s ≤7 chars plus the 2-char "/s" suffix = ≤9
-            // chars, so this column needs more room than the others.
+            // `fmt_dps`'s ≤5 chars (issue #80.3: it drops the decimal once
+            // the scaled value hits 3 digits, e.g. `1000K`/`999M`) plus the
+            // 2-char "/s" suffix = ≤7 chars — narrower than `fmt_short`'s
+            // old always-one-decimal text, so this needs less room than it
+            // used to. `width` measured at 47.59375pt for "1000K/s" and
+            // rounded up to the next multiple of 8.
             ColumnKind::Dps => StatColumn {
-                width: 80.0,
-                text: |row| format!("{}/s", fmt_short(row.dps as i64)),
+                width: 48.0,
+                text: |row| format!("{}/s", fmt_dps(row.dps as i64)),
                 color: Color32::WHITE,
             },
+            // Unaffected by issue #80.2's 0-decimal change (that's `CritPct`/
+            // `LuckyPct` only) — still `fmt_share`'s one decimal, e.g.
+            // `100.0%`. `width` is tightened per issue #80.1: measured at
+            // 43.34375pt for the widest plausible value and rounded up to
+            // the next multiple of 8, same convention as the columns below.
             ColumnKind::SharePct => StatColumn {
-                width: 56.0,
+                width: 48.0,
                 text: |row| fmt_share(row.share_pct),
                 color: Color32::from_rgb(STAT_TEXT_RGB.0, STAT_TEXT_RGB.1, STAT_TEXT_RGB.2),
             },
+            // 0 decimal places (issue #80.2): the reference render shows
+            // `73%`/`76%`/etc., not `fmt_share`'s one-decimal `73.0%`.
+            // `width` measured at 32.8125pt for "100%" and rounded up to the
+            // next multiple of 8.
             ColumnKind::CritPct => StatColumn {
-                width: 56.0,
-                text: |row| fmt_share(row.crit_pct),
+                width: 40.0,
+                text: |row| fmt_pct0(row.crit_pct),
                 color: Color32::from_rgb(CRIT_PCT_RGB.0, CRIT_PCT_RGB.1, CRIT_PCT_RGB.2),
             },
+            // Same formatter and width reasoning as `CritPct` above.
             ColumnKind::LuckyPct => StatColumn {
-                width: 56.0,
-                text: |row| fmt_share(row.lucky_pct),
+                width: 40.0,
+                text: |row| fmt_pct0(row.lucky_pct),
                 color: Color32::from_rgb(LUCKY_PCT_RGB.0, LUCKY_PCT_RGB.1, LUCKY_PCT_RGB.2),
             },
             // `fmt_short` bounds this to ~7 chars regardless of how many
