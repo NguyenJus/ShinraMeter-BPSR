@@ -378,7 +378,9 @@ struct SettingsHandle<'a> {
 /// The two pieces of window-chrome state `draw_header`'s controls drive: the
 /// in-flight manual move/resize gesture (issue #11, started by the title
 /// bar's drag surface) and the collapse-to-header state (issue #54, toggled
-/// by the chevron). Bundled for exactly the reason `SettingsHandle` is —
+/// by `draw_header_menu`'s Collapse/Expand item, not the chevron — the
+/// chevron just opens the menu the item lives in, issue #71). Bundled for
+/// exactly the reason `SettingsHandle` is —
 /// `draw_header` is already at clippy's argument limit, and these two are
 /// always needed together by the same function.
 struct ChromeHandle<'a> {
@@ -741,7 +743,7 @@ fn chevron_points(rect: egui::Rect, pointing_down: bool) -> [egui::Pos2; 3] {
 /// label names what a click does ("Menu"), not a state.
 fn menu_chevron(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
     let label = "Menu";
-    let response = ui.interact(rect, ui.id().with("collapse_chevron"), egui::Sense::click());
+    let response = ui.interact(rect, ui.id().with("menu_chevron"), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         ui.painter().add(egui::Shape::line(
             chevron_points(rect, true).to_vec(),
@@ -4904,6 +4906,172 @@ mod tests {
             .find(|(node_id, _)| *node_id == id.accesskit_id())
             .and_then(|(_, node)| node.label())
             .map(str::to_string)
+    }
+
+    /// Same idea as `accessible_label`, but reads back where AccessKit says
+    /// the labeled node painted. Every interactive `Response` fills in its
+    /// AccessKit bounds from its own `rect` for free
+    /// (`Response::fill_accesskit_node_common`), so this is what lets a test
+    /// click a specific `draw_header_menu` item without that function
+    /// handing back anything more than a `Ui` to paint into.
+    fn accessible_rect_for_label(update: &egui::accesskit::TreeUpdate, label: &str) -> egui::Rect {
+        let bounds = update
+            .nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.label() == Some(label))
+                    .then(|| node.bounds())
+                    .flatten()
+            })
+            .unwrap_or_else(|| panic!("no accessible node labeled {label:?} painted"));
+        egui::Rect::from_min_max(
+            egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+            egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+        )
+    }
+
+    /// A single left-click (move, press, release, all in one frame) at
+    /// `pos` — enough for `Response::clicked()` to fire on whatever gets
+    /// allocated at `pos` during the very frame this `RawInput` drives,
+    /// since `Context::run_ui` folds `new_input` into `InputState` before
+    /// the paint closure runs.
+    fn click_at(pos: egui::Pos2) -> egui::RawInput {
+        let modifiers = egui::Modifiers::NONE;
+        egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// Reset and Close are built from structurally near-identical blocks in
+    /// `draw_header_menu` — icon, label, `.clicked()` guard, command
+    /// dispatch — exactly the shape a copy-paste slip could swap without
+    /// the compiler ever noticing. This drives real clicks through
+    /// `Response::clicked()`, the same path `draw_header_menu` itself
+    /// checks, rather than calling `tx_command.try_send` or
+    /// `ctx.send_viewport_cmd` directly — a swapped pairing between the two
+    /// blocks would still pass a test that only inspected the call sites in
+    /// isolation.
+    #[test]
+    fn draw_header_menu_dispatches_reset_and_close_to_the_right_commands() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let mut collapse = CollapseState::default();
+
+        // Frame 1: lay the menu out with no input, and read back where
+        // AccessKit says "Reset" and "Close" actually painted — neither
+        // button's rect is knowable ahead of a real `draw_header_menu` run.
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut collapse,
+                40.0,
+            );
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let reset_pos = accessible_rect_for_label(&update, "Reset").center();
+        let close_pos = accessible_rect_for_label(&update, "Close").center();
+        layout.drop_without_applying_deltas();
+
+        // Frame 2: click Reset.
+        let output = ctx.run_ui(click_at(reset_pos), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut collapse,
+                40.0,
+            );
+        });
+        let reset_commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            rx_command.try_recv().expect("Reset must send a command"),
+            UiCommand::Reset
+        );
+        assert!(
+            rx_command.try_recv().is_err(),
+            "Reset must not also queue a second command"
+        );
+        assert!(
+            !reset_commands.contains(&egui::ViewportCommand::Close),
+            "Reset must not also close the window: {reset_commands:?}"
+        );
+
+        // Frame 3: click Close.
+        let output = ctx.run_ui(click_at(close_pos), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut collapse,
+                40.0,
+            );
+        });
+        let close_commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            rx_command.try_recv().expect("Close must send a command"),
+            UiCommand::Quit
+        );
+        assert!(
+            rx_command.try_recv().is_err(),
+            "Close must not also queue a second command"
+        );
+        assert!(
+            close_commands.contains(&egui::ViewportCommand::Close),
+            "Close must also ask the viewport to close: {close_commands:?}"
+        );
     }
 
     #[test]
