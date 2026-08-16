@@ -9,6 +9,7 @@ mod dump;
 mod fonts;
 mod icons;
 mod inspect;
+mod logging;
 mod pipeline;
 mod platform;
 mod settings;
@@ -46,7 +47,12 @@ fn names_cache_path() -> PathBuf {
 }
 
 fn main() -> eframe::Result {
-    env_logger::init();
+    // `env_logger::init()` alone defaults to `error`-only and, since this
+    // binary carries `windows_subsystem = "windows"`, has no console for
+    // stderr to land on in a shipped build — so it was effectively silent.
+    // `logging::init` (issue #69) turns logging on by default and tees it to
+    // a file so a user hitting a bug can actually produce diagnostics.
+    logging::init();
 
     let (tx_events, rx_events) = bounded::<ProtocolEvent>(EVENT_CAPACITY);
     let (tx_command, rx_command) = bounded::<UiCommand>(COMMAND_CAPACITY);
