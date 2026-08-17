@@ -58,13 +58,13 @@ The binary lands at `target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe`.
 
 ### Windows Runtime
 
-Nothing to install: `ShinraMeter-BPSR.exe` is self-contained. Download it, double-click it, and accept the UAC prompt.
+The release is a zip file containing the executable and the asset directories. Extract it, keep `assets/` next to `ShinraMeter-BPSR.exe`, double-click the exe, and accept the UAC prompt. (Deleting `assets/` or either of its subdirectories leaves the meter fully functional — rows will just be missing class and Imagine icons, but all names, numbers, and stats still display.)
 
 The WinDivert 2.2.2 runtime (`WinDivert.dll` and the signed `WinDivert64.sys` kernel driver) is embedded in the executable and unpacked to `%LOCALAPPDATA%\ShinraMeter-BPSR\windivert\2.2.2\` on first run — the driver has to exist as a real file because Windows loads kernel drivers by path, but the user never handles it. Subsequent runs reuse the unpacked copy and write nothing.
 
 The exe carries a manifest requesting `requireAdministrator`, so Windows prompts for elevation on launch; WinDivert installs its driver through the Service Control Manager, which is administrator-only.
 
-To uninstall, delete the exe and `%LOCALAPPDATA%\ShinraMeter-BPSR\`.
+To uninstall, delete the extracted folder and `%LOCALAPPDATA%\ShinraMeter-BPSR\`.
 
 #### Updating the bundled WinDivert
 

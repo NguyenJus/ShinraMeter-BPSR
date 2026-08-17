@@ -5,3 +5,7 @@
 # would corrupt them into a driver the kernel refuses to load.
 crates/capture/vendor/windivert/*.dll binary
 crates/capture/vendor/windivert/*.sys binary
+
+# Class and Imagine icons are now shipped as files rather than compiled into the
+# executable. Pin them as binary to guard against any future text=auto misdetection.
+crates/app/assets/**/*.png binary
