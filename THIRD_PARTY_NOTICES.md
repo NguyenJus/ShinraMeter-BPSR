@@ -54,10 +54,13 @@ WinDivert's LGPL-3.0 option is compatible.
   have publicly endorsed open-source meters and have not objected to other
   meters shipping the same data. To be explicit: no permission was requested
   or granted directly, by either the game's developers or BPSR-ZDPS.
-- Embedded verbatim (compiled into the executable via `include_bytes!` in
-  `crates/app/src/icons.rs`), unmodified, at build time.
+- Shipped verbatim and unmodified as files under `assets/classes/` beside the
+  executable, loaded at runtime.
 - Takedown: these assets will be removed promptly on request from the rights
-  holder. To request removal, open a GitHub issue on this repository.
+  holder. To request removal, open a GitHub issue on this repository. For an
+  already-distributed release, the takedown is `rm -r assets/classes/` in the
+  extracted folder plus deleting `crates/app/assets/classes/` from the source
+  tree — no rebuild or re-release is needed.
 
 ## BPSR-ZDPS Imagine icons
 
@@ -77,14 +80,18 @@ WinDivert's LGPL-3.0 option is compatible.
   resampling, then alpha-masked to a circle, by
   `scripts/prep-imagine-icons.py`. Resampled with stated provenance, not
   verbatim — the same register the egui-winit note above uses.
-- Compiled into the executable via `include_bytes!` in the generated
-  `crates/app/src/imagines.rs`, at build time.
+- Shipped as files under `assets/imagines/` beside the executable, loaded at
+  runtime. The file names are generated into `IMAGINE_ICON_FILES` in
+  `crates/app/src/imagines.rs` by `scripts/gen-imagine-table.py`.
 - The id/name table these icons are keyed against —
   `crates/app/data/imagine_table.json` (hand-curated) and the `imagines.rs`
   it generates via `scripts/gen-imagine-table.py` — is likewise derived from
   BPSR-ZDPS's `Data/SkillTable.json`, under the same basis as the icons.
 - Takedown: these assets will be removed promptly on request from the rights
-  holder. To request removal, open a GitHub issue on this repository.
+  holder. To request removal, open a GitHub issue on this repository. For an
+  already-distributed release, the takedown is `rm -r assets/imagines/` in the
+  extracted folder plus deleting `crates/app/assets/imagines/` from the source
+  tree — no rebuild or re-release is needed.
 
 ## ShinraMeter toolbar icons
 

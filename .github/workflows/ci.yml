@@ -38,9 +38,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu
 
   # The release link is the only place the embedded manifest and the absence
-  # of a load-time WinDivert import can actually be observed, and both are
-  # what make the single-file distribution work — so assert them here rather
-  # than discovering a two-file regression on a user's machine.
+  # of a load-time WinDivert import can actually be observed, so assert them
+  # here rather than discovering a regression on a user's machine.
   build-windows:
     runs-on: ubuntu-latest
     steps:
@@ -49,7 +48,7 @@ jobs:
       - run: rustup target add x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --target x86_64-pc-windows-gnu
-      - name: Assert the executable is self-contained
+      - name: Assert the executable needs no registered DLL and self-elevates
         run: |
           set -euo pipefail
           exe=target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe
@@ -61,10 +60,15 @@ jobs:
             echo "::error::the UAC manifest is missing from the executable"
             exit 1
           fi
+      - name: Package the release zip
+        run: |
+          scripts/package-release.sh \
+            target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe \
+            ShinraMeter-BPSR-windows-x64.zip
       - uses: actions/upload-artifact@v4
         with:
           name: ShinraMeter-BPSR-windows-x64
-          path: target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe
+          path: ShinraMeter-BPSR-windows-x64.zip
 
   # Host-target tests for the whole workspace, app crate included. The app
   # crate used to be excluded on the assumption that egui/eframe would drag in

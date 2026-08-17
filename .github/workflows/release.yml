@@ -1,8 +1,9 @@
 name: Release
 
-# Tagged versions publish the Windows executable. The build mirrors the
-# `build-windows` job in ci.yml — same cross-toolchain, same self-contained
-# assertions — so a tag can never ship a binary CI would have rejected.
+# Tagged versions publish a zip containing the Windows executable and required
+# asset directories (classes and Imagine icons). The build mirrors the
+# `build-windows` job in ci.yml — same cross-toolchain, same checks — so a tag
+# can never ship a binary CI would have rejected.
 on:
   push:
     tags: ["v*"]
@@ -23,7 +24,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --target x86_64-pc-windows-gnu
 
-      - name: Assert the executable is self-contained
+      - name: Assert the executable needs no registered DLL and self-elevates
         run: |
           set -euo pipefail
           exe=target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe
@@ -41,8 +42,9 @@ jobs:
       - name: Stage the release asset
         run: |
           set -euo pipefail
-          cp target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe \
-             "ShinraMeter-BPSR-${GITHUB_REF_NAME}-windows-x64.exe"
+          scripts/package-release.sh \
+            target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe \
+            "ShinraMeter-BPSR-${GITHUB_REF_NAME}-windows-x64.zip"
 
       # Tags carrying a pre-release suffix (v0.2.0-rc1) publish as pre-releases
       # so they stay off the repository's "latest release" link.
@@ -54,7 +56,7 @@ jobs:
           prerelease=""
           case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" \
-            "ShinraMeter-BPSR-${GITHUB_REF_NAME}-windows-x64.exe" \
+            "ShinraMeter-BPSR-${GITHUB_REF_NAME}-windows-x64.zip" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
             $prerelease

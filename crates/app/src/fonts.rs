@@ -3,10 +3,9 @@
 //!
 //! egui's bundled default fonts have no CJK coverage *and* no bold weight,
 //! and vendoring either a Noto-CJK-sized file or a second Latin weight would
-//! balloon the self-contained binary this project ships as (see the CI job
-//! asserting a small single-file exe). Instead, at startup we probe the local
-//! `C:\Windows\Fonts` install for what we need and register whatever is
-//! actually there:
+//! balloon the binary size and raise font licensing questions around
+//! redistribution. Instead, at startup we probe the local `C:\Windows\Fonts`
+//! install for what we need and register whatever is actually there:
 //!
 //! * a humanist-sans regular/bold pair (Segoe UI first — it ships on every
 //!   Windows install and is what the reference render in
