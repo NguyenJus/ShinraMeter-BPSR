@@ -557,17 +557,11 @@ fn draw_header(
     // panel's own fill/border already cover that strip.
     let header_paint_clip =
         egui::Rect::from_min_size(panel.min, egui::vec2(panel.width(), band_height));
-    // What the gutter emblem may paint into (issue #75): the header's *text*
-    // rows only, not the whole band. Its 60pt box hangs well below a 22pt
-    // title row, and the stat-pill row underneath carries the timer's oval
-    // in the same column — so ink reaching that row lands straight on the
-    // timer's readout. Clipping to the text band still keeps the intentional
-    // bleed off the left edge. Deliberately *not* `header_paint_clip`: the
-    // wash below spans the whole band, this mark does not (see
-    // `header_emblem_rect`).
+    // The height the gutter emblem's box is *centered* on — the header's
+    // text rows, which is the block the mark decorates. Not what it is
+    // clipped to: that is `header_paint_clip`, the whole band (see the blit
+    // below).
     let text_band_height = header_text_band_height();
-    let emblem_clip =
-        egui::Rect::from_min_size(panel.min, egui::vec2(panel.width(), text_band_height));
     // The whole header band is the drag surface — title line, subtitle
     // line, and the timer/DPS/buttons row — registered *before* the
     // row's contents so the buttons drawn into it end up on top and still get
@@ -609,13 +603,23 @@ fn draw_header(
     // row every time the app fell back to its idle "No target" state.
     let title_row = draw_title_line(ui, &title);
     // The gutter emblem (issue #59): bled off the left edge and centered on
-    // the header's text rows, clipped to them (`emblem_clip`, issue #75) so
-    // it stays clear of the stat-pill row below. Issue #91 briefly sized and
-    // clipped it to the whole band to square the diamond up; that put its
-    // lower blade behind the timer's digits, and the asymmetry was restored
-    // — see `header_emblem_rect` before changing either number again.
+    // the header's *text* rows (`text_band_height`), but clipped to the
+    // *whole band* (`header_paint_clip`, issue #91). The two are deliberately
+    // different heights and neither is a typo for the other.
+    //
+    // Issue #75 clipped this to the text band as well, to keep the mark's
+    // lower blade off the timer's readout underneath. That cost the diamond
+    // its bottom corner: the box runs 14pt past the text band, so a text-band
+    // clip visibly chopped the mark's point off mid-blade. The stat row is
+    // what moved instead (`HEADER_STAT_ROW_INSET_X`) — it now starts right
+    // of the emblem's right edge, so the two share the same rows without
+    // touching, and the clip is free to be the band's. It is a floor, not a
+    // trim: all it still stops is ink running on into the first player row.
+    //
+    // The mark's *top* corner is still cut, by the panel's own edge — see
+    // `header_emblem_rect`, where that asymmetry is the design.
     if let Some(emblem) = icons.glyphs.get(GlyphIcon::Emblem) {
-        ui.painter().with_clip_rect(emblem_clip).image(
+        ui.painter().with_clip_rect(header_paint_clip).image(
             emblem.id(),
             header_emblem_rect(title_row, text_band_height),
             UV_FULL,
@@ -1108,16 +1112,6 @@ const PILL_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(9, 9, 9,
 const TIMER_PILL_FILL: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(0xAA, 0xAA, 0xAA, 0x11);
 
-/// Hairline outline of the timer pill — the source's `#2fff`, white at
-/// alpha `0x22`. The only stroked pill in the window: the DPS/damage ovals
-/// are fill-only, so this border is the second half of what distinguishes
-/// the timer from them. Issue #91's rule about it is a shape rule, not a
-/// chrome rule — the capsule must be a *full* oval, inset from the panel
-/// border by `HEADER_STAT_ROW_INSET_X`, never the half-pill welded to the
-/// window edge it once was.
-const TIMER_PILL_BORDER: egui::Color32 =
-    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x22);
-
 /// Value text color inside a header/DPS/damage pill — the source's `#afff`:
 /// white at ~2/3 alpha, the dimmer, partially transparent sibling of
 /// `TITLE_TEXT_COLOR`'s opaque white. The two are deliberately not the same
@@ -1198,8 +1192,14 @@ struct StatPill<'a> {
     /// Fill behind the pill. The timer's (`TIMER_PILL_FILL`) is a shade
     /// lighter than the value pills' `PILL_FILL`.
     fill: egui::Color32,
-    /// Optional 1pt outline. Only the timer has one (`TIMER_PILL_BORDER`);
-    /// the DPS/damage and counter pills are fill-only.
+    /// Optional 1pt outline. No pill has one: the header's timer, DPS and
+    /// damage ovals and the per-row counter are all fill-only. The timer
+    /// carried the source's hairline `#2fff` border until issue #91 — ringed
+    /// among three otherwise bare capsules, it read as an outlined odd one
+    /// out rather than as the row's lead readout, and its lighter
+    /// `TIMER_PILL_FILL` carries that distinction alone now. Kept as a field
+    /// because the chrome is per-call-site and a stroked pill elsewhere
+    /// stays a one-line change.
     stroke: Option<egui::Stroke>,
 }
 
@@ -1224,9 +1224,10 @@ impl<'a> StatPill<'a> {
 
     /// The encounter duration: the source's largest stat text, trailed by
     /// its clock glyph, in a capsule of its own — a slightly lighter fill
-    /// (`TIMER_PILL_FILL`) than the two value pills and the window's only
-    /// pill border (`TIMER_PILL_BORDER`), so the lead readout reads as
-    /// distinct from them.
+    /// (`TIMER_PILL_FILL`) than the two value pills, which is the whole of
+    /// what marks it as the row's lead readout. The source also ringed it in
+    /// a hairline `#2fff`; issue #91 drops that, because one outlined oval
+    /// among three bare ones reads as a stray border, not as emphasis.
     ///
     /// Issue #91: the clock used to *lead* the duration. The reference
     /// render reads `02:39 ⏱`, the same value-then-icon order as the DPS
@@ -1251,7 +1252,7 @@ impl<'a> StatPill<'a> {
             icon_first: false,
             corner_radius: egui::CornerRadius::same((BUTTON_ROW_HEIGHT / 2.0) as u8),
             fill: TIMER_PILL_FILL,
-            stroke: Some(egui::Stroke::new(1.0, TIMER_PILL_BORDER)),
+            stroke: None,
         }
     }
 
@@ -1526,10 +1527,21 @@ const HEADER_STAT_ROW_GAP: f32 = 6.0;
 /// How far the stat row (timer, DPS, damage, toggle cluster) is inset from
 /// the panel's left content edge. The timer used to sit flush against it, so
 /// its capsule was cropped by the window border and drawn as a half-pill to
-/// match; the reference render starts the row's leftmost ink 8px in from the
-/// panel's content edge instead, which is what lets the timer wear a whole
-/// oval (see `StatPill::timer`).
-const HEADER_STAT_ROW_INSET_X: f32 = 8.0;
+/// match; inset, it can wear a whole oval (see `StatPill::timer`).
+///
+/// Exactly the title column's own indent, not a margin of its own:
+/// `header_text_rect` starts the boss name and area name at this same sum,
+/// so the timer reads as sitting *under* the title rather than tucked into
+/// the gutter beside it.
+///
+/// It is also what keeps the gutter emblem off the timer. That mark's box
+/// ends at `HEADER_EMBLEM_LEFT_BLEED + HEADER_EMBLEM_SIZE ==
+/// HEADER_GUTTER_WIDTH` and hangs 14pt into this row's vertical span, so
+/// this sum leaves `HEADER_TEXT_PAD_X` of daylight between the mark's right
+/// edge and the row's leftmost ink — which is why the mark no longer has to
+/// be clipped to the text band (and have its bottom corner sliced off) to
+/// stay clear of the readout. See `header_emblem_rect`.
+const HEADER_STAT_ROW_INSET_X: f32 = HEADER_GUTTER_WIDTH + HEADER_TEXT_PAD_X;
 
 /// Height of `draw_header`'s drag band: the title line, the subtitle line,
 /// and the button row (`button_row_height`, egui's `interact_size.y`), plus
@@ -1558,13 +1570,17 @@ fn header_band_height(button_row_height: f32) -> f32 {
 ///
 /// This, not the whole drag band, is the block the left gutter belongs to:
 /// `header_text_rect` indents these rows by `HEADER_GUTTER_WIDTH` to leave
-/// room for the emblem, while the stat-pill row below them clears the panel
-/// edge by only `HEADER_STAT_ROW_INSET_X` — its timer sits well inside the
-/// column the emblem occupies. So the emblem is both centered on and clipped
-/// to this height (issue #75), never the whole band.
+/// room for the emblem, which is why the emblem's box is *centered* on this
+/// height (issue #75) rather than on the band.
 ///
-/// The background wash is deliberately *not* bounded by this (issue #91): it
-/// spans the whole `header_band_height`, stat row included.
+/// Centered on, no longer clipped to. Issue #75 did both; the clip cut the
+/// mark's bottom corner off, and issue #91 replaced it with horizontal
+/// clearance instead (`HEADER_STAT_ROW_INSET_X`, which now starts the stat
+/// row right of the emblem rather than under it). `draw_header` clips the
+/// mark to the whole band.
+///
+/// The background wash is deliberately *not* bounded by this either (issue
+/// #91): it spans the whole `header_band_height`, stat row included.
 fn header_text_band_height() -> f32 {
     TITLE_LINE_HEIGHT + ITEM_SPACING_Y + SUBTITLE_LINE_HEIGHT
 }
@@ -1603,8 +1619,9 @@ fn draw_title_line(ui: &mut egui::Ui, text: &str) -> egui::Rect {
 // -- header gutter emblem (issue #59) ------------------------------------
 
 /// The source's `Svg.HPBar` beside the encounter name: 60x60, bled off the
-/// left edge by `Margin="-26 0 0 -8"` and clipped to the header's *text*
-/// band, so only its right two-thirds are ever on screen.
+/// left edge by `Margin="-26 0 0 -8"`, so only its right two-thirds are ever
+/// on screen. Vertically it is centered on the header's *text* band but
+/// clipped to the whole header band — see `header_emblem_rect`.
 const HEADER_EMBLEM_SIZE: f32 = 60.0;
 /// The `Margin`'s left component: the emblem hangs 26pt off the left edge of
 /// the header rows, so only its right `60 - 26 = 34`pt — one
@@ -1627,23 +1644,34 @@ const HEADER_EMBLEM_COLOR: egui::Color32 = egui::Color32::from_rgb(0x70, 0x80, 0
 /// starts at that row's top. Pure geometry, so the negative-margin bleed is
 /// unit-testable without a painter.
 ///
-/// **The asymmetry here is deliberate — do not "fix" it again.** It has now
-/// been squared up once (issue #91) and reverted once. `emblem.png` is a
-/// 512x512 canvas holding one perfect diamond whose corners are the
-/// midpoints of the canvas' edges, so centering a box of exactly
-/// `header_band_height` on the band *does* make the diamond symmetric about
-/// the band — and that is precisely the bug. The mark decorates the title
-/// and area-name rows, the ones `header_text_rect` indents by
-/// `HEADER_GUTTER_WIDTH` to make room for it. Centering on the text band
-/// (and clipping to it, in `draw_header`) is what stops the diamond's lower
-/// blade running down through the stat-pill row; the symmetric version put
-/// that blade straight behind the timer readout's digits. The asymmetry is
-/// load-bearing: it buys the clip something to cut.
+/// **The off-centre placement here is deliberate — do not "fix" it.** It has
+/// been squared up to the band once (issue #91) and reverted once.
+/// `emblem.png` is a 512x512 canvas holding one perfect diamond whose
+/// corners are the midpoints of the canvas' edges, so a box of exactly
+/// `header_band_height` *does* make the diamond symmetric about the band —
+/// and that is not what this mark is. It decorates the title and area-name
+/// rows, the ones `header_text_rect` indents by `HEADER_GUTTER_WIDTH` to
+/// make room for it, so it is centered on those rows (plus the source's
+/// negative bottom margin) and rides high in the band: top edge 6pt above
+/// the panel, bottom edge 14pt below the text band. Both numbers are the
+/// design.
+///
+/// What is *no longer* true is that a clip is what keeps its lower blade
+/// off the timer. Issue #75 clipped this to the text band for that, and the
+/// clip landed at 40 while the box reaches 54 — it sliced the diamond's
+/// bottom corner clean off, which is the bug that reading closes. The stat
+/// row moved right instead
+/// (`HEADER_STAT_ROW_INSET_X == HEADER_GUTTER_WIDTH + HEADER_TEXT_PAD_X`),
+/// clearing the emblem's right edge at `HEADER_GUTTER_WIDTH` by
+/// `HEADER_TEXT_PAD_X`; that horizontal daylight is the whole separation
+/// now, and `draw_header` clips the mark to the header band, which cuts
+/// nothing off the bottom. The mark's *top* corner is still cut — by the
+/// panel's own top edge, since the box starts above it. That is the
+/// asymmetry, and it stays.
 ///
 /// This bounds the *gutter* mark only. The background wash
-/// (`header_wash_rect` / `draw_header_wash`) is a different rect and still
-/// spans the whole header band, stat-pill row included — the grey gradient
-/// behind the timer row is wanted, the mark's blade over it is not.
+/// (`header_wash_rect` / `draw_header_wash`) is a different rect and also
+/// spans the whole header band, stat-pill row included.
 fn header_emblem_rect(row: egui::Rect, text_band_height: f32) -> egui::Rect {
     let available = text_band_height + HEADER_EMBLEM_BOTTOM_BLEED;
     egui::Rect::from_min_size(
@@ -3928,6 +3956,10 @@ mod tests {
     /// where an ink-based bound could only assert `>= inset + PILL_PAD_X`.
     /// The panel's content edge is read back off the wash, which
     /// `draw_header` anchors to it at `HEADER_WASH_INSET`.
+    ///
+    /// And the inset is the *title column's*: the capsule's left edge must
+    /// land on the boss name's, so the stat row reads as a third line of the
+    /// same block rather than as a row indented by a number of its own.
     #[test]
     fn the_stat_row_ink_is_inset_from_the_panel_edge() {
         let snapshot = header_test_snapshot(30_100_000_000);
@@ -3942,6 +3974,19 @@ mod tests {
             pill.left(),
             pill.left() - panel_left
         );
+        assert_eq!(
+            HEADER_STAT_ROW_INSET_X,
+            HEADER_GUTTER_WIDTH + HEADER_TEXT_PAD_X,
+            "the stat row's inset has drifted off the title column's indent"
+        );
+        let title = frame.text_box(&encounter_title(&snapshot.encounter));
+        assert!(
+            (pill.left() - title.left()).abs() < 0.01,
+            "the timer capsule starts at {}, the boss name at {} — the stat row \
+             is no longer aligned with the title column",
+            pill.left(),
+            title.left()
+        );
         // The duration's own ink then clears the capsule's padding, so a
         // regression that kept the pill inset while un-padding the text
         // still fails here.
@@ -3955,16 +4000,21 @@ mod tests {
         );
     }
 
-    /// Issue #75's rule for the gutter emblem, which issue #91 inverted and
-    /// this revert restores.
+    /// The gutter emblem and the stat row are separated *horizontally*, and
+    /// nothing cuts the mark's bottom off to do it.
     ///
-    /// The horned mark is decoration for the header's *text* rows — the ones
-    /// `header_text_rect` indents by `HEADER_GUTTER_WIDTH` to make room for
-    /// it. Its 60pt box hangs far below a 22pt title row, so only the clip
-    /// keeps its lower blade out of the stat-pill row; issue #91 squared the
-    /// box up to the band and clipped it to the band too, which ran that
-    /// blade straight down behind the timer readout's digits. This is the
-    /// guard for that collision.
+    /// Issue #75 clipped the horned mark to the header's *text* rows to keep
+    /// its lower blade out of the stat-pill row. The box reaches 14pt past
+    /// that band, so the clip did not just stop the blade — it sliced the
+    /// diamond's bottom corner off, plainly visible in the composited window.
+    /// The row moved right instead (`HEADER_STAT_ROW_INSET_X`), so the mark
+    /// may now run its full box down into the stat row's vertical span while
+    /// still touching neither the timer's capsule nor its digits.
+    ///
+    /// Both halves are asserted on one real frame, because either alone is
+    /// cheatable: that the painted ink reaches the box's own bottom (the
+    /// guard against the clip creeping back up to the text band), and that
+    /// it lands on nothing — with the clearance that buys pinned exactly.
     ///
     /// A paint-level check, not a comparison of constants: the box geometry
     /// and the clip are two independent decisions, and only what the frame
@@ -3972,7 +4022,7 @@ mod tests {
     /// are read back off the wash gradient, which
     /// `the_wash_gradient_spans_the_whole_header_band` independently pins.
     #[test]
-    fn the_gutter_emblem_never_reaches_the_stat_pill_row() {
+    fn the_gutter_emblem_clears_the_stat_row_horizontally_not_by_clipping() {
         let snapshot = header_test_snapshot(30_100_000_000);
         let frame = header_painted_boxes(&snapshot);
         let pill = frame.fill_box(TIMER_PILL_FILL);
@@ -3981,6 +4031,18 @@ mod tests {
         let wash = frame.gradient_box();
         let panel_min = wash.min - egui::Vec2::splat(HEADER_WASH_INSET);
         let text_band_bottom = panel_min.y + header_text_band_height();
+        // Where the box wants to end — 14pt below the text band, inside the
+        // stat row's span, and the depth the paint has to actually reach.
+        let box_bottom = header_emblem_rect(
+            egui::Rect::from_min_size(panel_min, egui::vec2(wash.width(), TITLE_LINE_HEIGHT)),
+            header_text_band_height(),
+        )
+        .bottom();
+        assert!(
+            box_bottom > text_band_bottom,
+            "the emblem box no longer overflows the text band, so the \
+             uncut-bottom assertion below proves nothing"
+        );
 
         let emblems = frame.glyph_boxes(GlyphIcon::Emblem);
         assert_eq!(
@@ -3996,6 +4058,24 @@ mod tests {
             .min_by(|a, b| a.left().total_cmp(&b.left()))
             .expect("the header painted no emblem");
 
+        // Uncut: the ink ends where the box does, not where the text band
+        // does — the diamond keeps its bottom corner.
+        assert!(
+            (gutter.bottom() - box_bottom).abs() < 0.01,
+            "gutter emblem ink stops at {}, short of its box's {box_bottom} \
+             (the text band ends at {text_band_bottom}) — its bottom corner is \
+             being clipped off again",
+            gutter.bottom()
+        );
+        assert!(
+            gutter.bottom() > pill.top(),
+            "gutter emblem ink stops at {} — above the stat row starting at {}, \
+             so this frame cannot show the two coexisting",
+            gutter.bottom(),
+            pill.top()
+        );
+
+        // …and lands on nothing, despite sharing those rows.
         assert!(
             !gutter.intersects(pill),
             "gutter emblem ink {gutter:?} lands on the timer pill {pill:?}"
@@ -4004,24 +4084,12 @@ mod tests {
             !gutter.intersects(stat_ink),
             "gutter emblem ink {gutter:?} lands on the timer readout {stat_ink:?}"
         );
-        // …because the clip cut it at the text band, not merely because the
-        // pill happened to sit elsewhere on the row.
+        // …because of where the row starts, which is the whole mechanism.
+        let clearance = pill.left() - gutter.right();
         assert!(
-            gutter.bottom() <= text_band_bottom + 0.01,
-            "gutter emblem ink reaches {} — past the text band's bottom edge at \
-             {text_band_bottom}, down into the stat-pill row",
-            gutter.bottom()
-        );
-        // The clip really is what stops it: the box itself hangs lower.
-        assert!(
-            header_emblem_rect(
-                egui::Rect::from_min_size(panel_min, egui::vec2(wash.width(), TITLE_LINE_HEIGHT)),
-                header_text_band_height(),
-            )
-            .bottom()
-                > text_band_bottom,
-            "the emblem box no longer overflows the text band, so this test \
-             would pass even with the clip removed"
+            (clearance - HEADER_TEXT_PAD_X).abs() < 0.01,
+            "the stat row starts {clearance}pt right of the emblem, not the \
+             {HEADER_TEXT_PAD_X}pt the title column's indent buys it"
         );
         // And it is still a *gutter* decoration horizontally.
         assert!(
@@ -4504,20 +4572,22 @@ mod tests {
             );
         }
 
-        // Both pills wear chrome, and the timer's is its own: a lighter
-        // fill plus the window's only pill border.
+        // Both pills wear chrome, and the timer's is its own — but chrome
+        // here means *fill*. The timer's capsule is a shade lighter than the
+        // value pills' and that alone marks it as the lead readout; issue
+        // #91 dropped the source's hairline border, which drew a ring round
+        // one of three otherwise bare ovals. No pill is stroked.
         assert_ne!(header.fill, egui::Color32::TRANSPARENT);
         assert_ne!(timer.fill, egui::Color32::TRANSPARENT);
         assert_eq!(timer.fill, TIMER_PILL_FILL);
         assert_ne!(timer.fill, header.fill);
-        assert_eq!(
-            timer
-                .stroke
-                .expect("the timer keeps its hairline border")
-                .color,
-            TIMER_PILL_BORDER
-        );
-        assert!(header.stroke.is_none());
+        for (name, pill) in [("header", &header), ("timer", &timer)] {
+            assert!(
+                pill.stroke.is_none(),
+                "{name}: {:?} rings the oval — no header pill is stroked",
+                pill.stroke
+            );
+        }
     }
 
     /// Issue #91: the timer used to sit flush against the panel's left
@@ -4526,10 +4596,22 @@ mod tests {
     /// gap — not zero, and not so wide it eats the row's width budget
     /// (`the_stat_pills_fit_the_default_window_width` is the other half of
     /// that bargain).
+    ///
+    /// The value is not free to drift: it is the title column's own indent,
+    /// so the timer sits under the boss name rather than at a margin of its
+    /// own — and, since the gutter emblem's box ends at exactly
+    /// `HEADER_GUTTER_WIDTH` while hanging into this row's height, that same
+    /// sum is what holds the row clear of the mark (see
+    /// `the_gutter_emblem_clears_the_stat_row_horizontally_not_by_clipping`).
     #[test]
     fn the_stat_row_is_inset_from_the_left_border() {
         const { assert!(HEADER_STAT_ROW_INSET_X > 0.0) };
-        assert_eq!(HEADER_STAT_ROW_INSET_X, 8.0);
+        // The same sum `header_text_rect` indents the title and area name by.
+        assert_eq!(
+            HEADER_STAT_ROW_INSET_X,
+            HEADER_GUTTER_WIDTH + HEADER_TEXT_PAD_X
+        );
+        assert_eq!(HEADER_STAT_ROW_INSET_X, 36.0);
     }
 
     /// The stat row is one non-wrapping `ui.horizontal`: if the timer/DPS/
@@ -5497,10 +5579,14 @@ mod tests {
         assert_eq!(header_band_height(BUTTON_ROW_HEIGHT), 68.0);
     }
 
-    /// The emblem is bled off the title row's left edge and is taller than
-    /// the text band it decorates in *both* directions, so it only ever
-    /// shows through a clip. Asserting the overhang below matters most: that
-    /// is the blade the clip has to cut before it reaches the timer.
+    /// The emblem is bled off the title row's left edge and overhangs the
+    /// text band it decorates in *both* directions. Only the left bleed and
+    /// the top overhang are ever cut (by the panel's own edges); the bottom
+    /// overhang is painted in full, since `draw_header` clips the mark to
+    /// the whole header band and the stat row is inset clear of it. Pinning
+    /// the bottom overhang here is what keeps that so: shrink the box back
+    /// inside the text band and the mark stops being the thing the reference
+    /// render shows.
     #[test]
     fn the_header_emblem_bleeds_off_the_left_edge_and_out_of_the_text_band() {
         let row = egui::Rect::from_min_size(egui::pos2(10.0, 40.0), egui::vec2(380.0, 20.0));
@@ -5525,9 +5611,10 @@ mod tests {
     /// That asymmetry is the design, not an oversight — issue #91 squared it
     /// up on the assumption it was a bug and had to be reverted, so the
     /// numbers are pinned here. Against issue #91's 40pt text band the
-    /// formula centres 60pt on `40 + 8 = 48`: top 6pt above the band, bottom
-    /// at `row.top() + 54`, 14pt below it, where the clip cuts the blade off
-    /// before it can reach the timer. See `header_emblem_rect`.
+    /// formula centres 60pt on `40 + 8 = 48`: top 6pt above the band (cut by
+    /// the panel's own top edge) and bottom at `row.top() + 54`, 14pt below
+    /// it — painted in full, down inside the stat row's height, which the
+    /// row's own inset keeps clear of. See `header_emblem_rect`.
     #[test]
     fn the_header_emblem_hangs_further_below_the_text_band_than_above_it() {
         let row = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, 20.0));
@@ -5559,17 +5646,19 @@ mod tests {
         assert_eq!(HEADER_EMBLEM_LEFT_BLEED, -26.0);
         assert_eq!(HEADER_EMBLEM_SIZE, 60.0);
         // And the mark is deliberately *not* the band: it is shorter than
-        // the drag band and taller than the text band it is centered on, so
-        // the clip always has something to cut.
+        // the drag band it is clipped to — so the clip never cuts its
+        // bottom — and taller than the text band it is centered on, which is
+        // what makes it overhang those rows at all.
         assert!(HEADER_EMBLEM_SIZE < header_band_height(BUTTON_ROW_HEIGHT));
         assert!(HEADER_EMBLEM_SIZE > header_text_band_height());
     }
 
     /// The band the drag surface covers is the text rows plus
-    /// `HEADER_STAT_ROW_GAP` plus the stat-pill row — the gutter emblem's
-    /// clip (the text rows) is strictly shorter, so confining that emblem to
-    /// it cannot have moved the drag surface or the collapsed window's
-    /// height.
+    /// `HEADER_STAT_ROW_GAP` plus the stat-pill row, so the text band is
+    /// strictly shorter than it. Both numbers exist and neither may be
+    /// substituted for the other: the drag surface, the wash and the gutter
+    /// emblem's clip are the band's, only the title/subtitle rows and the
+    /// emblem's *centering* are the text band's.
     #[test]
     fn the_text_band_is_the_drag_band_minus_the_stat_pill_row() {
         let text = header_text_band_height();
