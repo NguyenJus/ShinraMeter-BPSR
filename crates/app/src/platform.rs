@@ -217,8 +217,7 @@ static OVERLAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicI
 /// real fix in `main.rs` / `third_party/egui-winit`. What it *does* do is
 /// force a frame/non-client recompute, which remains the correct thing to
 /// do after a resize the window manager didn't drive itself (since issue
-/// #11's rework, `ui.rs`'s manual drag-resize and the header
-/// collapse/expand go through
+/// #11's rework, `ui.rs`'s manual drag-resize goes through
 /// `ViewportCommand::OuterPosition`/`InnerSize`/`MinInnerSize`, never a raw
 /// `SetWindowPos`, so Win32 is never told the frame moved).
 ///
@@ -235,8 +234,8 @@ static OVERLAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicI
 /// target, but the invariant is "every call is wrapped", not "only the ones
 /// that could plausibly be vetoed".
 ///
-/// Callers must fire this once per completed resize (gesture end, or a
-/// settled collapse/expand), never every frame of an in-progress one — the
+/// Callers must fire this once per completed resize (gesture end), never
+/// every frame of an in-progress one — the
 /// whole issue #11/#68 rework exists to keep manual resize out of native
 /// Win32 loops, and a `SetWindowPos` on every frame of an active drag risks
 /// feeding back into egui's own viewport sizing and reproducing #68's resize
