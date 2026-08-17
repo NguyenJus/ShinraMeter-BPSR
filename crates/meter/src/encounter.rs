@@ -557,17 +557,41 @@ impl Meter {
     /// Boss = the monster uid with the largest known `max_hp` among monsters
     /// that have taken damage in the current fight (plan §T2.2; no boss-name
     /// table, no death/wipe packets).
+    ///
+    /// issue #76: `max_hp` is no longer *required*, only preferred. It
+    /// arrives on the entity's `SyncNearEntities` appear packet; the HP
+    /// deltas that follow carry `AttrHp` and `AttrId` but not `AttrMaxHp`.
+    /// A meter started mid-pull therefore never learns the boss's `max_hp`
+    /// at all, and demanding it left `boss_uid` — and so the header — empty
+    /// for the whole fight. The reference trackers hit the same problem and
+    /// each work around it rather than accepting the empty result: bpsr-logs
+    /// keeps a `uid_to_monster_info` shadow map of `(monster_id, max_hp)`
+    /// that outlives entity-map clears (`src-tauri/src/live/
+    /// opcodes_process.rs:506-534`), and resonance-logs deliberately
+    /// preserves boss HP attributes across segment switches "so the boss
+    /// health bar remains visible" (`src-tauri/src/live/
+    /// opcodes_process.rs:950-951`).
+    ///
+    /// So enemies rank in two tiers: a known `max_hp` always outranks a
+    /// `curr_hp`-only enemy, however large that current HP is (`max_hp` is
+    /// the real boss signal — current HP is a moving number that a healthy
+    /// trash mob can top while the boss sits at 10%). Within a tier the
+    /// larger HP wins. An enemy with neither is unrankable and stays out.
     fn recompute_boss(&mut self) {
         self.boss_uid = self
             .enemies
             .iter()
             .filter(|(_, e)| e.took_damage)
-            .filter_map(|(uid, e)| e.max_hp.map(|hp| (*uid, hp)))
+            .filter_map(|(uid, e)| match (e.max_hp, e.curr_hp) {
+                (Some(max), _) => Some((*uid, 1u8, max)),
+                (None, Some(curr)) => Some((*uid, 0u8, curr)),
+                (None, None) => None,
+            })
             // Tie-break deterministically on uid: `HashMap` iteration order
             // is unspecified, so breaking ties on `hp` alone let `boss_uid`
             // flip between calls for two enemies sharing the same `max_hp`.
-            .max_by_key(|(uid, hp)| (*hp, *uid))
-            .map(|(uid, _)| uid);
+            .max_by_key(|(uid, tier, hp)| (*tier, *hp, *uid))
+            .map(|(uid, _, _)| uid);
     }
 
     /// Clears `players` and per-enemy `lowest_pct`; keeps `names`. Deaths
@@ -1794,6 +1818,63 @@ mod tests {
             assert_eq!(snap.encounter.boss_monster_id, Some(103));
             assert_eq!(snap.encounter.boss_name, Some("Rathalos"));
             assert!(snap.encounter.is_boss);
+        }
+
+        /// issue #76: a meter started mid-pull never sees the boss's
+        /// `SyncNearEntities` appear packet, so it only ever receives HP
+        /// *deltas* — which carry `AttrHp` and `AttrId` but no `AttrMaxHp`.
+        /// Requiring `max_hp` before a boss could resolve left the header
+        /// reading "No target" for the entire fight even though the boss's
+        /// identity was on the wire the whole time.
+        #[test]
+        fn boss_resolves_from_curr_hp_alone_when_max_hp_was_never_seen() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0));
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                uid: 10,
+                curr_hp: Some(5_000_000),
+                max_hp: None,
+                monster_id: Some(103),
+                timestamp_ms: 0,
+            }));
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.boss_monster_id, Some(103));
+            assert_eq!(snap.encounter.boss_name, Some("Rathalos"));
+            assert!(snap.encounter.is_boss);
+        }
+
+        /// `max_hp` stays the real boss signal: an enemy with a known
+        /// `max_hp` outranks a `curr_hp`-only enemy no matter how much
+        /// larger that current HP is. Otherwise a trash mob caught
+        /// mid-delta would outvote the boss whose full state we actually
+        /// have.
+        #[test]
+        fn known_max_hp_outranks_a_larger_curr_hp_only_enemy() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0));
+            m.apply(&boss_hit(11, 0));
+            // Real boss: full state known, but a smaller number.
+            m.apply(&hp(10, 100, 100, Some(103), 0));
+            // Trash caught mid-delta with a huge current HP and no max.
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                uid: 11,
+                curr_hp: Some(9_000_000),
+                max_hp: None,
+                monster_id: Some(10_900),
+                timestamp_ms: 0,
+            }));
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.boss_monster_id, Some(103));
+        }
+
+        /// A monster that has taken damage but whose HP never decoded at
+        /// all still cannot be the boss — there is nothing to rank it by.
+        #[test]
+        fn damaged_enemy_with_no_hp_at_all_does_not_become_the_boss() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0));
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.boss_monster_id, None);
         }
 
         #[test]
