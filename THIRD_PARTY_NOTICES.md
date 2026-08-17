@@ -24,6 +24,24 @@ only replacing them in that directory.
 `ShinraMeter-BPSR` itself is licensed GPL-3.0-only (see `LICENSE`), with which
 WinDivert's LGPL-3.0 option is compatible.
 
+## egui-winit 0.36.1
+
+- Files: `third_party/egui-winit/`
+- Upstream: <https://github.com/emilk/egui/tree/main/crates/egui-winit>
+- Copyright (c) 2018-2021 Emil Ernerfeldt and the egui contributors
+- License: dual-licensed under your choice of the MIT license or the Apache
+  License version 2.0. The full text of both, copied from the upstream
+  repository at tag 0.36.1, is in `third_party/egui-winit/LICENSE-MIT` and
+  `third_party/egui-winit/LICENSE-APACHE`. Either option is compatible with
+  this project's GPL-3.0-only licence.
+- A vendored fork (issue #89), compiled into the executable: the workspace's
+  `[patch.crates-io]` entry redirects both this project's and eframe's
+  dependency on `egui-winit` to this copy. It is upstream 0.36.1 verbatim apart
+  from one addition, the `set_no_redirection_bitmap` opt-in in `src/lib.rs` and
+  the `WS_EX_NOREDIRECTIONBITMAP` it sets on the window winit creates — plus
+  two dead manifest keys dropped, described at the top of
+  `third_party/egui-winit/Cargo.toml`.
+
 ## BPSR-ZDPS class icons
 
 - Files: `crates/app/assets/classes/*.png`

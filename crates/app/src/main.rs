@@ -47,6 +47,178 @@ fn names_cache_path() -> PathBuf {
     path
 }
 
+/// Issue #89: how the overlay window and its swapchain get created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowComposition {
+    /// `WS_EX_NOREDIRECTIONBITMAP` paired with DirectComposition presentation
+    /// on DX12 — the genuinely transparent overlay.
+    DirectComposition,
+    /// Held back by `SHINRA_NO_COMPOSITION`.
+    ForcedOff,
+    /// No hardware DX12 adapter to present through.
+    NoDx12Adapter,
+}
+
+impl WindowComposition {
+    /// Why the legacy opaque path was taken, for the startup log line. The
+    /// `DirectComposition` arm is reachable only when the choice was made and
+    /// [`dx12_composition_setup`] then failed to build the configuration.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::DirectComposition => "the DirectComposition configuration could not be built",
+            Self::ForcedOff => "held back by SHINRA_NO_COMPOSITION",
+            Self::NoDx12Adapter => "no hardware DX12 adapter",
+        }
+    }
+}
+
+/// Issue #89: the transparency decision, with both inputs passed in so the
+/// branching is testable without a GPU or a Windows box — the raw
+/// `SHINRA_NO_COMPOSITION` value, and a probe for a hardware DX12 adapter.
+///
+/// The escape hatch wins, and short-circuits the probe: `set_no_redirection_bitmap`
+/// is only reached if this returns [`WindowComposition::DirectComposition`], and
+/// `WS_EX_NOREDIRECTIONBITMAP` is baked into `CreateWindowEx` and cannot be
+/// taken back on the live window. A machine where the DirectComposition path
+/// leaves the overlay black or blank — a broken or ancient driver, an RDP
+/// session, a virtualized GPU — therefore has no in-app way out; the only
+/// recovery is refusing the path before the window exists. The probe is skipped
+/// too, so a driver that hangs or crashes inside adapter enumeration is
+/// recoverable by the same variable.
+///
+/// Same truthiness rule as `SHINRA_INSPECT`: set to anything but empty, `0` or
+/// `false` counts as on.
+fn composition_choice(
+    no_composition: Option<&str>,
+    hardware_dx12_adapter: impl FnOnce() -> bool,
+) -> WindowComposition {
+    let forced_off = no_composition.is_some_and(|value| {
+        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+    });
+    if forced_off {
+        WindowComposition::ForcedOff
+    } else if hardware_dx12_adapter() {
+        WindowComposition::DirectComposition
+    } else {
+        WindowComposition::NoDx12Adapter
+    }
+}
+
+/// Whether this machine has a *hardware* DX12 adapter, the prerequisite for the
+/// configuration [`dx12_composition_setup`] builds.
+///
+/// Software adapters (WARP, "Microsoft Basic Render Driver") do enumerate under
+/// DX12 in exactly the environments where a composition swapchain is least
+/// likely to work — RDP sessions, virtualized or absent GPUs — so they do not
+/// count: a machine whose only DX12 adapter is a CPU one keeps the old opaque
+/// startup rather than risking a window that never presents at all. That is the
+/// cheapest capability signal wgpu offers here; short of building a
+/// `DxgiFromVisual` swapchain for real (which needs a window, i.e. after the
+/// irreversible `CreateWindowEx`), there is nothing better to test.
+///
+/// Both the start and the end of the probe are logged. `enumerate_adapters` is
+/// async even on native (wgpu 30) and the native future is already resolved, so
+/// the `block_on` below returns immediately rather than parking — but this
+/// binary carries `windows_subsystem = "windows"`, so if that claim were ever
+/// wrong the app would hang before its first window with no console and nothing
+/// to go on. `logging::init` runs first in `main`, so the "probing" line is
+/// already on disk if the line after it never arrives.
+fn hardware_dx12_adapter() -> bool {
+    use eframe::egui_wgpu::wgpu;
+
+    // A throwaway instance restricted to DX12: if it enumerates nothing, this
+    // machine has no DX12 adapter and the whole scheme is off the table. Cheap
+    // enough to do unconditionally at startup, and far safer than assuming
+    // "Windows implies DX12".
+    log::info!("probing for a hardware DX12 adapter (issue #89)");
+    let probe = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::DX12,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapters = pollster::block_on(probe.enumerate_adapters(wgpu::Backends::DX12));
+    let found: Vec<String> = adapters
+        .iter()
+        .map(|adapter| {
+            let info = adapter.get_info();
+            format!("{} ({:?})", info.name, info.device_type)
+        })
+        .collect();
+    let hardware = adapters
+        .iter()
+        .any(|adapter| adapter.get_info().device_type != wgpu::DeviceType::Cpu);
+    log::info!(
+        "DX12 probe finished: {} adapter(s) [{}]; hardware adapter present: {hardware}",
+        adapters.len(),
+        found.join(", ")
+    );
+    hardware
+}
+
+/// Issue #89: the wgpu configuration a *genuinely* transparent overlay needs on
+/// Windows, or `None` when eframe's defaults no longer offer the seam it needs.
+///
+/// # The bug
+///
+/// The overlay opens as a transparent, undecorated, always-on-top window. DWM
+/// allocates an opaque GDI *redirection surface* for such a window at
+/// `CreateWindowEx`, sized to the window and initialized white; wgpu presents
+/// with `alpha_mode: PreMultiplied`, so DWM blends the swapchain over that
+/// white surface rather than over the desktop. The panel fill (18,18,22,200)
+/// premultiplied over white lands on exactly the flat #454548 gray users
+/// reported. Only area the window is later *grown* into lacks a redirection
+/// surface, which is why dragging the edge appeared to "fix" the overlay one
+/// freshly exposed strip at a time.
+///
+/// # The fix, and why it is all-or-nothing
+///
+/// `WS_EX_NOREDIRECTIONBITMAP` stops the surface from ever existing, but three
+/// facts make it a package deal rather than a one-line flag:
+///
+/// 1. Windows honors the flag **only** at `CreateWindowEx`. Setting it later
+///    with `SetWindowLongPtrW(GWL_EXSTYLE)` is silently ignored (measured on
+///    the live window: zero pixels changed). Hence the vendored egui-winit in
+///    `third_party/egui-winit` — see `set_no_redirection_bitmap` there.
+/// 2. DXGI refuses `CreateSwapChainForHwnd` on a window carrying the flag, so
+///    it must be paired with the DirectComposition presentation path
+///    ([`wgpu::Dx12SwapchainKind::DxgiFromVisual`], which presents through an
+///    `IDCompositionVisual` instead).
+/// 3. That path is DX12-only. Vulkan is assumed unable to present to a
+///    no-redirection window at all, so the flag must never be set unless the
+///    DX12 backend is the one actually in use — which is why this pins
+///    [`wgpu::Backends::DX12`] rather than merely preferring it.
+///
+/// # Degradation
+///
+/// Not taking this path leaves `NativeOptions::wgpu_options` at its default and
+/// leaves the egui-winit opt-in untouched, i.e. exactly today's behaviour:
+/// wgpu picks a backend as it always has and the overlay opens with the old
+/// gray-until-resized startup. A machine without a hardware DX12 adapter (a
+/// non-Windows dev build, a stripped-down VM, an exotic driver setup) must
+/// still *launch* — a cosmetic fix is never worth a failure to start, which is
+/// also why `SHINRA_NO_COMPOSITION` exists (see [`composition_choice`]).
+fn dx12_composition_setup() -> Option<eframe::WgpuConfiguration> {
+    use eframe::egui_wgpu::{WgpuSetup, wgpu};
+
+    let mut wgpu_options = eframe::WgpuConfiguration::default();
+    // `WgpuSetup::Existing` would mean the caller already built an instance and
+    // device, which `eframe::WgpuConfiguration::default()` never does — but
+    // match rather than assume, and treat the impossible arm as "no DX12
+    // configuration available" instead of panicking.
+    let WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup else {
+        log::warn!(
+            "eframe's default wgpu setup is no longer `CreateNew`; skipping the issue #89 DirectComposition configuration"
+        );
+        return None;
+    };
+    create_new.instance_descriptor.backends = wgpu::Backends::DX12;
+    create_new
+        .instance_descriptor
+        .backend_options
+        .dx12
+        .presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
+    Some(wgpu_options)
+}
+
 fn main() -> eframe::Result {
     // `env_logger::init()` alone defaults to `error`-only and, since this
     // binary carries `windows_subsystem = "windows"`, has no console for
@@ -95,8 +267,38 @@ fn main() -> eframe::Result {
     // constants stay private and the two can't drift apart.
     let default_inner_size = ui::viewport(None).inner_size;
 
+    // Issue #89. Both halves of the transparency fix are decided here, before
+    // any window exists, because both are creation-time-only: the wgpu backend
+    // choice is baked into the instance eframe builds, and
+    // `WS_EX_NOREDIRECTIONBITMAP` is baked into `CreateWindowEx`. The two must
+    // move together — the flag without DirectComposition gives a window DXGI
+    // refuses to create a swapchain for, i.e. an overlay that never presents —
+    // so the opt-in is flipped only inside the `Some` arm, never speculatively.
+    let choice = composition_choice(
+        std::env::var("SHINRA_NO_COMPOSITION").ok().as_deref(),
+        hardware_dx12_adapter,
+    );
+    let dx12_setup = match choice {
+        WindowComposition::DirectComposition => dx12_composition_setup(),
+        WindowComposition::ForcedOff | WindowComposition::NoDx12Adapter => None,
+    };
+    if dx12_setup.is_some() {
+        egui_winit::set_no_redirection_bitmap(true);
+        log::info!(
+            "opening the overlay with WS_EX_NOREDIRECTIONBITMAP and DirectComposition presentation (issue #89); if it stays black or blank, set SHINRA_NO_COMPOSITION=1 and restart to get the old opaque window back"
+        );
+    } else {
+        log::info!(
+            "using eframe's default wgpu setup ({}); the overlay may paint opaque gray until resized (issue #89)",
+            choice.reason()
+        );
+    }
+
     let native_options = eframe::NativeOptions {
         viewport: ui::viewport(settings.window_position),
+        // `unwrap_or_default()` is precisely "change nothing": it is the same
+        // value `NativeOptions::default()` would have put here.
+        wgpu_options: dx12_setup.unwrap_or_default(),
         ..Default::default()
     };
 
@@ -140,4 +342,67 @@ fn main() -> eframe::Result {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    // -- composition_choice (issue #89) -------------------------------------
+
+    #[test]
+    fn composition_uses_direct_composition_with_a_hardware_dx12_adapter() {
+        assert_eq!(
+            composition_choice(None, || true),
+            WindowComposition::DirectComposition
+        );
+    }
+
+    #[test]
+    fn composition_falls_back_without_a_hardware_dx12_adapter() {
+        assert_eq!(
+            composition_choice(None, || false),
+            WindowComposition::NoDx12Adapter
+        );
+    }
+
+    /// The escape hatch has to beat the probe, not just its result: a driver
+    /// that hangs or crashes inside adapter enumeration is one of the things
+    /// `SHINRA_NO_COMPOSITION` exists to rescue.
+    #[test]
+    fn the_escape_hatch_forces_the_legacy_path_without_probing() {
+        let probed = Cell::new(false);
+        let choice = composition_choice(Some("1"), || {
+            probed.set(true);
+            true
+        });
+        assert_eq!(choice, WindowComposition::ForcedOff);
+        assert!(!probed.get(), "SHINRA_NO_COMPOSITION must skip the probe");
+    }
+
+    /// An off-looking value must not disable the fix — same truthiness rule as
+    /// `SHINRA_INSPECT`, so `SHINRA_NO_COMPOSITION=0` means "no, don't".
+    #[test]
+    fn an_off_looking_escape_hatch_value_leaves_the_fix_on() {
+        for value in ["", "0", "false", "FALSE"] {
+            assert_eq!(
+                composition_choice(Some(value), || true),
+                WindowComposition::DirectComposition,
+                "SHINRA_NO_COMPOSITION={value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_legacy_path_explains_itself_in_the_startup_log() {
+        for choice in [
+            WindowComposition::DirectComposition,
+            WindowComposition::ForcedOff,
+            WindowComposition::NoDx12Adapter,
+        ] {
+            assert!(!choice.reason().is_empty(), "{choice:?} has no reason");
+        }
+    }
 }

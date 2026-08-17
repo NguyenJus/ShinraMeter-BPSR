@@ -105,6 +105,9 @@ The manifest normally makes Windows prompt for this automatically, so seeing thi
 3. Restart the meter and try again.
 4. Confirm the game server is being detected — watch the overlay for `ServerChanged` events in debug logs if enabled.
 
+### The overlay is black, blank, or never paints
+The overlay normally opens as a genuinely transparent window: on a machine with a hardware DX12 adapter it is created with `WS_EX_NOREDIRECTIONBITMAP` and presents through DirectComposition (issue #89). Both are creation-time-only and cannot be undone on a live window, so if a driver, an RDP session or a virtualized GPU cannot present that way, set `SHINRA_NO_COMPOSITION=1` and restart: that forces the legacy path, whose only cost is the old flat-gray-until-resized startup. The startup log records which path was chosen and why.
+
 ### Logs
 Logging (issue #69) is on by default at `info`, since the app carries no console to print to (`windows_subsystem = "windows"`) and stderr alone would go nowhere. Logs are written to `%APPDATA%\ShinraMeter-BPSR\logs\ShinraMeter-BPSR.log`, overridable with `SHINRA_LOG_FILE=<path>` (falling back to `ShinraMeter-BPSR.log` in the working directory if `APPDATA` is unset, e.g. a non-Windows dev host). Raise the verbosity with the standard `RUST_LOG` env var, e.g. `RUST_LOG=debug`. The file is rotated once at startup — renamed to `<path>.1`, replacing any previous one — once it reaches 5 MiB, so a long-lived overlay can't grow it unbounded.
 
