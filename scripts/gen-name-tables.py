@@ -236,7 +236,7 @@ def filter_id_names(raw: dict) -> dict[str, str]:
             continue
         name = row.get("Name")
         if isinstance(name, str) and name.strip():
-            out[str(int(key))] = name
+            out[str(int(key))] = name.strip()
     return dict(sorted(out.items(), key=lambda kv: int(kv[0])))
 
 
@@ -282,10 +282,18 @@ def _self_test() -> None:
             "13": {"NoName": 1},
             "14": "not a row",
             "9": {"Name": "Sorted First"},
+            "15": {"Name": "  Padded  "},
         }
     )
-    assert filtered == {"9": "Sorted First", "10": "Kept"}, filtered
-    assert list(filtered) == ["9", "10"], "filtered output must be id-sorted"
+    assert filtered == {
+        "9": "Sorted First",
+        "10": "Kept",
+        "15": "Padded",
+    }, filtered
+    assert list(filtered) == ["9", "10", "15"], "filtered output must be id-sorted"
+    assert filtered["15"] == "Padded", (
+        "a non-blank name carrying leading/trailing padding must be stored stripped"
+    )
 
     assert esc('a\\b"c') == 'a\\\\b\\"c'
     assert esc("line1\rline2") == "line1\\rline2"
@@ -310,6 +318,13 @@ def _self_test() -> None:
     # Order: backslash-escaping must not re-escape a literal `\r` that was
     # already produced for a real carriage return.
     assert esc("\\\r") == "\\\\\\r"
+
+    # BOM handling must be uniform across the write path (`_render_source`)
+    # and the read path (`render()`'s loader), so neither can crash on a
+    # BOM'd vendored file. `utf-8-sig` mirrors what both use.
+    bom = b"\xef\xbb\xbf"
+    assert json.loads((bom + b'{"a": 1}').decode("utf-8-sig")) == {"a": 1}
+    assert (bom + b'{"a": 1}').removeprefix(bom) == b'{"a": 1}'
 
 
 def emit(out: io.StringIO, doc: str, fn: str, table: dict) -> None:
@@ -384,7 +399,11 @@ def _render_source(name: str, url: str) -> bytes:
     if name in FILTERED_SOURCES:
         filtered = filter_id_names(json.loads(body.decode("utf-8-sig")))
         return (json.dumps(filtered, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    return body
+    # `VERBATIM_SOURCES` are vendored byte-for-byte, but a leading UTF-8 BOM
+    # would otherwise ride along untouched: strip it here so every vendored
+    # file — filtered or verbatim — is guaranteed BOM-free on disk, matching
+    # what `render()`'s loader is written to expect.
+    return body.removeprefix(b"\xef\xbb\xbf")
 
 
 def refresh(check: bool) -> bool:
@@ -414,7 +433,11 @@ def refresh(check: bool) -> bool:
 
 def render() -> str:
     """Build the full text of `tables.rs` from the vendored JSON."""
-    load = lambda name: json.loads((DATA / name).read_text(encoding="utf-8"))  # noqa: E731
+    # `utf-8-sig` tolerates a leading UTF-8 BOM (and is a no-op without one),
+    # so a BOM'd vendored file can never crash `render()` with a bare
+    # `json.JSONDecodeError` instead of a clear drift message. `_render_source`
+    # already strips the BOM on write, so this is defense in depth.
+    load = lambda name: json.loads((DATA / name).read_text(encoding="utf-8-sig"))  # noqa: E731
 
     # Least authoritative layer first in every call below.
     monsters = merge_names(
