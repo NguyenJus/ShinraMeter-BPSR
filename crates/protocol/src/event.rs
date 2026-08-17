@@ -5,10 +5,18 @@
 
 use crate::pb::Class;
 
-/// Uuid low-16 value identifying a player entity (plan §0.6).
-const KIND_PLAYER: i64 = 640;
-/// Uuid low-16 value identifying a monster entity (plan §0.6).
-const KIND_MONSTER: i64 = 64;
+/// `EEntityType::EntChar`, the entity-type value for a player.
+/// (BPSR-ZDPS `BPSR-ZDPSLib/protos/EnumEEntityType.cs:53`; identically
+/// bpsr-logs `src-tauri/src/protocol/pb.proto:14`.)
+const ENT_CHAR: i64 = 10;
+/// `EEntityType::EntMonster`, the entity-type value for a monster.
+/// (BPSR-ZDPS `BPSR-ZDPSLib/protos/EnumEEntityType.cs:46`; identically
+/// bpsr-logs `src-tauri/src/protocol/pb.proto:13`.)
+const ENT_MONSTER: i64 = 1;
+/// Bit offset of the entity-type field inside a uuid, and its width (5
+/// bits). See `kind_of` for the full layout.
+const ENT_TYPE_SHIFT: u32 = 6;
+const ENT_TYPE_MASK: i64 = 0x1F;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EntityKind {
@@ -22,13 +30,35 @@ pub fn uid_of(uuid: i64) -> i64 {
     uuid >> 16
 }
 
-/// `entity_kind = uuid & 0xFFFF`; `640` = player, `64` = monster, else
-/// unknown. (Differs from the proto enum's own numbering 10/1 — this is the
-/// wire uuid low-16, not `EEntityType`.)
+/// Entity type unpacked from the uuid's bit layout, which BPSR-ZDPS spells
+/// out in `Utils.cs:261` (`EntityIdToUuid`):
+///
+/// ```text
+/// uuid = uid << 16 | is_summon << 15 | is_client << 14 | entity_type << 6
+/// ```
+///
+/// so the type is `(uuid >> 6) & 31` (BPSR-ZDPS `Utils.cs:264`,
+/// `UuidToEntityType`) and carries the proto enum's own numbering —
+/// `EntChar = 10`, `EntMonster = 1`.
+///
+/// issue #76: this used to match the *whole* low-16 against `640`/`64`,
+/// which is only correct while both flag bits are clear. `EntMonster << 6`
+/// is 64 and `EntChar << 6` is 640, so the two forms agree on a plain
+/// entity — but a summoned monster (bit 15) arrives as `0x8040`, and a
+/// client-side entity (bit 14) shifts likewise, and the old form scored
+/// both as `Unknown`. `decode.rs` drops `Unknown` entities outright, so
+/// those monsters produced no `EnemyHp` at all and could never be named or
+/// ranked as the boss. StarResonanceDamageCounter papers over exactly this
+/// case by whitelisting the single extra literal `32832` (`0x8040`)
+/// alongside `64` (`algo/packet.js:234-237`); masking the flags off, as
+/// ZDPS does, handles every combination rather than one.
+///
+/// Types this meter has no use for (`EntNpc = 2`, `EntPet = 8`,
+/// `EntDummy = 11`) stay `Unknown`.
 pub fn kind_of(uuid: i64) -> EntityKind {
-    match uuid & 0xFFFF {
-        KIND_PLAYER => EntityKind::Player,
-        KIND_MONSTER => EntityKind::Monster,
+    match (uuid >> ENT_TYPE_SHIFT) & ENT_TYPE_MASK {
+        ENT_CHAR => EntityKind::Player,
+        ENT_MONSTER => EntityKind::Monster,
         _ => EntityKind::Unknown,
     }
 }
@@ -134,5 +164,46 @@ mod tests {
     fn unknown_kind_for_other_low_bits() {
         let uuid = (1i64 << 16) | 7;
         assert_eq!(kind_of(uuid), EntityKind::Unknown);
+    }
+
+    /// issue #76: the uuid packs two flags *above* the type field, so
+    /// matching the whole low-16 against `64` dropped every summoned
+    /// monster on the floor — its `EnemyHp` was never emitted at all, so
+    /// the header could never name it.
+    #[test]
+    fn summoned_monster_uuid_is_still_a_monster() {
+        let uuid = (999i64 << 16) | (1 << 15) | (1 << 6);
+        // The exact low-16 StarResonanceDamageCounter special-cases as
+        // "monster" alongside 64 (`algo/packet.js:234-237`).
+        assert_eq!(uuid & 0xFFFF, 0x8040);
+        assert_eq!(uid_of(uuid), 999);
+        assert_eq!(kind_of(uuid), EntityKind::Monster);
+    }
+
+    /// The client flag (bit 14) is the other flag that must not change an
+    /// entity's decoded type.
+    #[test]
+    fn client_flagged_player_uuid_is_still_a_player() {
+        let uuid = (12345i64 << 16) | (1 << 14) | (10 << 6);
+        assert_eq!(uid_of(uuid), 12345);
+        assert_eq!(kind_of(uuid), EntityKind::Player);
+    }
+
+    /// Bits 0-5 are unused by the packing, so they must not affect the
+    /// decoded type either.
+    #[test]
+    fn unused_low_bits_do_not_change_the_decoded_kind() {
+        let uuid = (7i64 << 16) | (1 << 6) | 0x3F;
+        assert_eq!(kind_of(uuid), EntityKind::Monster);
+    }
+
+    /// An entity type this meter has no use for (NPC = 2, pet = 8, dummy =
+    /// 11) must still decode as `Unknown` rather than being mistaken for a
+    /// monster now that the flag bits are masked off.
+    #[test]
+    fn npc_and_pet_entity_types_stay_unknown() {
+        assert_eq!(kind_of((1i64 << 16) | (2 << 6)), EntityKind::Unknown);
+        assert_eq!(kind_of((1i64 << 16) | (8 << 6)), EntityKind::Unknown);
+        assert_eq!(kind_of((1i64 << 16) | (11 << 6)), EntityKind::Unknown);
     }
 }

@@ -157,14 +157,30 @@ pub struct OverlayApp {
     /// because it owns the reposition exemption guard, whose lifetime has
     /// to be explicit.
     window_gesture: WindowGesture,
-    /// Collapse-to-header state (issue #54). Always starts expanded — it is
-    /// deliberately not persisted to `Settings`; see the `CollapseState`
-    /// section comment.
-    collapse: CollapseState,
     /// Issue #83: last-logged `(pixels_per_point, zoom_factor)`, so the
     /// per-frame DPI probe in `ui()` only writes to the log when the value
     /// actually changes rather than every ~10Hz frame.
     last_dpi_probe: Option<(f32, f32)>,
+    /// Issue #96 (PR #98 review): the row-list content bottom edge — top
+    /// chrome plus only the populated rows, in window-space points
+    /// (`rows_content_bottom_y`) — for the Share screenshot request
+    /// currently in flight, or `None` if no request is in flight.
+    ///
+    /// `handle_screenshot_events` runs at the *start* of `ui()`, but the
+    /// `Event::Screenshot` reply to a Share click lands asynchronously, on
+    /// some later frame than the click — and `self.snapshot`'s row count
+    /// is live combat data that can change on any frame in between (a
+    /// player joining or dropping mid-encounter is routine). Reading
+    /// whatever row-bottom bound happens to be current when the reply
+    /// lands would crop against a row count that no longer matches the
+    /// pixels actually captured. Instead, the bound is computed and
+    /// stashed here once, at the end of the *same* frame the click
+    /// happened on (after `draw_rows` has laid out that frame's rows —
+    /// the Share button itself is drawn earlier, in the header), and
+    /// `handle_screenshot_events`'s call site `take()`s it when the reply
+    /// lands, so the crop always matches the frame that was actually
+    /// captured regardless of how the row count drifts afterward.
+    pending_screenshot_bound: Option<f32>,
 }
 
 /// All icon textures the overlay paints, bundled so `OverlayApp` has exactly
@@ -217,8 +233,8 @@ impl OverlayApp {
             tx_settings,
             icons: None,
             window_gesture: WindowGesture::default(),
-            collapse: CollapseState::default(),
             last_dpi_probe: None,
+            pending_screenshot_bound: None,
         }
     }
 
@@ -268,28 +284,25 @@ impl eframe::App for OverlayApp {
         // one (issue #82: `toggle_cluster` fired the request one or more
         // frames ago via `ViewportCommand::Screenshot`; the round trip is
         // asynchronous, so it can land on any later frame). Checked every
-        // frame, unconditionally, rather than only while collapsed/expanded
-        // state would suggest — a screenshot can be requested at any point
-        // in the header, which is always painted.
-        handle_screenshot_events(&ctx, crate::platform::write_clipboard_image);
+        // frame, unconditionally — a screenshot can be requested at any
+        // point in the header, which is always painted.
+        // Issue #96 (PR #98 review): crop to the header chrome + populated
+        // rows before the clipboard write, using the bound captured at
+        // *request* time (`pending_screenshot_bound`) rather than whatever
+        // bound is current on the frame the reply happens to land on — see
+        // `pending_screenshot_bound`'s doc comment. `take()`n so a later,
+        // unrelated frame never reuses a stale bound.
+        let rows_bottom_y = self.pending_screenshot_bound.take().unwrap_or(0.0);
+        let pixels_per_point = ctx.pixels_per_point();
+        handle_screenshot_events(&ctx, |image| {
+            let cropped = crop_screenshot_to_rows(image, rows_bottom_y, pixels_per_point);
+            crate::platform::write_clipboard_image(&cropped);
+        });
 
         // Loaded once, lazily: the `egui::Context` above isn't available yet
         // at `OverlayApp::new`, so the first frame is what actually uploads
         // the icon textures (issues #9, #41); every later frame reuses them.
         let icons = self.icons.get_or_insert_with(|| Icons::load(&ctx));
-
-        // Reconcile the collapse (issue #54) before anything is painted —
-        // including the "somebody else resized us, expand" case that issue
-        // #53's tray "Reset Window" reaches. The band height is the
-        // collapsed window's whole inner height, and `draw_header` derives
-        // the same number from the same call. The actual collapsed/expanded
-        // read used to gate row-painting happens after `draw_header` below,
-        // since that call can itself flip the state this frame.
-        let band_height = header_band_height(
-            encounter_subtitle(&self.snapshot.encounter).is_some(),
-            ui.spacing().interact_size.y,
-        );
-        self.collapse.sync(&ctx, band_height);
 
         egui::CentralPanel::default()
             .frame(
@@ -302,7 +315,13 @@ impl eframe::App for OverlayApp {
                 // First, so the header buttons drawn afterwards stay on top of
                 // the corner zones they overlap.
                 draw_resize_handles(ui, &ctx, &mut self.window_gesture);
-                draw_header(
+                // Issue #96 (PR #98 review): whether the Share button fired
+                // a screenshot request this frame — if so, the row bound
+                // this same frame computes below is stashed into
+                // `pending_screenshot_bound` for whenever the async reply
+                // lands, instead of leaving that field for the crop to read
+                // fresh (and possibly stale) at reply time.
+                let screenshot_requested = draw_header(
                     ui,
                     &ctx,
                     &self.snapshot,
@@ -312,39 +331,33 @@ impl eframe::App for OverlayApp {
                         tx_settings: &self.tx_settings,
                     },
                     icons,
-                    ChromeHandle {
-                        gesture: &mut self.window_gesture,
-                        collapse: &mut self.collapse,
-                    },
-                );
-                // Read after `draw_header` returns, not before: the chevron
-                // click it handles can flip the collapse state via
-                // `chrome.collapse.toggle`, and gating row-painting below on
-                // a value read before that call would still paint rows for
-                // one extra frame after the click that just collapsed us.
-                let collapsed = self.collapse.is_collapsed();
-                // After both, so a gesture that started this frame is
-                // already anchored — and, being outside them, it is the one
-                // place a gesture can end no matter which zone began it.
-                // The resize floor comes from the collapse state, not
-                // `MIN_INNER_SIZE` directly (issue #54).
-                drive_window_gesture(
-                    &ctx,
                     &mut self.window_gesture,
-                    self.collapse.min_inner_size(),
                 );
+                // After the header, so a gesture that started this frame is
+                // already anchored — and, being outside it, it is the one
+                // place a gesture can end no matter which zone began it.
+                drive_window_gesture(&ctx, &mut self.window_gesture, MIN_INNER_SIZE);
 
-                // Everything below the header band is skipped outright while
-                // collapsed (issue #54) — not painted into a clipped rect —
-                // so a collapsed overlay costs nothing per row, and the
-                // window really is only as tall as the band it shows.
-                if !collapsed {
-                    if let StatusLine::Error(msg) = &self.status {
-                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), msg.as_str());
-                    }
+                if let StatusLine::Error(msg) = &self.status {
+                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), msg.as_str());
+                }
 
-                    ui.separator();
-                    draw_rows(ui, &self.snapshot, &self.settings.ordered_columns(), icons);
+                ui.separator();
+                // Issue #96: captured before `draw_rows` consumes the space —
+                // `rows_top` is where the scroll area starts,
+                // `rows_area_height` is all of what's left in the panel for
+                // it, matching `draw_rows`'s own `auto_shrink([false,
+                // false])`.
+                let rows_top = ui.cursor().top();
+                let rows_area_height = ui.available_height();
+                draw_rows(ui, &self.snapshot, &self.settings.ordered_columns(), icons);
+                if screenshot_requested {
+                    self.pending_screenshot_bound = Some(rows_content_bottom_y(
+                        rows_top,
+                        self.snapshot.rows.len(),
+                        ROW_HEIGHT,
+                        rows_area_height,
+                    ));
                 }
             });
 
@@ -416,19 +429,10 @@ struct SettingsHandle<'a> {
     tx_settings: &'a Sender<Settings>,
 }
 
-/// The two pieces of window-chrome state `draw_header`'s controls drive: the
-/// in-flight manual move/resize gesture (issue #11, started by the title
-/// bar's drag surface) and the collapse-to-header state (issue #54, toggled
-/// by `draw_header_menu`'s Collapse/Expand item, not the chevron — the
-/// chevron just opens the menu the item lives in, issue #71). Bundled for
-/// exactly the reason `SettingsHandle` is —
-/// `draw_header` is already at clippy's argument limit, and these two are
-/// always needed together by the same function.
-struct ChromeHandle<'a> {
-    gesture: &'a mut WindowGesture,
-    collapse: &'a mut CollapseState,
-}
-
+/// Returns whether the Share button (in the toggle cluster painted at the
+/// end of this function) fired a screenshot request this frame — issue #96
+/// (PR #98 review): the caller uses this to know whether to stash this same
+/// frame's row-bottom bound into `OverlayApp::pending_screenshot_bound`.
 fn draw_header(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -436,13 +440,13 @@ fn draw_header(
     tx_command: &Sender<UiCommand>,
     settings: SettingsHandle<'_>,
     icons: &Icons,
-    chrome: ChromeHandle<'_>,
-) {
+    gesture: &mut WindowGesture,
+) -> bool {
     let title = encounter_title(&snapshot.encounter);
     let subtitle = encounter_subtitle(&snapshot.encounter);
-    // Also the collapsed window's whole inner height (issue #54): collapsing
-    // leaves exactly this band on screen, so the two are the same number by
-    // construction rather than by a hardcoded constant that could drift.
+    // The header band's height budget — also what `draw_header_wash` and the
+    // paint clips below size themselves against, so the whole band is one
+    // number derived once rather than several that could drift apart.
     let band_height = header_band_height(subtitle.is_some(), ui.spacing().interact_size.y);
     let text_band_height = header_text_band_height(subtitle.is_some());
 
@@ -494,7 +498,7 @@ fn draw_header(
     // Once per gesture: this only captures the anchor the drag is measured
     // against. The actual per-frame repositioning is `drive_window_gesture`.
     if drag_surface.drag_started_by(egui::PointerButton::Primary) {
-        begin_window_gesture(ctx, chrome.gesture, GestureKind::Move);
+        begin_window_gesture(ctx, gesture, GestureKind::Move);
     }
 
     // Title is always rendered (even as the "No target" placeholder) so the
@@ -522,17 +526,17 @@ fn draw_header(
     // instead of starting a window move. Always points down — it is a menu
     // affordance now, not a collapse-state indicator (see `menu_chevron`).
     let chevron_response = menu_chevron(ui, chevron_rect(title_row));
-    egui::Popup::menu(&chevron_response).show(|ui| {
-        draw_header_menu(
-            ui,
-            ctx,
-            tx_command,
-            settings,
-            icons,
-            chrome.collapse,
-            band_height,
-        );
-    });
+    // `CloseOnClickOutside` rather than the default `CloseOnClick` (issue
+    // #93): with the Columns checkboxes now direct children of this popup
+    // (no submenu layer to defer the close decision to, see
+    // `draw_header_menu`'s doc comment), the default would dismiss the
+    // whole dropdown on every checkbox toggle. Minimize/Close call
+    // `ui.close()` themselves to still dismiss on click.
+    egui::Popup::menu(&chevron_response)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            draw_header_menu(ui, ctx, tx_command, settings, icons);
+        });
     if let Some(subtitle) = &subtitle {
         draw_subtitle_line(ui, subtitle);
     }
@@ -572,8 +576,9 @@ fn draw_header(
                 icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
             ),
         );
-        toggle_cluster(ui, tx_command, icons);
-    });
+        toggle_cluster(ui, tx_command, icons)
+    })
+    .inner
 }
 
 // -- status indicators (issue #62, #82) -----------------------------------
@@ -637,7 +642,11 @@ fn toggle_button(ui: &egui::Ui, rect: egui::Rect, label: &str) -> egui::Response
 /// check glyph centered in it; no backlog arc, since there is still no
 /// queue for it to show). All in one `PILL_FILL` oval, matching the
 /// DPS/damage pills' chrome.
-fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Icons) {
+///
+/// Returns whether Share was clicked this frame (issue #96, PR #98 review)
+/// — `draw_header` propagates this up so `OverlayApp::ui` knows to stash
+/// this frame's row-bottom bound for the async screenshot reply.
+fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Icons) -> bool {
     let height = ui.spacing().interact_size.y;
     let width = 2.0 * TOGGLE_PAD_X
         + TOGGLE_MOUSE_SIDE
@@ -648,7 +657,7 @@ fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Ico
     let (rect, _response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
 
     if !ui.is_rect_visible(rect) {
-        return;
+        return false;
     }
     ui.painter()
         .rect_filled(rect, rect.height() / 2.0, PILL_FILL);
@@ -666,9 +675,11 @@ fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Ico
         egui::pos2(x + TOGGLE_MOUSE_SIDE / 2.0, y),
         egui::Vec2::splat(TOGGLE_MOUSE_SIDE),
     );
+    let mut screenshot_requested = false;
     if toggle_button(ui, share_rect, "Copy screenshot to clipboard").clicked() {
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+        screenshot_requested = true;
     }
     if let Some(share) = icons.glyphs.get(GlyphIcon::Share) {
         ui.painter()
@@ -705,6 +716,8 @@ fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Ico
         ui.painter()
             .image(check.id(), icon_rect, UV_FULL, TOGGLE_OFF_COLOR);
     }
+
+    screenshot_requested
 }
 
 /// Scans this frame's input events for the reply to a screenshot request
@@ -727,6 +740,88 @@ fn handle_screenshot_events(ctx: &egui::Context, mut write: impl FnMut(&egui::Co
             }
         }
     });
+}
+
+/// Issue #96: the window-space y coordinate (in points) of the bottom of
+/// the row list's actual content — top chrome plus only the populated rows
+/// — used to crop the Share button's clipboard screenshot down to just
+/// that content instead of the whole window.
+///
+/// `rows_area_height` is the row `ScrollArea`'s own allocated height: per
+/// `draw_rows`'s `auto_shrink([false, false])` it always fills whatever
+/// space the panel leaves it, so it is exactly what got rendered this
+/// frame, regardless of how many rows there are. Clamping the rows' own
+/// height to it handles both crop directions purely:
+///
+/// - Trailing empty space (fewer/shorter rows than the scroll area) is
+///   trimmed — the bound stops right after the last row, not at the
+///   scroll area's full height.
+/// - Scrolled-off rows (more row content than the scroll area shows) are
+///   never trimmed further than what was actually painted — the bound
+///   clamps at the scroll area's height rather than the taller row-count
+///   total, since content past that was clipped out of the render itself
+///   and cannot be recovered from a screenshot of it.
+fn rows_content_bottom_y(
+    rows_top: f32,
+    row_count: usize,
+    row_height: f32,
+    rows_area_height: f32,
+) -> f32 {
+    let rows_height = row_count as f32 * row_height;
+    rows_top + rows_height.min(rows_area_height.max(0.0))
+}
+
+/// Converts a window-space y bound (points, from `rows_content_bottom_y`)
+/// to a row count in the captured `ColorImage`'s physical-pixel coordinate
+/// space, using the frame's `pixels_per_point` scale. Clamped to
+/// `image_height_px` as a last-resort safety net — `pixels_per_point` is
+/// still read fresh on the frame the reply lands on (see
+/// `OverlayApp::pending_screenshot_bound`'s doc comment, which covers the
+/// row-count half of this), so a DPI/zoom change mid-round-trip could in
+/// principle still scale the bound past the image; this clamp makes sure
+/// that only ever crops *less* than the full image, never indexes past its
+/// end.
+fn screenshot_crop_height_px(
+    bottom_y_points: f32,
+    pixels_per_point: f32,
+    image_height_px: usize,
+) -> usize {
+    // Clippy's `neg_cmp_op_on_partial_ord`: `!(x > 0.0)` is not the same as
+    // `x <= 0.0` once NaN is possible (NaN compares false either way, so
+    // the negated form silently treats it as "not positive" too — which is
+    // exactly the fallback wanted here, but spelled via `partial_cmp` to
+    // make that NaN handling explicit rather than implicit in a negation).
+    let is_positive = |v: f32| v.partial_cmp(&0.0) == Some(std::cmp::Ordering::Greater);
+    if !is_positive(bottom_y_points) || !is_positive(pixels_per_point) {
+        return 0;
+    }
+    let px = bottom_y_points * pixels_per_point;
+    if !px.is_finite() {
+        return image_height_px;
+    }
+    (px.round() as usize).min(image_height_px)
+}
+
+/// Crops a Share-button screenshot down to the header chrome plus
+/// populated rows (issue #96), dropping trailing empty window background
+/// below the last row — or keeping the full capture when the content
+/// already fills it (scrolled-off rows, or the bound clamped past the
+/// image). This is a pure post-capture crop of the `ColorImage` already in
+/// hand: it never touches the live window's size or geometry, which is the
+/// point of doing it here rather than by resizing the overlay — only the
+/// clipboard image differs from a bare full-window capture.
+fn crop_screenshot_to_rows(
+    image: &egui::ColorImage,
+    bottom_y_points: f32,
+    pixels_per_point: f32,
+) -> egui::ColorImage {
+    let [width, height] = image.size;
+    let crop_height = screenshot_crop_height_px(bottom_y_points, pixels_per_point, height);
+    if crop_height >= height {
+        return image.clone();
+    }
+    let pixels = image.pixels[..width * crop_height].to_vec();
+    egui::ColorImage::new([width, crop_height], pixels)
 }
 
 /// Fixed display size, in points, every toolbar icon (issue #41) is drawn
@@ -777,8 +872,7 @@ fn menu_item_button<'a>(texture: Option<&egui::TextureHandle>, label: &'a str) -
 // upstream ShinraMeter icon set (`icons.rs`'s `TOOLBAR_ICON_BYTES`).
 // Originally this toggled collapse-to-header directly; it now opens a
 // dropdown menu instead (issue #71), so it always points down — a menu
-// affordance, not a collapse-state indicator — and the menu itself carries
-// the Collapse/Expand action alongside the rest.
+// affordance, not a collapse-state indicator.
 
 /// Side of the chevron's square hit/paint box, matched to `TOOLBAR_ICON_SIZE`
 /// so it reads as one of the window controls rather than as decoration.
@@ -1568,87 +1662,119 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
 /// The header dropdown (issue #54, #71): opened from `menu_chevron` via
 /// `egui::Popup::menu`, replacing the old row of window-control icon
 /// buttons. Built from plain `Ui` menu widgets rather than one bespoke
-/// helper per item, since egui's own `menu_button`/`SubMenuButton` already
-/// give every item free open/close state management.
+/// helper per item, since egui's own `menu_button`/`CollapsingHeader`
+/// already give every item free open/close state management.
 ///
-/// Order matches the spec: a Columns submenu (issue #13's stat column
-/// toggles, unchanged in behavior — just relocated), a separator,
-/// Collapse/Expand (issue #54's collapse-to-header, still driven by
-/// `CollapseState::toggle`), Minimize to tray, a separator, then Close.
-/// Reset used to be the first item here but moved into the header's toggle
-/// cluster (issue #82; see `toggle_cluster`), leaving this menu with no
-/// reset trigger of its own.
+/// Order matches the spec: a Columns disclosure section (issue #13's stat
+/// column toggles, unchanged in behavior — just relocated), a separator,
+/// Minimize to tray, a separator, then Close. Reset used to be the first
+/// item here but moved into the header's toggle cluster (issue #82; see
+/// `toggle_cluster`), leaving this menu with no reset trigger of its own.
+/// Collapse/Expand (issue #54's collapse-to-header) used to be the item
+/// between Columns and Minimize; it was removed outright rather than
+/// reworked, since the chevron no longer indicates a collapse state to
+/// toggle (see `menu_chevron`).
 ///
-/// The Columns submenu is given `PopupCloseBehavior::CloseOnClickOutside`
-/// explicitly: the *root* popup's default `CloseOnClick` is fine for the
-/// other items (a click on Collapse/Minimize/Close should dismiss the
-/// whole menu), but the same default on the submenu would dismiss the
-/// entire dropdown on every single checkbox toggle — verified against the
-/// vendored egui source (`containers/menu.rs`'s `SubMenu::show`): the root
-/// popup defers its own close decision to whichever submenu is open, so
-/// only the submenu's own config matters for clicks landing on a checkbox.
+/// Columns renders its checkboxes inline behind a click-to-expand
+/// `CollapsingHeader` rather than the hover `SubMenu` flyout it used to be
+/// (issue #93). The flyout had two compounding problems in this egui
+/// version: it opened purely on hover with no dwell delay, and its own
+/// `CloseOnClickOutside` config (needed for the reason below) meant leaving
+/// the hover didn't close it either — an accidental hover trapped the
+/// pointer until an explicit outside click. It also requested
+/// `RectAlign::RIGHT_START` but could fall back to the mirrored
+/// `LEFT_START` near a screen edge, opening back over the trigger instead
+/// of beside it — exactly what this screen-edge overlay routinely sits
+/// near. A disclosure section has no second popup layer to mistime or
+/// mis-position, so neither problem is reachable.
+///
+/// Built from `collapsing_header::CollapsingState::show_header` rather than
+/// the plain `egui::CollapsingHeader::new(...).show(...)` shorthand so the
+/// header can carry `ToolbarIcon::Settings` beside the "Columns" label —
+/// otherwise this item would have no icon call site while every other item
+/// in the menu (Close) still does, an inconsistency review flagged on this
+/// PR.
+///
+/// Losing the submenu also loses the `close_behavior` it carried on its own:
+/// the checkboxes are now direct children of the *root* popup, so
+/// `draw_header`'s `close_behavior(CloseOnClickOutside)` on that root popup
+/// does the checkbox-safe job the submenu's own config used to — a
+/// checkbox click no longer dismisses the whole dropdown. Minimize/Close
+/// call `ui.close()` themselves so they still dismiss it on click, matching
+/// the root's old `CloseOnClick` default for those two items.
 fn draw_header_menu(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     tx_command: &Sender<UiCommand>,
     settings: SettingsHandle<'_>,
     icons: &Icons,
-    collapse: &mut CollapseState,
-    band_height: f32,
 ) {
     let SettingsHandle {
         settings,
         tx_settings,
     } = settings;
 
-    let columns_button = menu_item_button(icons.toolbar.get(ToolbarIcon::Settings), "Columns")
-        .right_text(egui::containers::menu::SubMenuButton::RIGHT_ARROW);
-    egui::containers::menu::SubMenuButton::from_button(columns_button)
-        .config(
-            egui::containers::menu::MenuConfig::new()
-                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
-        )
-        .ui(ui, |ui| {
-            let mut changed = false;
-            for col in ColumnKind::ALL {
-                let is_visible = settings.is_visible(col);
-                // Disabling the last remaining column would leave the row
-                // with nothing to show, so its checkbox is greyed out and
-                // inert rather than letting the click land (issue #13's
-                // "keep the UI usable" guard).
-                let would_disable_last = is_visible && settings.visible_columns.len() <= 1;
-                let mut checked = is_visible;
-                let resp = ui.add_enabled(
-                    !would_disable_last,
-                    egui::Checkbox::new(&mut checked, col.label()),
-                );
-                if resp.changed() {
-                    settings.toggle(col);
-                    changed = true;
-                }
+    let columns_id = ui.make_persistent_id("header_menu_columns");
+    let mut columns_state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ctx, columns_id, false);
+    // Built from `CollapsingState` directly, rather than the plain
+    // `egui::CollapsingHeader::new(...).show(...)` shorthand this replaced,
+    // so the header can carry `ToolbarIcon::Settings` beside the "Columns"
+    // label. `show_toggle_button`'s own click target is only the small
+    // disclosure-arrow box, unlike `CollapsingHeader::show`'s whole clickable
+    // row — so the icon+label response is unioned and toggled by hand below,
+    // to keep the same full-row click target rather than shrinking it down
+    // to the arrow alone.
+    let header_response = ui.horizontal(|ui| {
+        columns_state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+        // A bare `ui.label` only senses hover, never clicks — `Sense::click()`
+        // is what actually lets the union below toggle on a label/icon click
+        // rather than doing nothing.
+        let mut header_response = ui.add(egui::Label::new("Columns").sense(egui::Sense::click()));
+        if let Some(handle) = icons.toolbar.get(ToolbarIcon::Settings) {
+            // Same reasoning as the label above: `toolbar_icon_image` builds
+            // a plain `egui::Image`, hover-sensing only by default, so it
+            // needs an explicit click sense to actually contribute to the
+            // unioned header-row click target.
+            header_response |= ui.add(toolbar_icon_image(handle).sense(egui::Sense::click()));
+        }
+        header_response
+    });
+    if header_response.inner.clicked() {
+        columns_state.toggle(ui);
+    }
+    columns_state.show_body_indented(&header_response.response, ui, |ui| {
+        let mut changed = false;
+        for col in ColumnKind::ALL {
+            let is_visible = settings.is_visible(col);
+            // Disabling the last remaining column would leave the row
+            // with nothing to show, so its checkbox is greyed out and
+            // inert rather than letting the click land (issue #13's
+            // "keep the UI usable" guard).
+            let would_disable_last = is_visible && settings.visible_columns.len() <= 1;
+            let mut checked = is_visible;
+            let resp = ui.add_enabled(
+                !would_disable_last,
+                egui::Checkbox::new(&mut checked, col.label()),
+            );
+            if resp.changed() {
+                settings.toggle(col);
+                changed = true;
             }
-            if changed {
-                // Persisting is blocking file IO (`fs::write` + `fs::rename`),
-                // so it must not run on this render thread — hand the new
-                // value to the dedicated settings-writer thread instead,
-                // same as `pipeline::spawn` owns the meter off this thread.
-                // A disconnected receiver (writer thread gone) is not
-                // fatal: the in-memory `settings` the UI already mutated
-                // stays correct for the rest of this session.
-                let _ = tx_settings.send(settings.clone());
-            }
-        });
+        }
+        if changed {
+            // Persisting is blocking file IO (`fs::write` + `fs::rename`),
+            // so it must not run on this render thread — hand the new
+            // value to the dedicated settings-writer thread instead,
+            // same as `pipeline::spawn` owns the meter off this thread.
+            // A disconnected receiver (writer thread gone) is not
+            // fatal: the in-memory `settings` the UI already mutated
+            // stays correct for the rest of this session.
+            let _ = tx_settings.send(settings.clone());
+        }
+    });
 
     ui.separator();
-
-    let collapse_label = if collapse.is_collapsed() {
-        "Expand"
-    } else {
-        "Collapse"
-    };
-    if ui.button(collapse_label).clicked() {
-        collapse.toggle(ctx, band_height);
-    }
 
     // Issue #53: this minimize goes to the notification area, not the
     // taskbar. `platform::install_tray`'s subclass intercepts the
@@ -1658,6 +1784,7 @@ fn draw_header_menu(
     // anything that bypasses a real minimize.
     if ui.button("Minimize to tray").clicked() {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        ui.close();
     }
 
     ui.separator();
@@ -1671,6 +1798,7 @@ fn draw_header_menu(
     {
         let _ = tx_command.try_send(UiCommand::Quit);
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        ui.close();
     }
 }
 
@@ -1686,227 +1814,6 @@ const MIN_INNER_SIZE: egui::Vec2 = egui::vec2(220.0, 90.0);
 /// window already is before a viewport command is worth sending. Purely to
 /// keep a held-still drag from re-queueing identical commands every frame.
 const GESTURE_EPSILON: f32 = 0.5;
-
-// -- collapse to header (issue #54) ------------------------------------
-//
-// Collapsing hides the player rows (and the status banner) and shrinks the
-// window down to the header band, so the overlay parks as a one-line strip.
-// Expanding restores the height it had immediately before.
-//
-// Two things make this more than a boolean:
-//
-//  1. The collapsed height is **below `MIN_INNER_SIZE.y`** (the band is
-//     40-58pt against a 90pt floor), and that floor is enforced in two
-//     independent places — `viewport`'s `with_min_inner_size`, i.e. winit and
-//     the OS, and `resized_window_rect`'s clamp on the manual drag-resize
-//     (issue #11). Both are moved for the duration of the collapse rather
-//     than lowered globally: a permanently lower floor would let a user drag
-//     the *expanded* window down into an unusable sliver.
-//  2. Something else can resize the window while it is collapsed — issue
-//     #53's tray "Reset Window", which puts the overlay back at
-//     `viewport`'s expanded default size, or a vertical drag-resize. The
-//     collapsed state watches for a height it did not ask for and expands,
-//     keeping the height whoever changed it chose. Without that, "Reset
-//     Window" would produce a full-height window painting nothing but a
-//     header.
-//
-// Deliberately **not persisted** to `Settings`: the issue doesn't ask for it,
-// and a meter that reopens collapsed after a crash looks broken. Every launch
-// starts expanded.
-
-/// How far, in points, the window's real inner height may differ from the
-/// collapsed height that was requested before it counts as somebody else's
-/// change. Same job as `GESTURE_EPSILON`: absorb the sub-point wobble
-/// fractional DPI scaling introduces between what is asked for and what
-/// winit reports back.
-const COLLAPSE_HEIGHT_EPSILON: f32 = 1.0;
-
-/// The window's inner rect this frame, in points. The overlay is borderless
-/// (`viewport`'s `with_decorations(false)`), so this is also its outer size —
-/// and its origin is the window's own top-left, so only the size is
-/// meaningful. Named because the collapse arithmetic asks for it three
-/// times and `i.viewport_rect()` reads like screen geometry rather than
-/// window size.
-fn inner_rect(ctx: &egui::Context) -> egui::Rect {
-    ctx.input(|i| i.viewport_rect())
-}
-
-/// Whether the overlay is collapsed to its header band, and everything needed
-/// to put it back (issue #54). `None` is the expanded state.
-#[derive(Debug, Default)]
-pub struct CollapseState {
-    collapsed: Option<Collapsed>,
-}
-
-/// The live collapse, while one is in effect.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Collapsed {
-    /// The window's inner height, in points, at the moment it collapsed —
-    /// restored verbatim when the chevron expands it again, so a
-    /// collapse/expand round-trip is size-neutral even if the user had
-    /// dragged the window to an unusual height first.
-    ///
-    /// Held here rather than read back off the live window on expand,
-    /// because while collapsed the live window *is* the band height — there
-    /// would be nothing left to read.
-    restore_height: f32,
-    /// The collapsed inner height last asked for via
-    /// `ViewportCommand::InnerSize`. Not a constant: the header band grows
-    /// and shrinks with the dungeon subtitle (`header_band_height`), which
-    /// can appear or disappear mid-collapse when the encounter changes, so
-    /// this is re-derived every frame and re-requested when it moves.
-    requested_height: f32,
-    /// Whether the window has actually reached `requested_height` yet.
-    /// Viewport commands are queued and applied by winit later, so for the
-    /// first frame or two after a collapse the window is still its old
-    /// height — which must not be mistaken for somebody else resizing it.
-    settled: bool,
-}
-
-/// What `CollapseState::sync` should do with the collapse this frame.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum CollapseSync {
-    /// Nothing: the window is the height we asked for, or is still on its
-    /// way there.
-    Hold,
-    /// The window has arrived at the requested height — mark it settled, so
-    /// any *later* deviation is recognizable as somebody else's.
-    Settle,
-    /// The band's own height changed underneath the collapse (the dungeon
-    /// subtitle appeared or disappeared); ask for the new one and wait for
-    /// it to land.
-    Request(f32),
-    /// The window is a height nobody here asked for — issue #53's "Reset
-    /// Window", or a vertical drag-resize — so honor it and expand.
-    Expand,
-}
-
-/// Decides `CollapseSync` from the collapse's own bookkeeping, the header
-/// band's current height, and the window's real inner height. Pure, so every
-/// branch — including the ones that need a tray menu or a drag gesture to
-/// reach in the running app — is unit-testable.
-fn collapse_sync(collapsed: Collapsed, band_height: f32, actual_height: f32) -> CollapseSync {
-    // Checked first: a band that changed size makes the old
-    // `requested_height` stale, so the height comparison below would read
-    // "somebody resized us" for what is really our own target moving.
-    if (band_height - collapsed.requested_height).abs() > COLLAPSE_HEIGHT_EPSILON {
-        return CollapseSync::Request(band_height);
-    }
-    let at_target = (actual_height - collapsed.requested_height).abs() <= COLLAPSE_HEIGHT_EPSILON;
-    match (collapsed.settled, at_target) {
-        (false, true) => CollapseSync::Settle,
-        (true, false) => CollapseSync::Expand,
-        _ => CollapseSync::Hold,
-    }
-}
-
-impl CollapseState {
-    /// Whether the player rows are currently hidden. `OverlayApp::ui` skips
-    /// painting them (and the status banner, and the separator) entirely on
-    /// this, rather than painting into a clipped-away rect.
-    pub fn is_collapsed(&self) -> bool {
-        self.collapsed.is_some()
-    }
-
-    /// The minimum inner size in force right now: the normal floor while
-    /// expanded, and one lowered to the collapsed height while collapsed.
-    ///
-    /// Handed to `resized_window_rect` so the manual drag-resize clamps at
-    /// exactly the same floor the OS is being told about — otherwise a
-    /// purely *horizontal* drag on a collapsed window would clamp its height
-    /// back up to 90pt as a side effect and silently expand it.
-    fn min_inner_size(&self) -> egui::Vec2 {
-        match self.collapsed {
-            Some(collapsed) => egui::vec2(MIN_INNER_SIZE.x, collapsed.requested_height),
-            None => MIN_INNER_SIZE,
-        }
-    }
-
-    /// Collapses or expands, moving the OS min-inner-size floor along with
-    /// the window so winit doesn't refuse the sub-minimum collapsed height.
-    ///
-    /// The floor command is queued *ahead of* the size command on both
-    /// paths — the lowered floor before the smaller size on collapse, the
-    /// normal floor before the restored size on expand — so the window is
-    /// never asked for a size the floor then in force would reject.
-    fn toggle(&mut self, ctx: &egui::Context, band_height: f32) {
-        let inner = inner_rect(ctx);
-        match self.collapsed.take() {
-            Some(collapsed) => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MIN_INNER_SIZE));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                    inner.width(),
-                    collapsed.restore_height,
-                )));
-                // Issue #74: an app-driven resize outside `disable_aero_snap`'s
-                // one startup call never re-triggers DWM's frame recompute on
-                // its own, leaving the header opaque gray. Fired once here —
-                // `toggle` runs once per chevron click, never per frame — see
-                // `platform::force_frame_recompute`'s doc comment.
-                crate::platform::force_frame_recompute();
-            }
-            None => {
-                self.collapsed = Some(Collapsed {
-                    restore_height: inner.height(),
-                    requested_height: band_height,
-                    settled: false,
-                });
-                self.request_height(ctx, band_height);
-            }
-        }
-    }
-
-    /// Reconciles the collapse against the window once per frame. A no-op
-    /// while expanded.
-    fn sync(&mut self, ctx: &egui::Context, band_height: f32) {
-        let Some(collapsed) = self.collapsed else {
-            return;
-        };
-        match collapse_sync(collapsed, band_height, inner_rect(ctx).height()) {
-            CollapseSync::Hold => {}
-            CollapseSync::Settle => {
-                self.collapsed = Some(Collapsed {
-                    settled: true,
-                    ..collapsed
-                });
-            }
-            CollapseSync::Request(height) => {
-                self.collapsed = Some(Collapsed {
-                    requested_height: height,
-                    settled: false,
-                    ..collapsed
-                });
-                self.request_height(ctx, height);
-            }
-            CollapseSync::Expand => {
-                // The window's *current* height is kept deliberately —
-                // whoever set it (the tray's "Reset Window", or the user's
-                // own drag) meant it, and overwriting it with
-                // `restore_height` would undo their action. Only the chevron
-                // restores the pre-collapse height.
-                self.collapsed = None;
-                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MIN_INNER_SIZE));
-            }
-        }
-    }
-
-    /// Asks the window for a collapsed inner height of `height`, lowering the
-    /// min-inner-size floor to match first. Width is left exactly as it is —
-    /// collapsing is a vertical operation only.
-    fn request_height(&self, ctx: &egui::Context, height: f32) {
-        let width = inner_rect(ctx).width();
-        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-            MIN_INNER_SIZE.x,
-            height,
-        )));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, height)));
-        // Issue #74: see the identical call (and comment) in `toggle` above.
-        // This fires once per call here too — `sync`'s `CollapseSync::Request`
-        // branch that reaches this only runs when the band height has
-        // actually changed, not every frame while collapsed.
-        crate::platform::force_frame_recompute();
-    }
-}
 
 /// What a manual window gesture is currently driving.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2077,12 +1984,10 @@ fn begin_window_gesture(ctx: &egui::Context, gesture: &mut WindowGesture, kind: 
 /// frame after the header and resize zones have had their chance to start
 /// one.
 ///
-/// `min_size` is the floor a resize clamps at. It is a parameter rather than
-/// `MIN_INNER_SIZE` directly because issue #54's collapsed state lowers the
-/// floor for as long as it lasts (`CollapseState::min_inner_size`) — a drag
-/// clamping at the expanded 90pt minimum while the window is a 40pt strip
-/// would fight the collapse on the very first frame of any drag, including a
-/// purely horizontal one.
+/// `min_size` is the floor a resize clamps at — always `MIN_INNER_SIZE` from
+/// the one live call site, but a parameter (rather than reading the constant
+/// directly) so `resized_window_rect`'s clamp is exercised against an
+/// arbitrary floor in its own unit tests.
 fn drive_window_gesture(ctx: &egui::Context, gesture: &mut WindowGesture, min_size: egui::Vec2) {
     let Some(kind) = gesture.kind() else {
         return;
@@ -2567,10 +2472,10 @@ fn column_clip_rect(rect: egui::Rect, anchor: f32, width: f32) -> egui::Rect {
 /// column kinds, their `StatColumn` specs, and the anchors `column_anchors`
 /// derived from them — computed once by `draw_rows` and handed to every
 /// `draw_row` call rather than recomputed per row. Bundled into one struct
-/// for the same reason `SettingsHandle`/`ChromeHandle` are (issue #71,
-/// #54): three arguments that are always needed together and always travel
-/// together push `draw_row` over clippy's argument limit on their own,
-/// especially once issue #84 adds `row_width`.
+/// for the same reason `SettingsHandle` is (issue #71): three arguments
+/// that are always needed together and always travel together push
+/// `draw_row` over clippy's argument limit on their own, especially once
+/// issue #84 adds `row_width`.
 struct RowLayout<'a> {
     kinds: &'a [ColumnKind],
     columns: &'a [StatColumn],
@@ -2920,17 +2825,33 @@ fn share_bar_rgb(class: Option<Class>) -> (u8, u8, u8) {
     }
 }
 
+/// Issue #97: floor a positive-damage row's bar fraction is clamped up to,
+/// so a row far below the top row (e.g. a support/healer next to a burst
+/// DPS class) still paints a noticeably visible sliver instead of reading
+/// as if it did zero damage. 3% sits in the middle of the sane 2-5% range:
+/// at the row bar's actual width (`share_bar_rect`'s 300pt test fixture)
+/// that is a solid ~9px sliver — clearly present — while staying far below
+/// any real double-digit share, so it never overstates a near-zero
+/// contributor as roughly comparable to a genuine one.
+const ROW_BAR_MIN_FRAC: f32 = 0.03;
+
 /// Computes a row's damage-share bar fraction (issue #73): `damage` scaled
 /// against `top_damage` — the highest-damage row in the current snapshot —
 /// rather than against total encounter damage, so the top row's bar always
 /// fills the full width regardless of how dominant it is over the rest of
 /// the raid. Guards against a zero or negative `top_damage` (an empty or
 /// degenerate snapshot) by returning `0.0` rather than dividing.
+///
+/// Issue #97: any row with `damage > 0` is clamped up to at least
+/// `ROW_BAR_MIN_FRAC`, so a real but tiny contributor still paints a
+/// visible bar. A row with `damage == 0` (or negative, defensively) stays
+/// at exactly `0.0` — no floor for a row that did nothing.
 fn row_bar_frac(damage: i64, top_damage: i64) -> f32 {
-    if top_damage <= 0 {
+    if top_damage <= 0 || damage <= 0 {
         0.0
     } else {
-        (damage as f64 / top_damage as f64) as f32
+        let frac = (damage as f64 / top_damage as f64) as f32;
+        frac.max(ROW_BAR_MIN_FRAC)
     }
 }
 
@@ -3532,10 +3453,7 @@ mod tests {
                     tx_settings: &tx_settings,
                 },
                 &icons,
-                ChromeHandle {
-                    gesture: &mut WindowGesture::default(),
-                    collapse: &mut CollapseState::default(),
-                },
+                &mut WindowGesture::default(),
             );
         });
         let mut texts = Vec::new();
@@ -3670,10 +3588,7 @@ mod tests {
                     tx_settings: &tx_settings,
                 },
                 &icons,
-                ChromeHandle {
-                    gesture: &mut WindowGesture::default(),
-                    collapse: &mut CollapseState::default(),
-                },
+                &mut WindowGesture::default(),
             );
         });
         for clipped in &output.shapes {
@@ -3776,10 +3691,7 @@ mod tests {
                     tx_settings: &tx_settings,
                 },
                 &icons,
-                ChromeHandle {
-                    gesture: &mut WindowGesture::default(),
-                    collapse: &mut CollapseState::default(),
-                },
+                &mut WindowGesture::default(),
             );
         });
         let update = output
@@ -3857,10 +3769,7 @@ mod tests {
                     tx_settings: &tx_settings,
                 },
                 &icons,
-                ChromeHandle {
-                    gesture: &mut WindowGesture::default(),
-                    collapse: &mut CollapseState::default(),
-                },
+                &mut WindowGesture::default(),
             );
             interact_size_y = ui.spacing().interact_size.y;
             rendered_height = ui.min_rect().height();
@@ -4487,6 +4396,174 @@ mod tests {
             !called,
             "the writer must not run without a Screenshot event"
         );
+    }
+
+    // -- Share screenshot cropping (issue #96) -------------------------------
+
+    /// Issue #96 (PR #98 review): `pending_screenshot_bound` must be pinned
+    /// to the row count as of the frame the Share click fired on — reading
+    /// `self.snapshot` fresh when the async `Event::Screenshot` reply lands
+    /// would crop against a row count that no longer matches the pixels
+    /// actually captured (a player joining or dropping mid-encounter is
+    /// routine during a real round trip). Exercises `OverlayApp`'s own
+    /// field directly, not just the pure crop helpers, so a future
+    /// refactor that reintroduces a reply-time read would be caught here —
+    /// no egui round trip needed.
+    #[test]
+    fn pending_screenshot_bound_survives_a_later_snapshot_row_count_change() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(rx_snapshot, tx_command, tx_settings, Settings::default());
+
+        // What `OverlayApp::ui` does at the end of the frame the Share
+        // click fired on: stash *that* frame's row bound, computed from
+        // *that* frame's row count (3 rows).
+        app.snapshot = rows_test_snapshot(3);
+        let request_time_bound =
+            rows_content_bottom_y(50.0, app.snapshot.rows.len(), ROW_HEIGHT, 500.0);
+        app.pending_screenshot_bound = Some(request_time_bound);
+
+        // A player joins mid-encounter before the async reply lands — the
+        // row count changes underneath the pending request.
+        app.snapshot = rows_test_snapshot(8);
+
+        assert_eq!(
+            app.pending_screenshot_bound,
+            Some(request_time_bound),
+            "the pending bound must stay pinned to the request-time row \
+             count, not drift with the live snapshot"
+        );
+    }
+
+    /// Fewer/shorter populated rows than the scroll area's allocated height
+    /// must trim the bound to right after the last row, not the scroll
+    /// area's full height — no trailing empty background.
+    #[test]
+    fn rows_content_bottom_y_trims_trailing_empty_space() {
+        let bottom = rows_content_bottom_y(100.0, 3, 30.0, 500.0);
+        assert_eq!(bottom, 100.0 + 3.0 * 30.0);
+    }
+
+    /// More populated-row content than the scroll area shows (scrolled
+    /// off) must not push the bound past what the scroll area actually
+    /// rendered — that content was clipped out of the frame itself.
+    #[test]
+    fn rows_content_bottom_y_clamps_to_the_scroll_area_when_rows_overflow_it() {
+        let bottom = rows_content_bottom_y(100.0, 50, 30.0, 200.0);
+        assert_eq!(bottom, 100.0 + 200.0);
+    }
+
+    /// Zero populated rows must not add any height past the chrome.
+    #[test]
+    fn rows_content_bottom_y_is_just_the_chrome_with_no_rows() {
+        assert_eq!(rows_content_bottom_y(100.0, 0, 30.0, 500.0), 100.0);
+    }
+
+    /// The common case: converts a points bound to pixels via
+    /// `pixels_per_point` and stays within the image.
+    #[test]
+    fn screenshot_crop_height_px_scales_by_pixels_per_point() {
+        assert_eq!(screenshot_crop_height_px(200.0, 2.0, 1000), 400);
+    }
+
+    /// A stale bound taller than the actual captured image (e.g. the
+    /// window shrank between the frame that computed the bound and the
+    /// later frame the screenshot reply landed on) must clamp to the
+    /// image's real height, never index past it.
+    #[test]
+    fn screenshot_crop_height_px_clamps_to_the_image_height() {
+        assert_eq!(screenshot_crop_height_px(10_000.0, 1.0, 600), 600);
+    }
+
+    /// A non-positive bound (e.g. no bound stashed yet, so the crop falls
+    /// back to `0.0`) must crop to nothing rather than underflow.
+    #[test]
+    fn screenshot_crop_height_px_floors_a_non_positive_bound_to_zero() {
+        assert_eq!(screenshot_crop_height_px(0.0, 1.0, 600), 0);
+        assert_eq!(screenshot_crop_height_px(-5.0, 1.0, 600), 0);
+    }
+
+    /// PR #98 review (clippy `neg_cmp_op_on_partial_ord`): a NaN bound or
+    /// scale must floor to zero too, matching the original `!(x > 0.0)`
+    /// behavior for every input (NaN comparisons are always `false`, so the
+    /// negated form treated NaN as "not positive" — the rewritten
+    /// `partial_cmp`-based check must preserve exactly that, not just the
+    /// non-NaN cases).
+    #[test]
+    fn screenshot_crop_height_px_floors_a_nan_bound_or_scale_to_zero() {
+        assert_eq!(screenshot_crop_height_px(f32::NAN, 1.0, 600), 0);
+        assert_eq!(screenshot_crop_height_px(200.0, f32::NAN, 600), 0);
+        assert_eq!(screenshot_crop_height_px(f32::NAN, f32::NAN, 600), 0);
+    }
+
+    /// Issue #96 (PR #98 review): the crop must be driven by the row count
+    /// as of the frame the screenshot was actually *requested* on, not
+    /// whatever row count is current by the time the async reply is
+    /// handled — the row count is live combat data (a player joining or
+    /// dropping mid-encounter is routine) and can change during the round
+    /// trip. This exercises the pure crop helpers directly with two
+    /// different row counts standing in for "request time" and "reply
+    /// time", proving they produce different — and the request-time one is
+    /// the one that must be used.
+    #[test]
+    fn crop_uses_the_bound_captured_at_request_time_even_if_the_row_count_later_changes() {
+        let rows_top = 50.0;
+        let row_height = 20.0;
+        let rows_area_height = 500.0;
+        let pixels_per_point = 1.0;
+
+        // The frame the Share click fired on: 3 populated rows.
+        let request_time_bound = rows_content_bottom_y(rows_top, 3, row_height, rows_area_height);
+
+        // By the time the async reply lands, a player joined mid-encounter
+        // and the row count grew — recomputing from *that* would produce a
+        // different bound than what was actually captured.
+        let reply_time_bound = rows_content_bottom_y(rows_top, 8, row_height, rows_area_height);
+        assert_ne!(
+            request_time_bound, reply_time_bound,
+            "the test setup must actually exercise a row-count change"
+        );
+
+        let image = crop_test_image(4, 200);
+        let cropped = crop_screenshot_to_rows(&image, request_time_bound, pixels_per_point);
+
+        let expected_height =
+            screenshot_crop_height_px(request_time_bound, pixels_per_point, image.size[1]);
+        assert_eq!(cropped.size, [4, expected_height]);
+        assert_ne!(
+            cropped.size[1],
+            screenshot_crop_height_px(reply_time_bound, pixels_per_point, image.size[1]),
+            "must not crop as if it were computed from the reply-time row count"
+        );
+    }
+
+    fn crop_test_image(width: usize, height: usize) -> egui::ColorImage {
+        let pixels = (0..width * height)
+            .map(|i| egui::Color32::from_gray((i % 256) as u8))
+            .collect();
+        egui::ColorImage::new([width, height], pixels)
+    }
+
+    /// The primary case: trims the image down to the rows' bottom edge,
+    /// keeping every pixel above it and dropping every row below.
+    #[test]
+    fn crop_screenshot_to_rows_trims_below_the_bound() {
+        let image = crop_test_image(4, 10);
+        let cropped = crop_screenshot_to_rows(&image, 6.0, 1.0);
+        assert_eq!(cropped.size, [4, 6]);
+        assert_eq!(cropped.pixels, image.pixels[..4 * 6]);
+    }
+
+    /// When the computed bound reaches or exceeds the image's actual
+    /// height (content overflows the scroll area, or a stale bound), the
+    /// full capture is kept unmodified rather than degenerately cropped.
+    #[test]
+    fn crop_screenshot_to_rows_keeps_the_full_image_when_the_bound_is_not_smaller() {
+        let image = crop_test_image(4, 10);
+        let cropped = crop_screenshot_to_rows(&image, 1000.0, 1.0);
+        assert_eq!(cropped.size, image.size);
+        assert_eq!(cropped.pixels, image.pixels);
     }
 
     /// The reference drops the trailing " DPS"/" DMG" words in favor of the
@@ -5560,6 +5637,29 @@ mod tests {
         assert_eq!(row_bar_frac(500, -10), 0.0);
     }
 
+    /// Issue #97: a row doing real damage but far below the top row (e.g. a
+    /// support/healer next to a burst DPS class) must still paint a visible
+    /// sliver of bar rather than reading as if it did zero damage.
+    #[test]
+    fn row_bar_frac_floors_a_near_zero_positive_share_to_the_visible_minimum() {
+        // 1 out of 1,000,000 rounds to a fraction far below the floor.
+        assert_eq!(row_bar_frac(1, 1_000_000), ROW_BAR_MIN_FRAC);
+    }
+
+    /// The floor must never kick in for a row that truly did zero damage —
+    /// that row stays fully empty, not a fake sliver.
+    #[test]
+    fn row_bar_frac_stays_zero_for_zero_damage() {
+        assert_eq!(row_bar_frac(0, 1_000_000), 0.0);
+    }
+
+    /// A share already at or above the floor must pass through unchanged,
+    /// not get clamped down to the floor.
+    #[test]
+    fn row_bar_frac_leaves_a_share_already_above_the_floor_untouched() {
+        assert_eq!(row_bar_frac(500_000, 1_000_000), 0.5);
+    }
+
     /// The two quads must be contiguous (no gap, no overlap) and meet at the
     /// peak offset with the peak color on both sides of the seam.
     #[test]
@@ -6284,14 +6384,28 @@ mod tests {
     /// (`Response::fill_accesskit_node_common`), so this is what lets a test
     /// click a specific `draw_header_menu` item without that function
     /// handing back anything more than a `Ui` to paint into.
+    /// Matches a node's `label()` (what `Button`/`Checkbox`/interact-only
+    /// widgets like `menu_chevron` register via `WidgetInfo::labeled`) or,
+    /// failing that, its `value()` (where a plain `ui.label(...)` — a
+    /// `Role::Label` node — puts its text instead; see egui's
+    /// `Response::fill_widget_info`, which calls `set_value` rather than
+    /// `set_label` specifically for `Role::Label`).
     fn accessible_rect_for_label(update: &egui::accesskit::TreeUpdate, label: &str) -> egui::Rect {
         let bounds = update
             .nodes
             .iter()
             .find_map(|(_, node)| {
-                (node.label() == Some(label))
-                    .then(|| node.bounds())
-                    .flatten()
+                // A direct `==` rather than `.as_deref() == Some(label)`:
+                // accesskit's `label()`/`value()` return type differs by
+                // target (owned `String` on some, borrowed `&str` on
+                // others — `x86_64-pc-windows-gnu`, this crate's CI
+                // target, is one where `.as_deref()` is already a no-op
+                // and clippy's `needless_option_as_deref` rejects it), and
+                // `String`/`&str` both compare directly against `label: &str`.
+                (node.label().is_some_and(|s| s == label)
+                    || node.value().is_some_and(|s| s == label))
+                .then(|| node.bounds())
+                .flatten()
             })
             .unwrap_or_else(|| panic!("no accessible node labeled {label:?} painted"));
         egui::Rect::from_min_max(
@@ -6341,7 +6455,6 @@ mod tests {
         let (tx_command, rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
         let mut settings = Settings::default();
-        let mut collapse = CollapseState::default();
 
         // Frame 1: lay the menu out with no input, and read back where
         // AccessKit says "Close" actually painted — its rect isn't knowable
@@ -6356,8 +6469,6 @@ mod tests {
                     tx_settings: &tx_settings,
                 },
                 &icons,
-                &mut collapse,
-                40.0,
             );
         });
         let update = layout
@@ -6379,8 +6490,6 @@ mod tests {
                     tx_settings: &tx_settings,
                 },
                 &icons,
-                &mut collapse,
-                40.0,
             );
         });
         let close_commands = output
@@ -6401,6 +6510,165 @@ mod tests {
         assert!(
             close_commands.contains(&egui::ViewportCommand::Close),
             "Close must also ask the viewport to close: {close_commands:?}"
+        );
+    }
+
+    /// Regression coverage for issue #93's actual fix, which the test above
+    /// cannot see: it calls `draw_header_menu` directly, never through the
+    /// `egui::Popup::menu(&chevron_response).close_behavior(CloseOnClickOutside)`
+    /// wiring `draw_header` builds around it (~lines 473-477), so the
+    /// `ui.close()` calls on Minimize/Close are no-ops in that harness — a
+    /// popup that was never opened has nothing to close.
+    ///
+    /// This drives the real thing through `draw_header` across several
+    /// frames of the same `egui::Context` (memory persists across `run_ui`
+    /// calls the way it would across real app frames): open the chevron
+    /// menu with a genuine click, expand the Columns disclosure, click a
+    /// column checkbox, and confirm the popup is still open afterward — the
+    /// whole point of `CloseOnClickOutside` plus no `ui.close()` on that
+    /// path. Then click Close and confirm the popup closes (on the frame
+    /// after, since `Ui::close` only takes effect for the next frame's
+    /// `is_open` check) and the right command still goes out, even with the
+    /// popup now in the mix.
+    #[test]
+    fn header_menu_popup_stays_open_for_a_column_checkbox_but_closes_for_close() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        // The Columns disclosure section's own arrow (`show_toggle_button`)
+        // reads `openness()` once before this test's click toggles it and
+        // once more right after, both in the same frame — with the default
+        // nonzero `animation_time`, the second read still animates from
+        // the first read's now-stale timestamp with zero elapsed time, so
+        // it stays at 0.0 and the checkboxes never render that frame. A
+        // zero animation time makes `AnimationManager::animate_bool` snap
+        // straight to the target instead (its `elapsed / animation_time`
+        // divide-by-zero produces a non-finite value, which its own
+        // fallback resolves to the target), matching how instantly a real
+        // click should feel anyway.
+        ctx.global_style_mut(|style| style.animation_time = 0.0);
+        let icons = Icons::load(&ctx);
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(0);
+        let mut gesture = WindowGesture::default();
+
+        // Runs one frame of the real `draw_header` (chevron, popup wiring,
+        // and all) and hands back this frame's accessibility tree, the same
+        // ground truth `draw_header_menu_dispatches_close_to_the_right_command`
+        // reads Close's position from.
+        let mut frame = |mut input: egui::RawInput| -> egui::accesskit::TreeUpdate {
+            // A fixed, bounded screen every frame — the same reasoning as
+            // `header_painted_boxes`'s doc comment: without one, the
+            // popup's own best-alignment logic (there is nothing to align
+            // *inside*) has no stable anchor to measure against, and the
+            // chevron/menu paint at a different, arbitrary offset each
+            // frame, silently invalidating a position captured on an
+            // earlier frame.
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(default_inner_width(), default_inner_height()),
+            ));
+            let output = ctx.run_ui(input, |ui| {
+                draw_header(
+                    ui,
+                    &ctx,
+                    &snapshot,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    &mut gesture,
+                );
+            });
+            let update = output
+                .platform_output
+                .accesskit_update
+                .clone()
+                .expect("accesskit was enabled for this frame");
+            output.drop_without_applying_deltas();
+            update
+        };
+        let is_open = |update: &egui::accesskit::TreeUpdate| {
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Close"))
+        };
+
+        // Frame 1: closed header, find the chevron.
+        let update = frame(egui::RawInput::default());
+        assert!(!is_open(&update), "the menu must start closed");
+        let chevron_pos = accessible_rect_for_label(&update, "Menu").center();
+
+        // Frame 2: click the chevron. `Popup::menu`'s `open_memory` toggles
+        // and the popup paints in the very same frame (egui's `Popup::show`
+        // opens before deciding whether to render), so Columns is already
+        // visible here — collapsed, per its own `default_open(false)`. Its
+        // *position* is not trustworthy yet though: `Popup::show` runs the
+        // just-opened Area through a `sizing_pass` (no prior measured size
+        // to align against), which lays the content out differently from
+        // every later frame — so this frame only proves the menu opened.
+        let update = frame(click_at(chevron_pos));
+        assert!(is_open(&update), "clicking the chevron must open the menu");
+
+        // Frame 3: no new input, just letting the popup settle into its
+        // real, stable position now that a prior frame's size is on record.
+        let update = frame(egui::RawInput::default());
+        assert!(is_open(&update), "the menu must still be open once settled");
+        let columns_pos = accessible_rect_for_label(&update, "Columns").center();
+
+        // Frame 4: click Columns to expand its disclosure section.
+        let update = frame(click_at(columns_pos));
+        assert!(
+            is_open(&update),
+            "expanding Columns must not close the menu"
+        );
+        let first_column_label = ColumnKind::ALL[0].label();
+        let checkbox_pos = accessible_rect_for_label(&update, first_column_label).center();
+
+        // Frame 5: click a column checkbox. Issue #93's fix — no `ui.close()`
+        // on this path, plus the root popup's `CloseOnClickOutside` — means
+        // this must NOT dismiss the popup, unlike the old submenu flyout.
+        let update = frame(click_at(checkbox_pos));
+        assert!(
+            is_open(&update),
+            "a Columns checkbox click must leave the popup open"
+        );
+        assert!(
+            rx_command.try_recv().is_err(),
+            "a checkbox click must not dispatch a command"
+        );
+
+        // Frame 6: confirm it is still open on the frame after too — not
+        // just within the click frame itself.
+        let update = frame(egui::RawInput::default());
+        assert!(
+            is_open(&update),
+            "the popup must stay open on the frame after the checkbox click"
+        );
+        let close_pos = accessible_rect_for_label(&update, "Close").center();
+
+        // Frame 7: click Close. It calls `ui.close()` itself, so — unlike
+        // the checkbox — this must close the popup, and still dispatch the
+        // Quit command even though the click went through the real popup
+        // wiring this time, not a direct `draw_header_menu` call.
+        let _ = frame(click_at(close_pos));
+        assert_eq!(
+            rx_command.try_recv().expect("Close must send a command"),
+            UiCommand::Quit
+        );
+
+        // Frame 8: `Ui::close` only closes for the *next* frame's `is_open`
+        // check (the frame it's called on already painted before the close
+        // decision runs) — so the popup must be gone by now.
+        let update = frame(egui::RawInput::default());
+        assert!(
+            !is_open(&update),
+            "Close must actually dismiss the popup by the following frame"
         );
     }
 
@@ -6793,305 +7061,6 @@ mod tests {
         );
         let textures = counter_pill_textures(None);
         assert!(!textures.contains(&texture.id()));
-    }
-
-    // --- collapse to header, issue #54 -----------------------------------
-
-    /// The collapsed height *is* the header band — no second constant to
-    /// drift — and it is well under the normal minimum inner height, which
-    /// is exactly why the min-inner-size floor has to move with the state.
-    #[test]
-    fn a_collapsed_overlay_is_shorter_than_the_normal_minimum_height() {
-        let button_row = BUTTON_ROW_HEIGHT;
-        for has_subtitle in [false, true] {
-            let band = header_band_height(has_subtitle, button_row);
-            assert!(
-                band < MIN_INNER_SIZE.y,
-                "a {band}pt band (subtitle: {has_subtitle}) would not need the floor lowered"
-            );
-            assert!(band < default_inner_height());
-        }
-    }
-
-    /// The band — and therefore the collapsed height — is not a constant: a
-    /// dungeon subtitle appearing mid-collapse makes it taller, which is the
-    /// case `CollapseSync::Request` exists for.
-    #[test]
-    fn the_collapsed_height_depends_on_the_subtitle() {
-        let button_row = egui::Style::default().spacing.interact_size.y;
-        assert!(header_band_height(true, button_row) > header_band_height(false, button_row));
-    }
-
-    fn collapsed_at(requested: f32, settled: bool) -> Collapsed {
-        Collapsed {
-            restore_height: 488.0,
-            requested_height: requested,
-            settled,
-        }
-    }
-
-    /// Viewport commands are queued and applied later, so the frames between
-    /// asking for the collapsed height and getting it must not be read as
-    /// somebody else resizing the window.
-    #[test]
-    fn collapse_sync_waits_for_an_in_flight_resize_instead_of_expanding() {
-        assert_eq!(
-            collapse_sync(collapsed_at(40.0, false), 40.0, 488.0),
-            CollapseSync::Hold
-        );
-    }
-
-    #[test]
-    fn collapse_sync_settles_once_the_window_reaches_the_requested_height() {
-        assert_eq!(
-            collapse_sync(collapsed_at(40.0, false), 40.0, 40.0),
-            CollapseSync::Settle
-        );
-        // And stays put afterwards.
-        assert_eq!(
-            collapse_sync(collapsed_at(40.0, true), 40.0, 40.0),
-            CollapseSync::Hold
-        );
-    }
-
-    /// Issue #53's tray "Reset Window" puts the overlay back at the expanded
-    /// default size behind the app's back. A collapsed overlay must notice
-    /// and expand, or it would sit full-height painting nothing but a header.
-    #[test]
-    fn collapse_sync_expands_when_something_else_resizes_the_window() {
-        assert_eq!(
-            collapse_sync(collapsed_at(40.0, true), 40.0, default_inner_height()),
-            CollapseSync::Expand
-        );
-    }
-
-    /// A vertical drag-resize reaches the same branch, so pulling the bottom
-    /// edge of a collapsed overlay opens it.
-    #[test]
-    fn dragging_a_collapsed_overlay_taller_expands_it() {
-        assert_eq!(
-            collapse_sync(collapsed_at(40.0, true), 40.0, 120.0),
-            CollapseSync::Expand
-        );
-    }
-
-    /// Sub-point wobble under fractional DPI scaling is not a resize — the
-    /// same tolerance `GESTURE_EPSILON` buys the drag gestures.
-    #[test]
-    fn collapse_sync_tolerates_sub_point_height_wobble() {
-        assert_eq!(
-            collapse_sync(collapsed_at(40.0, true), 40.0, 40.4),
-            CollapseSync::Hold
-        );
-    }
-
-    /// A subtitle appearing while collapsed grows the band; the collapse
-    /// re-requests the new height rather than mistaking its own moved target
-    /// for somebody else's resize.
-    #[test]
-    fn collapse_sync_re_requests_when_the_band_changes_under_it() {
-        let button_row = egui::Style::default().spacing.interact_size.y;
-        let without = header_band_height(false, button_row);
-        let with = header_band_height(true, button_row);
-
-        assert_eq!(
-            collapse_sync(collapsed_at(without, true), with, without),
-            CollapseSync::Request(with)
-        );
-    }
-
-    /// The resize floor tracks the state: normal while expanded, lowered to
-    /// the collapsed height while collapsed — and only ever on the vertical
-    /// axis, since collapsing never touches the width.
-    #[test]
-    fn the_min_inner_size_floor_follows_the_collapse_state() {
-        let mut state = CollapseState::default();
-        assert_eq!(state.min_inner_size(), MIN_INNER_SIZE);
-
-        state.collapsed = Some(collapsed_at(40.0, true));
-        assert_eq!(state.min_inner_size(), egui::vec2(MIN_INNER_SIZE.x, 40.0));
-        assert!(state.min_inner_size().y < MIN_INNER_SIZE.y);
-    }
-
-    /// With the floor lowered, a purely horizontal drag on a collapsed
-    /// window keeps its collapsed height instead of being clamped back up to
-    /// the expanded 90pt minimum — which would silently expand it.
-    #[test]
-    fn a_horizontal_drag_does_not_clamp_a_collapsed_window_taller() {
-        let state = CollapseState {
-            collapsed: Some(collapsed_at(40.0, true)),
-        };
-        let start = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(400.0, 40.0));
-
-        let resized = resized_window_rect(
-            start,
-            egui::ResizeDirection::East,
-            egui::vec2(30.0, 0.0),
-            state.min_inner_size(),
-        );
-
-        assert_eq!(resized.height(), 40.0);
-        assert_eq!(resized.width(), 430.0);
-    }
-
-    /// Runs one frame with the window reporting an inner size of `size`,
-    /// calling `body` from inside it exactly like `OverlayApp::ui` does, and
-    /// returns every viewport command the frame queued.
-    fn collapse_frame(
-        state: &mut CollapseState,
-        size: egui::Vec2,
-        mut body: impl FnMut(&mut CollapseState, &egui::Context),
-    ) -> Vec<egui::ViewportCommand> {
-        let ctx = egui::Context::default();
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-            ..Default::default()
-        };
-        let output = ctx.run_ui(input, |ui| body(state, ui.ctx()));
-        let commands = output
-            .viewport_output
-            .get(&egui::ViewportId::ROOT)
-            .map(|viewport| viewport.commands.clone())
-            .unwrap_or_default();
-        output.drop_without_applying_deltas();
-        commands
-    }
-
-    fn inner_sizes(commands: &[egui::ViewportCommand]) -> Vec<egui::Vec2> {
-        commands
-            .iter()
-            .filter_map(|cmd| match cmd {
-                egui::ViewportCommand::InnerSize(size) => Some(*size),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn min_inner_sizes(commands: &[egui::ViewportCommand]) -> Vec<egui::Vec2> {
-        commands
-            .iter()
-            .filter_map(|cmd| match cmd {
-                egui::ViewportCommand::MinInnerSize(size) => Some(*size),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Collapsing asks for exactly the band height, at the unchanged width,
-    /// and lowers the OS floor to match — without that second command winit
-    /// would simply refuse the sub-minimum size.
-    #[test]
-    fn collapsing_asks_for_the_band_height_and_lowers_the_os_floor() {
-        let mut state = CollapseState::default();
-        let size = egui::vec2(432.0, 488.0);
-
-        let commands = collapse_frame(&mut state, size, |state, ctx| state.toggle(ctx, 40.0));
-
-        assert!(state.is_collapsed());
-        assert_eq!(inner_sizes(&commands), vec![egui::vec2(432.0, 40.0)]);
-        assert_eq!(
-            min_inner_sizes(&commands),
-            vec![egui::vec2(MIN_INNER_SIZE.x, 40.0)]
-        );
-    }
-
-    /// The round trip: collapsing remembers the height the window had, and
-    /// expanding restores exactly it — not the default, and not whatever the
-    /// collapsed window happened to measure.
-    #[test]
-    fn collapse_then_expand_round_trips_to_the_same_height() {
-        let mut state = CollapseState::default();
-        let expanded = egui::vec2(432.0, 313.0);
-
-        collapse_frame(&mut state, expanded, |state, ctx| state.toggle(ctx, 40.0));
-        assert!(state.is_collapsed());
-
-        // The window really is the band height by the time the chevron is
-        // clicked again — the pre-collapse height has to come from the state,
-        // not from the live window.
-        let commands = collapse_frame(&mut state, egui::vec2(432.0, 40.0), |state, ctx| {
-            state.toggle(ctx, 40.0)
-        });
-
-        assert!(!state.is_collapsed());
-        assert_eq!(inner_sizes(&commands), vec![expanded]);
-        assert_eq!(min_inner_sizes(&commands), vec![MIN_INNER_SIZE]);
-    }
-
-    /// The expand path restores the normal floor *before* asking for the
-    /// bigger size, so no intermediate state asks for a size the floor in
-    /// force would reject.
-    #[test]
-    fn expanding_raises_the_floor_before_it_asks_for_the_larger_size() {
-        let mut state = CollapseState::default();
-        collapse_frame(&mut state, egui::vec2(432.0, 488.0), |state, ctx| {
-            state.toggle(ctx, 40.0)
-        });
-
-        let commands = collapse_frame(&mut state, egui::vec2(432.0, 40.0), |state, ctx| {
-            state.toggle(ctx, 40.0)
-        });
-
-        let floor = commands
-            .iter()
-            .position(|cmd| matches!(cmd, egui::ViewportCommand::MinInnerSize(_)))
-            .expect("expanding must restore the floor");
-        let size = commands
-            .iter()
-            .position(|cmd| matches!(cmd, egui::ViewportCommand::InnerSize(_)))
-            .expect("expanding must resize the window");
-        assert!(floor < size);
-    }
-
-    /// Issue #53's "Reset Window" end to end: the tray command resizes the
-    /// window to the expanded default behind the app's back, and the next
-    /// `sync` expands — keeping the height the reset chose, and restoring the
-    /// normal floor rather than fighting it back down to the band.
-    #[test]
-    fn a_reset_window_while_collapsed_expands_and_keeps_the_reset_height() {
-        let mut state = CollapseState {
-            collapsed: Some(collapsed_at(40.0, true)),
-        };
-
-        let reset = egui::vec2(432.0, default_inner_height());
-        let commands = collapse_frame(&mut state, reset, |state, ctx| state.sync(ctx, 40.0));
-
-        assert!(!state.is_collapsed());
-        assert_eq!(min_inner_sizes(&commands), vec![MIN_INNER_SIZE]);
-        assert!(
-            inner_sizes(&commands).is_empty(),
-            "expanding on somebody else's resize must not overwrite their height"
-        );
-    }
-
-    /// `sync` is a no-op while expanded — it must not queue a resize on
-    /// every one of the overlay's ~10 frames a second. (Only the size
-    /// commands are inspected: egui queues chrome commands of its own for
-    /// every frame, and none of them are this module's business.)
-    #[test]
-    fn syncing_an_expanded_overlay_never_resizes_the_window() {
-        let mut state = CollapseState::default();
-        let commands = collapse_frame(&mut state, egui::vec2(432.0, 488.0), |state, ctx| {
-            state.sync(ctx, 40.0)
-        });
-        assert!(!state.is_collapsed());
-        assert!(inner_sizes(&commands).is_empty());
-        assert!(min_inner_sizes(&commands).is_empty());
-    }
-
-    /// A settled collapse holds still too, for the same reason — it must not
-    /// re-request the height it is already at.
-    #[test]
-    fn a_settled_collapse_never_re_requests_its_height() {
-        let mut state = CollapseState {
-            collapsed: Some(collapsed_at(40.0, true)),
-        };
-        let commands = collapse_frame(&mut state, egui::vec2(432.0, 40.0), |state, ctx| {
-            state.sync(ctx, 40.0)
-        });
-        assert!(state.is_collapsed());
-        assert!(inner_sizes(&commands).is_empty());
-        assert!(min_inner_sizes(&commands).is_empty());
     }
 
     // --- the chevron itself (issue #54) ----------------------------------

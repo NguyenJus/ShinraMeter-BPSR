@@ -164,7 +164,7 @@ WinDivert's LGPL-3.0 option is compatible.
   scalings) don't have to stretch a neighbouring frame. No other pixel data
   was changed.
 
-## Monster and scene name tables
+## Monster and scene name tables (community)
 
 - Files: `crates/meter/data/MonsterName.json`, `crates/meter/data/SceneName.json`
   (from `resonance-logs/resonance-logs`, GPL-3.0) and
@@ -176,6 +176,37 @@ WinDivert's LGPL-3.0 option is compatible.
 - License: GPL-3.0, matching this project's own licence
 - Not shipped as files: compiled into `crates/meter/src/tables.rs` by
   `scripts/gen-name-tables.py` at development time, then built into the
+  executable as Rust source.
+- These are the hand-checked, player-facing names, and the generator ranks them
+  *above* the BPSR-ZDPS tables below wherever the two disagree on an id.
+
+## Monster and scene name tables (BPSR-ZDPS)
+
+- Files: `crates/meter/data/MonsterTableNames.json`,
+  `crates/meter/data/SceneTableNames.json`,
+  `crates/meter/data/DungeonsTableNames.json`
+- Upstream: <https://github.com/Blue-Protocol-Source/BPSR-ZDPS> —
+  `BPSR-ZDPS/Data/MonsterTable.json`, `SceneTable.json`, `DungeonsTable.json`
+- Copyright (c) 2025 Blue-Protocol-Source
+- License: **MIT — note this differs from the GPL-3.0 of the community tables
+  above.** MIT is the more permissive of the two and imposes only the
+  attribution this section provides, so combining the two in a GPL-3.0-only
+  work is fine; the combined result is governed by this project's GPL-3.0-only
+  licence. BPSR-ZDPS states its licence once, at the repository root, with no
+  carve-out for `Data/`.
+- **Filtered, not verbatim.** Upstream these three files are roughly 6.5 MB,
+  0.6 MB and 1.1 MB of full row data — stats, drop tables, AI references and
+  asset paths. What is vendored here is only the `{id: name}` projection of
+  each (about 97 KB, 19 KB and 17 KB), produced by `filter_id_names` in
+  `scripts/gen-name-tables.py`; nothing else from those rows is copied into
+  this repository. Re-run `scripts/gen-name-tables.py --refresh` to reproduce
+  the filtering from upstream.
+- Added by issue #36 to backfill the ids the community tables do not cover:
+  they take `monster_name` from 216 to 3,094 ids and `scene_name` from 340 to
+  605, so far fewer encounters fall back to a raw `Monster #40010` /
+  `Scene #1201` placeholder in the header.
+- Not shipped as files: like the community tables, they are compiled into
+  `crates/meter/src/tables.rs` at development time and built into the
   executable as Rust source.
 
 ## Boss-monster id list
@@ -191,3 +222,9 @@ WinDivert's LGPL-3.0 option is compatible.
   of its own, so this id set is consulted at display time to decide whether
   the resolved target is a real boss worth naming, rather than a large trash
   pull.
+- Deliberately left as the small hand-checked list by issue #36's backfill.
+  That backfill grew `monster_name` more than tenfold, which grew the
+  population of trash `recompute_boss` can resolve a name for — so this gate
+  became more load-bearing, not less. The BPSR-ZDPS `MonsterTable.json` has no
+  trustworthy substitute for it: its `MonsterRank` field marks elites and
+  minibosses alongside raid bosses.

@@ -107,13 +107,16 @@ fn log_file_path_from(log_file: Option<&str>, appdata: Option<&str>) -> (PathBuf
     )
 }
 
-/// True once a log file has grown large enough to rotate.
-fn should_rotate(len: u64, max_bytes: u64) -> bool {
+/// True once a file has grown large enough to rotate. Shared with
+/// `crate::dump`'s rotation of the packet-inspection dump file (issue #87),
+/// so the two size-cap-and-rotate-to-`.1` behaviors stay identical.
+pub(crate) fn should_rotate(len: u64, max_bytes: u64) -> bool {
     len >= max_bytes
 }
 
-/// The `<path>.1` a rotation moves `path` to.
-fn rotated_path(path: &Path) -> PathBuf {
+/// The `<path>.1` a rotation moves `path` to. Shared with `crate::dump` —
+/// see [`should_rotate`].
+pub(crate) fn rotated_path(path: &Path) -> PathBuf {
     let mut rotated = path.as_os_str().to_owned();
     rotated.push(".1");
     PathBuf::from(rotated)
