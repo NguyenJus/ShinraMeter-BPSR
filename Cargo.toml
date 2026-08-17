@@ -19,6 +19,16 @@ raw-window-handle = "0.6"
 embed-resource = "3"
 eframe = "0.36"
 egui = "0.36"
+# Depended on directly only for `set_no_redirection_bitmap` (issue #89); eframe
+# pulls the same crate in transitively, and the `[patch.crates-io]` entry below
+# redirects both to the vendored fork. `default-features = false` so this entry
+# adds nothing to eframe's own feature selection — cargo unions the two, and we
+# want eframe's set verbatim, not eframe's set plus egui-winit's defaults.
+egui-winit = { version = "0.36", default-features = false }
+# `enumerate_adapters` (the DX12 probe in `crates/app/src/main.rs`) is async,
+# and this is a plain `fn main` with no runtime. pollster is already in the
+# dependency graph via eframe, so this costs no extra compilation.
+pollster = "1"
 arboard = { version = "3.6", features = ["image-data"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 crossbeam-channel = "0.5"
@@ -30,3 +40,25 @@ bpsr-protocol = { path = "crates/protocol" }
 bpsr-meter = { path = "crates/meter" }
 bpsr-capture = { path = "crates/capture" }
 bpsr-test-support = { path = "crates/test-support" }
+
+# Issue #89: the overlay paints flat gray (#454548) at startup because DWM
+# allocates an opaque, white-initialized GDI redirection surface for the window
+# at `CreateWindowEx` and composites wgpu's premultiplied-alpha swapchain over
+# *that* instead of over the desktop. The cure is `WS_EX_NOREDIRECTIONBITMAP`,
+# which Windows honors only at `CreateWindowEx` — and `CreateWindowEx` is
+# reached through winit's `WindowAttributes`, which egui-winit builds and
+# eframe never exposes. There is no seam in unmodified eframe 0.36.1 to inject
+# the flag, so egui-winit is vendored with a single opt-in added. `eframe`'s own
+# transitive `egui-winit 0.36.1` dependency is redirected here too, which is the
+# whole point: the patched copy must be the one that creates eframe's window.
+#
+# Verify with `cargo tree -i egui-winit` — it must report the path source, not
+# `registry+https://github.com/rust-lang/crates.io-index`.
+#
+# Note it is *not* added to `members` above. A patched path dependency that
+# isn't a member is built only with the features eframe and the app request,
+# and is skipped by `cargo fmt --all` and `cargo clippy --workspace` — so
+# vendored upstream code neither drags extra crates into the lockfile nor has
+# to be reformatted/relinted to this repo's taste.
+[patch.crates-io]
+egui-winit = { path = "third_party/egui-winit" }

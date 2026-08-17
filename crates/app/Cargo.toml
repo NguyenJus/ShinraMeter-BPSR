@@ -11,6 +11,14 @@ path = "src/main.rs"
 [dependencies]
 eframe = { workspace = true }
 egui = { workspace = true }
+# Issue #89: only for `egui_winit::set_no_redirection_bitmap`, the opt-in added
+# by the vendored fork in `third_party/egui-winit` (see the `[patch.crates-io]`
+# entry in the workspace manifest). eframe re-exports neither the crate nor the
+# function, so `main.rs` has to name it directly.
+egui-winit = { workspace = true }
+# Issue #89: blocks on `wgpu::Instance::enumerate_adapters` for the DX12 probe
+# in `main.rs`.
+pollster = { workspace = true }
 arboard = { workspace = true }
 image = { workspace = true }
 crossbeam-channel = { workspace = true }

@@ -47,6 +47,84 @@ fn names_cache_path() -> PathBuf {
     path
 }
 
+/// Issue #89: the wgpu configuration a *genuinely* transparent overlay needs on
+/// Windows, or `None` when this machine can't provide it.
+///
+/// # The bug
+///
+/// The overlay opens as a transparent, undecorated, always-on-top window. DWM
+/// allocates an opaque GDI *redirection surface* for such a window at
+/// `CreateWindowEx`, sized to the window and initialized white; wgpu presents
+/// with `alpha_mode: PreMultiplied`, so DWM blends the swapchain over that
+/// white surface rather than over the desktop. The panel fill (18,18,22,200)
+/// premultiplied over white lands on exactly the flat #454548 gray users
+/// reported. Only area the window is later *grown* into lacks a redirection
+/// surface, which is why dragging the edge appeared to "fix" the overlay one
+/// freshly exposed strip at a time.
+///
+/// # The fix, and why it is all-or-nothing
+///
+/// `WS_EX_NOREDIRECTIONBITMAP` stops the surface from ever existing, but three
+/// facts make it a package deal rather than a one-line flag:
+///
+/// 1. Windows honors the flag **only** at `CreateWindowEx`. Setting it later
+///    with `SetWindowLongPtrW(GWL_EXSTYLE)` is silently ignored (measured on
+///    the live window: zero pixels changed). Hence the vendored egui-winit in
+///    `third_party/egui-winit` — see `set_no_redirection_bitmap` there.
+/// 2. DXGI refuses `CreateSwapChainForHwnd` on a window carrying the flag, so
+///    it must be paired with the DirectComposition presentation path
+///    ([`wgpu::Dx12SwapchainKind::DxgiFromVisual`], which presents through an
+///    `IDCompositionVisual` instead).
+/// 3. That path is DX12-only. Vulkan is assumed unable to present to a
+///    no-redirection window at all, so the flag must never be set unless the
+///    DX12 backend is the one actually in use — which is why this pins
+///    [`wgpu::Backends::DX12`] rather than merely preferring it.
+///
+/// # Degradation
+///
+/// Returning `None` leaves `NativeOptions::wgpu_options` at its default and
+/// leaves the egui-winit opt-in untouched, i.e. exactly today's behaviour:
+/// wgpu picks a backend as it always has and the overlay opens with the old
+/// gray-until-resized startup. A machine without a DX12 adapter (a non-Windows
+/// dev build, a stripped-down VM, an exotic driver setup) must still *launch* —
+/// a cosmetic fix is never worth a failure to start.
+fn dx12_composition_setup() -> Option<eframe::WgpuConfiguration> {
+    use eframe::egui_wgpu::{WgpuSetup, wgpu};
+
+    // A throwaway instance restricted to DX12: if it enumerates nothing, this
+    // machine has no DX12 adapter and the whole scheme is off the table. Cheap
+    // enough to do unconditionally at startup, and far safer than assuming
+    // "Windows implies DX12". `enumerate_adapters` is async even on native
+    // (wgpu 30), but the native future is already resolved, so `block_on`
+    // returns immediately rather than parking.
+    let probe = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::DX12,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    if pollster::block_on(probe.enumerate_adapters(wgpu::Backends::DX12)).is_empty() {
+        return None;
+    }
+
+    let mut wgpu_options = eframe::WgpuConfiguration::default();
+    // `WgpuSetup::Existing` would mean the caller already built an instance and
+    // device, which `eframe::WgpuConfiguration::default()` never does — but
+    // match rather than assume, and treat the impossible arm as "no DX12
+    // configuration available" instead of panicking.
+    let WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup else {
+        log::warn!(
+            "eframe's default wgpu setup is no longer `CreateNew`; skipping the issue #89 DirectComposition configuration"
+        );
+        return None;
+    };
+    create_new.instance_descriptor.backends = wgpu::Backends::DX12;
+    create_new
+        .instance_descriptor
+        .backend_options
+        .dx12
+        .presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
+    Some(wgpu_options)
+}
+
 fn main() -> eframe::Result {
     // `env_logger::init()` alone defaults to `error`-only and, since this
     // binary carries `windows_subsystem = "windows"`, has no console for
@@ -95,8 +173,30 @@ fn main() -> eframe::Result {
     // constants stay private and the two can't drift apart.
     let default_inner_size = ui::viewport(None).inner_size;
 
+    // Issue #89. Both halves of the transparency fix are decided here, before
+    // any window exists, because both are creation-time-only: the wgpu backend
+    // choice is baked into the instance eframe builds, and
+    // `WS_EX_NOREDIRECTIONBITMAP` is baked into `CreateWindowEx`. The two must
+    // move together — the flag without DirectComposition gives a window DXGI
+    // refuses to create a swapchain for, i.e. an overlay that never presents —
+    // so the opt-in is flipped only inside the `Some` arm, never speculatively.
+    let dx12_setup = dx12_composition_setup();
+    if dx12_setup.is_some() {
+        egui_winit::set_no_redirection_bitmap(true);
+        log::info!(
+            "DX12 adapter found: opening the overlay with WS_EX_NOREDIRECTIONBITMAP and DirectComposition presentation (issue #89)"
+        );
+    } else {
+        log::info!(
+            "no DX12 adapter: using eframe's default wgpu setup; the overlay may paint opaque until resized (issue #89)"
+        );
+    }
+
     let native_options = eframe::NativeOptions {
         viewport: ui::viewport(settings.window_position),
+        // `unwrap_or_default()` is precisely "change nothing": it is the same
+        // value `NativeOptions::default()` would have put here.
+        wgpu_options: dx12_setup.unwrap_or_default(),
         ..Default::default()
     };
 

@@ -135,15 +135,27 @@ pub fn disable_aero_snap(cc: &eframe::CreationContext<'_>) {
         return;
     }
 
-    // A `GWL_STYLE` change alone doesn't make DWM recompute the window's
-    // frame — Win32 requires an explicit `SWP_FRAMECHANGED` `SetWindowPos`
-    // for that. Without this, DWM keeps compositing the client area
-    // against its own opaque redirection surface instead of honoring the
-    // per-pixel alpha winit set up via `DwmEnableBlurBehindWindow`, so the
-    // whole window paints opaque gray at startup until something else
-    // (e.g. a resize) forces a frame update. `SWP_NOMOVE | SWP_NOSIZE`
-    // means this call only asks for the frame-change side effect, not an
-    // actual move/resize, so the position/size arguments are ignored.
+    // A `GWL_STYLE` change alone doesn't take effect — Win32 requires an
+    // explicit `SWP_FRAMECHANGED` `SetWindowPos` before the window manager
+    // re-reads the style bits. That, and *only* that, is what this call is
+    // for: it commits the `WS_MAXIMIZEBOX` clear above, which is what
+    // actually disables Aero Snap on drag.
+    //
+    // NOT the transparency fix, despite what this comment used to claim.
+    // Issue #89 measured it directly: issuing this exact `SetWindowPos` on
+    // the live window changes zero pixels, as do `RedrawWindow`, hide/show,
+    // minimize/restore and re-applying `DwmEnableBlurBehindWindow`. The
+    // startup gray is DWM compositing wgpu's premultiplied-alpha swapchain
+    // over the opaque, white-initialized GDI redirection surface it
+    // allocated at `CreateWindowEx` — a surface no post-creation call can
+    // remove, which is why the real fix (`WS_EX_NOREDIRECTIONBITMAP` plus
+    // DirectComposition presentation) lives in `main.rs` and the vendored
+    // `third_party/egui-winit`, and why this call still has to stay: the
+    // Aero Snap workaround above is inert without it.
+    //
+    // `SWP_NOMOVE | SWP_NOSIZE` means this call only asks for the
+    // frame-change side effect, not an actual move/resize, so the
+    // position/size arguments are ignored.
     //
     // Wrapped in `app_driven_reposition` like every other direct
     // `SetWindowPos` in this crate. The wrapper is inert *today* — this runs
@@ -167,7 +179,7 @@ pub fn disable_aero_snap(cc: &eframe::CreationContext<'_>) {
     });
     if !framechanged.as_bool() {
         log::warn!(
-            "SetWindowPos(SWP_FRAMECHANGED) failed; the window may keep painting opaque until resized"
+            "SetWindowPos(SWP_FRAMECHANGED) failed; the WS_MAXIMIZEBOX clear may not have taken effect and Aero Snap may still trigger on drag"
         );
     }
 
@@ -191,22 +203,30 @@ pub fn disable_aero_snap(_cc: &eframe::CreationContext<'_>) {}
 #[cfg(windows)]
 static OVERLAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
-/// Issue #74: forces DWM to recompute the overlay's frame, the same
-/// `SWP_FRAMECHANGED` `SetWindowPos` `disable_aero_snap` issues once at
-/// startup — see that function's comment for *why* this is needed at all
-/// (DWM keeps compositing against its opaque redirection surface, ignoring
-/// the per-pixel alpha `DwmEnableBlurBehindWindow` set up, until something
-/// forces this recompute).
+/// Issue #74: asks Windows to recompute the overlay's frame after an
+/// app-driven resize, via the same `SWP_FRAMECHANGED` `SetWindowPos`
+/// `disable_aero_snap` issues once at startup.
 ///
-/// Since issue #11's rework, every app-driven resize after startup
-/// (`ui.rs`'s manual drag-resize and the header collapse/expand) goes
-/// through `ViewportCommand::OuterPosition`/`InnerSize`/`MinInnerSize`
-/// instead of a raw `SetWindowPos`, so nothing after startup ever re-issued
-/// `SWP_FRAMECHANGED` — leaving the header opaque gray until some other
-/// resize happened to force a recompute. This is the call those `ui.rs`
-/// sites make once their resize has actually landed, using the `HWND`
-/// `disable_aero_snap` cached in `OVERLAY_HWND` above rather than a handle
-/// of their own (they don't have one).
+/// NOT the transparency fix. Issue #74 added this on the theory that
+/// `SWP_FRAMECHANGED` is what makes DWM honor per-pixel alpha, and that the
+/// header stayed opaque gray because nothing re-issued it after a resize.
+/// Issue #89 disproved that: this call changes zero pixels on the live
+/// window, and the startup gray was DWM compositing wgpu's
+/// premultiplied-alpha swapchain over the opaque GDI redirection surface it
+/// allocated at `CreateWindowEx` — see `disable_aero_snap` above and the
+/// real fix in `main.rs` / `third_party/egui-winit`. What it *does* do is
+/// force a frame/non-client recompute, which remains the correct thing to
+/// do after a resize the window manager didn't drive itself (since issue
+/// #11's rework, `ui.rs`'s manual drag-resize and the header
+/// collapse/expand go through
+/// `ViewportCommand::OuterPosition`/`InnerSize`/`MinInnerSize`, never a raw
+/// `SetWindowPos`, so Win32 is never told the frame moved).
+///
+/// Kept, rather than deleted along with the theory, because it is cheap,
+/// side-effect-free under the no-op flags below, and the honest state of
+/// knowledge is "harmless and probably right", not "proven useless". It
+/// uses the `HWND` `disable_aero_snap` cached in `OVERLAY_HWND` above
+/// rather than a handle of its own — the `ui.rs` call sites don't have one.
 ///
 /// `SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE` means this
 /// changes nothing but the frame, exactly like `disable_aero_snap`'s own
@@ -254,7 +274,7 @@ pub fn force_frame_recompute() {
     });
     if !framechanged.as_bool() {
         log::warn!(
-            "SetWindowPos(SWP_FRAMECHANGED) failed after an app-driven resize; the window may keep painting opaque"
+            "SetWindowPos(SWP_FRAMECHANGED) failed after an app-driven resize; the window's frame may be stale"
         );
     }
 }
