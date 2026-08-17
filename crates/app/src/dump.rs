@@ -242,19 +242,30 @@ fn run_writer(rx: Receiver<Record>, path: &Path, max_bytes: u64) {
         written += json.len() as u64 + 1; // +1 for the trailing newline
         if should_rotate(written, max_bytes) {
             let _ = out.flush();
-            match rotate(path) {
-                Some(file) => {
-                    out = BufWriter::new(file);
-                    written = 0;
-                }
-                None => {
-                    // Best-effort, like `logging::Tee::rotate`: retried once
-                    // per `max_bytes` rather than on every subsequent record.
-                }
-            }
+            let rotated = rotate(path);
+            (out, written) = rotation_outcome(out, rotated);
         }
     }
     let _ = out.flush();
+}
+
+/// Applies one rotation attempt's outcome to the writer's live file and byte
+/// count. `Some(file)` (success) swaps in the freshly-rotated file with a
+/// zeroed count. `None` (failure, already logged by [`rotate`]) keeps
+/// writing to the same `current` file but *also* zeroes the count — mirrors
+/// `logging::Tee::rotate`'s unconditional `self.written = 0` — so a
+/// persistent rotation failure (locked `.1`, permission denial, a
+/// read-only/full volume) is retried once per `max_bytes` of subsequent
+/// writes rather than on every single record. Without this reset on
+/// failure, `written` would stay pinned at or above `max_bytes` forever
+/// once rotation starts failing, and every later record would retry the
+/// failing rename and log a warning — a per-record log-spam storm instead
+/// of the intended once-per-`max_bytes` backoff.
+fn rotation_outcome(current: BufWriter<File>, rotated: Option<File>) -> (BufWriter<File>, u64) {
+    match rotated {
+        Some(file) => (BufWriter::new(file), 0),
+        None => (current, 0),
+    }
 }
 
 /// Renames `path` to `<path>.1` (replacing any previous `.1`) and reopens
@@ -529,6 +540,40 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&rotated);
+    }
+
+    /// Regression test for the review finding on PR #99: the failure arm
+    /// used to leave `written` untouched, so once rotation started failing
+    /// (locked `.1`, permission denial, a read-only/full volume) *every*
+    /// subsequent record would retry the failing rename and warn, instead
+    /// of the documented once-per-`max_bytes` backoff that
+    /// `logging::Tee::rotate` gets by unconditionally zeroing
+    /// `self.written`. Both arms must reset the count.
+    #[test]
+    fn rotation_outcome_resets_written_on_success_and_on_failure() {
+        let success_path = temp_path("rotation-outcome-success");
+        let out = BufWriter::new(File::create(&success_path).unwrap());
+        let fresh_path = temp_path("rotation-outcome-fresh");
+        let fresh_file = File::create(&fresh_path).unwrap();
+
+        let (_out, written) = rotation_outcome(out, Some(fresh_file));
+
+        assert_eq!(written, 0, "a successful rotation resets written to 0");
+        let _ = fs::remove_file(&success_path);
+        let _ = fs::remove_file(&fresh_path);
+
+        let failure_path = temp_path("rotation-outcome-failure");
+        let out = BufWriter::new(File::create(&failure_path).unwrap());
+
+        let (_out, written) = rotation_outcome(out, None);
+
+        assert_eq!(
+            written, 0,
+            "a failed rotation must also reset written to 0, mirroring \
+             logging::Tee::rotate, so the failing rename is retried once \
+             per max_bytes rather than on every subsequent record"
+        );
+        let _ = fs::remove_file(&failure_path);
     }
 
     /// A dump file already at or above the threshold at process start is
