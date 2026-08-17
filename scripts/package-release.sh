@@ -47,6 +47,7 @@ for tree in classes imagines; do
   cp -R "$src/." "$dist_dir/assets/$tree/"
 done
 
+rm -f "$repo_root/$zip_name"
 (
   cd "$dist_dir"
   zip -r "$repo_root/$zip_name" .
