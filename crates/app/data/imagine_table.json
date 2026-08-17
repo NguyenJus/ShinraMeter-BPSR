@@ -1,0 +1,604 @@
+{
+  "_comment": [
+    "Curated SkillId -> equipped-Imagine table (issue #33). Hand-curated; do not",
+    "regenerate blindly. Consumed by scripts/prep-imagine-icons.py and",
+    "scripts/gen-imagine-table.py. See docs/packet-inspection.md.",
+    "",
+    "Derived from BPSR-ZDPS Data/SkillTable.json by taking every row whose",
+    "SlotPositionId contains 7 or 8 (the reference's IsImagineSlot() predicate,",
+    "DataTypes/SkillTable.cs:137-150), which yields 125 rows, then excluding 19",
+    "false positives by hand (see _excluded).",
+    "",
+    "There is NO data-native predicate that reproduces this list: slotType,",
+    "slotPassiveType and slotPositionId are identical (0 / 0 / [7,8]) across real",
+    "Imagines and false positives alike, and skillType overlaps. An icon-path",
+    "heuristic also fails - ids 2350, 2351, 2900370 and 2900570 carry genuine",
+    "skill_aoyi icons but are not Imagines.",
+    "",
+    "IDENTITY IS THE ICON BASENAME, NOT THE NAME.",
+    "",
+    "Ids 3901-3987 are the canonical Imagine set: 83 ids covering 81 distinct",
+    "icons and 81 distinct names, with icon and name bijective - no canonical",
+    "icon serves two names. (3982/3986 and 3983/3987 are exact duplicate pairs,",
+    "same icon and same name.) The remaining 23 ids are variants, and every one",
+    "of their icons already appears in the canonical set - there are zero orphan",
+    "icons. So a variant is always another id for a canonical Imagine.",
+    "",
+    "Three variants disagree with their canonical name and must NOT be treated as",
+    "separate Imagines: 102651 'Boar Knight' and 102655 'Boar Impact!' are both",
+    "the Boar Imagine ('Stunt! Boarrier Rush'), and 2002840 'Arcane! Swift Vortex'",
+    "is 'Arcane! Meteor Shower'. Deduplicating by name would let a single equipped",
+    "Imagine occupy both of a player's two slots. Deduplicate by icon, and display",
+    "the canonical (39xx) name.",
+    "",
+    "All 106 ids are kept rather than just the canonical 83, because no packet",
+    "capture exists to confirm whether the wire carries canonical or variant ids.",
+    "Matching both is the safe choice; they collapse to the same identity anyway."
+  ],
+  "_excluded": {
+    "talent-passive stubs (untranslated placeholder name, talent_passive icons)": [
+      3000,
+      3001,
+      3002,
+      3301,
+      3302,
+      3303,
+      3601,
+      3602,
+      3603,
+      3604,
+      3605,
+      706103
+    ],
+    "non-player abilities (dungeon boss, vehicle, monster howls)": [
+      4310,
+      102659,
+      2350,
+      2351
+    ],
+    "stand-in cosmetic entrance effects": [
+      2900270,
+      2900370,
+      2900570
+    ]
+  },
+  "_counts": {
+    "slot_7_or_8_rows": 125,
+    "excluded": 19,
+    "imagines": 106,
+    "distinct_names": 84,
+    "distinct_icons": 81
+  },
+  "imagines": [
+    {
+      "id": 3901,
+      "name": "Arcane! Flame Roar",
+      "icon": "skill_aoyi_skill_icon_017"
+    },
+    {
+      "id": 3902,
+      "name": "Arcane! Thunderfall Grasp",
+      "icon": "skill_aoyi_skill_icon_014"
+    },
+    {
+      "id": 3903,
+      "name": "Arcane! Blazing Axe",
+      "icon": "skill_aoyi_skill_icon_018"
+    },
+    {
+      "id": 3904,
+      "name": "Stunt! Super Critical",
+      "icon": "skill_aoyi_skill_icon_026"
+    },
+    {
+      "id": 3905,
+      "name": "Stunt! Boarrier Rush",
+      "icon": "skill_aoyi_skill_icon_001"
+    },
+    {
+      "id": 3906,
+      "name": "Arcane! Frostquake",
+      "icon": "skill_aoyi_skill_icon_015"
+    },
+    {
+      "id": 3907,
+      "name": "Stunt! Falling Star",
+      "icon": "skill_aoyi_skill_icon_008"
+    },
+    {
+      "id": 3908,
+      "name": "Arcane! Pulse Benediction",
+      "icon": "skill_aoyi_skill_icon_012"
+    },
+    {
+      "id": 3909,
+      "name": "Stunt! Fox Assault",
+      "icon": "skill_aoyi_skill_icon_011"
+    },
+    {
+      "id": 3910,
+      "name": "Stunt! Chaotic Barrage",
+      "icon": "skill_aoyi_skill_icon_009"
+    },
+    {
+      "id": 3911,
+      "name": "Arcane! Heart of Flame",
+      "icon": "skill_aoyi_skill_icon_042"
+    },
+    {
+      "id": 3913,
+      "name": "Stunt! Electro Bomb",
+      "icon": "skill_aoyi_skill_icon_010"
+    },
+    {
+      "id": 3914,
+      "name": "Stunt! Blade Sweep",
+      "icon": "skill_aoyi_skill_icon_019"
+    },
+    {
+      "id": 3915,
+      "name": "Stunt! Frenzied Shot",
+      "icon": "skill_aoyi_skill_icon_020"
+    },
+    {
+      "id": 3916,
+      "name": "Stunt! Piercing Arrow",
+      "icon": "skill_aoyi_skill_icon_021"
+    },
+    {
+      "id": 3917,
+      "name": "Stunt! Heavy Slash",
+      "icon": "skill_aoyi_skill_icon_022"
+    },
+    {
+      "id": 3918,
+      "name": "Arcane! Shadow of the Fox",
+      "icon": "skill_aoyi_skill_icon_023"
+    },
+    {
+      "id": 3919,
+      "name": "Arcane! Assault Turret",
+      "icon": "skill_aoyi_skill_icon_024"
+    },
+    {
+      "id": 3920,
+      "name": "Arcane! Blessing of Life",
+      "icon": "skill_aoyi_skill_icon_013"
+    },
+    {
+      "id": 3921,
+      "name": "Arcane! Time Decree",
+      "icon": "skill_aoyi_skill_icon_016"
+    },
+    {
+      "id": 3922,
+      "name": "Arcane! Flash Execution",
+      "icon": "skill_aoyi_skill_icon_025"
+    },
+    {
+      "id": 3923,
+      "name": "Arcane! Furious Hammer",
+      "icon": "skill_aoyi_skill_icon_005"
+    },
+    {
+      "id": 3924,
+      "name": "Stunt! Gale of Silence",
+      "icon": "skill_aoyi_skill_icon_027"
+    },
+    {
+      "id": 3925,
+      "name": "Stunt! Invisible Impact",
+      "icon": "skill_aoyi_skill_icon_028"
+    },
+    {
+      "id": 3926,
+      "name": "Arcane! Meteor Shower",
+      "icon": "skill_aoyi_skill_icon_029"
+    },
+    {
+      "id": 3927,
+      "name": "Stunt! Roar Command",
+      "icon": "skill_aoyi_skill_icon_030"
+    },
+    {
+      "id": 3928,
+      "name": "Stunt! Predator Slash",
+      "icon": "skill_aoyi_skill_icon_031"
+    },
+    {
+      "id": 3929,
+      "name": "Stunt! Shell Defense",
+      "icon": "skill_aoyi_skill_icon_032"
+    },
+    {
+      "id": 3930,
+      "name": "Stunt! Earth Shield",
+      "icon": "skill_aoyi_skill_icon_033"
+    },
+    {
+      "id": 3931,
+      "name": "Arcane! Shrine Field",
+      "icon": "skill_aoyi_skill_icon_034"
+    },
+    {
+      "id": 3932,
+      "name": "Stunt! Flamewheel Dance",
+      "icon": "skill_aoyi_skill_icon_035"
+    },
+    {
+      "id": 3933,
+      "name": "Stunt! Intimidating Roar",
+      "icon": "skill_aoyi_skill_icon_036"
+    },
+    {
+      "id": 3934,
+      "name": "Stunt! Blink Ambush",
+      "icon": "skill_aoyi_skill_icon_037"
+    },
+    {
+      "id": 3935,
+      "name": "Arcane! Thunder Roar",
+      "icon": "skill_aoyi_skill_icon_038"
+    },
+    {
+      "id": 3936,
+      "name": "Stunt! Water of Silence",
+      "icon": "skill_aoyi_skill_icon_039"
+    },
+    {
+      "id": 3937,
+      "name": "Stunt! Thunder Suppress",
+      "icon": "skill_aoyi_skill_icon_040"
+    },
+    {
+      "id": 3938,
+      "name": "Arcane! Cocoon Tech",
+      "icon": "skill_aoyi_skill_icon_041"
+    },
+    {
+      "id": 3939,
+      "name": "Stunt! Lightning Orb",
+      "icon": "skill_aoyi_skill_icon_043"
+    },
+    {
+      "id": 3940,
+      "name": "Stunt! Whirlwind Strike",
+      "icon": "skill_aoyi_skill_icon_044"
+    },
+    {
+      "id": 3941,
+      "name": "Stunt! Transform into Bee",
+      "icon": "skill_aoyi_skill_icon_045"
+    },
+    {
+      "id": 3942,
+      "name": "Arcane! Poison Explosion",
+      "icon": "skill_aoyi_skill_icon_046"
+    },
+    {
+      "id": 3943,
+      "name": "Arcane! Infernal Thrust",
+      "icon": "skill_aoyi_skill_icon_047"
+    },
+    {
+      "id": 3944,
+      "name": "Arcane! Azure Gale",
+      "icon": "skill_aoyi_skill_icon_048"
+    },
+    {
+      "id": 3945,
+      "name": "Arcane! Silent Tide",
+      "icon": "skill_aoyi_skill_icon_049"
+    },
+    {
+      "id": 3946,
+      "name": "Arcane! Goblin March",
+      "icon": "skill_aoyi_skill_icon_050"
+    },
+    {
+      "id": 3947,
+      "name": "Stunt! Spiral Severance",
+      "icon": "skill_aoyi_skill_icon_051"
+    },
+    {
+      "id": 3948,
+      "name": "Arcane! Divine Reliance",
+      "icon": "skill_aoyi_skill_icon_052"
+    },
+    {
+      "id": 3949,
+      "name": "Arcane! Illusion Resonance",
+      "icon": "skill_aoyi_skill_icon_053"
+    },
+    {
+      "id": 3950,
+      "name": "Arcane! Allscape Sublimation",
+      "icon": "skill_aoyi_skill_icon_055"
+    },
+    {
+      "id": 3951,
+      "name": "Arcane! Guardian's Boundary",
+      "icon": "skill_aoyi_skill_icon_054"
+    },
+    {
+      "id": 3952,
+      "name": "Arcane! Blazing Flames",
+      "icon": "skill_aoyi_skill_icon_058"
+    },
+    {
+      "id": 3953,
+      "name": "Arcane! Peerless Thrust",
+      "icon": "skill_aoyi_skill_icon_063"
+    },
+    {
+      "id": 3954,
+      "name": "Arcane! Phantom Ambush",
+      "icon": "skill_aoyi_skill_icon_068"
+    },
+    {
+      "id": 3955,
+      "name": "Arcane! Cabbage Hammer",
+      "icon": "skill_aoyi_skill_icon_066"
+    },
+    {
+      "id": 3956,
+      "name": "Arcane! Flame Spirit's Fortune",
+      "icon": "skill_aoyi_skill_icon_070"
+    },
+    {
+      "id": 3957,
+      "name": "Arcane! Fatal Spiral",
+      "icon": "skill_aoyi_skill_icon_057"
+    },
+    {
+      "id": 3958,
+      "name": "Stunt! Frost Breath",
+      "icon": "skill_aoyi_skill_icon_056"
+    },
+    {
+      "id": 3959,
+      "name": "Stunt! Lightning Smite",
+      "icon": "skill_aoyi_skill_icon_060"
+    },
+    {
+      "id": 3960,
+      "name": "Stunt! Blade Storm",
+      "icon": "skill_aoyi_skill_icon_059"
+    },
+    {
+      "id": 3961,
+      "name": "Stunt! Carpet Bombing",
+      "icon": "skill_aoyi_skill_icon_061"
+    },
+    {
+      "id": 3962,
+      "name": "Stunt! Healing Bomb",
+      "icon": "skill_aoyi_skill_icon_062"
+    },
+    {
+      "id": 3963,
+      "name": "Stunt! Kinetic Strike",
+      "icon": "skill_aoyi_skill_icon_067"
+    },
+    {
+      "id": 3964,
+      "name": "Stunt! Cabbage Boomerang",
+      "icon": "skill_aoyi_skill_icon_064"
+    },
+    {
+      "id": 3965,
+      "name": "Stunt! Cabbage Blitz",
+      "icon": "skill_aoyi_skill_icon_065"
+    },
+    {
+      "id": 3966,
+      "name": "Stunt! Twin Fangs",
+      "icon": "skill_aoyi_skill_icon_069"
+    },
+    {
+      "id": 3968,
+      "name": "Arcane! Void Corruption Blade",
+      "icon": "skill_aoyi_skill_icon_071"
+    },
+    {
+      "id": 3969,
+      "name": "Arcane! Rift Recoil",
+      "icon": "skill_aoyi_skill_icon_072"
+    },
+    {
+      "id": 3970,
+      "name": "Arcane! Command Quadrant",
+      "icon": "skill_aoyi_skill_icon_073"
+    },
+    {
+      "id": 3971,
+      "name": "Arcane! Superconductor Surge",
+      "icon": "skill_aoyi_skill_icon_074"
+    },
+    {
+      "id": 3972,
+      "name": "Arcane! Shuttle Fang",
+      "icon": "skill_aoyi_skill_icon_075"
+    },
+    {
+      "id": 3973,
+      "name": "Arcane! Flash Stomp",
+      "icon": "skill_aoyi_skill_icon_076"
+    },
+    {
+      "id": 3974,
+      "name": "Arcane! Precision Burst",
+      "icon": "skill_aoyi_skill_icon_077"
+    },
+    {
+      "id": 3975,
+      "name": "Arcane! Piercing Roar",
+      "icon": "skill_aoyi_skill_icon_078"
+    },
+    {
+      "id": 3976,
+      "name": "Arcane! Swift Devour",
+      "icon": "skill_aoyi_skill_icon_079"
+    },
+    {
+      "id": 3977,
+      "name": "Stunt! Hidden Strike",
+      "icon": "skill_aoyi_skill_icon_080"
+    },
+    {
+      "id": 3978,
+      "name": "Stunt! Absolute Zero",
+      "icon": "skill_aoyi_skill_icon_081"
+    },
+    {
+      "id": 3979,
+      "name": "Stunt! Abyssal Breath",
+      "icon": "skill_aoyi_skill_icon_082"
+    },
+    {
+      "id": 3980,
+      "name": "Stunt! Ground Smash",
+      "icon": "skill_aoyi_skill_icon_083"
+    },
+    {
+      "id": 3981,
+      "name": "Stunt! Lock-On Shot",
+      "icon": "skill_aoyi_skill_icon_084"
+    },
+    {
+      "id": 3982,
+      "name": "Arcane! Celestial Spirit Mage",
+      "icon": "skill_aoyi_skill_icon_086"
+    },
+    {
+      "id": 3983,
+      "name": "Arcane! Dragon Slayer",
+      "icon": "skill_aoyi_skill_icon_085"
+    },
+    {
+      "id": 3986,
+      "name": "Arcane! Celestial Spirit Mage",
+      "icon": "skill_aoyi_skill_icon_086"
+    },
+    {
+      "id": 3987,
+      "name": "Arcane! Dragon Slayer",
+      "icon": "skill_aoyi_skill_icon_085"
+    },
+    {
+      "id": 102640,
+      "name": "Stunt! Boarrier Rush",
+      "icon": "skill_aoyi_skill_icon_001"
+    },
+    {
+      "id": 102651,
+      "name": "Boar Knight",
+      "icon": "skill_aoyi_skill_icon_001"
+    },
+    {
+      "id": 102655,
+      "name": "Boar Impact!",
+      "icon": "skill_aoyi_skill_icon_001"
+    },
+    {
+      "id": 102658,
+      "name": "Stunt! Boarrier Rush",
+      "icon": "skill_aoyi_skill_icon_001"
+    },
+    {
+      "id": 420140,
+      "name": "Stunt! Chaotic Barrage",
+      "icon": "skill_aoyi_skill_icon_009"
+    },
+    {
+      "id": 1002440,
+      "name": "Stunt! Super Critical",
+      "icon": "skill_aoyi_skill_icon_026"
+    },
+    {
+      "id": 1002830,
+      "name": "Arcane! Frostquake",
+      "icon": "skill_aoyi_skill_icon_015"
+    },
+    {
+      "id": 1005240,
+      "name": "Stunt! Predator Slash",
+      "icon": "skill_aoyi_skill_icon_031"
+    },
+    {
+      "id": 1006940,
+      "name": "Arcane! Cocoon Tech",
+      "icon": "skill_aoyi_skill_icon_041"
+    },
+    {
+      "id": 1008640,
+      "name": "Stunt! Falling Star",
+      "icon": "skill_aoyi_skill_icon_008"
+    },
+    {
+      "id": 1008641,
+      "name": "Stunt! Whirlwind Strike",
+      "icon": "skill_aoyi_skill_icon_044"
+    },
+    {
+      "id": 1010440,
+      "name": "Stunt! Thunder Suppress",
+      "icon": "skill_aoyi_skill_icon_040"
+    },
+    {
+      "id": 1010540,
+      "name": "Stunt! Water of Silence",
+      "icon": "skill_aoyi_skill_icon_039"
+    },
+    {
+      "id": 1700440,
+      "name": "Arcane! Furious Hammer",
+      "icon": "skill_aoyi_skill_icon_005"
+    },
+    {
+      "id": 2001740,
+      "name": "Stunt! Blink Ambush",
+      "icon": "skill_aoyi_skill_icon_037"
+    },
+    {
+      "id": 2002440,
+      "name": "Arcane! Thunderfall Grasp",
+      "icon": "skill_aoyi_skill_icon_014"
+    },
+    {
+      "id": 2002441,
+      "name": "Arcane! Thunderfall Grasp",
+      "icon": "skill_aoyi_skill_icon_014"
+    },
+    {
+      "id": 2002840,
+      "name": "Arcane! Swift Vortex",
+      "icon": "skill_aoyi_skill_icon_029"
+    },
+    {
+      "id": 2900240,
+      "name": "Arcane! Blessing of Life",
+      "icon": "skill_aoyi_skill_icon_013"
+    },
+    {
+      "id": 2900241,
+      "name": "Arcane! Blessing of Life",
+      "icon": "skill_aoyi_skill_icon_013"
+    },
+    {
+      "id": 2900340,
+      "name": "Arcane! Time Decree",
+      "icon": "skill_aoyi_skill_icon_016"
+    },
+    {
+      "id": 2900540,
+      "name": "Arcane! Flash Execution",
+      "icon": "skill_aoyi_skill_icon_025"
+    },
+    {
+      "id": 2900640,
+      "name": "Arcane! Heart of Flame",
+      "icon": "skill_aoyi_skill_icon_042"
+    }
+  ]
+}

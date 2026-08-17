@@ -115,7 +115,16 @@ Logs may contain player names and other identifying traffic — never attach one
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0 (GPL-3.0-only).
+This project is licensed under the GNU General Public License v3.0
+(GPL-3.0-only). That license covers the code in this repository. It does not
+cover, and does not purport to cover, the game-client-derived assets
+described in `THIRD_PARTY_NOTICES.md` (the class icons and Imagine icons
+under `crates/app/assets/`, and the Imagine id/name table) — those remain the
+property of their respective owners and are redistributed here only on the
+inferred basis explained there, not under a grant from this project.
+
+Those assets will be removed promptly on request from the rights holder. To
+request removal, open a GitHub issue on this repository.
 
 Ported packet-format knowledge from these open-source trackers (all GPL-compatible):
 - https://github.com/Blue-Protocol-Source/BPSR-ZDPS

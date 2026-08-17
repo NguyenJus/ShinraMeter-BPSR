@@ -34,6 +34,8 @@ struct NameEntry {
     /// packet arrives.
     ability_score: Option<u32>,
     season_strength: Option<u32>,
+    // IMAGINE-TAKEDOWN: part of the imagines field chain (see plan D4 #5).
+    imagines: Option<[Option<i32>; 2]>,
     seq: u64,
 }
 
@@ -47,6 +49,8 @@ struct CachedAttrs {
     class: Option<Class>,
     ability_score: Option<u32>,
     season_strength: Option<u32>,
+    // IMAGINE-TAKEDOWN: part of the imagines field chain (see plan D4 #5).
+    imagines: Option<[Option<i32>; 2]>,
 }
 
 pub struct Meter {
@@ -145,6 +149,7 @@ impl Meter {
                     class,
                     ability_score: None,
                     season_strength: None,
+                    imagines: None,
                     seq,
                 },
             );
@@ -165,6 +170,7 @@ impl Meter {
                 class: entry.class,
                 ability_score: entry.ability_score,
                 season_strength: entry.season_strength,
+                imagines: entry.imagines,
             }
         })
     }
@@ -189,12 +195,16 @@ impl Meter {
         if incoming.season_strength.is_some() {
             entry.season_strength = incoming.season_strength;
         }
+        if incoming.imagines.is_some() {
+            entry.imagines = incoming.imagines;
+        }
         entry.seq = seq;
         CachedAttrs {
             name: entry.name.clone(),
             class: entry.class,
             ability_score: entry.ability_score,
             season_strength: entry.season_strength,
+            imagines: entry.imagines,
         }
     }
 
@@ -471,6 +481,7 @@ impl Meter {
                 class: p.class,
                 ability_score: p.ability_score,
                 season_strength: p.season_strength,
+                imagines: p.imagines,
             },
         );
         if let Some(stats) = self.players.get_mut(&p.uid) {
@@ -485,6 +496,9 @@ impl Meter {
             }
             if merged.season_strength.is_some() {
                 stats.season_strength = merged.season_strength;
+            }
+            if merged.imagines.is_some() {
+                stats.imagines = merged.imagines;
             }
         }
     }
@@ -633,6 +647,7 @@ impl Meter {
                     class: p.class,
                     ability_score: p.ability_score,
                     season_strength: p.season_strength,
+                    imagines: p.imagines.unwrap_or_default(),
                     damage: p.total_damage,
                     dps,
                     share_pct,
@@ -766,6 +781,7 @@ mod tests {
             class: Some(Class::Stormblade),
             ability_score: None,
             season_strength: None,
+            imagines: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].name, "Foo");
@@ -782,6 +798,7 @@ mod tests {
             class: None,
             ability_score: Some(45_000),
             season_strength: None,
+            imagines: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].ability_score, Some(45_000));
@@ -796,12 +813,96 @@ mod tests {
             class: None,
             ability_score: Some(1000),
             season_strength: None,
+            imagines: None,
         }));
         m.apply(&dmg(3, 100, 0));
         m.reset(ResetReason::Manual, 1000);
         m.apply(&dmg(3, 50, 2000));
         let snap = m.snapshot(3000);
         assert_eq!(snap.rows[0].ability_score, Some(1000));
+    }
+
+    /// A `PlayerInfo` carrying `Some([Some(id), None])` surfaces on the row
+    /// (issue #33). `bpsr-meter` treats the id as opaque — it never
+    /// interprets it, only threads it through.
+    #[test]
+    fn player_info_imagines_reach_row() {
+        let mut m = Meter::new();
+        m.apply(&dmg(9, 100, 1000));
+        m.apply(&ProtocolEvent::Player(PlayerInfo {
+            uid: 9,
+            name: None,
+            class: None,
+            ability_score: None,
+            season_strength: None,
+            imagines: Some([Some(3905), None]),
+        }));
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows[0].imagines, [Some(3905), None]);
+    }
+
+    /// `imagines: None` means no `0x74` packet has been seen *this time* —
+    /// it must not clobber a previously cached pair, mirroring
+    /// `ability_score`'s "`Some` overwrites, `None` preserves" merge rule.
+    #[test]
+    fn imagines_none_does_not_clobber_the_cached_pair() {
+        let mut m = Meter::new();
+        m.apply(&dmg(9, 100, 1000));
+        m.apply(&ProtocolEvent::Player(PlayerInfo {
+            uid: 9,
+            name: None,
+            class: None,
+            ability_score: None,
+            season_strength: None,
+            imagines: Some([Some(3905), Some(102640)]),
+        }));
+        m.apply(&ProtocolEvent::Player(PlayerInfo {
+            uid: 9,
+            name: None,
+            class: None,
+            ability_score: None,
+            season_strength: None,
+            imagines: None,
+        }));
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows[0].imagines, [Some(3905), Some(102640)]);
+    }
+
+    /// `Some([None, None])` means a packet *was* seen and this player has no
+    /// known Imagines — unlike bare `None`, this does overwrite ("live
+    /// wins").
+    #[test]
+    fn imagines_some_none_none_overwrites_the_cached_pair() {
+        let mut m = Meter::new();
+        m.apply(&dmg(9, 100, 1000));
+        m.apply(&ProtocolEvent::Player(PlayerInfo {
+            uid: 9,
+            name: None,
+            class: None,
+            ability_score: None,
+            season_strength: None,
+            imagines: Some([Some(3905), Some(102640)]),
+        }));
+        m.apply(&ProtocolEvent::Player(PlayerInfo {
+            uid: 9,
+            name: None,
+            class: None,
+            ability_score: None,
+            season_strength: None,
+            imagines: Some([None, None]),
+        }));
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows[0].imagines, [None, None]);
+    }
+
+    /// A player with no Imagine packet at all snapshots as `[None, None]`,
+    /// not a missing/default row.
+    #[test]
+    fn no_imagine_packet_snapshots_as_empty_slots() {
+        let mut m = Meter::new();
+        m.apply(&dmg(9, 100, 1000));
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows[0].imagines, [None, None]);
     }
 
     #[test]
@@ -814,6 +915,7 @@ mod tests {
             class: None,
             ability_score: None,
             season_strength: Some(12_345),
+            imagines: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].season_strength, Some(12_345));
@@ -828,6 +930,7 @@ mod tests {
             class: None,
             ability_score: None,
             season_strength: Some(999),
+            imagines: None,
         }));
         m.apply(&dmg(4, 100, 0));
         m.reset(ResetReason::Manual, 1000);
@@ -1052,6 +1155,7 @@ mod tests {
                 class: Some(Class::FrostMage),
                 ability_score: None,
                 season_strength: None,
+                imagines: None,
             }));
             m.apply(&dmg(5, 100, 1000));
 
@@ -1072,6 +1176,7 @@ mod tests {
                 class: None,
                 ability_score: None,
                 season_strength: None,
+                imagines: None,
             }));
             m.apply(&dmg(5, 100, 1000));
 
@@ -1097,6 +1202,7 @@ mod tests {
                 class: Some(Class::Stormblade),
                 ability_score: None,
                 season_strength: None,
+                imagines: None,
             }));
             m.apply(&dmg(5, 100, 1000));
 
@@ -1108,6 +1214,7 @@ mod tests {
                 class: None,
                 ability_score: None,
                 season_strength: None,
+                imagines: None,
             }));
 
             let snap = m.snapshot(2000);
@@ -1158,6 +1265,7 @@ mod tests {
                 class: None,
                 ability_score: None,
                 season_strength: None,
+                imagines: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
                 uid: 2,
@@ -1165,6 +1273,7 @@ mod tests {
                 class: None,
                 ability_score: None,
                 season_strength: None,
+                imagines: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
                 uid: 3,
@@ -1172,6 +1281,7 @@ mod tests {
                 class: None,
                 ability_score: None,
                 season_strength: None,
+                imagines: None,
             }));
             // Re-touch uid 1 so it becomes the most recently used, ahead of
             // 3 and 2 (in that order).
@@ -1181,6 +1291,7 @@ mod tests {
                 class: None,
                 ability_score: None,
                 season_strength: None,
+                imagines: None,
             }));
 
             let before = m.names_for_save();
@@ -1207,6 +1318,7 @@ mod tests {
                 class: None,
                 ability_score: None,
                 season_strength: None,
+                imagines: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
                 uid: 2,
@@ -1214,6 +1326,7 @@ mod tests {
                 class: None,
                 ability_score: None,
                 season_strength: None,
+                imagines: None,
             }));
 
             let saved = m.names_for_save();
@@ -1230,6 +1343,7 @@ mod tests {
                 class: None,
                 ability_score: None,
                 season_strength: None,
+                imagines: None,
             }));
             m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 1000 });
 
@@ -1419,6 +1533,7 @@ mod tests {
                 class: None,
                 ability_score: None,
                 season_strength: None,
+                imagines: None,
             }));
             m.apply(&dmg(1, 100, 0));
             m.reset(ResetReason::Manual, 1000);
@@ -1753,6 +1868,7 @@ mod tests {
                 class: None,
                 ability_score: None,
                 season_strength: None,
+                imagines: None,
             }));
             m.apply(&dmg(1, 100, 0));
             m.apply(&dmg(1, 100, 100_000));

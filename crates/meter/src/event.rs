@@ -163,6 +163,17 @@ pub struct PlayerInfo {
     /// Season strength. Mirrors `bpsr_protocol::PlayerInfo::season_strength`
     /// (issue #15).
     pub season_strength: Option<u32>,
+    /// The two equipped Imagines, as opaque skill ids resolved to display
+    /// data (name/icon) only by `crates/app/src/imagines.rs` (issue #33) —
+    /// `bpsr-meter` never learns what an Imagine is.
+    ///
+    /// `None` means no `0x74` (`SKILL_LEVEL_ID_LIST`) packet has been seen
+    /// yet for this player, so a cached pair (if any) must not be clobbered.
+    /// `Some([None, None])` means a packet *was* seen and this player has no
+    /// known Imagines — this does overwrite, the same "live wins" rule
+    /// `name_upsert` already applies to `ability_score`/`season_strength`.
+    // IMAGINE-TAKEDOWN: part of the imagines field chain (see plan D4 #5).
+    pub imagines: Option<[Option<i32>; 2]>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

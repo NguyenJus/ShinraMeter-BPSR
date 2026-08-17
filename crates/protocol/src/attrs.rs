@@ -6,6 +6,8 @@
 
 use std::io::Cursor;
 
+use prost::Message;
+
 use crate::event::{EnemyHp, PlayerInfo};
 use crate::inspect::InspectSink;
 use crate::pb;
@@ -39,6 +41,13 @@ pub mod attr_id {
     /// (`AttrSeasonStrength = 11440`) because no packet capture was
     /// available. See `SEASON_LEVEL`'s doc comment for the full caveat.
     pub const SEASON_STRENGTH: i32 = 0x2CB0;
+    /// Reference-derived, **not confirmed against live traffic** (issue
+    /// #33): reimplemented from BPSR-ZDPS's `EnumEAttrType.cs`
+    /// (`AttrSkillLevelIdList = 116`) because no packet capture was
+    /// available. Same unverified-provenance caveat as `SEASON_LEVEL` above
+    /// and `pb::IMAGINE_PROFESSION_IDS`. Re-verify against a real capture if
+    /// one ever becomes available.
+    pub const SKILL_LEVEL_ID_LIST: i32 = 0x74;
 }
 
 /// protobuf varint → `u64`; `None` on empty/malformed input. The widest
@@ -65,6 +74,35 @@ pub fn decode_varint_i32(raw: &[u8]) -> Option<i32> {
 /// outside `u32` range (truncating it would yield a plausible-but-wrong id).
 pub fn decode_varint_u32(raw: &[u8]) -> Option<u32> {
     decode_varint_u64(raw).and_then(|v| u32::try_from(v).ok())
+}
+
+/// `raw_data` for `attr_id::SKILL_LEVEL_ID_LIST` → the equipped skill ids, in
+/// wire order, with `0` entries dropped (matching the crate's zero-is-absent
+/// convention). `None` on malformed input (prost decode failure), per this
+/// module's non-panicking convention — `player_info_from_attrs` treats
+/// `None` the same as "no ids".
+///
+/// Uses `pb::SkillLevelIdList`, whose wrapper tag is an unverified constant
+/// (see its doc comment). If that tag is wrong, a non-empty `raw` still
+/// parses as *zero* skills rather than erroring — a silent, non-crashing
+/// miss (issue #33's open question #2) — so that specific case is logged at
+/// `debug` to keep the failure diagnosable from a user's log.
+pub fn decode_skill_ids(raw: &[u8]) -> Option<Vec<i32>> {
+    let list = pb::SkillLevelIdList::decode(raw).ok()?;
+    let ids: Vec<i32> = list
+        .skills
+        .into_iter()
+        .map(|s| s.skill_id)
+        .filter(|&id| id != 0)
+        .collect();
+    if !raw.is_empty() && ids.is_empty() {
+        log::debug!(
+            "attr_id::SKILL_LEVEL_ID_LIST: {} raw bytes decoded to zero skill ids; \
+             the wrapper tag (pb::SkillLevelIdList) may be wrong",
+            raw.len()
+        );
+    }
+    Some(ids)
 }
 
 /// `raw_data` for a name attr is the string bytes behind a protobuf varint
@@ -110,6 +148,7 @@ pub fn player_info_from_attrs(
     let mut ability_score = None;
     let mut season_level = None;
     let mut season_strength = None;
+    let mut skill_ids = Vec::new();
     for attr in attrs {
         if attr.raw_data.is_empty() || attr.id == 0 {
             continue;
@@ -122,6 +161,7 @@ pub fn player_info_from_attrs(
                     | attr_id::FIGHT_POINT
                     | attr_id::SEASON_LEVEL
                     | attr_id::SEASON_STRENGTH
+                    | attr_id::SKILL_LEVEL_ID_LIST
             );
             sink.on_attr(uid, attr.id, &attr.raw_data, known);
         }
@@ -161,6 +201,11 @@ pub fn player_info_from_attrs(
                     season_strength = Some(v);
                 }
             }
+            attr_id::SKILL_LEVEL_ID_LIST => {
+                if let Some(ids) = decode_skill_ids(&attr.raw_data) {
+                    skill_ids = ids;
+                }
+            }
             _ => {}
         }
     }
@@ -171,6 +216,7 @@ pub fn player_info_from_attrs(
         ability_score,
         season_level,
         season_strength,
+        skill_ids,
     }
 }
 
@@ -398,6 +444,78 @@ mod tests {
         let info = player_info_from_attrs(1, &attrs, None);
         assert_eq!(info.name, None);
         assert_eq!(info.class, None);
+    }
+
+    // -- Skill level id list (issue #33) -----------------------------------
+
+    fn encode_skill_list(ids: &[i32]) -> Vec<u8> {
+        let msg = pb::SkillLevelIdList {
+            skills: ids
+                .iter()
+                .map(|&skill_id| pb::SkillLevelInfo {
+                    skill_id,
+                    current_level: 1,
+                    remodel_level: 0,
+                })
+                .collect(),
+        };
+        let mut buf = Vec::new();
+        prost::Message::encode(&msg, &mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn decode_skill_ids_well_formed_payload_decodes_in_order() {
+        let raw = encode_skill_list(&[3905, 102640, 71000]);
+        assert_eq!(decode_skill_ids(&raw), Some(vec![3905, 102640, 71000]));
+    }
+
+    #[test]
+    fn decode_skill_ids_empty_payload_yields_empty_list() {
+        assert_eq!(decode_skill_ids(&[]), Some(Vec::new()));
+    }
+
+    #[test]
+    fn decode_skill_ids_truncated_varint_yields_none() {
+        // A single 0x80 byte is a continuation bit with nothing following —
+        // malformed, must not panic.
+        assert_eq!(decode_skill_ids(&[0x80]), None);
+    }
+
+    #[test]
+    fn decode_skill_ids_garbage_bytes_yield_none() {
+        let raw = [0xFFu8, 0x00, 0xAB, 0xCD, 0xEF];
+        assert_eq!(decode_skill_ids(&raw), None);
+    }
+
+    #[test]
+    fn decode_skill_ids_drops_zero_ids() {
+        let raw = encode_skill_list(&[3905, 0, 102640]);
+        assert_eq!(decode_skill_ids(&raw), Some(vec![3905, 102640]));
+    }
+
+    #[test]
+    fn skill_level_id_list_attr_sets_skill_ids_on_player_info() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::SKILL_LEVEL_ID_LIST,
+            raw_data: encode_skill_list(&[3905, 102640]),
+        }];
+        assert_eq!(
+            player_info_from_attrs(1, &attrs, None).skill_ids,
+            vec![3905, 102640]
+        );
+    }
+
+    #[test]
+    fn missing_skill_level_id_list_attr_yields_empty_skill_ids() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::PROFESSION_ID,
+            raw_data: varint(1),
+        }];
+        assert_eq!(
+            player_info_from_attrs(1, &attrs, None).skill_ids,
+            Vec::<i32>::new()
+        );
     }
 
     // -- InspectSink observation (issue #25 slice A) ----------------------

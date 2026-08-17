@@ -46,9 +46,45 @@ WinDivert's LGPL-3.0 option is compatible.
 
 - Files: `crates/app/assets/classes/*.png`
 - Upstream: <https://github.com/Blue-Protocol-Source/BPSR-ZDPS>
-- License: MIT
+- Basis: these are game-client-derived assets, obtained via BPSR-ZDPS.
+  BPSR-ZDPS's own `LICENSE` is MIT, but that grant covers ZDPS's source code,
+  not art extracted from the game client — ZDPS applying MIT to those files
+  does not make the art theirs to license, so this is not recorded as an MIT
+  grant. Redistributed here on the inferred basis that the game's developers
+  have publicly endorsed open-source meters and have not objected to other
+  meters shipping the same data. To be explicit: no permission was requested
+  or granted directly, by either the game's developers or BPSR-ZDPS.
 - Embedded verbatim (compiled into the executable via `include_bytes!` in
   `crates/app/src/icons.rs`), unmodified, at build time.
+- Takedown: these assets will be removed promptly on request from the rights
+  holder. To request removal, open a GitHub issue on this repository.
+
+## BPSR-ZDPS Imagine icons
+
+- Files: `crates/app/assets/imagines/*.png` — 81 of the upstream 86. The
+  remaining 5 are not referenced by any entry in
+  `crates/app/data/imagine_table.json` and are deliberately not
+  redistributed: only the icons the meter actually draws are shipped,
+  keeping the footprint to what the feature needs.
+- Upstream: <https://github.com/Blue-Protocol-Source/BPSR-ZDPS>
+  (`Data/Images/Skills_Imagines/`)
+- Basis: same as the class icons above — game-client-derived assets, obtained
+  via BPSR-ZDPS, redistributed on the inferred basis that the game's
+  developers have publicly endorsed open-source meters and have not objected
+  to other meters shipping the same data. No permission was requested or
+  granted directly, by either the game's developers or BPSR-ZDPS.
+- Modified: downscaled from the upstream 124x124 to 48x48 with Lanczos
+  resampling, then alpha-masked to a circle, by
+  `scripts/prep-imagine-icons.py`. Resampled with stated provenance, not
+  verbatim — the same register the egui-winit note above uses.
+- Compiled into the executable via `include_bytes!` in the generated
+  `crates/app/src/imagines.rs`, at build time.
+- The id/name table these icons are keyed against —
+  `crates/app/data/imagine_table.json` (hand-curated) and the `imagines.rs`
+  it generates via `scripts/gen-imagine-table.py` — is likewise derived from
+  BPSR-ZDPS's `Data/SkillTable.json`, under the same basis as the icons.
+- Takedown: these assets will be removed promptly on request from the rights
+  holder. To request removal, open a GitHub issue on this repository.
 
 ## ShinraMeter toolbar icons
 

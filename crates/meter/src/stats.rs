@@ -14,6 +14,12 @@ pub struct PlayerStats {
     /// Season strength; `None` until a packet carrying it (attrs
     /// `SEASON_STRENGTH`) has been seen for this player (issue #15).
     pub season_strength: Option<u32>,
+    /// The two equipped Imagines, as opaque skill ids; `None` until a `0x74`
+    /// packet has been seen for this player, `Some([None, None])` once one
+    /// has been seen but no known Imagine was found (issue #33). See
+    /// `event::PlayerInfo::imagines` for the full merge-rule doc.
+    // IMAGINE-TAKEDOWN: part of the imagines field chain (see plan D4 #5).
+    pub imagines: Option<[Option<i32>; 2]>,
     pub total_damage: i64,
     pub hits: u64,
     pub crit_hits: u64,
@@ -39,6 +45,7 @@ impl PlayerStats {
             class: None,
             ability_score: None,
             season_strength: None,
+            imagines: None,
             total_damage: 0,
             hits: 0,
             crit_hits: 0,
@@ -79,6 +86,12 @@ pub struct PlayerRow {
     /// Season strength; `None` when no packet carrying it has been seen for
     /// this player yet (issue #15).
     pub season_strength: Option<u32>,
+    /// The two equipped Imagine slots, as opaque skill ids resolved to
+    /// display data only by `crates/app/src/imagines.rs` (issue #33). Always
+    /// exactly two slots — `None` per-slot means empty/unknown, never a
+    /// missing packet (that distinction lives on `PlayerStats::imagines`).
+    // IMAGINE-TAKEDOWN: part of the imagines field chain (see plan D4 #5).
+    pub imagines: [Option<i32>; 2],
     pub damage: i64,
     pub dps: f64,
     pub share_pct: f32,

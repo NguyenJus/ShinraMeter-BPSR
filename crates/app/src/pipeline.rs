@@ -17,6 +17,7 @@ use bpsr_meter as meter;
 use bpsr_protocol as proto;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select, tick};
 
+use crate::imagines;
 use crate::ui::UiCommand;
 
 /// Snapshot publication rate (~10 Hz), matching the overlay's repaint cadence.
@@ -56,6 +57,39 @@ pub fn map_class(class: proto::Class) -> meter::Class {
     }
 }
 
+// IMAGINE-TAKEDOWN: classifies raw skill ids into up to two equipped-Imagine
+// slots. See `crates/app/src/imagines.rs` and the plan's D2/D4 and the spec's
+// "Many-to-one is expected" section for why dedup is keyed on the whole
+// `Imagine` value (equivalently, its `icon`) rather than `name` or raw id.
+/// Walks `skill_ids` in wire order, resolves each through
+/// [`imagines::imagine_of_skill_id`], skips unknown ids (they must never
+/// occupy a slot), and dedups by the resolved `Imagine` value so that variant
+/// ids sharing one canonical Imagine collapse to a single slot even when
+/// their own `name` differs from the canonical one (e.g. `102651`/`102655`
+/// vs. `3905`). Returns the *representative skill id* — the first id seen for
+/// each distinct Imagine — for up to two distinct Imagines, in wire order.
+fn imagine_slots(skill_ids: &[i32]) -> [Option<i32>; 2] {
+    let mut slots: [Option<i32>; 2] = [None, None];
+    let mut seen: Vec<imagines::Imagine> = Vec::with_capacity(2);
+
+    for &id in skill_ids {
+        let Some(imagine) = imagines::imagine_of_skill_id(id) else {
+            continue;
+        };
+        if seen.contains(&imagine) {
+            continue;
+        }
+        let slot_index = seen.len();
+        if slot_index >= slots.len() {
+            break;
+        }
+        seen.push(imagine);
+        slots[slot_index] = Some(id);
+    }
+
+    slots
+}
+
 /// Translates a `bpsr_protocol::ProtocolEvent` into the meter's mirror event.
 pub fn map_event(ev: proto::ProtocolEvent) -> meter::ProtocolEvent {
     match ev {
@@ -80,6 +114,11 @@ pub fn map_event(ev: proto::ProtocolEvent) -> meter::ProtocolEvent {
             class: p.class.map(map_class),
             ability_score: p.ability_score,
             season_strength: p.season_strength,
+            // IMAGINE-TAKEDOWN: empty `skill_ids` means the attr was absent
+            // from this packet, so stay `None` rather than `Some([None,
+            // None])` — the meter's merge rule (T4) must not clobber a
+            // previously cached pair with an absent packet.
+            imagines: (!p.skill_ids.is_empty()).then(|| imagine_slots(&p.skill_ids)),
         }),
         proto::ProtocolEvent::EnemyHp(e) => meter::ProtocolEvent::EnemyHp(meter::EnemyHp {
             uid: e.uid,
@@ -441,6 +480,7 @@ mod tests {
             ability_score: Some(9_999),
             season_level: Some(42),
             season_strength: Some(3_333),
+            skill_ids: Vec::new(),
         }));
         assert_eq!(
             mapped,
@@ -450,8 +490,46 @@ mod tests {
                 class: Some(meter::Class::Marksman),
                 ability_score: Some(9_999),
                 season_strength: Some(3_333),
+                imagines: None,
             })
         );
+    }
+
+    #[test]
+    fn maps_player_info_classifies_skill_ids_into_imagine_slots() {
+        // 3905 and 102640 are both the canonical Boar Imagine (see the spec's
+        // "Many-to-one is expected" section); 3926 is a distinct Imagine.
+        // 999_999_999 is not in the curated table and must not consume slot 2.
+        let mapped = map_event(proto::ProtocolEvent::Player(proto::PlayerInfo {
+            uid: 7,
+            name: None,
+            class: None,
+            ability_score: None,
+            season_level: None,
+            season_strength: None,
+            skill_ids: vec![3905, 102640, 3926, 999_999_999],
+        }));
+        let meter::ProtocolEvent::Player(p) = mapped else {
+            panic!("expected a player event");
+        };
+        assert_eq!(p.imagines, Some([Some(3905), Some(3926)]));
+    }
+
+    #[test]
+    fn maps_player_info_leaves_imagines_none_when_skill_ids_is_empty() {
+        let mapped = map_event(proto::ProtocolEvent::Player(proto::PlayerInfo {
+            uid: 8,
+            name: None,
+            class: None,
+            ability_score: None,
+            season_level: None,
+            season_strength: None,
+            skill_ids: Vec::new(),
+        }));
+        let meter::ProtocolEvent::Player(p) = mapped else {
+            panic!("expected a player event");
+        };
+        assert_eq!(p.imagines, None);
     }
 
     #[test]
@@ -599,6 +677,7 @@ mod tests {
                 ability_score: None,
                 season_level: None,
                 season_strength: None,
+                skill_ids: Vec::new(),
             }));
 
             assert!(!path.exists());
@@ -629,6 +708,7 @@ mod tests {
                 ability_score: None,
                 season_level: None,
                 season_strength: None,
+                skill_ids: Vec::new(),
             }));
 
             assert!(!path.exists());
@@ -656,6 +736,7 @@ mod tests {
             ability_score: None,
             season_level: None,
             season_strength: None,
+            skill_ids: Vec::new(),
         }));
         let snap = p.snapshot(2_000);
         assert_eq!(snap.rows[0].name, "Late");
@@ -673,6 +754,7 @@ mod tests {
             ability_score: Some(77_000),
             season_level: None,
             season_strength: None,
+            skill_ids: Vec::new(),
         }));
         let snap = p.snapshot(2_000);
         assert_eq!(snap.rows[0].ability_score, Some(77_000));
@@ -689,8 +771,58 @@ mod tests {
             ability_score: None,
             season_level: None,
             season_strength: Some(3_333),
+            skill_ids: Vec::new(),
         }));
         let snap = p.snapshot(2_000);
         assert_eq!(snap.rows[0].season_strength, Some(3_333));
+    }
+
+    mod imagine_slots_classification {
+        use super::*;
+
+        #[test]
+        fn two_distinct_imagines_fill_both_slots_in_wire_order() {
+            assert_eq!(imagine_slots(&[3926, 3905]), [Some(3926), Some(3905)]);
+        }
+
+        #[test]
+        fn the_boar_variant_group_dedups_to_one_slot_and_frees_the_second() {
+            // 102651 ("Boar Knight") and 102655 ("Boar Impact!") have raw
+            // names that diverge from the canonical 3905 ("Stunt! Boarrier
+            // Rush"), so this only passes if dedup is keyed on the resolved
+            // `Imagine` (== icon), not on `name` or raw skill id.
+            let ids = [3905, 102640, 102651, 102655, 102658, 3926];
+            assert_eq!(imagine_slots(&ids), [Some(3905), Some(3926)]);
+        }
+
+        #[test]
+        fn a_name_divergent_variant_still_collapses_with_its_canonical_pair() {
+            // 2002840 ("Arcane! Swift Vortex") is a variant of the canonical
+            // 3926 ("Arcane! Meteor Shower") and shares its icon.
+            assert_eq!(imagine_slots(&[3926, 2002840]), [Some(3926), None]);
+        }
+
+        #[test]
+        fn unknown_ids_are_skipped_and_never_consume_a_slot() {
+            assert_eq!(
+                imagine_slots(&[999_999_999, 3905, -1, 3926]),
+                [Some(3905), Some(3926)]
+            );
+        }
+
+        #[test]
+        fn more_than_two_known_imagines_truncates_to_the_first_two() {
+            // 3905, 3926, and a third distinct Imagine (3901) — only the
+            // first two distinct Imagines seen should occupy slots.
+            assert_eq!(
+                imagine_slots(&[3905, 3926, 3901]),
+                [Some(3905), Some(3926)]
+            );
+        }
+
+        #[test]
+        fn an_empty_list_yields_two_empty_slots() {
+            assert_eq!(imagine_slots(&[]), [None, None]);
+        }
     }
 }
