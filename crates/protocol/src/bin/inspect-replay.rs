@@ -48,12 +48,23 @@
 //! foreign-codec fragment is itself a finding — but never handed to the
 //! decoder, since its bytes are not protobuf; the report totals them
 //! separately.
+//!
+//! ## Rotated dumps
+//!
+//! `crates/app/src/dump.rs` caps a dump at 5 MiB and rotates it to
+//! `<path>.1` (replacing any previous one) rather than growing it
+//! unbounded — now that inspection runs by default (issue #87), a routine
+//! long session will hit that cap. If `<path>.1` exists alongside the path
+//! given on the command line, this binary reads it too — *before* `path`,
+//! so records stay in chronological order — and prints how many records it
+//! contributed, so a long session's histogram covers the full retained
+//! history instead of silently dropping its earliest records.
 
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -125,6 +136,57 @@ fn parse_record(line: &str) -> Result<DumpRecord, String> {
         payload,
         payload_decoded: raw.payload_decoded,
     })
+}
+
+/// The rotated sibling `dump.rs` would have renamed `path` to once it grew
+/// past `MAX_DUMP_BYTES`: `<path>.1`, replacing any previous one. Matches
+/// `crate::logging::rotated_path` / `crates/app/src/dump.rs`'s
+/// `rotated_path`, reimplemented here rather than shared because this binary
+/// intentionally doesn't depend on the app crate (see the module doc
+/// comment's "Why this lives here" section).
+fn rotated_sibling(path: &Path) -> PathBuf {
+    let mut rotated = path.as_os_str().to_owned();
+    rotated.push(".1");
+    PathBuf::from(rotated)
+}
+
+/// Opens `path`, parses every JSONL line with [`parse_record`], and appends
+/// the successfully-parsed records to `records` in file order. A malformed
+/// line is skipped (printed to stderr, `path` prefixed so it's clear which
+/// file it came from) rather than aborting the whole replay. `Err` only when
+/// `path` itself can't be opened — the caller decides whether that's fatal.
+/// Returns how many records were appended, for the caller to report.
+fn append_records_from(
+    path: &Path,
+    records: &mut Vec<DumpRecord>,
+) -> Result<usize, std::io::Error> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut appended = 0;
+    for (lineno, line) in reader.lines().enumerate() {
+        let line = match line {
+            Ok(l) => l,
+            Err(err) => {
+                eprintln!("{}: line {}: read error: {err}", path.display(), lineno + 1);
+                continue;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        match parse_record(&line) {
+            Ok(r) => {
+                records.push(r);
+                appended += 1;
+            }
+            Err(err) => eprintln!(
+                "{}: line {}: skipping malformed record: {err}",
+                path.display(),
+                lineno + 1
+            ),
+        }
+    }
+    Ok(appended)
 }
 
 /// Count, first/last-seen timestamp, and whether an observed id is one we
@@ -417,31 +479,32 @@ fn main() -> ExitCode {
         eprintln!("usage: inspect-replay <dump.jsonl> [--since MS] [--until MS]");
         return ExitCode::FAILURE;
     };
-    let file = match File::open(&path) {
-        Ok(f) => f,
-        Err(err) => {
-            eprintln!("failed to open {}: {err}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let reader = BufReader::new(file);
     let mut records = Vec::new();
-    for (lineno, line) in reader.lines().enumerate() {
-        let line = match line {
-            Ok(l) => l,
-            Err(err) => {
-                eprintln!("line {}: read error: {err}", lineno + 1);
-                continue;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        match parse_record(&line) {
-            Ok(r) => records.push(r),
-            Err(err) => eprintln!("line {}: skipping malformed record: {err}", lineno + 1),
+
+    // Read the rotated sibling first (if any) so records end up in
+    // chronological order — it holds strictly older records than `path`.
+    let rotated = rotated_sibling(&path);
+    if rotated.exists() {
+        match append_records_from(&rotated, &mut records) {
+            Ok(count) => eprintln!(
+                "note: also read rotated dump {} — {count} earlier record(s) included \
+                 before {} so the histogram covers the full retained history",
+                rotated.display(),
+                path.display()
+            ),
+            Err(err) => eprintln!(
+                "warning: found rotated dump {} but could not read it ({err}); \
+                 earlier records may be missing from this histogram",
+                rotated.display()
+            ),
         }
     }
+
+    if let Err(err) = append_records_from(&path, &mut records) {
+        eprintln!("failed to open {}: {err}", path.display());
+        return ExitCode::FAILURE;
+    }
+
     let histogram = build_histogram(records.into_iter(), since, until);
     print!("{}", format_report(&histogram));
     ExitCode::SUCCESS
@@ -525,6 +588,94 @@ mod tests {
     fn parse_record_rejects_odd_length_payload_hex() {
         let line = r#"{"ts_ms":1,"service_uuid":"0x0000000063335342","method_id":"0x00000001","payload_hex":"abc","payload_decoded":true}"#;
         assert!(parse_record(line).is_err());
+    }
+
+    // -- rotated-sibling consumption (PR #99 review: routine long sessions
+    // silently dropped their earliest records once dump.rs started rotating
+    // at 5 MiB by default) -----------------------------------------------
+
+    fn temp_path(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "bpsr-protocol-inspect-replay-test-{tag}-{}-{n}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    fn dump_line(ts_ms: u64) -> String {
+        format!(
+            r#"{{"ts_ms":{ts_ms},"service_uuid":"0x0000000063335342","method_id":"0x0000002d","payload_hex":"","payload_decoded":true}}"#
+        )
+    }
+
+    #[test]
+    fn rotated_sibling_appends_dot_one_to_the_path() {
+        let path = PathBuf::from("/some/dir/dump-123.jsonl");
+        assert_eq!(
+            rotated_sibling(&path),
+            PathBuf::from("/some/dir/dump-123.jsonl.1")
+        );
+    }
+
+    #[test]
+    fn append_records_from_reports_the_open_error_for_a_missing_file() {
+        let path = temp_path("missing");
+        let mut records = Vec::new();
+        assert!(append_records_from(&path, &mut records).is_err());
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn append_records_from_parses_valid_lines_and_skips_malformed_ones() {
+        let path = temp_path("append");
+        std::fs::write(
+            &path,
+            format!("{}\nnot json\n{}\n", dump_line(1), dump_line(2)),
+        )
+        .unwrap();
+
+        let mut records = Vec::new();
+        let count = append_records_from(&path, &mut records).expect("file must open");
+
+        assert_eq!(count, 2);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].ts_ms, 1);
+        assert_eq!(records[1].ts_ms, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression test for the review finding on PR #99: `main` reads the
+    /// rotated `<path>.1` sibling before the live file, so records from a
+    /// dump.rs rotation stay in chronological order instead of being
+    /// silently dropped or reordered.
+    #[test]
+    fn rotated_sibling_records_are_read_before_the_live_files_and_stay_in_order() {
+        let path = temp_path("live");
+        let rotated = rotated_sibling(&path);
+        std::fs::write(
+            &rotated,
+            format!("{}\n{}\n", dump_line(100), dump_line(200)),
+        )
+        .unwrap();
+        std::fs::write(&path, format!("{}\n", dump_line(300))).unwrap();
+
+        let mut records = Vec::new();
+        let rotated_count =
+            append_records_from(&rotated, &mut records).expect("rotated file must open");
+        append_records_from(&path, &mut records).expect("live file must open");
+
+        assert_eq!(rotated_count, 2);
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records.iter().map(|r| r.ts_ms).collect::<Vec<_>>(),
+            vec![100, 200, 300],
+            "rotated (older) records must come first, in their original order"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
     }
 
     #[test]
