@@ -1,4 +1,5 @@
-//! Per-class row icons (issue #9 slice 1).
+//! Per-class row icons (issue #9 slice 1), toolbar/glyph chrome, and equipped
+//! Imagine icons (issue #33).
 //!
 //! The nine 128x128 PNGs under `crates/app/assets/classes/` are baked into
 //! the executable with `include_bytes!`, same as `fonts.rs`'s reasoning for
@@ -10,7 +11,12 @@
 //!
 //! Source: <https://github.com/Blue-Protocol-Source/BPSR-ZDPS> (MIT) — see
 //! `THIRD_PARTY_NOTICES.md`.
+//!
+//! `ImagineIcons` follows the same load-once pattern, keyed by the icon
+//! basenames generated in `crate::imagines` rather than a closed key enum —
+//! see its doc comment.
 
+use crate::imagines;
 use bpsr_meter::Class;
 use eframe::egui;
 
@@ -328,6 +334,41 @@ impl GlyphIcons {
     }
 }
 
+// IMAGINE-TAKEDOWN: one of five sites — see
+// `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
+//
+/// Textures for equipped-Imagine row icons (issue #33), uploaded once via
+/// `ImagineIcons::load`. Same lazy-load, load-once-per-process pattern as
+/// `ClassIcons`/`ToolbarIcons`/`GlyphIcons` — see `ClassIcons`'s doc comment
+/// — but keyed by the icon *basename* (`&'static str`) rather than a closed
+/// key enum: `crate::imagines` maps many skill ids to one of 81 icon
+/// basenames, and that set is open-ended game data, not fixed UI chrome.
+/// `&'static str` already satisfies `IconSet<K>`'s `K: Copy + PartialEq`
+/// bound, so no new key enum is needed.
+pub struct ImagineIcons(IconSet<&'static str>);
+
+impl ImagineIcons {
+    pub fn load(ctx: &egui::Context) -> Self {
+        Self(IconSet::load(
+            ctx,
+            imagines::IMAGINE_ICON_BYTES,
+            |icon| format!("imagine-icon-{icon}"),
+            |icon| format!("imagine icon {icon}"),
+        ))
+    }
+
+    /// The texture for the icon basename `icon`, or `None` if no Imagine
+    /// icon is loaded for it (an id `crate::imagines` doesn't know, or a PNG
+    /// that failed to decode) — the caller paints the blank-circle slot
+    /// placeholder in that case, never a panic. Takes `&'static str` rather
+    /// than a bare `&str`: `IconSet<&'static str>::get` needs an exact `K`
+    /// match, and every real caller already holds a `&'static str` from
+    /// `imagines::Imagine::icon`.
+    pub fn get(&self, icon: &'static str) -> Option<&egui::TextureHandle> {
+        self.0.get(icon)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,5 +528,47 @@ mod tests {
         let timer = image::load_from_memory(timer_bytes).expect("timer.png must decode");
         assert_eq!(emblem.width(), 512);
         assert_eq!(timer.width(), 64);
+    }
+
+    // -- imagine icons (issue #33) -----------------------------------------
+    //
+    // The invariant "every icon `imagines::ALL_ENTRIES` references is
+    // present in `IMAGINE_ICON_BYTES`" is already enforced by
+    // `imagines.rs`'s own generated `#[cfg(test)]` module (`ALL_ENTRIES` is
+    // private to that module, not visible here across the sibling-module
+    // boundary), so it isn't repeated in this file.
+
+    #[test]
+    fn every_imagine_icon_decodes_at_48x48() {
+        for &(basename, bytes) in imagines::IMAGINE_ICON_BYTES {
+            let image = decode(&format!("imagine icon {basename}"), bytes)
+                .unwrap_or_else(|| panic!("{basename}'s icon failed to decode"));
+            assert_eq!(
+                image.size,
+                [48, 48],
+                "{basename}'s icon must be rasterized at 48x48"
+            );
+        }
+    }
+
+    #[test]
+    fn imagine_icon_basenames_are_unique() {
+        for (i, &(a, _)) in imagines::IMAGINE_ICON_BYTES.iter().enumerate() {
+            for &(b, _) in &imagines::IMAGINE_ICON_BYTES[i + 1..] {
+                assert_ne!(a, b, "icon basename {a:?} appears more than once");
+            }
+        }
+    }
+
+    #[test]
+    fn imagine_icons_get_is_defined_for_every_embedded_icon() {
+        let ctx = egui::Context::default();
+        let icons = ImagineIcons::load(&ctx);
+        for &(basename, _) in imagines::IMAGINE_ICON_BYTES {
+            assert!(
+                icons.get(basename).is_some(),
+                "{basename} has no loaded texture"
+            );
+        }
     }
 }

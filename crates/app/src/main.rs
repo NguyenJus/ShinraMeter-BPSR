@@ -8,6 +8,8 @@
 mod dump;
 mod fonts;
 mod icons;
+// IMAGINE-TAKEDOWN: one of five sites — see `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
+mod imagines;
 mod inspect;
 mod logging;
 mod paths;

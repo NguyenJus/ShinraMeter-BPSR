@@ -94,6 +94,35 @@ pub struct AttrCollection {
     pub attrs: Vec<Attr>,
 }
 
+/// One entry of a player's skill list, inside a `SkillLevelIdList` (issue #33).
+///
+/// This carries *every* skill the player has, not just their equipped
+/// Imagines: deciding which entries are Imagines needs a lookup table this
+/// crate deliberately does not carry, and happens in `crates/app`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SkillLevelInfo {
+    #[prost(int32, tag = "1")]
+    pub skill_id: i32,
+    #[prost(int32, tag = "2")]
+    pub current_level: i32,
+    #[prost(int32, tag = "3")]
+    pub remodel_level: i32,
+}
+
+/// Wrapper for `attr_id::SKILL_LEVEL_ID_LIST` (`0x74`, issue #33).
+///
+/// **Unverified constant.** The wrapper field's tag (assumed `1`) has not
+/// been confirmed against live traffic — no capture is available. Same
+/// documented exception as `attr_id::SEASON_LEVEL` and
+/// `IMAGINE_PROFESSION_IDS`: reference-derived, unconfirmed, per
+/// `docs/packet-inspection.md`'s "Recording a result" procedure. Re-verify
+/// against a real capture if one ever becomes available.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SkillLevelIdList {
+    #[prost(message, repeated, tag = "1")]
+    pub skills: Vec<SkillLevelInfo>,
+}
+
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Entity {
     #[prost(int64, tag = "1")]
@@ -292,6 +321,28 @@ mod tests {
         pub attacker_uuid: i64,
         #[prost(string, tag = "99")]
         pub unknown_field: String,
+    }
+
+    #[test]
+    fn round_trip_skill_level_id_list() {
+        let msg = SkillLevelIdList {
+            skills: vec![
+                SkillLevelInfo {
+                    skill_id: 3905,
+                    current_level: 1,
+                    remodel_level: 0,
+                },
+                SkillLevelInfo {
+                    skill_id: 102640,
+                    current_level: 2,
+                    remodel_level: 1,
+                },
+            ],
+        };
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = SkillLevelIdList::decode(buf.as_slice()).unwrap();
+        assert_eq!(decoded, msg);
     }
 
     #[test]

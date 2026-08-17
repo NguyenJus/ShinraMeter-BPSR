@@ -12,7 +12,8 @@ use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 
 use crate::fonts;
-use crate::icons::{ClassIcons, GlyphIcon, GlyphIcons, ToolbarIcon, ToolbarIcons};
+use crate::icons::{ClassIcons, GlyphIcon, GlyphIcons, ImagineIcons, ToolbarIcon, ToolbarIcons};
+use crate::imagines;
 use crate::settings::{ColumnKind, Settings};
 
 // -- typography scale (issue #56, issue #62) ----------------------------
@@ -188,6 +189,9 @@ struct Icons {
     classes: ClassIcons,
     toolbar: ToolbarIcons,
     glyphs: GlyphIcons,
+    // IMAGINE-TAKEDOWN: one of five sites — see
+    // `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
+    imagines: ImagineIcons,
 }
 
 impl Icons {
@@ -196,6 +200,7 @@ impl Icons {
             classes: ClassIcons::load(ctx),
             toolbar: ToolbarIcons::load(ctx),
             glyphs: GlyphIcons::load(ctx),
+            imagines: ImagineIcons::load(ctx),
         }
     }
 }
@@ -1160,7 +1165,7 @@ fn pill_size(text_size: egui::Vec2, icon_side: f32, max_height: f32) -> egui::Ve
 /// Where a pill's two pieces go inside its rect: the value text's
 /// `Align2::LEFT_CENTER` anchor, and the icon's (square, vertically
 /// centered) box. Pure geometry so both orderings are unit-testable without
-/// a live `egui::Ui` — same reasoning as `icon_slot`.
+/// a live `egui::Ui` — same reasoning as `icon_slots`.
 fn pill_content_layout(
     rect: egui::Rect,
     text_size: egui::Vec2,
@@ -2525,14 +2530,50 @@ fn draw_row(
         }
     }
 
-    // The icon slot (issue #9) is reserved at a fixed offset regardless of
-    // whether this row's class has an icon, so names stay left-aligned in a
+    // The icon slots (issue #9, widened by issue #33) are reserved at a
+    // fixed offset regardless of whether this row's class has an icon or
+    // its two Imagine slots are filled, so names stay left-aligned in a
     // column across rows either way — only the painting below is
     // conditional.
-    let (icon_rect, name_offset) = icon_slot(rect);
+    let RowIconSlots {
+        class: icon_rect,
+        imagines: imagine_slots,
+        name_offset,
+    } = icon_slots(rect);
     if let Some(texture) = row.class.and_then(|class| icons.classes.get(class)) {
         ui.painter()
             .image(texture.id(), icon_rect, UV_FULL, CLASS_ICON_TINT);
+    }
+
+    // IMAGINE-TAKEDOWN: one of five sites — see
+    // `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
+    //
+    // The two Imagine slots (issue #33): a filled slot paints the equipped
+    // Imagine's icon (pre-masked to a circle at asset-prep time, so no
+    // runtime clip is needed) with a name tooltip on hover; an empty slot,
+    // an id outside the curated table, or a texture that failed to decode
+    // all degrade to the same blank-circle placeholder — one branch, never
+    // a panic (D4's runtime-degrade path).
+    for (i, slot) in imagine_slots.into_iter().enumerate() {
+        let filled = row.imagines[i]
+            .and_then(imagines::imagine_of_skill_id)
+            .and_then(|im| icons.imagines.get(im.icon).map(|texture| (im, texture)));
+        match filled {
+            Some((im, texture)) => {
+                ui.painter()
+                    .image(texture.id(), slot, UV_FULL, CLASS_ICON_TINT);
+                ui.interact(
+                    slot,
+                    ui.id().with(("imagine", row.uid, i)),
+                    egui::Sense::hover(),
+                )
+                .on_hover_text(im.name);
+            }
+            None => {
+                ui.painter()
+                    .circle_filled(slot.center(), IMAGINE_SIZE / 2.0, IMAGINE_SLOT_EMPTY);
+            }
+        }
     }
 
     // Regular weight, at the row's flat metric size (issue #62): the
@@ -2857,33 +2898,98 @@ fn share_bar_paints(rect: egui::Rect, bar_frac: f32, class: Option<Class>) -> Sh
 const ICON_SIZE: f32 = 18.0;
 
 /// Gap on both sides of the icon: between the row's left edge and the icon,
-/// and between the icon and the name that follows it. `3.5` so
-/// `ICON_GUTTER_WIDTH` lands exactly on `25.0` — the source's 18px glyph
-/// centered in a fixed 25px `SharedSizeGroup="p0"` column.
+/// and between the icon and the Imagine gutter that follows it. `3.5` so
+/// the class-icon portion of `ICON_GUTTER_WIDTH` lands exactly on the
+/// source's 18px glyph centered in a fixed 25px `SharedSizeGroup="p0"`
+/// column — `25.0` is what `ICON_GUTTER_WIDTH` reverts to once the
+/// `IMAGINE_GUTTER_WIDTH` addend below is deleted (D4's takedown).
 const ICON_MARGIN: f32 = 3.5;
 
 /// Class icon tint (source `Fill="#ddd"`).
 const CLASS_ICON_TINT: egui::Color32 = egui::Color32::from_rgb(0xDD, 0xDD, 0xDD);
 
-/// Fixed left-hand gutter `draw_row` reserves for the class icon slot: a
-/// margin, the icon itself, then a matching margin — reserved whether or
-/// not this particular row has an icon to paint into it, so every row's
-/// name still starts at the same x (see `icon_slot`).
-const ICON_GUTTER_WIDTH: f32 = ICON_MARGIN + ICON_SIZE + ICON_MARGIN;
+// IMAGINE-TAKEDOWN: one of five sites — see
+// `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
+//
+/// Square side of each Imagine slot (issue #33) — subordinate to the
+/// 18x18 class icon.
+const IMAGINE_SIZE: f32 = 14.0;
 
-/// Computes a row's icon slot (a square, vertically centered in `rect`,
-/// inset from the left edge by `ICON_MARGIN`) and the x-offset from
+// IMAGINE-TAKEDOWN: one of five sites — see
+// `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
+//
+/// Gap between the class icon and Imagine slot 0, and between slot 0 and
+/// slot 1. Not sourced from the reference meter — chosen so the gutter
+/// arithmetic (`IMAGINE_GUTTER_WIDTH`) lands cleanly.
+const IMAGINE_GAP: f32 = 2.0;
+
+// IMAGINE-TAKEDOWN: one of five sites — see
+// `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
+//
+/// Width the two Imagine slots add to `ICON_GUTTER_WIDTH`: two
+/// `(gap + slot)` pairs, `32.0`. A single named addend so D4's takedown is
+/// mechanical — deleting this line (and its use below) restores
+/// `ICON_GUTTER_WIDTH` to its pre-issue-#33 `25.0` with no other
+/// arithmetic to touch.
+const IMAGINE_GUTTER_WIDTH: f32 = 2.0 * (IMAGINE_GAP + IMAGINE_SIZE);
+
+// IMAGINE-TAKEDOWN: one of five sites — see
+// `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
+//
+/// Dim fill for the blank-circle placeholder an empty, unknown-id, or
+/// undecoded-texture Imagine slot paints instead of an icon — in the same
+/// register as `CLASS_ICON_TINT`.
+const IMAGINE_SLOT_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x55, 0x55, 0x55);
+
+/// Fixed left-hand gutter `draw_row` reserves for the class icon plus its
+/// two Imagine slots (issue #33): a margin, the class icon, the Imagine
+/// gutter, then a matching margin — reserved whether or not this
+/// particular row has any of these to paint, so every row's name still
+/// starts at the same x (see `icon_slots`).
+const ICON_GUTTER_WIDTH: f32 = ICON_MARGIN + ICON_SIZE + IMAGINE_GUTTER_WIDTH + ICON_MARGIN;
+
+/// A row's class-icon slot, its two Imagine slots (issue #33), and the
+/// x-offset from the row rect's left edge at which the player name should
+/// then start.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct RowIconSlots {
+    class: egui::Rect,
+    imagines: [egui::Rect; 2],
+    name_offset: f32,
+}
+
+/// Computes a row's class icon slot (a square, vertically centered in
+/// `rect`, inset from the left edge by `ICON_MARGIN`), its two Imagine
+/// slots immediately to its right (issue #33), and the x-offset from
 /// `rect`'s left edge at which the player name should then start. Pure
 /// geometry — it never looks at whether this row actually has a class icon
-/// to paint — so the slot, and therefore the name's start position, is
-/// identical across every row regardless of which classes have icons.
-fn icon_slot(rect: egui::Rect) -> (egui::Rect, f32) {
-    let icon_rect = egui::Rect::from_min_size(
+/// to paint or any equipped Imagines — so the slots, and therefore the
+/// name's start position, are identical across every row regardless of
+/// which classes have icons or which Imagines are equipped.
+fn icon_slots(rect: egui::Rect) -> RowIconSlots {
+    let class = egui::Rect::from_min_size(
         egui::pos2(rect.left() + ICON_MARGIN, rect.center().y - ICON_SIZE / 2.0),
         egui::vec2(ICON_SIZE, ICON_SIZE),
     );
+    // IMAGINE-TAKEDOWN: one of five sites — see
+    // `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
+    let imagines = std::array::from_fn(|i| {
+        let left = rect.left()
+            + ICON_MARGIN
+            + ICON_SIZE
+            + IMAGINE_GAP
+            + i as f32 * (IMAGINE_SIZE + IMAGINE_GAP);
+        egui::Rect::from_min_size(
+            egui::pos2(left, rect.center().y - IMAGINE_SIZE / 2.0),
+            egui::vec2(IMAGINE_SIZE, IMAGINE_SIZE),
+        )
+    });
     let name_offset = ICON_GUTTER_WIDTH + NAME_LEFT_PAD;
-    (icon_rect, name_offset)
+    RowIconSlots {
+        class,
+        imagines,
+        name_offset,
+    }
 }
 
 /// `bpsr_meter` already fills unknown names with `Player {uid}`; this is a
@@ -3005,10 +3111,11 @@ const SEPARATOR_HEIGHT: f32 = 6.0;
 /// between every consecutive pair of them.
 const ITEM_SPACING_Y: f32 = 2.0;
 
-/// Gap `draw_row` leaves between the icon slot (issue #9's `ICON_GUTTER_WIDTH`)
-/// and where the player name starts (`icon_slot`'s `name_offset`). Predates
-/// the icon slot — this used to be measured from the row's own left edge —
-/// but keeps its name since it's still the same "breathing room before the
+/// Gap `draw_row` leaves between the icon gutter (issue #9's
+/// `ICON_GUTTER_WIDTH`, widened by issue #33's Imagine slots) and where the
+/// player name starts (`icon_slots`'s `name_offset`). Predates the icon
+/// slot — this used to be measured from the row's own left edge — but
+/// keeps its name since it's still the same "breathing room before the
 /// name" budget.
 const NAME_LEFT_PAD: f32 = 2.0;
 
@@ -3069,23 +3176,26 @@ fn default_inner_height() -> f32 {
 /// font-metric variance between environments.
 const HEADER_ROW_EXTRA_WIDTH: f32 = 20.0;
 
-/// Default opening width (issue #26, widened for issue #9's icon gutter): a
-/// name budget in front of the default stat columns' combined fixed width
-/// (read out of `ColumnKind::spec` for whatever `Settings::default` enables,
-/// never hardcoded), so names don't visually collide with them — plus the
-/// fixed icon gutter now reserved at the row's left edge, so adding it
-/// doesn't squeeze the name budget or the stat columns relative to before
-/// issue #9 — plus `HEADER_ROW_EXTRA_WIDTH` so the header's own (now wider)
-/// stat row fits too.
+/// Default opening width (issue #26, widened for issue #9's icon gutter and
+/// again for issue #33's two Imagine slots): a name budget in front of the
+/// default stat columns' combined fixed width (read out of
+/// `ColumnKind::spec` for whatever `Settings::default` enables, never
+/// hardcoded), so names don't visually collide with them — plus the fixed
+/// icon gutter now reserved at the row's left edge, so adding it doesn't
+/// squeeze the name budget or the stat columns relative to before issue #9
+/// — plus `HEADER_ROW_EXTRA_WIDTH` so the header's own (now wider) stat row
+/// fits too.
 ///
-///   icon gutter (3.5 + 18.0 + 3.5 = 25.0) + left pad (2.0)
+///   icon gutter (class 3.5 + 18.0 + Imagines 32.0 + 3.5 = 57.0) + left pad (2.0)
 ///     + name budget (150.0) + gap (10.0)
 ///     + columns (DPS 80.0 + crit 56.0 + lucky 56.0 + deaths 48.0 = 240.0)
-///     + right margin (4.0) + header row headroom (20.0) = 451.0
+///     + right margin (4.0) + header row headroom (20.0) = 483.0
 ///
 /// The columns term grew with issue #49's death column joining the default
 /// set; because it is summed rather than written down, the default window
 /// widened to keep the same name budget instead of quietly squeezing it.
+/// Issue #33's `IMAGINE_GUTTER_WIDTH` addend widens this the same way: the
+/// name budget stays `150.0` rather than being squeezed to make room.
 fn default_inner_width() -> f32 {
     let columns_width: f32 = stat_columns_for(&Settings::default().ordered_columns())
         .iter()
@@ -4757,6 +4867,7 @@ mod tests {
             deaths: 0,
             ability_score,
             season_strength: None,
+            imagines: [None, None],
         }
     }
 
@@ -5276,6 +5387,7 @@ mod tests {
             deaths: 99,
             ability_score: Some(99_999),
             season_strength: Some(9_999),
+            imagines: [Some(99_999), Some(99_999)],
         };
 
         for (kind, column) in ColumnKind::ALL
@@ -5305,59 +5417,96 @@ mod tests {
         }
     }
 
-    // -- icon slot geometry (issue #9) ------------------------------------
+    // -- icon slot geometry (issue #9, issue #33) --------------------------
 
     fn row_rect() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(10.0, 100.0), egui::vec2(300.0, ROW_HEIGHT))
     }
 
     #[test]
-    fn icon_slot_is_square() {
-        let (icon_rect, _) = icon_slot(row_rect());
-        assert_eq!(icon_rect.width(), ICON_SIZE);
-        assert_eq!(icon_rect.height(), ICON_SIZE);
+    fn icon_slots_class_is_square() {
+        let slots = icon_slots(row_rect());
+        assert_eq!(slots.class.width(), ICON_SIZE);
+        assert_eq!(slots.class.height(), ICON_SIZE);
     }
 
     #[test]
-    fn icon_slot_is_inset_from_the_rows_left_edge_by_the_margin() {
+    fn icon_slots_class_is_inset_from_the_rows_left_edge_by_the_margin() {
         let rect = row_rect();
-        let (icon_rect, _) = icon_slot(rect);
-        assert_eq!(icon_rect.left(), rect.left() + ICON_MARGIN);
+        let slots = icon_slots(rect);
+        assert_eq!(slots.class.left(), rect.left() + ICON_MARGIN);
     }
 
     #[test]
-    fn icon_slot_is_vertically_centered_in_the_row() {
+    fn icon_slots_class_is_vertically_centered_in_the_row() {
         let rect = row_rect();
-        let (icon_rect, _) = icon_slot(rect);
-        assert_eq!(icon_rect.center().y, rect.center().y);
+        let slots = icon_slots(rect);
+        assert_eq!(slots.class.center().y, rect.center().y);
     }
 
     #[test]
-    fn icon_slot_name_offset_clears_the_icon_with_its_own_margin() {
-        let (icon_rect, name_offset) = icon_slot(row_rect());
+    fn icon_slots_name_offset_clears_the_icon_with_its_own_margin() {
         let rect = row_rect();
+        let slots = icon_slots(rect);
         // The name must start at or after the icon's right edge plus its own
         // margin gap — never overlapping the icon.
-        assert!(rect.left() + name_offset >= icon_rect.right() + ICON_MARGIN);
+        assert!(rect.left() + slots.name_offset >= slots.class.right() + ICON_MARGIN);
     }
 
     #[test]
-    fn icon_slot_name_offset_equals_the_gutter_plus_name_pad() {
-        let (_, name_offset) = icon_slot(row_rect());
-        assert_eq!(name_offset, ICON_GUTTER_WIDTH + NAME_LEFT_PAD);
+    fn icon_slots_name_offset_equals_the_gutter_plus_name_pad() {
+        let slots = icon_slots(row_rect());
+        assert_eq!(slots.name_offset, ICON_GUTTER_WIDTH + NAME_LEFT_PAD);
     }
 
-    /// The slot is reserved unconditionally: its geometry depends only on
-    /// the row rect, never on anything row-specific like whether this
-    /// player's class actually has an icon — so identical rects must always
-    /// yield identical slots.
+    /// The slots are reserved unconditionally: their geometry depends only
+    /// on the row rect, never on anything row-specific like whether this
+    /// player's class actually has an icon or any Imagines equipped — so
+    /// identical rects must always yield identical slots.
     #[test]
-    fn icon_slot_is_independent_of_row_width() {
+    fn icon_slots_is_independent_of_row_width() {
         let narrow =
             egui::Rect::from_min_size(egui::pos2(10.0, 100.0), egui::vec2(50.0, ROW_HEIGHT));
         let wide =
             egui::Rect::from_min_size(egui::pos2(10.0, 100.0), egui::vec2(500.0, ROW_HEIGHT));
-        assert_eq!(icon_slot(narrow), icon_slot(wide));
+        assert_eq!(icon_slots(narrow), icon_slots(wide));
+    }
+
+    #[test]
+    fn icon_slots_imagines_are_square_and_vertically_centered() {
+        let rect = row_rect();
+        let slots = icon_slots(rect);
+        for slot in slots.imagines {
+            assert_eq!(slot.width(), IMAGINE_SIZE);
+            assert_eq!(slot.height(), IMAGINE_SIZE);
+            assert_eq!(slot.center().y, rect.center().y);
+        }
+    }
+
+    #[test]
+    fn icon_slots_imagine_zero_starts_the_gap_right_of_the_class_icon() {
+        let slots = icon_slots(row_rect());
+        assert_eq!(slots.imagines[0].left(), slots.class.right() + IMAGINE_GAP);
+    }
+
+    #[test]
+    fn icon_slots_imagine_one_starts_the_gap_right_of_slot_zero() {
+        let slots = icon_slots(row_rect());
+        assert_eq!(
+            slots.imagines[1].left(),
+            slots.imagines[0].right() + IMAGINE_GAP
+        );
+    }
+
+    #[test]
+    fn icon_slots_imagines_never_overlap_the_class_icon_or_the_name() {
+        let rect = row_rect();
+        let slots = icon_slots(rect);
+        assert!(slots.imagines[0].left() >= slots.class.right());
+        assert!(
+            rect.left() + slots.name_offset >= slots.imagines[1].right() + ICON_MARGIN,
+            "name must start at or after the last imagine slot's right edge plus ICON_MARGIN"
+        );
     }
 
     // -- damage-share bar paints (issue #43) --------------------------------
@@ -5769,8 +5918,11 @@ mod tests {
             + HEADER_ROW_EXTRA_WIDTH;
         assert_eq!(default_inner_width(), expected);
         // Issue #80.1 tightened the default columns' widths (`Dps`,
-        // `CritPct`, `LuckyPct`), shrinking this from its old `451.0`.
-        assert_eq!(default_inner_width(), 387.0);
+        // `CritPct`, `LuckyPct`), shrinking this from its old `451.0` to
+        // `387.0`; issue #33's two Imagine slots then widened the icon
+        // gutter by `IMAGINE_GUTTER_WIDTH` (`32.0`), landing here at
+        // `419.0`.
+        assert_eq!(default_inner_width(), 419.0);
     }
 
     #[test]
@@ -5872,9 +6024,11 @@ mod tests {
         /// equal-damage trick: nothing else `draw_row` paints is
         /// `ROW_HEIGHT` tall — the accent line is
         /// `SHARE_BAR_ACCENT_THICKNESS`, the hover highlight only paints
-        /// while hovered (never true in a static render), and the class
-        /// icon is `ICON_SIZE`. Sorted top-to-bottom so index `i` here
-        /// really is row `i`.
+        /// while hovered (never true in a static render), the class icon is
+        /// `ICON_SIZE`, and the two Imagine slots (issue #33) are
+        /// `IMAGINE_SIZE` — a filled slot's `Shape::Mesh` and an empty
+        /// slot's `Shape::Circle` are both filtered out the same way.
+        /// Sorted top-to-bottom so index `i` here really is row `i`.
         fn row_rects(&self) -> Vec<egui::Rect> {
             let mut rects: Vec<egui::Rect> = self
                 .meshes

@@ -931,6 +931,7 @@ mod tests {
             deaths: 12,
             ability_score: None,
             season_strength: None,
+            imagines: [None, None],
         };
         assert_eq!((ColumnKind::Deaths.spec().text)(&row), "12");
     }
