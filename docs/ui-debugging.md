@@ -134,6 +134,17 @@ Probe -Label after  -Cols 6 -Rows 8
 PS
 ```
 
+Launching with an arbitrary environment variable set — e.g. `SHINRA_DEMO=1`
+(issue #91) to populate the header with a synthetic encounter instead of "No
+target" — doesn't fit `-Action run`'s switches, which only cover named
+options like `-RustLog`. Those switches exist for the common cases; arbitrary
+env vars go through `run`'s `-EnvVars` hashtable instead, submitted as an
+inline PowerShell snippet rather than `scripts/ctl.sh app`:
+
+```bash
+scripts/ctl.sh -c '& $env:SHINRA_UIDBG_APP -Action run -EnvVars @{ SHINRA_DEMO = "1" }'
+```
+
 ## Reading probe output
 
 ```
@@ -296,3 +307,11 @@ Each of these cost real time to find; they are commented at the site in
   virtualised and captures can land offset on a scaled display; compare a
   `status` rect against a screenshot once at the start of a session on a
   non-100% display.
+- **A quoted parameter name is not a parameter name.** `ctl.sh app` used to
+  single-quote every forwarded argument, so `-Action` reached PowerShell as
+  the literal string `'-Action'` — a positional value, not the parameter name
+  — and `scripts/ctl.sh app -Action status` failed with a confusing "the
+  argument `-Action` does not belong to the set" from `ValidateSet`, nowhere
+  near the actual cause. Arguments matching `-[A-Za-z]*` are now passed bare;
+  a value like `-12` still gets single-quoted, since it isn't a parameter
+  name.
