@@ -12,27 +12,61 @@ use crate::pb;
 
 pub mod attr_id {
     pub const NAME: i32 = 0x01;
-    /// **Unverified** against live traffic. Critical to issue #76 ("No
-    /// target" in header). Confirm via `docs/packet-inspection.md`.
+    /// `AttrId` (10) — the entity's *type* id, which for a monster is its
+    /// row in the game's monster table (what `tables::monster_name` and
+    /// `tables::is_boss_monster` key off). Despite the generic name there
+    /// is no separate "monster config id" attr: BPSR-ZDPS is explicit that
+    /// this is the one that resolves, and rewrites a non-player's uid with
+    /// it (`Managers/EncounterManager.cs:637-641`, "*Only the Attribute
+    /// named Id (AttrId) is their real type UID which can be resolved into
+    /// a name*"). `AttrConfigUid`/`AttrTableUid` exist in the enum but no
+    /// reference tracker reads either as a monster identity.
+    ///
+    /// Corroborated (issue #76) across all four reference trackers:
+    /// BPSR-ZDPS `BPSR-ZDPSLib/protos/EnumEAttrType.cs:798`
+    /// (`AttrId = 10`), StarResonanceDamageCounter `algo/packet.js:104`,
+    /// bpsr-logs `src-tauri/src/protocol/constants.rs:42`, resonance-logs
+    /// `src-tauri/src/live/opcodes_models.rs:545`.
     pub const MONSTER_ID: i32 = 0x0A;
-    /// **Unverified** against live traffic. Critical to issue #76 ("No
-    /// target" in header). Confirm via `docs/packet-inspection.md`.
+    /// `AttrHp` (11310) — current HP. Typed `int64` by the game's own
+    /// shipped `Data/FightAttrTable.json:1098-1103` (`"EnumName":
+    /// "AttrHp"`, `"IsSyncAoi": true`), so it is decoded at full width
+    /// here; the oldest reference tracker narrows it to `int32`, which
+    /// corrupts exactly the high-HP raid bosses this meter is for.
+    ///
+    /// Corroborated (issue #76): BPSR-ZDPS `EnumEAttrType.cs:1306`,
+    /// StarResonanceDamageCounter `algo/packet.js:111`, bpsr-logs
+    /// `src-tauri/src/protocol/constants.rs:44`, resonance-logs
+    /// `src-tauri/src/live/opcodes_models.rs:585`.
     pub const HP: i32 = 0x2C2E;
-    /// **Unverified** against live traffic. Critical to issue #76 ("No
-    /// target" in header). Confirm via `docs/packet-inspection.md`.
+    /// `AttrMaxHp` (11320) — max HP, read straight off this same attr
+    /// channel by every reference tracker (none derives it from a
+    /// percentage). Also `int64` per `Data/FightAttrTable.json:1138-1148`.
+    /// Not to be confused with `AttrMaxHpTotal` (11321, `0x2C39`), the
+    /// rollup of this attr, which no tracker reads.
+    ///
+    /// Corroborated (issue #76): BPSR-ZDPS `EnumEAttrType.cs:1307`,
+    /// StarResonanceDamageCounter `algo/packet.js:112`, bpsr-logs
+    /// `src-tauri/src/protocol/constants.rs:45`, resonance-logs
+    /// `src-tauri/src/live/opcodes_models.rs:586`.
+    ///
+    /// Note this attr rides the *appear* packet, not the HP deltas that
+    /// follow it — see `encounter::Meter::recompute_boss` for why the boss
+    /// heuristic must not require it.
     pub const MAX_HP: i32 = 0x2C38;
     pub const PROFESSION_ID: i32 = 0xDC;
     pub const FIGHT_POINT: i32 = 0x272E;
     /// Reference-derived, **not yet verified against live traffic** (issue
     /// #15): reimplemented from BPSR-ZDPS's `EnumEAttrType.cs`
     /// (`AttrSeasonLevel = 10070`) because no packet capture was available.
-    /// Only `FIGHT_POINT` in this module has been confirmed against captured
-    /// traffic per `docs/packet-inspection.md`'s "Recording a result"
-    /// convention. The attr ids `MONSTER_ID`, `HP`, `MAX_HP` (above), and
-    /// this constant, along with `SEASON_STRENGTH` (below), are unverified
-    /// reference-derived guesses. Issue #76 tracks the impact of unverified
-    /// `MONSTER_ID` and `MAX_HP`. Re-verify against a real capture if one
-    /// ever becomes available.
+    /// `FIGHT_POINT` is the only id in this module confirmed against
+    /// *captured traffic* per `docs/packet-inspection.md`'s "Recording a
+    /// result" convention. `MONSTER_ID`, `HP`, and `MAX_HP` (above) are
+    /// confirmed by source corroboration instead — all four reference
+    /// trackers plus the game's own shipped `FightAttrTable.json`, cited
+    /// per-constant above (issue #76). This constant and `SEASON_STRENGTH`
+    /// (below) rest on BPSR-ZDPS alone and remain single-source; re-verify
+    /// them against a real capture if one ever becomes available.
     pub const SEASON_LEVEL: i32 = 0x2756;
     /// Reference-derived, **not yet verified against live traffic** (issue
     /// #15): reimplemented from BPSR-ZDPS's `EnumEAttrType.cs`
@@ -322,6 +356,58 @@ mod tests {
         assert_eq!(
             player_info_from_attrs(1, &attrs, None).class,
             Some(pb::Class::Stormblade)
+        );
+    }
+
+    /// issue #76: the whole monster attr triple, built from the reference
+    /// trackers' own field numbering, decodes to a fully-populated
+    /// `EnemyHp`. The literal ids are deliberate — this test pins the
+    /// constants' *values*, so renumbering `attr_id` fails here rather
+    /// than silently returning `None` for every monster on the wire.
+    ///
+    /// `AttrId = 10` / `AttrHp = 11310` / `AttrMaxHp = 11320`, corroborated
+    /// by all four reference trackers; see the `attr_id` doc comments for
+    /// the per-repo file/line citations.
+    #[test]
+    fn monster_attr_triple_decodes_to_a_full_enemy_hp() {
+        let attrs = vec![
+            pb::Attr {
+                id: 0x0A,
+                raw_data: varint(103),
+            },
+            pb::Attr {
+                id: 0x2C2E,
+                raw_data: varint(4_200_000),
+            },
+            pb::Attr {
+                id: 0x2C38,
+                raw_data: varint(9_000_000),
+            },
+        ];
+
+        let hp = enemy_hp_from_attrs(42, &attrs, 7, None);
+
+        assert_eq!(hp.uid, 42);
+        assert_eq!(hp.monster_id, Some(103));
+        assert_eq!(hp.curr_hp, Some(4_200_000));
+        assert_eq!(hp.max_hp, Some(9_000_000));
+        assert_eq!(hp.timestamp_ms, 7);
+    }
+
+    /// The game's own `FightAttrTable.json` types `AttrHp`/`AttrMaxHp` as
+    /// `int64`, and BPSR-ZDPS reads both with `ReadInt64()`. A raid boss's
+    /// max HP genuinely exceeds `i32`, so narrowing here (as the oldest
+    /// reference tracker does with `reader.int32()`) would corrupt exactly
+    /// the fights this meter exists for.
+    #[test]
+    fn max_hp_above_i32_range_decodes_losslessly() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::MAX_HP,
+            raw_data: varint(9_000_000_000),
+        }];
+        assert_eq!(
+            enemy_hp_from_attrs(1, &attrs, 0, None).max_hp,
+            Some(9_000_000_000)
         );
     }
 

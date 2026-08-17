@@ -35,6 +35,13 @@ impl Default for ResetConfig {
 pub struct EnemyState {
     pub curr_hp: Option<u64>,
     pub max_hp: Option<u64>,
+    /// High-water mark of every `curr_hp` ever observed for this enemy
+    /// (issue #76 / PR #100 review). Stands in for `max_hp` when the appear
+    /// packet that carries `AttrMaxHp` was never seen, so a meter started
+    /// mid-pull still has a denominator to measure rollbacks against. It is
+    /// monotonically non-decreasing and deliberately survives `Meter::reset`
+    /// — the peak is a property of the entity, not of the encounter.
+    pub peak_hp: Option<u64>,
     pub lowest_pct: Option<f64>,
     pub took_damage: bool,
     /// Monster template id, from `EnemyHp::monster_id` (issue #9 slice 2).
@@ -44,11 +51,30 @@ pub struct EnemyState {
 }
 
 impl EnemyState {
+    /// Invariant (PR #100 review, finding 1): **every enemy with a known
+    /// `curr_hp` has a percentage**, so `check_hp_rollback` — and through it
+    /// the wipe/re-pull auto-reset — works for the `curr_hp`-only bosses that
+    /// issue #76 made resolvable. Before that invariant, widening
+    /// `recompute_boss` to rank on `curr_hp` alone produced a boss that could
+    /// *never* trigger a reset: `pct()` returned `None`, `check_hp_rollback`
+    /// short-circuited to `false`, and a wipe-and-repull kept accumulating
+    /// damage into the previous attempt until the idle timeout fired.
+    ///
+    /// The denominator is `max_hp` when it is known and non-zero (unchanged
+    /// behaviour for that path), otherwise the observed `peak_hp`. Measuring
+    /// against the peak means a `curr_hp`-only enemy reads exactly 100% at
+    /// every new high, so the bar refilling after a wipe still registers as
+    /// a rollback. Healing past the observed peak reads the same way, which
+    /// is accepted: it cannot fire on its own, because `check_hp_rollback`
+    /// also requires an earlier dip below `hp_drop_below_pct`, and a fresh
+    /// pull is safe because `Meter::reset` clears `lowest_pct`.
     pub fn pct(&self) -> Option<f64> {
-        match (self.curr_hp, self.max_hp) {
-            (Some(curr), Some(max)) if max > 0 => Some(curr as f64 / max as f64 * 100.0),
-            _ => None,
-        }
+        let curr = self.curr_hp?;
+        let denom = match self.max_hp {
+            Some(max) if max > 0 => max,
+            _ => self.peak_hp.filter(|peak| *peak > 0)?,
+        };
+        Some(curr as f64 / denom as f64 * 100.0)
     }
 }
 
@@ -73,6 +99,20 @@ mod tests {
         EnemyState {
             curr_hp: Some(curr_hp),
             max_hp: Some(max_hp),
+            peak_hp: Some(max_hp),
+            lowest_pct,
+            took_damage: true,
+            monster_id: None,
+        }
+    }
+
+    /// An enemy seen only through HP deltas: no `max_hp`, just a running
+    /// `curr_hp` and the peak observed so far.
+    fn curr_only(lowest_pct: Option<f64>, curr_hp: u64, peak_hp: u64) -> EnemyState {
+        EnemyState {
+            curr_hp: Some(curr_hp),
+            max_hp: None,
+            peak_hp: Some(peak_hp),
             lowest_pct,
             took_damage: true,
             monster_id: None,
@@ -86,9 +126,56 @@ mod tests {
     }
 
     #[test]
-    fn pct_none_when_max_missing() {
+    fn pct_none_when_no_hp_at_all() {
         let e = EnemyState::default();
         assert_eq!(e.pct(), None);
+    }
+
+    #[test]
+    fn pct_falls_back_to_the_observed_peak_when_max_hp_is_unknown() {
+        let e = curr_only(None, 2_000_000, 8_000_000);
+        assert!((e.pct().unwrap() - 25.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn pct_prefers_max_hp_over_the_observed_peak() {
+        let mut e = enemy(None, 50, 200);
+        // A peak below `max_hp` (mid-pull join that later learned `max_hp`)
+        // must not change the answer.
+        e.peak_hp = Some(60);
+        assert!((e.pct().unwrap() - 25.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn pct_treats_a_zero_max_hp_as_unknown() {
+        let mut e = enemy(None, 50, 0);
+        e.peak_hp = Some(100);
+        assert!((e.pct().unwrap() - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn pct_none_when_neither_max_hp_nor_peak_is_known() {
+        let e = EnemyState {
+            curr_hp: Some(50),
+            ..EnemyState::default()
+        };
+        assert_eq!(e.pct(), None);
+    }
+
+    #[test]
+    fn rollback_triggers_for_a_curr_hp_only_enemy_snapping_back_to_its_peak() {
+        let cfg = ResetConfig::default();
+        // Joined mid-pull at 5M (the peak), burned to 1M (20%), then the bar
+        // refilled to the peak on the wipe -> 100% of peak, rollback.
+        let e = curr_only(Some(20.0), 5_000_000, 5_000_000);
+        assert!(check_hp_rollback(&e, &cfg));
+    }
+
+    #[test]
+    fn rollback_does_not_trigger_for_a_curr_hp_only_enemy_still_being_burned() {
+        let cfg = ResetConfig::default();
+        let e = curr_only(Some(20.0), 2_000_000, 5_000_000);
+        assert!(!check_hp_rollback(&e, &cfg));
     }
 
     #[test]

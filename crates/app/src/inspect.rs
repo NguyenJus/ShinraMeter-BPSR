@@ -1,7 +1,7 @@
-//! Opt-in packet-inspection diagnostic mode (issue #25 slice A).
+//! Packet-inspection diagnostic mode (issue #25 slice A).
 //!
-//! Off by default — `SHINRA_INSPECT=1` (any non-empty value other than `0`
-//! or `false`, case-insensitively) turns it on. When on:
+//! On by default (issue #87) — set `SHINRA_INSPECT=0`, `false`, or `off`
+//! (case-insensitively) to opt out. When on:
 //!
 //! - every Notify-shaped fragment observed — recognized service or not, and
 //!   including one whose payload would not decompress (dumped as its raw
@@ -38,15 +38,20 @@ use crate::dump;
 /// log lines readable.
 const HEX_PREFIX_LEN: usize = 32;
 
-/// True when `SHINRA_INSPECT` turns diagnostics on.
+/// True unless `SHINRA_INSPECT` is set to an explicit opt-out value (`0`,
+/// `false`, or `off`, case-insensitively) — diagnostics are on by default.
 pub fn enabled() -> bool {
     enabled_from(std::env::var("SHINRA_INSPECT").ok().as_deref())
 }
 
 fn enabled_from(var: Option<&str>) -> bool {
     match var {
-        Some(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
-        None => false,
+        Some(v) => {
+            !(v.eq_ignore_ascii_case("0")
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off"))
+        }
+        None => true,
     }
 }
 
@@ -97,16 +102,16 @@ impl Handle {
     }
 }
 
-/// Turns diagnostics on if `SHINRA_INSPECT` is set, spawning the dump-writer
-/// thread and returning a `Handle`; `None` (zero cost beyond the env check)
-/// otherwise.
+/// Turns diagnostics on unless opted out via `SHINRA_INSPECT`, spawning the
+/// dump-writer thread and returning a `Handle`; `None` (zero cost beyond the
+/// env check) if opted out.
 pub fn init() -> Option<Handle> {
     if !enabled() {
         return None;
     }
     let path = dump_path();
     log::info!(
-        "packet inspection enabled (SHINRA_INSPECT set); dumping to {}",
+        "packet inspection enabled by default (set SHINRA_INSPECT=0 to opt out); dumping to {}",
         path.display()
     );
     let writer = dump::DumpWriter::spawn(path);
@@ -250,16 +255,17 @@ mod tests {
     // -- enabled ------------------------------------------------------
 
     #[test]
-    fn enabled_is_false_when_unset() {
-        assert!(!enabled_from(None));
+    fn enabled_is_true_when_unset() {
+        assert!(enabled_from(None));
     }
 
     #[test]
-    fn enabled_is_false_for_0_or_false_case_insensitive() {
+    fn enabled_is_false_for_0_false_or_off_case_insensitive() {
         assert!(!enabled_from(Some("0")));
         assert!(!enabled_from(Some("false")));
         assert!(!enabled_from(Some("FALSE")));
-        assert!(!enabled_from(Some("")));
+        assert!(!enabled_from(Some("off")));
+        assert!(!enabled_from(Some("OFF")));
     }
 
     #[test]
@@ -267,6 +273,11 @@ mod tests {
         assert!(enabled_from(Some("1")));
         assert!(enabled_from(Some("yes")));
         assert!(enabled_from(Some("true")));
+    }
+
+    #[test]
+    fn enabled_is_true_for_an_empty_value_since_only_the_named_tokens_opt_out() {
+        assert!(enabled_from(Some("")));
     }
 
     // -- dump_path ------------------------------------------------------
