@@ -36,7 +36,7 @@ use crate::settings::{ColumnKind, Settings};
 
 /// Boss/encounter title — the source's `FontSize="13" FontWeight="DemiBold"`.
 const FONT_SIZE_TITLE: f32 = 13.0;
-/// The value inside the timer half-pill — the source's `FontSize="16"
+/// The header's timer readout — the source's `FontSize="16"
 /// FontWeight="DemiBold"`, the largest text in the UI.
 const FONT_SIZE_TIMER: f32 = 16.0;
 /// Every text in a player row — name and every metric column alike. The
@@ -181,6 +181,11 @@ pub struct OverlayApp {
     /// lands, so the crop always matches the frame that was actually
     /// captured regardless of how the row count drifts afterward.
     pending_screenshot_bound: Option<f32>,
+    /// `demo_enabled()` cached at construction so `ui()` doesn't re-read the
+    /// env var every frame; also lets `ui()` keep demo mode's synthetic
+    /// snapshot from being clobbered by the per-frame `rx_snapshot` drain
+    /// below (see that call site).
+    demo_mode: bool,
 }
 
 /// All icon textures the overlay paints, bundled so `OverlayApp` has exactly
@@ -205,6 +210,81 @@ impl Icons {
     }
 }
 
+/// The overlay only ever renders real data when the game is running on
+/// Windows, which makes UI work on the header (issue #91) unverifiable on a
+/// dev box — there is no live encounter to populate it with. Setting
+/// `SHINRA_DEMO=1` seeds a fixed synthetic encounter instead of "No target",
+/// so the issue #88 uidbg harness can capture a populated header without a
+/// game session. Opt-in and off by default; see [`demo_enabled_from`] for the
+/// exact truthiness rule (same idiom as `main::composition_choice`'s
+/// `SHINRA_NO_COMPOSITION`, but with the true/false senses swapped since this
+/// one defaults off).
+fn demo_enabled() -> bool {
+    demo_enabled_from(std::env::var("SHINRA_DEMO").ok().as_deref())
+}
+
+/// Pure truthiness check for `SHINRA_DEMO`, split out from [`demo_enabled`]
+/// so it is testable without touching the process environment. `1`, `true`,
+/// or `on` (case-insensitively) turn demo mode on; everything else —
+/// including unset, empty, and any other value — leaves it off.
+fn demo_enabled_from(var: Option<&str>) -> bool {
+    var.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+}
+
+/// `(name, class, damage, crit_pct, deaths)` for each demo row, in
+/// descending-damage order. Values intentionally mirror
+/// `docs/reference/new-shinra-ex.webp` so a demo-mode capture can be diffed
+/// against the reference screenshot.
+const DEMO_ROWS: [(&str, Class, i64, f32, u32); 5] = [
+    ("Quick", Class::Stormblade, 55_300_000, 73.0, 0),
+    ("Ranmori", Class::FrostMage, 55_100_000, 76.0, 1),
+    ("Aki", Class::TwinStriker, 49_900_000, 54.0, 0),
+    ("Izumik", Class::WindKnight, 17_800_000, 59.0, 0),
+    ("Lyzl", Class::VerdantOracle, 10_300_000, 29.0, 0),
+];
+
+/// The synthetic snapshot `demo_enabled` seeds the overlay with. Values
+/// chosen to render as "2:39", "188M/s", and "30.1B" — the same duration,
+/// DPS, and total-damage figures shown in `docs/reference/new-shinra-ex.webp`
+/// — plus `DEMO_ROWS`'s per-row damage/crit% pairs, so a demo-mode capture
+/// can be compared directly against that reference.
+fn demo_snapshot() -> Snapshot {
+    let row_damage_sum: i64 = DEMO_ROWS.iter().map(|(_, _, dmg, _, _)| dmg).sum();
+    let duration_ms = 159_000u64;
+    let rows = DEMO_ROWS
+        .iter()
+        .enumerate()
+        .map(|(i, &(name, class, damage, crit_pct, deaths))| PlayerRow {
+            uid: i as i64 + 1,
+            name: name.to_string(),
+            class: Some(class),
+            ability_score: None,
+            season_strength: None,
+            imagines: [None, None],
+            damage,
+            dps: damage as f64 / (duration_ms as f64 / 1000.0),
+            share_pct: damage as f32 / row_damage_sum as f32 * 100.0,
+            crit_pct,
+            lucky_pct: 20.0,
+            hits: 200,
+            deaths,
+        })
+        .collect();
+    Snapshot {
+        duration_ms,
+        total_damage: 30_100_000_000,
+        total_dps: 188_000_000.0,
+        rows,
+        encounter: EncounterInfo {
+            boss_monster_id: Some(1),
+            boss_name: Some("Bahaar"),
+            is_boss: true,
+            scene_id: None,
+            scene_name: Some("Frozen Bahaar's Sanctum"),
+        },
+    }
+}
+
 impl OverlayApp {
     /// `settings` is loaded by the caller (`main.rs`) rather than via
     /// `settings::load()` in here, because issue #27 needs the same loaded
@@ -218,14 +298,23 @@ impl OverlayApp {
         tx_settings: Sender<Settings>,
         settings: Settings,
     ) -> Self {
-        Self {
-            snapshot: Snapshot {
+        // Demo seed (see `demo_enabled`/`demo_snapshot` above). Cached once
+        // here rather than re-called, so `ui()` below can reuse the same
+        // answer every frame instead of re-reading the env var.
+        let demo_mode = demo_enabled();
+        let snapshot = if demo_mode {
+            demo_snapshot()
+        } else {
+            Snapshot {
                 duration_ms: 0,
                 total_damage: 0,
                 total_dps: 0.0,
                 rows: Vec::new(),
                 encounter: EncounterInfo::default(),
-            },
+            }
+        };
+        Self {
+            snapshot,
             status: StatusLine::Ok,
             settings,
             rx_snapshot,
@@ -235,6 +324,7 @@ impl OverlayApp {
             window_gesture: WindowGesture::default(),
             last_dpi_probe: None,
             pending_screenshot_bound: None,
+            demo_mode,
         }
     }
 
@@ -250,9 +340,15 @@ impl eframe::App for OverlayApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Drain the channel, keeping only the most recent snapshot.
-        for snap in self.rx_snapshot.try_iter() {
-            self.snapshot = snap;
+        // Drain the channel, keeping only the most recent snapshot. Demo
+        // mode's snapshot is synthetic, not a stand-in for "no live data
+        // yet" — draining here would replace it with the pipeline's real
+        // (empty, game-not-running) snapshots every frame, which is exactly
+        // the bug this skip avoids.
+        if !self.demo_mode {
+            for snap in self.rx_snapshot.try_iter() {
+                self.snapshot = snap;
+            }
         }
 
         let ctx = ui.ctx().clone();
@@ -447,14 +543,13 @@ fn draw_header(
     // The header band's height budget — also what `draw_header_wash` and the
     // paint clips below size themselves against, so the whole band is one
     // number derived once rather than several that could drift apart.
-    let band_height = header_band_height(subtitle.is_some(), ui.spacing().interact_size.y);
-    let text_band_height = header_text_band_height(subtitle.is_some());
+    let band_height = header_band_height(ui.spacing().interact_size.y);
 
     // The panel's own full-width rect, captured before the band below
     // narrows it to the drag band's height — the background wash (issue #59,
-    // #62, #81) is anchored off the panel's left/top/right edges, sized to
-    // `text_band_height` rather than the drag band, so it stops above the
-    // stat-pill row instead of running into it.
+    // #62, #81, #91) is anchored off the panel's left/top/right edges and
+    // sized to the whole drag band, so it ends exactly where the first
+    // player row begins.
     let panel = ui.available_rect_before_wrap();
     // The header band's full paint extent — `panel` truncated to
     // `band_height`, with no top adjustment. `RESIZE_EDGE` is a
@@ -462,17 +557,8 @@ fn draw_header(
     // panel's own fill/border already cover that strip.
     let header_paint_clip =
         egui::Rect::from_min_size(panel.min, egui::vec2(panel.width(), band_height));
-    // What the gutter emblem may paint into (issue #75): the header's *text*
-    // rows only, not the whole band. Its 60pt box hangs well below a 20pt
-    // title row, and the stat-pill row underneath has no gutter to hang into
-    // — the timer half-pill is flush against the same left border — so ink
-    // reaching that row lands straight on the pill, under a 6%-alpha fill
-    // and behind a clock glyph tinted at a third alpha. Clipping to the
-    // text band still keeps the intentional bleed off the left edge.
-    let emblem_clip =
-        egui::Rect::from_min_size(panel.min, egui::vec2(panel.width(), text_band_height));
-    // The whole header band is the drag surface — title line, the optional
-    // subtitle line, and the timer/DPS/buttons row — registered *before* the
+    // The whole header band is the drag surface — title line, subtitle
+    // line, and the timer/DPS/buttons row — registered *before* the
     // row's contents so the buttons drawn into it end up on top and still get
     // their clicks. Grabbing a single glyph was too small a target to hit.
     let band = {
@@ -485,10 +571,13 @@ fn draw_header(
 
     // The decorative background wash, painted before anything else in the
     // band so every later layer — emblem, title, separator, chevron,
-    // subtitle, stat row — sits on top of it. Sized to the text rows alone
-    // (issue #81), not the fixed-98pt run it used to be, so it stops clear
-    // of the stat-pill row painted below it rather than bleeding into it.
-    let wash_height = text_band_height - HEADER_WASH_INSET;
+    // subtitle, stat row — sits on top of it. Sized to the whole drag band
+    // (issue #91), not the text rows alone (issue #81) and not the fixed
+    // 98pt run before that: the gradient and the oversized emblem it carries
+    // are the header's background, so they run behind the stat-pill row too
+    // and stop exactly at the band's bottom edge, where the first player row
+    // starts. Derived from `band_height`, never a literal.
+    let wash_height = band_height - HEADER_WASH_INSET;
     draw_header_wash(ui, panel, icons, wash_height);
 
     let drag_surface = ui.interact(band, ui.id().with("title_bar"), egui::Sense::drag());
@@ -502,17 +591,29 @@ fn draw_header(
     }
 
     // Title is always rendered (even as the "No target" placeholder) so the
-    // header's height never jitters between frames; the subtitle is omitted
-    // entirely — not rendered blank — when the scene is unknown (issue #9
-    // slice 2).
+    // header's height never jitters between frames. So is the subtitle row
+    // (issue #91): it renders empty when the scene is unknown rather than
+    // being skipped, because skipping it collapsed the band by
+    // `SUBTITLE_LINE_HEIGHT + ITEM_SPACING_Y` and lifted the whole stat-pill
+    // row every time the app fell back to its idle "No target" state.
     let title_row = draw_title_line(ui, &title);
-    // The gutter emblem (issue #59): bled off the left edge and centered on
-    // the header's text rows, clipped to them (`emblem_clip`, issue #75) so
-    // it stays clear of the stat-pill row below.
+    // The gutter emblem (issue #59): bled off the left edge and spanning the
+    // whole band, both as geometry (`header_emblem_rect`) and as clip
+    // (`header_paint_clip`) — one boundary, so the diamond's top and bottom
+    // corners land exactly on the band's edges and its ink never reaches the
+    // first player row.
+    //
+    // Issue #75 sized and clipped it to the text rows instead, to keep its
+    // ink off the timer's half-pill chrome. Issue #91 moved that chrome out
+    // of the way instead (`HEADER_STAT_ROW_INSET_X`), and measuring the
+    // reference render showed the mark's body and diagonal blade running
+    // down through the timer row to the band's bottom edge — our text-band
+    // box and clip were slicing the blade off at the subtitle line while
+    // hanging the mark's top corner above the band.
     if let Some(emblem) = icons.glyphs.get(GlyphIcon::Emblem) {
-        ui.painter().with_clip_rect(emblem_clip).image(
+        ui.painter().with_clip_rect(header_paint_clip).image(
             emblem.id(),
-            header_emblem_rect(title_row, text_band_height),
+            header_emblem_rect(title_row, band_height),
             UV_FULL,
             HEADER_EMBLEM_COLOR,
         );
@@ -537,12 +638,22 @@ fn draw_header(
         .show(|ui| {
             draw_header_menu(ui, ctx, tx_command, settings, icons);
         });
-    if let Some(subtitle) = &subtitle {
-        draw_subtitle_line(ui, subtitle);
-    }
+    draw_subtitle_line(ui, subtitle.as_deref().unwrap_or(""));
 
+    // The gap above the stat row is `HEADER_STAT_ROW_GAP`, not the layout's
+    // own `ITEM_SPACING_Y` — see that constant for why, and
+    // `header_band_height` for the budget it feeds. egui already inserted
+    // one `ITEM_SPACING_Y` after the row above, so only the remainder is
+    // added here.
+    ui.add_space(HEADER_STAT_ROW_GAP - ITEM_SPACING_Y);
     ui.horizontal(|ui| {
-        // Three oval stat pills (issue #56), replacing the bare
+        // The whole row is inset from the panel's left content edge
+        // (`HEADER_STAT_ROW_INSET_X`, issue #91). `add_space` in a
+        // horizontal layout advances the cursor directly, with no
+        // `item_spacing` of its own, so the timer's ink starts exactly this
+        // far in.
+        ui.add_space(HEADER_STAT_ROW_INSET_X);
+        // Three stat readouts (issue #56), replacing the bare
         // "clock icon + 02:39 | X DPS | Y DMG" run this row used to be. The
         // gap between them is the layout's own `item_spacing.x`
         // (`apply_theme` sets 6.0), which is exactly the "small gap" the
@@ -985,6 +1096,24 @@ fn menu_chevron(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
 /// `const fn` in ecolor.
 const PILL_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(9, 9, 9, 9);
 
+/// Fill of the timer pill — the source's `#1aaaaaaa`, a light gray at very
+/// low alpha. Deliberately not `PILL_FILL`: the duration is the stat row's
+/// lead readout and its capsule sits a shade lighter than the two value
+/// pills beside it, which is what lets the eye separate "how long" from
+/// "how much" without a divider between them.
+const TIMER_PILL_FILL: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0xAA, 0xAA, 0xAA, 0x11);
+
+/// Hairline outline of the timer pill — the source's `#2fff`, white at
+/// alpha `0x22`. The only stroked pill in the window: the DPS/damage ovals
+/// are fill-only, so this border is the second half of what distinguishes
+/// the timer from them. Issue #91's rule about it is a shape rule, not a
+/// chrome rule — the capsule must be a *full* oval, inset from the panel
+/// border by `HEADER_STAT_ROW_INSET_X`, never the half-pill welded to the
+/// window edge it once was.
+const TIMER_PILL_BORDER: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x22);
+
 /// Value text color inside a header/DPS/damage pill — the source's `#afff`:
 /// white at ~2/3 alpha, the dimmer, partially transparent sibling of
 /// `TITLE_TEXT_COLOR`'s opaque white. The two are deliberately not the same
@@ -1004,14 +1133,6 @@ const PILL_ICON_COLOR: egui::Color32 =
 /// Side of a header/DPS/damage pill's glyph box, in points — the source's
 /// `GeneralStatPathStyle` `14x14`.
 const PILL_GLYPH_SIDE: f32 = 14.0;
-
-/// Timer half-pill fill — the source's `#1aaa`.
-const TIMER_PILL_FILL: egui::Color32 =
-    egui::Color32::from_rgba_unmultiplied_const(0xAA, 0xAA, 0xAA, 0x11);
-
-/// Timer half-pill border — the source's `#2fff`.
-const TIMER_PILL_BORDER: egui::Color32 =
-    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x22);
 
 /// Counter (death) pill fill — `MetricBorderStyle`'s `#1fff`.
 const COUNTER_PILL_FILL: egui::Color32 =
@@ -1042,8 +1163,8 @@ const PILL_PAD_Y: f32 = 2.0;
 const PILL_ICON_GAP: f32 = 5.0;
 
 /// One stat pill's content. A struct rather than a long argument list
-/// because issue #49's death counter and issue #59's timer half-pill need
-/// the same chrome with different sizes, colors, glyph sides and corner
+/// because issue #49's death counter and issue #59's timer readout need
+/// the same layout with different sizes, colors, glyph sides and corner
 /// radii — a positional call would be unreadable at every call site.
 struct StatPill<'a> {
     value: &'a str,
@@ -1060,17 +1181,21 @@ struct StatPill<'a> {
     size: f32,
     value_color: egui::Color32,
     icon_color: egui::Color32,
-    /// Icon before the value instead of after it. The header's DPS/damage
-    /// pills read value-then-icon; the timer half-pill and issue #49's
-    /// death counter read icon-then-value.
+    /// Icon before the value instead of after it. Every header pill —
+    /// timer, DPS and damage alike — reads value-then-icon, matching the
+    /// reference render's `02:39 ⏱ | 188M/s ☁ | 30.1B ♡`; only issue #49's
+    /// per-row death counter reads icon-then-value (skull, then count).
     icon_first: bool,
-    /// Per-corner radius. The DPS/damage pills are full ovals; the timer
-    /// half-pill is `CornerRadius="0 13 13 0"`, flush against the panel's
-    /// left border.
+    /// Per-corner radius. Every pill is a full oval — all four corners at
+    /// half the button row's height, never a flattened pair. The timer used
+    /// to be a half-pill (`CornerRadius="0 13 13 0"`, welded to the panel's
+    /// left border), which is the shape issue #91 fixed.
     corner_radius: egui::CornerRadius,
-    /// Fill behind the pill.
+    /// Fill behind the pill. The timer's (`TIMER_PILL_FILL`) is a shade
+    /// lighter than the value pills' `PILL_FILL`.
     fill: egui::Color32,
-    /// Optional 1pt outline — only the timer half-pill has one (`#2fff`).
+    /// Optional 1pt outline. Only the timer has one (`TIMER_PILL_BORDER`);
+    /// the DPS/damage and counter pills are fill-only.
     stroke: Option<egui::Stroke>,
 }
 
@@ -1093,9 +1218,24 @@ impl<'a> StatPill<'a> {
         }
     }
 
-    /// The encounter-duration half-pill, flush against the panel's left
-    /// border (`CornerRadius="0 13 13 0"`) — the source's largest stat text
-    /// and its only stroked/bordered pill.
+    /// The encounter duration: the source's largest stat text, trailed by
+    /// its clock glyph, in a capsule of its own — a slightly lighter fill
+    /// (`TIMER_PILL_FILL`) than the two value pills and the window's only
+    /// pill border (`TIMER_PILL_BORDER`), so the lead readout reads as
+    /// distinct from them.
+    ///
+    /// Issue #91: the clock used to *lead* the duration. The reference
+    /// render reads `02:39 ⏱`, the same value-then-icon order as the DPS
+    /// and damage pills beside it.
+    ///
+    /// Issue #91's real quarrel was never with the capsule but with its
+    /// *shape and place*: it was a half-pill (`CornerRadius="0 13 13 0"`)
+    /// sitting flush against the panel's left border, so it read as an oval
+    /// sliced off by the window edge. The radius is now uniform on all four
+    /// corners — a full oval, like `header` — and
+    /// `HEADER_STAT_ROW_INSET_X` holds the whole row clear of the border so
+    /// nothing crops it. Those two together are the fix; the chrome itself
+    /// is the source's and stays.
     fn timer(value: &'a str, icon: Option<egui::TextureId>) -> Self {
         Self {
             value,
@@ -1104,13 +1244,8 @@ impl<'a> StatPill<'a> {
             size: FONT_SIZE_TIMER,
             value_color: PILL_VALUE_COLOR,
             icon_color: PILL_ICON_COLOR,
-            icon_first: true,
-            corner_radius: egui::CornerRadius {
-                nw: 0,
-                ne: 13,
-                sw: 0,
-                se: 13,
-            },
+            icon_first: false,
+            corner_radius: egui::CornerRadius::same((BUTTON_ROW_HEIGHT / 2.0) as u8),
             fill: TIMER_PILL_FILL,
             stroke: Some(egui::Stroke::new(1.0, TIMER_PILL_BORDER)),
         }
@@ -1288,8 +1423,9 @@ fn encounter_title(e: &EncounterInfo) -> String {
 }
 
 /// Header subtitle text (issue #9 slice 2): the scene name when known, else
-/// its raw scene id, else `None` — `draw_header` omits the subtitle line
-/// entirely in that case rather than reserving space for nothing.
+/// its raw scene id, else `None` — `draw_header` paints the subtitle row
+/// blank in that case. The row's space is reserved either way (issue #91,
+/// `header_text_band_height`); only its ink is conditional.
 fn encounter_subtitle(e: &EncounterInfo) -> Option<String> {
     match (e.scene_name, e.scene_id) {
         (Some(name), _) => Some(name.to_string()),
@@ -1301,7 +1437,11 @@ fn encounter_subtitle(e: &EncounterInfo) -> Option<String> {
 /// Height of the header's title line, reused by both `draw_header`'s
 /// drag-band sizing and `default_inner_height` so they can't drift apart —
 /// the same pattern `ROW_HEIGHT` follows for player rows.
-const TITLE_LINE_HEIGHT: f32 = 20.0;
+/// Issue #91 raised this from `20.0`: measured against
+/// `docs/reference/new-shinra-ex.webp`, our boss name sat with barely a
+/// point of air under its descenders, while the reference leaves the name a
+/// visibly taller line box.
+const TITLE_LINE_HEIGHT: f32 = 22.0;
 
 /// White the title line is painted in — the source's inherited `White`
 /// title foreground, deliberately not `ui.visuals().text_color()` (the
@@ -1311,13 +1451,18 @@ const TITLE_LINE_HEIGHT: f32 = 20.0;
 /// step dimmer in `PILL_VALUE_COLOR` so the title still outweighs them.
 const TITLE_TEXT_COLOR: egui::Color32 = egui::Color32::WHITE;
 
-/// Height of the header's subtitle line. Not part of `default_inner_height`
-/// — the subtitle is conditional and the default window assumes it is
-/// absent (see `default_inner_height`'s doc).
+/// Height of the header's subtitle line, always reserved by the header band
+/// whether or not there is an area name to paint into it (issue #91, see
+/// `header_text_band_height`). Still not part of `default_inner_height`,
+/// which keeps the opening size it was measured at (see its doc).
 ///
-/// `TITLE_LINE_HEIGHT (20) + ITEM_SPACING_Y (2) + SUBTITLE_LINE_HEIGHT (14)
-/// == 36.0`, the source's `Height="36"` header grid, exactly.
-const SUBTITLE_LINE_HEIGHT: f32 = 14.0;
+/// `TITLE_LINE_HEIGHT (22) + ITEM_SPACING_Y (2) + SUBTITLE_LINE_HEIGHT (16)
+/// == 40.0`. Issue #91 grew both line heights off the source's original
+/// `Height="36"` grid (`20 + 2 + 14`): pixel-measured against
+/// `docs/reference/new-shinra-ex.webp`, the reference's area name clears its
+/// own descenders and the separator above it with more room than a 14pt line
+/// box leaves.
+const SUBTITLE_LINE_HEIGHT: f32 = 16.0;
 
 /// Subtitle text color — the source's `#5fff`, white at ~1/3 alpha.
 const SUBTITLE_TEXT_COLOR: egui::Color32 =
@@ -1360,35 +1505,65 @@ fn header_text_rect(row: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_max(egui::pos2(left, row.top()), egui::pos2(right, row.bottom()))
 }
 
-/// Height of `draw_header`'s drag band: the title line, the optional
-/// subtitle line, and the button row (`button_row_height`, egui's
-/// `interact_size.y`), plus one `ITEM_SPACING_Y` gap for every adjacent pair
-/// egui's vertical layout stacks them as — 1 gap (title -> button row) when
-/// there's no subtitle, 2 (title -> subtitle -> button row) when there is.
-/// Extracted from `draw_header` so the two cases are unit-testable without a
-/// live `egui::Ui`.
-fn header_band_height(has_subtitle: bool, button_row_height: f32) -> f32 {
-    header_text_band_height(has_subtitle) + ITEM_SPACING_Y + button_row_height
+/// Gap between the header's text band (title + subtitle) and the
+/// stat-pill row below it. Its own constant rather than the `ITEM_SPACING_Y`
+/// (2.0) every other adjacent pair pays, because the stat row has to clear
+/// the subtitle's *descenders* the way the reference does: measured on
+/// `docs/reference/new-shinra-ex.webp`, the reference leaves 14px between the
+/// subtitle's ink and the stat row's ink, where ours left 8px and the pills
+/// crowded the area name. The extra 4pt here is what buys the difference
+/// without inflating every other gap in the window.
+///
+/// `draw_header` applies it explicitly (`ui.add_space`) *and* budgets it in
+/// `header_band_height`, so the drag band, the wash and the painted rows all
+/// stay derived from this one number.
+const HEADER_STAT_ROW_GAP: f32 = 6.0;
+
+/// How far the stat row (timer, DPS, damage, toggle cluster) is inset from
+/// the panel's left content edge. The timer used to sit flush against it, so
+/// its capsule was cropped by the window border and drawn as a half-pill to
+/// match; the reference render starts the row's leftmost ink 8px in from the
+/// panel's content edge instead, which is what lets the timer wear a whole
+/// oval (see `StatPill::timer`).
+const HEADER_STAT_ROW_INSET_X: f32 = 8.0;
+
+/// Height of `draw_header`'s drag band: the title line, the subtitle line,
+/// and the button row (`button_row_height`, egui's `interact_size.y`), plus
+/// the gaps egui's vertical layout stacks between them — `ITEM_SPACING_Y`
+/// between the title and subtitle rows, and `HEADER_STAT_ROW_GAP` above the
+/// stat-pill row. Extracted from `draw_header` so it is unit-testable
+/// without a live `egui::Ui`.
+///
+/// A constant `68.0` at the real `BUTTON_ROW_HEIGHT`, with no dependence on
+/// whether an area name is known — see `header_text_band_height`.
+fn header_band_height(button_row_height: f32) -> f32 {
+    header_text_band_height() + HEADER_STAT_ROW_GAP + button_row_height
 }
 
-/// Height of the header's *text* rows alone: the title line plus, when the
-/// scene is known, the gap and the subtitle line under it — the source's
-/// `Height="36"` header grid.
+/// Height of the header's *text* rows alone: the title line, the gap, and
+/// the subtitle line under it (issue #91's `22 + 2 + 16`, grown from the
+/// source's `Height="36"` grid).
+///
+/// Unconditional. The subtitle's line and gap are reserved whether or not a
+/// scene is known, so the header is a fixed-height band: the app's idle
+/// "No target" state used to skip them, which collapsed the band from 68 to
+/// 50 and jumped the whole stat-pill row 18pt up the window the moment the
+/// area name arrived or went away. `draw_header` renders the subtitle row
+/// empty rather than omitting it (see
+/// `a_missing_area_name_does_not_collapse_the_header_or_lift_the_stat_row`).
 ///
 /// This, not the whole drag band, is the block the left gutter belongs to:
 /// `header_text_rect` indents these rows by `HEADER_GUTTER_WIDTH` to leave
-/// room for the emblem, while the stat-pill row below them has no gutter at
-/// all — its timer half-pill is deliberately flush against the panel's left
-/// border, in exactly the column the emblem occupies. So the emblem is both
-/// centered in this height and clipped to it (issue #75); a clip to the full
-/// band instead let its ink paint straight through the timer pill, whose
-/// fill is 6% alpha and whose clock glyph is tinted at a third alpha.
-fn header_text_band_height(has_subtitle: bool) -> f32 {
-    if has_subtitle {
-        TITLE_LINE_HEIGHT + ITEM_SPACING_Y + SUBTITLE_LINE_HEIGHT
-    } else {
-        TITLE_LINE_HEIGHT
-    }
+/// room for the emblem, while the stat-pill row below them clears the panel
+/// edge by only `HEADER_STAT_ROW_INSET_X` — its timer sits well inside the
+/// column the emblem occupies. So the emblem is centered on this height
+/// (issue #75), though issue #91 widened its *clip* to the whole band so the
+/// mark's diagonal blade survives.
+///
+/// The background wash is deliberately *not* bounded by this (issue #91): it
+/// spans the whole `header_band_height`, stat row included.
+fn header_text_band_height() -> f32 {
+    TITLE_LINE_HEIGHT + ITEM_SPACING_Y + SUBTITLE_LINE_HEIGHT
 }
 
 /// Paints the header's title line (boss name/id/placeholder) at a fixed
@@ -1424,38 +1599,45 @@ fn draw_title_line(ui: &mut egui::Ui, text: &str) -> egui::Rect {
 
 // -- header gutter emblem (issue #59) ------------------------------------
 
-/// The source's `Svg.HPBar` beside the encounter name: 60x60, bled off the
-/// left edge by `Margin="-26 0 0 -8"` and clipped to the header band, so only
-/// its right two-thirds are ever on screen.
-const HEADER_EMBLEM_SIZE: f32 = 60.0;
-/// The `Margin`'s left component: the emblem hangs 26pt off the left edge of
-/// the header rows, so only its right `60 - 26 = 34`pt — one
-/// `HEADER_GUTTER_WIDTH` — is ever on screen.
-const HEADER_EMBLEM_LEFT_BLEED: f32 = -26.0;
-/// The `Margin`'s bottom component (`-8`): a *negative* bottom margin, which
-/// in WPF adds to the height the emblem is centered in rather than moving
-/// it. With the source's 36pt header grid that gives `(36 + 8 - 60)/2 = -8`,
-/// i.e. a top edge 8pt above the grid — but the grid is only 36pt tall when
-/// the subtitle line is present, so `header_emblem_rect` recomputes the
-/// centering from the text band it is actually given instead of baking that
-/// one case in (issue #75).
-const HEADER_EMBLEM_BOTTOM_BLEED: f32 = 8.0;
+/// The source's `Svg.HPBar` beside the encounter name, bled off the left
+/// edge and clipped to the header band so only its right third is ever on
+/// screen.
+///
+/// Sized to the header band (issue #91): `emblem.png` is a 512x512 canvas
+/// holding one perfect diamond whose four corners are the midpoints of the
+/// canvas' four edges. So the artwork's corners are the box's edge
+/// midpoints, and making the box exactly `header_band_height` tall is what
+/// lands the diamond's top corner on the band's top edge and its bottom
+/// corner on the band's bottom edge. The source's 60pt (with a `-8` bottom
+/// margin biasing the centering) hung the top corner 6pt above the band —
+/// clipped away entirely — and stopped the bottom corner 14pt short of it,
+/// 20pt out of symmetry.
+const HEADER_EMBLEM_SIZE: f32 = 68.0;
+/// How far the emblem hangs off the left edge of the header rows, so that
+/// exactly one `HEADER_GUTTER_WIDTH` of it is on screen — which puts the
+/// diamond's right corner precisely on the gutter's right edge, at the
+/// band's vertical midpoint. Derived from the two constants it has to keep
+/// in step rather than written out as `-34.0`: the title/subtitle indent is
+/// `HEADER_GUTTER_WIDTH`, so a size change that did not move this bleed
+/// with it would silently push the mark into (or out of) the text column.
+const HEADER_EMBLEM_LEFT_BLEED: f32 = HEADER_GUTTER_WIDTH - HEADER_EMBLEM_SIZE;
 /// `Fill="SlateGray"`.
 const HEADER_EMBLEM_COLOR: egui::Color32 = egui::Color32::from_rgb(0x70, 0x80, 0x90);
 
-/// Where the header emblem's 60x60 box sits: bled off the left of the title
-/// row `row`, and vertically centered on the header's text band
-/// (`text_band_height`, plus the source's negative bottom margin) that
-/// starts at that row's top. Pure geometry, so the negative-margin bleed is
-/// unit-testable without a painter.
-fn header_emblem_rect(row: egui::Rect, text_band_height: f32) -> egui::Rect {
-    let available = text_band_height + HEADER_EMBLEM_BOTTOM_BLEED;
+/// Where the header emblem's box sits: bled off the left of the title row
+/// `row` by `HEADER_EMBLEM_LEFT_BLEED`, and running the full `band_height`
+/// down from that row's top — which is the header band's top edge, since
+/// the title row is the band's first row.
+///
+/// No centering arithmetic: `HEADER_EMBLEM_SIZE` *is* the band height
+/// (issue #91), so the box's top and bottom are the band's, and the
+/// diamond's top and bottom corners land on them. The band height is still
+/// taken as an argument rather than read from `header_band_height` so the
+/// geometry stays a pure function, unit-testable without a painter.
+fn header_emblem_rect(row: egui::Rect, band_height: f32) -> egui::Rect {
     egui::Rect::from_min_size(
-        egui::pos2(
-            row.left() + HEADER_EMBLEM_LEFT_BLEED,
-            row.top() + (available - HEADER_EMBLEM_SIZE) / 2.0,
-        ),
-        egui::Vec2::splat(HEADER_EMBLEM_SIZE),
+        egui::pos2(row.left() + HEADER_EMBLEM_LEFT_BLEED, row.top()),
+        egui::vec2(HEADER_EMBLEM_SIZE, band_height),
     )
 }
 
@@ -1468,15 +1650,13 @@ fn header_emblem_rect(row: egui::Rect, text_band_height: f32) -> egui::Rect {
 /// opacity masks, and the diagonal gradient already falls to zero by the
 /// bottom-right, so the mask is deliberately not reproduced.
 ///
-/// Issue #81: this used to be a fixed `98.0`pt run against the whole panel,
-/// taller than the ~58-64pt drag band (`header_band_height`) that actually
-/// holds the title/subtitle/stat-pill row — so the wash's tail painted
-/// straight through the stat-pill row instead of stopping above it, unlike
-/// the reference render. `draw_header` now sizes the wash to
-/// `header_text_band_height` (the title + optional subtitle rows only, not
-/// the stat-pill row below them) instead, via `header_wash_rect`'s `height`
-/// argument — no fixed constant left to drift out of sync with the content
-/// it sits behind.
+/// Issue #81 replaced a fixed `98.0`pt run — taller than the drag band
+/// itself, so its tail bled into the player rows — with a height derived
+/// from the content. Issue #91 settles which content: the whole header band
+/// (`header_band_height`), stat-pill row included. The gradient and the
+/// oversized emblem share one rect, so both now run the full band and both
+/// stop dead at its bottom edge, flush with the first player row. No fixed
+/// constant is left to drift out of sync with the content it sits behind.
 /// Inset from the panel's edges the wash is painted at, so its square
 /// corners never poke past the panel's own `PANEL_CORNER_RADIUS`-rounded,
 /// `PANEL_BORDER_WIDTH`-thick border.
@@ -1484,13 +1664,12 @@ const HEADER_WASH_INSET: f32 = 1.0;
 /// Alpha at the wash gradient's brightest (top-left) stop — `Opacity=".5"`.
 const HEADER_WASH_TOP_ALPHA: u8 = 0x50;
 /// Side of the wash's oversized `Svg.HPBar` box, in points — the same emblem
-/// the gutter draws at 60pt (`HEADER_EMBLEM_SIZE`), blown up as wallpaper.
+/// the gutter draws at `HEADER_EMBLEM_SIZE`, blown up as wallpaper.
 const HEADER_WASH_EMBLEM_SIZE: f32 = 200.0;
 /// How far the wash emblem's right edge overhangs the wash's own right edge,
 /// in points: the source right-aligns the wash `Svg.HPBar` with a `-25` right
 /// margin, so its last 25pt hang off the panel and the wash's clip rect cuts
-/// them away — the mirror of the gutter emblem's `-26` left bleed
-/// (`HEADER_EMBLEM_OFFSET`).
+/// them away — the mirror of the gutter emblem's `HEADER_EMBLEM_LEFT_BLEED`.
 const HEADER_WASH_EMBLEM_BLEED: f32 = 25.0;
 /// `Opacity=".05"` on a SlateGray fill.
 const HEADER_WASH_EMBLEM_COLOR: egui::Color32 =
@@ -1501,8 +1680,8 @@ const HEADER_WASH_EMBLEM_COLOR: egui::Color32 =
 /// `height` points rather than to the panel's bottom. Pure geometry, so the
 /// inset is unit-testable without a painter — the same factoring as
 /// `header_emblem_rect`. `height` is the caller's to pick (`draw_header`
-/// passes `header_text_band_height`, issue #81) rather than a fixed
-/// constant here, so the wash can never outgrow the content it decorates.
+/// passes `header_band_height - HEADER_WASH_INSET`, issue #91) rather than a
+/// fixed constant here, so the wash can never outgrow the band it decorates.
 fn header_wash_rect(panel: egui::Rect, height: f32) -> egui::Rect {
     egui::Rect::from_min_size(
         panel.min + egui::Vec2::splat(HEADER_WASH_INSET),
@@ -1529,10 +1708,10 @@ fn header_wash_emblem_rect(wash: egui::Rect) -> egui::Rect {
 /// panel with a huge, nearly-invisible emblem bleeding off its right edge —
 /// clipped to its own rect so it can never bleed into the rows below or over
 /// the panel's rounded corners. `panel` is the whole central panel's rect
-/// (not the drag band); `height` (issue #81, `header_text_band_height`) is
-/// what actually bounds the wash — the title + optional subtitle rows only,
-/// stopping clear of the stat-pill row below so the two never share paint
-/// space (`wash_does_not_reach_the_stat_pill_row`).
+/// (not the drag band); `height` (issue #91, `header_band_height` less
+/// `HEADER_WASH_INSET`) is what actually bounds the wash — the whole header
+/// band, stat-pill row included, stopping exactly where the first player row
+/// begins (`wash_covers_the_stat_pill_row_but_stops_at_the_first_player_row`).
 ///
 /// The source rounds the wash's top corners (`CornerRadius="7 7 0 0"`); egui
 /// cannot clip to a rounded rect this cheaply, so the wash keeps square
@@ -1640,10 +1819,11 @@ fn title_separator_segments(rect: egui::Rect) -> Vec<(egui::Rect, egui::Color32)
         .collect()
 }
 
-/// Paints the header's subtitle line (scene name/id), dimmed. Only called
-/// when `encounter_subtitle` returned `Some` — the caller skips this
-/// entirely, rather than calling it with empty text, so no space is
-/// reserved when the scene is unknown.
+/// Paints the header's subtitle line (scene name/id), dimmed. Always
+/// called, with empty text when `encounter_subtitle` returned `None`
+/// (issue #91): the row's height is part of the header's fixed band, so it
+/// is reserved — and rendered blank, with no placeholder — rather than
+/// skipped, which would let the stat row below it ride up.
 fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
     let desired_size = egui::vec2(ui.available_width(), SUBTITLE_LINE_HEIGHT);
     let (row, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
@@ -3018,12 +3198,22 @@ pub fn fmt_short(v: i64) -> String {
     }
 }
 
-/// Fight duration as `m:ss`.
+/// Fight duration as `mm:ss` — zero-padded to two digits below ten minutes
+/// (issue #91: the reference render shows `02:39`, where we showed `2:39`).
+///
+/// There is no hours field and deliberately still isn't: minutes are always
+/// the leading field, so they are always padded and simply keep counting up
+/// past 59 (`60:00`, `120:00`) rather than rolling over. A raid pull that
+/// ran an hour reads more directly as `75:12` than as `1:15:12`, and the
+/// stat row's width budget
+/// (`the_stat_pills_fit_the_default_window_width`) is measured against the
+/// `120:00` worst case. `{:02}` only ever pads, never truncates, so those
+/// long durations are unaffected.
 pub fn fmt_duration(ms: u64) -> String {
     let total_secs = ms / 1000;
     let mins = total_secs / 60;
     let secs = total_secs % 60;
-    format!("{mins}:{secs:02}")
+    format!("{mins:02}:{secs:02}")
 }
 
 /// Damage-share percentage as `12.3%`.
@@ -3146,30 +3336,35 @@ const COLUMN_RIGHT_MARGIN: f32 = 4.0;
 const MIN_COLUMN_SCALE: f32 = 0.6;
 
 /// Default opening height (issue #26; extended by issue #9 slice 2's title
-/// line): the header's title line + timer/DPS/buttons row + separator + a
-/// full 20-row raid roster, so no scrolling is needed on first launch. The
-/// subtitle line is deliberately excluded — it is conditional (only
-/// rendered once a scene name/id is known, `encounter_subtitle`), and the
-/// default assumes it is absent.
+/// line): the whole header band + separator + a full 20-row raid roster, so
+/// no scrolling is needed on first launch.
+///
+/// The header term is `header_band_height` itself, not a re-sum of the rows
+/// inside it, so the two can never drift. That matters as of issue #91: the
+/// band now reserves the subtitle's line and gap unconditionally, where this
+/// used to leave them out on the grounds that the subtitle was conditional
+/// and the default window could assume it absent. It no longer can — that
+/// assumption was what left the window 18pt short of the 20 rows it
+/// promises.
 ///
 /// Decision 3: `draw_rows` zeroes `item_spacing.y` for its own scope, so
 /// rows are truly contiguous (`ROW_HEIGHT` is the full 30pt pitch, no
 /// separate gap) and there is no gap between the separator and the first
-/// row either. Only the two gaps *above* the row list — title->header and
-/// header->separator — still pay `ITEM_SPACING_Y`.
+/// row either. Of the gaps above the row list, both that survive are
+/// already inside the band except the stat row->separator one, which pays
+/// the layout's ordinary `ITEM_SPACING_Y`.
 ///
-///   title (20.0) + header row (22.0) + separator (6.0) + 20 rows * 30.0 (600.0)
-///     + 2 gaps * 2.0 (4.0) = 652.0
+///   band (68.0) + separator (6.0) + 20 rows * 30.0 (600.0) + gap (2.0)
+///     = 676.0
 fn default_inner_height() -> f32 {
     let rows = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
-    let gaps = 2.0 * ITEM_SPACING_Y;
-    TITLE_LINE_HEIGHT + BUTTON_ROW_HEIGHT + SEPARATOR_HEIGHT + rows + gaps
+    header_band_height(BUTTON_ROW_HEIGHT) + SEPARATOR_HEIGHT + rows + ITEM_SPACING_Y
 }
 
 /// Extra width folded into `default_inner_width` on top of the row-column
 /// budget below, so the window opens wide enough to lay out the header's
 /// stat row without wrapping. That row (issue #59's real rasterized pill
-/// glyphs, the timer half-pill, and issue #62's 58pt inert status-toggle
+/// glyphs, the timer readout, and issue #62's 58pt inert status-toggle
 /// cluster) is measured independently by `the_stat_pills_fit_the_default_
 /// window_width`, which is the ground truth this headroom exists to
 /// satisfy; 20pt clears the gap with room to spare across minor
@@ -3281,6 +3476,37 @@ mod tests {
     use crate::settings::{ColumnKind, Settings};
     use bpsr_meter::Class;
 
+    // -- demo_enabled_from (issue #91) --------------------------------------
+
+    #[test]
+    fn demo_enabled_from_unset_is_off() {
+        assert!(!demo_enabled_from(None));
+    }
+
+    #[test]
+    fn demo_enabled_from_empty_is_off() {
+        assert!(!demo_enabled_from(Some("")));
+    }
+
+    #[test]
+    fn demo_enabled_from_explicit_off_values() {
+        for value in ["0", "false", "off"] {
+            assert!(!demo_enabled_from(Some(value)), "SHINRA_DEMO={value:?}");
+        }
+    }
+
+    #[test]
+    fn demo_enabled_from_on_values_case_insensitive() {
+        for value in ["1", "true", "TRUE", "on"] {
+            assert!(demo_enabled_from(Some(value)), "SHINRA_DEMO={value:?}");
+        }
+    }
+
+    #[test]
+    fn demo_enabled_from_garbage_is_off() {
+        assert!(!demo_enabled_from(Some("banana")));
+    }
+
     #[test]
     fn fmt_short_below_thousand_is_plain() {
         assert_eq!(fmt_short(999), "999");
@@ -3308,17 +3534,35 @@ mod tests {
 
     #[test]
     fn fmt_duration_zero() {
-        assert_eq!(fmt_duration(0), "0:00");
+        assert_eq!(fmt_duration(0), "00:00");
     }
 
     #[test]
     fn fmt_duration_minute_and_seconds() {
-        assert_eq!(fmt_duration(65_000), "1:05");
+        assert_eq!(fmt_duration(65_000), "01:05");
+    }
+
+    /// Issue #91: minutes are the leading field and are zero-padded to two
+    /// digits below ten, matching the reference render's `02:39` — the
+    /// exact value it shows.
+    #[test]
+    fn fmt_duration_pads_single_digit_minutes() {
+        assert_eq!(fmt_duration(159_000), "02:39");
+        assert_eq!(fmt_duration(9_000), "00:09");
+        assert_eq!(fmt_duration(599_000), "09:59");
+        // Ten minutes and up is already two digits — the pad must not add a
+        // third.
+        assert_eq!(fmt_duration(600_000), "10:00");
     }
 
     #[test]
     fn fmt_duration_no_hour_rollover() {
         assert_eq!(fmt_duration(3_600_000), "60:00");
+        // Issue #91's minute padding must not have introduced one either:
+        // three-digit minute counts keep counting, and `120:00` stays the
+        // width-budget worst case `the_stat_pills_fit_the_default_window_
+        // width` measures.
+        assert_eq!(fmt_duration(7_200_000), "120:00");
     }
 
     // -- issue #68: gesture pointer sourced from the OS cursor, not the
@@ -3509,8 +3753,25 @@ mod tests {
                 .collect()
         }
 
-        /// The box of the (single) rect filled with `fill` — how a pill's
-        /// own chrome is identified, since each pill kind has its own fill.
+        /// The box of the largest untextured mesh the header painted — the
+        /// background wash's own gradient quad (`gradient_mesh`), which is
+        /// the only near-panel-wide mesh in the band carrying no texture of
+        /// its own (glyph blits all carry one; every other fill in the
+        /// header is a `Shape::Rect`).
+        fn gradient_box(&self) -> egui::Rect {
+            self.images
+                .iter()
+                .filter(|(id, rect)| *id == egui::TextureId::default() && rect.is_positive())
+                .map(|(_, rect)| *rect)
+                .max_by(|a, b| a.area().total_cmp(&b.area()))
+                .expect("the header painted no untextured mesh")
+        }
+
+        /// The box of the first rect filled with `fill` — how a pill's own
+        /// chrome is identified, since each pill kind has its own fill.
+        /// `PILL_FILL` is the stat row's, which is what
+        /// `a_missing_area_name_does_not_collapse_the_header_or_lift_the_stat_row`
+        /// measures the row's position by.
         fn fill_box(&self, fill: egui::Color32) -> egui::Rect {
             self.rects
                 .iter()
@@ -3598,15 +3859,22 @@ mod tests {
         frame
     }
 
-    /// Issue #75: the timer half-pill's clock glyph must not overlap the
-    /// duration it leads, measured on the shapes `draw_header` *actually
-    /// paints*, and both must sit inside the pill's own filled box.
+    /// Issue #75: the timer's clock glyph must not overlap the duration it
+    /// sits beside, measured on the shapes `draw_header` *actually paints*,
+    /// and the two must share a centerline.
+    ///
+    /// Issue #91 flipped the ordering: the clock now *trails* the duration
+    /// (`02:39 ⏱`), matching the DPS and damage pills and the reference
+    /// render, so the gap is measured the other way round. Containment
+    /// inside the capsule is
+    /// `the_header_pills_lay_glyph_and_value_out_inside_their_box`'s job;
+    /// what this test owns is that the two marks neither overlap nor drift
+    /// off a shared centerline in the frame actually painted.
     #[test]
     fn the_timer_pills_clock_glyph_never_overlaps_its_value() {
         let snapshot = header_test_snapshot(30_100_000_000);
         let frame = header_painted_boxes(&snapshot);
 
-        let pill = frame.fill_box(TIMER_PILL_FILL);
         let value = frame.text_box(&fmt_duration(snapshot.duration_ms));
         let glyphs = frame.glyph_boxes(GlyphIcon::Timer);
         assert_eq!(
@@ -3616,39 +3884,120 @@ mod tests {
         );
         let glyph = glyphs[0];
 
-        let gap = value.left() - glyph.right();
+        assert!(
+            glyph.left() >= value.right(),
+            "the clock glyph {glyph:?} is not to the right of the duration {value:?} — \
+             the header reads value-then-icon"
+        );
+        let gap = glyph.left() - value.right();
         assert!(
             gap >= PILL_ICON_GAP - 0.01,
-            "the clock glyph {glyph:?} and the value {value:?} are only {gap}pt apart \
-             (want {PILL_ICON_GAP}) inside pill {pill:?}"
+            "the duration {value:?} and the clock glyph {glyph:?} are only {gap}pt apart \
+             (want {PILL_ICON_GAP})"
         );
-        for (what, rect) in [("glyph", glyph), ("value", value)] {
-            assert!(
-                pill.expand(0.01).contains_rect(rect),
-                "the timer pill's {what} {rect:?} spills out of the pill box {pill:?}"
-            );
-        }
+        let drift = (glyph.center().y - value.center().y).abs();
+        assert!(
+            drift <= 1.0,
+            "the clock glyph {glyph:?} and the value {value:?} are {drift}pt off \
+             a shared centerline"
+        );
     }
 
-    /// Issue #75: the gutter emblem is decoration for the header's *text*
-    /// rows — the ones `header_text_rect` indents by `HEADER_GUTTER_WIDTH`
-    /// to make room for it. The stat-pill row has no such gutter: the timer
-    /// half-pill is deliberately flush against the panel's left border, in
-    /// exactly the column the emblem occupies. Since the emblem's box is
-    /// 60pt tall against a 20pt title row, only its clip keeps its ink out
-    /// of that row — and it must, or it paints straight through the pill,
-    /// under a 6%-alpha fill, behind a clock glyph tinted at a third alpha.
+    /// Issue #91: the timer is inset from the panel's left content edge by
+    /// `HEADER_STAT_ROW_INSET_X` rather than sitting flush against the
+    /// window border the way its old half-pill did. That gap is the whole
+    /// reason the timer may keep a *full* oval — nothing crops it.
+    ///
+    /// Measured on the capsule itself, not on the duration's glyphs: the
+    /// pill is the row's leftmost painted mark, and its own left edge is
+    /// what the window border would clip, so this pins the exact inset
+    /// where an ink-based bound could only assert `>= inset + PILL_PAD_X`.
+    /// The panel's content edge is read back off the wash, which
+    /// `draw_header` anchors to it at `HEADER_WASH_INSET`.
     #[test]
-    fn the_gutter_emblem_never_reaches_the_stat_pill_row() {
-        let frame = header_painted_boxes(&header_test_snapshot(30_100_000_000));
+    fn the_stat_row_ink_is_inset_from_the_panel_edge() {
+        let snapshot = header_test_snapshot(30_100_000_000);
+        let frame = header_painted_boxes(&snapshot);
+        let panel_left = frame.gradient_box().left() - HEADER_WASH_INSET;
         let pill = frame.fill_box(TIMER_PILL_FILL);
 
-        for emblem in frame.glyph_boxes(GlyphIcon::Emblem) {
-            assert!(
-                !emblem.intersects(pill),
-                "emblem ink {emblem:?} lands on the timer pill {pill:?}"
-            );
-        }
+        assert!(
+            (pill.left() - (panel_left + HEADER_STAT_ROW_INSET_X)).abs() < 0.01,
+            "the timer capsule starts at {} — {}pt inside the panel edge at \
+             {panel_left}, not {HEADER_STAT_ROW_INSET_X}pt",
+            pill.left(),
+            pill.left() - panel_left
+        );
+        // The duration's own ink then clears the capsule's padding, so a
+        // regression that kept the pill inset while un-padding the text
+        // still fails here.
+        let value = frame.text_box(&fmt_duration(snapshot.duration_ms));
+        assert!(
+            value.left() >= pill.left() + PILL_PAD_X - 0.01,
+            "the duration starts at {} — inside the capsule's {PILL_PAD_X}pt \
+             padding from {}",
+            value.left(),
+            pill.left()
+        );
+    }
+
+    /// Issue #91 inverts issue #75's rule for the gutter emblem.
+    ///
+    /// Issue #75 clipped the horned mark to the header's *text* rows so its
+    /// ink stayed off the timer's half-pill chrome. That capsule is inset
+    /// clear of the gutter now (`HEADER_STAT_ROW_INSET_X`), and a
+    /// scale-matched diff against `docs/reference/new-shinra-ex.webp`
+    /// showed the reference's mark — body plus its diagonal blade — running
+    /// down *through* the timer row to the band's bottom edge, while ours
+    /// was sliced off at the subtitle line. The clip is now the whole band
+    /// (`header_paint_clip`), so the mark must reach into the stat-pill row
+    /// and must still stop at the band, never bleeding into the first player
+    /// row below it.
+    ///
+    /// The band's bottom edge is read off the wash gradient, which
+    /// `the_wash_gradient_spans_the_whole_header_band` independently pins to
+    /// exactly that edge — the two decorations share one boundary.
+    #[test]
+    fn the_gutter_emblem_runs_through_the_stat_pill_row_and_stops_at_the_band() {
+        let snapshot = header_test_snapshot(30_100_000_000);
+        let frame = header_painted_boxes(&snapshot);
+        let stat_ink = frame.glyph_boxes(GlyphIcon::Timer)[0]
+            .union(frame.text_box(&fmt_duration(snapshot.duration_ms)));
+        let band_bottom = frame.gradient_box().bottom();
+
+        let emblems = frame.glyph_boxes(GlyphIcon::Emblem);
+        assert_eq!(
+            emblems.len(),
+            2,
+            "expected the gutter mark and the wash wallpaper: {emblems:?}"
+        );
+        // The gutter mark bleeds off the panel's left edge; the wash
+        // wallpaper is right-aligned to the wash. Leftmost is the gutter.
+        let gutter = emblems
+            .iter()
+            .copied()
+            .min_by(|a, b| a.left().total_cmp(&b.left()))
+            .expect("the header painted no emblem");
+
+        assert!(
+            gutter.bottom() > stat_ink.top(),
+            "gutter emblem ink stops at {} — above the stat row's ink {stat_ink:?}, \
+             so the mark's blade is still being sliced off",
+            gutter.bottom()
+        );
+        assert!(
+            gutter.bottom() <= band_bottom + 0.01,
+            "gutter emblem ink reaches {} — past the header band's bottom edge at \
+             {band_bottom}, into the first player row",
+            gutter.bottom()
+        );
+        // The mark is still a *gutter* decoration: it must not have grown
+        // rightwards across the row while the clip grew downwards.
+        assert!(
+            gutter.right() <= HEADER_GUTTER_WIDTH + 0.01,
+            "gutter emblem ink runs to x={}, past the {HEADER_GUTTER_WIDTH}pt gutter",
+            gutter.right()
+        );
     }
 
     /// The stray `☰` hamburger label had no counterpart in the reference
@@ -3776,8 +4125,7 @@ mod tests {
         });
         output.drop_without_applying_deltas();
 
-        let has_subtitle = encounter_subtitle(&snapshot.encounter).is_some();
-        let band = header_band_height(has_subtitle, interact_size_y);
+        let band = header_band_height(interact_size_y);
         assert!(
             rendered_height <= band,
             "rendered header ({rendered_height}) overflowed its band ({band})"
@@ -4002,8 +4350,8 @@ mod tests {
     }
 
     /// `icon_first` swaps the two without changing the pill's width — the
-    /// ordering issue #49's skull-then-count counter (and the timer
-    /// half-pill) need.
+    /// ordering issue #49's skull-then-count counter (and the timer readout)
+    /// need.
     #[test]
     fn pill_content_can_lead_with_its_icon() {
         let text = egui::vec2(40.0, 15.0);
@@ -4044,6 +4392,13 @@ mod tests {
                     .rect
                     .size()
             });
+            // Issue #91: all three header readouts are value-then-icon
+            // (`02:39 ⏱ | 188M/s ☁ | 30.1B ♡`) — the timer's leading clock
+            // was ours, not the reference's.
+            assert!(
+                !pill.icon_first,
+                "{name}: the header reads value-then-icon, not icon-first"
+            );
             let size = pill_size(text, pill.icon_side, BUTTON_ROW_HEIGHT);
             let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size);
             let (text_pos, icon_rect) =
@@ -4060,11 +4415,12 @@ mod tests {
                 size.x,
                 text.x
             );
-            let gap = if pill.icon_first {
-                text_rect.left() - icon_rect.right()
-            } else {
-                icon_rect.left() - text_rect.right()
-            };
+            assert!(
+                icon_rect.left() >= text_rect.right(),
+                "{name}: the glyph {icon_rect:?} is not to the right of the value \
+                 {text_rect:?}"
+            );
+            let gap = icon_rect.left() - text_rect.right();
             assert!(
                 gap >= PILL_ICON_GAP - 0.01,
                 "{name}: glyph and value are only {gap}pt apart (want {PILL_ICON_GAP})"
@@ -4086,33 +4442,63 @@ mod tests {
         }
     }
 
-    /// The DPS/damage pills are full ovals (corner radius at least half the
-    /// button row height, uniform on all four corners); the timer half-pill
-    /// is flush against the panel's left border — the source's
-    /// `CornerRadius="0 13 13 0"`.
+    /// Every header pill is a full oval: a corner radius of at least half
+    /// the button row height, *equal on all four corners*. The four-way
+    /// equality is the regression guard for issue #91's actual bug — the
+    /// timer's `CornerRadius="0 13 13 0"`, whose zeroed west corners made
+    /// it a half-pill welded to the window border. Its capsule is not the
+    /// problem and is deliberately kept (see `StatPill::timer`); a
+    /// west-flattened radius on any pill is.
     #[test]
-    fn header_pills_are_ovals_and_the_timer_is_a_half_pill() {
-        let header = StatPill::header("1", None);
-        assert_eq!(header.corner_radius.nw, header.corner_radius.ne);
-        assert_eq!(header.corner_radius.ne, header.corner_radius.se);
-        assert_eq!(header.corner_radius.se, header.corner_radius.sw);
-        assert!(header.corner_radius.nw as f32 >= BUTTON_ROW_HEIGHT / 2.0 - 1.0);
-
+    fn every_header_pill_is_a_full_oval_and_none_is_a_half_pill() {
         let timer = StatPill::timer("1", None);
-        assert_eq!(timer.corner_radius.nw, 0);
-        assert_eq!(timer.corner_radius.sw, 0);
-        assert!(timer.corner_radius.ne > 0);
-        assert!(timer.corner_radius.se > 0);
+        let header = StatPill::header("1", None);
+
+        for (name, pill) in [("header", &header), ("timer", &timer)] {
+            let r = pill.corner_radius;
+            assert!(
+                r.nw == r.sw && r.nw == r.ne && r.nw == r.se,
+                "{name}: corner radii nw={} sw={} ne={} se={} are not all equal — \
+                 a flattened pair is the half-pill bug",
+                r.nw,
+                r.sw,
+                r.ne,
+                r.se
+            );
+            assert!(r.nw > 0, "{name}: radius {} is square, not an oval", r.nw);
+            assert!(
+                r.nw as f32 >= BUTTON_ROW_HEIGHT / 2.0 - 1.0,
+                "{name}: radius {} is not a full pill",
+                r.nw
+            );
+        }
+
+        // Both pills wear chrome, and the timer's is its own: a lighter
+        // fill plus the window's only pill border.
+        assert_ne!(header.fill, egui::Color32::TRANSPARENT);
+        assert_ne!(timer.fill, egui::Color32::TRANSPARENT);
+        assert_eq!(timer.fill, TIMER_PILL_FILL);
+        assert_ne!(timer.fill, header.fill);
+        assert_eq!(
+            timer
+                .stroke
+                .expect("the timer keeps its hairline border")
+                .color,
+            TIMER_PILL_BORDER
+        );
+        assert!(header.stroke.is_none());
     }
 
-    /// `StatPill::timer`'s corner radius has zero west corners — flush
-    /// against the panel's left border — independent of the general oval
-    /// check above.
+    /// Issue #91: the timer used to sit flush against the panel's left
+    /// border as a half-pill. It is now inset by `HEADER_STAT_ROW_INSET_X`
+    /// along with the rest of the stat row, and that inset must be a real
+    /// gap — not zero, and not so wide it eats the row's width budget
+    /// (`the_stat_pills_fit_the_default_window_width` is the other half of
+    /// that bargain).
     #[test]
-    fn the_timer_pill_is_flush_against_the_left_border() {
-        let pill = StatPill::timer("1", None);
-        assert_eq!(pill.corner_radius.nw, 0);
-        assert_eq!(pill.corner_radius.sw, 0);
+    fn the_stat_row_is_inset_from_the_left_border() {
+        const { assert!(HEADER_STAT_ROW_INSET_X > 0.0) };
+        assert_eq!(HEADER_STAT_ROW_INSET_X, 8.0);
     }
 
     /// The stat row is one non-wrapping `ui.horizontal`: if the timer/DPS/
@@ -4171,7 +4557,9 @@ mod tests {
         // (timer, dps, dmg, toggle cluster).
         let gaps = 3.0 * 6.0;
 
-        let total = timer + dps + dmg + toggles + gaps;
+        // Issue #91: the row no longer starts flush against the panel's
+        // left content edge, so its inset is part of the width it needs.
+        let total = HEADER_STAT_ROW_INSET_X + timer + dps + dmg + toggles + gaps;
         assert!(
             total <= default_inner_width(),
             "stat row needs {total}pt but the default window is only {}pt wide",
@@ -4987,103 +5375,180 @@ mod tests {
 
     // -- header_band_height (drag band must cover the rendered header) ----
 
-    /// No subtitle: egui stacks title + button row, one gap between them.
+    /// egui stacks title + subtitle + stat row, so the band pays two gaps,
+    /// not one, and they are not the same size: title -> subtitle pays
+    /// `ITEM_SPACING_Y`, subtitle -> stat row pays `HEADER_STAT_ROW_GAP`.
+    /// All three rows are unconditional (issue #91), so this is the band's
+    /// only case — 68pt at the real button-row height.
     #[test]
-    fn header_band_height_with_no_subtitle_covers_title_gap_and_button_row() {
+    fn header_band_height_covers_both_text_rows_both_gaps_and_the_button_row() {
         let button_row_height = 18.0;
-        let expected = TITLE_LINE_HEIGHT + button_row_height + ITEM_SPACING_Y;
-        assert_eq!(header_band_height(false, button_row_height), expected);
+        let expected = TITLE_LINE_HEIGHT
+            + ITEM_SPACING_Y
+            + SUBTITLE_LINE_HEIGHT
+            + HEADER_STAT_ROW_GAP
+            + button_row_height;
+        assert_eq!(header_band_height(button_row_height), expected);
+        assert_eq!(header_band_height(BUTTON_ROW_HEIGHT), 68.0);
     }
 
-    /// With a subtitle: egui stacks title + subtitle + button row, so there
-    /// are two gaps, not one — the bug this guards against undercounted by
-    /// exactly one `ITEM_SPACING_Y` here.
+    /// Issue #91 regression. The header must be a fixed-height band whether
+    /// or not an area name is known: the app's idle "No target" state used
+    /// to skip the subtitle row *and* the gap above it, collapsing the band
+    /// from 68 to 50 and lifting the entire stat-pill row — timer, DPS,
+    /// damage, toggles — 18pt (`SUBTITLE_LINE_HEIGHT + ITEM_SPACING_Y`) up
+    /// the window the moment the boss/area data arrived or went away. A
+    /// pixel scan of the live window measured the band bottom at y=51
+    /// without an area name against y=69 with one.
+    ///
+    /// Asserted twice over: on the layout helpers `draw_header` lays the
+    /// band out with, and on where the stat row's chrome actually lands
+    /// when the same snapshot is rendered with and without a scene name.
     #[test]
-    fn header_band_height_with_subtitle_covers_both_gaps() {
-        let button_row_height = 18.0;
-        let expected =
-            TITLE_LINE_HEIGHT + SUBTITLE_LINE_HEIGHT + button_row_height + 2.0 * ITEM_SPACING_Y;
-        assert_eq!(header_band_height(true, button_row_height), expected);
+    fn a_missing_area_name_does_not_collapse_the_header_or_lift_the_stat_row() {
+        // The band, and the stat row's offset into it, are single numbers —
+        // there is no longer a subtitle-present/absent pair to diverge.
+        assert_eq!(header_band_height(BUTTON_ROW_HEIGHT), 68.0);
+        let stat_row_top = header_text_band_height() + HEADER_STAT_ROW_GAP;
+        assert_eq!(stat_row_top, 46.0);
+
+        // Painted truth: `header_test_snapshot` has no scene at all, so it
+        // is exactly the idle state that used to collapse the band.
+        let without = header_test_snapshot(30_100_000_000);
+        assert!(encounter_subtitle(&without.encounter).is_none());
+        let mut with = header_test_snapshot(30_100_000_000);
+        with.encounter.scene_name = Some("Frozen Bahaar's Sanctum");
+        assert!(encounter_subtitle(&with.encounter).is_some());
+
+        // The stat-pill chrome is the row's own ink, and it must not move
+        // by so much as a point between the two. `PILL_FILL` picks the
+        // first *value* pill (the timer wears `TIMER_PILL_FILL`, a colour
+        // of its own), which is the same shape in both renders.
+        let pill_without = header_painted_boxes(&without).fill_box(PILL_FILL);
+        let pill_with = header_painted_boxes(&with).fill_box(PILL_FILL);
+        assert!(
+            (pill_with.top() - pill_without.top()).abs() < 0.01,
+            "the stat-pill row sits at y={} with an area name but y={} without \
+             it — a {}pt jump",
+            pill_with.top(),
+            pill_without.top(),
+            pill_with.top() - pill_without.top()
+        );
+        assert!(
+            (pill_with.height() - pill_without.height()).abs() < 0.01,
+            "the stat-pill row is {}pt tall with an area name and {}pt without",
+            pill_with.height(),
+            pill_without.height()
+        );
     }
 
-    /// Adding the subtitle must grow the band by exactly the subtitle's own
-    /// height plus the extra gap it introduces — not by a smaller amount
-    /// (the original bug: gaps were never added, so a subtitle only grew the
-    /// band by `SUBTITLE_LINE_HEIGHT`, leaving the band 4px short).
-    #[test]
-    fn subtitle_grows_band_by_its_height_plus_one_extra_gap() {
-        let button_row_height = 18.0;
-        let without = header_band_height(false, button_row_height);
-        let with = header_band_height(true, button_row_height);
-        assert_eq!(with - without, SUBTITLE_LINE_HEIGHT + ITEM_SPACING_Y);
-    }
-
-    /// `TITLE_LINE_HEIGHT + ITEM_SPACING_Y + SUBTITLE_LINE_HEIGHT` is the
-    /// source's `Height="36"` header grid — pinned as a sum, not three
+    /// Issue #91's header grid: `TITLE_LINE_HEIGHT + ITEM_SPACING_Y +
+    /// SUBTITLE_LINE_HEIGHT == 40.0`, grown from the source's `Height="36"`
+    /// (`20 + 2 + 14`) so the boss name and area name each get the vertical
+    /// room the reference render gives them. Pinned as a sum, not three
     /// separate literals, so a future edit to any one constant can't drift
-    /// from the source without this test catching it.
+    /// without this test catching it.
     #[test]
     fn the_title_and_subtitle_lines_add_up_to_the_source_header_grid() {
         let total = TITLE_LINE_HEIGHT + ITEM_SPACING_Y + SUBTITLE_LINE_HEIGHT;
-        assert_eq!(total, 36.0);
+        assert_eq!(total, 40.0);
+        // …and the text band is that grid, whole, always (issue #91).
+        assert_eq!(header_text_band_height(), total);
     }
 
-    /// The emblem is bled off the title row's left edge and is taller than
-    /// the text band it decorates in both directions, so it only ever shows
-    /// through a clip. Rewritten for issue #75: it used to assert the box
-    /// merely started above the row (the hardcoded `-8` of the
-    /// subtitle-present case), which said nothing about the far bigger
-    /// overhang *below* — the one that was painting over the stat pills.
+    /// The whole point of issue #91's `HEADER_STAT_ROW_GAP`: the stat row
+    /// must clear the subtitle's descenders by more than the 2pt every other
+    /// adjacent pair gets, and the band must budget that extra room — 68pt
+    /// with a subtitle, against the 60 it used to be.
     #[test]
-    fn the_header_emblem_bleeds_off_the_left_edge_and_out_of_the_text_band() {
+    fn the_stat_row_gap_is_wider_than_the_ordinary_row_spacing() {
+        const { assert!(HEADER_STAT_ROW_GAP > ITEM_SPACING_Y) };
+        assert_eq!(header_band_height(BUTTON_ROW_HEIGHT), 68.0);
+    }
+
+    /// The emblem still bleeds off the title row's left edge — that is what
+    /// leaves exactly one `HEADER_GUTTER_WIDTH` of the diamond on screen —
+    /// but it no longer bleeds vertically at all (issue #91). It used to be
+    /// 60pt centered on a 48pt reference, hanging 6pt above the band and
+    /// stopping 14pt short of its bottom; the box is now the band, so the
+    /// only clipping left is the horizontal one.
+    #[test]
+    fn the_header_emblem_bleeds_off_the_left_edge_but_not_out_of_the_band() {
         let row = egui::Rect::from_min_size(egui::pos2(10.0, 40.0), egui::vec2(380.0, 20.0));
-        for has_subtitle in [false, true] {
-            let band = header_text_band_height(has_subtitle);
-            let rect = header_emblem_rect(row, band);
-            assert!(rect.left() < row.left());
-            assert!(rect.top() < row.top());
-            assert!(rect.bottom() > row.top() + band);
-            assert_eq!(rect.width(), HEADER_EMBLEM_SIZE);
-            assert_eq!(rect.height(), HEADER_EMBLEM_SIZE);
-        }
+        let band = header_band_height(BUTTON_ROW_HEIGHT);
+        let rect = header_emblem_rect(row, band);
+
+        assert!(rect.left() < row.left());
+        // …and by exactly enough that the visible remainder is the gutter.
+        assert_eq!(rect.right() - row.left(), HEADER_GUTTER_WIDTH);
+
+        assert_eq!(rect.top(), row.top());
+        assert_eq!(rect.bottom(), row.top() + band);
+        assert_eq!(rect.width(), HEADER_EMBLEM_SIZE);
+        assert_eq!(rect.height(), HEADER_EMBLEM_SIZE);
     }
 
-    /// The source's centering, reproduced exactly for the case it was read
-    /// off (`Height="36"` grid, `Margin="… -8"`): a top edge 8pt above the
-    /// grid. With no subtitle line the grid is only `TITLE_LINE_HEIGHT`
-    /// tall, and the same formula re-centers on it rather than leaving the
-    /// art hanging low (issue #75).
+    /// Issue #91: `emblem.png` is a 512x512 canvas holding one perfect
+    /// diamond that fills it — top corner at y=0, bottom at y=511, left at
+    /// (0,256), right at (511,256) — so the diamond's four corners are the
+    /// midpoints of whatever box the blit is given. Making that box the
+    /// header band is therefore the whole of the symmetry fix: the top
+    /// corner lands on the band's top edge, the bottom corner on its bottom
+    /// edge, and the right corner on the gutter's right edge at the band's
+    /// vertical midpoint.
+    ///
+    /// The old geometry centered a 60pt box on `40 + 8 = 48`, putting the
+    /// top corner 6pt above the band (clipped away entirely) and the bottom
+    /// corner at y=54, 14pt short — 20pt out of symmetry.
     #[test]
-    fn the_header_emblem_is_centered_on_the_text_band_it_decorates() {
+    fn the_header_emblem_box_is_the_band_so_its_diamond_is_symmetric() {
+        let band = header_band_height(BUTTON_ROW_HEIGHT);
         let row = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, 20.0));
-        assert_eq!(header_emblem_rect(row, 36.0).top(), -8.0);
-        for has_subtitle in [false, true] {
-            let band = header_text_band_height(has_subtitle);
-            let rect = header_emblem_rect(row, band);
-            let above = row.top() - rect.top();
-            let below = rect.bottom() - (row.top() + band);
-            assert!(
-                (below - (above + HEADER_EMBLEM_BOTTOM_BLEED)).abs() < 0.01,
-                "the negative bottom margin should hang the emblem \
-                 {HEADER_EMBLEM_BOTTOM_BLEED}pt further below the band than above it \
-                 (has_subtitle={has_subtitle}): above {above}, below {below}"
-            );
-        }
+        let rect = header_emblem_rect(row, band);
+
+        // Top and bottom corners of the diamond are the box's edge
+        // midpoints, and the box is the band exactly.
+        assert_eq!(rect.top(), row.top());
+        assert_eq!(rect.bottom(), row.top() + band);
+        let above = rect.top() - row.top();
+        let below = (row.top() + band) - rect.bottom();
+        assert_eq!(
+            above, below,
+            "the diamond overhangs the band by {above}pt above and {below}pt below"
+        );
+
+        // The right corner sits on the gutter's right edge, at the band's
+        // vertical midpoint.
+        assert_eq!(rect.right(), row.left() + HEADER_GUTTER_WIDTH);
+        assert_eq!(rect.center().y, row.top() + band / 2.0);
     }
 
-    /// The band the drag surface covers is the text rows plus one gap plus
-    /// the stat-pill row — the emblem's clip (the text rows) is strictly
-    /// shorter, so confining the emblem to it cannot have moved the drag
-    /// surface or the collapsed window's height.
+    /// The two relations the emblem box's geometry rests on, pinned as
+    /// constants so neither can be changed alone: shrinking or growing the
+    /// mark without moving its left bleed would drag the visible gutter —
+    /// and with it the title/subtitle indent — off `HEADER_GUTTER_WIDTH`,
+    /// and letting the size drift from the band would break the diamond's
+    /// vertical symmetry.
+    #[test]
+    fn the_emblem_box_preserves_the_gutter_and_spans_the_band() {
+        const { assert!(HEADER_EMBLEM_LEFT_BLEED + HEADER_EMBLEM_SIZE == HEADER_GUTTER_WIDTH) };
+        assert_eq!(HEADER_EMBLEM_LEFT_BLEED, -34.0);
+        assert_eq!(HEADER_EMBLEM_SIZE, header_band_height(BUTTON_ROW_HEIGHT));
+        assert_eq!(HEADER_EMBLEM_SIZE, 68.0);
+    }
+
+    /// The band the drag surface covers is the text rows plus
+    /// `HEADER_STAT_ROW_GAP` plus the stat-pill row — the gutter emblem's
+    /// clip (the text rows) is strictly shorter, so confining that emblem to
+    /// it cannot have moved the drag surface or the collapsed window's
+    /// height.
     #[test]
     fn the_text_band_is_the_drag_band_minus_the_stat_pill_row() {
-        for has_subtitle in [false, true] {
-            let text = header_text_band_height(has_subtitle);
-            let band = header_band_height(has_subtitle, BUTTON_ROW_HEIGHT);
-            assert_eq!(band, text + ITEM_SPACING_Y + BUTTON_ROW_HEIGHT);
-            assert!(text < band);
-        }
-        assert_eq!(header_text_band_height(true), 36.0);
+        let text = header_text_band_height();
+        let band = header_band_height(BUTTON_ROW_HEIGHT);
+        assert_eq!(band, text + HEADER_STAT_ROW_GAP + BUTTON_ROW_HEIGHT);
+        assert!(text < band);
+        assert_eq!(text, 40.0);
     }
 
     // -- header background wash (issue #59, #62, #81) --------------------
@@ -5144,35 +5609,73 @@ mod tests {
         assert!(emblem.bottom() > wash.bottom());
     }
 
-    /// Issue #81: the wash must never reach into the stat-pill row painted
-    /// below it. `draw_header` sizes the wash to
-    /// `text_band_height - HEADER_WASH_INSET`, so its painted bottom edge
-    /// sits above where the stat-pill row starts (`text_band_height +
-    /// ITEM_SPACING_Y` down from the panel top, the same geometry
-    /// `header_band_height` is built from) for both the with- and
-    /// without-subtitle cases — unlike the old fixed `98.0`pt wash, which
-    /// was taller than the whole drag band and painted straight through it.
+    /// Issue #91 inverts issue #81's rule. The wash is the header band's
+    /// *background*, so it must run behind the stat-pill row as well as the
+    /// text rows — `draw_header` sizes it to
+    /// `header_band_height - HEADER_WASH_INSET`, one rect carrying both the
+    /// gradient and the oversized emblem. What it must still never do is
+    /// bleed past the band into the first player row, which is exactly where
+    /// the old fixed `98.0`pt wash went wrong.
     #[test]
-    fn wash_does_not_reach_the_stat_pill_row() {
+    fn wash_covers_the_stat_pill_row_but_stops_at_the_first_player_row() {
         let panel = wash_test_panel();
         let button_row_height = 18.0;
-        for has_subtitle in [false, true] {
-            let text_band = header_text_band_height(has_subtitle);
-            let wash_height = text_band - HEADER_WASH_INSET;
-            let wash = header_wash_rect(panel, wash_height);
-            let stat_pill_row_top = panel.top() + text_band + ITEM_SPACING_Y;
-            let stat_pill_row_bottom = stat_pill_row_top + button_row_height;
-            assert!(
-                wash.bottom() <= stat_pill_row_top,
-                "wash bottom {} (has_subtitle={has_subtitle}) reaches into the \
-                 stat-pill row starting at {stat_pill_row_top}",
-                wash.bottom()
-            );
-            // Sanity: the two rects really are disjoint on the y axis, not
-            // just touching at a coincidental boundary.
-            assert!(wash.top() < stat_pill_row_bottom);
-            assert!(wash.bottom() < stat_pill_row_bottom);
-        }
+        let text_band = header_text_band_height();
+        let band = header_band_height(button_row_height);
+        let wash = header_wash_rect(panel, band - HEADER_WASH_INSET);
+        let stat_pill_row_top = panel.top() + text_band + HEADER_STAT_ROW_GAP;
+        let stat_pill_row_bottom = stat_pill_row_top + button_row_height;
+        let first_player_row_top = panel.top() + band;
+
+        assert!(
+            wash.top() < stat_pill_row_top,
+            "wash top {} starts below the stat-pill row at {stat_pill_row_top}",
+            wash.top()
+        );
+        assert!(
+            wash.bottom() >= stat_pill_row_bottom,
+            "wash bottom {} stops short of the stat-pill row's bottom at \
+             {stat_pill_row_bottom}",
+            wash.bottom()
+        );
+        assert!(
+            wash.bottom() <= first_player_row_top,
+            "wash bottom {} bleeds past the header band into the first player \
+             row at {first_player_row_top}",
+            wash.bottom()
+        );
+        // Flush, not merely inside: the only slack is the inset the wash
+        // is pushed down from the panel's top edge by.
+        assert_eq!(wash.bottom(), first_player_row_top);
+    }
+
+    /// Issue #91: the wash's *gradient* — not just its clip — has to span
+    /// the whole band, measured on what `draw_header` actually paints. A
+    /// change that shrank the quad back to the text band while leaving the
+    /// emblem alone would pass every pure-geometry test above and still be
+    /// the bug.
+    #[test]
+    fn the_wash_gradient_spans_the_whole_header_band() {
+        let snapshot = header_test_snapshot(30_100_000_000);
+        let frame = header_painted_boxes(&snapshot);
+        let gradient = frame.gradient_box();
+
+        let band = header_band_height(BUTTON_ROW_HEIGHT);
+        assert!(
+            (gradient.height() - (band - HEADER_WASH_INSET)).abs() < 0.01,
+            "the wash gradient is {}pt tall, not the header band's {}pt",
+            gradient.height(),
+            band - HEADER_WASH_INSET
+        );
+
+        // …and it really is behind the stat row's ink, not merely tall.
+        let stat_ink = frame.glyph_boxes(GlyphIcon::Timer)[0]
+            .union(frame.text_box(&fmt_duration(snapshot.duration_ms)));
+        assert!(
+            gradient.bottom() >= stat_ink.bottom(),
+            "the wash gradient ends at {} — above the timer's ink {stat_ink:?}",
+            gradient.bottom()
+        );
     }
 
     // -- column_anchors (issue #8) --------------------------------------
@@ -5883,24 +6386,44 @@ mod tests {
         // computed default height, with room left over for the header band
         // and separator on top of it.
         let rows_only = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
+        // Measured against what is actually stacked *above* the roster —
+        // the whole header band, the separator and the gap between them —
+        // not merely against the rows in isolation, which the 18pt-short
+        // window issue #91 inherited would also have passed.
+        let chrome = header_band_height(BUTTON_ROW_HEIGHT) + SEPARATOR_HEIGHT + ITEM_SPACING_Y;
         assert!(
-            default_inner_height() > rows_only,
-            "default height {} must exceed the {} rows themselves",
+            default_inner_height() - chrome >= rows_only,
+            "default height {} leaves only {}pt under the {chrome}pt of header \
+             chrome — short of the {rows_only}pt the {DEFAULT_VISIBLE_ROWS} rows need",
             default_inner_height(),
-            rows_only
+            default_inner_height() - chrome
         );
     }
 
     #[test]
     fn default_inner_height_matches_title_plus_header_plus_separator_plus_rows_plus_gaps() {
         let rows = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
-        // Decision 3: only the title->header and header->separator gaps
-        // remain — `draw_rows` zeroes `item_spacing.y` for its own scope,
-        // so there is no gap before the first row or between rows.
-        let gaps = 2.0 * ITEM_SPACING_Y;
-        let expected = TITLE_LINE_HEIGHT + BUTTON_ROW_HEIGHT + SEPARATOR_HEIGHT + rows + gaps;
+        // Decision 3: every gap above the row list is inside the band bar
+        // one — stat row->separator, the layout's ordinary
+        // `ITEM_SPACING_Y`. `draw_rows` zeroes `item_spacing.y` for its own
+        // scope, so there is no gap before the first row or between rows.
+        // The band is spelled out here (rather than reusing
+        // `header_band_height`, which is what the function itself calls) so
+        // this stays an independent statement of the sum.
+        let band = TITLE_LINE_HEIGHT
+            + ITEM_SPACING_Y
+            + SUBTITLE_LINE_HEIGHT
+            + HEADER_STAT_ROW_GAP
+            + BUTTON_ROW_HEIGHT;
+        let expected = band + SEPARATOR_HEIGHT + rows + ITEM_SPACING_Y;
         assert_eq!(default_inner_height(), expected);
-        assert_eq!(default_inner_height(), 652.0);
+        // Issue #91 grew this from `652.0` -> `658.0` (a 2pt taller title
+        // line, and `HEADER_STAT_ROW_GAP` above the stat row in place of
+        // `ITEM_SPACING_Y`) -> `676.0` here: the band now reserves the
+        // subtitle's line and gap whether or not an area name is known, so
+        // the default window has to budget them too or it opens 18pt short
+        // of the 20 rows it promises.
+        assert_eq!(default_inner_height(), 676.0);
     }
 
     #[test]

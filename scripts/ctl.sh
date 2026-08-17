@@ -121,8 +121,16 @@ trap 'rm -f "$tmp_file"' EXIT
   if [ "$MODE" = "app" ]; then
     printf '& $env:SHINRA_UIDBG_APP'
     for a in "${APP_ARGS[@]}"; do
-      # Single-quote every argument and double any embedded quote: PowerShell's
-      # single-quoted strings have no escape sequences, so this is exact.
+      # A parameter *name* must reach PowerShell bare: quoting `-Action` makes it
+      # a positional value, which is how `app -Action status` ended up binding
+      # "-Action" to -Action and failing its ValidateSet. `-` followed by a
+      # letter is a name; `-12` and friends stay values and get quoted.
+      case "$a" in
+        -[A-Za-z]*) printf ' %s' "$a"; continue ;;
+      esac
+      # Single-quote every other argument and double any embedded quote:
+      # PowerShell's single-quoted strings have no escape sequences, so this is
+      # exact.
       printf " '%s'" "${a//\'/\'\'}"
     done
     printf '\n'
