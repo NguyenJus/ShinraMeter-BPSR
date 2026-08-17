@@ -148,8 +148,9 @@ impl Drop for CaptureHandle {
 /// Opens a WinDivert sniff-mode handle on all non-loopback TCP/IP traffic
 /// and spawns a thread that reassembles the detected game-server's TCP
 /// stream and emits decoded [`ProtocolEvent`]s on `tx`. `inspect_sink`
-/// (issue #25 slice A) is opt-in diagnostic observation, wired straight into
-/// the thread's `Decoder`; `None` reproduces the pre-#25 decoder exactly.
+/// (issue #25 slice A, on by default since issue #87) is diagnostic
+/// observation, wired straight into the thread's `Decoder`; `None`
+/// reproduces the pre-#25 decoder exactly.
 pub fn start_capture(
     tx: Sender<ProtocolEvent>,
     inspect_sink: Option<Arc<dyn InspectSink>>,

@@ -113,6 +113,11 @@ Logging (issue #69) is on by default at `info`, since the app carries no console
 
 Logs may contain player names and other identifying traffic — never attach one to an issue or PR; mint a minimal synthetic repro instead.
 
+### Packet inspection dumps
+Packet inspection (issue #25, on by default since issue #87) writes every observed Notify-shaped fragment to a JSONL dump at `%APPDATA%\ShinraMeter-BPSR\inspect\dump-<pid>.jsonl` (falling back to a working-directory file if `APPDATA` is unset), overridable with `SHINRA_INSPECT_DUMP=<path>`. Like the log file, it is capped at 5 MiB and rotated to `<path>.1` (replacing any previous one) so a long-lived overlay can't grow it unbounded. Set `SHINRA_INSPECT=0` (`false` or `off` also work) to opt out.
+
+Dumps contain player names and other identifying traffic — never attach one to an issue or PR (see `.gitignore`).
+
 ## License
 
 This project is licensed under the GNU General Public License v3.0 (GPL-3.0-only).
