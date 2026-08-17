@@ -178,7 +178,7 @@ impl<K: Copy + PartialEq> IconSet<K> {
 }
 
 /// Textures for every class an icon was successfully decoded for, uploaded
-/// once via `ClassIcons::load`. Loaded lazily on `OverlayApp`'s first
+/// once via `ClassIcons::load_from`. Loaded lazily on `OverlayApp`'s first
 /// `ui()` call rather than in `OverlayApp::new`, because the `egui::Context`
 /// `load_texture` needs doesn't exist yet at construction time.
 pub struct ClassIcons(IconSet<Class>);
@@ -188,15 +188,25 @@ impl ClassIcons {
     /// decodes, and uploads a texture for it — skipping (and `log::warn!`ing
     /// the class and the full path for) any file that fails to read.
     /// `root == None` returns an empty set without touching the filesystem,
-    /// the same degradation a decode failure already produces.
+    /// the same degradation a decode failure already produces. Same
+    /// degradation, silently, when `<root>/classes/` itself doesn't exist
+    /// (the README's documented "delete the whole subdirectory" takedown
+    /// path): that case skips the per-file reads and their warns entirely
+    /// rather than emitting one `log::warn!` per class, since `Icons::load`
+    /// in `ui.rs` already logs a single aggregate "N missing" summary right
+    /// after this returns. A directory that exists but is missing individual
+    /// files still gets a per-file warn — that partial case is the one
+    /// actually worth a human's attention.
     pub fn load_from(ctx: &egui::Context, root: Option<&std::path::Path>) -> Self {
         let entries: Vec<(Class, Vec<u8>)> = root
-            .map(|root| {
+            .map(|root| root.join("classes"))
+            .filter(|dir| dir.is_dir())
+            .map(|dir| {
                 LOADABLE_CLASSES
                     .iter()
                     .filter_map(|&class| {
                         let file = class_icon_file(class)?;
-                        let path = root.join("classes").join(file);
+                        let path = dir.join(file);
                         match std::fs::read(&path) {
                             Ok(bytes) => Some((class, bytes)),
                             Err(err) => {
@@ -395,7 +405,7 @@ impl GlyphIcons {
 // `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
 //
 /// Textures for equipped-Imagine row icons (issue #33), uploaded once via
-/// `ImagineIcons::load`. Same lazy-load, load-once-per-process pattern as
+/// `ImagineIcons::load_from`. Same lazy-load, load-once-per-process pattern as
 /// `ClassIcons`/`ToolbarIcons`/`GlyphIcons` — see `ClassIcons`'s doc comment
 /// — but keyed by the icon *basename* (`&'static str`) rather than a closed
 /// key enum: `crate::imagines` maps many skill ids to one of 81 icon
@@ -410,14 +420,24 @@ impl ImagineIcons {
     /// skipping (and `log::warn!`ing the basename and the full path for)
     /// any file that fails to read. `root == None` returns an empty set
     /// without touching the filesystem, the same degradation a decode
-    /// failure already produces.
+    /// failure already produces. Same degradation, silently, when
+    /// `<root>/imagines/` itself doesn't exist (the README's documented
+    /// "delete the whole subdirectory" takedown path): that case skips the
+    /// per-file reads and their warns entirely rather than emitting one
+    /// `log::warn!` per basename (81 of them), since `Icons::load` in
+    /// `ui.rs` already logs a single aggregate "N missing" summary right
+    /// after this returns. A directory that exists but is missing
+    /// individual files still gets a per-file warn — that partial case is
+    /// the one actually worth a human's attention.
     pub fn load_from(ctx: &egui::Context, root: Option<&std::path::Path>) -> Self {
         let entries: Vec<(&'static str, Vec<u8>)> = root
-            .map(|root| {
+            .map(|root| root.join("imagines"))
+            .filter(|dir| dir.is_dir())
+            .map(|dir| {
                 imagines::IMAGINE_ICON_FILES
                     .iter()
                     .filter_map(|&basename| {
-                        let path = root.join("imagines").join(format!("{basename}.png"));
+                        let path = dir.join(format!("{basename}.png"));
                         match std::fs::read(&path) {
                             Ok(bytes) => Some((basename, bytes)),
                             Err(err) => {
@@ -568,6 +588,29 @@ mod tests {
         assert!(
             icons.get(Class::Stormblade).is_none(),
             "a nonexistent root must not produce any loaded class texture"
+        );
+        assert_eq!(icons.missing(), LOADABLE_CLASSES.len());
+    }
+
+    /// The README's documented takedown path is deleting the whole
+    /// `assets/classes/` subdirectory, not the asset root itself — distinct
+    /// from both `..._none_root_..` and `..._nonexistent_root_..` above in
+    /// that the root here does resolve (it exists and is a directory), only
+    /// `<root>/classes/` doesn't. `CARGO_MANIFEST_DIR` (this crate's own
+    /// root) is a convenient stand-in: it's a real, existing directory with
+    /// no `classes/` subdirectory of its own (only `assets/classes/` has
+    /// one). This is also the case finding-4's fix targets: it must degrade
+    /// the same way as a missing root, without attempting (and
+    /// `log::warn!`ing about) a per-file read for every `LOADABLE_CLASSES`
+    /// entry.
+    #[test]
+    fn class_icons_load_from_root_missing_classes_subdir_degrades_without_panicking() {
+        let ctx = egui::Context::default();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let icons = ClassIcons::load_from(&ctx, Some(root));
+        assert!(
+            icons.get(Class::Stormblade).is_none(),
+            "a root whose classes/ subdir doesn't exist must not produce any loaded class texture"
         );
         assert_eq!(icons.missing(), LOADABLE_CLASSES.len());
     }
@@ -757,6 +800,23 @@ mod tests {
         assert!(
             icons.get(representative).is_none(),
             "a nonexistent root must not produce any loaded imagine texture"
+        );
+        assert_eq!(icons.missing(), imagines::IMAGINE_ICON_FILES.len());
+    }
+
+    /// Same reasoning as
+    /// `class_icons_load_from_root_missing_classes_subdir_degrades_without_panicking`,
+    /// but for `assets/imagines/` — the higher-stakes case in practice,
+    /// since deleting it means 81 potential per-file warns rather than 9.
+    #[test]
+    fn imagine_icons_load_from_root_missing_imagines_subdir_degrades_without_panicking() {
+        let ctx = egui::Context::default();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let icons = ImagineIcons::load_from(&ctx, Some(root));
+        let representative = imagines::IMAGINE_ICON_FILES[0];
+        assert!(
+            icons.get(representative).is_none(),
+            "a root whose imagines/ subdir doesn't exist must not produce any loaded imagine texture"
         );
         assert_eq!(icons.missing(), imagines::IMAGINE_ICON_FILES.len());
     }
