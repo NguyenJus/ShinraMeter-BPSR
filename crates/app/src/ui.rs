@@ -4366,8 +4366,8 @@ mod tests {
         assert_eq!(screenshot_crop_height_px(10_000.0, 1.0, 600), 600);
     }
 
-    /// A non-positive bound (e.g. collapsed with no chrome measured yet)
-    /// must crop to nothing rather than underflow.
+    /// A non-positive bound (e.g. no bound stashed yet, so the crop falls
+    /// back to `0.0`) must crop to nothing rather than underflow.
     #[test]
     fn screenshot_crop_height_px_floors_a_non_positive_bound_to_zero() {
         assert_eq!(screenshot_crop_height_px(0.0, 1.0, 600), 0);
