@@ -719,8 +719,7 @@ fn menu_item_button<'a>(texture: Option<&egui::TextureHandle>, label: &'a str) -
 // upstream ShinraMeter icon set (`icons.rs`'s `TOOLBAR_ICON_BYTES`).
 // Originally this toggled collapse-to-header directly; it now opens a
 // dropdown menu instead (issue #71), so it always points down — a menu
-// affordance, not a collapse-state indicator — and the menu itself carries
-// the Collapse/Expand action alongside the rest.
+// affordance, not a collapse-state indicator.
 
 /// Side of the chevron's square hit/paint box, matched to `TOOLBAR_ICON_SIZE`
 /// so it reads as one of the window controls rather than as decoration.
@@ -1536,6 +1535,13 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
 /// near. A disclosure section has no second popup layer to mistime or
 /// mis-position, so neither problem is reachable.
 ///
+/// Built from `collapsing_header::CollapsingState::show_header` rather than
+/// the plain `egui::CollapsingHeader::new(...).show(...)` shorthand so the
+/// header can carry `ToolbarIcon::Settings` beside the "Columns" label —
+/// otherwise this item would have no icon call site while every other item
+/// in the menu (Close) still does, an inconsistency review flagged on this
+/// PR.
+///
 /// Losing the submenu also loses the `close_behavior` it carried on its own:
 /// the checkboxes are now direct children of the *root* popup, so
 /// `draw_header`'s `close_behavior(CloseOnClickOutside)` on that root popup
@@ -1555,38 +1561,65 @@ fn draw_header_menu(
         tx_settings,
     } = settings;
 
-    egui::CollapsingHeader::new("Columns")
-        .id_salt("header_menu_columns")
-        .show(ui, |ui| {
-            let mut changed = false;
-            for col in ColumnKind::ALL {
-                let is_visible = settings.is_visible(col);
-                // Disabling the last remaining column would leave the row
-                // with nothing to show, so its checkbox is greyed out and
-                // inert rather than letting the click land (issue #13's
-                // "keep the UI usable" guard).
-                let would_disable_last = is_visible && settings.visible_columns.len() <= 1;
-                let mut checked = is_visible;
-                let resp = ui.add_enabled(
-                    !would_disable_last,
-                    egui::Checkbox::new(&mut checked, col.label()),
-                );
-                if resp.changed() {
-                    settings.toggle(col);
-                    changed = true;
-                }
+    let columns_id = ui.make_persistent_id("header_menu_columns");
+    let mut columns_state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ctx, columns_id, false);
+    // Built from `CollapsingState` directly, rather than the plain
+    // `egui::CollapsingHeader::new(...).show(...)` shorthand this replaced,
+    // so the header can carry `ToolbarIcon::Settings` beside the "Columns"
+    // label. `show_toggle_button`'s own click target is only the small
+    // disclosure-arrow box, unlike `CollapsingHeader::show`'s whole clickable
+    // row — so the icon+label response is unioned and toggled by hand below,
+    // to keep the same full-row click target rather than shrinking it down
+    // to the arrow alone.
+    let header_response = ui.horizontal(|ui| {
+        columns_state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+        // A bare `ui.label` only senses hover, never clicks — `Sense::click()`
+        // is what actually lets the union below toggle on a label/icon click
+        // rather than doing nothing.
+        let mut header_response = ui.add(egui::Label::new("Columns").sense(egui::Sense::click()));
+        if let Some(handle) = icons.toolbar.get(ToolbarIcon::Settings) {
+            // Same reasoning as the label above: `toolbar_icon_image` builds
+            // a plain `egui::Image`, hover-sensing only by default, so it
+            // needs an explicit click sense to actually contribute to the
+            // unioned header-row click target.
+            header_response |= ui.add(toolbar_icon_image(handle).sense(egui::Sense::click()));
+        }
+        header_response
+    });
+    if header_response.inner.clicked() {
+        columns_state.toggle(ui);
+    }
+    columns_state.show_body_indented(&header_response.response, ui, |ui| {
+        let mut changed = false;
+        for col in ColumnKind::ALL {
+            let is_visible = settings.is_visible(col);
+            // Disabling the last remaining column would leave the row
+            // with nothing to show, so its checkbox is greyed out and
+            // inert rather than letting the click land (issue #13's
+            // "keep the UI usable" guard).
+            let would_disable_last = is_visible && settings.visible_columns.len() <= 1;
+            let mut checked = is_visible;
+            let resp = ui.add_enabled(
+                !would_disable_last,
+                egui::Checkbox::new(&mut checked, col.label()),
+            );
+            if resp.changed() {
+                settings.toggle(col);
+                changed = true;
             }
-            if changed {
-                // Persisting is blocking file IO (`fs::write` + `fs::rename`),
-                // so it must not run on this render thread — hand the new
-                // value to the dedicated settings-writer thread instead,
-                // same as `pipeline::spawn` owns the meter off this thread.
-                // A disconnected receiver (writer thread gone) is not
-                // fatal: the in-memory `settings` the UI already mutated
-                // stays correct for the rest of this session.
-                let _ = tx_settings.send(settings.clone());
-            }
-        });
+        }
+        if changed {
+            // Persisting is blocking file IO (`fs::write` + `fs::rename`),
+            // so it must not run on this render thread — hand the new
+            // value to the dedicated settings-writer thread instead,
+            // same as `pipeline::spawn` owns the meter off this thread.
+            // A disconnected receiver (writer thread gone) is not
+            // fatal: the in-memory `settings` the UI already mutated
+            // stays correct for the rest of this session.
+            let _ = tx_settings.send(settings.clone());
+        }
+    });
 
     ui.separator();
 
@@ -1628,7 +1661,6 @@ const MIN_INNER_SIZE: egui::Vec2 = egui::vec2(220.0, 90.0);
 /// window already is before a viewport command is worth sending. Purely to
 /// keep a held-still drag from re-queueing identical commands every frame.
 const GESTURE_EPSILON: f32 = 0.5;
-
 
 /// What a manual window gesture is currently driving.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -5843,14 +5875,28 @@ mod tests {
     /// (`Response::fill_accesskit_node_common`), so this is what lets a test
     /// click a specific `draw_header_menu` item without that function
     /// handing back anything more than a `Ui` to paint into.
+    /// Matches a node's `label()` (what `Button`/`Checkbox`/interact-only
+    /// widgets like `menu_chevron` register via `WidgetInfo::labeled`) or,
+    /// failing that, its `value()` (where a plain `ui.label(...)` — a
+    /// `Role::Label` node — puts its text instead; see egui's
+    /// `Response::fill_widget_info`, which calls `set_value` rather than
+    /// `set_label` specifically for `Role::Label`).
     fn accessible_rect_for_label(update: &egui::accesskit::TreeUpdate, label: &str) -> egui::Rect {
         let bounds = update
             .nodes
             .iter()
             .find_map(|(_, node)| {
-                (node.label() == Some(label))
-                    .then(|| node.bounds())
-                    .flatten()
+                // A direct `==` rather than `.as_deref() == Some(label)`:
+                // accesskit's `label()`/`value()` return type differs by
+                // target (owned `String` on some, borrowed `&str` on
+                // others — `x86_64-pc-windows-gnu`, this crate's CI
+                // target, is one where `.as_deref()` is already a no-op
+                // and clippy's `needless_option_as_deref` rejects it), and
+                // `String`/`&str` both compare directly against `label: &str`.
+                (node.label().is_some_and(|s| s == label)
+                    || node.value().is_some_and(|s| s == label))
+                .then(|| node.bounds())
+                .flatten()
             })
             .unwrap_or_else(|| panic!("no accessible node labeled {label:?} painted"));
         egui::Rect::from_min_max(
@@ -5955,6 +6001,165 @@ mod tests {
         assert!(
             close_commands.contains(&egui::ViewportCommand::Close),
             "Close must also ask the viewport to close: {close_commands:?}"
+        );
+    }
+
+    /// Regression coverage for issue #93's actual fix, which the test above
+    /// cannot see: it calls `draw_header_menu` directly, never through the
+    /// `egui::Popup::menu(&chevron_response).close_behavior(CloseOnClickOutside)`
+    /// wiring `draw_header` builds around it (~lines 473-477), so the
+    /// `ui.close()` calls on Minimize/Close are no-ops in that harness — a
+    /// popup that was never opened has nothing to close.
+    ///
+    /// This drives the real thing through `draw_header` across several
+    /// frames of the same `egui::Context` (memory persists across `run_ui`
+    /// calls the way it would across real app frames): open the chevron
+    /// menu with a genuine click, expand the Columns disclosure, click a
+    /// column checkbox, and confirm the popup is still open afterward — the
+    /// whole point of `CloseOnClickOutside` plus no `ui.close()` on that
+    /// path. Then click Close and confirm the popup closes (on the frame
+    /// after, since `Ui::close` only takes effect for the next frame's
+    /// `is_open` check) and the right command still goes out, even with the
+    /// popup now in the mix.
+    #[test]
+    fn header_menu_popup_stays_open_for_a_column_checkbox_but_closes_for_close() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        // The Columns disclosure section's own arrow (`show_toggle_button`)
+        // reads `openness()` once before this test's click toggles it and
+        // once more right after, both in the same frame — with the default
+        // nonzero `animation_time`, the second read still animates from
+        // the first read's now-stale timestamp with zero elapsed time, so
+        // it stays at 0.0 and the checkboxes never render that frame. A
+        // zero animation time makes `AnimationManager::animate_bool` snap
+        // straight to the target instead (its `elapsed / animation_time`
+        // divide-by-zero produces a non-finite value, which its own
+        // fallback resolves to the target), matching how instantly a real
+        // click should feel anyway.
+        ctx.global_style_mut(|style| style.animation_time = 0.0);
+        let icons = Icons::load(&ctx);
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(0);
+        let mut gesture = WindowGesture::default();
+
+        // Runs one frame of the real `draw_header` (chevron, popup wiring,
+        // and all) and hands back this frame's accessibility tree, the same
+        // ground truth `draw_header_menu_dispatches_close_to_the_right_command`
+        // reads Close's position from.
+        let mut frame = |mut input: egui::RawInput| -> egui::accesskit::TreeUpdate {
+            // A fixed, bounded screen every frame — the same reasoning as
+            // `header_painted_boxes`'s doc comment: without one, the
+            // popup's own best-alignment logic (there is nothing to align
+            // *inside*) has no stable anchor to measure against, and the
+            // chevron/menu paint at a different, arbitrary offset each
+            // frame, silently invalidating a position captured on an
+            // earlier frame.
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(default_inner_width(), default_inner_height()),
+            ));
+            let output = ctx.run_ui(input, |ui| {
+                draw_header(
+                    ui,
+                    &ctx,
+                    &snapshot,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    &mut gesture,
+                );
+            });
+            let update = output
+                .platform_output
+                .accesskit_update
+                .clone()
+                .expect("accesskit was enabled for this frame");
+            output.drop_without_applying_deltas();
+            update
+        };
+        let is_open = |update: &egui::accesskit::TreeUpdate| {
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Close"))
+        };
+
+        // Frame 1: closed header, find the chevron.
+        let update = frame(egui::RawInput::default());
+        assert!(!is_open(&update), "the menu must start closed");
+        let chevron_pos = accessible_rect_for_label(&update, "Menu").center();
+
+        // Frame 2: click the chevron. `Popup::menu`'s `open_memory` toggles
+        // and the popup paints in the very same frame (egui's `Popup::show`
+        // opens before deciding whether to render), so Columns is already
+        // visible here — collapsed, per its own `default_open(false)`. Its
+        // *position* is not trustworthy yet though: `Popup::show` runs the
+        // just-opened Area through a `sizing_pass` (no prior measured size
+        // to align against), which lays the content out differently from
+        // every later frame — so this frame only proves the menu opened.
+        let update = frame(click_at(chevron_pos));
+        assert!(is_open(&update), "clicking the chevron must open the menu");
+
+        // Frame 3: no new input, just letting the popup settle into its
+        // real, stable position now that a prior frame's size is on record.
+        let update = frame(egui::RawInput::default());
+        assert!(is_open(&update), "the menu must still be open once settled");
+        let columns_pos = accessible_rect_for_label(&update, "Columns").center();
+
+        // Frame 4: click Columns to expand its disclosure section.
+        let update = frame(click_at(columns_pos));
+        assert!(
+            is_open(&update),
+            "expanding Columns must not close the menu"
+        );
+        let first_column_label = ColumnKind::ALL[0].label();
+        let checkbox_pos = accessible_rect_for_label(&update, first_column_label).center();
+
+        // Frame 5: click a column checkbox. Issue #93's fix — no `ui.close()`
+        // on this path, plus the root popup's `CloseOnClickOutside` — means
+        // this must NOT dismiss the popup, unlike the old submenu flyout.
+        let update = frame(click_at(checkbox_pos));
+        assert!(
+            is_open(&update),
+            "a Columns checkbox click must leave the popup open"
+        );
+        assert!(
+            rx_command.try_recv().is_err(),
+            "a checkbox click must not dispatch a command"
+        );
+
+        // Frame 6: confirm it is still open on the frame after too — not
+        // just within the click frame itself.
+        let update = frame(egui::RawInput::default());
+        assert!(
+            is_open(&update),
+            "the popup must stay open on the frame after the checkbox click"
+        );
+        let close_pos = accessible_rect_for_label(&update, "Close").center();
+
+        // Frame 7: click Close. It calls `ui.close()` itself, so — unlike
+        // the checkbox — this must close the popup, and still dispatch the
+        // Quit command even though the click went through the real popup
+        // wiring this time, not a direct `draw_header_menu` call.
+        let _ = frame(click_at(close_pos));
+        assert_eq!(
+            rx_command.try_recv().expect("Close must send a command"),
+            UiCommand::Quit
+        );
+
+        // Frame 8: `Ui::close` only closes for the *next* frame's `is_open`
+        // check (the frame it's called on already painted before the close
+        // decision runs) — so the popup must be gone by now.
+        let update = frame(egui::RawInput::default());
+        assert!(
+            !is_open(&update),
+            "Close must actually dismiss the popup by the following frame"
         );
     }
 
@@ -6348,7 +6553,6 @@ mod tests {
         let textures = counter_pill_textures(None);
         assert!(!textures.contains(&texture.id()));
     }
-
 
     // --- the chevron itself (issue #54) ----------------------------------
 
