@@ -164,6 +164,26 @@ pub struct OverlayApp {
     /// per-frame DPI probe in `ui()` only writes to the log when the value
     /// actually changes rather than every ~10Hz frame.
     last_dpi_probe: Option<(f32, f32)>,
+    /// Issue #96 (PR #98 review): the row-list content bottom edge — top
+    /// chrome plus only the populated rows, in window-space points
+    /// (`rows_content_bottom_y`) — for the Share screenshot request
+    /// currently in flight, or `None` if no request is in flight.
+    ///
+    /// `handle_screenshot_events` runs at the *start* of `ui()`, but the
+    /// `Event::Screenshot` reply to a Share click lands asynchronously, on
+    /// some later frame than the click — and `self.snapshot`'s row count
+    /// is live combat data that can change on any frame in between (a
+    /// player joining or dropping mid-encounter is routine). Reading
+    /// whatever row-bottom bound happens to be current when the reply
+    /// lands would crop against a row count that no longer matches the
+    /// pixels actually captured. Instead, the bound is computed and
+    /// stashed here once, at the end of the *same* frame the click
+    /// happened on (after `draw_rows` has laid out that frame's rows —
+    /// the Share button itself is drawn earlier, in the header), and
+    /// `handle_screenshot_events`'s call site `take()`s it when the reply
+    /// lands, so the crop always matches the frame that was actually
+    /// captured regardless of how the row count drifts afterward.
+    pending_screenshot_bound: Option<f32>,
 }
 
 /// All icon textures the overlay paints, bundled so `OverlayApp` has exactly
@@ -214,6 +234,7 @@ impl OverlayApp {
             window_gesture: WindowGesture::default(),
             collapse: CollapseState::default(),
             last_dpi_probe: None,
+            pending_screenshot_bound: None,
         }
     }
 
@@ -266,7 +287,18 @@ impl eframe::App for OverlayApp {
         // frame, unconditionally, rather than only while collapsed/expanded
         // state would suggest — a screenshot can be requested at any point
         // in the header, which is always painted.
-        handle_screenshot_events(&ctx, crate::platform::write_clipboard_image);
+        // Issue #96 (PR #98 review): crop to the header chrome + populated
+        // rows before the clipboard write, using the bound captured at
+        // *request* time (`pending_screenshot_bound`) rather than whatever
+        // bound is current on the frame the reply happens to land on — see
+        // `pending_screenshot_bound`'s doc comment. `take()`n so a later,
+        // unrelated frame never reuses a stale bound.
+        let rows_bottom_y = self.pending_screenshot_bound.take().unwrap_or(0.0);
+        let pixels_per_point = ctx.pixels_per_point();
+        handle_screenshot_events(&ctx, |image| {
+            let cropped = crop_screenshot_to_rows(image, rows_bottom_y, pixels_per_point);
+            crate::platform::write_clipboard_image(&cropped);
+        });
 
         // Loaded once, lazily: the `egui::Context` above isn't available yet
         // at `OverlayApp::new`, so the first frame is what actually uploads
@@ -297,7 +329,13 @@ impl eframe::App for OverlayApp {
                 // First, so the header buttons drawn afterwards stay on top of
                 // the corner zones they overlap.
                 draw_resize_handles(ui, &ctx, &mut self.window_gesture);
-                draw_header(
+                // Issue #96 (PR #98 review): whether the Share button fired
+                // a screenshot request this frame — if so, the row bound
+                // this same frame computes below is stashed into
+                // `pending_screenshot_bound` for whenever the async reply
+                // lands, instead of leaving that field for the crop to read
+                // fresh (and possibly stale) at reply time.
+                let screenshot_requested = draw_header(
                     ui,
                     &ctx,
                     &self.snapshot,
@@ -329,6 +367,11 @@ impl eframe::App for OverlayApp {
                     self.collapse.min_inner_size(),
                 );
 
+                // Issue #96: where the header chrome ends in window space —
+                // the crop bound when collapsed (no rows painted at all),
+                // and the starting point rows are measured from otherwise.
+                let header_bottom_y = ui.cursor().top();
+
                 // Everything below the header band is skipped outright while
                 // collapsed (issue #54) — not painted into a clipped rect —
                 // so a collapsed overlay costs nothing per row, and the
@@ -339,7 +382,24 @@ impl eframe::App for OverlayApp {
                     }
 
                     ui.separator();
+                    // Issue #96: captured before `draw_rows` consumes the
+                    // space — `rows_top` is where the scroll area starts,
+                    // `rows_area_height` is all of what's left in the panel
+                    // for it, matching `draw_rows`'s own
+                    // `auto_shrink([false, false])`.
+                    let rows_top = ui.cursor().top();
+                    let rows_area_height = ui.available_height();
                     draw_rows(ui, &self.snapshot, &self.settings.ordered_columns(), icons);
+                    if screenshot_requested {
+                        self.pending_screenshot_bound = Some(rows_content_bottom_y(
+                            rows_top,
+                            self.snapshot.rows.len(),
+                            ROW_HEIGHT,
+                            rows_area_height,
+                        ));
+                    }
+                } else if screenshot_requested {
+                    self.pending_screenshot_bound = Some(header_bottom_y);
                 }
             });
 
@@ -424,6 +484,10 @@ struct ChromeHandle<'a> {
     collapse: &'a mut CollapseState,
 }
 
+/// Returns whether the Share button (in the toggle cluster painted at the
+/// end of this function) fired a screenshot request this frame — issue #96
+/// (PR #98 review): the caller uses this to know whether to stash this same
+/// frame's row-bottom bound into `OverlayApp::pending_screenshot_bound`.
 fn draw_header(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -432,7 +496,7 @@ fn draw_header(
     settings: SettingsHandle<'_>,
     icons: &Icons,
     chrome: ChromeHandle<'_>,
-) {
+) -> bool {
     let title = encounter_title(&snapshot.encounter);
     let subtitle = encounter_subtitle(&snapshot.encounter);
     // Also the collapsed window's whole inner height (issue #54): collapsing
@@ -567,8 +631,9 @@ fn draw_header(
                 icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
             ),
         );
-        toggle_cluster(ui, tx_command, icons);
-    });
+        toggle_cluster(ui, tx_command, icons)
+    })
+    .inner
 }
 
 // -- status indicators (issue #62, #82) -----------------------------------
@@ -632,7 +697,11 @@ fn toggle_button(ui: &egui::Ui, rect: egui::Rect, label: &str) -> egui::Response
 /// check glyph centered in it; no backlog arc, since there is still no
 /// queue for it to show). All in one `PILL_FILL` oval, matching the
 /// DPS/damage pills' chrome.
-fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Icons) {
+///
+/// Returns whether Share was clicked this frame (issue #96, PR #98 review)
+/// — `draw_header` propagates this up so `OverlayApp::ui` knows to stash
+/// this frame's row-bottom bound for the async screenshot reply.
+fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Icons) -> bool {
     let height = ui.spacing().interact_size.y;
     let width = 2.0 * TOGGLE_PAD_X
         + TOGGLE_MOUSE_SIDE
@@ -643,7 +712,7 @@ fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Ico
     let (rect, _response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
 
     if !ui.is_rect_visible(rect) {
-        return;
+        return false;
     }
     ui.painter()
         .rect_filled(rect, rect.height() / 2.0, PILL_FILL);
@@ -661,9 +730,11 @@ fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Ico
         egui::pos2(x + TOGGLE_MOUSE_SIDE / 2.0, y),
         egui::Vec2::splat(TOGGLE_MOUSE_SIDE),
     );
+    let mut screenshot_requested = false;
     if toggle_button(ui, share_rect, "Copy screenshot to clipboard").clicked() {
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+        screenshot_requested = true;
     }
     if let Some(share) = icons.glyphs.get(GlyphIcon::Share) {
         ui.painter()
@@ -700,6 +771,8 @@ fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Ico
         ui.painter()
             .image(check.id(), icon_rect, UV_FULL, TOGGLE_OFF_COLOR);
     }
+
+    screenshot_requested
 }
 
 /// Scans this frame's input events for the reply to a screenshot request
@@ -722,6 +795,88 @@ fn handle_screenshot_events(ctx: &egui::Context, mut write: impl FnMut(&egui::Co
             }
         }
     });
+}
+
+/// Issue #96: the window-space y coordinate (in points) of the bottom of
+/// the row list's actual content — top chrome plus only the populated rows
+/// — used to crop the Share button's clipboard screenshot down to just
+/// that content instead of the whole window.
+///
+/// `rows_area_height` is the row `ScrollArea`'s own allocated height: per
+/// `draw_rows`'s `auto_shrink([false, false])` it always fills whatever
+/// space the panel leaves it, so it is exactly what got rendered this
+/// frame, regardless of how many rows there are. Clamping the rows' own
+/// height to it handles both crop directions purely:
+///
+/// - Trailing empty space (fewer/shorter rows than the scroll area) is
+///   trimmed — the bound stops right after the last row, not at the
+///   scroll area's full height.
+/// - Scrolled-off rows (more row content than the scroll area shows) are
+///   never trimmed further than what was actually painted — the bound
+///   clamps at the scroll area's height rather than the taller row-count
+///   total, since content past that was clipped out of the render itself
+///   and cannot be recovered from a screenshot of it.
+fn rows_content_bottom_y(
+    rows_top: f32,
+    row_count: usize,
+    row_height: f32,
+    rows_area_height: f32,
+) -> f32 {
+    let rows_height = row_count as f32 * row_height;
+    rows_top + rows_height.min(rows_area_height.max(0.0))
+}
+
+/// Converts a window-space y bound (points, from `rows_content_bottom_y`)
+/// to a row count in the captured `ColorImage`'s physical-pixel coordinate
+/// space, using the frame's `pixels_per_point` scale. Clamped to
+/// `image_height_px` as a last-resort safety net — `pixels_per_point` is
+/// still read fresh on the frame the reply lands on (see
+/// `OverlayApp::pending_screenshot_bound`'s doc comment, which covers the
+/// row-count half of this), so a DPI/zoom change mid-round-trip could in
+/// principle still scale the bound past the image; this clamp makes sure
+/// that only ever crops *less* than the full image, never indexes past its
+/// end.
+fn screenshot_crop_height_px(
+    bottom_y_points: f32,
+    pixels_per_point: f32,
+    image_height_px: usize,
+) -> usize {
+    // Clippy's `neg_cmp_op_on_partial_ord`: `!(x > 0.0)` is not the same as
+    // `x <= 0.0` once NaN is possible (NaN compares false either way, so
+    // the negated form silently treats it as "not positive" too — which is
+    // exactly the fallback wanted here, but spelled via `partial_cmp` to
+    // make that NaN handling explicit rather than implicit in a negation).
+    let is_positive = |v: f32| v.partial_cmp(&0.0) == Some(std::cmp::Ordering::Greater);
+    if !is_positive(bottom_y_points) || !is_positive(pixels_per_point) {
+        return 0;
+    }
+    let px = bottom_y_points * pixels_per_point;
+    if !px.is_finite() {
+        return image_height_px;
+    }
+    (px.round() as usize).min(image_height_px)
+}
+
+/// Crops a Share-button screenshot down to the header chrome plus
+/// populated rows (issue #96), dropping trailing empty window background
+/// below the last row — or keeping the full capture when the content
+/// already fills it (scrolled-off rows, or the bound clamped past the
+/// image). This is a pure post-capture crop of the `ColorImage` already in
+/// hand: it never touches the live window's size or geometry, which is the
+/// point of doing it here rather than by resizing the overlay — only the
+/// clipboard image differs from a bare full-window capture.
+fn crop_screenshot_to_rows(
+    image: &egui::ColorImage,
+    bottom_y_points: f32,
+    pixels_per_point: f32,
+) -> egui::ColorImage {
+    let [width, height] = image.size;
+    let crop_height = screenshot_crop_height_px(bottom_y_points, pixels_per_point, height);
+    if crop_height >= height {
+        return image.clone();
+    }
+    let pixels = image.pixels[..width * crop_height].to_vec();
+    egui::ColorImage::new([width, crop_height], pixels)
 }
 
 /// Fixed display size, in points, every toolbar icon (issue #41) is drawn
@@ -2879,17 +3034,33 @@ fn share_bar_rgb(class: Option<Class>) -> (u8, u8, u8) {
     }
 }
 
+/// Issue #97: floor a positive-damage row's bar fraction is clamped up to,
+/// so a row far below the top row (e.g. a support/healer next to a burst
+/// DPS class) still paints a noticeably visible sliver instead of reading
+/// as if it did zero damage. 3% sits in the middle of the sane 2-5% range:
+/// at the row bar's actual width (`share_bar_rect`'s 300pt test fixture)
+/// that is a solid ~9px sliver — clearly present — while staying far below
+/// any real double-digit share, so it never overstates a near-zero
+/// contributor as roughly comparable to a genuine one.
+const ROW_BAR_MIN_FRAC: f32 = 0.03;
+
 /// Computes a row's damage-share bar fraction (issue #73): `damage` scaled
 /// against `top_damage` — the highest-damage row in the current snapshot —
 /// rather than against total encounter damage, so the top row's bar always
 /// fills the full width regardless of how dominant it is over the rest of
 /// the raid. Guards against a zero or negative `top_damage` (an empty or
 /// degenerate snapshot) by returning `0.0` rather than dividing.
+///
+/// Issue #97: any row with `damage > 0` is clamped up to at least
+/// `ROW_BAR_MIN_FRAC`, so a real but tiny contributor still paints a
+/// visible bar. A row with `damage == 0` (or negative, defensively) stays
+/// at exactly `0.0` — no floor for a row that did nothing.
 fn row_bar_frac(damage: i64, top_damage: i64) -> f32 {
-    if top_damage <= 0 {
+    if top_damage <= 0 || damage <= 0 {
         0.0
     } else {
-        (damage as f64 / top_damage as f64) as f32
+        let frac = (damage as f64 / top_damage as f64) as f32;
+        frac.max(ROW_BAR_MIN_FRAC)
     }
 }
 
@@ -4379,6 +4550,174 @@ mod tests {
         );
     }
 
+    // -- Share screenshot cropping (issue #96) -------------------------------
+
+    /// Issue #96 (PR #98 review): `pending_screenshot_bound` must be pinned
+    /// to the row count as of the frame the Share click fired on — reading
+    /// `self.snapshot` fresh when the async `Event::Screenshot` reply lands
+    /// would crop against a row count that no longer matches the pixels
+    /// actually captured (a player joining or dropping mid-encounter is
+    /// routine during a real round trip). Exercises `OverlayApp`'s own
+    /// field directly, not just the pure crop helpers, so a future
+    /// refactor that reintroduces a reply-time read would be caught here —
+    /// no egui round trip needed.
+    #[test]
+    fn pending_screenshot_bound_survives_a_later_snapshot_row_count_change() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(rx_snapshot, tx_command, tx_settings, Settings::default());
+
+        // What `OverlayApp::ui` does at the end of the frame the Share
+        // click fired on: stash *that* frame's row bound, computed from
+        // *that* frame's row count (3 rows).
+        app.snapshot = rows_test_snapshot(3);
+        let request_time_bound =
+            rows_content_bottom_y(50.0, app.snapshot.rows.len(), ROW_HEIGHT, 500.0);
+        app.pending_screenshot_bound = Some(request_time_bound);
+
+        // A player joins mid-encounter before the async reply lands — the
+        // row count changes underneath the pending request.
+        app.snapshot = rows_test_snapshot(8);
+
+        assert_eq!(
+            app.pending_screenshot_bound,
+            Some(request_time_bound),
+            "the pending bound must stay pinned to the request-time row \
+             count, not drift with the live snapshot"
+        );
+    }
+
+    /// Fewer/shorter populated rows than the scroll area's allocated height
+    /// must trim the bound to right after the last row, not the scroll
+    /// area's full height — no trailing empty background.
+    #[test]
+    fn rows_content_bottom_y_trims_trailing_empty_space() {
+        let bottom = rows_content_bottom_y(100.0, 3, 30.0, 500.0);
+        assert_eq!(bottom, 100.0 + 3.0 * 30.0);
+    }
+
+    /// More populated-row content than the scroll area shows (scrolled
+    /// off) must not push the bound past what the scroll area actually
+    /// rendered — that content was clipped out of the frame itself.
+    #[test]
+    fn rows_content_bottom_y_clamps_to_the_scroll_area_when_rows_overflow_it() {
+        let bottom = rows_content_bottom_y(100.0, 50, 30.0, 200.0);
+        assert_eq!(bottom, 100.0 + 200.0);
+    }
+
+    /// Zero populated rows must not add any height past the chrome.
+    #[test]
+    fn rows_content_bottom_y_is_just_the_chrome_with_no_rows() {
+        assert_eq!(rows_content_bottom_y(100.0, 0, 30.0, 500.0), 100.0);
+    }
+
+    /// The common case: converts a points bound to pixels via
+    /// `pixels_per_point` and stays within the image.
+    #[test]
+    fn screenshot_crop_height_px_scales_by_pixels_per_point() {
+        assert_eq!(screenshot_crop_height_px(200.0, 2.0, 1000), 400);
+    }
+
+    /// A stale bound taller than the actual captured image (e.g. the
+    /// window shrank between the frame that computed the bound and the
+    /// later frame the screenshot reply landed on) must clamp to the
+    /// image's real height, never index past it.
+    #[test]
+    fn screenshot_crop_height_px_clamps_to_the_image_height() {
+        assert_eq!(screenshot_crop_height_px(10_000.0, 1.0, 600), 600);
+    }
+
+    /// A non-positive bound (e.g. collapsed with no chrome measured yet)
+    /// must crop to nothing rather than underflow.
+    #[test]
+    fn screenshot_crop_height_px_floors_a_non_positive_bound_to_zero() {
+        assert_eq!(screenshot_crop_height_px(0.0, 1.0, 600), 0);
+        assert_eq!(screenshot_crop_height_px(-5.0, 1.0, 600), 0);
+    }
+
+    /// PR #98 review (clippy `neg_cmp_op_on_partial_ord`): a NaN bound or
+    /// scale must floor to zero too, matching the original `!(x > 0.0)`
+    /// behavior for every input (NaN comparisons are always `false`, so the
+    /// negated form treated NaN as "not positive" — the rewritten
+    /// `partial_cmp`-based check must preserve exactly that, not just the
+    /// non-NaN cases).
+    #[test]
+    fn screenshot_crop_height_px_floors_a_nan_bound_or_scale_to_zero() {
+        assert_eq!(screenshot_crop_height_px(f32::NAN, 1.0, 600), 0);
+        assert_eq!(screenshot_crop_height_px(200.0, f32::NAN, 600), 0);
+        assert_eq!(screenshot_crop_height_px(f32::NAN, f32::NAN, 600), 0);
+    }
+
+    /// Issue #96 (PR #98 review): the crop must be driven by the row count
+    /// as of the frame the screenshot was actually *requested* on, not
+    /// whatever row count is current by the time the async reply is
+    /// handled — the row count is live combat data (a player joining or
+    /// dropping mid-encounter is routine) and can change during the round
+    /// trip. This exercises the pure crop helpers directly with two
+    /// different row counts standing in for "request time" and "reply
+    /// time", proving they produce different — and the request-time one is
+    /// the one that must be used.
+    #[test]
+    fn crop_uses_the_bound_captured_at_request_time_even_if_the_row_count_later_changes() {
+        let rows_top = 50.0;
+        let row_height = 20.0;
+        let rows_area_height = 500.0;
+        let pixels_per_point = 1.0;
+
+        // The frame the Share click fired on: 3 populated rows.
+        let request_time_bound = rows_content_bottom_y(rows_top, 3, row_height, rows_area_height);
+
+        // By the time the async reply lands, a player joined mid-encounter
+        // and the row count grew — recomputing from *that* would produce a
+        // different bound than what was actually captured.
+        let reply_time_bound = rows_content_bottom_y(rows_top, 8, row_height, rows_area_height);
+        assert_ne!(
+            request_time_bound, reply_time_bound,
+            "the test setup must actually exercise a row-count change"
+        );
+
+        let image = crop_test_image(4, 200);
+        let cropped = crop_screenshot_to_rows(&image, request_time_bound, pixels_per_point);
+
+        let expected_height =
+            screenshot_crop_height_px(request_time_bound, pixels_per_point, image.size[1]);
+        assert_eq!(cropped.size, [4, expected_height]);
+        assert_ne!(
+            cropped.size[1],
+            screenshot_crop_height_px(reply_time_bound, pixels_per_point, image.size[1]),
+            "must not crop as if it were computed from the reply-time row count"
+        );
+    }
+
+    fn crop_test_image(width: usize, height: usize) -> egui::ColorImage {
+        let pixels = (0..width * height)
+            .map(|i| egui::Color32::from_gray((i % 256) as u8))
+            .collect();
+        egui::ColorImage::new([width, height], pixels)
+    }
+
+    /// The primary case: trims the image down to the rows' bottom edge,
+    /// keeping every pixel above it and dropping every row below.
+    #[test]
+    fn crop_screenshot_to_rows_trims_below_the_bound() {
+        let image = crop_test_image(4, 10);
+        let cropped = crop_screenshot_to_rows(&image, 6.0, 1.0);
+        assert_eq!(cropped.size, [4, 6]);
+        assert_eq!(cropped.pixels, image.pixels[..4 * 6]);
+    }
+
+    /// When the computed bound reaches or exceeds the image's actual
+    /// height (content overflows the scroll area, or a stale bound), the
+    /// full capture is kept unmodified rather than degenerately cropped.
+    #[test]
+    fn crop_screenshot_to_rows_keeps_the_full_image_when_the_bound_is_not_smaller() {
+        let image = crop_test_image(4, 10);
+        let cropped = crop_screenshot_to_rows(&image, 1000.0, 1.0);
+        assert_eq!(cropped.size, image.size);
+        assert_eq!(cropped.pixels, image.pixels);
+    }
+
     /// The reference drops the trailing " DPS"/" DMG" words in favor of the
     /// `/s` suffix and the pill icons — the words are pure width.
     #[test]
@@ -5409,6 +5748,29 @@ mod tests {
     fn row_bar_frac_guards_against_a_non_positive_top_damage() {
         assert_eq!(row_bar_frac(500, 0), 0.0);
         assert_eq!(row_bar_frac(500, -10), 0.0);
+    }
+
+    /// Issue #97: a row doing real damage but far below the top row (e.g. a
+    /// support/healer next to a burst DPS class) must still paint a visible
+    /// sliver of bar rather than reading as if it did zero damage.
+    #[test]
+    fn row_bar_frac_floors_a_near_zero_positive_share_to_the_visible_minimum() {
+        // 1 out of 1,000,000 rounds to a fraction far below the floor.
+        assert_eq!(row_bar_frac(1, 1_000_000), ROW_BAR_MIN_FRAC);
+    }
+
+    /// The floor must never kick in for a row that truly did zero damage —
+    /// that row stays fully empty, not a fake sliver.
+    #[test]
+    fn row_bar_frac_stays_zero_for_zero_damage() {
+        assert_eq!(row_bar_frac(0, 1_000_000), 0.0);
+    }
+
+    /// A share already at or above the floor must pass through unchanged,
+    /// not get clamped down to the floor.
+    #[test]
+    fn row_bar_frac_leaves_a_share_already_above_the_floor_untouched() {
+        assert_eq!(row_bar_frac(500_000, 1_000_000), 0.5);
     }
 
     /// The two quads must be contiguous (no gap, no overlap) and meet at the
