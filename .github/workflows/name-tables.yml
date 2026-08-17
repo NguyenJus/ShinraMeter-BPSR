@@ -1,0 +1,52 @@
+name: Name tables
+
+# Issue #36: `crates/meter/src/tables.rs` is generated from JSON vendored under
+# `crates/meter/data/`, and nothing used to notice when either half went stale.
+# Two independent kinds of rot, so two jobs.
+#
+# A CI job was chosen over a release-checklist note because the first job is the
+# only thing that can catch a hand-edit of a generated file, and a checklist
+# cannot run at all: the check is one script invocation with no toolchain, no
+# cross-compiler and no cache, so it is far cheaper than the review round-trip
+# that a stale `tables.rs` reaching main would otherwise cost.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Upstream moves on game patches, not on our commits, so the drift check is
+  # time-driven. Monday 05:00 UTC.
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Offline, and runs on every push and PR: does `tables.rs` still match the
+  # JSON it claims to be generated from? This is what catches someone editing
+  # the generated file by hand, or refreshing the vendored JSON without
+  # re-running the generator. It needs no network, so it can never flake on
+  # a third-party repository being unreachable.
+  generated:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 scripts/gen-name-tables.py --check
+
+  # Networked, and deliberately *not* on pull requests: have the vendored
+  # copies drifted from their upstream sources? A red run here is the nag that
+  # a refresh is due — it means the game tables moved, which is expected after
+  # a patch and is nobody's fault, so gating PRs on it would block unrelated
+  # work behind a third party's release schedule.
+  #
+  # To resolve a failure: run `python3 scripts/gen-name-tables.py --refresh`,
+  # then `cargo fmt -p bpsr-meter`, and commit the result.
+  upstream:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 scripts/gen-name-tables.py --refresh --check
