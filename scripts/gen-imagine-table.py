@@ -16,14 +16,24 @@ The icon PNGs referenced by the table are prepared separately by
 script does not touch them, but it refuses to emit unless every icon
 basename the table references resolves to a committed PNG there.
 
-To refresh (only after re-curating `crates/app/data/imagine_table.json`):
+Usage:
 
-    python3 scripts/gen-imagine-table.py && cargo fmt -p ShinraMeter-BPSR
+    python3 scripts/gen-imagine-table.py          # regenerate from the vendored JSON
+    python3 scripts/gen-imagine-table.py --check  # offline: fail if imagines.rs is stale
+
+Refresh only after re-curating `crates/app/data/imagine_table.json`, and run
+`cargo fmt -p ShinraMeter-BPSR` after a regeneration. There is no `--refresh`
+counterpart to `scripts/gen-name-tables.py`'s: this generator has no networked
+upstream: its inputs are the committed curated JSON and the committed PNGs.
+`.github/workflows/name-tables.yml` runs `--check` so the generated file cannot
+rot silently.
 """
 
+import argparse
 import io
 import json
 import pathlib
+import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DATA = ROOT / "crates" / "app" / "data" / "imagine_table.json"
@@ -37,10 +47,11 @@ HEADER = """//! Static Imagine skill-id -> `(name, icon)` table, and the embedde
 //! `crates/app/data/imagine_table.json`, itself derived from the game
 //! client via BPSR-ZDPS; see `THIRD_PARTY_NOTICES.md`. Do not edit by hand.
 //!
-//! // IMAGINE-TAKEDOWN: one of five sites — see `docs/plans/*imagines-plan.md`
+//! // IMAGINE-TAKEDOWN: not one of the five marked sites — this module is
+//! // removed via `rm`, not edited in place. See `docs/plans/*imagines-plan.md`
 //! // D4. Takedown removes this module, `crates/app/assets/imagines/`,
 //! // `crates/app/data/imagine_table.json`, `scripts/prep-imagine-icons.py`,
-//! // `scripts/gen-imagine-table.py`, and the other four marked sites.
+//! // `scripts/gen-imagine-table.py`, and the five marked sites.
 //!
 //! Coverage is a hand-curated allowlist, not every skill id in the game —
 //! an id outside the 106 curated Imagines yields `None` from
@@ -91,6 +102,17 @@ def _self_test() -> None:
     # Order: backslash-escaping must not re-escape a literal `\r` that was
     # already produced for a real carriage return.
     assert esc("\\\r") == "\\\\\\r"
+
+    # rustfmt-shape replication: the inline/broken-out decision is made on the
+    # joined element list, and the broken-out form carries a trailing comma.
+    # Getting either wrong makes `--check` permanently red against a
+    # `cargo fmt`-clean file, which is the failure mode this pair exists to
+    # avoid.
+    assert _fits(["a", "bb"], 5)  # "a, bb" is exactly the budget
+    assert not _fits(["a", "bb"], 4)
+    assert _fits([], 0)
+    assert _broken_out("    ", ["x", "y"]) == "        x,\n        y,\n"
+    assert _broken_out("", []) == ""
 
     # canonical_name_by_icon: happy path — the 39xx canonical rows win,
     # non-canonical rows (e.g. a 102xxx variant sharing the same icon) are
@@ -187,6 +209,29 @@ def resolve_canonical_names(entries: list[dict], canonical: dict[str, str]) -> d
     return resolved
 
 
+# rustfmt's own wrapping rules, replicated here so `render()` emits byte-for-byte
+# what `cargo fmt` would produce. Without this the generated file and the
+# committed file could only ever agree after a `cargo fmt` pass, and `--check`
+# would need a Rust toolchain it deliberately does not have — the same reason
+# `scripts/gen-name-tables.py` reproduces rustfmt's array packing in
+# `_BOSS_IDS_LINE_WIDTH`. Both numbers are rustfmt defaults (`fn_call_width` is
+# the budget a tuple literal's element list gets before rustfmt breaks it one
+# element per line; `struct_lit_width` is the same budget for a struct
+# literal's fields), and this repo ships no `rustfmt.toml` overriding them.
+_FN_CALL_WIDTH = 60
+_STRUCT_LIT_WIDTH = 18
+
+
+def _fits(items: list[str], budget: int) -> bool:
+    """Whether rustfmt would keep `items` inline inside their delimiters."""
+    return len(", ".join(items)) <= budget
+
+
+def _broken_out(indent: str, items: list[str]) -> str:
+    """rustfmt's broken-out form: one element per line, each trailing-comma'd."""
+    return "".join(f"{indent}    {item},\n" for item in items)
+
+
 def emit_lookup(out: io.StringIO, entries: list[dict], canonical_name_of_id: dict[int, str]) -> None:
     out.write(
         "\n/// One equippable Imagine's display data.\n"
@@ -216,10 +261,15 @@ def emit_lookup(out: io.StringIO, entries: list[dict], canonical_name_of_id: dic
         "    Some(match id {\n"
     )
     for e in sorted(entries, key=lambda e: e["id"]):
-        out.write(
-            '        %d => Imagine { name: "%s", icon: "%s" },\n'
-            % (e["id"], esc(canonical_name_of_id[e["id"]]), esc(e["icon"]))
-        )
+        fields = [
+            'name: "%s"' % esc(canonical_name_of_id[e["id"]]),
+            'icon: "%s"' % esc(e["icon"]),
+        ]
+        head = "        %d => Imagine" % e["id"]
+        if _fits(fields, _STRUCT_LIT_WIDTH):
+            out.write("%s { %s },\n" % (head, ", ".join(fields)))
+        else:
+            out.write("%s {\n%s        },\n" % (head, _broken_out("        ", fields)))
     out.write("        _ => return None,\n    })\n}\n")
 
 
@@ -234,10 +284,14 @@ def emit_icon_bytes(out: io.StringIO, icons: list[str]) -> None:
         "pub const IMAGINE_ICON_BYTES: &[(&str, &[u8])] = &[\n"
     )
     for icon in sorted(icons):
-        out.write(
-            '    ("%s", include_bytes!("../assets/imagines/%s.png")),\n'
-            % (esc(icon), icon)
-        )
+        items = [
+            '"%s"' % esc(icon),
+            'include_bytes!("../assets/imagines/%s.png")' % icon,
+        ]
+        if _fits(items, _FN_CALL_WIDTH):
+            out.write("    (%s),\n" % ", ".join(items))
+        else:
+            out.write("    (\n%s    ),\n" % _broken_out("    ", items))
     out.write("];\n")
 
 
@@ -323,7 +377,16 @@ mod tests {
         // Every spec-excluded id (docs/specs/2026-08-17-issue-33-imagines-spec.md
         // "Curation") plus an arbitrary id that was never in SkillTable.json.
         for id in [
-            3000, 3601, 706103, 4310, 102659, 2350, 2351, 2900270, 2900370, 2900570,
+            3000,
+            3601,
+            706103,
+            4310,
+            102659,
+            2350,
+            2351,
+            2900270,
+            2900370,
+            2900570,
             999_999_999,
         ] {
             assert_eq!(imagine_of_skill_id(id), None);
@@ -336,15 +399,22 @@ mod tests {
 def emit_all_entries(out: io.StringIO, entries: list[dict]) -> None:
     out.write(FOOTER_HEADER)
     for e in sorted(entries, key=lambda e: e["id"]):
-        out.write('    (%d, "%s", "%s"),\n' % (e["id"], esc(e["name"]), esc(e["icon"])))
+        items = ["%d" % e["id"], '"%s"' % esc(e["name"]), '"%s"' % esc(e["icon"])]
+        if _fits(items, _FN_CALL_WIDTH):
+            out.write("    (%s),\n" % ", ".join(items))
+        else:
+            out.write("    (\n%s    ),\n" % _broken_out("    ", items))
     out.write("];\n")
     out.write(FOOTER_TAIL)
 
 
-def main() -> None:
-    _self_test()
+def render() -> str:
+    """Build the full text of `imagines.rs` from the vendored JSON and assets.
 
-    table = json.loads(DATA.read_text())
+    Every pre-emit invariant lives here rather than on the write path, so
+    `--check` enforces exactly the same refusals a regeneration would.
+    """
+    table = json.loads(DATA.read_text(encoding="utf-8"))
     entries = table["imagines"]
     counts = table["_counts"]
 
@@ -404,11 +474,38 @@ def main() -> None:
     emit_lookup(out, entries, canonical_name_of_id)
     emit_icon_bytes(out, sorted(distinct_icons))
     emit_all_entries(out, entries)
-    OUT.write_text(out.getvalue())
     print(
-        f"wrote {OUT}: {len(entries)} imagines, {len(distinct_names)} distinct raw names, "
-        f"{len(distinct_icons)} distinct icons, {len(canonical_by_icon)} canonical names"
+        f"{len(entries)} imagines, {len(distinct_names)} distinct raw names, "
+        f"{len(distinct_icons)} distinct icons, {len(canonical_by_icon)} canonical names",
+        file=sys.stderr,
     )
+    return out.getvalue()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="write nothing; exit 1 if the generated file is out of date",
+    )
+    args = parser.parse_args()
+
+    _self_test()
+
+    rendered = render()
+    if args.check:
+        current = OUT.read_text(encoding="utf-8") if OUT.exists() else None
+        if current != rendered:
+            was = "missing" if current is None else f"{len(current)} chars"
+            print(f"DRIFT: {OUT} is out of date ({was} on disk, {len(rendered)} chars generated)")
+            print("\nrun `python3 scripts/gen-imagine-table.py` and commit the result")
+            sys.exit(1)
+        print("imagine table is up to date")
+        return
+
+    OUT.write_text(rendered, encoding="utf-8")
+    print(f"wrote {OUT}")
 
 
 if __name__ == "__main__":

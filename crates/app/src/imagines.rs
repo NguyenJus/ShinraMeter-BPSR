@@ -5,10 +5,11 @@
 //! `crates/app/data/imagine_table.json`, itself derived from the game
 //! client via BPSR-ZDPS; see `THIRD_PARTY_NOTICES.md`. Do not edit by hand.
 //!
-//! // IMAGINE-TAKEDOWN: one of five sites — see `docs/plans/*imagines-plan.md`
+//! // IMAGINE-TAKEDOWN: not one of the five marked sites — this module is
+//! // removed via `rm`, not edited in place. See `docs/plans/*imagines-plan.md`
 //! // D4. Takedown removes this module, `crates/app/assets/imagines/`,
 //! // `crates/app/data/imagine_table.json`, `scripts/prep-imagine-icons.py`,
-//! // `scripts/gen-imagine-table.py`, and the other four marked sites.
+//! // `scripts/gen-imagine-table.py`, and the five marked sites.
 //!
 //! Coverage is a hand-curated allowlist, not every skill id in the game —
 //! an id outside the 106 curated Imagines yields `None` from

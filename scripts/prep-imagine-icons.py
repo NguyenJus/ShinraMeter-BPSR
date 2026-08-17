@@ -8,7 +8,7 @@ refresh or extend the icon set, then commit the regenerated PNGs.
 The sources are the Imagine skill icons committed in the BPSR-ZDPS reference
 tracker. They are game-client-derived assets — see `THIRD_PARTY_NOTICES.md` for
 the basis on which this project redistributes them, and note that only the icons
-actually referenced by `crates/app/data/imagines.json` are copied, so the
+actually referenced by `crates/app/data/imagine_table.json` are copied, so the
 redistributed set stays as small as the feature needs.
 
 To refresh:
@@ -36,7 +36,7 @@ import sys
 from PIL import Image, ImageChops, ImageDraw
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-TABLE = ROOT / "crates" / "app" / "data" / "imagines.json"
+TABLE = ROOT / "crates" / "app" / "data" / "imagine_table.json"
 OUT = ROOT / "crates" / "app" / "assets" / "imagines"
 
 # Rendered at 14pt (see `IMAGINE_ICON_SIZE` in `crates/app/src/ui.rs`); 48px
