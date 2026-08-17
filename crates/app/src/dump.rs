@@ -62,6 +62,18 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use serde::Serialize;
 
+use crate::logging::{rotated_path, should_rotate};
+
+/// A dump file at or above this size gets rotated to `<path>.1` (replacing
+/// any previous `.1`), the same threshold and one-previous-file scheme as
+/// `crate::logging`'s log-file rotation (`should_rotate`/`rotated_path` are
+/// shared, not reimplemented) — now that inspection runs by default rather
+/// than opt-in (issue #87), the dump needs the same cap that keeps the log
+/// file from growing unbounded. Checked both at startup (a pre-existing
+/// oversized file from a prior run) and continuously while the writer thread
+/// runs, mirroring `logging::Tee`.
+const MAX_DUMP_BYTES: u64 = 5 * 1024 * 1024;
+
 /// How many records may queue up ahead of the writer thread. Bounded because
 /// an unbounded channel turns a stalled writer (slow disk, AV scan, a full
 /// volume) into unbounded memory growth behind a capture that never stops
@@ -146,10 +158,17 @@ pub struct DumpWriter {
 impl DumpWriter {
     /// Spawns the dedicated writer thread.
     pub fn spawn(path: PathBuf) -> Self {
+        Self::spawn_with_max_bytes(path, MAX_DUMP_BYTES)
+    }
+
+    /// Like [`spawn`](Self::spawn), but with the rotation threshold
+    /// overridable — only so tests can cross it without writing megabytes of
+    /// records.
+    fn spawn_with_max_bytes(path: PathBuf, max_bytes: u64) -> Self {
         let (tx, rx) = bounded::<Record>(CAPACITY);
         let handle = std::thread::Builder::new()
             .name("inspect-dump-writer".to_string())
-            .spawn(move || run_writer(rx, &path))
+            .spawn(move || run_writer(rx, &path, max_bytes))
             .expect("failed to spawn the inspect-dump-writer thread");
         Self {
             tx: RecordSender::new(tx),
@@ -192,30 +211,80 @@ impl DumpWriter {
 /// receives as one JSONL line, flushing on exit. Never panics: if the file
 /// can't be opened, drains the channel forever instead so senders never
 /// block on a dead writer.
-fn run_writer(rx: Receiver<Record>, path: &Path) {
-    let file = match open(path) {
+///
+/// Also owns rotation: `written` is seeded from the (post-startup-rotation)
+/// file's length and grows with every line, and the file is rotated to
+/// `<path>.1` and reopened empty the moment the running total reaches
+/// `max_bytes` — mirrors `logging::Tee`'s runtime rotation of the log file.
+fn run_writer(rx: Receiver<Record>, path: &Path, max_bytes: u64) {
+    let file = match open(path, max_bytes) {
         Some(f) => f,
         None => {
             while rx.recv().is_ok() {}
             return;
         }
     };
+    let mut written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
     let mut out = BufWriter::new(file);
     while let Ok(record) = rx.recv() {
         let line = Line::from(&record);
-        match serde_json::to_string(&line) {
-            Ok(json) => {
-                if let Err(err) = writeln!(out, "{json}") {
-                    log::warn!("inspect dump write failed: {err}");
+        let json = match serde_json::to_string(&line) {
+            Ok(json) => json,
+            Err(err) => {
+                log::warn!("inspect dump serialize failed: {err}");
+                continue;
+            }
+        };
+        if let Err(err) = writeln!(out, "{json}") {
+            log::warn!("inspect dump write failed: {err}");
+            continue;
+        }
+        written += json.len() as u64 + 1; // +1 for the trailing newline
+        if should_rotate(written, max_bytes) {
+            let _ = out.flush();
+            match rotate(path) {
+                Some(file) => {
+                    out = BufWriter::new(file);
+                    written = 0;
+                }
+                None => {
+                    // Best-effort, like `logging::Tee::rotate`: retried once
+                    // per `max_bytes` rather than on every subsequent record.
                 }
             }
-            Err(err) => log::warn!("inspect dump serialize failed: {err}"),
         }
     }
     let _ = out.flush();
 }
 
-fn open(path: &Path) -> Option<File> {
+/// Renames `path` to `<path>.1` (replacing any previous `.1`) and reopens
+/// `path` empty. `None` on failure, already logged.
+fn rotate(path: &Path) -> Option<File> {
+    let rotated = rotated_path(path);
+    if let Err(err) = fs::rename(path, &rotated) {
+        log::warn!(
+            "failed to rotate inspect dump {} to {} ({err}); continuing without rotation",
+            path.display(),
+            rotated.display()
+        );
+        return None;
+    }
+    match fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(f) => Some(f),
+        Err(err) => {
+            log::warn!(
+                "failed to reopen inspect dump file {} after rotation: {err}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Opens (or creates) the dump file for appending, first rotating it away if
+/// it's already at or above `max_bytes` from a previous run — mirrors
+/// `logging::init`'s startup rotation check.
+fn open(path: &Path, max_bytes: u64) -> Option<File> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
         && let Err(err) = fs::create_dir_all(parent)
@@ -225,6 +294,15 @@ fn open(path: &Path) -> Option<File> {
             parent.display()
         );
         return None;
+    }
+    if let Some(len) = fs::metadata(path).ok().map(|meta| meta.len())
+        && should_rotate(len, max_bytes)
+        && let Err(err) = fs::rename(path, rotated_path(path))
+    {
+        log::warn!(
+            "failed to rotate pre-existing inspect dump {} ({err}); continuing without rotation",
+            path.display()
+        );
     }
     match fs::OpenOptions::new().create(true).append(true).open(path) {
         Ok(f) => Some(f),
@@ -371,5 +449,106 @@ mod tests {
         drop(extra);
         writer.shutdown();
         let _ = fs::remove_file(&path);
+    }
+
+    // -- rotation (issue #87: no longer opt-in, so the dump needs the same
+    // fixed-size, one-previous-file cap as `crate::logging`) ---------------
+
+    fn line_len(record: &Record) -> u64 {
+        serde_json::to_string(&Line::from(record)).unwrap().len() as u64 + 1
+    }
+
+    /// The threshold is crossed by a running writer thread, not just found
+    /// crossed at startup — mirrors `logging::Tee`'s same requirement for a
+    /// long-lived process.
+    #[test]
+    fn writer_rotates_when_the_running_total_crosses_the_threshold() {
+        let path = temp_path("rotate");
+        let rotated = crate::logging::rotated_path(&path);
+        let record1 = Record {
+            ts_ms: 1,
+            service_uuid: 0xAB,
+            method_id: 2,
+            payload: vec![0xDE, 0xAD],
+            payload_decoded: true,
+        };
+        let record2 = Record {
+            ts_ms: 2,
+            service_uuid: 0xCD,
+            method_id: 3,
+            payload: vec![],
+            payload_decoded: false,
+        };
+        let max_bytes = line_len(&record1) + line_len(&record2);
+
+        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes);
+        writer.sender().send(record1);
+        writer.sender().send(record2);
+        writer.shutdown();
+
+        let rotated_contents = fs::read_to_string(&rotated).expect("rotated file should exist");
+        assert_eq!(rotated_contents.lines().count(), 2);
+        assert_eq!(
+            fs::read_to_string(&path).expect("path should be reopened empty"),
+            ""
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&rotated);
+    }
+
+    /// The file is opened in append mode, so a previous session's records
+    /// count toward the threshold too — mirrors
+    /// `logging::tee_seeds_its_count_from_the_file_it_appends_to`.
+    #[test]
+    fn writer_seeds_its_running_total_from_an_existing_dump_file() {
+        let path = temp_path("seed");
+        let rotated = crate::logging::rotated_path(&path);
+        fs::write(&path, b"previous-session-line\n").unwrap();
+        let existing_len = fs::metadata(&path).unwrap().len();
+
+        let record = Record {
+            ts_ms: 1,
+            service_uuid: 1,
+            method_id: 1,
+            payload: vec![],
+            payload_decoded: true,
+        };
+        let max_bytes = existing_len + line_len(&record);
+
+        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes);
+        writer.sender().send(record);
+        writer.shutdown();
+
+        let rotated_contents = fs::read(&rotated).expect("rotated file should exist");
+        assert!(rotated_contents.starts_with(b"previous-session-line\n"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("path should be reopened empty"),
+            ""
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&rotated);
+    }
+
+    /// A dump file already at or above the threshold at process start is
+    /// rotated before the first record is ever written to it.
+    #[test]
+    fn writer_rotates_a_pre_existing_oversized_file_at_startup() {
+        let path = temp_path("startup-rotate");
+        let rotated = crate::logging::rotated_path(&path);
+        fs::write(&path, b"stale-oversized-content").unwrap();
+        let max_bytes = fs::metadata(&path).unwrap().len();
+
+        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes);
+        writer.shutdown();
+
+        assert_eq!(
+            fs::read(&rotated).expect("rotated file should exist"),
+            b"stale-oversized-content"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&rotated);
     }
 }

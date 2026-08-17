@@ -1,8 +1,9 @@
 # Packet inspection: in-game confirmation procedure
 
-Issue #25 built the observation tooling (opt-in diagnostic mode, unrecognized
-service/method id logging, unknown attr id logging, and a raw frame dump for
-offline replay). That tooling only makes observation *possible* — turning an
+Issue #25 built the observation tooling (diagnostic mode — on by default since
+issue #87, opt out with `SHINRA_INSPECT=0` — unrecognized service/method id
+logging, unknown attr id logging, and a raw frame dump for offline replay).
+That tooling only makes observation *possible* — turning an
 observation into a confirmed constant still requires a deliberate procedure
 against live game traffic on a Windows box running `ShinraMeter-BPSR`. This is
 that procedure. It has not been run yet (no Windows box was available while
