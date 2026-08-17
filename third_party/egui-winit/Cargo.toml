@@ -19,8 +19,11 @@
 # both of which keep upstream's code upstream's, exactly what makes re-vendoring
 # the next version a copy instead of a merge.
 #
-# Upstream is MIT OR Apache-2.0; that license text lives in the egui repository
-# (https://github.com/emilk/egui) rather than being duplicated here.
+# Upstream is MIT OR Apache-2.0. Because this copy is redistributed inside the
+# executable, both license texts are copied here verbatim from the egui
+# repository (https://github.com/emilk/egui, tag 0.36.1) as `LICENSE-MIT` and
+# `LICENSE-APACHE` — the registry tarball omits them, since upstream's `include`
+# points at `../../LICENSE-*`. See `THIRD_PARTY_NOTICES.md`.
 
 [package]
 edition = "2024"
