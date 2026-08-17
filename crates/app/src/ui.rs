@@ -6524,7 +6524,7 @@ mod tests {
     #[test]
     fn class_icons_get_is_defined_for_every_class_including_unknown() {
         let ctx = egui::Context::default();
-        let icons = ClassIcons::load(&ctx);
+        let icons = ClassIcons::load_from(&ctx, assets::root().0.as_deref());
 
         for class in [
             Class::Stormblade,

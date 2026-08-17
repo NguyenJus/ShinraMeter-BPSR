@@ -27,7 +27,6 @@
 //! basenames generated in `crate::imagines` rather than a closed key enum —
 //! see its doc comment.
 
-use crate::assets;
 use crate::imagines;
 use bpsr_meter::Class;
 use eframe::egui;
@@ -185,15 +184,6 @@ impl<K: Copy + PartialEq> IconSet<K> {
 pub struct ClassIcons(IconSet<Class>);
 
 impl ClassIcons {
-    /// Resolves the asset root via `assets::root()` and loads from it. The
-    /// sole production call site (`ui.rs`'s `Icons::load`) instead calls
-    /// `load_from` directly so it can resolve the root once and share it
-    /// with `ImagineIcons`; this wrapper exists for callers (tests, and any
-    /// future one-off) that don't need that sharing.
-    pub fn load(ctx: &egui::Context) -> Self {
-        Self::load_from(ctx, assets::root().0.as_deref())
-    }
-
     /// Reads each `LOADABLE_CLASSES` entry's PNG from `<root>/classes/`,
     /// decodes, and uploads a texture for it — skipping (and `log::warn!`ing
     /// the class and the full path for) any file that fails to read.
@@ -415,15 +405,6 @@ impl GlyphIcons {
 pub struct ImagineIcons(IconSet<&'static str>);
 
 impl ImagineIcons {
-    /// Resolves the asset root via `assets::root()` and loads from it. The
-    /// sole production call site (`ui.rs`'s `Icons::load`) instead calls
-    /// `load_from` directly so it can resolve the root once and share it
-    /// with `ClassIcons`; this wrapper exists for callers (tests, and any
-    /// future one-off) that don't need that sharing.
-    pub fn load(ctx: &egui::Context) -> Self {
-        Self::load_from(ctx, assets::root().0.as_deref())
-    }
-
     /// Reads each `IMAGINE_ICON_FILES` basename's PNG from
     /// `<root>/imagines/`, decodes, and uploads a texture for it —
     /// skipping (and `log::warn!`ing the basename and the full path for)
@@ -482,6 +463,7 @@ impl ImagineIcons {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assets;
 
     // -- asset root guard (issue #103) --------------------------------------
     //
@@ -545,7 +527,7 @@ mod tests {
     #[test]
     fn class_icons_get_is_defined_for_every_loadable_class() {
         let ctx = egui::Context::default();
-        let icons = ClassIcons::load(&ctx);
+        let icons = ClassIcons::load_from(&ctx, assets::root().0.as_deref());
         for &class in LOADABLE_CLASSES {
             assert!(
                 icons.get(class).is_some(),
@@ -791,7 +773,7 @@ mod tests {
     #[test]
     fn imagine_icons_get_is_defined_for_every_icon_file() {
         let ctx = egui::Context::default();
-        let icons = ImagineIcons::load(&ctx);
+        let icons = ImagineIcons::load_from(&ctx, assets::root().0.as_deref());
         for &basename in imagines::IMAGINE_ICON_FILES {
             assert!(
                 icons.get(basename).is_some(),
