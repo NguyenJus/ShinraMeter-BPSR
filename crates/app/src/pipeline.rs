@@ -814,10 +814,7 @@ mod tests {
         fn more_than_two_known_imagines_truncates_to_the_first_two() {
             // 3905, 3926, and a third distinct Imagine (3901) — only the
             // first two distinct Imagines seen should occupy slots.
-            assert_eq!(
-                imagine_slots(&[3905, 3926, 3901]),
-                [Some(3905), Some(3926)]
-            );
+            assert_eq!(imagine_slots(&[3905, 3926, 3901]), [Some(3905), Some(3926)]);
         }
 
         #[test]
