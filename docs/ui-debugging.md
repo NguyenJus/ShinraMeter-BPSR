@@ -53,6 +53,30 @@ The channel is a directory watcher, not a service: it polls `<root>\in` for
 are retained under `<root>\done`, so the entire elevated surface of a session is
 auditable after the fact.
 
+### Trust boundary
+
+**The inbox is the credential.** There is no authentication and no origin
+check: any `.ps1` that appears in `<root>\in` is executed as Administrator, so
+write access to the working directory *is* the ability to run code as
+Administrator. Everything else about the channel follows from that.
+
+The server therefore creates `<root>` and its subdirectories with an explicit
+**protected** ACL — inheritance disabled, full control granted to
+Administrators, SYSTEM and the invoking user, and nobody else — and repairs an
+existing directory the same way. It then re-reads the ACL that actually stuck
+and refuses to start, with the offending principal named, if the directory is
+owned by or writable by anyone outside that set. (An owner keeps the implicit
+right to rewrite the ACL, so an untrusted owner is fatal even when the ACL
+itself looks correct.)
+
+That check exists because the default `C:\temp\shinra-uidbg` inherits `C:\temp`'s
+permissions, which on many machines let any local account write. If you override
+`-Root` / `SHINRA_UIDBG_DIR`, pick a path only your account can write to; a
+share, a world-writable temp directory, or anything another user can reach turns
+the harness into a local privilege-escalation channel. Stop the server when you
+are done with the session — it is a debugging tool, not something to leave
+running.
+
 ### Working directory and exe location
 
 Nothing is hardcoded to one machine's `C:\temp`:

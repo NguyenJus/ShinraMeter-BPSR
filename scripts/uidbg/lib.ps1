@@ -689,10 +689,11 @@ function Start-App {
       Launch the deployed exe and wait for its main window.
 
       -EnvVars takes a hashtable of environment overrides applied to this
-      PowerShell process before Start-Process, which the child inherits. The
-      useful ones are RUST_LOG (the app's env_logger filter) and the WGPU_*
-      backend overrides -- WGPU_BACKEND=gl / dx12 / vulkan and
-      WGPU_POWER_PREF -- for isolating a rendering defect to one backend.
+      PowerShell process just long enough for Start-Process to hand them to the
+      child, then restored. The useful ones are RUST_LOG (the app's env_logger
+      filter) and the WGPU_* backend overrides -- WGPU_BACKEND=gl / dx12 /
+      vulkan and WGPU_POWER_PREF -- for isolating a rendering defect to one
+      backend.
     #>
     param(
         [hashtable]$EnvVars = @{},
@@ -708,13 +709,31 @@ function Start-App {
 
     [void](Stop-App)
 
+    # GOTCHA (issue #88): the ctl server is ONE long-lived elevated host that
+    # runs every job in the same process, so a bare `Set-Item Env:...` here is
+    # not scoped to this launch -- it is a permanent mutation of the server.
+    # A single `-RustLog debug` would silently keep RUST_LOG=debug set for every
+    # later launch that asked for no logging at all. Save the prior value,
+    # restore it in a finally so a throw cannot leak it either. $null from
+    # GetEnvironmentVariable means "was not set", and SetEnvironmentVariable
+    # with $null removes the variable -- which is distinct from setting it to ''.
     $applied = @()
+    $saved = @{}
     foreach ($k in $EnvVars.Keys) {
+        $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process')
         Set-Item -Path "Env:$k" -Value $EnvVars[$k]
         $applied += ('{0}={1}' -f $k, $EnvVars[$k])
     }
 
-    Start-Process -FilePath $Exe -WorkingDirectory (Split-Path -Parent $Exe)
+    try {
+        # The child inherits the environment at creation, so the restore below
+        # is safe the instant Start-Process returns.
+        Start-Process -FilePath $Exe -WorkingDirectory (Split-Path -Parent $Exe)
+    } finally {
+        foreach ($k in @($saved.Keys)) {
+            [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process')
+        }
+    }
 
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
     while ([DateTime]::UtcNow -lt $deadline) {

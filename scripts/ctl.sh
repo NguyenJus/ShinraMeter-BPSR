@@ -40,7 +40,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UIDBG_DIR="$REPO_ROOT/scripts/uidbg"
 
 TIMEOUT_S=120
+# Whether -c was given is tracked separately from its value: `-c ''` is a
+# legitimate (no-op) job, and testing the value alone would make it look like -c
+# was omitted and send us to `cat`, blocking on stdin outside the timeout loop.
 INLINE=""
+INLINE_SET=0
 PREPEND_LIB=1
 KEEP=0
 MODE="job"
@@ -56,7 +60,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --serve-cmd)  MODE="serve-cmd"; shift ;;
     --wait-ready) MODE="wait-ready"; shift ;;
-    -c)           INLINE="${2:-}"; shift 2 ;;
+    -c)           INLINE="${2:-}"; INLINE_SET=1; shift 2 ;;
     --raw)        PREPEND_LIB=0; shift ;;
     --keep)       KEEP=1; shift ;;
     --timeout)    TIMEOUT_S="${2:-}"; shift 2 ;;
@@ -122,7 +126,7 @@ trap 'rm -f "$tmp_file"' EXIT
       printf " '%s'" "${a//\'/\'\'}"
     done
     printf '\n'
-  elif [ -n "$INLINE" ]; then
+  elif [ "$INLINE_SET" -eq 1 ]; then
     printf '%s\n' "$INLINE"
   else
     cat
