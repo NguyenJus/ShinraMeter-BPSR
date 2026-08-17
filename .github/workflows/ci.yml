@@ -66,11 +66,16 @@ jobs:
           name: ShinraMeter-BPSR-windows-x64
           path: target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe
 
-  # Host-target tests for the pure crates. The app crate is egui/eframe and
-  # would drag in Linux GUI system deps, so it is excluded.
+  # Host-target tests for the whole workspace, app crate included. The app
+  # crate used to be excluded on the assumption that egui/eframe would drag in
+  # Linux GUI system deps; it does not — winit, wgpu and arboard all reach
+  # their X11/Wayland libraries through `dlopen`, so the test binary links
+  # against libc alone and its tests (which never open a window) run headless.
+  # Excluding it left every `#[cfg(test)]` module in the app crate untested,
+  # including the issue #89 window-composition decision.
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --exclude ShinraMeter-BPSR
+      - run: cargo test --workspace

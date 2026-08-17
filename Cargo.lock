@@ -14,10 +14,12 @@ dependencies = [
  "crossbeam-channel",
  "eframe",
  "egui",
+ "egui-winit",
  "embed-resource",
  "env_logger",
  "image",
  "log",
+ "pollster",
  "raw-window-handle",
  "serde",
  "serde_json",
@@ -1030,8 +1032,6 @@ dependencies = [
 [[package]]
 name = "egui-winit"
 version = "0.36.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9327fc8edef2c57db9bcbcacc82c8a4b1e8cc64cd41a67db4419dcf643d88c83"
 dependencies = [
  "accesskit_winit",
  "arboard",
