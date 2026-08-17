@@ -285,6 +285,27 @@ fn demo_snapshot() -> Snapshot {
     }
 }
 
+/// The snapshot `OverlayApp::new` seeds itself with: `demo_snapshot()` when
+/// demo mode is on, otherwise the ordinary empty "No target" state. Split out
+/// from `new` itself — which otherwise cannot be unit-tested for this without
+/// mutating the process's `SHINRA_DEMO` env var (racy across the crate's
+/// parallel test threads, and `unsafe` as of the 2024 edition) — so the
+/// seeding decision is directly testable, the same way `demo_enabled_from`
+/// is split out from `demo_enabled`.
+fn initial_snapshot(demo_mode: bool) -> Snapshot {
+    if demo_mode {
+        demo_snapshot()
+    } else {
+        Snapshot {
+            duration_ms: 0,
+            total_damage: 0,
+            total_dps: 0.0,
+            rows: Vec::new(),
+            encounter: EncounterInfo::default(),
+        }
+    }
+}
+
 impl OverlayApp {
     /// `settings` is loaded by the caller (`main.rs`) rather than via
     /// `settings::load()` in here, because issue #27 needs the same loaded
@@ -302,17 +323,7 @@ impl OverlayApp {
         // here rather than re-called, so `ui()` below can reuse the same
         // answer every frame instead of re-reading the env var.
         let demo_mode = demo_enabled();
-        let snapshot = if demo_mode {
-            demo_snapshot()
-        } else {
-            Snapshot {
-                duration_ms: 0,
-                total_damage: 0,
-                total_dps: 0.0,
-                rows: Vec::new(),
-                encounter: EncounterInfo::default(),
-            }
-        };
+        let snapshot = initial_snapshot(demo_mode);
         Self {
             snapshot,
             status: StatusLine::Ok,
@@ -332,6 +343,20 @@ impl OverlayApp {
         self.status = status;
         self
     }
+
+    /// Drains `rx_snapshot`, keeping only the most recent snapshot. Demo
+    /// mode's snapshot is synthetic, not a stand-in for "no live data yet" —
+    /// draining here would replace it with the pipeline's real (empty,
+    /// game-not-running) snapshots every frame, which is exactly the bug
+    /// this skip avoids. Split out of `ui()` so the guard is unit-testable
+    /// without an `egui::Context`.
+    fn drain_snapshots(&mut self) {
+        if !self.demo_mode {
+            for snap in self.rx_snapshot.try_iter() {
+                self.snapshot = snap;
+            }
+        }
+    }
 }
 
 impl eframe::App for OverlayApp {
@@ -340,16 +365,7 @@ impl eframe::App for OverlayApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Drain the channel, keeping only the most recent snapshot. Demo
-        // mode's snapshot is synthetic, not a stand-in for "no live data
-        // yet" — draining here would replace it with the pipeline's real
-        // (empty, game-not-running) snapshots every frame, which is exactly
-        // the bug this skip avoids.
-        if !self.demo_mode {
-            for snap in self.rx_snapshot.try_iter() {
-                self.snapshot = snap;
-            }
-        }
+        self.drain_snapshots();
 
         let ctx = ui.ctx().clone();
         apply_theme(&ctx);
@@ -3547,6 +3563,69 @@ mod tests {
     #[test]
     fn demo_enabled_from_garbage_is_off() {
         assert!(!demo_enabled_from(Some("banana")));
+    }
+
+    // -- initial_snapshot / drain_snapshots (issue #91 demo mode) -----------
+
+    /// `OverlayApp::new` seeds a real-looking encounter from `demo_snapshot`
+    /// when demo mode is on, not the ordinary empty "No target" state — the
+    /// whole point of `SHINRA_DEMO` is a populated header to capture.
+    #[test]
+    fn initial_snapshot_seeds_the_demo_encounter_when_demo_mode_is_on() {
+        let snapshot = initial_snapshot(true);
+        assert!(!snapshot.rows.is_empty(), "demo mode must seed player rows");
+        assert_eq!(snapshot.encounter.boss_name, Some("Bahaar"));
+    }
+
+    /// Without demo mode, a fresh `OverlayApp` starts on the ordinary empty
+    /// state — no rows, no resolved boss — matching a game that has not
+    /// reported an encounter yet.
+    #[test]
+    fn initial_snapshot_is_empty_when_demo_mode_is_off() {
+        let snapshot = initial_snapshot(false);
+        assert!(snapshot.rows.is_empty());
+        assert_eq!(snapshot.encounter.boss_name, None);
+    }
+
+    /// The regression this guards: a future refactor that deletes or
+    /// inverts `drain_snapshots`'s `if !self.demo_mode` check would compile
+    /// and pass every other test while silently clobbering demo mode's
+    /// synthetic capture with the pipeline's real (empty, game-not-running)
+    /// snapshot the moment one arrives on the channel.
+    #[test]
+    fn drain_snapshots_leaves_the_demo_snapshot_intact_when_demo_mode_is_on() {
+        let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(rx_snapshot, tx_command, tx_settings, Settings::default());
+        app.demo_mode = true;
+        app.snapshot = demo_snapshot();
+
+        tx_snapshot.send(rows_test_snapshot(2)).unwrap();
+        app.drain_snapshots();
+
+        assert_eq!(
+            app.snapshot.encounter.boss_name,
+            Some("Bahaar"),
+            "a real snapshot arriving on the channel must not clobber demo mode's capture"
+        );
+    }
+
+    /// The mirror of the test above: outside demo mode, a real snapshot on
+    /// the channel must still win, or the overlay would never leave "No
+    /// target" once a real encounter starts.
+    #[test]
+    fn drain_snapshots_replaces_the_snapshot_when_demo_mode_is_off() {
+        let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(rx_snapshot, tx_command, tx_settings, Settings::default());
+        app.demo_mode = false;
+
+        tx_snapshot.send(rows_test_snapshot(2)).unwrap();
+        app.drain_snapshots();
+
+        assert_eq!(app.snapshot.rows.len(), 2);
     }
 
     #[test]
