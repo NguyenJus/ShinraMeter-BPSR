@@ -118,6 +118,9 @@ Packet inspection (issue #25, on by default since issue #87) writes every observ
 
 Dumps contain player names and other identifying traffic — never attach one to an issue or PR (see `.gitignore`).
 
+### Demo mode
+The overlay only ever renders real data when the game is running on Windows, which makes header UI work (issue #91) unverifiable on a dev box. Set `SHINRA_DEMO=1` (`true` or `on` also work, case-insensitively) to seed a fixed synthetic encounter instead of "No target", populating the header for visual debugging without a live session. Opt-in and off by default. The seeded values intentionally mirror `docs/reference/new-shinra-ex.webp` so a capture taken with it set can be diffed directly against that reference.
+
 ## License
 
 This project is licensed under the GNU General Public License v3.0
