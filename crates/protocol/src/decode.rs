@@ -221,6 +221,9 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
         // attr-list path only, via `player_info_from_attrs`.
         season_level: None,
         season_strength: None,
+        // Same: no confirmed `CharBaseInfo` field for equipped Imagines
+        // (issue #33) — attr-list path only.
+        skill_ids: Vec::new(),
     }));
 }
 

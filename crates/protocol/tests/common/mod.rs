@@ -120,6 +120,27 @@ pub fn varint_attr(id: i32, value: u64) -> pb::Attr {
     pb::Attr { id, raw_data: raw }
 }
 
+/// Builds an `Attr` carrying `attr_id::SKILL_LEVEL_ID_LIST` (issue #33): a
+/// prost-encoded `SkillLevelIdList` wrapping one `SkillLevelInfo` per id.
+pub fn skill_list_attr(ids: &[i32]) -> pb::Attr {
+    let msg = pb::SkillLevelIdList {
+        skills: ids
+            .iter()
+            .map(|&skill_id| pb::SkillLevelInfo {
+                skill_id,
+                current_level: 1,
+                remodel_level: 0,
+            })
+            .collect(),
+    };
+    let mut raw = Vec::new();
+    msg.encode(&mut raw).unwrap();
+    pb::Attr {
+        id: bpsr_protocol::attrs::attr_id::SKILL_LEVEL_ID_LIST,
+        raw_data: raw,
+    }
+}
+
 /// Builds an `appear` entity for `SyncNearEntities`.
 pub fn appear_entity(uuid: i64, ent_type: i32, attrs: Vec<pb::Attr>) -> pb::Entity {
     pb::Entity {

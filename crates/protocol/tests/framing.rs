@@ -284,6 +284,34 @@ fn zero_season_attrs_yield_no_season_data() {
     }
 }
 
+/// Attr `0x74` (`SKILL_LEVEL_ID_LIST`, issue #33) reaches `PlayerInfo` for an
+/// arbitrary nearby entity, not just the local player — same wiring as
+/// `season_attrs_on_entity_decode_into_player_info` above.
+#[test]
+fn skill_level_id_list_attr_on_entity_decodes_into_player_info() {
+    let player = appear_entity(
+        ATTACKER_UUID,
+        10,
+        vec![common::skill_list_attr(&[3905, 102640, 71000])],
+    );
+    let payload = sync_near_entities_payload(vec![player]);
+    let stream = notify(
+        bpsr_protocol::decode::opcode::SYNC_NEAR_ENTITIES,
+        &payload,
+        false,
+    );
+
+    let mut decoder = Decoder::new();
+    let events = decoder.push_stream(&stream, 1);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ProtocolEvent::Player(p) => {
+            assert_eq!(p.skill_ids, vec![3905, 102640, 71000]);
+        }
+        other => panic!("expected Player, got {other:?}"),
+    }
+}
+
 /// A `SyncToMeDeltaInfo` (opcode `0x2e`) carries the entity's identity on the
 /// *outer* `AoiSyncToMeDelta.uuid`; `base_delta.uuid` is 0. The decoder must
 /// read the outer uuid, otherwise every to-me update decodes as uid 0 /

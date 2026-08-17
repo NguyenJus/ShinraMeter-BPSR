@@ -1,8 +1,14 @@
-name: Name tables
+name: Generated tables
 
 # Issue #36: `crates/meter/src/tables.rs` is generated from JSON vendored under
 # `crates/meter/data/`, and nothing used to notice when either half went stale.
 # Two independent kinds of rot, so two jobs.
+#
+# Issue #33 added a second generated table on the same pattern —
+# `crates/app/src/imagines.rs`, from `crates/app/data/imagine_table.json` plus
+# the PNGs under `crates/app/assets/imagines/` — so the offline job checks it
+# too. It has no upstream half: its inputs are all committed here, and the only
+# rot it can suffer is a hand-edit or a re-curation without a regeneration.
 #
 # A CI job was chosen over a release-checklist note because the first job is the
 # only thing that can catch a hand-edit of a generated file, and a checklist
@@ -25,9 +31,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Offline, and runs on every push and PR: does `tables.rs` still match the
-  # JSON it claims to be generated from? This is what catches someone editing
-  # the generated file by hand, or refreshing the vendored JSON without
+  # Offline, and runs on every push and PR: does each generated file still
+  # match the data it claims to be generated from? This is what catches someone
+  # editing a generated file by hand, or refreshing the vendored JSON without
   # re-running the generator. It needs no network, so it can never flake on
   # a third-party repository being unreachable.
   generated:
@@ -35,6 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: python3 scripts/gen-name-tables.py --check
+      - run: python3 scripts/gen-imagine-table.py --check
 
   # Networked, and deliberately *not* on pull requests: have the vendored
   # copies drifted from their upstream sources? A red run here is the nag that
