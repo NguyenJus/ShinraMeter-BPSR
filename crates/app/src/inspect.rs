@@ -14,8 +14,16 @@
 //!   at `info` level with its method id, payload length, and a truncated
 //!   hex prefix; a running count and first-seen timestamp are kept and
 //!   logged again in a summary when diagnostics shut down (slice A item 1).
-//! - the first time an attr id with no known constant is seen for a given
-//!   entity uid it is logged the same way, keyed by uid (slice A item 3).
+//! - the first time an attr id with no known constant is seen **at all** it
+//!   is logged the same way (slice A item 3). This is keyed by `attr_id`
+//!   alone, *not* by `(uid, attr_id)`: a real session has ~60 distinct
+//!   unknown attr ids but thousands of entities, and keying discovery by uid
+//!   turned "log a new fact" into "log the same ~60 facts once per entity",
+//!   flooding the log file to eviction inside an hour with zero scene/boss
+//!   diagnostics ever surviving (issue #69). Per-attr aggregates (total
+//!   count, distinct uids seen up to a cap, a sample uid, and a sample hex
+//!   prefix) are still kept and logged in the shutdown summary, one line per
+//!   attr id.
 //!
 //! The dump path defaults to `%APPDATA%\ShinraMeter-BPSR\inspect\dump-<pid>.jsonl`
 //! (or `ShinraMeter-BPSR-inspect-dump-<pid>.jsonl` in the working directory if
@@ -25,7 +33,7 @@
 //! Dumps contain player names and other identifying traffic — never attach
 //! one to an issue or PR (see `.gitignore`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +45,15 @@ use crate::dump;
 /// logging, not the dump file (which keeps every byte) — this just keeps
 /// log lines readable.
 const HEX_PREFIX_LEN: usize = 32;
+
+/// How many distinct uids an [`AttrStat`] tracks per attr id before it stops
+/// inserting new ones (issue #69). The exact distinct-uid count past this
+/// point isn't diagnostically interesting — knowing it's "a lot" is enough,
+/// and an unbounded per-attr uid set would itself become an unbounded-memory
+/// version of the same flood problem this whole fix exists to avoid. When
+/// the cap is hit, `AttrStat::uids_saturated` is set so the summary line
+/// says so instead of silently under-reporting.
+const MAX_TRACKED_UIDS_PER_ATTR: usize = 16;
 
 /// True unless `SHINRA_INSPECT` is set to an explicit opt-out value (`0`,
 /// `false`, or `off`, case-insensitively) — diagnostics are on by default.
@@ -128,6 +145,20 @@ struct ServiceStat {
     hex_prefix: String,
 }
 
+/// Per-`attr_id` aggregate (issue #69) — the fix for `attrs`'s old
+/// `(uid, attr_id)` keying, which made "log a new fact" mean "log the same
+/// ~60 facts once per entity". `uids` is capped at
+/// [`MAX_TRACKED_UIDS_PER_ATTR`]; `uids_saturated` says whether the true
+/// distinct-uid count ran past that cap.
+#[derive(Debug, Clone)]
+struct AttrStat {
+    count: u64,
+    uids: HashSet<i64>,
+    uids_saturated: bool,
+    sample_uid: i64,
+    sample_raw_hex: String,
+}
+
 /// The real `InspectSink`: forwards every observation to the dump-writer
 /// channel, and keeps an in-memory tally of unrecognized service ids and
 /// unknown attr ids for the log-on-first-sight-plus-shutdown-summary
@@ -135,7 +166,7 @@ struct ServiceStat {
 struct DiagnosticSink {
     tx: dump::RecordSender,
     services: Mutex<HashMap<u64, ServiceStat>>,
-    attrs: Mutex<HashMap<(i64, i32), u64>>,
+    attrs: Mutex<HashMap<i32, AttrStat>>,
 }
 
 impl DiagnosticSink {
@@ -145,6 +176,31 @@ impl DiagnosticSink {
             services: Mutex::new(HashMap::new()),
             attrs: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Records one observation of `attr_id` on `uid`, updating the per-attr
+    /// aggregate. Returns `true` the first time this `attr_id` is seen at
+    /// all — regardless of `uid` — which is exactly the "new unknown
+    /// attr_id" discovery `on_attr` logs; `false` on every later
+    /// observation. Split out as its own method (rather than inlined in
+    /// `on_attr`) so the discovery decision is directly unit-testable.
+    fn record_attr(&self, uid: i64, attr_id: i32, raw: &[u8]) -> bool {
+        let mut attrs = self.attrs.lock().unwrap();
+        let is_new = !attrs.contains_key(&attr_id);
+        let stat = attrs.entry(attr_id).or_insert_with(|| AttrStat {
+            count: 0,
+            uids: HashSet::new(),
+            uids_saturated: false,
+            sample_uid: uid,
+            sample_raw_hex: hex_prefix(raw),
+        });
+        stat.count += 1;
+        if stat.uids.len() < MAX_TRACKED_UIDS_PER_ATTR {
+            stat.uids.insert(uid);
+        } else if !stat.uids.contains(&uid) {
+            stat.uids_saturated = true;
+        }
+        is_new
     }
 
     fn log_summary(&self) {
@@ -158,10 +214,27 @@ impl DiagnosticSink {
                 stat.hex_prefix,
             );
         }
-        for ((uid, attr_id), count) in self.attrs.lock().unwrap().iter() {
-            log::info!(
-                "packet-inspect summary: unknown attr_id=0x{attr_id:x} uid={uid} count={count}"
-            );
+        // One line per distinct attr_id (issue #69), not per (uid, attr_id)
+        // pair — `attrs` is keyed by `attr_id` alone, so this is already
+        // structurally guaranteed rather than something this loop has to
+        // enforce.
+        for (attr_id, stat) in self.attrs.lock().unwrap().iter() {
+            let uids = stat.uids.len();
+            if stat.uids_saturated {
+                log::info!(
+                    "packet-inspect summary: unknown attr_id=0x{attr_id:x} count={} uids={uids}+ (capped at {MAX_TRACKED_UIDS_PER_ATTR}) sample_uid={} sample_raw_hex={}",
+                    stat.count,
+                    stat.sample_uid,
+                    stat.sample_raw_hex,
+                );
+            } else {
+                log::info!(
+                    "packet-inspect summary: unknown attr_id=0x{attr_id:x} count={} uids={uids} sample_uid={} sample_raw_hex={}",
+                    stat.count,
+                    stat.sample_uid,
+                    stat.sample_raw_hex,
+                );
+            }
         }
     }
 }
@@ -228,10 +301,9 @@ impl InspectSink for DiagnosticSink {
         if known {
             return;
         }
-        let mut attrs = self.attrs.lock().unwrap();
-        let count = attrs.entry((uid, attr_id)).or_insert(0);
-        *count += 1;
-        if *count == 1 {
+        // Logged once per distinct attr_id, not once per (uid, attr_id) —
+        // see the module doc comment and issue #69.
+        if self.record_attr(uid, attr_id, raw) {
             log::info!(
                 "packet-inspect: new unknown attr_id=0x{attr_id:x} uid={uid} raw_hex={}",
                 hex_prefix(raw),
@@ -379,16 +451,78 @@ mod tests {
         assert!(sink.services.lock().unwrap().is_empty());
     }
 
+    /// Was `unknown_attr_is_counted_per_uid_and_attr_id`, asserting a count
+    /// per `(uid, attr_id)` pair — the exact cardinality bug issue #69 fixes.
+    /// Updated to assert the new per-`attr_id` aggregate: one entry keyed by
+    /// `attr_id` alone, with `count` summed across uids and `uids` holding
+    /// the distinct uids seen.
     #[test]
-    fn unknown_attr_is_counted_per_uid_and_attr_id() {
+    fn unknown_attr_is_counted_per_attr_id_across_uids() {
         let (sink, _rx) = new_sink();
         sink.on_attr(5, 0x99, &[1, 2], false);
         sink.on_attr(5, 0x99, &[3], false);
         sink.on_attr(6, 0x99, &[], false);
 
         let attrs = sink.attrs.lock().unwrap();
-        assert_eq!(attrs.get(&(5, 0x99)), Some(&2));
-        assert_eq!(attrs.get(&(6, 0x99)), Some(&1));
+        assert_eq!(attrs.len(), 1);
+        let stat = attrs.get(&0x99).expect("attr 0x99 should be tracked");
+        assert_eq!(stat.count, 3);
+        assert_eq!(stat.uids, std::collections::HashSet::from([5, 6]));
+    }
+
+    /// The interesting discovery is a previously-unseen `attr_id`, not a
+    /// previously-unseen `(uid, attr_id)` pair (issue #69) — `record_attr`
+    /// (what `on_attr` logs on) must return `true` only for the very first
+    /// sighting of a given `attr_id`, even when many different uids follow.
+    #[test]
+    fn record_attr_reports_new_discovery_once_per_attr_id_regardless_of_uid() {
+        let (sink, _rx) = new_sink();
+        assert!(sink.record_attr(5, 0x99, &[1, 2]));
+        assert!(!sink.record_attr(6, 0x99, &[3]));
+        assert!(!sink.record_attr(5, 0x99, &[4]));
+        assert!(sink.record_attr(5, 0x42, &[5]));
+
+        let attrs = sink.attrs.lock().unwrap();
+        let stat = attrs.get(&0x99).unwrap();
+        assert_eq!(stat.count, 3);
+        assert_eq!(stat.uids.len(), 2);
+        assert_eq!(attrs.get(&0x42).unwrap().count, 1);
+    }
+
+    /// `log_summary` iterates `attrs`, which is keyed by `attr_id` alone —
+    /// this proves that map holds one entry per distinct attr id no matter
+    /// how many uids it was observed on, i.e. `log_summary` emits one line
+    /// per attr id rather than per (uid, attr_id) pair (issue #69).
+    #[test]
+    fn attrs_map_has_one_entry_per_attr_id_not_per_uid_attr_pair() {
+        let (sink, _rx) = new_sink();
+        for uid in 0..5 {
+            sink.on_attr(uid, 0x99, &[uid as u8], false);
+        }
+        sink.on_attr(0, 0x42, &[], false);
+
+        let attrs = sink.attrs.lock().unwrap();
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs.get(&0x99).unwrap().count, 5);
+        assert_eq!(attrs.get(&0x42).unwrap().count, 1);
+    }
+
+    /// Distinct-uid tracking is capped (`MAX_TRACKED_UIDS_PER_ATTR`) so an
+    /// attr id seen on thousands of entities can't itself become an
+    /// unbounded-memory version of the flood this fix removes; saturation
+    /// is recorded rather than silently under-reporting.
+    #[test]
+    fn distinct_uid_tracking_is_capped_and_marks_saturation() {
+        let (sink, _rx) = new_sink();
+        for uid in 0..(MAX_TRACKED_UIDS_PER_ATTR as i64 + 3) {
+            sink.record_attr(uid, 0x99, &[]);
+        }
+
+        let attrs = sink.attrs.lock().unwrap();
+        let stat = attrs.get(&0x99).unwrap();
+        assert_eq!(stat.uids.len(), MAX_TRACKED_UIDS_PER_ATTR);
+        assert!(stat.uids_saturated);
+        assert_eq!(stat.count, MAX_TRACKED_UIDS_PER_ATTR as u64 + 3);
     }
 
     #[test]
