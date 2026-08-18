@@ -115,6 +115,33 @@ trap 'rm -f "$tmp_file"' EXIT
 
 {
   if [ "$PREPEND_LIB" -eq 1 ]; then
+    # This invocation's repo root, Windows-visible. The elevated ctl server is
+    # long-lived (started once per session, possibly from a different worktree
+    # than the one calling ctl.sh right now) and PowerShell-side path resolution
+    # (Get-UidbgRepoRoot in lib.ps1) otherwise falls back to deriving the repo
+    # root from wherever lib.ps1 itself was dot-sourced from -- the tree the
+    # server happened to be started against. `app -Action deploy` would then
+    # silently build and deploy from THAT tree instead of the one the caller is
+    # actually sitting in. Every job carries its own submitter's repo root so
+    # deploy always tracks the invoking worktree, not the server's birthplace.
+    # Computed here, not at the top of the script, because it is the only mode
+    # that needs it -- `--serve-cmd` and `--wait-ready` both exit long before
+    # this point.
+    WIN_REPO_ROOT="$(winpath "$REPO_ROOT")"
+    # GOTCHA (mirrors Start-App's RUST_LOG hazard in lib.ps1): the ctl server
+    # is ONE long-lived process and runs every job with `& $job.FullName` in
+    # that same process, not a child process -- `$env:X = ...` is a process-wide
+    # assignment, so setting it bare here would permanently mutate the server
+    # for every later job, including a subsequent --raw job that never means to
+    # inherit it. Save the prior value and restore it in a `finally` so a job
+    # that throws still can't leak it, exactly like Start-App does. Set BEFORE
+    # dot-sourcing the lib: Get-UidbgRepoRoot reads this env var, and ordering
+    # it first keeps the job's intent obvious on re-read. Single-quoted
+    # PowerShell string -- double any embedded quote, same rule as the
+    # app-args quoting below.
+    echo "\$__shinraSavedRepo = [Environment]::GetEnvironmentVariable('SHINRA_UIDBG_REPO', 'Process')"
+    echo "[Environment]::SetEnvironmentVariable('SHINRA_UIDBG_REPO', '${WIN_REPO_ROOT//\'/\'\'}', 'Process')"
+    echo 'try {'
     # The server exports SHINRA_UIDBG_LIB, so a job never hardcodes a path.
     echo '. $env:SHINRA_UIDBG_LIB'
   fi
@@ -138,6 +165,11 @@ trap 'rm -f "$tmp_file"' EXIT
     printf '%s\n' "$INLINE"
   else
     cat
+  fi
+  if [ "$PREPEND_LIB" -eq 1 ]; then
+    echo '} finally {'
+    echo "[Environment]::SetEnvironmentVariable('SHINRA_UIDBG_REPO', \$__shinraSavedRepo, 'Process')"
+    echo '}'
   fi
 } > "$tmp_file"
 
