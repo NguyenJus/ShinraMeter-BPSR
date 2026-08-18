@@ -5630,11 +5630,15 @@ mod tests {
     /// zero-decimal-at-3-digits rule that used to match the header pill's
     /// `188M/s` exactly — issue #118 traded that pixel match for a
     /// consistent significant-figure rule across every magnitude.
+    /// `100_000` pins the 2-decimal/1-decimal band boundary itself (the
+    /// scaled value hits exactly `100`, so `100.0K`, not `100.00K`) —
+    /// nothing else here lands exactly on that threshold.
     #[test]
     fn fmt_short_table() {
-        let cases: [(i64, &str); 8] = [
+        let cases: [(i64, &str); 9] = [
             (999, "999"),
             (1_000, "1.00K"),
+            (100_000, "100.0K"),
             (10_300_000, "10.30M"),
             (17_800_000, "17.80M"),
             (55_300_000, "55.30M"),

@@ -132,10 +132,14 @@ impl ColumnKind {
                 },
                 color: Color32::WHITE,
             },
-            // Issue #118's 2-/1-decimal bands widened `fmt_short`'s worst
-            // case ("99.99M"/"999.9M", 6 chars) past the old "1000K"
-            // (5 chars), same regression as `Dps` below — but this column's
-            // 56.0 already had enough slack (the new worst case measures
+            // Issue #118's 2-/1-decimal bands changed `fmt_short`'s worst
+            // case to "99.99M"/"999.9M" (6 chars) — narrower than the old
+            // always-one-decimal worst case, "1000.0K" (7 chars, rounds
+            // up across a K/M/B threshold), not wider like `Dps` below:
+            // `Damage` always used `fmt_short`, never the old `fmt_dps`,
+            // so there's no "1000K" (5 chars, `fmt_dps`'s own old worst
+            // case) baseline here to widen past. This column's 56.0
+            // already had enough slack (the new worst case measures
             // 43.78125pt, per `widest_formatted_text_fits_its_column_
             // width_budget`) that it still holds without changing.
             ColumnKind::Damage => StatColumn {
