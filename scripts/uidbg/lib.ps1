@@ -676,6 +676,12 @@ function Copy-AppAssets {
       land a working (if icon-less, same as the "asset root not found"
       runtime fallback) exe rather than fail outright over an asset tree that
       e.g. hasn't been generated yet in a fresh checkout.
+
+      A missing source still clears any STALE $dstAssets left by an earlier
+      deploy. `assets::resolve` checks `<exe dir>/assets` before anything
+      else, so leaving an old deployed copy in place while the source is
+      missing would make the app silently keep loading last time's icon set
+      even though this deploy's log says assets are MISSING.
     #>
     param([Parameter(Mandatory = $true)][string]$DstDir)
 
@@ -683,6 +689,18 @@ function Copy-AppAssets {
     $dstAssets = Join-Path $DstDir 'assets'
 
     if (-not (Test-Path -LiteralPath $srcAssets)) {
+        if (Test-Path -LiteralPath $dstAssets) {
+            try {
+                Remove-Item -LiteralPath $dstAssets -Recurse -Force -ErrorAction Stop
+                Write-Output ("WARN no assets dir at $srcAssets -- removed stale deployed assets at " +
+                              "$dstAssets so the app cannot keep loading the old icon set")
+                return 'assets=MISSING(stale-removed)'
+            } catch {
+                Write-Output ("WARN no assets dir at $srcAssets, and removing stale deployed assets at " +
+                              "$dstAssets failed: $($_.Exception.Message)")
+                return 'assets=MISSING(stale-remove-failed)'
+            }
+        }
         Write-Output "WARN no assets dir at $srcAssets -- class/Imagine icons will not be deployed"
         return 'assets=MISSING'
     }
