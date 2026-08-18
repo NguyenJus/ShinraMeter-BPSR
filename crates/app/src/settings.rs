@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use egui::Color32;
 
 use crate::ui::{
-    CRIT_PCT_RGB, DEATH_COUNT_RGB, LUCKY_PCT_RGB, STAT_TEXT_RGB, StatColumn, fmt_dps, fmt_pct0,
-    fmt_share, fmt_short,
+    CRIT_PCT_RGB, DEATH_COUNT_RGB, LUCKY_PCT_RGB, STAT_TEXT_RGB, StatColumn, fmt_pct0, fmt_share,
+    fmt_short,
 };
 
 /// One selectable stat column. Declaration order here is also the
@@ -132,20 +132,35 @@ impl ColumnKind {
                 },
                 color: Color32::WHITE,
             },
+            // Issue #118's 2-/1-decimal bands changed `fmt_short`'s worst
+            // case to "99.99M"/"999.9M" (6 chars) — narrower than the old
+            // always-one-decimal worst case, "1000.0K" (7 chars, rounds
+            // up across a K/M/B threshold), not wider like `Dps` below:
+            // `Damage` always used `fmt_short`, never the old `fmt_dps`,
+            // so there's no "1000K" (5 chars, `fmt_dps`'s own old worst
+            // case) baseline here to widen past. This column's 56.0
+            // already had enough slack (the new worst case measures
+            // 43.78125pt, per `widest_formatted_text_fits_its_column_
+            // width_budget`) that it still holds without changing.
             ColumnKind::Damage => StatColumn {
                 width: 56.0,
                 text: |row| fmt_short(row.damage),
                 color: Color32::from_rgb(STAT_TEXT_RGB.0, STAT_TEXT_RGB.1, STAT_TEXT_RGB.2),
             },
-            // `fmt_dps`'s ≤5 chars (issue #80.3: it drops the decimal once
-            // the scaled value hits 3 digits, e.g. `1000K`/`999M`) plus the
-            // 2-char "/s" suffix = ≤7 chars — narrower than `fmt_short`'s
-            // old always-one-decimal text, so this needs less room than it
-            // used to. `width` measured at 47.59375pt for "1000K/s" and
-            // rounded up to the next multiple of 8.
+            // Issue #118 unified `fmt_dps` into `fmt_short` — there is only
+            // one abbreviator now, shared with `Damage`/`Hits` below.
+            // `width` used to be sized for the old `fmt_dps`'s "1000K/s"
+            // (7 chars); `fmt_short`'s 2-/1-decimal bands are one char
+            // wider ("99.99M/s"/"999.9M/s", 8 chars) than that 0-decimal
+            // form, and — per `widest_formatted_text_fits_its_column_
+            // width_budget`'s real galley measurement, not a char count —
+            // the "M" suffix also happens to be the pixel-widest of
+            // K/M/B in this font, so the true worst case is 54.0pt.
+            // Measured and rounded up to the next multiple of 8, same
+            // convention as the columns around it.
             ColumnKind::Dps => StatColumn {
-                width: 48.0,
-                text: |row| format!("{}/s", fmt_dps(row.dps as i64)),
+                width: 56.0,
+                text: |row| format!("{}/s", fmt_short(row.dps as i64)),
                 color: Color32::WHITE,
             },
             // Unaffected by issue #80.2's 0-decimal change (that's `CritPct`/
