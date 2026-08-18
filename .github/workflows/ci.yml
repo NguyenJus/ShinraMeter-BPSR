@@ -28,9 +28,14 @@ jobs:
   # `.cargo/config.toml`.
   clippy:
     runs-on: ubuntu-latest
+    # Well clear of a good run (~2m) but far short of the 360-minute default,
+    # so a wedged step can never sit on a PR for an hour again.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+      - name: Install the mingw-w64 cross-toolchain
+        uses: ./.github/actions/mingw-w64-toolchain
+        timeout-minutes: 15
       - run: |
           rustup component add clippy
           rustup target add x86_64-pc-windows-gnu
@@ -42,9 +47,12 @@ jobs:
   # here rather than discovering a regression on a user's machine.
   build-windows:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+      - name: Install the mingw-w64 cross-toolchain
+        uses: ./.github/actions/mingw-w64-toolchain
+        timeout-minutes: 15
       - run: rustup target add x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --target x86_64-pc-windows-gnu

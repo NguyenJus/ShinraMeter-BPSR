@@ -1,0 +1,121 @@
+name: mingw-w64 cross-toolchain
+description: >
+  Installs the mingw-w64 cross-toolchain that every Windows-target job needs
+  (cc-rs and embed-resource shell out to x86_64-w64-mingw32-gcc and windres;
+  the release assertions call x86_64-w64-mingw32-objdump), restoring the .deb
+  files from the actions cache so the common path never touches an apt mirror.
+  Installing straight from apt was measured at 26 minutes on a bad day and has
+  twice wedged a job for the best part of an hour, so every network call here
+  is bounded by `timeout` and retried before it is allowed to fail the job.
+
+inputs:
+  packages:
+    description: Space-separated apt packages providing the cross-toolchain.
+    required: false
+    default: gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+
+runs:
+  using: composite
+  steps:
+    # The key pins everything that can change the bytes of the .debs: the
+    # runner's OS release and architecture, and the requested package set.
+    # There are deliberately no `restore-keys` — a near-miss restore would
+    # hand the build a partial dependency closure, and a toolchain that is
+    # silently missing a binary is worse than one that is plainly absent.
+    - id: plan
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        set -euo pipefail
+        packages=$(printf '%s' "$PACKAGES" | tr -s '[:space:]' '\n' | sed '/^$/d' | sort | tr '\n' ' ')
+        packages=${packages% }
+        . /etc/os-release
+        digest=$(printf '%s' "$packages" | sha256sum | cut -c1-16)
+        echo "packages=$packages" >> "$GITHUB_OUTPUT"
+        echo "key=mingw-apt-v1-${RUNNER_OS}-${ID}-${VERSION_ID}-${RUNNER_ARCH}-${digest}" >> "$GITHUB_OUTPUT"
+
+    - id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/mingw-apt
+        key: ${{ steps.plan.outputs.key }}
+
+    # `install --download-only` resolves and fetches the requested packages
+    # *and* every dependency the runner image does not already have, so the
+    # cached directory is the complete closure for this image.
+    - name: Download the packages
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        ARCHIVES: ${{ runner.temp }}/mingw-apt
+        PACKAGES: ${{ steps.plan.outputs.packages }}
+      run: |
+        set -euo pipefail
+        read -ra pkgs <<< "$PACKAGES"
+        rm -rf "$ARCHIVES"
+        mkdir -p "$ARCHIVES/partial"
+        opts=(
+          -o Dir::Cache::archives="$ARCHIVES"
+          -o APT::Sandbox::User=root
+          -o Acquire::Retries=3
+          -o Acquire::http::Timeout=20
+          -o Acquire::https::Timeout=20
+        )
+        downloaded=no
+        for attempt in 1 2 3; do
+          if sudo timeout 90 apt-get "${opts[@]}" update \
+            && sudo timeout 180 apt-get "${opts[@]}" install --download-only -y "${pkgs[@]}"; then
+            downloaded=yes
+            break
+          fi
+          echo "::warning::apt attempt ${attempt} failed or timed out; retrying"
+          sudo rm -rf /var/lib/apt/lists/partial "$ARCHIVES/partial"
+          mkdir -p "$ARCHIVES/partial"
+          sleep $((attempt * 10))
+        done
+        if [[ "$downloaded" != yes ]]; then
+          echo "::error::could not download the mingw-w64 packages after 3 bounded attempts"
+          exit 1
+        fi
+        sudo chown -R "$(id -u):$(id -g)" "$ARCHIVES"
+        rm -rf "$ARCHIVES/partial" "$ARCHIVES/lock"
+        echo "cached $(find "$ARCHIVES" -name '*.deb' | wc -l) package files"
+
+    # dpkg is offline, so a cache hit costs seconds. If the archive turns out
+    # not to satisfy its dependencies — a runner image that dropped a
+    # preinstalled library out from under an older cache entry — fall back to
+    # a plain (still bounded) apt install rather than limping on.
+    - name: Install the toolchain
+      shell: bash
+      env:
+        ARCHIVES: ${{ runner.temp }}/mingw-apt
+        PACKAGES: ${{ steps.plan.outputs.packages }}
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        read -ra pkgs <<< "$PACKAGES"
+        debs=("$ARCHIVES"/*.deb)
+        if (( ${#debs[@]} == 0 )); then
+          echo "::error::no .deb files were restored or downloaded"
+          exit 1
+        fi
+        if ! sudo dpkg --install "${debs[@]}"; then
+          echo "::warning::the cached packages did not satisfy their dependencies; falling back to apt"
+          sudo timeout 90 apt-get update || true
+          sudo timeout 300 apt-get --fix-broken install -y
+          sudo timeout 300 apt-get install -y "${pkgs[@]}"
+        fi
+
+    # A cache hit must leave a genuinely usable toolchain, so assert the exact
+    # binaries the build scripts and the release checks reach for. This runs
+    # before any cargo invocation, which is what keeps a degraded restore from
+    # reaching a release artifact.
+    - name: Verify the toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        for tool in gcc windres objdump ar; do
+          "x86_64-w64-mingw32-${tool}" --version > /dev/null
+        done
+        echo "mingw-w64 cross-toolchain ready (gcc $(x86_64-w64-mingw32-gcc -dumpversion))"
