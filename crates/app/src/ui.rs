@@ -181,6 +181,13 @@ pub struct OverlayApp {
     /// `handle_screenshot_events`'s call site `take()`s it when the reply
     /// lands, so the crop always matches the frame that was actually
     /// captured regardless of how the row count drifts afterward.
+    ///
+    /// Issue #82: that `take()` must only happen on the frame that
+    /// actually handles a screenshot event — see
+    /// `take_pending_screenshot_bound`'s doc comment for the regression an
+    /// unconditional, once-per-frame `take()` caused (the bound was
+    /// discarded before the asynchronous reply could ever land, so every
+    /// Share click failed).
     pending_screenshot_bound: Option<f32>,
     /// `demo_enabled()` cached at construction so `ui()` doesn't re-read the
     /// env var every frame; also lets `ui()` keep demo mode's synthetic
@@ -433,13 +440,19 @@ impl eframe::App for OverlayApp {
         // rows before the clipboard write, using the bound captured at
         // *request* time (`pending_screenshot_bound`) rather than whatever
         // bound is current on the frame the reply happens to land on — see
-        // `pending_screenshot_bound`'s doc comment. `take()`n so a later,
-        // unrelated frame never reuses a stale bound.
-        let rows_bottom_y = self.pending_screenshot_bound.take().unwrap_or(0.0);
-        let pixels_per_point = ctx.pixels_per_point();
-        handle_screenshot_events(&ctx, |image| {
-            let cropped = crop_screenshot_to_rows(image, rows_bottom_y, pixels_per_point);
-            crate::platform::write_clipboard_image(&cropped);
+        // `pending_screenshot_bound`'s doc comment.
+        // Issue #82 (async round-trip regression, see
+        // `take_pending_screenshot_bound`'s doc comment): the pending bound
+        // must only be consumed on the frame that actually handles a
+        // screenshot event, not unconditionally every frame — an
+        // unconditional `take()` here discarded the bound before the
+        // asynchronous reply could ever land, which is why the Share
+        // button failed on every single click. The sequencing itself lives
+        // in `handle_share_screenshot`, extracted out for the same
+        // testability reason `handle_screenshot_events` is: see its doc
+        // comment.
+        handle_share_screenshot(&ctx, &mut self.pending_screenshot_bound, |image| {
+            crate::platform::write_clipboard_image(&image);
         });
 
         // Loaded once, lazily: the `egui::Context` above isn't available yet
@@ -894,15 +907,27 @@ fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Ico
 /// `write` and no live window or clipboard; the real call site
 /// (`OverlayApp::ui`) passes `platform::write_clipboard_image`.
 ///
+/// `write` takes the event's `Arc<ColorImage>` itself rather than a bare
+/// `&ColorImage`: `egui::Event::Screenshot`'s `image` field is already an
+/// `Arc`, and handing out the reference-counted handle (a cheap refcount
+/// bump) instead of a borrow lets callers that need to keep the image past
+/// this closure — `OverlayApp::ui` collects every landed image into a
+/// `Vec` for the crop/write loop below — do so without a full pixel-buffer
+/// deep copy (`epaint::ColorImage` derives `Clone` over `Vec<Color32>`,
+/// which for a 4K capture is tens of MB).
+///
 /// A `Screenshot` event can only be `Event::Screenshot` in practice, but
 /// nothing stops another viewport's reply from showing up in a multi-
 /// viewport app; this app only ever has the root viewport, so every event
 /// this frame is implicitly ours.
-fn handle_screenshot_events(ctx: &egui::Context, mut write: impl FnMut(&egui::ColorImage)) {
+fn handle_screenshot_events(
+    ctx: &egui::Context,
+    mut write: impl FnMut(std::sync::Arc<egui::ColorImage>),
+) {
     ctx.input(|input| {
         for event in &input.events {
             if let egui::Event::Screenshot { image, .. } = event {
-                write(image);
+                write(image.clone());
             }
         }
     });
@@ -976,18 +1001,102 @@ fn screenshot_crop_height_px(
 /// hand: it never touches the live window's size or geometry, which is the
 /// point of doing it here rather than by resizing the overlay — only the
 /// clipboard image differs from a bare full-window capture.
+///
+/// Issue #82: a `crop_height` of `0` — from a non-positive bound or
+/// `pixels_per_point`, per `screenshot_crop_height_px`'s own fallback —
+/// also keeps the full image rather than producing a genuinely
+/// zero-height `ColorImage`. arboard rejects a zero-height image outright
+/// (`Error::ConversionFailure`), which is what made the Share button fail
+/// on every single click; a full, uncropped screenshot is a far better
+/// failure mode than no screenshot at all.
+///
+/// Takes and returns `Arc<ColorImage>`, not a bare `&ColorImage`/
+/// `ColorImage`, so the `crop_height == 0` no-op path — which is exactly
+/// the issue-#82 case above, not a rare edge — returns via a cheap Arc
+/// refcount bump instead of a second full pixel-buffer deep copy on top of
+/// the one `handle_screenshot_events`'s caller already avoids.
 fn crop_screenshot_to_rows(
-    image: &egui::ColorImage,
+    image: &std::sync::Arc<egui::ColorImage>,
     bottom_y_points: f32,
     pixels_per_point: f32,
-) -> egui::ColorImage {
+) -> std::sync::Arc<egui::ColorImage> {
     let [width, height] = image.size;
     let crop_height = screenshot_crop_height_px(bottom_y_points, pixels_per_point, height);
-    if crop_height >= height {
+    if crop_height == 0 || crop_height >= height {
         return image.clone();
     }
     let pixels = image.pixels[..width * crop_height].to_vec();
-    egui::ColorImage::new([width, crop_height], pixels)
+    std::sync::Arc::new(egui::ColorImage::new([width, crop_height], pixels))
+}
+
+/// Decides what row bound a landed screenshot reply should crop to, and
+/// what `OverlayApp::pending_screenshot_bound` must hold afterward.
+///
+/// Issue #96 (PR #98 review) `take()`s the pending bound so a stale value
+/// can never be reused by a later, unrelated frame — but the original fix
+/// took it *unconditionally*, once per frame, regardless of whether that
+/// frame actually had a screenshot event to handle. `ViewportCommand::
+/// Screenshot`'s reply is asynchronous and can land any number of frames
+/// after the Share click that requested it, so the bound stashed on the
+/// request frame was thrown away on the very next idle frame — long
+/// before the reply could arrive. By reply time `pending_screenshot_bound`
+/// was already `None`, `unwrap_or(0.0)` handed `crop_screenshot_to_rows` a
+/// zero bound, and the resulting zero-height image made arboard reject
+/// the clipboard write with `Error::ConversionFailure` on every attempt
+/// (issue #82).
+///
+/// The fix: only consume (reset to `None`) the pending bound on the frame
+/// that actually handles a screenshot event (`event_landed`); every other
+/// frame must leave whatever is pending untouched so it survives however
+/// many frames the round trip takes.
+fn take_pending_screenshot_bound(pending: Option<f32>, event_landed: bool) -> (f32, Option<f32>) {
+    if event_landed {
+        (pending.unwrap_or(0.0), None)
+    } else {
+        (0.0, pending)
+    }
+}
+
+/// The Share round trip's per-frame sequencing: collect any `Event::
+/// Screenshot` images that landed this frame, decide (via
+/// `take_pending_screenshot_bound`) what row bound to crop them to and
+/// what `pending_screenshot_bound` must hold afterward, and hand each
+/// cropped image to `write`.
+///
+/// Extracted out of `OverlayApp::ui` — mirroring this file's existing
+/// pure-helper-for-testability convention (see `handle_screenshot_events`)
+/// — because this sequencing was previously exercised only by driving the
+/// whole `ui()` method, which is infeasible to test directly: `eframe::
+/// Frame` has only `pub(crate)` fields and no public constructor. This
+/// logic never actually touches `_frame`, though — it needs only `ctx` and
+/// `pending_screenshot_bound`, both of which a bare `egui::Context::
+/// default()` and a plain `&mut Option<f32>` stand in for in a test, no
+/// GPU or window required. `write` is the same seam `handle_screenshot_
+/// events` uses, so a test can assert on what would have been written
+/// without a real clipboard.
+///
+/// The screenshot images are collected first, outside `handle_screenshot_
+/// events`'s `ctx.input` borrow, so the pending-bound take (which needs
+/// `&mut pending_screenshot_bound`) and the crop/write loop can happen
+/// afterward without a borrow conflict.
+fn handle_share_screenshot(
+    ctx: &egui::Context,
+    pending_screenshot_bound: &mut Option<f32>,
+    mut write: impl FnMut(std::sync::Arc<egui::ColorImage>),
+) {
+    let mut screenshot_images: Vec<std::sync::Arc<egui::ColorImage>> = Vec::new();
+    handle_screenshot_events(ctx, |image| screenshot_images.push(image));
+    let event_landed = !screenshot_images.is_empty();
+    let (rows_bottom_y, new_pending_screenshot_bound) =
+        take_pending_screenshot_bound(*pending_screenshot_bound, event_landed);
+    *pending_screenshot_bound = new_pending_screenshot_bound;
+    if event_landed {
+        let pixels_per_point = ctx.pixels_per_point();
+        for image in &screenshot_images {
+            let cropped = crop_screenshot_to_rows(image, rows_bottom_y, pixels_per_point);
+            write(cropped);
+        }
+    }
 }
 
 /// Fixed display size, in points, every toolbar icon (issue #41) is drawn
@@ -4978,9 +5087,9 @@ mod tests {
             ..Default::default()
         };
 
-        let mut written: Vec<egui::ColorImage> = Vec::new();
+        let mut written: Vec<std::sync::Arc<egui::ColorImage>> = Vec::new();
         let output = ctx.run_ui(input, |_ui| {
-            handle_screenshot_events(&ctx, |img| written.push(img.clone()));
+            handle_screenshot_events(&ctx, |img| written.push(img));
         });
         output.drop_without_applying_deltas();
 
@@ -5149,11 +5258,11 @@ mod tests {
         );
     }
 
-    fn crop_test_image(width: usize, height: usize) -> egui::ColorImage {
+    fn crop_test_image(width: usize, height: usize) -> std::sync::Arc<egui::ColorImage> {
         let pixels = (0..width * height)
             .map(|i| egui::Color32::from_gray((i % 256) as u8))
             .collect();
-        egui::ColorImage::new([width, height], pixels)
+        std::sync::Arc::new(egui::ColorImage::new([width, height], pixels))
     }
 
     /// The primary case: trims the image down to the rows' bottom edge,
@@ -5175,6 +5284,181 @@ mod tests {
         let cropped = crop_screenshot_to_rows(&image, 1000.0, 1.0);
         assert_eq!(cropped.size, image.size);
         assert_eq!(cropped.pixels, image.pixels);
+    }
+
+    /// Issue #82: a zero (or negative) row bound — e.g. the "no bound
+    /// pinned yet" fallback `unwrap_or(0.0)` at the `crop_screenshot_to_rows`
+    /// call site — used to make `screenshot_crop_height_px` return `0`,
+    /// which `crop_screenshot_to_rows` then turned into a genuinely
+    /// zero-height `ColorImage`. arboard rejects a zero-height image with
+    /// `Error::ConversionFailure`, which is exactly the clipboard write
+    /// failure reported in issue #82: every single Share click failed. A
+    /// full, uncropped screenshot is a far better failure mode than no
+    /// screenshot at all, so a degenerate crop height must fall back to the
+    /// full image instead of an empty one.
+    #[test]
+    fn crop_screenshot_to_rows_falls_back_to_the_full_image_when_the_bound_is_non_positive() {
+        let image = crop_test_image(4, 10);
+
+        let cropped_zero = crop_screenshot_to_rows(&image, 0.0, 1.0);
+        assert_eq!(cropped_zero.size, image.size);
+        assert_eq!(cropped_zero.pixels, image.pixels);
+
+        let cropped_negative = crop_screenshot_to_rows(&image, -5.0, 1.0);
+        assert_eq!(cropped_negative.size, image.size);
+        assert_eq!(cropped_negative.pixels, image.pixels);
+    }
+
+    /// Same degenerate-crop failure mode as above (issue #82), but driven
+    /// by a non-positive `pixels_per_point` instead of a non-positive
+    /// bound — both inputs feed the same `screenshot_crop_height_px` zero
+    /// fallback, so both must produce the full image rather than a
+    /// zero-height one.
+    #[test]
+    fn crop_screenshot_to_rows_falls_back_to_the_full_image_when_pixels_per_point_is_non_positive()
+    {
+        let image = crop_test_image(4, 10);
+        let cropped = crop_screenshot_to_rows(&image, 6.0, 0.0);
+        assert_eq!(cropped.size, image.size);
+        assert_eq!(cropped.pixels, image.pixels);
+    }
+
+    // -- pending screenshot bound take/consume (issue #82) -------------------
+
+    /// Issue #82 (async round-trip regression): a frame with no screenshot
+    /// event must leave whatever bound is pending untouched — the previous
+    /// code unconditionally `take()`d `pending_screenshot_bound` every
+    /// single frame regardless of whether that frame actually handled a
+    /// screenshot reply, so the bound stashed on the request frame was
+    /// discarded on the very next idle frame, long before the async
+    /// `ViewportCommand::Screenshot` reply could ever land. By the time the
+    /// reply arrived, the bound was already `None`, and the crop fell back
+    /// to `unwrap_or(0.0)` — a zero row bound that produced a degenerate,
+    /// zero-height clipboard image on every single Share click.
+    #[test]
+    fn take_pending_screenshot_bound_leaves_the_pending_bound_untouched_when_no_event_landed() {
+        let (bound_to_use, new_pending) = take_pending_screenshot_bound(Some(123.0), false);
+        assert_eq!(
+            new_pending,
+            Some(123.0),
+            "a frame without a screenshot event must not consume the pending bound"
+        );
+        // Nothing reads `bound_to_use` when no event landed, but it must
+        // still be a well-defined, harmless value.
+        let _ = bound_to_use;
+    }
+
+    /// The frame that actually handles a screenshot event must consume the
+    /// pending bound — using it for the crop and resetting the field to
+    /// `None` so a later, unrelated frame can never reuse a stale value.
+    #[test]
+    fn take_pending_screenshot_bound_consumes_the_bound_when_an_event_lands() {
+        let (bound_to_use, new_pending) = take_pending_screenshot_bound(Some(123.0), true);
+        assert_eq!(bound_to_use, 123.0);
+        assert_eq!(
+            new_pending, None,
+            "a landed event must consume (reset) the pending bound"
+        );
+    }
+
+    /// A screenshot event landing with no bound ever pinned (e.g. the round
+    /// trip somehow bypassed the request-time stash) must fall back to
+    /// `0.0`, matching the previous `unwrap_or(0.0)` behavior, rather than
+    /// panicking.
+    #[test]
+    fn take_pending_screenshot_bound_falls_back_to_zero_when_an_event_lands_with_no_pending_bound()
+    {
+        let (bound_to_use, new_pending) = take_pending_screenshot_bound(None, true);
+        assert_eq!(bound_to_use, 0.0);
+        assert_eq!(new_pending, None);
+    }
+
+    // -- handle_share_screenshot (the `OverlayApp::ui` sequencing itself) ---
+
+    /// `handle_share_screenshot` is the actual fix site for issue #82's
+    /// async round-trip regression (see `take_pending_screenshot_bound`'s
+    /// doc comment): it is the code that runs inside `OverlayApp::ui`, not
+    /// just the pure helpers it calls. Driving `OverlayApp::ui` itself is
+    /// infeasible — `eframe::Frame` has only `pub(crate)` fields and no
+    /// public constructor — but this sequencing never actually touches
+    /// `_frame`, so it was pulled out into its own function that needs
+    /// only `&egui::Context` and `&mut Option<f32>`, both of which a bare
+    /// `egui::Context::default()` and a plain local variable stand in for
+    /// here, mirroring `handle_screenshot_events_routes_a_screenshot_
+    /// event_to_the_writer`'s use of a synthetic `Event::Screenshot` with
+    /// no live window or clipboard.
+    ///
+    /// A frame with no screenshot event must leave the pending bound
+    /// untouched and must never call `write` — otherwise every idle frame
+    /// between the Share click and the async reply would either discard
+    /// the stashed bound (issue #82) or overwrite the clipboard with
+    /// nothing to write.
+    #[test]
+    fn handle_share_screenshot_leaves_the_bound_untouched_on_a_frame_with_no_event() {
+        let ctx = egui::Context::default();
+        let mut pending_screenshot_bound = Some(123.0);
+        let mut written: Vec<std::sync::Arc<egui::ColorImage>> = Vec::new();
+
+        let output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            handle_share_screenshot(&ctx, &mut pending_screenshot_bound, |image| {
+                written.push(image);
+            });
+        });
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            pending_screenshot_bound,
+            Some(123.0),
+            "a frame without a screenshot event must not consume the pending bound"
+        );
+        assert!(
+            written.is_empty(),
+            "write must not run without a Screenshot event"
+        );
+    }
+
+    /// The frame that actually carries the async `Event::Screenshot` reply
+    /// must consume (reset to `None`) the pending bound and hand exactly
+    /// one cropped image to `write` — proving the whole sequencing inside
+    /// `OverlayApp::ui` (collect → decide the bound → crop → write), not
+    /// just its pure helpers in isolation.
+    #[test]
+    fn handle_share_screenshot_consumes_the_bound_and_writes_on_the_frame_the_event_lands() {
+        let ctx = egui::Context::default();
+        let mut pending_screenshot_bound = Some(6.0);
+        let image = std::sync::Arc::new(egui::ColorImage::filled(
+            [4, 10],
+            egui::Color32::from_rgb(1, 2, 3),
+        ));
+        let input = egui::RawInput {
+            events: vec![egui::Event::Screenshot {
+                viewport_id: egui::ViewportId::ROOT,
+                user_data: egui::UserData::default(),
+                image: image.clone(),
+            }],
+            ..Default::default()
+        };
+
+        let mut written: Vec<std::sync::Arc<egui::ColorImage>> = Vec::new();
+        let output = ctx.run_ui(input, |_ui| {
+            handle_share_screenshot(&ctx, &mut pending_screenshot_bound, |image| {
+                written.push(image);
+            });
+        });
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            pending_screenshot_bound, None,
+            "a landed event must consume (reset) the pending bound"
+        );
+        assert_eq!(
+            written.len(),
+            1,
+            "the landed screenshot must be cropped and written exactly once"
+        );
+        // pending bound of 6.0 at pixels_per_point 1.0 (the context's
+        // default) crops the 10-tall source image down to 6 rows.
+        assert_eq!(written[0].size, [4, 6]);
     }
 
     /// The reference drops the trailing " DPS"/" DMG" words in favor of the
