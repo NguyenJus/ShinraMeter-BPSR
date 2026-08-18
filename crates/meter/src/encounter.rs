@@ -673,11 +673,12 @@ impl Meter {
             && tables::is_boss_monster(id)
             && tables::is_dungeon_scene(scene)
         {
-            let previous = self.scene_bosses.insert(scene, id);
-            if previous != Some(id)
-                && let Some(msg) = scene_boss_latch_log(previous, id, scene)
-            {
-                log::info!("{msg}");
+            let previous = self.scene_bosses.get(&scene).copied();
+            if previous != Some(id) {
+                self.scene_bosses.insert(scene, id);
+                if let Some(msg) = scene_boss_latch_log(previous, id, scene) {
+                    log::info!("{msg}");
+                }
             }
         }
 
@@ -888,10 +889,11 @@ fn boss_transition_log(
 
 /// Builds the "dungeon final boss learned/changed" diagnostic line (issue
 /// #125), or `None` when `new_monster_id` matches `previous` — `recompute_boss`
-/// re-inserts into `scene_bosses` on every latch-eligible event, so without
-/// this guard it would relog on every damage packet against a boss that is
-/// already the remembered one. Pure, like [`scene_transition_log`]/
-/// [`boss_transition_log`], for the same testability reason.
+/// only calls this (and only re-inserts into `scene_bosses`) when the winner
+/// differs from what's already latched, but this guard is kept as a second
+/// line of defense against relogging an unchanged boss. Pure, like
+/// [`scene_transition_log`]/[`boss_transition_log`], for the same
+/// testability reason.
 fn scene_boss_latch_log(
     previous: Option<u32>,
     new_monster_id: u32,

@@ -5759,6 +5759,21 @@ mod tests {
     }
 
     #[test]
+    fn title_prefers_scene_boss_name_before_any_hit_lands() {
+        // The case the function's doc comment leads with: the dungeon's
+        // final boss is already known from a prior pull, but this
+        // encounter hasn't hit anything yet — `boss_monster_id` is `None`.
+        // The scene boss name must still win, via the unconditional `if
+        // let` ahead of the `match e.boss_monster_id`, not "No target".
+        let e = EncounterInfo {
+            boss_monster_id: None,
+            scene_boss_name: Some("Blazing Mech 05"),
+            ..Default::default()
+        };
+        assert_eq!(encounter_title(&e), "Blazing Mech 05");
+    }
+
+    #[test]
     fn title_falls_through_to_existing_rules_when_scene_boss_name_absent() {
         // No dungeon final boss has been learned yet (e.g. a scene's first
         // run this session, or a non-dungeon scene) — the pre-issue-#125

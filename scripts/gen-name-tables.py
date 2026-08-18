@@ -517,24 +517,47 @@ _BOSS_IDS_LINE_WIDTH = 96
 _BOSS_IDS_INDENT = "    "
 
 
-def emit_boss_ids(out: io.StringIO, ids: list[int]) -> None:
-    out.write(f"\n{BOSS_IDS_DOC}\n#[rustfmt::skip]\nconst BOSS_MONSTER_IDS: &[u32] = &[\n")
-    line = _BOSS_IDS_INDENT
+def _emit_wrapped_u32_array(
+    out: io.StringIO,
+    doc: str,
+    const_name: str,
+    ids: list[int],
+    line_width: int,
+    indent: str,
+    predicate_fn: str,
+) -> None:
+    """Writes `doc`, a `#[rustfmt::skip]` `const {const_name}: &[u32]`
+    greedily line-wrapped at `line_width` (matching rustfmt's own
+    array-literal packing so a diff against a hand-formatted file stays
+    empty), and `predicate_fn` after it. Shared by `emit_boss_ids` and
+    `emit_dungeon_scene_ids`, which differ only in the args they pass."""
+    out.write(f"\n{doc}\n#[rustfmt::skip]\nconst {const_name}: &[u32] = &[\n")
+    line = indent
     for n in ids:
         piece = f"{n}, "
-        if line != _BOSS_IDS_INDENT and len(line) + len(piece) > _BOSS_IDS_LINE_WIDTH:
+        if line != indent and len(line) + len(piece) > line_width:
             out.write(line.rstrip() + "\n")
-            line = _BOSS_IDS_INDENT
+            line = indent
         line += piece
-    if line != _BOSS_IDS_INDENT:
+    if line != indent:
         out.write(line.rstrip() + "\n")
     out.write("];\n")
-    out.write(
+    out.write(predicate_fn)
+
+
+def emit_boss_ids(out: io.StringIO, ids: list[int]) -> None:
+    _emit_wrapped_u32_array(
+        out,
+        BOSS_IDS_DOC,
+        "BOSS_MONSTER_IDS",
+        ids,
+        _BOSS_IDS_LINE_WIDTH,
+        _BOSS_IDS_INDENT,
         "\n/// Whether `id` is a known boss-monster template id (issue #42) — i.e.\n"
         "/// whether the encounter name should ever be surfaced for it.\n"
         "pub fn is_boss_monster(id: u32) -> bool {\n"
         "    BOSS_MONSTER_IDS.binary_search(&id).is_ok()\n"
-        "}\n"
+        "}\n",
     )
 
 
@@ -562,26 +585,19 @@ _DUNGEON_SCENE_IDS_INDENT = "    "
 
 
 def emit_dungeon_scene_ids(out: io.StringIO, ids: list[int]) -> None:
-    out.write(
-        f"\n{DUNGEON_SCENE_IDS_DOC}\n#[rustfmt::skip]\nconst DUNGEON_SCENE_IDS: &[u32] = &[\n"
-    )
-    line = _DUNGEON_SCENE_IDS_INDENT
-    for n in ids:
-        piece = f"{n}, "
-        if line != _DUNGEON_SCENE_IDS_INDENT and len(line) + len(piece) > _DUNGEON_SCENE_IDS_LINE_WIDTH:
-            out.write(line.rstrip() + "\n")
-            line = _DUNGEON_SCENE_IDS_INDENT
-        line += piece
-    if line != _DUNGEON_SCENE_IDS_INDENT:
-        out.write(line.rstrip() + "\n")
-    out.write("];\n")
-    out.write(
+    _emit_wrapped_u32_array(
+        out,
+        DUNGEON_SCENE_IDS_DOC,
+        "DUNGEON_SCENE_IDS",
+        ids,
+        _DUNGEON_SCENE_IDS_LINE_WIDTH,
+        _DUNGEON_SCENE_IDS_INDENT,
         "\n/// Whether `id` is a known dungeon scene id (issue #125) — i.e. whether\n"
         "/// the final-boss latch in `Meter::recompute_boss` may record a\n"
         "/// remembered boss for it.\n"
         "pub fn is_dungeon_scene(id: u32) -> bool {\n"
         "    DUNGEON_SCENE_IDS.binary_search(&id).is_ok()\n"
-        "}\n"
+        "}\n",
     )
 
 
