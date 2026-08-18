@@ -9,7 +9,7 @@ use prost::Message;
 
 use std::sync::Arc;
 
-use crate::attrs::{enemy_hp_from_attrs, player_info_from_attrs};
+use crate::attrs::{enemy_hp_from_attrs, player_info_from_attrs, scene_id_from_attrs};
 use crate::event::{DamageEvent, EntityKind, PlayerInfo, ProtocolEvent, kind_of, uid_of};
 use crate::frame::{Desync, MAX_TAIL_LEN, Notify, parse_frame, split_frames};
 use crate::inspect::InspectSink;
@@ -20,6 +20,18 @@ pub mod opcode {
     pub const SYNC_CONTAINER_DATA: u32 = 0x0000_0015;
     pub const SYNC_NEAR_DELTA_INFO: u32 = 0x0000_002d;
     pub const SYNC_TO_ME_DELTA_INFO: u32 = 0x0000_002e;
+    /// `WorldNtf.EnterScene` (issue #35). Recovered, along with the four
+    /// constants above, by parsing `BPSR_ZDPSLib.ServiceMethods.WorldNtf`
+    /// out of the BPSR-ZDPS reference tool's .NET metadata — that parse
+    /// independently reproduced all four existing opcodes byte-for-byte,
+    /// which is what makes this value (and the enum's `SyncSceneAttrs` = 7
+    /// / `SyncContainerDirtyData` = 22, not otherwise used by this crate)
+    /// trustworthy rather than another unverified port. Carries the scene
+    /// attrs (`attrs::attr_id::SCENE_BASIC_ID` et al.) that
+    /// `on_enter_scene` reads `ProtocolEvent::Scene` from — replacing the
+    /// disproven `SyncContainerData.CharSerialize.scene_data` path (see
+    /// `pb::CharSerialize`'s doc comment).
+    pub const ENTER_SCENE: u32 = 0x0000_0003;
 }
 
 /// Decodes one Notify's payload and appends any resulting events to `out`.
@@ -40,6 +52,10 @@ pub fn decode_notify(
         opcode::SYNC_CONTAINER_DATA => match pb::SyncContainerData::decode(n.payload.as_slice()) {
             Ok(msg) => on_sync_container_data(&msg, out),
             Err(_) => log::debug!("bpsr-protocol: SyncContainerData decode failed"),
+        },
+        opcode::ENTER_SCENE => match pb::EnterScene::decode(n.payload.as_slice()) {
+            Ok(msg) => on_enter_scene(&msg, out, sink),
+            Err(_) => log::debug!("bpsr-protocol: EnterScene decode failed"),
         },
         opcode::SYNC_NEAR_DELTA_INFO => match pb::SyncNearDeltaInfo::decode(n.payload.as_slice()) {
             Ok(msg) => {
@@ -179,19 +195,13 @@ fn on_aoi_sync_delta(
     }
 }
 
+/// Emits `Player` only — the scene half of this notify was removed (issue
+/// #35): see `pb::CharSerialize`'s doc comment for why, and
+/// `on_enter_scene` for where the scene id actually comes from now.
 fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEvent>) {
     let Some(v_data) = &msg.v_data else {
         return;
     };
-    // `level_map_id == 0` is proto3's unset-scalar wire value (a `SceneData`
-    // submessage can be present with every field at its default), not a real
-    // scene id — treated as absent, matching `char_base.fight_point > 0`'s
-    // guard below.
-    if let Some(scene) = v_data.scene_data.as_ref().filter(|s| s.level_map_id > 0) {
-        out.push(ProtocolEvent::Scene {
-            level_map_id: scene.level_map_id,
-        });
-    }
     let Some(char_base) = &v_data.char_base else {
         return;
     };
@@ -225,6 +235,25 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
         // (issue #33) — attr-list path only.
         skill_ids: Vec::new(),
     }));
+}
+
+/// `WorldNtf.EnterScene` (issue #35): the current scene id, decoded from
+/// `AttrSceneBasicId` on the scene attr collection nested at field path
+/// `1.1` (`EnterScene.info.attrs`, per `pb::EnterScene`'s doc comment).
+/// Reuses `SyncNearEntities`' `AttrCollection`/`Attr` shape and
+/// `attrs::scene_id_from_attrs`'s zero-is-absent guard — no event is
+/// emitted when the collection, the attr, or a nonzero value is missing.
+fn on_enter_scene(
+    msg: &pb::EnterScene,
+    out: &mut Vec<ProtocolEvent>,
+    sink: Option<&dyn InspectSink>,
+) {
+    let Some(attrs) = msg.info.as_ref().and_then(|i| i.attrs.as_ref()) else {
+        return;
+    };
+    if let Some(level_map_id) = scene_id_from_attrs(&attrs.attrs, sink) {
+        out.push(ProtocolEvent::Scene { level_map_id });
+    }
 }
 
 /// The crate's public façade: buffers raw stream bytes across pushes,
@@ -759,8 +788,6 @@ mod tests {
         assert!(recorded[0].3, "FIGHT_POINT must be reported as known");
     }
 
-    // -- Scene (issue #9 slice 2) -------------------------------------
-
     fn container_notify(v_data: pb::CharSerialize) -> Notify {
         let msg = pb::SyncContainerData {
             v_data: Some(v_data),
@@ -771,40 +798,6 @@ mod tests {
             method_id: opcode::SYNC_CONTAINER_DATA,
             payload,
         }
-    }
-
-    #[test]
-    fn scene_data_on_char_serialize_emits_a_scene_event() {
-        let n = container_notify(pb::CharSerialize {
-            char_id: 1,
-            char_base: None,
-            scene_data: Some(pb::SceneData { level_map_id: 4242 }),
-            profession_list: None,
-        });
-        let mut out = Vec::new();
-        decode_notify(&n, 0, &mut out, None);
-        assert!(out.contains(&ProtocolEvent::Scene { level_map_id: 4242 }));
-    }
-
-    #[test]
-    fn scene_data_survives_alongside_char_base_in_the_same_notify() {
-        let n = container_notify(pb::CharSerialize {
-            char_id: 7,
-            char_base: Some(pb::CharBaseInfo {
-                char_id: 7,
-                name: "Ali".to_string(),
-                fight_point: 0,
-            }),
-            scene_data: Some(pb::SceneData { level_map_id: 99 }),
-            profession_list: None,
-        });
-        let mut out = Vec::new();
-        decode_notify(&n, 0, &mut out, None);
-        assert!(out.contains(&ProtocolEvent::Scene { level_map_id: 99 }));
-        assert!(
-            out.iter()
-                .any(|e| matches!(e, ProtocolEvent::Player(p) if p.uid == 7))
-        );
     }
 
     // -- Imagine profession ids (issue #37) ---------------------------------
@@ -818,7 +811,6 @@ mod tests {
                 name: "Ari".to_string(),
                 fight_point: 0,
             }),
-            scene_data: None,
             profession_list: Some(pb::ProfessionList {
                 cur_profession_id: 8, // Dorothy (Imagine)
             }),
@@ -832,32 +824,84 @@ mod tests {
         }
     }
 
+    // -- Scene, via EnterScene (issue #35) -----------------------------
+
+    /// Builds an `EnterScene` notify carrying exactly `attrs` on the scene
+    /// attr collection at field path `1.1`.
+    fn enter_scene_notify(attrs: Vec<pb::Attr>) -> Notify {
+        let msg = pb::EnterScene {
+            info: Some(pb::EnterSceneInfo {
+                attrs: Some(AttrCollection { uuid: 0, attrs }),
+            }),
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        Notify {
+            method_id: opcode::ENTER_SCENE,
+            payload,
+        }
+    }
+
+    /// The regression fixture: a real capture's `EnterScene` attr set
+    /// (`AttrSceneBasicId`/`AttrSceneChannel`/`AttrSceneUuid`/
+    /// `AttrSceneName`, ids 341/343/342/340), byte-for-byte as dumped
+    /// (issue #35). Only `AttrSceneBasicId`'s value (`8`, "Asterleeds" per
+    /// `tables::scene_name`) surfaces as a `Scene` event; the others —
+    /// including the string-valued `AttrSceneName` — must not corrupt the
+    /// result or panic.
     #[test]
-    fn missing_scene_data_produces_no_scene_event() {
-        let n = container_notify(pb::CharSerialize {
-            char_id: 1,
-            char_base: None,
-            scene_data: None,
-            profession_list: None,
-        });
+    fn enter_scene_attr_set_emits_a_single_scene_event() {
+        let attrs = vec![
+            pb::Attr {
+                id: 341, // AttrSceneBasicId
+                raw_data: vec![0x08],
+            },
+            pb::Attr {
+                id: 343, // AttrSceneChannel
+                raw_data: vec![0x01],
+            },
+            pb::Attr {
+                id: 342, // AttrSceneUuid
+                raw_data: vec![0x80, 0x80, 0x80, 0x80, 0x80, 0x81, 0x40],
+            },
+            pb::Attr {
+                id: 340, // AttrSceneName, length-prefixed UTF-8, not a varint
+                raw_data: vec![
+                    0x0f, 0xe9, 0x98, 0xbf, 0xe6, 0x96, 0xaf, 0xe7, 0x89, 0xb9, 0xe9, 0x87, 0x8c,
+                    0xe6, 0x96, 0xaf,
+                ],
+            },
+        ];
+        let n = enter_scene_notify(attrs);
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
-        assert!(!out.iter().any(|e| matches!(e, ProtocolEvent::Scene { .. })));
+        assert_eq!(out, vec![ProtocolEvent::Scene { level_map_id: 8 }]);
     }
 
     #[test]
-    fn zero_level_map_id_is_treated_as_absent() {
-        // level_map_id == 0 is proto3's unset-scalar wire value, indistinguishable
-        // from "not populated" — must not surface as a real scene id.
-        let n = container_notify(pb::CharSerialize {
-            char_id: 1,
-            char_base: None,
-            scene_data: Some(pb::SceneData { level_map_id: 0 }),
-            profession_list: None,
-        });
+    fn enter_scene_without_scene_basic_id_emits_no_scene_event() {
+        let attrs = vec![pb::Attr {
+            id: 343, // AttrSceneChannel only — no AttrSceneBasicId
+            raw_data: vec![0x01],
+        }];
+        let n = enter_scene_notify(attrs);
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
-        assert!(!out.iter().any(|e| matches!(e, ProtocolEvent::Scene { .. })));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn enter_scene_zero_level_map_id_is_treated_as_absent() {
+        // level_map_id == 0 is proto3's unset-scalar wire value, indistinguishable
+        // from "not populated" — must not surface as a real scene id.
+        let attrs = vec![pb::Attr {
+            id: 341, // AttrSceneBasicId
+            raw_data: vec![0x00],
+        }];
+        let n = enter_scene_notify(attrs);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.is_empty());
     }
 
     /// End-to-end through `Decoder::with_inspect_sink` + `push_stream`: a

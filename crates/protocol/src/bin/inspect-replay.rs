@@ -241,7 +241,7 @@ struct Histogram {
     undecodable: u64,
 }
 
-/// `true` for the four opcodes `decode::decode_notify` currently dispatches
+/// `true` for the five opcodes `decode::decode_notify` currently dispatches
 /// on; everything else (recognized service or not) is "not decoded".
 fn is_known_opcode(method_id: u32) -> bool {
     matches!(
@@ -250,6 +250,7 @@ fn is_known_opcode(method_id: u32) -> bool {
             | opcode::SYNC_CONTAINER_DATA
             | opcode::SYNC_NEAR_DELTA_INFO
             | opcode::SYNC_TO_ME_DELTA_INFO
+            | opcode::ENTER_SCENE
     )
 }
 

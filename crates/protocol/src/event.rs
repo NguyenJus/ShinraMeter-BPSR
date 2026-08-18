@@ -131,11 +131,14 @@ pub enum ProtocolEvent {
     Damage(DamageEvent),
     Player(PlayerInfo),
     EnemyHp(EnemyHp),
-    /// The dungeon/instance id, decoded from `CharSerialize.scene_data`
-    /// (issue #9 slice 2). `SocialData.scene_data`, the other path the
-    /// reference implementation reaches this through, is not wired up: the
-    /// decoder has no handler for `NotifySocialData`'s opcode today (see
-    /// `decode.rs`), and no capture is available here to learn it.
+    /// The dungeon/instance id (issue #9 slice 2), decoded from
+    /// `AttrSceneBasicId` on `WorldNtf.EnterScene`'s attr channel — see
+    /// `decode::on_enter_scene` and `attrs::attr_id::SCENE_BASIC_ID`.
+    ///
+    /// The originally-ported `CharSerialize.scene_data` path has been
+    /// **removed** (issue #35): a live capture proved it wrong for this
+    /// game build (zero messages anywhere matched `SceneData`'s shape),
+    /// and `EnterScene` is the verified source instead.
     Scene {
         level_map_id: u32,
     },
