@@ -268,8 +268,15 @@ fn install_panic_hook() {
         // whatever the platform layer last saw onto the same log line the
         // panic itself reaches. `last_oversize_proposal` is poison-safe and
         // never panics, so it's fine to call from inside a panic hook.
+        //
+        // The record is never cleared, so it can be arbitrarily stale by
+        // the time a panic reads it — a clamp from early in a multi-day
+        // session is not "before this panic" in any causal sense once an
+        // unrelated crash happens days later. `last_oversize_proposal`
+        // already prefixes its own age (e.g. "3d 4h ago"), so this line
+        // only reports what was seen, not when relative to the panic.
         if let Some(proposal) = crate::platform::last_oversize_proposal() {
-            log::error!("last oversize window proposal before this panic: {proposal}");
+            log::error!("{proposal}");
         }
         previous(info);
     }));

@@ -875,33 +875,70 @@ fn oversize_proposal_log(
 }
 
 /// Last oversize `WM_WINDOWPOSCHANGING` proposal `window_proc` clamped this
-/// session, formatted and ready to log — `None` until the first one happens.
-/// `install_panic_hook` in `logging.rs` reads this through
-/// [`last_oversize_proposal`] so a `Surface::configure` panic that follows a
-/// clamp still carries the context that led to it: the clamp is not the
-/// only path to an oversize surface, so the panic can still happen even
-/// after a proposal was countermanded (issue #119).
-#[cfg(windows)]
-static LAST_OVERSIZE_PROPOSAL: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
-    std::sync::OnceLock::new();
+/// session, paired with the `Instant` it was stored at — `None` until the
+/// first one happens. `install_panic_hook` in `logging.rs` reads this
+/// through [`last_oversize_proposal`] so a `Surface::configure` panic can
+/// still show the context that led to it: the clamp is not the only path to
+/// an oversize surface, so the panic can still happen even after a proposal
+/// was countermanded (issue #119). The `Instant` is what lets a reader tell
+/// a clamp from moments ago apart from one from days into a long-running
+/// session — this record is never cleared, so without an age a stale entry
+/// would read as if it just happened.
+///
+/// `#[cfg(any(windows, test))]` rather than plain `#[cfg(windows)]` so the
+/// store/read round trip and the poison-recovery path both have unit
+/// coverage on the ubuntu-only CI host — see the `tests` module below.
+#[cfg(any(windows, test))]
+static LAST_OVERSIZE_PROPOSAL: std::sync::OnceLock<
+    std::sync::Mutex<Option<(String, std::time::Instant)>>,
+> = std::sync::OnceLock::new();
 
-/// Records `message` as the most recent oversize proposal. Called from
-/// `window_proc`, which never has a reason to fail loudly here — losing this
-/// record would only make the *next* panic's diagnostics worse, not this
-/// call's own correctness — so a poisoned lock (some other panic already in
-/// flight) is recovered from rather than propagated.
-#[cfg(windows)]
+/// Records `message` as the most recent oversize proposal, timestamped
+/// `Instant::now()`. Called from `window_proc`, which never has a reason to
+/// fail loudly here — losing this record would only make the *next*
+/// panic's diagnostics worse, not this call's own correctness — so a
+/// poisoned lock (some other panic already in flight) is recovered from
+/// rather than propagated.
+#[cfg(any(windows, test))]
 fn store_last_oversize_proposal(message: String) {
     let lock = LAST_OVERSIZE_PROPOSAL.get_or_init(|| std::sync::Mutex::new(None));
     let mut guard = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = Some(message);
+    *guard = Some((message, std::time::Instant::now()));
+}
+
+/// Formats a duration as a short human-readable "ago" age, coarsest unit
+/// first (e.g. `"3d 4h"`, `"12m 5s"`), so a reader can judge at a glance
+/// whether a proposal is recent enough to be relevant to whatever panic it
+/// is being read alongside. Deliberately just two components — this is a
+/// diagnostic aid, not a precise clock.
+#[cfg(any(windows, test))]
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let minutes = (secs % 3_600) / 60;
+    let seconds = secs % 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 /// The last oversize proposal [`store_last_oversize_proposal`] recorded, if
-/// any. `logging.rs`'s panic hook calls this; see `LAST_OVERSIZE_PROPOSAL`'s
-/// doc comment for why it exists.
+/// any, formatted and ready to log with its age prefixed — e.g. `"last
+/// oversize window proposal (3d 4h ago): clamping an oversize window
+/// proposal: ..."`. `logging.rs`'s panic hook calls this; see
+/// `LAST_OVERSIZE_PROPOSAL`'s doc comment for why it exists. The age is
+/// computed fresh on every call (not at store time), since the gap that
+/// matters is between the clamp and *this* read, not the clamp and process
+/// start.
 ///
 /// Takes the lock without blocking, because a panic hook must never
 /// deadlock. `store_last_oversize_proposal` holds this lock across nothing
@@ -914,20 +951,28 @@ fn store_last_oversize_proposal(message: String) {
 /// recovered from for the same reason `store_last_oversize_proposal`
 /// recovers from one — the record is diagnostic, and a panic already in
 /// flight elsewhere is exactly when it is most worth reading.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub fn last_oversize_proposal() -> Option<String> {
     let lock = LAST_OVERSIZE_PROPOSAL.get_or_init(|| std::sync::Mutex::new(None));
-    match lock.try_lock() {
-        Ok(guard) => guard.clone(),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clone(),
-        Err(std::sync::TryLockError::WouldBlock) => None,
-    }
+    let guard = match lock.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    guard.as_ref().map(|(message, stored_at)| {
+        format!(
+            "last oversize window proposal ({} ago): {message}",
+            format_elapsed(stored_at.elapsed())
+        )
+    })
 }
 
-/// Stub for the non-Windows host build, which never installs `window_proc`
-/// and so never has a proposal to report; keeps `logging.rs` free of a
-/// hard Windows-only dependency.
-#[cfg(not(windows))]
+/// Stub for a non-Windows, non-test host build, which never installs
+/// `window_proc` and so never has a proposal to report; keeps `logging.rs`
+/// free of a hard Windows-only dependency. `cfg(not(any(windows, test)))`
+/// rather than `cfg(not(windows))` so this doesn't collide with the real
+/// definition above, which is also test-enabled on every host.
+#[cfg(not(any(windows, test)))]
 pub fn last_oversize_proposal() -> Option<String> {
     None
 }
@@ -1167,6 +1212,26 @@ unsafe extern "system" fn window_proc(
         // move/resize.
         let windowpos = unsafe { &mut *(lparam.0 as *mut WINDOWPOS) };
 
+        // Both branches below need the window's current on-screen rect,
+        // and neither of them changes it before the other runs: mutating
+        // `windowpos.cx`/`cy` in the oversize branch only edits the
+        // *proposed* `WINDOWPOS` in place, and nothing applies that
+        // proposal to the real window until this callback returns. So one
+        // `GetWindowRect` call, taken up front, is exactly as current for
+        // the snap-veto check below as a second call would be.
+        // SAFETY: `hwnd` is the window this subclass is installed on,
+        // alive and on the current thread for the duration of this
+        // callback; `current_rect` is a valid, correctly-sized out-param.
+        let mut current_rect = RECT::default();
+        let current_rect = unsafe { GetWindowRect(hwnd, &mut current_rect) }
+            .as_bool()
+            .then(|| Rect {
+                left: current_rect.left,
+                top: current_rect.top,
+                right: current_rect.right,
+                bottom: current_rect.bottom,
+            });
+
         // Cap the proposed size before anything else looks at
         // it. Unlike the Snap veto below this runs for *every* proposal,
         // app-driven ones included, because the renderer's limit is not a
@@ -1177,28 +1242,11 @@ unsafe extern "system" fn window_proc(
         {
             // Issue #119: this proposal is the crash's only lead, so gather
             // everything the next occurrence might need before it's gone.
-            // The snap-veto branch below makes its own `GetWindowRect` call
-            // after this one — it runs later and may run on a `windowpos`
-            // this branch has already mutated — so this can't reuse that
-            // call's result.
             // SAFETY: `hwnd` is the window this subclass is installed on,
             // alive and on the current thread for the duration of this
-            // callback; `current_rect` is a valid, correctly-sized
-            // out-param.
-            let mut current_rect = RECT::default();
-            let current = if unsafe { GetWindowRect(hwnd, &mut current_rect) }.as_bool() {
-                Some(Rect {
-                    left: current_rect.left,
-                    top: current_rect.top,
-                    right: current_rect.right,
-                    bottom: current_rect.bottom,
-                })
-            } else {
-                None
-            };
-            // SAFETY: same as above. A `0` return means the call failed,
-            // per `GetDpiForWindow`'s documented failure contract (also
-            // relied on by `reset_window`).
+            // callback. A `0` return means the call failed, per
+            // `GetDpiForWindow`'s documented failure contract (also relied
+            // on by `reset_window`).
             let dpi = unsafe { GetDpiForWindow(hwnd) };
             let dpi = (dpi != 0).then_some(dpi);
 
@@ -1211,7 +1259,7 @@ unsafe extern "system" fn window_proc(
                 },
                 (cx, cy),
                 windowpos.flags.0,
-                current,
+                current_rect,
                 dpi,
                 app_driven_reposition_active(),
             );
@@ -1236,26 +1284,19 @@ unsafe extern "system" fn window_proc(
             // where that is decides whether refusing is safe — see
             // `should_veto_snap` for the reasoning and for the residual
             // false-positive window this still leaves open.
-            // SAFETY: `hwnd` is the window this subclass is installed on,
-            // alive and on the current thread for the duration of this
-            // callback; `current` is a valid, correctly-sized out-param.
-            let mut current = RECT::default();
-            if !unsafe { GetWindowRect(hwnd, &mut current) }.as_bool() {
-                // Without the current rect there's no way to tell a veto
-                // from a stranding, and letting a Snap through is the
-                // cheaper mistake of the two.
-                log::warn!(
-                    "GetWindowRect failed in the Snap blocker; letting this reposition through"
-                );
-            } else {
-                let current = Rect {
-                    left: current.left,
-                    top: current.top,
-                    right: current.right,
-                    bottom: current.bottom,
-                };
-                if should_veto_snap(current, proposed, &enumerate_monitor_work_areas()) {
-                    windowpos.flags = windowpos.flags | SWP_NOMOVE | SWP_NOSIZE;
+            match current_rect {
+                None => {
+                    // Without the current rect there's no way to tell a
+                    // veto from a stranding, and letting a Snap through is
+                    // the cheaper mistake of the two.
+                    log::warn!(
+                        "GetWindowRect failed in the Snap blocker; letting this reposition through"
+                    );
+                }
+                Some(current) => {
+                    if should_veto_snap(current, proposed, &enumerate_monitor_work_areas()) {
+                        windowpos.flags = windowpos.flags | SWP_NOMOVE | SWP_NOSIZE;
+                    }
                 }
             }
         }
@@ -2375,6 +2416,68 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("dpi=<unavailable>"), "{message}");
+    }
+
+    // -- format_elapsed (issue #119) ---------------------------------------
+
+    #[test]
+    fn format_elapsed_reports_the_two_coarsest_units() {
+        assert_eq!(format_elapsed(std::time::Duration::from_secs(5)), "5s");
+        assert_eq!(format_elapsed(std::time::Duration::from_secs(65)), "1m 5s");
+        assert_eq!(
+            format_elapsed(std::time::Duration::from_secs(3_665)),
+            "1h 1m"
+        );
+        assert_eq!(
+            format_elapsed(std::time::Duration::from_secs(90_000)),
+            "1d 1h"
+        );
+    }
+
+    // -- LAST_OVERSIZE_PROPOSAL / last_oversize_proposal (issue #119) -----
+    //
+    // One test, not two: both cases share the same process-global
+    // `LAST_OVERSIZE_PROPOSAL`, and cargo runs `#[test]` fns concurrently
+    // by default, so splitting this into a round-trip test and a separate
+    // poison-recovery test would race on that global instead of exercising
+    // it deterministically.
+    #[test]
+    fn last_oversize_proposal_round_trips_and_survives_a_poisoned_lock() {
+        store_last_oversize_proposal("test proposal one".to_string());
+        let read = last_oversize_proposal().expect("a proposal was just stored");
+        assert!(
+            read.starts_with("last oversize window proposal ("),
+            "{read}"
+        );
+        assert!(read.contains("test proposal one"), "{read}");
+
+        // Poison the lock the way a real panic would: panic while holding
+        // the guard, on a call `catch_unwind` contains so the poisoning
+        // doesn't fail this test itself.
+        let lock = LAST_OVERSIZE_PROPOSAL.get_or_init(|| std::sync::Mutex::new(None));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.lock().unwrap();
+            panic!("deliberately poisoning the lock for a test");
+        }));
+        assert!(panicked.is_err());
+        assert!(lock.is_poisoned());
+
+        // The whole point of `PoisonError::into_inner` over `unwrap`/`?`
+        // here: the reader must recover the poisoned lock and still return
+        // the value stored before the poisoning, not panic or return
+        // `None`.
+        let read_after_poison = last_oversize_proposal()
+            .expect("poison recovery must still return the previously stored value");
+        assert!(
+            read_after_poison.contains("test proposal one"),
+            "{read_after_poison}"
+        );
+
+        // And a poisoned lock must not wedge future stores either.
+        store_last_oversize_proposal("test proposal two".to_string());
+        let read_final =
+            last_oversize_proposal().expect("store after recovering from a poison must work");
+        assert!(read_final.contains("test proposal two"), "{read_final}");
     }
 
     fn rect(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
