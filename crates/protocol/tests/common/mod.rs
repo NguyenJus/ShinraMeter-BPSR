@@ -177,7 +177,6 @@ pub fn sync_container_data_payload(
                 name: name.to_string(),
                 fight_point,
             }),
-            scene_data: None,
             profession_list: Some(pb::ProfessionList {
                 cur_profession_id: profession_id,
             }),

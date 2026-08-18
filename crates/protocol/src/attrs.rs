@@ -82,6 +82,29 @@ pub mod attr_id {
     /// and `pb::IMAGINE_PROFESSION_IDS`. Re-verify against a real capture if
     /// one ever becomes available.
     pub const SKILL_LEVEL_ID_LIST: i32 = 0x74;
+    /// `AttrSceneBasicId` (341, `0x155`) — the scene id `tables::scene_name`
+    /// is keyed by (issue #35, resolving its first item). Recovered by
+    /// parsing BPSR-ZDPS's `EAttrType` enum out of the reference tool's
+    /// .NET metadata; that same parse independently reproduced `NAME` (1),
+    /// `MONSTER_ID` (10), `PROFESSION_ID` (220, `0xDC`), `FIGHT_POINT`
+    /// (10030, `0x272E`), `HP` (11310), and `MAX_HP` (11320) byte-for-byte
+    /// against the constants already above, which is what makes this value
+    /// trustworthy rather than another unverified port. Confirmed against a
+    /// real capture: `AttrSceneBasicId`'s raw varint decoded to `8`, and
+    /// `tables.rs`'s `8 => "Asterleeds"` matches the reference tool's own
+    /// `SceneTable["8"].Name`.
+    ///
+    /// Rides `opcode::ENTER_SCENE`'s attr channel (`decode::on_enter_scene`),
+    /// not `SyncContainerData` — see `pb::CharSerialize`'s doc comment for
+    /// why the old `SceneData.level_map_id` path was removed.
+    ///
+    /// Four sibling ids from the same enum block are not modeled here
+    /// because nothing needs them yet: `AttrSceneName` (340, `0x154` — a
+    /// length-prefixed UTF-8 string, *not* a varint — do not decode it with
+    /// `decode_varint_*`), `AttrSceneUuid` (342, `0x156`, the per-instance
+    /// world uuid), `AttrSceneChannel` (343, `0x157`, the instance/channel
+    /// number), and `AttrSceneLevelId` (345, `0x159`).
+    pub const SCENE_BASIC_ID: i32 = 0x155;
 }
 
 /// protobuf varint → `u64`; `None` on empty/malformed input. The widest
@@ -304,6 +327,43 @@ pub fn enemy_hp_from_attrs(
         monster_id,
         timestamp_ms: now_ms,
     }
+}
+
+/// Reads `SCENE_BASIC_ID` off an `EnterScene` payload's attr list (issue
+/// #35). Empty `raw_data` and `id == 0` are skipped outright, same as
+/// `player_info_from_attrs`/`enemy_hp_from_attrs`; every other non-empty,
+/// nonzero id — including the string-valued `AttrSceneName` (340) — still
+/// reaches `sink` (tagged `known` only for `SCENE_BASIC_ID`) so slice A can
+/// surface the unmodeled scene attrs instead of them silently vanishing.
+///
+/// There is no entity uid for a scene attr (it isn't attached to any
+/// entity), so `sink.on_attr` is called with `uid = 0` — a scene event has
+/// no other identity to report it under.
+///
+/// A raw value of `0` is proto3's unset-scalar wire value, not a real scene
+/// id — treated as absent, matching `FIGHT_POINT`'s zero-is-absent rule
+/// above.
+pub fn scene_id_from_attrs(attrs: &[pb::Attr], sink: Option<&dyn InspectSink>) -> Option<u32> {
+    let mut scene_id = None;
+    for attr in attrs {
+        if attr.raw_data.is_empty() || attr.id == 0 {
+            continue;
+        }
+        if let Some(sink) = sink {
+            sink.on_attr(
+                0,
+                attr.id,
+                &attr.raw_data,
+                attr.id == attr_id::SCENE_BASIC_ID,
+            );
+        }
+        if attr.id == attr_id::SCENE_BASIC_ID
+            && let Some(v) = decode_varint_u32(&attr.raw_data).filter(|&v| v > 0)
+        {
+            scene_id = Some(v);
+        }
+    }
+    scene_id
 }
 
 #[cfg(test)]
