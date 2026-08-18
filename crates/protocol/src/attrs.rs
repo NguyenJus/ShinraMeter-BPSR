@@ -350,12 +350,17 @@ pub fn scene_id_from_attrs(attrs: &[pb::Attr], sink: Option<&dyn InspectSink>) -
             continue;
         }
         if let Some(sink) = sink {
-            sink.on_attr(0, attr.id, &attr.raw_data, attr.id == attr_id::SCENE_BASIC_ID);
+            sink.on_attr(
+                0,
+                attr.id,
+                &attr.raw_data,
+                attr.id == attr_id::SCENE_BASIC_ID,
+            );
         }
-        if attr.id == attr_id::SCENE_BASIC_ID {
-            if let Some(v) = decode_varint_u32(&attr.raw_data).filter(|&v| v > 0) {
-                scene_id = Some(v);
-            }
+        if attr.id == attr_id::SCENE_BASIC_ID
+            && let Some(v) = decode_varint_u32(&attr.raw_data).filter(|&v| v > 0)
+        {
+            scene_id = Some(v);
         }
     }
     scene_id

@@ -904,6 +904,41 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    /// Two `AttrSceneBasicId` attrs in one `EnterScene` attr collection: the
+    /// implementation doesn't dedupe by id, it just keeps overwriting as it
+    /// walks the list, so whichever valid value comes last in `attrs` wins.
+    #[test]
+    fn enter_scene_duplicate_scene_basic_id_attrs_keeps_the_last_valid_value() {
+        let attrs = vec![
+            pb::Attr {
+                id: 341, // AttrSceneBasicId
+                raw_data: vec![0x05],
+            },
+            pb::Attr {
+                id: 341, // AttrSceneBasicId, again — this one should win
+                raw_data: vec![0x08],
+            },
+        ];
+        let n = enter_scene_notify(attrs);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out, vec![ProtocolEvent::Scene { level_map_id: 8 }]);
+    }
+
+    #[test]
+    fn enter_scene_malformed_scene_basic_id_varint_emits_no_scene_event() {
+        // A truncated varint: the continuation bit is set but there's no
+        // following byte, so `decode_varint_u32` returns `None`.
+        let attrs = vec![pb::Attr {
+            id: 341, // AttrSceneBasicId
+            raw_data: vec![0x80],
+        }];
+        let n = enter_scene_notify(attrs);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.is_empty());
+    }
+
     /// End-to-end through `Decoder::with_inspect_sink` + `push_stream`: a
     /// Notify on an unrecognized service uuid is observed via the sink and
     /// still produces no `ProtocolEvent`s.
