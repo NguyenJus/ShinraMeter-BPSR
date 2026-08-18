@@ -738,6 +738,50 @@ fn app_driven_reposition_active() -> bool {
 static APP_DRIVEN_REPOSITION_DEPTH: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Largest window extent, in physical pixels, the overlay can be allowed to
+/// reach on either axis.
+///
+/// This is not a taste decision, it is the renderer's hard limit. egui-wgpu
+/// asks for a device with `max_texture_dimension_2d: 8192` (see
+/// `egui_wgpu::WgpuSetupCreateNew::default`'s `device_descriptor`, which
+/// `main.rs`'s issue #89 DirectComposition setup leaves untouched), and
+/// `Surface::configure` validates the swapchain against exactly that. wgpu
+/// handles validation errors as fatal by default, so a window even one pixel
+/// past this is not a rendering glitch — it is an immediate process-wide
+/// panic on the next resize:
+///
+/// ```text
+/// In Surface::configure
+///   `Surface` width and height must be within the maximum supported texture
+///   size. Requested was (460, 32767), maximum extent for either dimension is 8192.
+/// ```
+///
+/// 8192 comfortably clears any real display (an 8K panel is 7680 wide), so
+/// clamping here costs nothing a user could ever want.
+#[cfg(any(windows, test))]
+const MAX_WINDOW_EXTENT_PX: i32 = 8192;
+
+/// The size a `WM_WINDOWPOSCHANGING` proposal has to be countermanded to, or
+/// `None` when it already fits inside `MAX_WINDOW_EXTENT_PX` and should be
+/// passed through untouched.
+///
+/// `window_proc` applies this to every proposal that isn't `SWP_NOSIZE`,
+/// whoever raised it — the overlay's own resize gesture, winit, the shell, or
+/// an external `MoveWindow`/`SetWindowPos` from another process (which is how
+/// the 32767 in the doc comment above was actually reached: Win32 clamps a
+/// window's width/height to `SHRT_MAX`, so an oversize external request comes
+/// back through `WM_SIZE` as exactly 32767 and eframe feeds that straight into
+/// `Surface::configure`). `WM_WINDOWPOSCHANGING` is the one seam this process
+/// owns that every one of those paths passes through.
+///
+/// Pure integer geometry, no windows-crate types, so it is unit-testable off
+/// Windows like the rest of this module's helpers.
+#[cfg(any(windows, test))]
+fn clamped_window_extent(cx: i32, cy: i32) -> Option<(i32, i32)> {
+    let clamped = (cx.min(MAX_WINDOW_EXTENT_PX), cy.min(MAX_WINDOW_EXTENT_PX));
+    (clamped != (cx, cy)).then_some(clamped)
+}
+
 /// Tolerance, in physical pixels, when matching a proposed rect against a
 /// monitor-half/quarter/full shape in `is_snap_shaped`. Windows computes
 /// snap rects by splitting the work area's width/height, which can land a
@@ -964,18 +1008,37 @@ unsafe extern "system" fn window_proc(
         WM_WINDOWPOSCHANGING,
     };
 
-    if msg == WM_WINDOWPOSCHANGING && !app_driven_reposition_active() {
+    if msg == WM_WINDOWPOSCHANGING {
         // SAFETY: for `WM_WINDOWPOSCHANGING`, `lparam` is a valid pointer
         // to a `WINDOWPOS` the sender owns for the duration of this call;
         // mutating it in place before forwarding to `DefSubclassProc` is
         // exactly how a handler is meant to countermand a proposed
         // move/resize.
         let windowpos = unsafe { &mut *(lparam.0 as *mut WINDOWPOS) };
+
+        // Cap the proposed size before anything else looks at
+        // it. Unlike the Snap veto below this runs for *every* proposal,
+        // app-driven ones included, because the renderer's limit is not a
+        // policy about who asked — a swapchain wider or taller than
+        // `MAX_WINDOW_EXTENT_PX` is fatal whatever moved the window.
+        if (windowpos.flags & SWP_NOSIZE).0 == 0
+            && let Some((cx, cy)) = clamped_window_extent(windowpos.cx, windowpos.cy)
+        {
+            log::warn!(
+                "clamping an oversize window proposal ({}x{}) to {cx}x{cy}; \
+                 the renderer cannot present a surface larger than {MAX_WINDOW_EXTENT_PX}px",
+                windowpos.cx,
+                windowpos.cy
+            );
+            windowpos.cx = cx;
+            windowpos.cy = cy;
+        }
+
         // If the proposal is already pinned on move and/or size, it isn't
         // a full move+resize and so can't be a snap shape (Snap always
         // both moves and resizes) — nothing to veto.
         let already_pinned = (windowpos.flags & (SWP_NOMOVE | SWP_NOSIZE)).0 != 0;
-        if !already_pinned {
+        if !already_pinned && !app_driven_reposition_active() {
             let proposed = Rect {
                 left: windowpos.x,
                 top: windowpos.y,
@@ -1942,6 +2005,58 @@ mod tests {
     fn unchanged_when_maximize_box_already_absent() {
         let style = WS_POPUP | WS_VISIBLE | WS_THICKFRAME;
         assert_eq!(without_maximize_box(style), style);
+    }
+
+    /// The crash this exists to stop: an external `MoveWindow` (the uidbg
+    /// harness, a window manager, anything) asks for a window taller than
+    /// Win32 will grant, Win32 clamps the height to `SHRT_MAX`, and the
+    /// 32767px swapchain that follows blows past egui-wgpu's 8192
+    /// `max_texture_dimension_2d` and panics inside `Surface::configure`.
+    #[test]
+    fn an_i16_max_height_proposal_is_clamped_to_what_the_renderer_can_present() {
+        assert_eq!(
+            clamped_window_extent(460, i32::from(i16::MAX)),
+            Some((460, MAX_WINDOW_EXTENT_PX))
+        );
+    }
+
+    #[test]
+    fn an_oversize_width_is_clamped_on_its_own_axis() {
+        assert_eq!(
+            clamped_window_extent(40_000, 420),
+            Some((MAX_WINDOW_EXTENT_PX, 420))
+        );
+    }
+
+    #[test]
+    fn both_axes_clamp_together() {
+        assert_eq!(
+            clamped_window_extent(i32::MAX, i32::MAX),
+            Some((MAX_WINDOW_EXTENT_PX, MAX_WINDOW_EXTENT_PX))
+        );
+    }
+
+    /// Anything the renderer can actually present has to pass through
+    /// untouched, so the clamp never perturbs an ordinary move/resize —
+    /// including a window sized exactly at the limit.
+    #[test]
+    fn a_presentable_size_is_left_alone() {
+        for (cx, cy) in [
+            (460, 420),
+            (1, 1),
+            (MAX_WINDOW_EXTENT_PX, MAX_WINDOW_EXTENT_PX),
+        ] {
+            assert_eq!(clamped_window_extent(cx, cy), None, "{cx}x{cy}");
+        }
+    }
+
+    /// Win32 uses non-positive extents in some proposals (and an
+    /// `SWP_NOSIZE` proposal leaves the fields meaningless entirely); this
+    /// is a ceiling only, so it must not invent a floor of its own —
+    /// minimum sizing is `MIN_INNER_SIZE`'s job, over in `ui.rs`.
+    #[test]
+    fn a_non_positive_extent_is_not_the_clamps_business() {
+        assert_eq!(clamped_window_extent(0, -1), None);
     }
 
     fn rect(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
