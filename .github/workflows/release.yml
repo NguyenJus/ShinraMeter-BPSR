@@ -17,7 +17,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    timeout-minutes: 30
+    # Generous on purpose. This cap wraps the toolchain install (bounded at 15
+    # minutes by the step below), rustup, a cross-compile of a 468-crate
+    # dependency tree that may miss the rust-cache entirely, packaging, and the
+    # upload. The last release run took 6m45s end to end with a 6m01s cargo
+    # build and a rust-cache restore that completed in 2s (i.e. essentially
+    # cold), so ~22 minutes is the plausible bad-day sum — but that is an
+    # estimate built on one observation, not a measured worst case, so this
+    # leaves roughly 2.5x on top of it. A killed release job is worse than a
+    # killed CI job: the tag is already pushed and the whole thing needs a
+    # manual re-trigger. Still 6x below the 360-minute default, so a genuinely
+    # wedged job cannot sit here for hours.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       # Same composite action as CI, so a tag build can never diverge from the

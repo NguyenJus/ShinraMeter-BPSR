@@ -33,6 +33,19 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      # clippy and build-windows deliberately restore this cache independently
+      # rather than serialising behind a shared "populate" job. On a key miss
+      # both run the download path concurrently, which is real duplicated work
+      # — and misses are now routine rather than rare, because the key carries
+      # the runner image version and so rotates whenever GitHub rebuilds the
+      # image (roughly weekly). The trade is still lopsided: a miss costs ~15s
+      # of apt download in each job, while a `needs:` on a populate job would
+      # add that job's whole startup (~16s end to end for a trivial job here,
+      # measured on `fmt`) to the critical path of *every* run, hits included,
+      # and the two consumers would still each run their own cache restore.
+      # Revisit if the package set grows large enough that the download stops
+      # being seconds, if mirror flakiness starts failing jobs outright, or if
+      # a third consumer appears.
       - name: Install the mingw-w64 cross-toolchain
         uses: ./.github/actions/mingw-w64-toolchain
         timeout-minutes: 15
@@ -50,6 +63,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      # Restores the same cache as `clippy`, independently and in parallel; see
+      # the note there for why the duplicated download on a miss is accepted.
       - name: Install the mingw-w64 cross-toolchain
         uses: ./.github/actions/mingw-w64-toolchain
         timeout-minutes: 15

@@ -18,7 +18,18 @@ runs:
   using: composite
   steps:
     # The key pins everything that can change the bytes of the .debs: the
-    # runner's OS release and architecture, and the requested package set.
+    # runner image build, the runner's OS release and architecture, and the
+    # requested package set.
+    #
+    # ImageOS/ImageVersion (e.g. `ubuntu24` / `20260810.271`) are the rotation
+    # signal. Without them the key would be stable for the whole life of an
+    # Ubuntu release while apt mirrors ship point updates continuously, so a
+    # populated entry would serve the same .debs indefinitely — the Verify step
+    # only checks each binary runs, never which version it is. Runner images
+    # are rebuilt roughly weekly, which re-fetches the toolchain at that
+    # cadence and costs no network call on a hit. Both variables are exported
+    # by the GitHub-hosted runner itself, so reading them is free.
+    #
     # There are deliberately no `restore-keys` — a near-miss restore would
     # hand the build a partial dependency closure, and a toolchain that is
     # silently missing a binary is worse than one that is plainly absent.
@@ -32,8 +43,18 @@ runs:
         packages=${packages% }
         . /etc/os-release
         digest=$(printf '%s' "$packages" | sha256sum | cut -c1-16)
+        image="${ImageOS:-}-${ImageVersion:-}"
+        if [[ "$image" == "-" ]]; then
+          # Not a GitHub-hosted runner, or the variables were dropped. Emitting
+          # an empty segment here would collapse two different images onto one
+          # key and reintroduce exactly the staleness the segment exists to
+          # prevent, so fall back to a per-run sentinel instead: the entry is
+          # then never reused, leaving the job correct but uncached.
+          echo "::warning::ImageOS/ImageVersion are unset; the toolchain cache is disabled for this run"
+          image="norotate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        fi
         echo "packages=$packages" >> "$GITHUB_OUTPUT"
-        echo "key=mingw-apt-v1-${RUNNER_OS}-${ID}-${VERSION_ID}-${RUNNER_ARCH}-${digest}" >> "$GITHUB_OUTPUT"
+        echo "key=mingw-apt-v2-${RUNNER_OS}-${ID}-${VERSION_ID}-${RUNNER_ARCH}-${image}-${digest}" >> "$GITHUB_OUTPUT"
 
     - id: cache
       uses: actions/cache@v4
@@ -41,6 +62,32 @@ runs:
         path: ${{ runner.temp }}/mingw-apt
         key: ${{ steps.plan.outputs.key }}
 
+    # Time budget. Every network call below is bounded, and the bounds are
+    # chosen so the action's own worst case finishes well inside the
+    # `timeout-minutes: 15` the call sites put on this step — otherwise GitHub
+    # force-kills the step with a generic timeout and the crafted `::error::`
+    # messages below are never seen. Worst case, in seconds:
+    #
+    #   download   3 attempts x (40 update + 75 fetch)          = 345
+    #              backoff between attempts (10 + 20; none
+    #              after the final attempt)                     =  30
+    #   install    dpkg, offline                                =  60
+    #              apt fallback (40 update + 75 fix-broken
+    #              + 75 install)                                = 190
+    #   verify     4 tools x 10                                 =  40
+    #                                                            -----
+    #                                                             665s = 11m05s
+    #
+    # leaving ~4 minutes inside the 15-minute cap for the cache restore and
+    # per-step overhead. For scale, the whole cold path was measured at ~20s,
+    # so each individual bound is several times the observed cost and the
+    # retries absorb a slow mirror rather than a broken one.
+    #
+    # (GitHub does not reliably enforce `timeout-minutes` on a step that runs a
+    # composite action; the job-level cap is the guaranteed backstop. That
+    # makes this internal budget the thing that actually produces a clean
+    # failure, not a nicety.)
+    #
     # `install --download-only` resolves and fetches the requested packages
     # *and* every dependency the runner image does not already have, so the
     # cached directory is the complete closure for this image.
@@ -62,20 +109,23 @@ runs:
           -o Acquire::http::Timeout=20
           -o Acquire::https::Timeout=20
         )
+        attempts=3
         downloaded=no
-        for attempt in 1 2 3; do
-          if sudo timeout 90 apt-get "${opts[@]}" update \
-            && sudo timeout 180 apt-get "${opts[@]}" install --download-only -y "${pkgs[@]}"; then
+        for attempt in $(seq 1 "$attempts"); do
+          if sudo timeout 40 apt-get "${opts[@]}" update \
+            && sudo timeout 75 apt-get "${opts[@]}" install --download-only -y "${pkgs[@]}"; then
             downloaded=yes
             break
           fi
-          echo "::warning::apt attempt ${attempt} failed or timed out; retrying"
+          echo "::warning::apt attempt ${attempt} of ${attempts} failed or timed out"
           sudo rm -rf /var/lib/apt/lists/partial "$ARCHIVES/partial"
           mkdir -p "$ARCHIVES/partial"
-          sleep $((attempt * 10))
+          if (( attempt < attempts )); then
+            sleep $((attempt * 10))
+          fi
         done
         if [[ "$downloaded" != yes ]]; then
-          echo "::error::could not download the mingw-w64 packages after 3 bounded attempts"
+          echo "::error::could not download the mingw-w64 packages after ${attempts} bounded attempts"
           exit 1
         fi
         sudo chown -R "$(id -u):$(id -g)" "$ARCHIVES"
@@ -100,11 +150,14 @@ runs:
           echo "::error::no .deb files were restored or downloaded"
           exit 1
         fi
-        if ! sudo dpkg --install "${debs[@]}"; then
+        if ! sudo timeout 60 dpkg --install "${debs[@]}"; then
           echo "::warning::the cached packages did not satisfy their dependencies; falling back to apt"
-          sudo timeout 90 apt-get update || true
-          sudo timeout 300 apt-get --fix-broken install -y
-          sudo timeout 300 apt-get install -y "${pkgs[@]}"
+          sudo timeout 40 apt-get update || true
+          if ! sudo timeout 75 apt-get --fix-broken install -y \
+            || ! sudo timeout 75 apt-get install -y "${pkgs[@]}"; then
+            echo "::error::the cached packages were unusable and the apt fallback did not complete in its budget"
+            exit 1
+          fi
         fi
 
     # A cache hit must leave a genuinely usable toolchain, so assert the exact
@@ -116,6 +169,9 @@ runs:
       run: |
         set -euo pipefail
         for tool in gcc windres objdump ar; do
-          "x86_64-w64-mingw32-${tool}" --version > /dev/null
+          if ! timeout 10 "x86_64-w64-mingw32-${tool}" --version > /dev/null; then
+            echo "::error::x86_64-w64-mingw32-${tool} is missing or does not run"
+            exit 1
+          fi
         done
         echo "mingw-w64 cross-toolchain ready (gcc $(x86_64-w64-mingw32-gcc -dumpversion))"
