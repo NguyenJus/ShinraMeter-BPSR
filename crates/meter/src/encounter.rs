@@ -309,6 +309,14 @@ impl Meter {
             }
             ProtocolEvent::EnemyHp(e) => self.apply_enemy_hp(e),
             ProtocolEvent::Scene { level_map_id } => {
+                // Sparse, transition-only diagnostic (issue #69): a scene
+                // sync packet can repeat while the player stays in the same
+                // instance, so log only when the resolved id actually
+                // changes — never per packet, which would just be a smaller
+                // version of the #87 flood this exists to avoid.
+                if let Some(msg) = scene_transition_log(self.scene_id, Some(*level_map_id)) {
+                    log::info!("{msg}");
+                }
                 self.scene_id = Some(*level_map_id);
                 None
             }
@@ -316,6 +324,9 @@ impl Meter {
                 self.reset(ResetReason::ServerChange, *timestamp_ms);
                 self.enemies.clear();
                 self.boss_uid = None;
+                if let Some(msg) = scene_transition_log(self.scene_id, None) {
+                    log::info!("{msg}");
+                }
                 self.scene_id = None;
                 Some(ResetReason::ServerChange)
             }
@@ -613,6 +624,7 @@ impl Meter {
     ///
     /// An enemy with no HP of either kind is unrankable and stays out.
     fn recompute_boss(&mut self) {
+        let previous_boss_uid = self.boss_uid;
         self.boss_uid = self
             .enemies
             .iter()
@@ -627,13 +639,32 @@ impl Meter {
             })
             .max_by_key(|(uid, recognized, tier, hp)| (*recognized, *tier, *hp, *uid))
             .map(|(uid, _, _, _)| uid);
+
+        // Sparse, transition-only diagnostic (issue #69): `recompute_boss`
+        // runs on every damage/enemy-hp event, so this must only log when
+        // the winner actually changes — logging every call would reproduce
+        // the #87 flood at boss-target granularity instead of attr-id
+        // granularity.
+        if self.boss_uid != previous_boss_uid {
+            let monster_id = self
+                .boss_uid
+                .and_then(|uid| self.enemies.get(&uid))
+                .and_then(|e| e.monster_id);
+            if let Some(msg) = boss_transition_log(previous_boss_uid, self.boss_uid, monster_id) {
+                log::info!("{msg}");
+            }
+        }
     }
 
     /// Clears `players` and per-enemy `lowest_pct`; keeps `names`. Deaths
     /// are per-encounter (issue #49): `players.clear()` drops the whole
     /// `PlayerStats` entry per uid, taking `deaths`/`last_death_ms` with it,
     /// so no separate clearing step is needed here.
-    pub fn reset(&mut self, _reason: ResetReason, now_ms: u64) {
+    pub fn reset(&mut self, reason: ResetReason, now_ms: u64) {
+        // `reset` is itself already an event, never a per-snapshot poll, so
+        // this is naturally sparse (issue #69) — no transition-only guard
+        // needed the way scene/boss logging above requires one.
+        log::info!("encounter: reset reason={reason:?}");
         self.players.clear();
         for enemy in self.enemies.values_mut() {
             enemy.lowest_pct = None;
@@ -746,6 +777,59 @@ impl Meter {
     pub fn is_active(&self) -> bool {
         self.fight_start_ms.is_some()
     }
+}
+
+/// Builds the "scene changed" diagnostic line (issue #69), or `None` when
+/// `new_scene_id` matches `previous` — the transition-only guard that keeps
+/// this out of the #87-style flood. `new_scene_id` is `Option<u32>` so this
+/// can also represent a clear-to-`None` transition (the `ServerChanged` arm
+/// of `Meter::apply`, mirroring how [`boss_transition_log`] handles a
+/// cleared boss target) rather than only ever moving between two concrete
+/// scenes. Split out from `Meter::apply` as a pure function so the decision
+/// (log or not, and what) is unit-testable without a log-capturing harness.
+fn scene_transition_log(previous: Option<u32>, new_scene_id: Option<u32>) -> Option<String> {
+    if previous == new_scene_id {
+        return None;
+    }
+    Some(match new_scene_id {
+        None => "encounter: scene cleared".to_string(),
+        Some(id) => match tables::scene_name(id) {
+            Some(name) => format!("encounter: scene changed to id={id} name={name}"),
+            None => format!("encounter: scene changed to id={id} name=<unresolved>"),
+        },
+    })
+}
+
+/// Builds the "boss target changed" diagnostic line (issue #69), or `None`
+/// when `new_uid` matches `previous_uid` — `recompute_boss` runs on every
+/// damage/enemy-hp event, so without this guard the line would reproduce
+/// the #87 flood at boss-target granularity. Pure, like
+/// [`scene_transition_log`], for the same testability reason.
+fn boss_transition_log(
+    previous_uid: Option<i64>,
+    new_uid: Option<i64>,
+    monster_id: Option<u32>,
+) -> Option<String> {
+    if previous_uid == new_uid {
+        return None;
+    }
+    Some(match new_uid {
+        None => "encounter: boss target cleared".to_string(),
+        Some(uid) => match monster_id {
+            Some(id) => {
+                let recognized = tables::is_boss_monster(id);
+                match tables::monster_name(id) {
+                    Some(name) => format!(
+                        "encounter: boss target changed to uid={uid} monster_id={id} recognized_boss={recognized} name={name}"
+                    ),
+                    None => format!(
+                        "encounter: boss target changed to uid={uid} monster_id={id} recognized_boss={recognized} name=<unresolved>"
+                    ),
+                }
+            }
+            None => format!("encounter: boss target changed to uid={uid} monster_id=<unknown>"),
+        },
+    })
 }
 
 impl Default for Meter {
@@ -2228,6 +2312,79 @@ mod tests {
             let snap = m.snapshot(1000);
             assert_eq!(snap.encounter.scene_id, Some(999_999));
             assert_eq!(snap.encounter.scene_name, None);
+        }
+    }
+
+    /// issue #69: `scene_transition_log`/`boss_transition_log` are the pure
+    /// decision functions behind `Meter::apply`'s and `recompute_boss`'s
+    /// sparse diagnostics. Tested directly (rather than by capturing actual
+    /// `log::info!` output, which this workspace has no harness for) so
+    /// "logs on change, silent on repeat" is asserted without needing one.
+    mod diagnostics {
+        use super::*;
+
+        #[test]
+        fn scene_transition_log_fires_only_when_the_id_changes() {
+            assert!(scene_transition_log(None, Some(8)).is_some());
+            assert!(scene_transition_log(Some(8), Some(8)).is_none());
+            assert!(scene_transition_log(Some(8), Some(9)).is_some());
+            // Scene clearing (a real transition, e.g. on `ServerChanged`) still logs.
+            assert!(scene_transition_log(Some(8), None).is_some());
+            // No-op stays silent even when both sides are already empty.
+            assert!(scene_transition_log(None, None).is_none());
+        }
+
+        #[test]
+        fn scene_transition_log_reports_the_resolved_name_or_says_it_did_not_resolve() {
+            let msg = scene_transition_log(None, Some(8)).unwrap();
+            assert!(msg.contains("id=8"));
+            assert!(msg.contains("Asterleeds"));
+
+            let msg = scene_transition_log(None, Some(999_999)).unwrap();
+            assert!(msg.contains("id=999999"));
+            assert!(msg.contains("<unresolved>"));
+        }
+
+        #[test]
+        fn scene_transition_log_reports_a_clear() {
+            let msg = scene_transition_log(Some(8), None).unwrap();
+            assert!(msg.contains("cleared"));
+        }
+
+        #[test]
+        fn boss_transition_log_fires_only_when_the_uid_changes() {
+            assert!(boss_transition_log(None, Some(10), Some(103)).is_some());
+            assert!(boss_transition_log(Some(10), Some(10), Some(103)).is_none());
+            assert!(boss_transition_log(Some(10), Some(11), Some(103)).is_some());
+            // Boss target clearing (a real transition) still logs.
+            assert!(boss_transition_log(Some(10), None, None).is_some());
+            // No-op stays silent even when both sides are already empty.
+            assert!(boss_transition_log(None, None, None).is_none());
+        }
+
+        #[test]
+        fn boss_transition_log_reports_recognition_and_the_resolved_name() {
+            // Recognized boss id with a catalogued name.
+            let msg = boss_transition_log(None, Some(10), Some(103)).unwrap();
+            assert!(msg.contains("monster_id=103"));
+            assert!(msg.contains("recognized_boss=true"));
+            assert!(msg.contains("name=Rathalos"));
+
+            // A monster id outside the boss table: recognized_boss=false,
+            // name still resolved if catalogued (boss_monster_id itself is
+            // real data regardless of recognition — see `EncounterInfo`'s
+            // doc comment).
+            let msg = boss_transition_log(None, Some(10), Some(10_900)).unwrap();
+            assert!(msg.contains("recognized_boss=false"));
+
+            // Unknown monster id entirely.
+            let msg = boss_transition_log(None, Some(10), None).unwrap();
+            assert!(msg.contains("uid=10"));
+            assert!(msg.contains("monster_id=<unknown>"));
+
+            // Boss target cleared.
+            let msg = boss_transition_log(Some(10), None, None).unwrap();
+            assert!(msg.contains("cleared"));
         }
     }
 }
