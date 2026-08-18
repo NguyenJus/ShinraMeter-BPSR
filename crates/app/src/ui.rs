@@ -259,7 +259,7 @@ const DEMO_ROWS: [(&str, Class, i64, f32, u32); 5] = [
 ];
 
 /// The synthetic snapshot `demo_enabled` seeds the overlay with. Values
-/// chosen to render as "2:39", "188M/s", and "30.1B" — the same duration,
+/// chosen to render as "2:39", "188.0M/s", and "30.10B" — the same duration,
 /// DPS, and total-damage figures shown in `docs/reference/new-shinra-ex.webp`
 /// — plus `DEMO_ROWS`'s per-row damage/crit% pairs, so a demo-mode capture
 /// can be compared directly against that reference.
@@ -717,11 +717,11 @@ fn draw_header(
         stat_pill(
             ui,
             StatPill::header(
-                &format!("{}/s", fmt_dps(snapshot.total_dps as i64)),
+                &format!("{}/s", fmt_short(snapshot.total_dps as i64)),
                 icons.glyphs.get(GlyphIcon::Speed).map(|t| t.id()),
             ),
         );
-        // Total damage for the fight (reference render's e.g. "30.1B"). The
+        // Total damage for the fight (reference render's e.g. "30.10B"). The
         // heart icon is the reference's own choice of glyph here; despite it
         // this is `snapshot.total_damage` and nothing else — there is no
         // party-HP figure anywhere in this codebase.
@@ -1314,7 +1314,7 @@ struct StatPill<'a> {
     icon_color: egui::Color32,
     /// Icon before the value instead of after it. Every header pill —
     /// timer, DPS and damage alike — reads value-then-icon, matching the
-    /// reference render's `02:39 ⏱ | 188M/s ☁ | 30.1B ♡`; only issue #49's
+    /// reference render's `02:39 ⏱ | 188.0M/s ☁ | 30.10B ♡`; only issue #49's
     /// per-row death counter reads icon-then-value (skull, then count).
     icon_first: bool,
     /// Per-corner radius. Every pill is a full oval — all four corners at
@@ -2807,7 +2807,7 @@ pub fn column_anchors(
 /// row is wide enough to hold every column at full width; in a narrower row
 /// `column_anchors` scales those gaps down (see there), and clipping to a
 /// scaled gap would cut ordinary in-range values short — right-aligned text
-/// is clipped from the *left*, so a clipped `1000.0K` reads as a smaller
+/// is clipped from the *left*, so a clipped `99.99K` reads as a smaller
 /// number rather than as damage. In that compressed case the slots overlap
 /// and an overflowing value can bleed into its neighbor, which is exactly
 /// what a too-narrow window did before any clipping existed; visible
@@ -3357,17 +3357,70 @@ fn row_name(row: &PlayerRow) -> String {
     }
 }
 
-/// Compact damage abbreviation: `999`, `1.0K`, `1.2M`, `1.0B`.
+/// Compact damage/DPS abbreviation (issue #118): `999`, `1.23K`, `12.34K`,
+/// `123.4K`, `1.23M`, `1000K`. Below 1000 raw the value is left as a plain
+/// integer — no suffix, no decimals. At or above 1000 it is scaled by
+/// K/M/B as usual, and the *scaled* value's own magnitude then picks the
+/// decimal count so the digit run stays ~4 significant figures without
+/// ever growing wider than the Dps/Damage columns budget for: 2 decimals
+/// below 100 (`1.23K`), 1 decimal below 1000 (`123.4K`), 0 decimals at or
+/// above 1000 (`1000K`).
+///
+/// The 2- and 1-decimal bands are *truncated*, not rounded, to that
+/// precision: e.g. a raw scaled value of `123.456` prints `"123.4"`, not
+/// the `"123.5"` a naive `{:.1}` would round it to. Rust's `{:.N}` format
+/// specifier rounds, so it is deliberately not used for those two bands —
+/// truncating instead is what keeps a value's digit run stable as it
+/// crosses a decimal-of-precision's worth of noise, and matches this
+/// function's own reference table exactly (issue #118's `12345 ->
+/// "12.34K"`, not `"12.35K"`).
+///
+/// The coarsest, 0-decimal band is the one exception: reaching it still
+/// rounds, because that's the only band whose *threshold itself* is
+/// decided by rounding. A scaled value in `[999.5, 1000)` (e.g. `999.95`,
+/// issue #118's `999_950 -> "1000K"`) is close enough to the next full
+/// order of magnitude that showing its truncated 1-decimal form
+/// (`"999.9K"`) would read as more precise than it is — rounding the whole
+/// value to the nearest integer first, and taking the 0-decimal band
+/// whenever *that* reaches `1000`, is what escalates it to `"1000K"`
+/// instead. Every arithmetic step here is exact integer division (`u128`,
+/// to leave headroom for `av * 100` without overflow) rather than `f64`:
+/// floating-point division of an exact decimal like `12345.0 / 1000.0`
+/// does not always land on the exact decimal `12.345`, so an
+/// integer-vs-integer comparison replaces what would otherwise be a
+/// binary-representation-dependent truncation.
 pub fn fmt_short(v: i64) -> String {
     let sign = if v < 0 { "-" } else { "" };
     let av = v.unsigned_abs();
 
+    fn scaled(sign: &str, av: u64, divisor: u64, suffix: &str) -> String {
+        let av = av as u128;
+        let divisor = divisor as u128;
+
+        // Round `av / divisor` to the nearest whole number (round-half-up;
+        // `av` and `divisor` are both non-negative, and every divisor here
+        // is even, so `divisor / 2` is exact) to decide whether the value
+        // has effectively reached the next full order of magnitude.
+        let rounded_ones = (av + divisor / 2) / divisor;
+        if rounded_ones >= 1000 {
+            return format!("{sign}{rounded_ones}{suffix}");
+        }
+
+        if av >= 100 * divisor {
+            let tenths = (av * 10) / divisor;
+            return format!("{sign}{}.{}{suffix}", tenths / 10, tenths % 10);
+        }
+
+        let hundredths = (av * 100) / divisor;
+        format!("{sign}{}.{:02}{suffix}", hundredths / 100, hundredths % 100)
+    }
+
     if av >= 1_000_000_000 {
-        format!("{sign}{:.1}B", av as f64 / 1_000_000_000.0)
+        scaled(sign, av, 1_000_000_000, "B")
     } else if av >= 1_000_000 {
-        format!("{sign}{:.1}M", av as f64 / 1_000_000.0)
+        scaled(sign, av, 1_000_000, "M")
     } else if av >= 1_000 {
-        format!("{sign}{:.1}K", av as f64 / 1_000.0)
+        scaled(sign, av, 1_000, "K")
     } else {
         format!("{sign}{av}")
     }
@@ -3401,46 +3454,6 @@ pub fn fmt_share(share_pct: f32) -> String {
 /// (`docs/reference/new-shinra-ex.webp`) shows these two with none.
 pub fn fmt_pct0(pct: f32) -> String {
     format!("{pct:.0}%")
-}
-
-/// DPS-specific compact abbreviation (issue #80.3). Reuses `fmt_short`'s
-/// K/M/B thresholds, but once a magnitude is scaled its decimal count keeps
-/// the digit run a consistent width instead of `fmt_short`'s always-one:
-/// zero decimals once the scaled value has already reached 3 digits
-/// (`>= 100`, e.g. `188M`), one decimal below that (e.g. `55.3M`, `10.3M`).
-/// Matches the reference render's header pill (`188M/s`) and row values
-/// (`55.3M/s` .. `10.3M/s`) exactly. Raw sub-1000 values are left alone —
-/// always a plain integer — since a DPS figure that low never occurs in
-/// practice and a lone decimal there (`45.0`) would read oddly for a count
-/// of whole damage/sec.
-pub fn fmt_dps(v: i64) -> String {
-    let sign = if v < 0 { "-" } else { "" };
-    let av = v.unsigned_abs();
-
-    fn scaled(sign: &str, av: u64, divisor: f64, suffix: &str) -> String {
-        let value = av as f64 / divisor;
-        // Branch on the value *after* rounding to the one-decimal branch's
-        // precision, not before: a raw value just under 100 (e.g. 99.999)
-        // still rounds up to "100.0" once formatted, which must take the
-        // no-decimal branch (`"100K"`) instead of overflowing the narrowed
-        // Dps column with a 6-char `"100.0K"`.
-        let rounded = (value * 10.0).round() / 10.0;
-        if rounded >= 100.0 {
-            format!("{sign}{rounded:.0}{suffix}")
-        } else {
-            format!("{sign}{rounded:.1}{suffix}")
-        }
-    }
-
-    if av >= 1_000_000_000 {
-        scaled(sign, av, 1_000_000_000.0, "B")
-    } else if av >= 1_000_000 {
-        scaled(sign, av, 1_000_000.0, "M")
-    } else if av >= 1_000 {
-        scaled(sign, av, 1_000.0, "K")
-    } else {
-        format!("{sign}{av}")
-    }
 }
 
 // -- default window size (issue #26) -----------------------------------
@@ -3752,22 +3765,40 @@ mod tests {
 
     #[test]
     fn fmt_short_thousands() {
-        assert_eq!(fmt_short(1_000), "1.0K");
+        assert_eq!(fmt_short(1_000), "1.00K");
     }
 
     #[test]
     fn fmt_short_millions() {
-        assert_eq!(fmt_short(1_234_567), "1.2M");
+        assert_eq!(fmt_short(1_234_567), "1.23M");
     }
 
     #[test]
     fn fmt_short_negative() {
-        assert_eq!(fmt_short(-1_500), "-1.5K");
+        assert_eq!(fmt_short(-1_500), "-1.50K");
     }
 
     #[test]
     fn fmt_short_billions() {
-        assert_eq!(fmt_short(2_500_000_000), "2.5B");
+        assert_eq!(fmt_short(2_500_000_000), "2.50B");
+    }
+
+    /// Issue #118: the full table from the issue, verbatim.
+    #[test]
+    fn fmt_short_issue_118_table() {
+        let cases: [(i64, &str); 8] = [
+            (1234, "1.23K"),
+            (12345, "12.34K"),
+            (123456, "123.4K"),
+            (1234567, "1.23M"),
+            (12345678, "12.34M"),
+            (999, "999"),
+            (999950, "1000K"),
+            (-1500, "-1.50K"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(fmt_short(input), expected, "fmt_short({input})");
+        }
     }
 
     #[test]
@@ -4371,14 +4402,14 @@ mod tests {
     }
 
     /// The reference render shows a total-damage figure alongside the DPS
-    /// figure (e.g. "30.1B"), abbreviated with the same `fmt_short` used
+    /// figure (e.g. "30.10B"), abbreviated with the same `fmt_short` used
     /// everywhere else — `snapshot.total_damage` existed but was never
     /// painted before this change.
     #[test]
     fn draw_header_shows_total_damage_abbreviated() {
         let texts = header_rendered_texts(&header_test_snapshot(30_100_000_000));
         let expected = fmt_short(30_100_000_000);
-        assert_eq!(expected, "30.1B");
+        assert_eq!(expected, "30.10B");
         assert!(
             texts.iter().any(|text| text.contains(&expected)),
             "expected a painted text containing {expected:?}, got {texts:?}"
@@ -4679,8 +4710,8 @@ mod tests {
 
         for (name, pill) in [
             ("timer", StatPill::timer("02:39", None)),
-            ("dps", StatPill::header("1000.0K/s", None)),
-            ("damage", StatPill::header("30.1B", None)),
+            ("dps", StatPill::header("99.99M/s", None)),
+            ("damage", StatPill::header("30.10B", None)),
         ] {
             let text = ctx.fonts_mut(|f| {
                 f.layout_no_wrap(pill.value.to_owned(), bold(pill.size), pill.value_color)
@@ -4688,7 +4719,7 @@ mod tests {
                     .size()
             });
             // Issue #91: all three header readouts are value-then-icon
-            // (`02:39 ⏱ | 188M/s ☁ | 30.1B ♡`) — the timer's leading clock
+            // (`02:39 ⏱ | 188.0M/s ☁ | 30.10B ♡`) — the timer's leading clock
             // was ours, not the reference's.
             assert!(
                 !pill.icon_first,
@@ -4842,13 +4873,13 @@ mod tests {
         )
         .x;
         let dps = pill_size(
-            measure("1000.0K/s", FONT_SIZE_PILL_VALUE),
+            measure("99.99M/s", FONT_SIZE_PILL_VALUE),
             PILL_GLYPH_SIDE,
             row_height,
         )
         .x;
         let dmg = pill_size(
-            measure("1000.0B", FONT_SIZE_PILL_VALUE),
+            measure("99.99B", FONT_SIZE_PILL_VALUE),
             PILL_GLYPH_SIDE,
             row_height,
         )
@@ -5590,47 +5621,62 @@ mod tests {
         }
     }
 
-    /// Issue #80.3: `fmt_dps` keeps a K/M/B-scaled value's digit run a
-    /// consistent width by dropping the decimal once the scaled value
-    /// reaches 3 digits, matching the reference render's header pill
-    /// (`188M`) and row values (`55.3M` .. `10.3M`) exactly.
+    /// Issue #118: `fmt_short` keeps a K/M/B-scaled value's digit run
+    /// ~4 significant figures wide by picking the decimal count from the
+    /// *scaled* value's own magnitude — 2 decimals below 100, 1 below
+    /// 1000, 0 at or above 1000 — matching the row values (`55.30M` ..
+    /// `10.30M`) from the reference render exactly; `188_000_000` sits in
+    /// the 1-decimal band (`188.0M`), unlike the old `fmt_dps`'s
+    /// zero-decimal-at-3-digits rule that used to match the header pill's
+    /// `188M/s` exactly — issue #118 traded that pixel match for a
+    /// consistent significant-figure rule across every magnitude.
     #[test]
-    fn fmt_dps_table() {
+    fn fmt_short_table() {
         let cases: [(i64, &str); 8] = [
             (999, "999"),
-            (1_000, "1.0K"),
-            (10_300_000, "10.3M"),
-            (17_800_000, "17.8M"),
-            (55_300_000, "55.3M"),
-            (188_000_000, "188M"),
+            (1_000, "1.00K"),
+            (10_300_000, "10.30M"),
+            (17_800_000, "17.80M"),
+            (55_300_000, "55.30M"),
+            (188_000_000, "188.0M"),
             (999_950, "1000K"),
-            (-55_300_000, "-55.3M"),
+            (-55_300_000, "-55.30M"),
         ];
         for (input, expected) in cases {
-            assert_eq!(fmt_dps(input), expected, "fmt_dps({input})");
+            assert_eq!(fmt_short(input), expected, "fmt_short({input})");
         }
     }
 
-    /// Branch-before-rounding regression: a raw scaled value just under 100
-    /// (e.g. `99.999`) still rounds up to `100.0` once formatted to one
-    /// decimal, so it must take the no-decimal branch (`"100K"`, 4 chars)
-    /// rather than the one-decimal branch overflowing to `"100.0K"` (6
-    /// chars) — the narrowed Dps column is sized for the 7-char
-    /// `"1000K/s"` worst case, i.e. a 5-char budget before the `/s` suffix.
+    /// Branch-before-rounding regression: the 1- and 2-decimal bands
+    /// truncate rather than round (`fmt_short`'s doc comment), so they can
+    /// never round themselves over a band boundary — but the *coarsest*
+    /// band's own threshold is still decided by rounding the scaled value
+    /// to the nearest whole number, since a scaled value close enough to
+    /// the next full order of magnitude (`[999.5, 1000)`, e.g. `999.95`)
+    /// should escalate straight to the 0-decimal band (`"1000K"`) instead
+    /// of printing a falsely-precise truncated `"999.9K"`. `999_499` sits
+    /// one below that threshold and stays in the 1-decimal band. The Dps
+    /// column budgets 5 chars for the digit run alone, excluding the
+    /// trailing K/M/B suffix and any leading `-`.
     #[test]
-    fn fmt_dps_rounds_before_choosing_the_decimal_branch() {
-        let cases: [(i64, &str); 4] = [
-            (99_950, "100K"),
-            (99_999, "100K"),
-            (99_950_000, "100M"),
-            (99_999_999, "100M"),
+    fn fmt_short_rounds_before_choosing_the_decimal_branch() {
+        let cases: [(i64, &str); 6] = [
+            (999_499, "999.4K"),
+            (999_500, "1000K"),
+            (999_499_000, "999.4M"),
+            (999_500_000, "1000M"),
+            (99_999, "99.99K"),
+            (99_999_000, "99.99M"),
         ];
         for (input, expected) in cases {
-            let out = fmt_dps(input);
-            assert_eq!(out, expected, "fmt_dps({input})");
+            let out = fmt_short(input);
+            assert_eq!(out, expected, "fmt_short({input})");
+            let digits = out
+                .trim_start_matches('-')
+                .trim_end_matches(['K', 'M', 'B']);
             assert!(
-                out.trim_start_matches('-').len() <= 5,
-                "fmt_dps({input}) = {out:?} exceeds the 5-char pre-suffix budget"
+                digits.len() <= 5,
+                "fmt_short({input}) = {out:?} exceeds the 5-char pre-suffix digit budget"
             );
         }
     }
@@ -6336,6 +6382,21 @@ mod tests {
     /// column's 56.0-wide budget even though its text carries a 2-char
     /// "/s" suffix on top of `fmt_short`'s ~7-char max — this test fails
     /// against that width.
+    ///
+    /// Issue #118 also moved which of `fmt_short`'s own bands is widest:
+    /// its coarsest, 0-decimal band ("1000K") is one digit *shorter* than
+    /// its 2-/1-decimal bands ("99.99M"/"999.9M"), so `999_950 -> "1000K"`
+    /// — the value this test used pre-#118, back when 0-decimal was
+    /// `fmt_dps`'s *only* band — stopped being the widest case the day
+    /// #118 shipped, and a version of this test that still used it would
+    /// have missed the `Dps` column gap entirely. `widest_row` below now
+    /// uses `99_999_000 -> "99.99M"` instead. Character count alone
+    /// doesn't settle which band is widest, either: "1000K" and "99.99M"
+    /// differ by whole digits, but "99.99M" and "999.9M" are both 6 chars
+    /// and only measuring the real galley (as this test does, not counting
+    /// characters) shows they render identically wide — and that "M" is
+    /// the pixel-widest of the K/M/B suffixes in this font, wider even
+    /// than some 7-char strings in a narrower suffix.
     #[test]
     fn widest_formatted_text_fits_its_column_width_budget() {
         let ctx = egui::Context::default();
@@ -6346,32 +6407,34 @@ mod tests {
             .drop_without_applying_deltas();
 
         // Widest plausible value for every field any column formats:
-        // `fmt_short`'s 7-char maximum (rounds up across a K/M/B
-        // threshold, e.g. 999_950 -> "1000.0K"), `fmt_dps`'s narrower
-        // 5-char maximum (issue #80.3 drops the decimal once the scaled
-        // value rounds up to 3 digits, e.g. 999_950 -> "1000K"),
-        // `fmt_share`'s, and `fmt_pct0`'s (issue #80.2's 0-decimal variant).
-        // `ability_score`/`season_strength` are the two exceptions: they
-        // render the full, un-abbreviated digit string (owner requirement),
-        // so their widest plausible input is their real in-game ceiling —
-        // ability score is a 5-digit stat (max 99_999) and season strength
-        // is a 4-digit stat (max 9_999), per the repo owner — rather than
-        // the field type's own ceiling (`u32::MAX`) or a `fmt_short`-derived
-        // value. Do not "fix" these back to `u32::MAX`.
-        assert_eq!(fmt_short(999_950), "1000.0K");
-        assert_eq!(fmt_dps(999_950), "1000K");
+        // `fmt_short` (issue #118 unified `fmt_dps` into it — there is only
+        // one abbreviator now) keeps its scaled digit run to a 5-char
+        // pre-suffix budget, but the widest-*rendering* value is not the
+        // widest-*digit-count* one — see the doc comment above. Use
+        // `99_999_000 -> "99.99M"`, the actual widest case, rather than
+        // the 0-decimal `999_950 -> "1000K"` this test used to check.
+        // `fmt_share`'s and `fmt_pct0`'s (issue #80.2's 0-decimal variant)
+        // worst cases are unaffected by #118. `ability_score`/
+        // `season_strength` are the two exceptions: they render the full,
+        // un-abbreviated digit string (owner requirement), so their widest
+        // plausible input is their real in-game ceiling — ability score is
+        // a 5-digit stat (max 99_999) and season strength is a 4-digit
+        // stat (max 9_999), per the repo owner — rather than the field
+        // type's own ceiling (`u32::MAX`) or a `fmt_short`-derived value.
+        // Do not "fix" these back to `u32::MAX`.
+        assert_eq!(fmt_short(99_999_000), "99.99M");
         assert_eq!(fmt_share(100.0), "100.0%");
         assert_eq!(fmt_pct0(100.0), "100%");
         let widest_row = PlayerRow {
             uid: 1,
             name: String::new(),
             class: None,
-            damage: 999_950,
-            dps: 999_950.0,
+            damage: 99_999_000,
+            dps: 99_999_000.0,
             share_pct: 100.0,
             crit_pct: 100.0,
             lucky_pct: 100.0,
-            hits: 999_950,
+            hits: 99_999_000,
             // A death count is a 1-2 digit figure in practice; 99 is the
             // widest plausible one, not `u32::MAX`, same reasoning as the
             // in-game ceilings above.
@@ -6932,8 +6995,11 @@ mod tests {
         // `CritPct`, `LuckyPct`), shrinking this from its old `451.0` to
         // `387.0`; issue #33's two Imagine slots then widened the icon
         // gutter by `IMAGINE_GUTTER_WIDTH` (`32.0`), landing here at
-        // `419.0`.
-        assert_eq!(default_inner_width(), 419.0);
+        // `419.0`. Issue #118's 2-/1-decimal bands then widened
+        // `fmt_short`'s true worst case past `Dps`'s old 48.0-wide budget
+        // (see that column's comment in `settings.rs`), growing it to
+        // 56.0 and landing here at `427.0`.
+        assert_eq!(default_inner_width(), 427.0);
     }
 
     #[test]
