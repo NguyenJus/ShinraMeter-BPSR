@@ -89,8 +89,10 @@ impl WindowComposition {
 /// too, so a driver that hangs or crashes inside adapter enumeration is
 /// recoverable by the same variable.
 ///
-/// Same truthiness rule as `SHINRA_INSPECT`: set to anything but empty, `0` or
-/// `false` counts as on.
+/// Opt-out truthiness rule: set to anything but empty, `0` or `false` counts
+/// as on (i.e. as "no composition"). Unlike `SHINRA_INSPECT` (opt-in since
+/// issue #122), this variable is still opt-out — an unset or off-looking
+/// value leaves the DirectComposition fix enabled.
 fn composition_choice(
     no_composition: Option<&str>,
     hardware_dx12_adapter: impl FnOnce() -> bool,
@@ -233,8 +235,9 @@ fn main() -> eframe::Result {
     let (tx_events, rx_events) = bounded::<ProtocolEvent>(EVENT_CAPACITY);
     let (tx_command, rx_command) = bounded::<UiCommand>(COMMAND_CAPACITY);
 
-    // Opt-in packet-inspection diagnostics (issue #25 slice A); `None` unless
-    // `SHINRA_INSPECT` is set, in which case `start_capture` below wires the
+    // Opt-in packet-inspection diagnostics (issue #25 slice A, opt-in default
+    // since issue #122); `None` unless `SHINRA_INSPECT` opts in (see
+    // `inspect::enabled`), in which case `start_capture` below wires the
     // sink into its decoder.
     let inspect_handle = inspect::init();
     let inspect_sink = inspect_handle.as_ref().map(|h| Arc::clone(&h.sink));
@@ -385,8 +388,8 @@ mod tests {
         assert!(!probed.get(), "SHINRA_NO_COMPOSITION must skip the probe");
     }
 
-    /// An off-looking value must not disable the fix — same truthiness rule as
-    /// `SHINRA_INSPECT`, so `SHINRA_NO_COMPOSITION=0` means "no, don't".
+    /// An off-looking value must not disable the fix — `SHINRA_NO_COMPOSITION`
+    /// is opt-out, so `SHINRA_NO_COMPOSITION=0` means "no, don't".
     #[test]
     fn an_off_looking_escape_hatch_value_leaves_the_fix_on() {
         for value in ["", "0", "false", "FALSE"] {

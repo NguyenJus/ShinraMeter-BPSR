@@ -1,7 +1,7 @@
 //! Packet-inspection diagnostic mode (issue #25 slice A).
 //!
-//! On by default (issue #87) — set `SHINRA_INSPECT=0`, `false`, or `off`
-//! (case-insensitively) to opt out. When on:
+//! Off by default (issue #122) — set `SHINRA_INSPECT=1` (`true`, `on`, or
+//! `yes` also work, case-insensitively) to opt in. When on:
 //!
 //! - every Notify-shaped fragment observed — recognized service or not, and
 //!   including one whose payload would not decompress (dumped as its raw
@@ -55,8 +55,9 @@ const HEX_PREFIX_LEN: usize = 32;
 /// says so instead of silently under-reporting.
 const MAX_TRACKED_UIDS_PER_ATTR: usize = 16;
 
-/// True unless `SHINRA_INSPECT` is set to an explicit opt-out value (`0`,
-/// `false`, or `off`, case-insensitively) — diagnostics are on by default.
+/// False unless `SHINRA_INSPECT` is set to an explicit opt-in value (`1`,
+/// `true`, `on`, or `yes`, case-insensitively) — diagnostics are off by
+/// default (issue #122).
 pub fn enabled() -> bool {
     enabled_from(std::env::var("SHINRA_INSPECT").ok().as_deref())
 }
@@ -64,11 +65,12 @@ pub fn enabled() -> bool {
 fn enabled_from(var: Option<&str>) -> bool {
     match var {
         Some(v) => {
-            !(v.eq_ignore_ascii_case("0")
-                || v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("off"))
+            v.eq_ignore_ascii_case("1")
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("yes")
         }
-        None => true,
+        None => false,
     }
 }
 
@@ -119,16 +121,16 @@ impl Handle {
     }
 }
 
-/// Turns diagnostics on unless opted out via `SHINRA_INSPECT`, spawning the
+/// Turns diagnostics on when opted in via `SHINRA_INSPECT`, spawning the
 /// dump-writer thread and returning a `Handle`; `None` (zero cost beyond the
-/// env check) if opted out.
+/// env check) unless opted in.
 pub fn init() -> Option<Handle> {
     if !enabled() {
         return None;
     }
     let path = dump_path();
     log::info!(
-        "packet inspection enabled by default (set SHINRA_INSPECT=0 to opt out); dumping to {}",
+        "packet inspection enabled via SHINRA_INSPECT; dumping to {}",
         path.display()
     );
     let writer = dump::DumpWriter::spawn(path);
@@ -332,29 +334,33 @@ mod tests {
     // -- enabled ------------------------------------------------------
 
     #[test]
-    fn enabled_is_true_when_unset() {
-        assert!(enabled_from(None));
+    fn enabled_is_false_when_unset() {
+        assert!(!enabled_from(None));
     }
 
     #[test]
-    fn enabled_is_false_for_0_false_or_off_case_insensitive() {
+    fn enabled_is_true_for_1_true_on_or_yes_case_insensitive() {
+        assert!(enabled_from(Some("1")));
+        assert!(enabled_from(Some("true")));
+        assert!(enabled_from(Some("TRUE")));
+        assert!(enabled_from(Some("on")));
+        assert!(enabled_from(Some("ON")));
+        assert!(enabled_from(Some("yes")));
+        assert!(enabled_from(Some("YES")));
+    }
+
+    #[test]
+    fn enabled_is_false_for_0_or_any_other_unrecognized_value() {
         assert!(!enabled_from(Some("0")));
         assert!(!enabled_from(Some("false")));
-        assert!(!enabled_from(Some("FALSE")));
         assert!(!enabled_from(Some("off")));
-        assert!(!enabled_from(Some("OFF")));
+        assert!(!enabled_from(Some("2")));
+        assert!(!enabled_from(Some("enabled")));
     }
 
     #[test]
-    fn enabled_is_true_for_1_or_any_other_nonempty_value() {
-        assert!(enabled_from(Some("1")));
-        assert!(enabled_from(Some("yes")));
-        assert!(enabled_from(Some("true")));
-    }
-
-    #[test]
-    fn enabled_is_true_for_an_empty_value_since_only_the_named_tokens_opt_out() {
-        assert!(enabled_from(Some("")));
+    fn enabled_is_false_for_an_empty_value_since_only_the_named_tokens_opt_in() {
+        assert!(!enabled_from(Some("")));
     }
 
     // -- dump_path ------------------------------------------------------

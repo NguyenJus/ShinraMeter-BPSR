@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "ShinraMeter-BPSR"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arboard",
  "bpsr-capture",
@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "bpsr-capture"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bpsr-protocol",
  "crossbeam-channel",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "bpsr-meter"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bpsr-test-support",
  "log",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "bpsr-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "log",
@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "bpsr-test-support"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "bumpalo"
