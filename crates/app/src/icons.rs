@@ -1,24 +1,26 @@
 //! Per-class row icons (issue #9 slice 1), toolbar/glyph chrome, and equipped
 //! Imagine icons (issue #33).
 //!
-//! The nine 128x128 class PNGs and 81 Imagine PNGs are no longer baked into
-//! the executable via `include_bytes!`. Instead, they ship as files under
-//! `assets/classes/` and `assets/imagines/` beside the executable and are
-//! resolved at startup by `crate::assets`, which checks `SHINRA_ASSETS_DIR`
-//! env var, then `<exe dir>/assets`, then `CARGO_MANIFEST_DIR/assets` (for
-//! dev and tests), then gives up gracefully. This reverses the previous goal
-//! of single-file self-containment: a takedown request now costs a directory
-//! deletion instead of a source change, rebuild, and release. Embedding
-//! third-party game art in a GPL-3.0 binary carries a combined-work tension
-//! the project would rather not carry.
+//! The nine 128x128 class PNGs and 81 Imagine PNGs are compiled straight
+//! into the executable via `include_bytes!`, the same as every other icon
+//! set in this module (issue #123). They previously shipped as loose files
+//! under `assets/classes/` and `assets/imagines/` beside the executable,
+//! resolved at startup from `SHINRA_ASSETS_DIR`, `<exe dir>/assets`, or
+//! `CARGO_MANIFEST_DIR/assets` — a design meant to make a takedown request
+//! cost a directory deletion instead of a source change, rebuild, and
+//! release. In practice that traded a real, if rare, availability risk for
+//! that convenience: loose files can be silently lost to a user's own
+//! deletion, an antivirus quarantine, or a partial zip extraction, and the
+//! app would degrade to no icons with only a warning log. A takedown by
+//! source deletion + rebuild + release is easy enough on its own, so
+//! embedding wins.
 //!
-//! What stays embedded and why: `assets/icons/` and `assets/icons/glyphs/`
-//! (MIT ShinraMeter / Google Material / Pictogrammers / project-authored —
-//! no takedown exposure) and `shinra.ico` (a Win32 resource linked by
-//! `build.rs`). Each is decoded once, at startup, and uploaded to egui as
-//! a texture; `OverlayApp` holds the resulting icon sets for the rest of the
-//! process's life so a row or glyph never re-decodes or re-uploads on every
-//! frame.
+//! Every icon set here — `assets/icons/`, `assets/icons/glyphs/`,
+//! `assets/classes/`, and `assets/imagines/` — is decoded once, at startup,
+//! and uploaded to egui as a texture; `OverlayApp` holds the resulting icon
+//! sets for the rest of the process's life so a row or glyph never
+//! re-decodes or re-uploads on every frame. `shinra.ico` is separate: a
+//! Win32 resource linked by `build.rs`, not one of these `IconSet`s.
 //!
 //! Source: <https://github.com/Blue-Protocol-Source/BPSR-ZDPS> (MIT) — see
 //! `THIRD_PARTY_NOTICES.md`.
@@ -33,12 +35,12 @@ use eframe::egui;
 
 /// Generates `class_icon_file` — an exhaustive match with no wildcard arm
 /// pairing every `Class` variant to its icon's file name under
-/// `<assets root>/classes/`, or to `None` for `Class::Unknown` (which
-/// intentionally has no icon) — and `LOADABLE_CLASSES`, the list
-/// `ClassIcons::load_from` iterates to know which classes to attempt
-/// loading a texture for. Both are generated from the same list of
-/// variants given to this macro, so they cannot silently disagree with
-/// each other.
+/// `assets/classes/`, or to `None` for `Class::Unknown` (which
+/// intentionally has no icon) — `LOADABLE_CLASSES`, the list this module's
+/// tests iterate for totality checks, and `CLASS_ICON_BYTES`, the
+/// `(Class, &[u8])` table `ClassIcons::load` hands straight to
+/// `IconSet::load`. All three are generated from the same list of variants
+/// given to this macro, so they cannot silently disagree with each other.
 ///
 /// Before this (issue #52), the class→bytes pairing was a hand-maintained
 /// `const` slice, and its only coverage check compared that slice's length
@@ -53,25 +55,21 @@ use eframe::egui;
 /// `crates/meter/src/event.rs`, which uses the same "no wildcard arm" trick
 /// for the same reason.
 ///
-/// What this no longer guarantees (issue #103): that the named file
-/// actually exists under `assets/classes/` — the PNGs are read from disk at
-/// runtime now, not `include_bytes!`-ed, so a missing file is a runtime
-/// `log::warn!` and a blank icon slot, not a compile error. `icons::tests`
-/// carries a disk-existence test as the replacement guarantee.
-///
-/// `LOADABLE_CLASSES` only drives load iteration order — `Class` has no
-/// built-in enumerator, so *something* has to list its variants for
-/// `ClassIcons::load_from` to walk. It cannot go stale relative to
-/// `class_icon_file`'s match arms (they're written once, here, and both are
-/// generated from it), so the only representation left to keep in sync with
-/// reality is the match itself, which the compiler already does.
+/// Since the icons are `include_bytes!`-ed (issue #123), a `$path` that
+/// names a file missing from `assets/classes/` is a compile error, not a
+/// runtime `log::warn!` and a blank icon slot — one guarantee rustc gives
+/// for free that the loose-file design (issue #103) could not.
 macro_rules! class_icons {
     ($($variant:ident => $path:literal),+ $(,)?) => {
         /// The icon file name for `class` (relative to
-        /// `<assets root>/classes/`), or `None` if no icon exists for it
+        /// `assets/classes/`), or `None` if no icon exists for it
         /// (`Class::Unknown`). See the `class_icons!` invocation below for
         /// why adding a `Class` variant without pairing it here is a
-        /// compile error rather than a silently-missing icon.
+        /// compile error rather than a silently-missing icon. Test-only
+        /// (`CLASS_ICON_BYTES` below is what production code loads from) —
+        /// `#[cfg(test)]`-gated rather than left for the compiler to warn
+        /// about as dead code in a release build.
+        #[cfg(test)]
         fn class_icon_file(class: Class) -> Option<&'static str> {
             match class {
                 $(Class::$variant => Some($path),)+
@@ -80,10 +78,19 @@ macro_rules! class_icons {
         }
 
         /// Every `Class` variant `class_icon_file` pairs to `Some` file
-        /// name, in the order given to `class_icons!`. Used only by
-        /// `ClassIcons::load_from` to know which classes to attempt
-        /// loading a texture for — see the `class_icons!` doc comment.
+        /// name, in the order given to `class_icons!`. Used only by this
+        /// module's tests for totality/uniqueness checks — see the
+        /// `class_icons!` doc comment. Test-only, same reasoning as
+        /// `class_icon_file` above.
+        #[cfg(test)]
         const LOADABLE_CLASSES: &[Class] = &[$(Class::$variant),+];
+
+        /// Every `Class` variant paired with its icon's compiled-in bytes.
+        /// `ClassIcons::load` hands this straight to `IconSet::load`, the
+        /// same shape `TOOLBAR_ICON_BYTES` and `GLYPH_ICON_BYTES` use below.
+        const CLASS_ICON_BYTES: &[(Class, &[u8])] = &[
+            $((Class::$variant, include_bytes!(concat!("../assets/classes/", $path)))),+
+        ];
     };
 }
 
@@ -100,13 +107,14 @@ class_icons! {
 }
 
 /// Decodes one PNG into an egui-ready image. Never panics on a
-/// malformed slice — logs and returns `None` instead. Toolbar and glyph
-/// callers pass `&'static [u8]` from `include_bytes!`, while class and
-/// Imagine callers pass `Vec<u8>` read from disk at runtime, which is a real
-/// failure path. `label` identifies which icon this is in the log line
-/// (e.g. "class icon Stormblade", "toolbar icon Settings") so a decode
-/// failure points at the icon set that actually failed, rather than always
-/// reading "class icon" regardless of which `IconSet` called this.
+/// malformed slice — logs and returns `None` instead. Every caller (class,
+/// toolbar, glyph, Imagine) passes `&'static [u8]` from `include_bytes!`,
+/// so a decode failure here would mean a corrupt committed PNG, not a
+/// runtime read failure — still worth handling without a panic rather than
+/// assuming it can't happen. `label` identifies which icon this is in the
+/// log line (e.g. "class icon Stormblade", "toolbar icon Settings") so a
+/// decode failure points at the icon set that actually failed, rather than
+/// always reading "class icon" regardless of which `IconSet` called this.
 fn decode(label: &str, bytes: &[u8]) -> Option<egui::ColorImage> {
     match image::load_from_memory(bytes) {
         Ok(image) => {
@@ -138,12 +146,12 @@ struct IconSet<K> {
 impl<K: Copy + PartialEq> IconSet<K> {
     /// Decodes and uploads every `(key, bytes)` entry, skipping (and
     /// logging via `decode`) any whose PNG fails to decode. The payload is
-    /// anything `AsRef<[u8]>` rather than a bare `&[u8]`: toolbar/glyph pass
-    /// `&'static [u8]` slices from `include_bytes!`, while class/imagine pass
-    /// owned `Vec<u8>` read from disk at runtime, and neither should have to
-    /// allocate or copy to satisfy the other. `texture_name` and `log_label`
-    /// both take the key but are kept as two separate closures rather than
-    /// one shared string, since each is worded for a different audience:
+    /// anything `AsRef<[u8]>` rather than a bare `&[u8]` so every caller can
+    /// pass its `&'static [u8]` `include_bytes!` slice directly, with no
+    /// conversion needed regardless of key type. `texture_name` and
+    /// `log_label` both take the key but are kept as two separate closures
+    /// rather than one shared string, since each is worded for a different
+    /// audience:
     /// `texture_name` becomes egui's texture id (`ctx.load_texture`'s debug
     /// name), `log_label` becomes `decode`'s human-readable failure-log
     /// identifier.
@@ -171,73 +179,30 @@ impl<K: Copy + PartialEq> IconSet<K> {
             .find(|(k, _)| *k == key)
             .map(|(_, handle)| handle)
     }
-
-    fn len(&self) -> usize {
-        self.textures.len()
-    }
 }
 
 /// Textures for every class an icon was successfully decoded for, uploaded
-/// once via `ClassIcons::load_from`. Loaded lazily on `OverlayApp`'s first
+/// once via `ClassIcons::load`. Loaded lazily on `OverlayApp`'s first
 /// `ui()` call rather than in `OverlayApp::new`, because the `egui::Context`
 /// `load_texture` needs doesn't exist yet at construction time.
 pub struct ClassIcons(IconSet<Class>);
 
 impl ClassIcons {
-    /// Reads each `LOADABLE_CLASSES` entry's PNG from `<root>/classes/`,
-    /// decodes, and uploads a texture for it — skipping (and `log::warn!`ing
-    /// the class and the full path for) any file that fails to read.
-    /// `root == None` returns an empty set without touching the filesystem,
-    /// the same degradation a decode failure already produces. Same
-    /// degradation, silently, when `<root>/classes/` itself doesn't exist
-    /// (the README's documented "delete the whole subdirectory" takedown
-    /// path): that case skips the per-file reads and their warns entirely
-    /// rather than emitting one `log::warn!` per class, since `Icons::load`
-    /// in `ui.rs` already logs a single aggregate "N missing" summary right
-    /// after this returns. A directory that exists but is missing individual
-    /// files still gets a per-file warn — that partial case is the one
-    /// actually worth a human's attention.
-    pub fn load_from(ctx: &egui::Context, root: Option<&std::path::Path>) -> Self {
-        let entries: Vec<(Class, Vec<u8>)> = root
-            .map(|root| root.join("classes"))
-            .filter(|dir| dir.is_dir())
-            .map(|dir| {
-                LOADABLE_CLASSES
-                    .iter()
-                    .filter_map(|&class| {
-                        let file = class_icon_file(class)?;
-                        let path = dir.join(file);
-                        match std::fs::read(&path) {
-                            Ok(bytes) => Some((class, bytes)),
-                            Err(err) => {
-                                log::warn!(
-                                    "failed to read class icon for {class:?} at {}: {err}",
-                                    path.display()
-                                );
-                                None
-                            }
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+    /// Decodes and uploads a texture for every `CLASS_ICON_BYTES` entry.
+    /// Same load-once pattern as `ToolbarIcons::load`/`GlyphIcons::load`
+    /// below — see `ClassIcons`'s doc comment.
+    pub fn load(ctx: &egui::Context) -> Self {
         Self(IconSet::load(
             ctx,
-            &entries,
+            CLASS_ICON_BYTES,
             |class| format!("class-icon-{}", class.name()),
             |class| format!("class icon {}", class.name()),
         ))
     }
 
-    /// How many `LOADABLE_CLASSES` entries have no loaded texture — a
-    /// missing asset root, a missing file, or a decode failure. `ui.rs`'s
-    /// startup log reports this.
-    pub fn missing(&self) -> usize {
-        LOADABLE_CLASSES.len() - self.0.len()
-    }
-
     /// The texture for `class`, or `None` if no icon is loaded for it
-    /// (`Class::Unknown`, a missing/unreadable file, or a PNG that failed to
+    /// (`Class::Unknown`, or — never expected in practice, since
+    /// `CLASS_ICON_BYTES` are compile-time constants — a PNG that failed to
     /// decode).
     pub fn get(&self, class: Class) -> Option<&egui::TextureHandle> {
         self.0.get(class)
@@ -405,7 +370,7 @@ impl GlyphIcons {
 // `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
 //
 /// Textures for equipped-Imagine row icons (issue #33), uploaded once via
-/// `ImagineIcons::load_from`. Same lazy-load, load-once-per-process pattern as
+/// `ImagineIcons::load`. Same lazy-load, load-once-per-process pattern as
 /// `ClassIcons`/`ToolbarIcons`/`GlyphIcons` — see `ClassIcons`'s doc comment
 /// — but keyed by the icon *basename* (`&'static str`) rather than a closed
 /// key enum: `crate::imagines` maps many skill ids to one of 81 icon
@@ -415,66 +380,26 @@ impl GlyphIcons {
 pub struct ImagineIcons(IconSet<&'static str>);
 
 impl ImagineIcons {
-    /// Reads each `IMAGINE_ICON_FILES` basename's PNG from
-    /// `<root>/imagines/`, decodes, and uploads a texture for it —
-    /// skipping (and `log::warn!`ing the basename and the full path for)
-    /// any file that fails to read. `root == None` returns an empty set
-    /// without touching the filesystem, the same degradation a decode
-    /// failure already produces. Same degradation, silently, when
-    /// `<root>/imagines/` itself doesn't exist (the README's documented
-    /// "delete the whole subdirectory" takedown path): that case skips the
-    /// per-file reads and their warns entirely rather than emitting one
-    /// `log::warn!` per basename (81 of them), since `Icons::load` in
-    /// `ui.rs` already logs a single aggregate "N missing" summary right
-    /// after this returns. A directory that exists but is missing
-    /// individual files still gets a per-file warn — that partial case is
-    /// the one actually worth a human's attention.
-    pub fn load_from(ctx: &egui::Context, root: Option<&std::path::Path>) -> Self {
-        let entries: Vec<(&'static str, Vec<u8>)> = root
-            .map(|root| root.join("imagines"))
-            .filter(|dir| dir.is_dir())
-            .map(|dir| {
-                imagines::IMAGINE_ICON_FILES
-                    .iter()
-                    .filter_map(|&basename| {
-                        let path = dir.join(format!("{basename}.png"));
-                        match std::fs::read(&path) {
-                            Ok(bytes) => Some((basename, bytes)),
-                            Err(err) => {
-                                log::warn!(
-                                    "failed to read imagine icon {basename} at {}: {err}",
-                                    path.display()
-                                );
-                                None
-                            }
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+    /// Decodes and uploads a texture for every `imagines::IMAGINE_ICON_BYTES`
+    /// entry. Same load-once pattern as `ToolbarIcons::load`/`GlyphIcons::load`
+    /// — see `ClassIcons`'s doc comment.
+    pub fn load(ctx: &egui::Context) -> Self {
         Self(IconSet::load(
             ctx,
-            &entries,
+            imagines::IMAGINE_ICON_BYTES,
             |icon| format!("imagine-icon-{icon}"),
             |icon| format!("imagine icon {icon}"),
         ))
     }
 
-    /// How many `IMAGINE_ICON_FILES` entries have no loaded texture — a
-    /// missing asset root, a missing file, or a decode failure. `ui.rs`'s
-    /// startup log reports this.
-    pub fn missing(&self) -> usize {
-        imagines::IMAGINE_ICON_FILES.len() - self.0.len()
-    }
-
     /// The texture for the icon basename `icon`, or `None` if no Imagine
-    /// icon is loaded for it (an id `crate::imagines` doesn't know, a
-    /// missing/unreadable file, or a PNG that failed to decode) — the
-    /// caller paints the blank-circle slot placeholder in that case, never
-    /// a panic. Takes `&'static str` rather
-    /// than a bare `&str`: `IconSet<&'static str>::get` needs an exact `K`
-    /// match, and every real caller already holds a `&'static str` from
-    /// `imagines::Imagine::icon`.
+    /// icon is loaded for it — an id `crate::imagines` doesn't know, or —
+    /// never expected in practice, since `IMAGINE_ICON_BYTES` are
+    /// compile-time constants — a PNG that failed to decode. The caller
+    /// paints the blank-circle slot placeholder in that case, never a
+    /// panic. Takes `&'static str` rather than a bare `&str`:
+    /// `IconSet<&'static str>::get` needs an exact `K` match, and every real
+    /// caller already holds a `&'static str` from `imagines::Imagine::icon`.
     pub fn get(&self, icon: &'static str) -> Option<&egui::TextureHandle> {
         self.0.get(icon)
     }
@@ -483,24 +408,6 @@ impl ImagineIcons {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets;
-
-    // -- asset root guard (issue #103) --------------------------------------
-    //
-    // Every disk-backed test below (`every_loadable_classes_icon_decodes`,
-    // `every_imagine_icon_decodes_at_48x48`, etc.) is only a meaningful
-    // check if `assets::root()` actually resolves under `cargo test` — this
-    // test is the guard that makes that assumption explicit and gives it a
-    // dedicated failure message, rather than letting it fail incidentally
-    // inside some unrelated-looking test.
-    #[test]
-    fn assets_root_resolves_under_cargo_test() {
-        assert!(
-            assets::root().0.is_some(),
-            "no asset root resolved under cargo test — expected the D1 candidate-3 \
-             fallback (assets/ under CARGO_MANIFEST_DIR) to resolve"
-        );
-    }
 
     // -- class icons (issue #52) ------------------------------------------
 
@@ -510,16 +417,10 @@ mod tests {
     }
 
     #[test]
-    fn every_loadable_classes_icon_decodes() {
-        let root = assets::root()
-            .0
-            .expect("assets root must resolve under cargo test (see D1 candidate 3)");
-        for &class in LOADABLE_CLASSES {
-            let file = class_icon_file(class).expect("LOADABLE_CLASSES entries must be Some");
-            let bytes = std::fs::read(root.join("classes").join(file))
-                .unwrap_or_else(|err| panic!("failed to read {class:?}'s icon: {err}"));
+    fn every_embedded_class_icon_decodes() {
+        for &(class, bytes) in CLASS_ICON_BYTES {
             assert!(
-                decode(&format!("class icon {class:?}"), &bytes).is_some(),
+                decode(&format!("class icon {class:?}"), bytes).is_some(),
                 "{class:?}'s icon failed to decode"
             );
         }
@@ -547,72 +448,13 @@ mod tests {
     #[test]
     fn class_icons_get_is_defined_for_every_loadable_class() {
         let ctx = egui::Context::default();
-        let icons = ClassIcons::load_from(&ctx, assets::root().0.as_deref());
+        let icons = ClassIcons::load(&ctx);
         for &class in LOADABLE_CLASSES {
             assert!(
                 icons.get(class).is_some(),
                 "{class:?} has no loaded texture"
             );
         }
-    }
-
-    /// Replacement for `ClassIcons::load_from(&ctx, None)`'s no-filesystem
-    /// degradation: a missing asset root produces an empty set (`get`
-    /// returns `None` for everything, `missing()` equals the full entry
-    /// count) rather than a panic — this is the fallback path a real
-    /// `assets::root()` failure (no `SHINRA_ASSETS_DIR`, no exe dir, no
-    /// manifest dir) takes in production.
-    #[test]
-    fn class_icons_load_from_none_root_degrades_without_panicking() {
-        let ctx = egui::Context::default();
-        let icons = ClassIcons::load_from(&ctx, None);
-        assert!(
-            icons.get(Class::Stormblade).is_none(),
-            "a None root must not produce any loaded class texture"
-        );
-        assert_eq!(icons.missing(), LOADABLE_CLASSES.len());
-    }
-
-    /// Same degradation, but for a root that resolves to `Some` path which
-    /// simply doesn't exist on disk — the "root exists in principle, files
-    /// don't" case, distinct from `None` in that `load_from` does attempt
-    /// (and fail) an `fs::read` per class rather than skipping the
-    /// filesystem entirely.
-    #[test]
-    fn class_icons_load_from_nonexistent_root_degrades_without_panicking() {
-        let ctx = egui::Context::default();
-        let icons = ClassIcons::load_from(
-            &ctx,
-            Some(std::path::Path::new("/definitely/does/not/exist")),
-        );
-        assert!(
-            icons.get(Class::Stormblade).is_none(),
-            "a nonexistent root must not produce any loaded class texture"
-        );
-        assert_eq!(icons.missing(), LOADABLE_CLASSES.len());
-    }
-
-    /// The README's documented takedown path is deleting the whole
-    /// `assets/classes/` subdirectory, not the asset root itself — distinct
-    /// from both `..._none_root_..` and `..._nonexistent_root_..` above in
-    /// that the root here does resolve (it exists and is a directory), only
-    /// `<root>/classes/` doesn't. `CARGO_MANIFEST_DIR` (this crate's own
-    /// root) is a convenient stand-in: it's a real, existing directory with
-    /// no `classes/` subdirectory of its own (only `assets/classes/` has
-    /// one). This is also the case finding-4's fix targets: it must degrade
-    /// the same way as a missing root, without attempting (and
-    /// `log::warn!`ing about) a per-file read for every `LOADABLE_CLASSES`
-    /// entry.
-    #[test]
-    fn class_icons_load_from_root_missing_classes_subdir_degrades_without_panicking() {
-        let ctx = egui::Context::default();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let icons = ClassIcons::load_from(&ctx, Some(root));
-        assert!(
-            icons.get(Class::Stormblade).is_none(),
-            "a root whose classes/ subdir doesn't exist must not produce any loaded class texture"
-        );
-        assert_eq!(icons.missing(), LOADABLE_CLASSES.len());
     }
 
     // -- toolbar icons (issue #41) ----------------------------------------
@@ -733,13 +575,8 @@ mod tests {
 
     #[test]
     fn every_imagine_icon_decodes_at_48x48() {
-        let root = assets::root()
-            .0
-            .expect("assets root must resolve under cargo test (see D1 candidate 3)");
-        for &basename in imagines::IMAGINE_ICON_FILES {
-            let bytes = std::fs::read(root.join("imagines").join(format!("{basename}.png")))
-                .unwrap_or_else(|err| panic!("failed to read {basename}'s icon: {err}"));
-            let image = decode(&format!("imagine icon {basename}"), &bytes)
+        for &(basename, bytes) in imagines::IMAGINE_ICON_BYTES {
+            let image = decode(&format!("imagine icon {basename}"), bytes)
                 .unwrap_or_else(|| panic!("{basename}'s icon failed to decode"));
             assert_eq!(
                 image.size,
@@ -747,78 +584,6 @@ mod tests {
                 "{basename}'s icon must be rasterized at 48x48"
             );
         }
-    }
-
-    /// `every_imagine_icon_decodes_at_48x48`'s failure message names only
-    /// the basename, not the full path it tried to read — this test is the
-    /// explicit existence assertion with the full path surfaced, direct
-    /// replacement for `include_bytes!`'s build-time existence check on the
-    /// Imagine side (mirrors `every_loadable_classes_icon_decodes` on the
-    /// class side).
-    #[test]
-    fn every_imagine_icon_file_exists_on_disk() {
-        let root = assets::root()
-            .0
-            .expect("assets root must resolve under cargo test (see D1 candidate 3)");
-        for &basename in imagines::IMAGINE_ICON_FILES {
-            let path = root.join("imagines").join(format!("{basename}.png"));
-            assert!(
-                path.exists(),
-                "imagine icon file missing: {}",
-                path.display()
-            );
-        }
-    }
-
-    /// Replacement for `ImagineIcons::load_from(&ctx, None)`'s no-filesystem
-    /// degradation — see `class_icons_load_from_none_root_degrades_without_panicking`
-    /// for the class-side counterpart and its reasoning.
-    #[test]
-    fn imagine_icons_load_from_none_root_degrades_without_panicking() {
-        let ctx = egui::Context::default();
-        let icons = ImagineIcons::load_from(&ctx, None);
-        let representative = imagines::IMAGINE_ICON_FILES[0];
-        assert!(
-            icons.get(representative).is_none(),
-            "a None root must not produce any loaded imagine texture"
-        );
-        assert_eq!(icons.missing(), imagines::IMAGINE_ICON_FILES.len());
-    }
-
-    /// Same degradation, but for a root that resolves to `Some` path which
-    /// simply doesn't exist on disk — see
-    /// `class_icons_load_from_nonexistent_root_degrades_without_panicking`
-    /// for the class-side counterpart and its reasoning.
-    #[test]
-    fn imagine_icons_load_from_nonexistent_root_degrades_without_panicking() {
-        let ctx = egui::Context::default();
-        let icons = ImagineIcons::load_from(
-            &ctx,
-            Some(std::path::Path::new("/definitely/does/not/exist")),
-        );
-        let representative = imagines::IMAGINE_ICON_FILES[0];
-        assert!(
-            icons.get(representative).is_none(),
-            "a nonexistent root must not produce any loaded imagine texture"
-        );
-        assert_eq!(icons.missing(), imagines::IMAGINE_ICON_FILES.len());
-    }
-
-    /// Same reasoning as
-    /// `class_icons_load_from_root_missing_classes_subdir_degrades_without_panicking`,
-    /// but for `assets/imagines/` — the higher-stakes case in practice,
-    /// since deleting it means 81 potential per-file warns rather than 9.
-    #[test]
-    fn imagine_icons_load_from_root_missing_imagines_subdir_degrades_without_panicking() {
-        let ctx = egui::Context::default();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let icons = ImagineIcons::load_from(&ctx, Some(root));
-        let representative = imagines::IMAGINE_ICON_FILES[0];
-        assert!(
-            icons.get(representative).is_none(),
-            "a root whose imagines/ subdir doesn't exist must not produce any loaded imagine texture"
-        );
-        assert_eq!(icons.missing(), imagines::IMAGINE_ICON_FILES.len());
     }
 
     #[test]
@@ -833,7 +598,7 @@ mod tests {
     #[test]
     fn imagine_icons_get_is_defined_for_every_icon_file() {
         let ctx = egui::Context::default();
-        let icons = ImagineIcons::load_from(&ctx, assets::root().0.as_deref());
+        let icons = ImagineIcons::load(&ctx);
         for &basename in imagines::IMAGINE_ICON_FILES {
             assert!(
                 icons.get(basename).is_some(),
