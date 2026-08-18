@@ -119,6 +119,15 @@ function Get-UidbgRepoRoot {
       prints) this resolves to the WSL worktree over UNC and Copy-Item reads
       straight out of it. If you instead copied the scripts somewhere else, set
       SHINRA_UIDBG_REPO to the Windows-visible repo root.
+
+      `scripts/ctl.sh` sets SHINRA_UIDBG_REPO on every job it submits, to ITS
+      OWN repo root -- see the comment on WIN_REPO_ROOT there. This matters
+      because the ctl server is long-lived and may have been started from a
+      different worktree than the one calling ctl.sh right now: without this,
+      a deploy would silently build from the server's birthplace tree instead
+      of the caller's. Running one of these scripts directly (not through
+      ctl.sh) leaves the env var unset and hits the two-Split-Paths fallback
+      above, same as always.
     #>
     if ($env:SHINRA_UIDBG_REPO) { return $env:SHINRA_UIDBG_REPO }
     return (Split-Path -Parent (Split-Path -Parent $script:UidbgScriptDir))
@@ -645,9 +654,73 @@ function Stop-App {
     return $true
 }
 
+function Copy-AppAssets {
+    <#
+      Mirror crates/app/assets next to the deployed exe (issue #107 fallout).
+
+      Since PR #107 the app loads class/Imagine icons from files on disk
+      instead of embedding them: `assets::resolve` (crates/app/src/assets.rs)
+      tries, in order, SHINRA_ASSETS_DIR, then `<exe dir>/assets`, then the
+      crate's own `assets/` (the `cargo run` dev layout). A deploy that copies
+      only the exe gives it none of those, so the running app logs "no asset
+      root found" and every class/Imagine icon fails to load. Deploying next
+      to the exe (candidate 2 above) is the one of the three a *deployed*
+      build can actually hit.
+
+      Delete-then-copy rather than an overwrite-in-place Copy-Item -Recurse:
+      the latter only adds/replaces files, so an icon removed or renamed
+      upstream since the last deploy would silently survive in the deployed
+      copy and mask the real (rebuilt) asset set.
+
+      Missing source assets is reported, not thrown -- a deploy should still
+      land a working (if icon-less, same as the "asset root not found"
+      runtime fallback) exe rather than fail outright over an asset tree that
+      e.g. hasn't been generated yet in a fresh checkout.
+
+      A missing source still clears any STALE $dstAssets left by an earlier
+      deploy. `assets::resolve` checks `<exe dir>/assets` before anything
+      else, so leaving an old deployed copy in place while the source is
+      missing would make the app silently keep loading last time's icon set
+      even though this deploy's log says assets are MISSING.
+    #>
+    param([Parameter(Mandatory = $true)][string]$DstDir)
+
+    $srcAssets = Join-Path (Get-UidbgRepoRoot) 'crates\app\assets'
+    $dstAssets = Join-Path $DstDir 'assets'
+
+    if (-not (Test-Path -LiteralPath $srcAssets)) {
+        if (Test-Path -LiteralPath $dstAssets) {
+            try {
+                Remove-Item -LiteralPath $dstAssets -Recurse -Force -ErrorAction Stop
+                Write-Output ("WARN no assets dir at $srcAssets -- removed stale deployed assets at " +
+                              "$dstAssets so the app cannot keep loading the old icon set")
+                return 'assets=MISSING(stale-removed)'
+            } catch {
+                Write-Output ("WARN no assets dir at $srcAssets, and removing stale deployed assets at " +
+                              "$dstAssets failed: $($_.Exception.Message)")
+                return 'assets=MISSING(stale-remove-failed)'
+            }
+        }
+        Write-Output "WARN no assets dir at $srcAssets -- class/Imagine icons will not be deployed"
+        return 'assets=MISSING'
+    }
+
+    try {
+        if (Test-Path -LiteralPath $dstAssets) {
+            Remove-Item -LiteralPath $dstAssets -Recurse -Force
+        }
+        Copy-Item -LiteralPath $srcAssets -Destination $dstAssets -Recurse -Force -ErrorAction Stop
+        return "assets=$dstAssets"
+    } catch {
+        Write-Output "WARN asset copy failed: $($_.Exception.Message)"
+        return 'assets=FAILED'
+    }
+}
+
 function Copy-AppExe {
     <#
-      Copy the cross-compiled exe into the working dir.
+      Copy the cross-compiled exe (and its asset tree, see Copy-AppAssets)
+      into the working dir.
 
       GOTCHA (issue #88): Windows holds an exclusive lock on a running image, so
       copying over a live ShinraMeter-BPSR.exe fails with "Permission denied" /
@@ -672,7 +745,8 @@ function Copy-AppExe {
     for ($attempt = 1; $attempt -le $Retries; $attempt++) {
         try {
             Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop
-            Write-Output ('OK deployed src={0} dst={1} killedRunning={2} attempts={3}' -f $src, $dst, $killed, $attempt)
+            $assetResult = Copy-AppAssets -DstDir $dstDir
+            Write-Output ('OK deployed src={0} dst={1} killedRunning={2} attempts={3} {4}' -f $src, $dst, $killed, $attempt, $assetResult)
             return
         } catch {
             if ($attempt -eq $Retries) {
