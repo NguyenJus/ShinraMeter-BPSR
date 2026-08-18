@@ -17,9 +17,27 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Generous on purpose. This cap wraps the toolchain install (bounded at 15
+    # minutes by the step below), rustup, a cross-compile of a 468-crate
+    # dependency tree that may miss the rust-cache entirely, packaging, and the
+    # upload. The last release run took 6m45s end to end with a 6m01s cargo
+    # build and a rust-cache restore that completed in 2s (i.e. essentially
+    # cold), so ~22 minutes is the plausible bad-day sum — but that is an
+    # estimate built on one observation, not a measured worst case, so this
+    # leaves roughly 2.5x on top of it. A killed release job is worse than a
+    # killed CI job: the tag is already pushed and the whole thing needs a
+    # manual re-trigger. Still 6x below the 360-minute default, so a genuinely
+    # wedged job cannot sit here for hours.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+      # Same composite action as CI, so a tag build can never diverge from the
+      # toolchain `build-windows` verified. The action asserts every
+      # cross-binary works before cargo runs, so a degraded cache restore
+      # fails the release rather than shipping a quietly different binary.
+      - name: Install the mingw-w64 cross-toolchain
+        uses: ./.github/actions/mingw-w64-toolchain
+        timeout-minutes: 15
       - run: rustup target add x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --target x86_64-pc-windows-gnu
