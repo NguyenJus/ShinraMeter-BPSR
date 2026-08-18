@@ -5,7 +5,6 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-mod assets;
 mod dump;
 mod fonts;
 mod icons;

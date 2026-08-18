@@ -1,9 +1,10 @@
 name: Release
 
-# Tagged versions publish a zip containing the Windows executable and required
-# asset directories (classes and Imagine icons). The build mirrors the
-# `build-windows` job in ci.yml — same cross-toolchain, same checks — so a tag
-# can never ship a binary CI would have rejected.
+# Tagged versions publish a zip containing the Windows executable — every
+# icon set (including the class and Imagine icons) is compiled in via
+# `include_bytes!` (issue #123), so there is no separate asset tree to ship.
+# The build mirrors the `build-windows` job in ci.yml — same cross-toolchain,
+# same checks — so a tag can never ship a binary CI would have rejected.
 on:
   push:
     tags: ["v*"]

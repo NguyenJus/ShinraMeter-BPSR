@@ -654,73 +654,14 @@ function Stop-App {
     return $true
 }
 
-function Copy-AppAssets {
-    <#
-      Mirror crates/app/assets next to the deployed exe (issue #107 fallout).
-
-      Since PR #107 the app loads class/Imagine icons from files on disk
-      instead of embedding them: `assets::resolve` (crates/app/src/assets.rs)
-      tries, in order, SHINRA_ASSETS_DIR, then `<exe dir>/assets`, then the
-      crate's own `assets/` (the `cargo run` dev layout). A deploy that copies
-      only the exe gives it none of those, so the running app logs "no asset
-      root found" and every class/Imagine icon fails to load. Deploying next
-      to the exe (candidate 2 above) is the one of the three a *deployed*
-      build can actually hit.
-
-      Delete-then-copy rather than an overwrite-in-place Copy-Item -Recurse:
-      the latter only adds/replaces files, so an icon removed or renamed
-      upstream since the last deploy would silently survive in the deployed
-      copy and mask the real (rebuilt) asset set.
-
-      Missing source assets is reported, not thrown -- a deploy should still
-      land a working (if icon-less, same as the "asset root not found"
-      runtime fallback) exe rather than fail outright over an asset tree that
-      e.g. hasn't been generated yet in a fresh checkout.
-
-      A missing source still clears any STALE $dstAssets left by an earlier
-      deploy. `assets::resolve` checks `<exe dir>/assets` before anything
-      else, so leaving an old deployed copy in place while the source is
-      missing would make the app silently keep loading last time's icon set
-      even though this deploy's log says assets are MISSING.
-    #>
-    param([Parameter(Mandatory = $true)][string]$DstDir)
-
-    $srcAssets = Join-Path (Get-UidbgRepoRoot) 'crates\app\assets'
-    $dstAssets = Join-Path $DstDir 'assets'
-
-    if (-not (Test-Path -LiteralPath $srcAssets)) {
-        if (Test-Path -LiteralPath $dstAssets) {
-            try {
-                Remove-Item -LiteralPath $dstAssets -Recurse -Force -ErrorAction Stop
-                Write-Output ("WARN no assets dir at $srcAssets -- removed stale deployed assets at " +
-                              "$dstAssets so the app cannot keep loading the old icon set")
-                return 'assets=MISSING(stale-removed)'
-            } catch {
-                Write-Output ("WARN no assets dir at $srcAssets, and removing stale deployed assets at " +
-                              "$dstAssets failed: $($_.Exception.Message)")
-                return 'assets=MISSING(stale-remove-failed)'
-            }
-        }
-        Write-Output "WARN no assets dir at $srcAssets -- class/Imagine icons will not be deployed"
-        return 'assets=MISSING'
-    }
-
-    try {
-        if (Test-Path -LiteralPath $dstAssets) {
-            Remove-Item -LiteralPath $dstAssets -Recurse -Force
-        }
-        Copy-Item -LiteralPath $srcAssets -Destination $dstAssets -Recurse -Force -ErrorAction Stop
-        return "assets=$dstAssets"
-    } catch {
-        Write-Output "WARN asset copy failed: $($_.Exception.Message)"
-        return 'assets=FAILED'
-    }
-}
-
 function Copy-AppExe {
     <#
-      Copy the cross-compiled exe (and its asset tree, see Copy-AppAssets)
-      into the working dir.
+      Copy the cross-compiled exe into the working dir.
+
+      No asset tree to mirror alongside it: every icon set, including the
+      class and Imagine icons that PR #107/#114 once deployed as loose files
+      beside the exe, is compiled into the executable via `include_bytes!`
+      (issue #123). A deployed exe is now fully self-contained.
 
       GOTCHA (issue #88): Windows holds an exclusive lock on a running image, so
       copying over a live ShinraMeter-BPSR.exe fails with "Permission denied" /
@@ -745,8 +686,7 @@ function Copy-AppExe {
     for ($attempt = 1; $attempt -le $Retries; $attempt++) {
         try {
             Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop
-            $assetResult = Copy-AppAssets -DstDir $dstDir
-            Write-Output ('OK deployed src={0} dst={1} killedRunning={2} attempts={3} {4}' -f $src, $dst, $killed, $attempt, $assetResult)
+            Write-Output ('OK deployed src={0} dst={1} killedRunning={2} attempts={3}' -f $src, $dst, $killed, $attempt)
             return
         } catch {
             if ($attempt -eq $Retries) {
