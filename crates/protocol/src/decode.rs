@@ -69,6 +69,18 @@ pub fn decode_notify(
                 Err(_) => log::debug!("bpsr-protocol: SyncToMeDeltaInfo decode failed"),
             }
         }
+        // Every other opcode is skipped on purpose. The largest of them,
+        // `SyncContainerDirtyData` (0x16, a few hundred messages a session), was
+        // investigated against a real capture and is *not* worth decoding: all
+        // 264 payloads in that capture share the shape
+        // `{ 1: { 1: bytes diff_blob, 2: varint == 1 } }`, where `diff_blob` is
+        // not protobuf at all but a proprietary little-endian i32 tree keyed by
+        // `0xFFFF_FFFE`/`0xFFFF_FFFD` sentinel words. It carries no entity uuid
+        // and no `AttrCollection`: none of the distinctive attr ids (220
+        // PROFESSION_ID, 10030 FIGHT_POINT, 11310 HP, 11320 MAX_HP) appears
+        // anywhere in it. It is a container/inventory diff channel, so every
+        // entity attribute we care about still arrives on the four opcodes
+        // above.
         _ => {}
     }
 }
