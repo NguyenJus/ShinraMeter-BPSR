@@ -44,10 +44,10 @@ rustup target add x86_64-pc-windows-gnu
 sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
 ```
 
-`crates/capture` links `windivert` with the `vendored` feature, which shells
-out to `x86_64-w64-mingw32-gcc` during the build script, so the mingw
-toolchain above is required even for a plain `cargo check --target
-x86_64-pc-windows-gnu`.
+`bpsr-protocol`'s `zstd` dependency builds `zstd-sys` from C, and the `app`
+crate's `build.rs` shells out to `windres` (via `embed_resource`) to embed
+the UAC manifest, so the mingw toolchain above is required even for a plain
+`cargo check --target x86_64-pc-windows-gnu`.
 
 Common commands:
 

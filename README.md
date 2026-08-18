@@ -35,8 +35,8 @@ That's it — no separate driver download, no installer, nothing else to set up.
 - **Nothing to install separately for packet capture.** Unlike some other
   meters, you do not need to install Npcap or WinPcap yourself. The
   WinDivert driver is bundled inside the executable and unpacked
-  automatically to `%LOCALAPPDATA%\ShinraMeter-BPSR\windivert\` the first
-  time you run it.
+  automatically to `%LOCALAPPDATA%\ShinraMeter-BPSR\windivert\<version>\` the
+  first time you run it.
 - **Antivirus/VPN software that may interfere.** Some antivirus tools, VPN
   filter drivers, or Windows Core Isolation settings can block the
   WinDivert driver from loading. NordVPN and Brave's built-in VPN are known
@@ -80,9 +80,9 @@ WinDivert. Close it, or reboot, and retry.
 `services.msc` → Base Filtering Engine → Start.
 
 **"Windows could not find the WinDivert driver file"** — the driver is
-unpacked to `%LOCALAPPDATA%\ShinraMeter-BPSR\windivert\` at startup and
-wasn't found there. Check that antivirus isn't quarantining it, then
-delete that folder to force a clean re-unpack.
+unpacked to `%LOCALAPPDATA%\ShinraMeter-BPSR\windivert\<version>\` at
+startup and wasn't found there. Check that antivirus isn't quarantining it,
+then delete that folder to force a clean re-unpack.
 
 **"Run as Administrator"** — the manifest normally triggers the UAC prompt
 automatically; seeing this message means elevation was declined or

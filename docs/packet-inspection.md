@@ -62,7 +62,7 @@ thinner-than-expected attr section.
 
 A dump caps at 5 MiB and rotates to `<path>.1` (see `crates/app/src/dump.rs`
 and the README's "Packet inspection dumps" section) — routine enough for a
-long session now that inspection is on by default. `inspect-replay` handles
+long session once inspection is enabled. `inspect-replay` handles
 this itself: if `<path>.1` exists next to the file you pass it, it reads
 that rotated file first (so records stay in chronological order) and prints
 a `note:` line saying how many records it contributed. You only need to

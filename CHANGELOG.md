@@ -33,6 +33,9 @@ affiliated with the game's publisher.
   redundant collapse toggle was removed.
 - Diagnostic logging is more informative: unknown packet attributes and
   encounter transitions are now logged.
+- Packet-inspection diagnostics (`SHINRA_INSPECT`) are now opt-in instead of
+  opt-out, since the dumps they produce can contain other players' names.
+  Set `SHINRA_INSPECT=1` to enable them; by default nothing is written.
 
 ### Fixed
 
