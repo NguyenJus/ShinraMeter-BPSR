@@ -262,6 +262,22 @@ fn install_panic_hook() {
             .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
             .unwrap_or("<no message>");
         log::error!("panic at {location}: {message}");
+        // Issue #119: a `Surface::configure` panic can follow an oversize
+        // window proposal even after `platform::window_proc` clamped it —
+        // the clamp is not the only path to an oversize surface — so carry
+        // whatever the platform layer last saw onto the same log line the
+        // panic itself reaches. `last_oversize_proposal` is poison-safe and
+        // never panics, so it's fine to call from inside a panic hook.
+        //
+        // The record is never cleared, so it can be arbitrarily stale by
+        // the time a panic reads it — a clamp from early in a multi-day
+        // session is not "before this panic" in any causal sense once an
+        // unrelated crash happens days later. `last_oversize_proposal`
+        // already prefixes its own age (e.g. "3d 4h ago"), so this line
+        // only reports what was seen, not when relative to the panic.
+        if let Some(proposal) = crate::platform::last_oversize_proposal() {
+            log::error!("{proposal}");
+        }
         previous(info);
     }));
 }
