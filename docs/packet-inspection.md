@@ -1,8 +1,8 @@
 # Packet inspection: in-game confirmation procedure
 
-Issue #25 built the observation tooling (diagnostic mode — on by default since
-issue #87, opt out with `SHINRA_INSPECT=0` — unrecognized service/method id
-logging, unknown attr id logging, and a raw frame dump for offline replay).
+Issue #25 built the observation tooling (diagnostic mode — opt-in since issue
+#122 via `SHINRA_INSPECT=1` — unrecognized service/method id logging, unknown
+attr id logging, and a raw frame dump for offline replay).
 That tooling only makes observation *possible* — turning an
 observation into a confirmed constant still requires a deliberate procedure
 against live game traffic on a Windows box running `ShinraMeter-BPSR`. This is
@@ -62,7 +62,7 @@ thinner-than-expected attr section.
 
 A dump caps at 5 MiB and rotates to `<path>.1` (see `crates/app/src/dump.rs`
 and the README's "Packet inspection dumps" section) — routine enough for a
-long session now that inspection is on by default. `inspect-replay` handles
+long session once inspection is enabled. `inspect-replay` handles
 this itself: if `<path>.1` exists next to the file you pass it, it reads
 that rotated file first (so records stay in chronological order) and prints
 a `note:` line saying how many records it contributed. You only need to
