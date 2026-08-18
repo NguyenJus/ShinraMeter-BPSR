@@ -186,14 +186,19 @@ impl DiagnosticSink {
     /// `on_attr`) so the discovery decision is directly unit-testable.
     fn record_attr(&self, uid: i64, attr_id: i32, raw: &[u8]) -> bool {
         let mut attrs = self.attrs.lock().unwrap();
-        let is_new = !attrs.contains_key(&attr_id);
-        let stat = attrs.entry(attr_id).or_insert_with(|| AttrStat {
-            count: 0,
-            uids: HashSet::new(),
-            uids_saturated: false,
-            sample_uid: uid,
-            sample_raw_hex: hex_prefix(raw),
-        });
+        let (stat, is_new) = match attrs.entry(attr_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => (entry.into_mut(), false),
+            std::collections::hash_map::Entry::Vacant(entry) => (
+                entry.insert(AttrStat {
+                    count: 0,
+                    uids: HashSet::new(),
+                    uids_saturated: false,
+                    sample_uid: uid,
+                    sample_raw_hex: hex_prefix(raw),
+                }),
+                true,
+            ),
+        };
         stat.count += 1;
         if stat.uids.len() < MAX_TRACKED_UIDS_PER_ATTR {
             stat.uids.insert(uid);

@@ -314,7 +314,7 @@ impl Meter {
                 // instance, so log only when the resolved id actually
                 // changes — never per packet, which would just be a smaller
                 // version of the #87 flood this exists to avoid.
-                if let Some(msg) = scene_transition_log(self.scene_id, *level_map_id) {
+                if let Some(msg) = scene_transition_log(self.scene_id, Some(*level_map_id)) {
                     log::info!("{msg}");
                 }
                 self.scene_id = Some(*level_map_id);
@@ -324,6 +324,9 @@ impl Meter {
                 self.reset(ResetReason::ServerChange, *timestamp_ms);
                 self.enemies.clear();
                 self.boss_uid = None;
+                if let Some(msg) = scene_transition_log(self.scene_id, None) {
+                    log::info!("{msg}");
+                }
                 self.scene_id = None;
                 Some(ResetReason::ServerChange)
             }
@@ -778,16 +781,22 @@ impl Meter {
 
 /// Builds the "scene changed" diagnostic line (issue #69), or `None` when
 /// `new_scene_id` matches `previous` — the transition-only guard that keeps
-/// this out of the #87-style flood. Split out from `Meter::apply` as a pure
-/// function so the decision (log or not, and what) is unit-testable without
-/// a log-capturing harness.
-fn scene_transition_log(previous: Option<u32>, new_scene_id: u32) -> Option<String> {
-    if previous == Some(new_scene_id) {
+/// this out of the #87-style flood. `new_scene_id` is `Option<u32>` so this
+/// can also represent a clear-to-`None` transition (the `ServerChanged` arm
+/// of `Meter::apply`, mirroring how [`boss_transition_log`] handles a
+/// cleared boss target) rather than only ever moving between two concrete
+/// scenes. Split out from `Meter::apply` as a pure function so the decision
+/// (log or not, and what) is unit-testable without a log-capturing harness.
+fn scene_transition_log(previous: Option<u32>, new_scene_id: Option<u32>) -> Option<String> {
+    if previous == new_scene_id {
         return None;
     }
-    Some(match tables::scene_name(new_scene_id) {
-        Some(name) => format!("encounter: scene changed to id={new_scene_id} name={name}"),
-        None => format!("encounter: scene changed to id={new_scene_id} name=<unresolved>"),
+    Some(match new_scene_id {
+        None => "encounter: scene cleared".to_string(),
+        Some(id) => match tables::scene_name(id) {
+            Some(name) => format!("encounter: scene changed to id={id} name={name}"),
+            None => format!("encounter: scene changed to id={id} name=<unresolved>"),
+        },
     })
 }
 
@@ -2294,20 +2303,30 @@ mod tests {
 
         #[test]
         fn scene_transition_log_fires_only_when_the_id_changes() {
-            assert!(scene_transition_log(None, 8).is_some());
-            assert!(scene_transition_log(Some(8), 8).is_none());
-            assert!(scene_transition_log(Some(8), 9).is_some());
+            assert!(scene_transition_log(None, Some(8)).is_some());
+            assert!(scene_transition_log(Some(8), Some(8)).is_none());
+            assert!(scene_transition_log(Some(8), Some(9)).is_some());
+            // Scene clearing (a real transition, e.g. on `ServerChanged`) still logs.
+            assert!(scene_transition_log(Some(8), None).is_some());
+            // No-op stays silent even when both sides are already empty.
+            assert!(scene_transition_log(None, None).is_none());
         }
 
         #[test]
         fn scene_transition_log_reports_the_resolved_name_or_says_it_did_not_resolve() {
-            let msg = scene_transition_log(None, 8).unwrap();
+            let msg = scene_transition_log(None, Some(8)).unwrap();
             assert!(msg.contains("id=8"));
             assert!(msg.contains("Asterleeds"));
 
-            let msg = scene_transition_log(None, 999_999).unwrap();
+            let msg = scene_transition_log(None, Some(999_999)).unwrap();
             assert!(msg.contains("id=999999"));
             assert!(msg.contains("<unresolved>"));
+        }
+
+        #[test]
+        fn scene_transition_log_reports_a_clear() {
+            let msg = scene_transition_log(Some(8), None).unwrap();
+            assert!(msg.contains("cleared"));
         }
 
         #[test]
