@@ -12,9 +12,10 @@ any way.
 ## Download
 
 1. Go to the [latest release](https://github.com/NguyenJus/ShinraMeter-BPSR/releases/latest).
-2. Download the `.zip` asset and extract it somewhere on your PC. Keep the
-   `assets` folder next to `ShinraMeter-BPSR.exe` — that's where the class
-   and skill icons come from.
+2. Download the `.zip` asset and extract it somewhere on your PC. The zip
+   contains the executable only — every icon set, including the class and
+   Imagine icons, is compiled into the executable, so there is nothing else
+   to extract or keep beside it.
 3. Double-click `ShinraMeter-BPSR.exe`.
 4. Windows will show a UAC prompt asking to run as Administrator. Accept it
    — the meter needs elevation to install its packet-capture driver (see
@@ -59,8 +60,9 @@ game, always on top. A few things to know:
 - **Data location**: settings are stored in
   `%APPDATA%\ShinraMeter-BPSR\settings.json`, and logs in
   `%APPDATA%\ShinraMeter-BPSR\logs\ShinraMeter-BPSR.log`.
-- Deleting the `assets` folder doesn't break the meter — you just lose the
-  class and skill icons; names, numbers, and stats still work fine.
+- All icons — class, Imagine, and toolbar — are compiled into the
+  executable, so there's no `assets` folder shipped alongside it to lose,
+  delete, or otherwise manage.
 
 ## Troubleshooting
 
@@ -127,8 +129,10 @@ id/name table) — those remain the property of their respective owners and
 are redistributed here only on the inferred basis explained there, not
 under a grant from this project.
 
-Those assets will be removed promptly on request from the rights holder. To
-request removal, open a GitHub issue on this repository.
+Those assets will be removed promptly on request from the rights holder — a
+source deletion and rebuild, since they are compiled into the executable
+(issue #123), followed by a re-release. To request removal, open a GitHub
+issue on this repository.
 
 Ported packet-format knowledge from these open-source trackers (all GPL-compatible):
 - https://github.com/Blue-Protocol-Source/BPSR-ZDPS
@@ -213,7 +217,6 @@ The binaries live in `crates/capture/vendor/windivert/`, taken verbatim from the
 
 ### Dev environment variables
 
-- `SHINRA_ASSETS_DIR` — override the assets directory search.
 - `SHINRA_LOG_FILE` — override the log file path (falls back to
   `ShinraMeter-BPSR.log` in the working directory if `APPDATA` is unset,
   e.g. a non-Windows dev host).

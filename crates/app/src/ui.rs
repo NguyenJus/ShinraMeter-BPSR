@@ -11,7 +11,6 @@ use bpsr_meter::{Class, EncounterInfo, PlayerRow, Role, Snapshot};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 
-use crate::assets;
 use crate::fonts;
 use crate::icons::{ClassIcons, GlyphIcon, GlyphIcons, ImagineIcons, ToolbarIcon, ToolbarIcons};
 use crate::imagines;
@@ -199,12 +198,9 @@ pub struct OverlayApp {
 /// All icon textures the overlay paints, bundled so `OverlayApp` has exactly
 /// one lazily-loaded field for them instead of one per icon set (issue #41).
 ///
-/// `Icons::load` is also the single per-process asset-root resolution site
-/// (issue #103): it calls `assets::root()` exactly once and threads the
-/// result into both `ClassIcons::load_from` and `ImagineIcons::load_from`,
-/// rather than each set independently re-resolving (and re-warning about) the
-/// same root. That is why the startup asset-root log line lives here rather
-/// than in `main`.
+/// Every set here is `include_bytes!`-ed at compile time (issue #123), so
+/// `Icons::load` has nothing to resolve or warn about — it just decodes and
+/// uploads a texture for each set.
 struct Icons {
     classes: ClassIcons,
     toolbar: ToolbarIcons,
@@ -215,35 +211,16 @@ struct Icons {
 }
 
 impl Icons {
-    /// Safe to call more than once per process (each call re-resolves the
-    /// root and re-reads every icon file), but nothing does: `ui.rs`'s
+    /// Safe to call more than once per process (each call re-decodes and
+    /// re-uploads every icon), but nothing does: `ui.rs`'s
     /// `get_or_insert_with` call site only ever calls this on `OverlayApp`'s
-    /// first `ui()` frame, so the log lines below fire once, not per frame.
+    /// first `ui()` frame.
     fn load(ctx: &egui::Context) -> Self {
-        let (root, warning) = assets::root();
-        if let Some(warning) = warning {
-            log::warn!("{warning}");
-        } else if let Some(root) = &root {
-            log::info!("loading class and Imagine icons from {}", root.display());
-        }
-        let classes = ClassIcons::load_from(ctx, root.as_deref());
-        let imagines = ImagineIcons::load_from(ctx, root.as_deref());
-        let missing_classes = classes.missing();
-        let missing_imagines = imagines.missing();
-        let override_hint = if missing_classes > 0 || missing_imagines > 0 {
-            " (set SHINRA_ASSETS_DIR to override the asset root)"
-        } else {
-            ""
-        };
-        log::info!(
-            "{missing_classes} class icon(s) and {missing_imagines} Imagine icon(s) failed to \
-             load{override_hint}"
-        );
         Self {
-            classes,
+            classes: ClassIcons::load(ctx),
             toolbar: ToolbarIcons::load(ctx),
             glyphs: GlyphIcons::load(ctx),
-            imagines,
+            imagines: ImagineIcons::load(ctx),
         }
     }
 }
@@ -6808,7 +6785,7 @@ mod tests {
     #[test]
     fn class_icons_get_is_defined_for_every_class_including_unknown() {
         let ctx = egui::Context::default();
-        let icons = ClassIcons::load_from(&ctx, assets::root().0.as_deref());
+        let icons = ClassIcons::load(&ctx);
 
         for class in [
             Class::Stormblade,
