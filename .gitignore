@@ -20,8 +20,8 @@ docs/reference/
 /ShinraMeter-BPSR.log
 /ShinraMeter-BPSR.log.1
 
-# Packet-inspection diagnostic dumps (issue #25, on by default since issue
-# #87 — set SHINRA_INSPECT=0 to opt out). These contain player names and
+# Packet-inspection diagnostic dumps (issue #25, opt-in since issue #122 —
+# set SHINRA_INSPECT=1 to enable). These contain player names and
 # other identifying traffic captured from a live session — never commit one
 # or attach it to an issue/PR; mint a minimal synthetic fixture instead.
 ShinraMeter-BPSR-inspect-dump-*.jsonl
