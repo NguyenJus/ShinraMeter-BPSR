@@ -2002,6 +2002,28 @@ mod tests {
             assert!(snap.encounter.is_boss);
         }
 
+        /// issue #112: the curated `BOSS_MONSTER_IDS` list jumped straight
+        /// from 102721 to 130110 — no 103xxx id at all — so a real
+        /// current-content boss like 103108 resolved a `boss_monster_id` but
+        /// `is_boss` came back false, and `encounter_title`
+        /// (`crates/app/src/ui.rs`) rendered an empty header mid-fight. This
+        /// covers the same end-to-end path with a boss id now sourced from
+        /// `MonsterTable.json`'s `MonsterType == 2` instead of the stale
+        /// hand-curated list.
+        #[test]
+        fn boss_name_resolves_for_an_issue_112_boss_id() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 100, 100, Some(103_108), 0));
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.boss_monster_id, Some(103_108));
+            assert_eq!(
+                snap.encounter.boss_name,
+                Some("Paradox-Calamity Remnant - Origin")
+            );
+            assert!(snap.encounter.is_boss);
+        }
+
         /// issue #76: a meter started mid-pull never sees the boss's
         /// `SyncNearEntities` appear packet, so it only ever receives HP
         /// *deltas* — which carry `AttrHp` and `AttrId` but no `AttrMaxHp`.

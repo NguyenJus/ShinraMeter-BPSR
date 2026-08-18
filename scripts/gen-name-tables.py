@@ -38,6 +38,7 @@ can rot silently.
 """
 
 import argparse
+import functools
 import io
 import json
 import pathlib
@@ -59,7 +60,6 @@ VERBATIM_SOURCES = {
     "MonsterName.json": f"{_RESONANCE}/MonsterName.json",
     "SceneName.json": f"{_RESONANCE}/SceneName.json",
     "MonsterNameCrowdsource.json": f"{_BPSR_LOGS}/MonsterNameCrowdsource.json",
-    "MonsterNameBoss.json": f"{_BPSR_LOGS}/MonsterNameBoss.json",
 }
 
 # Authoritative game tables, vendored *filtered*. Upstream these are 6.5 MB,
@@ -69,6 +69,35 @@ FILTERED_SOURCES = {
     "MonsterTableNames.json": f"{_ZDPS}/MonsterTable.json",
     "SceneTableNames.json": f"{_ZDPS}/SceneTable.json",
     "DungeonsTableNames.json": f"{_ZDPS}/DungeonsTable.json",
+}
+
+# Issue #112: the same `MonsterTable.json` also carries `MonsterType`, an enum
+# (`Zproto.EMonsterType`: Monster = 0, Elite = 1, Boss = 2) that the reference
+# tool BPSR-ZDPS itself uses to classify encounters (`Encounter.SetEntityType`
+# -> `UpdateEncounterBossData`, tested against `MonsterType == 2`). That is a
+# trustworthy, fully-populated boss flag — unlike the tempting-looking
+# `MonsterRank` field, which is `""` for every one of the table's 3094 rows in
+# the shipped data (a dead, unshipped field) and the attrs
+# `AttrIsMonsterRankEnable` (459) / `AttrMonsterRank` (460), which the
+# reference tool's IL never reads and no enum gives meaning to. Do not resurrect
+# either. This is filtered from the same URL as `MonsterTableNames.json` above,
+# just projected to ids instead of names.
+BOSS_ID_SOURCES = {
+    "MonsterTableBossIds.json": f"{_ZDPS}/MonsterTable.json",
+}
+
+# Manual overrides (issue #112): ids the old hand-curated `MonsterNameBoss.json`
+# list carried as bosses that `MonsterTable.json`'s `MonsterType` does not mark
+# as `Boss` (2). Checked individually — see the per-id comment — and unioned on
+# top of the generated `MonsterType == 2` set; this can only ever add ids back,
+# never suppress one the generated set already includes.
+BOSS_ID_MANUAL_OVERRIDES: dict[int, str] = {
+    # "Storm Goblin King": MonsterType 1 (Elite) in MonsterTable.json, not 2.
+    # Both community trackers (`resonance-logs` and `bpsr-logs`) flagged it as
+    # a boss in their curated files, and it is fought as a named miniboss with
+    # its own encounter, so it is kept rather than silently losing its header
+    # display when the source of truth switched to MonsterType.
+    61_220: "Storm Goblin King",
 }
 
 HEADER = """//! Static id -> display-name tables for monsters and scenes.
@@ -116,8 +145,9 @@ mod tests {
         // The backfill multiplies named monster ids more than tenfold, so far
         // more trash now carries a name `recompute_boss` could hoist into the
         // header. Having a name must never imply bosshood: the display gate is
-        // `is_boss_monster`, which reads only the curated `MonsterNameBoss.json`
-        // set and is deliberately *not* widened by the backfill.
+        // `is_boss_monster`, which reads only ids `MonsterTable.json` marks
+        // `MonsterType == 2` (issue #112) and is deliberately *not* widened by
+        // the backfill.
         assert!(monster_name(205).is_some());
         assert!(!is_boss_monster(205));
     }
@@ -136,10 +166,32 @@ mod tests {
 
     #[test]
     fn is_boss_monster_false_for_a_known_non_boss_monster_id() {
-        // "Golden Nappo" (10900) has a name in `monster_name` but is not in
-        // `MonsterNameBoss.json` — a named-but-non-boss id must not read as
-        // a boss just because the tables happen to know its name.
+        // "Golden Nappo" (10900) has a name in `monster_name` but its
+        // `MonsterTable.json` `MonsterType` is 0 (plain Monster), not 2 — a
+        // named-but-non-boss id must not read as a boss just because the
+        // tables happen to know its name.
         assert!(!is_boss_monster(10_900));
+    }
+
+    #[test]
+    fn is_boss_monster_true_for_the_issue_112_boss_ids() {
+        // These template ids jumped straight from 102721 to 130110 in the
+        // old hand-curated list — no 103xxx id at all — so real
+        // current-content bosses fell through to a blank header mid-fight.
+        // All four have `MonsterType == 2` in `MonsterTable.json`.
+        assert!(is_boss_monster(103_108)); // Paradox-Calamity Remnant - Origin
+        assert!(is_boss_monster(103_111)); // Dragonbane Golem - Left Cannon
+        assert!(is_boss_monster(103_207)); // Paradox-Calamity Remnant - Continuation
+        assert!(is_boss_monster(103_308)); // Paradox-Calamity Remnant - Final
+    }
+
+    #[test]
+    fn is_boss_monster_true_for_a_manual_override_not_marked_boss_by_monster_type() {
+        // "Storm Goblin King": MonsterType 1 (Elite) in MonsterTable.json,
+        // not 2, but both community trackers flagged it as a boss and it is
+        // fought as one — see `BOSS_ID_MANUAL_OVERRIDES` in
+        // `scripts/gen-name-tables.py`.
+        assert!(is_boss_monster(61_220));
     }
 
     #[test]
@@ -240,6 +292,18 @@ def filter_id_names(raw: dict) -> dict[str, str]:
     return dict(sorted(out.items(), key=lambda kv: int(kv[0])))
 
 
+def filter_boss_ids(raw: dict) -> list[int]:
+    """Project a full `MonsterTable.json` down to ids with `MonsterType == 2`
+    (`Zproto.EMonsterType.Boss`) — see `BOSS_ID_SOURCES` for why this field,
+    not `MonsterRank`, is the trustworthy one.
+    """
+    out = []
+    for key, row in raw.items():
+        if isinstance(row, dict) and row.get("MonsterType") == 2:
+            out.append(int(key))
+    return sorted(out)
+
+
 def merge_names(*layers: dict[int, str]) -> dict[int, str]:
     """Merge id -> name layers, least authoritative first.
 
@@ -295,6 +359,18 @@ def _self_test() -> None:
         "a non-blank name carrying leading/trailing padding must be stored stripped"
     )
 
+    boss_ids = filter_boss_ids(
+        {
+            "20": {"MonsterType": 2},
+            "10": {"MonsterType": 0},
+            "15": {"MonsterType": 2},
+            "11": {"MonsterType": 1},
+            "12": {"NoType": 1},
+            "13": "not a row",
+        }
+    )
+    assert boss_ids == [15, 20], boss_ids
+
     assert esc('a\\b"c') == 'a\\\\b\\"c'
     assert esc("line1\rline2") == "line1\\rline2"
     assert esc("line1\nline2") == "line1\\nline2"
@@ -345,17 +421,33 @@ BOSS_IDS_DOC = """/// Boss-monster template ids (issue #42): the top-bar encount
 /// of membership here; only `boss_name`/`is_boss` (set in `Meter::snapshot`)
 /// are gated by it.
 ///
-/// This set is deliberately *not* widened by issue #36's authoritative
-/// backfill. That backfill grew `monster_name` more than tenfold, which grew
-/// the population of trash that `recompute_boss` can name — so the gate got
-/// more load-bearing, not less. It stays the hand-checked list precisely
-/// because the client table offers no trustworthy boss flag: `MonsterRank`
-/// there marks elites and minibosses too.
+/// Generated (issue #112) from `crates/meter/data/MonsterTableNames.json`'s
+/// source, BPSR-ZDPS's `MonsterTable.json`, as every id whose `MonsterType`
+/// is 2 (`Zproto.EMonsterType::Boss`) — the same field and the same test the
+/// reference tool BPSR-ZDPS itself uses to classify an encounter
+/// (`Encounter.SetEntityType` -> `UpdateEncounterBossData`). `MonsterRank`,
+/// which the previous version of this comment cited as the reason to hand-curate
+/// this list instead, is `""` for every one of the table's 3094 shipped rows —
+/// a dead, unshipped field, not a finer-grained elites-vs-bosses signal — and
+/// the attrs that might look like a substitute (`AttrIsMonsterRankEnable` =
+/// 459, `AttrMonsterRank` = 460) are never read by the reference tool's IL and
+/// have no enum giving their values meaning. Do not resurrect either as a
+/// classification source.
 ///
-/// Generated from `crates/meter/data/MonsterNameBoss.json`, shipped
-/// identically by the `bpsr-logs` and `resonance-logs` community trackers
-/// (both GPL-3.0, the same licence as this project); see
-/// `THIRD_PARTY_NOTICES.md`.
+/// A short manual-override list in `scripts/gen-name-tables.py`
+/// (`BOSS_ID_MANUAL_OVERRIDES`) adds back ids the previous hand-curated list
+/// carried that `MonsterType` does not mark as 2 but that community trackers
+/// fought and flagged as bosses; see its comment for the one id it currently
+/// carries.
+///
+/// Previously hand-curated from `crates/meter/data/MonsterNameBoss.json`
+/// (community-tracker data, GPL-3.0); see `THIRD_PARTY_NOTICES.md` for the
+/// licence of the table this now derives from instead.
+///
+/// This set is deliberately *not* widened by issue #36's authoritative
+/// backfill beyond what `MonsterType == 2` already yields: `monster_name`
+/// covers an order of magnitude more ids than are bosses, and having a name
+/// must never by itself imply bosshood.
 ///
 /// Sorted ascending; `is_boss_monster` binary-searches it."""
 
@@ -388,7 +480,12 @@ def emit_boss_ids(out: io.StringIO, ids: list[int]) -> None:
     )
 
 
+@functools.lru_cache(maxsize=None)
 def _fetch(url: str) -> bytes:
+    # Cached by URL: `BOSS_ID_SOURCES["MonsterTableBossIds.json"]` and
+    # `FILTERED_SOURCES["MonsterTableNames.json"]` are the same upstream URL,
+    # projected two different ways, so without this a `--refresh` would
+    # download the multi-megabyte `MonsterTable.json` twice.
     with urllib.request.urlopen(url, timeout=120) as resp:  # noqa: S310 - fixed https URLs
         return resp.read()
 
@@ -399,6 +496,9 @@ def _render_source(name: str, url: str) -> bytes:
     if name in FILTERED_SOURCES:
         filtered = filter_id_names(json.loads(body.decode("utf-8-sig")))
         return (json.dumps(filtered, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if name in BOSS_ID_SOURCES:
+        ids = filter_boss_ids(json.loads(body.decode("utf-8-sig")))
+        return (json.dumps(ids, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     # `VERBATIM_SOURCES` are vendored byte-for-byte, but a leading UTF-8 BOM
     # would otherwise ride along untouched: strip it here so every vendored
     # file — filtered or verbatim — is guaranteed BOM-free on disk, matching
@@ -414,7 +514,7 @@ def refresh(check: bool) -> bool:
     copies are overwritten.
     """
     clean = True
-    for name, url in {**VERBATIM_SOURCES, **FILTERED_SOURCES}.items():
+    for name, url in {**VERBATIM_SOURCES, **FILTERED_SOURCES, **BOSS_ID_SOURCES}.items():
         rendered = _render_source(name, url)
         target = DATA / name
         current = target.read_bytes() if target.exists() else None
@@ -455,7 +555,9 @@ def render() -> str:
         _keyed(load("SceneTableNames.json")),
         _keyed(load("SceneName.json")),
     )
-    boss_ids = sorted(int(k) for k in load("MonsterNameBoss.json"))
+    boss_ids = sorted(
+        {int(x) for x in load("MonsterTableBossIds.json")} | set(BOSS_ID_MANUAL_OVERRIDES)
+    )
 
     out = io.StringIO()
     out.write(HEADER)
