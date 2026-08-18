@@ -176,8 +176,7 @@ WinDivert's LGPL-3.0 option is compatible.
 - Files: `crates/meter/data/MonsterName.json`, `crates/meter/data/SceneName.json`
   (from `resonance-logs/resonance-logs`, GPL-3.0) and
   `crates/meter/data/MonsterNameCrowdsource.json` (from `winjwinj/bpsr-logs`,
-  GPL-3.0). See "Boss-monster id list" below for
-  `crates/meter/data/MonsterNameBoss.json`.
+  GPL-3.0).
 - Upstream: <https://github.com/resonance-logs/resonance-logs>,
   <https://github.com/winjwinj/bpsr-logs>
 - License: GPL-3.0, matching this project's own licence
@@ -218,10 +217,23 @@ WinDivert's LGPL-3.0 option is compatible.
 
 ## Boss-monster id list
 
-- Files: `crates/meter/data/MonsterNameBoss.json`
-- Upstream: <https://github.com/winjwinj/bpsr-logs> (also shipped identically
-  by <https://github.com/resonance-logs/resonance-logs>)
-- License: GPL-3.0, matching this project's own licence
+- Files: `crates/meter/data/MonsterTableBossIds.json`
+- Upstream: <https://github.com/Blue-Protocol-Source/BPSR-ZDPS> —
+  `BPSR-ZDPS/Data/MonsterTable.json` (the same file `MonsterTableNames.json`
+  above is filtered from, projected to ids instead of names)
+- Copyright (c) 2025 Blue-Protocol-Source
+- License: MIT, the same as the "Monster and scene name tables (BPSR-ZDPS)"
+  section above and for the same reason: combining it into this GPL-3.0-only
+  project is fine, and the combined result is governed by this project's
+  GPL-3.0-only licence.
+- **Filtered, not verbatim** (issue #112). `filter_boss_ids` in
+  `scripts/gen-name-tables.py` projects `MonsterTable.json` down to the ids
+  whose `MonsterType` field is 2 (`Zproto.EMonsterType::Boss`) — the same
+  field and test the reference tool BPSR-ZDPS itself uses to classify an
+  encounter (`Encounter.SetEntityType` -> `UpdateEncounterBossData`).
+  `MonsterRank`, which the previous version of this list's generation logic
+  relied on hand-curation instead of, is `""` for every shipped row and is not
+  a trustworthy substitute.
 - Compiled into the `BOSS_MONSTER_IDS` constant and `is_boss_monster` in
   `crates/meter/src/tables.rs` by `scripts/gen-name-tables.py`, the same as
   the tables above. Used to gate the top-bar encounter name to boss fights
@@ -229,9 +241,15 @@ WinDivert's LGPL-3.0 option is compatible.
   of its own, so this id set is consulted at display time to decide whether
   the resolved target is a real boss worth naming, rather than a large trash
   pull.
-- Deliberately left as the small hand-checked list by issue #36's backfill.
-  That backfill grew `monster_name` more than tenfold, which grew the
-  population of trash `recompute_boss` can resolve a name for — so this gate
-  became more load-bearing, not less. The BPSR-ZDPS `MonsterTable.json` has no
-  trustworthy substitute for it: its `MonsterRank` field marks elites and
-  minibosses alongside raid bosses.
+- A short manual-override list (`BOSS_ID_MANUAL_OVERRIDES` in
+  `scripts/gen-name-tables.py`, not a vendored file) adds back one id —
+  61,220, "Storm Goblin King" — that `MonsterType` does not mark as 2 but that
+  the previous hand-curated list below carried as a boss and that is fought as
+  a named miniboss; see the override's comment in the script for the full
+  reasoning.
+- Until issue #112 this list was hand-curated from
+  `crates/meter/data/MonsterNameBoss.json` (GPL-3.0, from
+  `winjwinj/bpsr-logs`, also shipped identically by
+  `resonance-logs/resonance-logs`). That file has been removed from this
+  repository; it is credited here only as the historical source of the one id
+  preserved by `BOSS_ID_MANUAL_OVERRIDES` above.
