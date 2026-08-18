@@ -56,6 +56,17 @@ die() { echo "ctl.sh: $*" >&2; exit 1; }
 # be expressed this way -- it is a Windows process and cannot read /mnt/c paths.
 winpath() { wslpath -w "$1"; }
 
+# This invocation's repo root, Windows-visible. The elevated ctl server is
+# long-lived (started once per session, possibly from a different worktree
+# than the one calling ctl.sh right now) and PowerShell-side path resolution
+# (Get-UidbgRepoRoot in lib.ps1) otherwise falls back to deriving the repo
+# root from wherever lib.ps1 itself was dot-sourced from -- the tree the
+# server happened to be started against. `app -Action deploy` would then
+# silently build and deploy from THAT tree instead of the one the caller is
+# actually sitting in. Every job carries its own submitter's repo root so
+# deploy always tracks the invoking worktree, not the server's birthplace.
+WIN_REPO_ROOT="$(winpath "$REPO_ROOT")"
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --serve-cmd)  MODE="serve-cmd"; shift ;;
@@ -115,6 +126,12 @@ trap 'rm -f "$tmp_file"' EXIT
 
 {
   if [ "$PREPEND_LIB" -eq 1 ]; then
+    # Set BEFORE dot-sourcing the lib: Get-UidbgRepoRoot reads this env var,
+    # and functions defined later in the file still see whatever the process
+    # env holds at call time, but ordering it first keeps the job's intent
+    # obvious on re-read. Single-quoted PowerShell string -- double any
+    # embedded quote, same rule as the app-args quoting below.
+    echo "\$env:SHINRA_UIDBG_REPO = '${WIN_REPO_ROOT//\'/\'\'}'"
     # The server exports SHINRA_UIDBG_LIB, so a job never hardcodes a path.
     echo '. $env:SHINRA_UIDBG_LIB'
   fi
