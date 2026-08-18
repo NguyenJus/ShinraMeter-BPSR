@@ -173,7 +173,7 @@ rustup target add x86_64-pc-windows-gnu
 sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
 ```
 
-The `crates/capture` crate links `windivert` with the `vendored` feature, which invokes `x86_64-w64-mingw32-gcc`, `-dlltool`, and `-strip` during the build script — without mingw, even `cargo check --target x86_64-pc-windows-gnu` fails.
+`bpsr-protocol`'s `zstd` dependency builds `zstd-sys` from C, and the `app` crate's `build.rs` shells out to `windres` (via `embed_resource`) to embed the UAC manifest — so without mingw, even `cargo check --target x86_64-pc-windows-gnu` fails.
 
 ### Compile
 
