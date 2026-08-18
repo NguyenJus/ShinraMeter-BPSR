@@ -153,27 +153,44 @@ pub struct SyncContainerData {
     pub v_data: Option<CharSerialize>,
 }
 
+/// `WorldNtf.EnterScene` (opcode 3, `decode::opcode::ENTER_SCENE`, issue
+/// #35). Only field 1 (the scene attrs, via [`EnterSceneInfo`]) is modeled —
+/// the message also carries character data (fields 1.2: 1, 2, 3, 4, 7) and
+/// top-level fields 7/8/9, dumped from a real capture but not needed by
+/// anything downstream today; prost skips them automatically (see this
+/// file's module doc), so adding them later is non-breaking.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EnterScene {
+    #[prost(message, optional, tag = "1")]
+    pub info: Option<EnterSceneInfo>,
+}
+
+/// The scene-enter payload nested inside `EnterScene`'s field 1. Field 1 is
+/// an `AttrCollection` — the same `{2: repeated Attr}` shape already used by
+/// `SyncNearEntities`' `Entity.attrs` — carrying the scene attrs
+/// (`attr_id::SCENE_BASIC_ID` and its siblings), confirmed against a real
+/// capture (issue #35).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EnterSceneInfo {
+    #[prost(message, optional, tag = "1")]
+    pub attrs: Option<AttrCollection>,
+}
+
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CharSerialize {
     #[prost(int64, tag = "1")]
     pub char_id: i64,
     #[prost(message, optional, tag = "2")]
     pub char_base: Option<CharBaseInfo>,
-    #[prost(message, optional, tag = "3")]
-    pub scene_data: Option<SceneData>,
+    // Field 3 was `scene_data: Option<SceneData>`, ported unverified from
+    // `winjwinj/bpsr-logs`' `pb.proto` (issue #35). **Disproven**: a live
+    // 19,667-message capture's single `SyncContainerData.CharSerialize` has
+    // no field 3 at all (its field numbers jump 2 -> 5), and zero messages
+    // anywhere in that capture match the `SceneData{level_map_id}` shape.
+    // The scene id actually rides `opcode::ENTER_SCENE`'s attr channel — see
+    // `attr_id::SCENE_BASIC_ID` and `decode::on_enter_scene`.
     #[prost(message, optional, tag = "61")]
     pub profession_list: Option<ProfessionList>,
-}
-
-/// Dungeon/instance identity, confirmed against `winjwinj/bpsr-logs`'
-/// `src-tauri/src/protocol/pb.proto` (`message SceneData { uint32
-/// level_map_id = 6; uint32 line_id = 15; }`). `line_id` (the instance's
-/// party-line number, not its identity) is not decoded — nothing downstream
-/// needs it.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SceneData {
-    #[prost(uint32, tag = "6")]
-    pub level_map_id: u32,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
