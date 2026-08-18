@@ -60,7 +60,6 @@ VERBATIM_SOURCES = {
     "MonsterName.json": f"{_RESONANCE}/MonsterName.json",
     "SceneName.json": f"{_RESONANCE}/SceneName.json",
     "MonsterNameCrowdsource.json": f"{_BPSR_LOGS}/MonsterNameCrowdsource.json",
-    "MonsterNameBoss.json": f"{_BPSR_LOGS}/MonsterNameBoss.json",
 }
 
 # Authoritative game tables, vendored *filtered*. Upstream these are 6.5 MB,

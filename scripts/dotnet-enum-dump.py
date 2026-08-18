@@ -248,6 +248,20 @@ _CONST_FMT = {
 }
 
 
+def _heap_widths(heap_sizes: int) -> Tuple[int, int, int]:
+    """Byte widths (2 or 4) of #Strings/#GUID/#Blob heap indexes, decoded
+    from the table stream header's ``heapSizes`` byte (II.24.2.6): bit 0
+    selects wide #Strings indexes, bit 1 wide #GUID indexes, bit 2 wide
+    #Blob indexes. Pulled out as its own function so `_self_test` can
+    exercise the bit positions directly.
+    """
+    return (
+        4 if heap_sizes & 1 else 2,
+        4 if heap_sizes & 2 else 2,
+        4 if heap_sizes & 4 else 2,
+    )
+
+
 class MetadataError(Exception):
     pass
 
@@ -334,9 +348,7 @@ class Metadata:
                 raise MetadataError("unknown table 0x%02X" % i)
             self.rows[TABLES[i][0]] = struct.unpack_from("<I", b, p)[0]
             p += 4
-        self.str_w = 4 if heap_sizes & 1 else 2
-        self.guid_w = 4 if heap_sizes & 2 else 2
-        self.blob_w = 4 if heap_sizes & 4 else 2
+        self.str_w, self.guid_w, self.blob_w = _heap_widths(heap_sizes)
 
         # Column widths depend on the row counts we just read.
         self._layout: Dict[str, Tuple[int, List[Tuple[str, int, int]]]] = {}
@@ -484,6 +496,128 @@ class Metadata:
             val = struct.unpack_from(fmt, data)[0]
             return bool(val) if etype == 0x02 else val
         return None
+
+
+def _fake_metadata(rows: Dict[str, int], str_w: int = 2, guid_w: int = 2,
+                    blob_w: int = 2) -> Metadata:
+    """A `Metadata` instance with pre-set row counts and heap widths, no
+    backing buffer. `_width` only ever reads `.rows`/`.str_w`/`.guid_w`/
+    `.blob_w`, so this is enough to exercise its layout math without
+    parsing a real assembly.
+    """
+    md = Metadata.__new__(Metadata)
+    md.rows = rows
+    md.str_w, md.guid_w, md.blob_w = str_w, guid_w, blob_w
+    return md
+
+
+def _self_test() -> None:
+    """Fast synthetic checks for the pure ECMA-335 layout math -- coded and
+    simple index widths, table row sizes, and heap index selection -- run
+    unconditionally on import. There is no Python test harness elsewhere in
+    this repo (see `scripts/gen-name-tables.py`'s `_self_test`), so this
+    hard-fails inline instead of living in an untested, never-run test
+    file. Fixtures are built in-memory; no real .dll, network, or
+    filesystem access is used.
+    """
+    # -- heap-index width selection (II.24.2.6 heapSizes byte) ------------
+    assert _heap_widths(0b000) == (2, 2, 2)
+    assert _heap_widths(0b001) == (4, 2, 2)
+    assert _heap_widths(0b010) == (2, 4, 2)
+    assert _heap_widths(0b100) == (2, 2, 4)
+    assert _heap_widths(0b101) == (4, 2, 4)
+    assert _heap_widths(0b111) == (4, 4, 4)
+
+    any_md = _fake_metadata({})
+    assert any_md._width(U1) == 1
+    assert any_md._width(U2) == 2
+    assert any_md._width(U4) == 4
+    assert any_md._width(U8) == 8
+    assert _fake_metadata({}, guid_w=4)._width(GUID) == 4
+    try:
+        any_md._width("bogus")
+    except MetadataError:
+        pass
+    else:
+        raise AssertionError("an unknown column kind must raise MetadataError")
+
+    # -- simple table index width: 2 bytes below 2**16 rows, 4 at/above ---
+    assert _fake_metadata({"Field": 0xFFFF})._width(tbl("Field")) == 2
+    assert _fake_metadata({"Field": 0x10000})._width(tbl("Field")) == 4
+    assert _fake_metadata({})._width(tbl("Field")) == 2, (
+        "a table absent from `rows` must be treated as zero rows, not KeyError"
+    )
+
+    # -- coded-index width: HasConstant = {Field, Param, Property}, 3 tags
+    # -> 2 tag bits (`(3 - 1).bit_length()`) -> widens at 2**(16-2) = 16384
+    # rows in the *largest* of the three target tables (II.24.2.6). This is
+    # the coded index the Constant table keys on to find an enum member's
+    # literal value, so getting its tag order and width math wrong would
+    # misread every enum this script dumps.
+    assert _fake_metadata(
+        {"Field": 16_383, "Param": 0, "Property": 0}
+    )._width(coded("HasConstant")) == 2
+    assert _fake_metadata(
+        {"Field": 16_384, "Param": 0, "Property": 0}
+    )._width(coded("HasConstant")) == 4
+    # The largest tag's table governs, not the first one listed.
+    assert _fake_metadata(
+        {"Field": 0, "Param": 0, "Property": 16_384}
+    )._width(coded("HasConstant")) == 4
+
+    # A coded index with reserved (None) tags: CustomAttributeType has 5
+    # slots (3 real, 2 reserved) -> 3 tag bits -> widens at 2**13 = 8192.
+    # Reserved slots must be excluded from the "biggest table" scan.
+    assert _fake_metadata(
+        {"MethodDef": 8_191, "MemberRef": 0}
+    )._width(coded("CustomAttributeType")) == 2
+    assert _fake_metadata(
+        {"MethodDef": 8_192, "MemberRef": 0}
+    )._width(coded("CustomAttributeType")) == 4
+
+    # A wider tag set: HasCustomAttribute has 22 tags -> 5 tag bits ->
+    # widens at 2**11 = 2048.
+    assert _fake_metadata({"Assembly": 2_047})._width(coded("HasCustomAttribute")) == 2
+    assert _fake_metadata({"Assembly": 2_048})._width(coded("HasCustomAttribute")) == 4
+
+    # HasConstant tag order (0=Field, 1=Param, 2=Property) must decode back
+    # correctly, and an out-of-range tag (reserved slot 3) must yield `None`
+    # rather than a wrong table.
+    assert Metadata.decode_coded("HasConstant", (5 << 2) | 0) == ("Field", 5)
+    assert Metadata.decode_coded("HasConstant", (7 << 2) | 2) == ("Property", 7)
+    assert Metadata.decode_coded("HasConstant", 3) == (None, 0)
+
+    # -- table row-size computation: sum of column widths, in schema order.
+    def row_size(table_num: int, rows: Dict[str, int], str_w: int = 2,
+                 guid_w: int = 2, blob_w: int = 2) -> int:
+        md = _fake_metadata(rows, str_w, guid_w, blob_w)
+        _name, cols = TABLES[table_num]
+        return sum(md._width(kind) for _cname, kind in cols)
+
+    # Field (0x04): Flags(u2) + Name(str) + Signature(blob).
+    assert row_size(0x04, {}) == 2 + 2 + 2
+    assert row_size(0x04, {}, str_w=4, blob_w=4) == 2 + 4 + 4
+
+    # Constant (0x0B): Type(u1) + Padding(u1) + Parent(coded HasConstant) +
+    # Value(blob) -- the row that carries every enum member's literal.
+    assert row_size(0x0B, {"Field": 0, "Param": 0, "Property": 0}) == 1 + 1 + 2 + 2
+    assert row_size(
+        0x0B, {"Field": 20_000, "Param": 0, "Property": 0}, blob_w=4
+    ) == 1 + 1 + 4 + 4
+
+    # TypeDef (0x02): Flags(u4) + Name(str) + Namespace(str) +
+    # Extends(coded TypeDefOrRef, 3 tags -> widens at 16384) +
+    # FieldList(t:Field) + MethodList(t:MethodDef).
+    small_rows = {"TypeDef": 0, "TypeRef": 0, "TypeSpec": 0, "Field": 0, "MethodDef": 0}
+    assert row_size(0x02, small_rows) == 4 + 2 + 2 + 2 + 2 + 2
+    big_rows = {
+        "TypeDef": 0, "TypeRef": 0, "TypeSpec": 16_384,
+        "Field": 0x10000, "MethodDef": 0,
+    }
+    assert row_size(0x02, big_rows) == 4 + 2 + 2 + 4 + 4 + 2
+
+
+_self_test()
 
 
 def find_metadata_roots(buf: bytes) -> List[Metadata]:
