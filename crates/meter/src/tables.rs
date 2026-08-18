@@ -3738,38 +3738,68 @@ pub fn scene_name(id: u32) -> Option<&'static str> {
 /// of membership here; only `boss_name`/`is_boss` (set in `Meter::snapshot`)
 /// are gated by it.
 ///
-/// This set is deliberately *not* widened by issue #36's authoritative
-/// backfill. That backfill grew `monster_name` more than tenfold, which grew
-/// the population of trash that `recompute_boss` can name — so the gate got
-/// more load-bearing, not less. It stays the hand-checked list precisely
-/// because the client table offers no trustworthy boss flag: `MonsterRank`
-/// there marks elites and minibosses too.
+/// Generated (issue #112) from `crates/meter/data/MonsterTableNames.json`'s
+/// source, BPSR-ZDPS's `MonsterTable.json`, as every id whose `MonsterType`
+/// is 2 (`Zproto.EMonsterType::Boss`) — the same field and the same test the
+/// reference tool BPSR-ZDPS itself uses to classify an encounter
+/// (`Encounter.SetEntityType` -> `UpdateEncounterBossData`). `MonsterRank`,
+/// which the previous version of this comment cited as the reason to hand-curate
+/// this list instead, is `""` for every one of the table's 3094 shipped rows —
+/// a dead, unshipped field, not a finer-grained elites-vs-bosses signal — and
+/// the attrs that might look like a substitute (`AttrIsMonsterRankEnable` =
+/// 459, `AttrMonsterRank` = 460) are never read by the reference tool's IL and
+/// have no enum giving their values meaning. Do not resurrect either as a
+/// classification source.
 ///
-/// Generated from `crates/meter/data/MonsterNameBoss.json`, shipped
-/// identically by the `bpsr-logs` and `resonance-logs` community trackers
-/// (both GPL-3.0, the same licence as this project); see
-/// `THIRD_PARTY_NOTICES.md`.
+/// A short manual-override list in `scripts/gen-name-tables.py`
+/// (`BOSS_ID_MANUAL_OVERRIDES`) adds back ids the previous hand-curated list
+/// carried that `MonsterType` does not mark as 2 but that community trackers
+/// fought and flagged as bosses; see its comment for the one id it currently
+/// carries.
+///
+/// Previously hand-curated from `crates/meter/data/MonsterNameBoss.json`
+/// (community-tracker data, GPL-3.0); see `THIRD_PARTY_NOTICES.md` for the
+/// licence of the table this now derives from instead.
+///
+/// This set is deliberately *not* widened by issue #36's authoritative
+/// backfill beyond what `MonsterType == 2` already yields: `monster_name`
+/// covers an order of magnitude more ids than are bosses, and having a name
+/// must never by itself imply bosshood.
 ///
 /// Sorted ascending; `is_boss_monster` binary-searches it.
 #[rustfmt::skip]
 const BOSS_MONSTER_IDS: &[u32] = &[
-    103, 107, 108, 109, 112, 116, 117, 118, 119, 120, 203, 204, 1012, 1013, 1110, 1150, 1174,
-    1215, 1230, 1232, 1309, 1317, 1360, 1400, 1401, 1407, 1410, 1437, 1701, 1702, 1703, 1705,
-    3000, 3002, 3049, 3050, 3996, 3997, 3998, 4002, 4003, 4033, 4201, 7001, 7006, 10007, 10009,
-    10010, 10018, 10029, 10032, 10041, 10056, 10059, 10069, 10077, 10081, 10084, 10085, 10086,
-    11007, 11014, 11019, 11024, 11031, 11032, 11037, 11038, 11043, 11044, 11110, 17001, 17004,
-    17008, 17010, 20004, 20020, 20021, 20024, 20026, 20027, 20028, 20029, 20070, 20071, 20072,
-    20073, 20086, 20087, 20088, 20092, 20100, 20107, 20108, 20125, 20127, 30100, 30810, 31101,
-    33201, 33301, 33401, 35000, 35050, 40010, 40026, 40027, 40394, 40400, 40403, 40404, 40408,
-    40409, 60021, 60141, 60151, 60216, 60237, 60416, 60742, 60745, 61220, 61221, 70063, 70064,
-    70065, 70066, 70067, 70068, 70070, 70071, 70072, 70073, 70173, 70174, 70175, 70263, 70264,
-    70265, 70266, 70267, 70268, 70270, 70271, 70272, 70273, 70274, 70275, 70276, 81000, 81003,
-    102101, 102102, 102104, 102105, 102401, 102402, 102450, 102451, 102701, 102720, 102721,
-    130110, 530354, 540111, 540303, 552020, 612401, 920011, 920012, 920013, 1205001, 2000104,
-    2000105, 2000109, 2000110, 2000113, 2000115, 2000116, 2000121, 2000123, 2000124, 2000127,
-    2000128, 2000129, 2000131, 2000132, 2000133, 2000134, 2000135, 2000137, 2000138, 2000139,
-    2000140, 2000141, 2000199, 2004109, 2004120, 2004126, 2004131, 2004152, 2004171, 2004172,
-    3000000, 3000001, 3000003, 3000006, 3000007, 5026001, 6116001, 7700001,
+    103, 107, 108, 109, 112, 116, 117, 118, 119, 120, 203, 204, 1012, 1013, 1110, 1150, 1151,
+    1152, 1174, 1215, 1230, 1232, 1309, 1317, 1360, 1399, 1400, 1401, 1407, 1410, 1437, 1520,
+    1701, 1702, 1703, 1705, 3000, 3002, 3049, 3050, 3996, 3997, 3998, 4002, 4003, 4033, 4201,
+    4501, 4601, 4621, 7001, 7006, 8081, 8082, 8315, 8317, 8728, 10007, 10009, 10010, 10018,
+    10029, 10032, 10041, 10056, 10059, 10069, 10077, 10081, 10084, 10085, 10086, 10118, 10119,
+    11007, 11014, 11019, 11023, 11024, 11031, 11032, 11037, 11038, 11043, 11044, 11110, 11203,
+    11207, 11211, 11215, 11219, 11223, 11227, 11231, 11235, 11239, 12000, 17001, 17004, 17008,
+    17010, 20004, 20020, 20021, 20024, 20026, 20027, 20028, 20029, 20070, 20071, 20072, 20073,
+    20086, 20087, 20088, 20092, 20100, 20107, 20108, 20125, 20127, 30100, 30152, 30810, 30861,
+    31101, 33201, 33208, 33209, 33210, 33211, 33212, 33213, 33301, 33401, 33402, 33404, 33500,
+    33601, 33701, 33707, 33708, 33709, 33799, 33801, 33813, 33901, 33923, 35000, 35050, 40010,
+    40026, 40027, 40394, 40400, 40403, 40404, 40408, 40409, 40500, 60021, 60141, 60151, 60216,
+    60237, 60416, 60742, 60745, 61220, 61221, 69100, 69200, 69250, 70063, 70064, 70065, 70066,
+    70067, 70068, 70070, 70071, 70072, 70073, 70173, 70174, 70175, 70263, 70264, 70265, 70266,
+    70267, 70268, 70270, 70271, 70272, 70273, 70274, 70275, 70276, 71001, 71002, 71003, 71004,
+    71005, 71006, 71036, 71037, 71038, 71039, 71040, 71041, 72001, 72002, 72003, 72004, 72005,
+    72006, 72007, 72008, 72009, 72010, 72011, 72012, 72013, 72014, 81000, 81003, 102101,
+    102102, 102104, 102105, 102401, 102402, 102450, 102451, 102701, 102720, 102721, 102800,
+    102801, 102821, 102822, 102831, 102832, 102901, 102911, 102921, 103001, 103002, 103006,
+    103011, 103012, 103021, 103022, 103100, 103107, 103108, 103110, 103111, 103200, 103207,
+    103208, 103300, 103301, 103302, 103308, 103309, 103310, 103311, 130110, 530354, 540111,
+    540303, 552020, 590101, 590102, 590103, 591004, 612401, 655001, 661501, 920011, 920012,
+    920013, 920112, 920113, 920114, 920201, 920202, 920203, 920204, 920205, 920206, 920207,
+    920208, 920209, 920210, 920251, 920252, 920253, 920254, 920255, 920256, 920257, 920258,
+    920259, 920260, 920501, 920502, 920503, 920504, 920505, 920506, 920507, 920508, 920509,
+    920510, 920561, 920562, 920563, 920564, 920565, 920566, 920567, 920568, 920569, 920570,
+    1100154, 1100155, 1100156, 1100157, 1205001, 2000104, 2000105, 2000109, 2000110, 2000113,
+    2000115, 2000116, 2000121, 2000123, 2000124, 2000127, 2000128, 2000129, 2000131, 2000132,
+    2000133, 2000134, 2000135, 2000137, 2000138, 2000139, 2000140, 2000141, 2000199, 2004109,
+    2004120, 2004126, 2004131, 2004152, 2004171, 2004172, 3000000, 3000001, 3000003, 3000006,
+    3000007, 5026001, 6116001, 7700001,
 ];
 
 /// Whether `id` is a known boss-monster template id (issue #42) — i.e.
@@ -3804,8 +3834,9 @@ mod tests {
         // The backfill multiplies named monster ids more than tenfold, so far
         // more trash now carries a name `recompute_boss` could hoist into the
         // header. Having a name must never imply bosshood: the display gate is
-        // `is_boss_monster`, which reads only the curated `MonsterNameBoss.json`
-        // set and is deliberately *not* widened by the backfill.
+        // `is_boss_monster`, which reads only ids `MonsterTable.json` marks
+        // `MonsterType == 2` (issue #112) and is deliberately *not* widened by
+        // the backfill.
         assert!(monster_name(205).is_some());
         assert!(!is_boss_monster(205));
     }
@@ -3824,10 +3855,32 @@ mod tests {
 
     #[test]
     fn is_boss_monster_false_for_a_known_non_boss_monster_id() {
-        // "Golden Nappo" (10900) has a name in `monster_name` but is not in
-        // `MonsterNameBoss.json` — a named-but-non-boss id must not read as
-        // a boss just because the tables happen to know its name.
+        // "Golden Nappo" (10900) has a name in `monster_name` but its
+        // `MonsterTable.json` `MonsterType` is 0 (plain Monster), not 2 — a
+        // named-but-non-boss id must not read as a boss just because the
+        // tables happen to know its name.
         assert!(!is_boss_monster(10_900));
+    }
+
+    #[test]
+    fn is_boss_monster_true_for_the_issue_112_boss_ids() {
+        // These template ids jumped straight from 102721 to 130110 in the
+        // old hand-curated list — no 103xxx id at all — so real
+        // current-content bosses fell through to a blank header mid-fight.
+        // All four have `MonsterType == 2` in `MonsterTable.json`.
+        assert!(is_boss_monster(103_108)); // Paradox-Calamity Remnant - Origin
+        assert!(is_boss_monster(103_111)); // Dragonbane Golem - Left Cannon
+        assert!(is_boss_monster(103_207)); // Paradox-Calamity Remnant - Continuation
+        assert!(is_boss_monster(103_308)); // Paradox-Calamity Remnant - Final
+    }
+
+    #[test]
+    fn is_boss_monster_true_for_a_manual_override_not_marked_boss_by_monster_type() {
+        // "Storm Goblin King": MonsterType 1 (Elite) in MonsterTable.json,
+        // not 2, but both community trackers flagged it as a boss and it is
+        // fought as one — see `BOSS_ID_MANUAL_OVERRIDES` in
+        // `scripts/gen-name-tables.py`.
+        assert!(is_boss_monster(61_220));
     }
 
     #[test]
