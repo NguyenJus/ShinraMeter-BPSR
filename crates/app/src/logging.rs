@@ -262,6 +262,15 @@ fn install_panic_hook() {
             .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
             .unwrap_or("<no message>");
         log::error!("panic at {location}: {message}");
+        // Issue #119: a `Surface::configure` panic can follow an oversize
+        // window proposal even after `platform::window_proc` clamped it —
+        // the clamp is not the only path to an oversize surface — so carry
+        // whatever the platform layer last saw onto the same log line the
+        // panic itself reaches. `last_oversize_proposal` is poison-safe and
+        // never panics, so it's fine to call from inside a panic hook.
+        if let Some(proposal) = crate::platform::last_oversize_proposal() {
+            log::error!("last oversize window proposal before this panic: {proposal}");
+        }
         previous(info);
     }));
 }

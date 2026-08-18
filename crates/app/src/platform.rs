@@ -782,6 +782,156 @@ fn clamped_window_extent(cx: i32, cy: i32) -> Option<(i32, i32)> {
     (clamped != (cx, cy)).then_some(clamped)
 }
 
+/// Human-readable names for the `SWP_*` bits set in a `WM_WINDOWPOSCHANGING`
+/// proposal's `flags` (issue #119), e.g. `NOMOVE|NOZORDER` instead of a raw
+/// integer nobody can read at a glance. This is the single most load-bearing
+/// piece of the enriched diagnostic: a proposal carrying `NOMOVE` (a pure
+/// resize) tells a very different story from one with neither `NOMOVE` nor
+/// `NOSIZE` set (a full move+resize, the shape an external `MoveWindow`/
+/// `SetWindowPos` would send). `NOOWNERZORDER` and `NOREPOSITION` share bit
+/// `0x200`, so only the former is named. Any bit this table doesn't
+/// recognize is appended as a raw hex remainder rather than silently
+/// dropped. Pure `u32` in and `String` out — no windows-crate types — so
+/// this is unit-testable off Windows.
+#[cfg(any(windows, test))]
+fn decode_swp_flags(flags: u32) -> String {
+    const NAMED: &[(u32, &str)] = &[
+        (0x0001, "NOSIZE"),
+        (0x0002, "NOMOVE"),
+        (0x0004, "NOZORDER"),
+        (0x0008, "NOREDRAW"),
+        (0x0010, "NOACTIVATE"),
+        (0x0020, "FRAMECHANGED"),
+        (0x0040, "SHOWWINDOW"),
+        (0x0080, "HIDEWINDOW"),
+        (0x0100, "NOCOPYBITS"),
+        (0x0200, "NOOWNERZORDER"),
+        (0x0400, "NOSENDCHANGING"),
+        (0x2000, "DEFERERASE"),
+        (0x4000, "ASYNCWINDOWPOS"),
+    ];
+    let names: Vec<&str> = NAMED
+        .iter()
+        .filter(|(bit, _)| flags & bit != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    let recognized_mask = NAMED.iter().fold(0u32, |acc, (bit, _)| acc | bit);
+    let remainder = flags & !recognized_mask;
+    let mut out = if names.is_empty() {
+        "NONE".to_string()
+    } else {
+        names.join("|")
+    };
+    if remainder != 0 {
+        out.push_str(&format!("|0x{remainder:04x}"));
+    }
+    out
+}
+
+/// The raw `x`/`y`/`cx`/`cy` from a `WM_WINDOWPOSCHANGING` proposal, bundled
+/// only to keep [`oversize_proposal_log`]'s argument count under clippy's
+/// too-many-arguments threshold — not a general-purpose window-pos type, so
+/// it lives right next to its one caller rather than near `Rect`.
+#[cfg(any(windows, test))]
+struct ProposedWindowPos {
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+}
+
+/// Builds the diagnostic line for an oversize `WM_WINDOWPOSCHANGING`
+/// proposal (issue #119). The raw `warn!` this replaced logged only the
+/// proposed `cx`x`cy` — exactly the information the #119 crash already
+/// proved insufficient (`460x32767` says nothing about who asked or in what
+/// state). `window_proc` gathers the impure Win32 state (current rect, DPI,
+/// gesture flag) and hands it here so the formatting itself stays
+/// unit-testable without a window; see `boss_transition_log`/
+/// `scene_transition_log` in `meter::encounter` for the same pure-formatter
+/// register this follows.
+#[cfg(any(windows, test))]
+fn oversize_proposal_log(
+    proposed: ProposedWindowPos,
+    clamped: (i32, i32),
+    flags: u32,
+    current: Option<Rect>,
+    dpi: Option<u32>,
+    gesture_active: bool,
+) -> String {
+    let ProposedWindowPos { x, y, cx, cy } = proposed;
+    let (clamped_cx, clamped_cy) = clamped;
+    let current = current.map_or_else(
+        || "<unavailable>".to_string(),
+        |r| format!("{}x{} at ({}, {})", r.width(), r.height(), r.left, r.top),
+    );
+    let dpi = dpi.map_or_else(|| "<unavailable>".to_string(), |d| d.to_string());
+    format!(
+        "clamping an oversize window proposal: proposed=(x={x}, y={y}, {cx}x{cy}) \
+         clamped_to={clamped_cx}x{clamped_cy} flags={} current_window={current} dpi={dpi} \
+         app_driven_reposition_active={gesture_active}; the renderer cannot present a surface \
+         larger than {MAX_WINDOW_EXTENT_PX}px",
+        decode_swp_flags(flags)
+    )
+}
+
+/// Last oversize `WM_WINDOWPOSCHANGING` proposal `window_proc` clamped this
+/// session, formatted and ready to log — `None` until the first one happens.
+/// `install_panic_hook` in `logging.rs` reads this through
+/// [`last_oversize_proposal`] so a `Surface::configure` panic that follows a
+/// clamp still carries the context that led to it: the clamp is not the
+/// only path to an oversize surface, so the panic can still happen even
+/// after a proposal was countermanded (issue #119).
+#[cfg(windows)]
+static LAST_OVERSIZE_PROPOSAL: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+/// Records `message` as the most recent oversize proposal. Called from
+/// `window_proc`, which never has a reason to fail loudly here — losing this
+/// record would only make the *next* panic's diagnostics worse, not this
+/// call's own correctness — so a poisoned lock (some other panic already in
+/// flight) is recovered from rather than propagated.
+#[cfg(windows)]
+fn store_last_oversize_proposal(message: String) {
+    let lock = LAST_OVERSIZE_PROPOSAL.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(message);
+}
+
+/// The last oversize proposal [`store_last_oversize_proposal`] recorded, if
+/// any. `logging.rs`'s panic hook calls this; see `LAST_OVERSIZE_PROPOSAL`'s
+/// doc comment for why it exists.
+///
+/// Takes the lock without blocking, because a panic hook must never
+/// deadlock. `store_last_oversize_proposal` holds this lock across nothing
+/// but an assignment, but "nothing but an assignment" is not "nothing": a
+/// panic raised on this thread while that guard is alive would re-enter
+/// here, and `Mutex` is not reentrant, so a blocking `lock()` would hang the
+/// panicking process instead of reporting it. Failing to read the record
+/// costs one supplementary log line; hanging costs the whole panic report,
+/// which is the very thing this exists to improve. A poisoned lock is
+/// recovered from for the same reason `store_last_oversize_proposal`
+/// recovers from one — the record is diagnostic, and a panic already in
+/// flight elsewhere is exactly when it is most worth reading.
+#[cfg(windows)]
+pub fn last_oversize_proposal() -> Option<String> {
+    let lock = LAST_OVERSIZE_PROPOSAL.get_or_init(|| std::sync::Mutex::new(None));
+    match lock.try_lock() {
+        Ok(guard) => guard.clone(),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clone(),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// Stub for the non-Windows host build, which never installs `window_proc`
+/// and so never has a proposal to report; keeps `logging.rs` free of a
+/// hard Windows-only dependency.
+#[cfg(not(windows))]
+pub fn last_oversize_proposal() -> Option<String> {
+    None
+}
+
 /// Tolerance, in physical pixels, when matching a proposed rect against a
 /// monitor-half/quarter/full shape in `is_snap_shaped`. Windows computes
 /// snap rects by splitting the work area's width/height, which can land a
@@ -1002,10 +1152,11 @@ unsafe extern "system" fn window_proc(
     _dwrefdata: usize,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Shell::DefSubclassProc;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowRect, SC_MAXIMIZE, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS, WM_SYSCOMMAND,
-        WM_WINDOWPOSCHANGING,
+        GetWindowRect, SC_MAXIMIZE, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS, WM_DPICHANGED,
+        WM_SYSCOMMAND, WM_WINDOWPOSCHANGING,
     };
 
     if msg == WM_WINDOWPOSCHANGING {
@@ -1024,12 +1175,48 @@ unsafe extern "system" fn window_proc(
         if (windowpos.flags & SWP_NOSIZE).0 == 0
             && let Some((cx, cy)) = clamped_window_extent(windowpos.cx, windowpos.cy)
         {
-            log::warn!(
-                "clamping an oversize window proposal ({}x{}) to {cx}x{cy}; \
-                 the renderer cannot present a surface larger than {MAX_WINDOW_EXTENT_PX}px",
-                windowpos.cx,
-                windowpos.cy
+            // Issue #119: this proposal is the crash's only lead, so gather
+            // everything the next occurrence might need before it's gone.
+            // The snap-veto branch below makes its own `GetWindowRect` call
+            // after this one — it runs later and may run on a `windowpos`
+            // this branch has already mutated — so this can't reuse that
+            // call's result.
+            // SAFETY: `hwnd` is the window this subclass is installed on,
+            // alive and on the current thread for the duration of this
+            // callback; `current_rect` is a valid, correctly-sized
+            // out-param.
+            let mut current_rect = RECT::default();
+            let current = if unsafe { GetWindowRect(hwnd, &mut current_rect) }.as_bool() {
+                Some(Rect {
+                    left: current_rect.left,
+                    top: current_rect.top,
+                    right: current_rect.right,
+                    bottom: current_rect.bottom,
+                })
+            } else {
+                None
+            };
+            // SAFETY: same as above. A `0` return means the call failed,
+            // per `GetDpiForWindow`'s documented failure contract (also
+            // relied on by `reset_window`).
+            let dpi = unsafe { GetDpiForWindow(hwnd) };
+            let dpi = (dpi != 0).then_some(dpi);
+
+            let message = oversize_proposal_log(
+                ProposedWindowPos {
+                    x: windowpos.x,
+                    y: windowpos.y,
+                    cx: windowpos.cx,
+                    cy: windowpos.cy,
+                },
+                (cx, cy),
+                windowpos.flags.0,
+                current,
+                dpi,
+                app_driven_reposition_active(),
             );
+            log::warn!("{message}");
+            store_last_oversize_proposal(message);
             windowpos.cx = cx;
             windowpos.cy = cy;
         }
@@ -1083,6 +1270,26 @@ unsafe extern "system" fn window_proc(
             // handlers signal "handled, don't do the default action".
             return windows::Win32::Foundation::LRESULT(0);
         }
+    } else if msg == WM_DPICHANGED {
+        // Issue #119: nothing in this crate handles `WM_DPICHANGED` today,
+        // so a DPI-change-driven resize is currently invisible in the
+        // logs. This is a diagnostic tap only — it neither reads the
+        // suggested rect for any decision nor stops the message from
+        // reaching winit's own handling below.
+        let new_dpi = (wparam.0 & 0xFFFF) as u32;
+        // SAFETY: for `WM_DPICHANGED`, `lparam` is a valid pointer to a
+        // `RECT` suggesting the window's new bounds at the new DPI, owned
+        // by the sender for the duration of this call; this only reads it.
+        let suggested = unsafe { &*(lparam.0 as *const RECT) };
+        log::debug!(
+            "WM_DPICHANGED: new dpi={new_dpi} suggested_rect=({}, {}, {}, {}) [{}x{}]",
+            suggested.left,
+            suggested.top,
+            suggested.right,
+            suggested.bottom,
+            suggested.right - suggested.left,
+            suggested.bottom - suggested.top
+        );
     }
 
     // SAFETY: `hwnd`/`msg`/`wparam`/`lparam` are exactly what this
@@ -2057,6 +2264,117 @@ mod tests {
     #[test]
     fn a_non_positive_extent_is_not_the_clamps_business() {
         assert_eq!(clamped_window_extent(0, -1), None);
+    }
+
+    // -- decode_swp_flags / oversize_proposal_log (issue #119) ------------
+
+    #[test]
+    fn decode_swp_flags_names_a_single_bit() {
+        assert_eq!(decode_swp_flags(0x0002), "NOMOVE");
+    }
+
+    #[test]
+    fn decode_swp_flags_names_every_set_bit_in_declaration_order() {
+        // NOSIZE | NOMOVE | NOZORDER | NOACTIVATE, the shape a full
+        // move+resize with z-order and activation pinned would carry.
+        assert_eq!(
+            decode_swp_flags(0x0001 | 0x0002 | 0x0004 | 0x0010),
+            "NOSIZE|NOMOVE|NOZORDER|NOACTIVATE"
+        );
+    }
+
+    #[test]
+    fn decode_swp_flags_reports_no_bits_set_explicitly() {
+        // A full move+resize with nothing pinned — the shape an external
+        // MoveWindow/SetWindowPos sends, and the case #119's diagnostics
+        // most need to be unambiguous about.
+        assert_eq!(decode_swp_flags(0), "NONE");
+    }
+
+    #[test]
+    fn decode_swp_flags_appends_unrecognized_bits_as_hex() {
+        assert_eq!(decode_swp_flags(0x0002 | 0x0800), "NOMOVE|0x0800");
+    }
+
+    /// The exact issue-#119 shape: a 460x32767 proposal, no gesture in
+    /// flight, current rect and DPI both available.
+    #[test]
+    fn oversize_proposal_log_reports_the_issue_119_shape() {
+        let message = oversize_proposal_log(
+            ProposedWindowPos {
+                x: 10,
+                y: 20,
+                cx: 460,
+                cy: i32::from(i16::MAX),
+            },
+            (460, MAX_WINDOW_EXTENT_PX),
+            0,
+            Some(rect(10, 20, 470, 420)),
+            Some(96),
+            false,
+        );
+        assert!(
+            message.contains("proposed=(x=10, y=20, 460x32767)"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("clamped_to=460x{MAX_WINDOW_EXTENT_PX}")),
+            "{message}"
+        );
+        assert!(message.contains("flags=NONE"), "{message}");
+        assert!(
+            message.contains("current_window=460x400 at (10, 20)"),
+            "{message}"
+        );
+        assert!(message.contains("dpi=96"), "{message}");
+        assert!(
+            message.contains("app_driven_reposition_active=false"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn oversize_proposal_log_reports_a_gesture_in_flight() {
+        let message = oversize_proposal_log(
+            ProposedWindowPos {
+                x: 0,
+                y: 0,
+                cx: 9000,
+                cy: 9000,
+            },
+            (MAX_WINDOW_EXTENT_PX, MAX_WINDOW_EXTENT_PX),
+            0x0002,
+            Some(rect(0, 0, 9000, 9000)),
+            Some(96),
+            true,
+        );
+        assert!(
+            message.contains("app_driven_reposition_active=true"),
+            "{message}"
+        );
+        assert!(message.contains("flags=NOMOVE"), "{message}");
+    }
+
+    #[test]
+    fn oversize_proposal_log_reports_a_missing_current_rect_and_dpi() {
+        let message = oversize_proposal_log(
+            ProposedWindowPos {
+                x: 0,
+                y: 0,
+                cx: 9000,
+                cy: 9000,
+            },
+            (MAX_WINDOW_EXTENT_PX, MAX_WINDOW_EXTENT_PX),
+            0,
+            None,
+            None,
+            false,
+        );
+        assert!(
+            message.contains("current_window=<unavailable>"),
+            "{message}"
+        );
+        assert!(message.contains("dpi=<unavailable>"), "{message}");
     }
 
     fn rect(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
