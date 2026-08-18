@@ -1225,7 +1225,7 @@ unsafe extern "system" fn window_proc(
         let mut current_rect = RECT::default();
         let current_rect = unsafe { GetWindowRect(hwnd, &mut current_rect) }
             .as_bool()
-            .then(|| Rect {
+            .then_some(Rect {
                 left: current_rect.left,
                 top: current_rect.top,
                 right: current_rect.right,
