@@ -80,6 +80,20 @@ pub struct Meter {
     /// boss-HP rollback both stay in the same dungeon); cleared only on
     /// `ServerChanged`, in `apply` directly rather than in `reset` itself.
     scene_id: Option<u32>,
+    /// Learned final boss per dungeon scene (issue #125): maps a dungeon
+    /// scene id (`tables::is_dungeon_scene`) to the monster id of the last
+    /// genuine boss (`tables::is_boss_monster`) engaged there. No upstream
+    /// data table maps a scene to its final boss, so this is *learned* by
+    /// observation instead — the last real boss fought in a dungeon is
+    /// assumed to be its final boss, which converges correctly because a
+    /// dungeon's own boss order runs earlier bosses before its last one.
+    /// Deliberately session-lifetime, **not** cleared by `reset`: an
+    /// encounter reset (or a boss-HP rollback) happens mid-dungeon, and the
+    /// whole point is for the remembered name to survive into the *next*
+    /// pull and the *next* run of the same dungeon, not just the current
+    /// one. Not persisted to disk — see the issue #125 design note on
+    /// `recompute_boss`.
+    scene_bosses: HashMap<u32, u32>,
     /// When the current fight ended, if it has (issue #78). `Some(t)` puts
     /// the meter in [`FightState::Ended`]: the snapshot is rendered as of
     /// `t` rather than the caller's `now_ms`, so rows, totals and the
@@ -104,6 +118,7 @@ impl Meter {
             last_reset_ms: None,
             boss_uid: None,
             scene_id: None,
+            scene_bosses: HashMap::new(),
             fight_end_ms: None,
             reset_cfg: ResetConfig::default(),
             fight_cfg: FightConfig::default(),
@@ -640,19 +655,42 @@ impl Meter {
             .max_by_key(|(uid, recognized, tier, hp)| (*recognized, *tier, *hp, *uid))
             .map(|(uid, _, _, _)| uid);
 
+        let monster_id = self
+            .boss_uid
+            .and_then(|uid| self.enemies.get(&uid))
+            .and_then(|e| e.monster_id);
+
+        // issue #125: learn this dungeon's final boss by observation. No
+        // upstream table maps a scene to its final boss, so the last genuine
+        // boss (`is_boss_monster`) engaged in an actual dungeon scene
+        // (`is_dungeon_scene`) is assumed to be it — see `scene_bosses`' doc
+        // comment. Overwriting is correct and intended: a dungeon fought
+        // through multiple bosses converges on the last one engaged, which
+        // is the final boss. The `is_dungeon_scene` guard keeps a world boss
+        // fought in an open-world zone from pinning its name to every later
+        // visit to that town or field.
+        if let (Some(id), Some(scene)) = (monster_id, self.scene_id)
+            && tables::is_boss_monster(id)
+            && tables::is_dungeon_scene(scene)
+        {
+            let previous = self.scene_bosses.get(&scene).copied();
+            if previous != Some(id) {
+                self.scene_bosses.insert(scene, id);
+                if let Some(msg) = scene_boss_latch_log(previous, id, scene) {
+                    log::info!("{msg}");
+                }
+            }
+        }
+
         // Sparse, transition-only diagnostic (issue #69): `recompute_boss`
         // runs on every damage/enemy-hp event, so this must only log when
         // the winner actually changes — logging every call would reproduce
         // the #87 flood at boss-target granularity instead of attr-id
         // granularity.
-        if self.boss_uid != previous_boss_uid {
-            let monster_id = self
-                .boss_uid
-                .and_then(|uid| self.enemies.get(&uid))
-                .and_then(|e| e.monster_id);
-            if let Some(msg) = boss_transition_log(previous_boss_uid, self.boss_uid, monster_id) {
-                log::info!("{msg}");
-            }
+        if self.boss_uid != previous_boss_uid
+            && let Some(msg) = boss_transition_log(previous_boss_uid, self.boss_uid, monster_id)
+        {
+            log::info!("{msg}");
         }
     }
 
@@ -660,6 +698,13 @@ impl Meter {
     /// are per-encounter (issue #49): `players.clear()` drops the whole
     /// `PlayerStats` entry per uid, taking `deaths`/`last_death_ms` with it,
     /// so no separate clearing step is needed here.
+    ///
+    /// Deliberately does **not** clear `scene_bosses` (issue #125): that map
+    /// is session-lifetime by design, so the dungeon's final boss stays
+    /// remembered across every reset a pull inside that dungeon can trigger
+    /// (manual, boss-HP rollback) and across every later pull and later run
+    /// of the same dungeon this session — clearing it here would defeat the
+    /// entire point of latching it.
     pub fn reset(&mut self, reason: ResetReason, now_ms: u64) {
         // `reset` is itself already an event, never a per-snapshot poll, so
         // this is naturally sparse (issue #69) — no transition-only guard
@@ -750,6 +795,15 @@ impl Meter {
         // populated for every pull since it's real data, not a display
         // choice.
         let is_boss = boss_monster_id.is_some_and(tables::is_boss_monster);
+        // issue #125: the dungeon's remembered final boss, if `scene_id` is
+        // known and a boss has been latched for it — see `scene_bosses`' doc
+        // comment. Independent of `boss_monster_id`/`is_boss` above, which
+        // stay the raw facts about the currently-selected target; this is
+        // what `encounter_title` prefers over them.
+        let scene_boss_name = self
+            .scene_id
+            .and_then(|scene| self.scene_bosses.get(&scene))
+            .and_then(|&id| tables::monster_name(id));
         let encounter = EncounterInfo {
             boss_monster_id,
             boss_name: if is_boss {
@@ -760,6 +814,7 @@ impl Meter {
             is_boss,
             scene_id: self.scene_id,
             scene_name: self.scene_id.and_then(tables::scene_name),
+            scene_boss_name,
         };
 
         Snapshot {
@@ -829,6 +884,31 @@ fn boss_transition_log(
             }
             None => format!("encounter: boss target changed to uid={uid} monster_id=<unknown>"),
         },
+    })
+}
+
+/// Builds the "dungeon final boss learned/changed" diagnostic line (issue
+/// #125), or `None` when `new_monster_id` matches `previous` — `recompute_boss`
+/// only calls this (and only re-inserts into `scene_bosses`) when the winner
+/// differs from what's already latched, but this guard is kept as a second
+/// line of defense against relogging an unchanged boss. Pure, like
+/// [`scene_transition_log`]/[`boss_transition_log`], for the same
+/// testability reason.
+fn scene_boss_latch_log(
+    previous: Option<u32>,
+    new_monster_id: u32,
+    scene_id: u32,
+) -> Option<String> {
+    if previous == Some(new_monster_id) {
+        return None;
+    }
+    Some(match tables::monster_name(new_monster_id) {
+        Some(name) => format!(
+            "encounter: scene={scene_id} final boss latched monster_id={new_monster_id} name={name}"
+        ),
+        None => format!(
+            "encounter: scene={scene_id} final boss latched monster_id={new_monster_id} name=<unresolved>"
+        ),
     })
 }
 
@@ -2313,6 +2393,79 @@ mod tests {
             assert_eq!(snap.encounter.scene_id, Some(999_999));
             assert_eq!(snap.encounter.scene_name, None);
         }
+
+        // -- dungeon final-boss latch (issue #125) --------------------------
+
+        #[test]
+        fn scene_boss_name_latches_for_a_genuine_boss_in_a_dungeon_scene() {
+            // 1001 ("Tina's Mindrealm") is a dungeon scene; 103 ("Rathalos")
+            // is a genuine boss (`is_boss_monster`).
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 100, 100, Some(103), 0));
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
+        }
+
+        #[test]
+        fn scene_boss_name_does_not_latch_for_a_non_boss_mid_dungeon_mech() {
+            // The exact issue #125 case: template 1342 ("Boss - Battle Mech
+            // 03") is not a genuine boss (`MonsterType != 2`), so it must
+            // never latch as the dungeon's final boss even though it's the
+            // selected `boss_uid` target.
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 100, 100, Some(1342), 0));
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.scene_boss_name, None);
+        }
+
+        #[test]
+        fn scene_boss_name_does_not_latch_in_a_non_dungeon_scene() {
+            // 8 ("Asterleeds") is an open-world zone, not a dungeon scene:
+            // a world boss fought there must not pin its name to the header
+            // for every later visit to that zone.
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 8 });
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 100, 100, Some(103), 0));
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.scene_boss_name, None);
+        }
+
+        #[test]
+        fn scene_boss_name_survives_an_encounter_reset() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 100, 100, Some(103), 0));
+            m.reset(ResetReason::Manual, 1000);
+            let snap = m.snapshot(2000);
+            assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
+        }
+
+        #[test]
+        fn scene_boss_name_overwrites_to_converge_on_the_last_boss_engaged() {
+            // A dungeon fought through multiple bosses converges on the last
+            // one engaged, which is the final boss — overwriting, not
+            // first-write-wins, is the intended behavior.
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 100, 100, Some(103), 0));
+            assert_eq!(m.snapshot(1000).encounter.scene_boss_name, Some("Rathalos"));
+
+            m.reset(ResetReason::Manual, 1000);
+            m.apply(&boss_hit(11, 1000));
+            m.apply(&hp(11, 100, 100, Some(103_108), 1000));
+            let snap = m.snapshot(2000);
+            assert_eq!(
+                snap.encounter.scene_boss_name,
+                Some("Paradox-Calamity Remnant - Origin")
+            );
+        }
     }
 
     /// issue #69: `scene_transition_log`/`boss_transition_log` are the pure
@@ -2385,6 +2538,24 @@ mod tests {
             // Boss target cleared.
             let msg = boss_transition_log(Some(10), None, None).unwrap();
             assert!(msg.contains("cleared"));
+        }
+
+        #[test]
+        fn scene_boss_latch_log_fires_only_when_the_monster_id_changes() {
+            assert!(scene_boss_latch_log(None, 103, 1001).is_some());
+            assert!(scene_boss_latch_log(Some(103), 103, 1001).is_none());
+            assert!(scene_boss_latch_log(Some(103), 103_108, 1001).is_some());
+        }
+
+        #[test]
+        fn scene_boss_latch_log_reports_the_scene_and_resolved_name() {
+            let msg = scene_boss_latch_log(None, 103, 1001).unwrap();
+            assert!(msg.contains("scene=1001"));
+            assert!(msg.contains("monster_id=103"));
+            assert!(msg.contains("name=Rathalos"));
+
+            let msg = scene_boss_latch_log(None, 999_999, 1001).unwrap();
+            assert!(msg.contains("<unresolved>"));
         }
     }
 }

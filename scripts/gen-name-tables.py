@@ -86,6 +86,19 @@ BOSS_ID_SOURCES = {
     "MonsterTableBossIds.json": f"{_ZDPS}/MonsterTable.json",
 }
 
+# Issue #125: `DungeonsTable.json`'s `SceneID` column lists the scene id each
+# dungeon instance loads into — 572 distinct ids (min 1001, max 171001; 571 of
+# 572 also appear in `SceneTable.json`, the exception being 20043). This is
+# what `is_dungeon_scene` uses to gate the final-boss latch in
+# `Meter::recompute_boss` to actual dungeons: without it, killing a world
+# boss in an open-world zone would pin its name to the banner for every later
+# visit to that town or field. This is filtered from the same URL as
+# `DungeonsTableNames.json` above, just projected to scene ids instead of
+# names.
+DUNGEON_SCENE_ID_SOURCES = {
+    "DungeonSceneIds.json": f"{_ZDPS}/DungeonsTable.json",
+}
+
 # Manual overrides (issue #112): ids the old hand-curated `MonsterNameBoss.json`
 # list carried as bosses that `MonsterTable.json`'s `MonsterType` does not mark
 # as `Boss` (2). Checked individually — see the per-id comment — and unioned on
@@ -203,6 +216,24 @@ mod tests {
     }
 
     #[test]
+    fn is_dungeon_scene_true_for_known_dungeon_scene_ids() {
+        // issue #125: sample dungeon scene ids from `DungeonsTable.json`'s
+        // `SceneID` column, spanning early- and late-game content.
+        assert!(is_dungeon_scene(1001)); // Tina's Mindrealm
+        assert!(is_dungeon_scene(1101)); // Towering Ruin
+        assert!(is_dungeon_scene(1201)); // Dragon Claw Valley
+        assert!(is_dungeon_scene(7050)); // Goblin Rampage
+    }
+
+    #[test]
+    fn is_dungeon_scene_false_for_an_open_world_scene() {
+        // Scene 8 ("Asterleeds") is an open-world zone, not a dungeon
+        // instance: it must never latch a remembered boss (issue #125),
+        // which is exactly what `is_dungeon_scene` gates.
+        assert!(!is_dungeon_scene(8));
+    }
+
+    #[test]
     fn crowdsourced_entries_are_present_in_the_generated_table() {
         // NB: this only proves `MonsterNameCrowdsource.json` entries make it
         // into the table at all — it shares every overlapping id with
@@ -304,6 +335,20 @@ def filter_boss_ids(raw: dict) -> list[int]:
     return sorted(out)
 
 
+def filter_dungeon_scene_ids(raw: dict) -> list[int]:
+    """Project a full `DungeonsTable.json` down to distinct dungeon scene ids
+    (issue #125) — the `SceneID` each row's dungeon instance loads into. See
+    `DUNGEON_SCENE_ID_SOURCES` for why this gates the final-boss latch.
+    """
+    out = []
+    for row in raw.values():
+        if isinstance(row, dict):
+            scene_id = row.get("SceneID")
+            if scene_id:
+                out.append(int(scene_id))
+    return sorted(set(out))
+
+
 def merge_names(*layers: dict[int, str]) -> dict[int, str]:
     """Merge id -> name layers, least authoritative first.
 
@@ -370,6 +415,19 @@ def _self_test() -> None:
         }
     )
     assert boss_ids == [15, 20], boss_ids
+
+    dungeon_scene_ids = filter_dungeon_scene_ids(
+        {
+            "1": {"SceneID": 1001},
+            "2": {"SceneID": 0},
+            "3": {"SceneID": 1001},
+            "4": {"SceneID": None},
+            "5": {"NoSceneID": 1},
+            "6": "not a row",
+            "7": {"SceneID": 1201},
+        }
+    )
+    assert dungeon_scene_ids == [1001, 1201], dungeon_scene_ids
 
     assert esc('a\\b"c') == 'a\\\\b\\"c'
     assert esc("line1\rline2") == "line1\\rline2"
@@ -459,24 +517,87 @@ _BOSS_IDS_LINE_WIDTH = 96
 _BOSS_IDS_INDENT = "    "
 
 
-def emit_boss_ids(out: io.StringIO, ids: list[int]) -> None:
-    out.write(f"\n{BOSS_IDS_DOC}\n#[rustfmt::skip]\nconst BOSS_MONSTER_IDS: &[u32] = &[\n")
-    line = _BOSS_IDS_INDENT
+def _emit_wrapped_u32_array(
+    out: io.StringIO,
+    doc: str,
+    const_name: str,
+    ids: list[int],
+    line_width: int,
+    indent: str,
+    predicate_fn: str,
+) -> None:
+    """Writes `doc`, a `#[rustfmt::skip]` `const {const_name}: &[u32]`
+    greedily line-wrapped at `line_width` (matching rustfmt's own
+    array-literal packing so a diff against a hand-formatted file stays
+    empty), and `predicate_fn` after it. Shared by `emit_boss_ids` and
+    `emit_dungeon_scene_ids`, which differ only in the args they pass."""
+    out.write(f"\n{doc}\n#[rustfmt::skip]\nconst {const_name}: &[u32] = &[\n")
+    line = indent
     for n in ids:
         piece = f"{n}, "
-        if line != _BOSS_IDS_INDENT and len(line) + len(piece) > _BOSS_IDS_LINE_WIDTH:
+        if line != indent and len(line) + len(piece) > line_width:
             out.write(line.rstrip() + "\n")
-            line = _BOSS_IDS_INDENT
+            line = indent
         line += piece
-    if line != _BOSS_IDS_INDENT:
+    if line != indent:
         out.write(line.rstrip() + "\n")
     out.write("];\n")
-    out.write(
+    out.write(predicate_fn)
+
+
+def emit_boss_ids(out: io.StringIO, ids: list[int]) -> None:
+    _emit_wrapped_u32_array(
+        out,
+        BOSS_IDS_DOC,
+        "BOSS_MONSTER_IDS",
+        ids,
+        _BOSS_IDS_LINE_WIDTH,
+        _BOSS_IDS_INDENT,
         "\n/// Whether `id` is a known boss-monster template id (issue #42) — i.e.\n"
         "/// whether the encounter name should ever be surfaced for it.\n"
         "pub fn is_boss_monster(id: u32) -> bool {\n"
         "    BOSS_MONSTER_IDS.binary_search(&id).is_ok()\n"
-        "}\n"
+        "}\n",
+    )
+
+
+DUNGEON_SCENE_IDS_DOC = """/// Dungeon scene ids (issue #125): every scene id `DungeonsTable.json` lists
+/// as a dungeon instance's `SceneID` — 572 distinct ids (min 1001, max
+/// 171001). No upstream table maps a scene/dungeon to its final boss (issue
+/// #125's investigation checked every `BPSR-ZDPS/Data/*.json` table and both
+/// community data repos), so `Meter::recompute_boss`
+/// (`crates/meter/src/encounter.rs`) instead *learns* a dungeon's final boss
+/// by observation — the last genuine boss engaged in a scene — and remembers
+/// it per scene for the rest of the session. This table is what gates that
+/// latch to actual dungeons: without it, killing a world boss in an
+/// open-world zone would pin its name to the banner for every later visit to
+/// that town or field.
+///
+/// Generated from `crates/meter/data/DungeonSceneIds.json`, itself filtered
+/// from BPSR-ZDPS's `DungeonsTable.json` — the same URL vendored as
+/// `DungeonsTableNames.json`, just projected to scene ids instead of names.
+///
+/// Sorted ascending; `is_dungeon_scene` binary-searches it."""
+
+# Mirrors `_BOSS_IDS_LINE_WIDTH`/`_BOSS_IDS_INDENT` above — see their comment.
+_DUNGEON_SCENE_IDS_LINE_WIDTH = 96
+_DUNGEON_SCENE_IDS_INDENT = "    "
+
+
+def emit_dungeon_scene_ids(out: io.StringIO, ids: list[int]) -> None:
+    _emit_wrapped_u32_array(
+        out,
+        DUNGEON_SCENE_IDS_DOC,
+        "DUNGEON_SCENE_IDS",
+        ids,
+        _DUNGEON_SCENE_IDS_LINE_WIDTH,
+        _DUNGEON_SCENE_IDS_INDENT,
+        "\n/// Whether `id` is a known dungeon scene id (issue #125) — i.e. whether\n"
+        "/// the final-boss latch in `Meter::recompute_boss` may record a\n"
+        "/// remembered boss for it.\n"
+        "pub fn is_dungeon_scene(id: u32) -> bool {\n"
+        "    DUNGEON_SCENE_IDS.binary_search(&id).is_ok()\n"
+        "}\n",
     )
 
 
@@ -499,6 +620,9 @@ def _render_source(name: str, url: str) -> bytes:
     if name in BOSS_ID_SOURCES:
         ids = filter_boss_ids(json.loads(body.decode("utf-8-sig")))
         return (json.dumps(ids, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if name in DUNGEON_SCENE_ID_SOURCES:
+        ids = filter_dungeon_scene_ids(json.loads(body.decode("utf-8-sig")))
+        return (json.dumps(ids, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     # `VERBATIM_SOURCES` are vendored byte-for-byte, but a leading UTF-8 BOM
     # would otherwise ride along untouched: strip it here so every vendored
     # file — filtered or verbatim — is guaranteed BOM-free on disk, matching
@@ -514,7 +638,12 @@ def refresh(check: bool) -> bool:
     copies are overwritten.
     """
     clean = True
-    for name, url in {**VERBATIM_SOURCES, **FILTERED_SOURCES, **BOSS_ID_SOURCES}.items():
+    for name, url in {
+        **VERBATIM_SOURCES,
+        **FILTERED_SOURCES,
+        **BOSS_ID_SOURCES,
+        **DUNGEON_SCENE_ID_SOURCES,
+    }.items():
         rendered = _render_source(name, url)
         target = DATA / name
         current = target.read_bytes() if target.exists() else None
@@ -558,6 +687,7 @@ def render() -> str:
     boss_ids = sorted(
         {int(x) for x in load("MonsterTableBossIds.json")} | set(BOSS_ID_MANUAL_OVERRIDES)
     )
+    dungeon_scene_ids = sorted({int(x) for x in load("DungeonSceneIds.json")})
 
     out = io.StringIO()
     out.write(HEADER)
@@ -574,9 +704,11 @@ def render() -> str:
         scenes,
     )
     emit_boss_ids(out, boss_ids)
+    emit_dungeon_scene_ids(out, dungeon_scene_ids)
     out.write(FOOTER)
     print(
-        f"{len(monsters)} monsters, {len(scenes)} scenes, {len(boss_ids)} boss ids",
+        f"{len(monsters)} monsters, {len(scenes)} scenes, {len(boss_ids)} boss ids, "
+        f"{len(dungeon_scene_ids)} dungeon scene ids",
         file=sys.stderr,
     )
     return out.getvalue()
