@@ -296,6 +296,7 @@ fn demo_snapshot() -> Snapshot {
             is_boss: true,
             scene_id: None,
             scene_name: Some("Frozen Bahaar's Sanctum"),
+            scene_boss_name: None,
         },
     }
 }
@@ -1530,26 +1531,50 @@ fn paint_stat_pill(
 /// argument every full-texture `Painter::image` blit in this module passes.
 const UV_FULL: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
 
-/// Header title text (issue #9 slice 2; gated to boss fights by issue #42):
-/// the boss name when the current target is a recognized boss with a
-/// resolved name, `Monster #{id}` when it's a recognized boss whose name
-/// didn't resolve (the two vendored lists aren't guaranteed to agree — see
-/// `EncounterInfo::is_boss`), else blank for a non-boss pull, else "No
-/// target" when nothing has been hit yet. Always returns something (never
-/// omits the line) so `draw_header` can render it unconditionally and the
-/// header's height never jitters between frames depending on whether a
-/// target — or a name for it — is known.
+/// Header title text (issue #9 slice 2; gated to boss fights by issue #42;
+/// dungeon-final-boss precedence by issue #125).
+///
+/// Precedence, highest first:
+///
+/// 1. `scene_boss_name` — the current dungeon's *remembered final boss*
+///    (`Meter::scene_bosses`), if one has been learned. This outranks
+///    everything below, including a genuine currently-selected boss: a
+///    dungeon's trash clear routinely selects a mid-dungeon mech or boss as
+///    `boss_uid` (`Meter::recompute_boss`'s HP heuristic has no notion of
+///    "final"), and once the dungeon's real final boss is known, showing
+///    anything else in the header is a regression back to the "wrong name
+///    flashes mid-trash" problem issue #42 existed to fix. This is also what
+///    delivers "shown from the moment the player enters the dungeon": on a
+///    later run of the same dungeon this session, `scene_boss_name` is
+///    already populated before a single hit lands.
+/// 2. else the existing recognized-boss branch: the boss name when the
+///    current target is a recognized boss with a resolved name, `Monster
+///    #{id}` when it's a recognized boss whose name didn't resolve (the two
+///    vendored lists aren't guaranteed to agree — see `EncounterInfo::is_boss`),
+///    else blank for a non-boss pull. This is what a dungeon's first-ever run
+///    this session falls back to before its final boss has been observed,
+///    and what non-dungeon scenes (`tables::is_dungeon_scene`) use always,
+///    since `scene_boss_name` is never populated for them.
+/// 3. else "No target" when nothing has been hit yet.
+///
+/// Always returns something (never omits the line) so `draw_header` can
+/// render it unconditionally and the header's height never jitters between
+/// frames depending on whether a target — or a name for it — is known.
 ///
 /// "No target" is kept for the genuinely-empty-encounter case (no target at
-/// all), but a non-boss pull is a real target we're deliberately not naming
-/// — showing `Monster #{id}` there was dropped rather than kept as the
-/// non-boss fallback, since a raw id would read as an unresolved boss name
-/// rather than the intentional omission it actually is (the reference meter
-/// only names boss fights; see `tables::is_boss_monster`). A *recognized
-/// boss* with no resolved name is different: it's a real boss fight, and an
-/// empty header would be indistinguishable from a trash pull — so that case
-/// still falls back to the raw id.
+/// all), but a non-boss pull with no remembered dungeon boss is a real
+/// target we're deliberately not naming — showing `Monster #{id}` there was
+/// dropped rather than kept as the non-boss fallback, since a raw id would
+/// read as an unresolved boss name rather than the intentional omission it
+/// actually is (the reference meter only names boss fights; see
+/// `tables::is_boss_monster`). A *recognized boss* with no resolved name is
+/// different: it's a real boss fight, and an empty header would be
+/// indistinguishable from a trash pull — so that case still falls back to
+/// the raw id.
 fn encounter_title(e: &EncounterInfo) -> String {
+    if let Some(name) = e.scene_boss_name {
+        return name.to_string();
+    }
     match e.boss_monster_id {
         None => "No target".to_string(),
         Some(id) if e.is_boss => e
@@ -3865,6 +3890,7 @@ mod tests {
                 boss_name: Some("Bahaar"),
                 scene_id: None,
                 scene_name: None,
+                scene_boss_name: None,
             },
         }
     }
@@ -5695,6 +5721,71 @@ mod tests {
     #[test]
     fn title_shows_placeholder_when_nothing_known() {
         assert_eq!(encounter_title(&EncounterInfo::default()), "No target");
+    }
+
+    // -- dungeon final-boss precedence (issue #125) -------------------------
+
+    #[test]
+    fn title_prefers_scene_boss_name_over_a_non_boss_mid_dungeon_mech() {
+        // The exact issue #125 case: `recompute_boss` selected a mid-dungeon
+        // mech (e.g. template 1342, "Boss - Battle Mech 03") that
+        // `MonsterType` does not mark a boss, so `is_boss` is false and
+        // `boss_name` is `None` — but the dungeon's remembered final boss is
+        // known, so the header must show that name, not go blank.
+        let e = EncounterInfo {
+            boss_monster_id: Some(1342),
+            boss_name: None,
+            is_boss: false,
+            scene_boss_name: Some("Blazing Mech 05"),
+            ..Default::default()
+        };
+        assert_eq!(encounter_title(&e), "Blazing Mech 05");
+    }
+
+    #[test]
+    fn title_prefers_scene_boss_name_over_a_genuine_mid_dungeon_boss() {
+        // Even a *real* mid-dungeon boss (`is_boss: true`) must not displace
+        // the dungeon's remembered final boss — the design is "final boss
+        // only, always", not "final boss unless something else looks
+        // boss-like too".
+        let e = EncounterInfo {
+            boss_monster_id: Some(103),
+            boss_name: Some("Rathalos"),
+            is_boss: true,
+            scene_boss_name: Some("Blazing Mech 05"),
+            ..Default::default()
+        };
+        assert_eq!(encounter_title(&e), "Blazing Mech 05");
+    }
+
+    #[test]
+    fn title_prefers_scene_boss_name_before_any_hit_lands() {
+        // The case the function's doc comment leads with: the dungeon's
+        // final boss is already known from a prior pull, but this
+        // encounter hasn't hit anything yet — `boss_monster_id` is `None`.
+        // The scene boss name must still win, via the unconditional `if
+        // let` ahead of the `match e.boss_monster_id`, not "No target".
+        let e = EncounterInfo {
+            boss_monster_id: None,
+            scene_boss_name: Some("Blazing Mech 05"),
+            ..Default::default()
+        };
+        assert_eq!(encounter_title(&e), "Blazing Mech 05");
+    }
+
+    #[test]
+    fn title_falls_through_to_existing_rules_when_scene_boss_name_absent() {
+        // No dungeon final boss has been learned yet (e.g. a scene's first
+        // run this session, or a non-dungeon scene) — the pre-issue-#125
+        // precedence still applies unchanged.
+        let e = EncounterInfo {
+            boss_monster_id: Some(103),
+            boss_name: Some("Rathalos"),
+            is_boss: true,
+            scene_boss_name: None,
+            ..Default::default()
+        };
+        assert_eq!(encounter_title(&e), "Rathalos");
     }
 
     #[test]

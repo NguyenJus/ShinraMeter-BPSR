@@ -119,6 +119,14 @@ pub struct EncounterInfo {
     pub is_boss: bool,
     pub scene_id: Option<u32>,
     pub scene_name: Option<&'static str>,
+    /// The current dungeon scene's remembered final boss (issue #125), if
+    /// one has been learned — see `Meter::scene_bosses`' doc comment for how
+    /// it's learned. Independent of `boss_monster_id`/`boss_name`/`is_boss`
+    /// above, which remain the raw facts about the currently-selected
+    /// target; `encounter_title` in `crates/app/src/ui.rs` prefers this
+    /// field over them so a mid-dungeon mech (or even a genuine mid-dungeon
+    /// boss) never displaces the dungeon's final boss name once it's known.
+    pub scene_boss_name: Option<&'static str>,
 }
 
 /// Cheap, immutable snapshot of the current encounter, sorted by damage
