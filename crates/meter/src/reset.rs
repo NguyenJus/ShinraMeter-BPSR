@@ -1,16 +1,24 @@
-//! Reset triggers: manual reset, boss-HP-rollback heuristic, server-change
-//! clear (plan §T2.2).
-
+//! Reset triggers: manual reset, boss-HP-rollback heuristic, the next
+//! fight's first hit (plan §T2.2).
+//!
+//! `ServerChanged` is deliberately **not** one of these (issue #138): a
+//! server change invalidates entity/scene state (`Meter::apply`'s
+//! `ServerChanged` arm clears `enemies`/`boss_uid`/`scene_id` directly and
+//! freezes the fight clock) but never clears the displayed stats, so it
+//! never produces a `ResetReason`. The stats-clearing reset on the far side
+//! of a reconnect is `NewFight`, fired by the reconnecting player's first
+//! real hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ResetReason {
     Manual,
     BossHpRollback,
-    ServerChange,
     /// The previous fight had ended (see `crate::fight`) and its stats were
     /// being held on screen; the first damage of the next fight clears them
     /// (issue #78). Unlike the other reasons this one is *caused* by combat
     /// resuming, so the reset and the new fight's first hit are the same
-    /// event.
+    /// event. Also the reset that clears a held fight across a
+    /// `ServerChanged` reconnect (issue #138): the reconnect itself only
+    /// freezes the clock, it does not reset.
     NewFight,
 }
 
@@ -68,7 +76,9 @@ pub struct EnemyState {
     pub death_order: Option<u64>,
     /// Monster template id, from `EnemyHp::monster_id` (issue #9 slice 2).
     /// Survives `Meter::reset` like the rest of `EnemyState` — only a
-    /// `ServerChange` clears the enemy map itself.
+    /// `ProtocolEvent::ServerChanged` clears the enemy map itself (uids are
+    /// re-issued by the new server session, so entity state does not
+    /// survive a reconnect the way display state does — issue #138).
     pub monster_id: Option<u32>,
 }
 

@@ -449,21 +449,42 @@ impl Meter {
                 None
             }
             ProtocolEvent::ServerChanged { timestamp_ms } => {
-                // issue #12/#145 finding 4: a server change is as real a
-                // scene change as any (the old scene's preloads can't
-                // possibly still be in AOI range afterward), so mirror the
-                // Scene arm above and prune stale preloads — and log the
-                // same summary line — before `reset` clears `players` and
-                // `scene_id` is cleared below.
+                // issue #138: a server change (reconnect/zone transition)
+                // only invalidates state keyed on identifiers that are
+                // valid within one server session — uids are re-issued by
+                // the new server, and the scene id is unknown until the
+                // next `EnterScene`. It deliberately does **not** clear
+                // `players`/totals: those are display state, and a
+                // reconnect does not make them wrong. The next real fight's
+                // `NewFight` reset (`apply_damage`, below) is what clears
+                // them, exactly as it does after an idle-timeout hold.
+                //
+                // issue #12: a server change is as real a scene change as
+                // any (the old scene's preloads can't possibly still be in
+                // AOI range afterward), so mirror the Scene arm above and
+                // drop preloaded rows nobody ever damaged — logging the
+                // same summary line — while `scene_id` still names the
+                // scene being left. Rows with real activity survive: they
+                // are the display state this arm deliberately keeps.
                 self.prune_stale_preloads();
-                self.reset(ResetReason::ServerChange, *timestamp_ms);
                 self.enemies.clear();
                 self.boss_uid = None;
                 if let Some(msg) = scene_transition_log(self.scene_id, None) {
                     log::info!("{msg}");
                 }
                 self.scene_id = None;
-                Some(ResetReason::ServerChange)
+
+                // Freeze the fight clock across the zoning gap, same as the
+                // idle timeout does, so the held elapsed timer does not run
+                // while the connection is down — and so `fight_end_ms`
+                // being `Some` arms the `NewFight` path for the
+                // reconnecting player's first real hit. A fight already
+                // held (or none running at all) is left exactly as-is.
+                if self.fight_start_ms.is_some() && self.fight_end_ms.is_none() {
+                    self.fight_end_ms = Some(*timestamp_ms);
+                }
+
+                None
             }
         }
     }
@@ -1717,9 +1738,9 @@ mod tests {
         assert_eq!(m.preload_count, 0);
     }
 
-    /// issue #145 finding 4: `ServerChanged` used to reset straight away
-    /// without pruning first, leaving `preload_count` stale (and skipping
-    /// the summary log) the same way an un-fixed `BossHpRollback` would.
+    /// issue #12: `ServerChanged` prunes preloads like any other real scene
+    /// change, so `preload_count` can't go stale (and the summary log can't
+    /// be skipped) the way an un-pruned `BossHpRollback` would leave it.
     /// Mirrors `preload_count_stays_in_sync_across_a_mid_dungeon_reset`, but
     /// with the scene ending via `ServerChanged` instead of a same-scene
     /// reset.
@@ -1735,10 +1756,12 @@ mod tests {
         m.apply(&dmg(1, 100, 1000));
         m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 2000 });
         assert_eq!(m.preload_count, 0);
-        // The one row with real activity doesn't survive `ServerChanged`
-        // either — `reset` still clears `players` outright — but the
-        // counter accounting is what this test is about.
-        assert!(m.snapshot(2000).rows.is_empty());
+        // Bob was only ever preloaded, so pruning drops him; Alice landed a
+        // real hit, and issue #138 keeps that display state across a
+        // reconnect rather than resetting it here.
+        let rows = m.snapshot(2000).rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Alice");
     }
 
     /// The per-scene preload cap guards against a misclassified dungeon
@@ -2618,25 +2641,33 @@ mod tests {
         }
 
         #[test]
-        fn server_change_cooldown_uses_change_time_not_stale_last_event_ms() {
+        fn rollback_cooldown_anchors_on_the_reconnect_new_fight_reset() {
             let mut m = Meter::new();
             // Old fight, long since idle.
             m.apply(&boss_hit(10, 0));
             m.apply(&hp(10, 100, 100, 0));
 
-            // Server change detected 5 minutes later.
+            // Server change detected 5 minutes later. This no longer resets
+            // (issue #138) -- it only latches `fight_end_ms`, so it does
+            // *not* anchor the cooldown below.
             m.apply(&ProtocolEvent::ServerChanged {
                 timestamp_ms: 300_000,
             });
 
-            // New zone: boss picked up again almost immediately.
-            m.apply(&boss_hit(10, 300_050));
-            m.apply(&hp(10, 55, 100, 300_060));
-            let r = m.apply(&hp(10, 96, 100, 300_100));
+            // New zone: boss picked up again well after the reconnect
+            // signal itself. This hit is what actually anchors the
+            // cooldown -- it fires the `NewFight` reset
+            // (`last_reset_ms = 300_800`) that clears the held fight, not
+            // the `ServerChanged` moment above.
+            m.apply(&boss_hit(10, 300_800));
+            m.apply(&hp(10, 55, 100, 300_850));
+            let r = m.apply(&hp(10, 96, 100, 302_400));
 
-            // This looks like a rollback shape, but the cooldown (anchored to
-            // the server-change moment, not the stale last-event time) hasn't
-            // elapsed yet -> must be suppressed.
+            // 302_400 - 300_800 = 1_600ms: still inside the cooldown
+            // anchored on the reconnect hit -> suppressed. If the cooldown
+            // were (wrongly) anchored on the `ServerChanged` moment instead,
+            // 302_400 - 300_000 = 2_400ms would already be past the
+            // 2_000ms cooldown and this rollback shape would fire for real.
             assert_eq!(r, None);
         }
 
@@ -2667,16 +2698,23 @@ mod tests {
             assert!(!m.enemies[&10].took_damage);
         }
 
+        /// issue #138: a server change invalidates uid-keyed entity state
+        /// (uids are re-issued by the new server) but must not touch the
+        /// displayed player stats — those are cleared later, by the next
+        /// fight's `NewFight` reset, not here.
         #[test]
-        fn server_changed_clears_players_and_enemies() {
+        fn server_changed_clears_enemies_but_keeps_players() {
             let mut m = Meter::new();
             m.apply(&dmg(1, 100, 0));
             m.apply(&boss_hit(10, 0));
             m.apply(&hp(10, 100, 100, 0));
             let r = m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 1000 });
-            assert_eq!(r, Some(ResetReason::ServerChange));
+            assert_eq!(r, None, "a server change must not report a reset");
             let snap = m.snapshot(1000);
-            assert!(snap.rows.is_empty());
+            assert!(
+                !snap.rows.is_empty(),
+                "player rows must survive a reconnect"
+            );
             assert!(m.enemies.is_empty());
             assert!(m.boss_uid.is_none());
         }
@@ -2882,8 +2920,12 @@ mod tests {
             assert_eq!(m.fight_state(101_000), FightState::Idle);
         }
 
+        /// issue #138: a server change (reconnect/zoning) must not wipe the
+        /// numbers the player is still reading. It only invalidates
+        /// entity/scene state, and — since the fight was already held —
+        /// leaves the freeze exactly where it was.
         #[test]
-        fn server_change_clears_from_the_ended_state() {
+        fn server_change_freezes_but_does_not_clear_an_already_ended_fight() {
             let mut m = Meter::new();
             m.apply(&dmg(1, 5_000, 0));
             assert_eq!(m.tick(100_000), FightState::Ended);
@@ -2891,9 +2933,150 @@ mod tests {
             let reason = m.apply(&ProtocolEvent::ServerChanged {
                 timestamp_ms: 100_000,
             });
-            assert_eq!(reason, Some(ResetReason::ServerChange));
-            assert!(m.snapshot(101_000).rows.is_empty());
-            assert_eq!(m.fight_state(101_000), FightState::Idle);
+            assert_eq!(reason, None, "a server change must not report a reset");
+            let snap = m.snapshot(200_000);
+            assert_eq!(snap.total_damage, 5_000);
+            assert!(!snap.rows.is_empty());
+            assert_eq!(m.fight_state(200_000), FightState::Ended);
+        }
+
+        /// A reconnect mid-fight (still `Active`, not yet held) must latch
+        /// `fight_end_ms` to the `ServerChanged` timestamp — freezing the
+        /// clock across the zoning gap and arming the `NewFight` path —
+        /// while keeping the accumulated stats, and must invalidate the
+        /// uid-keyed entity state and the scene id.
+        #[test]
+        fn server_change_mid_fight_latches_the_clock_and_keeps_the_stats() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 7 });
+            m.apply(&dmg(1, 700, 0));
+            m.apply(&boss_hit(10, 100, false));
+            m.apply(&hp(10, 50, Some(103), 100));
+            assert_eq!(m.snapshot(100).encounter.scene_id, Some(7));
+
+            // Well inside the idle window: still active, not yet held.
+            assert_eq!(m.fight_state(500), FightState::Active);
+            let reason = m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 500 });
+            assert_eq!(reason, None, "a server change must not report a reset");
+
+            assert_eq!(m.fight_state(600_000), FightState::Ended);
+            let snap = m.snapshot(600_000);
+            assert_eq!(
+                snap.total_damage, 800,
+                "player totals must survive a reconnect"
+            );
+            assert!(!snap.rows.is_empty());
+            assert_eq!(
+                snap.duration_ms, 500,
+                "the clock latches to the ServerChanged timestamp, not fight_start_ms drifting"
+            );
+            assert!(m.enemies.is_empty(), "uids are re-issued by the new server");
+            assert!(m.boss_uid.is_none());
+            assert_eq!(snap.encounter.scene_id, None);
+        }
+
+        /// No fight was running at all: a server change must not conjure a
+        /// fight end (or anything else) out of nothing.
+        #[test]
+        fn server_change_while_idle_touches_nothing() {
+            let mut m = Meter::new();
+            assert_eq!(m.fight_state(1_000), FightState::Idle);
+            let reason = m.apply(&ProtocolEvent::ServerChanged {
+                timestamp_ms: 1_000,
+            });
+            assert_eq!(reason, None);
+            assert_eq!(m.fight_state(2_000), FightState::Idle);
+            let snap = m.snapshot(2_000);
+            assert_eq!(snap.total_damage, 0);
+            assert!(snap.rows.is_empty());
+        }
+
+        /// The reconnecting player's first real hit is what finally clears
+        /// the pre-disconnect numbers — the same `NewFight` path an
+        /// idle-timeout hold uses, not a new reset kind.
+        #[test]
+        fn server_change_then_next_fights_first_hit_clears_the_held_stats() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 700, 0));
+            m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 500 });
+            assert_eq!(m.fight_state(500), FightState::Ended);
+
+            let reason = m.apply(&dmg(1, 300, 10_000));
+            assert_eq!(reason, Some(ResetReason::NewFight));
+            let snap = m.snapshot(11_000);
+            assert_eq!(
+                snap.total_damage, 300,
+                "the pre-disconnect damage must be gone"
+            );
+            assert_eq!(m.fight_state(11_000), FightState::Active);
+        }
+
+        /// The same character can come back under a different uid after a
+        /// reconnect (issue #138's double-count risk). `NewFight`'s
+        /// `players.clear()` drops the whole map rather than merging by
+        /// uid, so the old uid's row cannot survive into — or be summed
+        /// with — the new one.
+        #[test]
+        fn a_reconnect_uid_change_does_not_double_count_with_the_old_uid() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 700, 0));
+            m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 500 });
+
+            // The same player returns under uid 2, not uid 1.
+            let reason = m.apply(&dmg(2, 300, 10_000));
+            assert_eq!(reason, Some(ResetReason::NewFight));
+
+            let snap = m.snapshot(11_000);
+            assert_eq!(
+                snap.total_damage, 300,
+                "the old uid's damage must not survive into the new fight"
+            );
+            assert_eq!(snap.rows.len(), 1);
+            assert_eq!(snap.rows[0].uid, 2);
+        }
+
+        /// Mirrors `a_monster_swinging_at_a_player_does_not_end_the_hold`:
+        /// combat the user isn't part of must not end a hold that started
+        /// with a server change either.
+        #[test]
+        fn a_monster_hit_after_a_server_change_does_not_end_the_hold() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 5_000, 0));
+            m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 500 });
+            assert_eq!(m.fight_state(500), FightState::Ended);
+
+            let reason = m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 99,
+                attacker_kind: EntityKind::Monster,
+                target_uid: 1,
+                target_kind: EntityKind::Player,
+                value: 200,
+                timestamp_ms: 10_000,
+                ..Default::default()
+            }));
+            assert_eq!(reason, None);
+            assert_eq!(m.snapshot(11_000).total_damage, 5_000);
+            assert_eq!(m.fight_state(11_000), FightState::Ended);
+        }
+
+        /// Mirrors `a_heal_does_not_end_the_hold` for the server-change
+        /// case.
+        #[test]
+        fn a_heal_after_a_server_change_does_not_end_the_hold() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 5_000, 0));
+            m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 500 });
+
+            let reason = m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                value: 400,
+                is_heal: true,
+                timestamp_ms: 10_000,
+                ..Default::default()
+            }));
+            assert_eq!(reason, None);
+            assert_eq!(m.snapshot(11_000).total_damage, 5_000);
         }
 
         #[test]
