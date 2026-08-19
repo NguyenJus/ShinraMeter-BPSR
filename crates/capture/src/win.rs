@@ -16,7 +16,7 @@
 //! the four entry points is also what allows the library to be loaded at
 //! runtime from the unpacked copy — see [`crate::driver`].
 
-use std::ffi::CString;
+use std::ffi::{CString, c_void};
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -163,13 +163,20 @@ pub fn start_capture(
     let restart = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let thread_restart = Arc::clone(&restart);
-    // `HANDLE` is a `Copy` newtype over `isize`; the capture thread gets its
-    // own copy of the value, not a reference into shared state.
-    let thread_handle = handle;
+    // `HANDLE` is a `Copy` newtype over a raw `*mut c_void`, which makes it
+    // neither `Send` nor `Sync` — so the closure below cannot capture one
+    // directly, even though a WinDivert handle has no thread affinity and the
+    // C API takes it by value from whichever thread calls in. Cross the
+    // boundary as a plain integer and rebuild the handle on the far side: the
+    // capture thread still gets its own copy of the value rather than a
+    // reference into shared state, and no crate-wide `unsafe impl Send for
+    // HANDLE`-style escape hatch — which would silently cover every other
+    // handle type too — has to exist for it.
+    let thread_handle = handle.0 as usize;
     let join = thread::spawn(move || {
         recv_loop(
             api,
-            thread_handle,
+            HANDLE(thread_handle as *mut c_void),
             tx,
             thread_stop,
             thread_restart,
