@@ -9,6 +9,7 @@
 //! explicit `now_ms`), and `bpsr-protocol` events already carry the capture
 //! thread's timestamp. [`now_ms`] is this crate's only `SystemTime` call site.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,6 +19,7 @@ use bpsr_protocol as proto;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select, tick};
 
 use crate::imagines;
+use crate::scene_bosses_cache;
 use crate::ui::UiCommand;
 
 /// Snapshot publication rate (~10 Hz), matching the overlay's repaint cadence.
@@ -204,6 +206,68 @@ impl CacheWriter {
     }
 }
 
+/// A scene -> final-boss snapshot as handed to the background writer thread
+/// (issue #131) — the same shape `scene_bosses_cache::save` takes.
+type SceneBossesSnapshot = HashMap<u32, u32>;
+
+/// Persists the scene -> final-boss cache off the pipeline thread, mirroring
+/// `CacheWriter` exactly (same capacity-1 coalescing channel, same
+/// rationale) — see its doc comment.
+struct SceneBossesWriter {
+    tx: Sender<SceneBossesSnapshot>,
+    /// A second receiver handle used only to drain a stale, not-yet-written
+    /// snapshot out of the channel before enqueuing a newer one — mirrors
+    /// `CacheWriter::stale`.
+    stale: Receiver<SceneBossesSnapshot>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl SceneBossesWriter {
+    fn spawn(path: PathBuf) -> Self {
+        let (tx, rx) = bounded::<SceneBossesSnapshot>(1);
+        let stale = rx.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("scene-bosses-writer".to_string())
+            .spawn(move || {
+                while let Ok(snapshot) = rx.recv() {
+                    scene_bosses_cache::save(&path, &snapshot);
+                }
+            })
+            .expect("failed to spawn the scene-bosses-writer thread");
+
+        Self {
+            tx,
+            stale,
+            handle: Some(handle),
+        }
+    }
+
+    /// Enqueues `snapshot` to be written, dropping a still-pending stale
+    /// snapshot in its favour rather than blocking on the writer thread.
+    fn save(&self, snapshot: SceneBossesSnapshot) {
+        match self.tx.try_send(snapshot) {
+            Ok(()) => {}
+            Err(TrySendError::Full(snapshot)) => {
+                let _ = self.stale.try_recv();
+                let _ = self.tx.try_send(snapshot);
+            }
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    /// Closes the channel and blocks until the writer thread has drained
+    /// (and written) any pending snapshot. Must be called before process
+    /// exit so the final save is never lost.
+    fn shutdown(self) {
+        drop(self.tx);
+        drop(self.stale);
+        if let Some(handle) = self.handle {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Owns the encounter state and applies mapped protocol events to it.
 pub struct Pipeline {
     meter: meter::Meter,
@@ -211,6 +275,15 @@ pub struct Pipeline {
     /// `None` in tests / `Pipeline::new()` — no writer means no disk IO at
     /// all.
     cache_writer: Option<CacheWriter>,
+    /// Background writer for the cross-session scene -> final-boss cache
+    /// (issue #131). Same "`None` means no disk IO" contract as
+    /// `cache_writer`.
+    scene_bosses_writer: Option<SceneBossesWriter>,
+    /// The path `scene_bosses_writer` was spawned against, kept so
+    /// `forget_scene_bosses` can delete the file directly (issue #131's
+    /// "Forget learned bosses" action) rather than going through the
+    /// debounced writer, which only ever overwrites, never deletes.
+    scene_bosses_path: Option<PathBuf>,
 }
 
 impl Pipeline {
@@ -218,6 +291,8 @@ impl Pipeline {
         Self {
             meter: meter::Meter::new(),
             cache_writer: None,
+            scene_bosses_writer: None,
+            scene_bosses_path: None,
         }
     }
 
@@ -231,7 +306,26 @@ impl Pipeline {
         Self {
             meter: meter::Meter::with_names_cache(cached),
             cache_writer: Some(CacheWriter::spawn(path)),
+            scene_bosses_writer: None,
+            scene_bosses_path: None,
         }
+    }
+
+    /// Loads the scene -> final-boss cache from `path` (if it exists) to
+    /// seed the meter, and spawns a background writer against `path` so
+    /// future resets/shutdown persist back to it off the pipeline thread
+    /// (issue #131). Mirrors `with_names_cache_path` exactly, but takes
+    /// `self` by value so it can be chained after that constructor — `run`
+    /// needs both caches seeded on the one `Pipeline` it constructs, and
+    /// `Meter::set_scene_bosses` (unlike `with_names_cache`, which builds a
+    /// whole fresh `Meter`) is a plain in-place setter for exactly this
+    /// reason.
+    pub fn with_scene_bosses_path(mut self, path: PathBuf) -> Self {
+        let cached = scene_bosses_cache::load(&path);
+        self.meter.set_scene_bosses(cached);
+        self.scene_bosses_writer = Some(SceneBossesWriter::spawn(path.clone()));
+        self.scene_bosses_path = Some(path);
+        self
     }
 
     /// Hands the current name cache to the background writer, if one is
@@ -245,6 +339,29 @@ impl Pipeline {
         }
     }
 
+    /// Hands the current scene -> final-boss map to its background writer,
+    /// if one is configured (issue #131). Same off-thread, never-panics
+    /// contract as `save_names_cache`.
+    pub fn save_scene_bosses(&self) {
+        if let Some(writer) = &self.scene_bosses_writer {
+            writer.save(self.meter.scene_bosses_for_save());
+        }
+    }
+
+    /// Clears the learned scene -> final-boss map, both in-process and on
+    /// disk (issue #131's "Forget learned bosses" menu action, wired from
+    /// `ui.rs`'s `UiCommand::ForgetLearnedBosses`). Runs on the pipeline
+    /// thread, same as `reset` — not the UI thread — and only on an
+    /// explicit, rare user action, so the direct blocking
+    /// `scene_bosses_cache::forget` call here (unlike the debounced writer
+    /// above) is not a stall risk in practice.
+    pub fn forget_scene_bosses(&mut self) {
+        self.meter.set_scene_bosses(HashMap::new());
+        if let Some(path) = &self.scene_bosses_path {
+            scene_bosses_cache::forget(path);
+        }
+    }
+
     /// Applies one protocol event. Returns `Some(reason)` when the event
     /// triggered a reset (boss-HP rollback or server change).
     pub fn step(&mut self, ev: proto::ProtocolEvent) -> Option<meter::ResetReason> {
@@ -252,6 +369,7 @@ impl Pipeline {
         if let Some(reason) = reason {
             log::debug!("meter reset: {reason:?}");
             self.save_names_cache();
+            self.save_scene_bosses();
         }
         reason
     }
@@ -260,6 +378,7 @@ impl Pipeline {
     pub fn reset(&mut self, now_ms: u64) {
         self.meter.reset(meter::ResetReason::Manual, now_ms);
         self.save_names_cache();
+        self.save_scene_bosses();
     }
 
     pub fn snapshot(&self, now_ms: u64) -> meter::Snapshot {
@@ -289,6 +408,15 @@ impl Pipeline {
             writer.shutdown();
         }
     }
+
+    /// Stops the background scene-bosses-writer thread, blocking until it
+    /// has written any pending snapshot to disk (issue #131). Mirrors
+    /// `shutdown_names_cache` exactly.
+    pub fn shutdown_scene_bosses(&mut self) {
+        if let Some(writer) = self.scene_bosses_writer.take() {
+            writer.shutdown();
+        }
+    }
 }
 
 impl Default for Pipeline {
@@ -308,13 +436,23 @@ pub fn spawn(
     events: Receiver<proto::ProtocolEvent>,
     commands: Receiver<UiCommand>,
     names_cache_path: PathBuf,
+    scene_bosses_path: PathBuf,
 ) -> (Receiver<meter::Snapshot>, JoinHandle<()>) {
     let (tx_snapshot, rx_snapshot) = bounded::<meter::Snapshot>(1);
     let stale = rx_snapshot.clone();
 
     let handle = std::thread::Builder::new()
         .name("pipeline".to_string())
-        .spawn(move || run(events, commands, tx_snapshot, stale, names_cache_path))
+        .spawn(move || {
+            run(
+                events,
+                commands,
+                tx_snapshot,
+                stale,
+                names_cache_path,
+                scene_bosses_path,
+            )
+        })
         .expect("failed to spawn the pipeline thread");
 
     (rx_snapshot, handle)
@@ -326,8 +464,10 @@ fn run(
     tx_snapshot: Sender<meter::Snapshot>,
     stale: Receiver<meter::Snapshot>,
     names_cache_path: PathBuf,
+    scene_bosses_path: PathBuf,
 ) {
-    let mut pipeline = Pipeline::with_names_cache_path(names_cache_path);
+    let mut pipeline =
+        Pipeline::with_names_cache_path(names_cache_path).with_scene_bosses_path(scene_bosses_path);
     // Replaced by `never()` once capture disconnects, so a dead channel does
     // not spin the select loop.
     let mut events = events;
@@ -346,6 +486,7 @@ fn run(
             },
             recv(commands) -> msg => match msg {
                 Ok(UiCommand::Reset) => pipeline.reset(now_ms()),
+                Ok(UiCommand::ForgetLearnedBosses) => pipeline.forget_scene_bosses(),
                 Ok(UiCommand::Quit) => break,
                 Err(_) => break,
             },
@@ -355,10 +496,12 @@ fn run(
 
     // Shutdown save: catches identity data learned since the last
     // reset/encounter-end save (e.g. a session with no resets at all). Then
-    // stop the writer thread, blocking until it has drained this (and any
-    // still-pending) snapshot to disk, so the final save is never lost.
+    // stop the writer threads, blocking until each has drained this (and
+    // any still-pending) snapshot to disk, so the final save is never lost.
     pipeline.save_names_cache();
+    pipeline.save_scene_bosses();
     pipeline.shutdown_names_cache();
+    pipeline.shutdown_scene_bosses();
 }
 
 /// Publishes the latest snapshot, dropping the previous one if the UI has not
@@ -722,6 +865,108 @@ mod tests {
             assert_eq!(cached_name(&loaded, 1), Some("Foo".to_string()));
 
             let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Issue #131: `Pipeline`-level wiring for the scene -> final-boss
+    /// cache, mirroring `names_cache_wiring` above.
+    mod scene_bosses_wiring {
+        use super::*;
+        use bpsr_test_support::scratch_path;
+
+        fn boss_hit(uid: i64, ts: u64) -> proto::DamageEvent {
+            proto::DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: proto::EntityKind::Player,
+                skill_id: 7,
+                value: 1,
+                crit: false,
+                lucky: false,
+                hp_lessen: 0,
+                is_miss: false,
+                is_heal: false,
+                target_uid: uid,
+                target_kind: proto::EntityKind::Monster,
+                timestamp_ms: ts,
+                is_dead: false,
+            }
+        }
+
+        fn boss_hp(uid: i64, monster_id: u32, ts: u64) -> proto::EnemyHp {
+            proto::EnemyHp {
+                uid,
+                curr_hp: Some(100),
+                max_hp: Some(100),
+                monster_id: Some(monster_id),
+                timestamp_ms: ts,
+            }
+        }
+
+        #[test]
+        fn with_scene_bosses_path_seeds_the_meter_from_an_existing_file() {
+            // 1001 ("Tina's Mindrealm") is a dungeon scene; 103 ("Rathalos")
+            // is a genuine boss.
+            let names_path = scratch_path("scene-bosses-seed-names");
+            let scene_path = scratch_path("scene-bosses-seed");
+            scene_bosses_cache::save(&scene_path, &HashMap::from([(1001, 103)]));
+
+            let mut p = Pipeline::with_names_cache_path(names_path.clone())
+                .with_scene_bosses_path(scene_path.clone());
+            p.step(proto::ProtocolEvent::Scene { level_map_id: 1001 });
+            let snap = p.snapshot(1_000);
+            assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
+
+            p.shutdown_names_cache();
+            p.shutdown_scene_bosses();
+            let _ = std::fs::remove_file(&names_path);
+            let _ = std::fs::remove_file(&scene_path);
+        }
+
+        #[test]
+        fn manual_reset_persists_the_scene_bosses_cache_to_disk() {
+            let names_path = scratch_path("scene-bosses-manual-reset-names");
+            let scene_path = scratch_path("scene-bosses-manual-reset");
+            let mut p = Pipeline::with_names_cache_path(names_path.clone())
+                .with_scene_bosses_path(scene_path.clone());
+            p.step(proto::ProtocolEvent::Scene { level_map_id: 1001 });
+            p.step(proto::ProtocolEvent::Damage(boss_hit(10, 0)));
+            p.step(proto::ProtocolEvent::EnemyHp(boss_hp(10, 103, 0)));
+
+            assert!(!scene_path.exists());
+            p.reset(1_000);
+            // The save is handed off to the background writer thread; flush
+            // and join it before asserting the on-disk state.
+            p.shutdown_scene_bosses();
+            assert!(scene_path.exists());
+
+            let loaded = scene_bosses_cache::load(&scene_path);
+            assert_eq!(loaded.get(&1001), Some(&103));
+
+            p.shutdown_names_cache();
+            let _ = std::fs::remove_file(&names_path);
+            let _ = std::fs::remove_file(&scene_path);
+        }
+
+        #[test]
+        fn forget_learned_bosses_clears_in_process_state_and_deletes_the_file() {
+            let names_path = scratch_path("scene-bosses-forget-names");
+            let scene_path = scratch_path("scene-bosses-forget");
+            let mut p = Pipeline::with_names_cache_path(names_path.clone())
+                .with_scene_bosses_path(scene_path.clone());
+            p.step(proto::ProtocolEvent::Scene { level_map_id: 1001 });
+            p.step(proto::ProtocolEvent::Damage(boss_hit(10, 0)));
+            p.step(proto::ProtocolEvent::EnemyHp(boss_hp(10, 103, 0)));
+            p.reset(1_000);
+            p.shutdown_scene_bosses();
+            assert!(scene_path.exists());
+
+            p.forget_scene_bosses();
+            assert!(!scene_path.exists());
+            let snap = p.snapshot(2_000);
+            assert_eq!(snap.encounter.scene_boss_name, None);
+
+            p.shutdown_names_cache();
+            let _ = std::fs::remove_file(&names_path);
         }
     }
 

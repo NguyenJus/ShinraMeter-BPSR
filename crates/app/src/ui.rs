@@ -127,6 +127,11 @@ fn paint_bold_text(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiCommand {
     Reset,
+    /// Issue #131: clears the learned scene -> final-boss map, both
+    /// in-process and its on-disk cache. Sent from the header dropdown's
+    /// "Forget learned bosses" item (`draw_header_menu`); handled by
+    /// `pipeline::run` on the pipeline thread, not here — same as `Reset`.
+    ForgetLearnedBosses,
     Quit,
 }
 
@@ -1532,30 +1537,34 @@ fn paint_stat_pill(
 const UV_FULL: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
 
 /// Header title text (issue #9 slice 2; gated to boss fights by issue #42;
-/// dungeon-final-boss precedence by issue #125).
+/// dungeon-final-boss precedence by issue #125; live-boss-first by issue
+/// #131).
 ///
 /// Precedence, highest first:
 ///
-/// 1. `scene_boss_name` — the current dungeon's *remembered final boss*
-///    (`Meter::scene_bosses`), if one has been learned. This outranks
-///    everything below, including a genuine currently-selected boss: a
-///    dungeon's trash clear routinely selects a mid-dungeon mech or boss as
-///    `boss_uid` (`Meter::recompute_boss`'s HP heuristic has no notion of
-///    "final"), and once the dungeon's real final boss is known, showing
-///    anything else in the header is a regression back to the "wrong name
-///    flashes mid-trash" problem issue #42 existed to fix. This is also what
-///    delivers "shown from the moment the player enters the dungeon": on a
-///    later run of the same dungeon this session, `scene_boss_name` is
-///    already populated before a single hit lands.
-/// 2. else the existing recognized-boss branch: the boss name when the
-///    current target is a recognized boss with a resolved name, `Monster
-///    #{id}` when it's a recognized boss whose name didn't resolve (the two
-///    vendored lists aren't guaranteed to agree — see `EncounterInfo::is_boss`),
-///    else blank for a non-boss pull. This is what a dungeon's first-ever run
-///    this session falls back to before its final boss has been observed,
-///    and what non-dungeon scenes (`tables::is_dungeon_scene`) use always,
-///    since `scene_boss_name` is never populated for them.
-/// 3. else "No target" when nothing has been hit yet.
+/// 1. The *live* boss, when the currently-selected target is a genuinely
+///    recognized boss (`is_boss`): its resolved name, or `Monster #{id}`
+///    when it's a recognized boss whose name didn't resolve (the two
+///    vendored lists aren't guaranteed to agree — see
+///    `EncounterInfo::is_boss`). This now outranks `scene_boss_name` —
+///    inverted from issue #125's original precedence — because a raid can
+///    string several *different* final bosses together in one instance
+///    (repo owner, issue #131): `Meter::scene_bosses` only ever remembers
+///    one boss per scene and overwrites, so once a second or third raid
+///    boss is actually engaged, showing the *previous* one instead of the
+///    boss currently being fought would be actively wrong, not just stale.
+///    A single-final-boss dungeon is unaffected: nothing else is ever
+///    `is_boss` there once the run's target is the remembered boss itself.
+/// 2. else `scene_boss_name` — the current dungeon's *remembered final
+///    boss* (`Meter::scene_bosses`), if one has been learned. This is what
+///    covers both "just walked in, nothing engaged yet" (`boss_monster_id`
+///    is still `None`) and the issue #125 case: `recompute_boss` selected a
+///    non-boss mid-dungeon mech or add as `boss_uid` (`is_boss` false), so
+///    branch 1 doesn't apply, but the header still shouldn't go blank or
+///    fall through to "No target" when the dungeon's real boss is already
+///    known.
+/// 3. else the pre-#125 fallback: blank for a non-boss pull with nothing
+///    remembered, "No target" when nothing has been hit yet at all.
 ///
 /// Always returns something (never omits the line) so `draw_header` can
 /// render it unconditionally and the header's height never jitters between
@@ -1571,16 +1580,32 @@ const UV_FULL: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui:
 /// different: it's a real boss fight, and an empty header would be
 /// indistinguishable from a trash pull — so that case still falls back to
 /// the raw id.
+///
+/// Known limitation (issue #131, not fixed here): on *entry* to a
+/// multi-boss raid, before anything has been engaged this session,
+/// `scene_boss_name` is whichever boss `Meter::scene_bosses` last latched
+/// for that scene — not necessarily the *first* one the raid will actually
+/// fight. The header only becomes correct once a boss is engaged and branch
+/// 1 takes over.
 fn encounter_title(e: &EncounterInfo) -> String {
+    if e.is_boss {
+        // `is_boss` is only ever true alongside a `Some` `boss_monster_id`
+        // (see `Meter::snapshot`), so the `None` arm here is unreachable in
+        // practice — kept only so this stays a total match rather than an
+        // `unwrap`.
+        return match e.boss_monster_id {
+            Some(id) => e
+                .boss_name
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Monster #{id}")),
+            None => String::new(),
+        };
+    }
     if let Some(name) = e.scene_boss_name {
         return name.to_string();
     }
     match e.boss_monster_id {
         None => "No target".to_string(),
-        Some(id) if e.is_boss => e
-            .boss_name
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("Monster #{id}")),
         Some(_) => String::new(),
     }
 }
@@ -2047,9 +2072,10 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
 ///
 /// Order matches the spec: a Columns disclosure section (issue #13's stat
 /// column toggles, unchanged in behavior — just relocated), a separator,
-/// Minimize to tray, a separator, then Close. Reset used to be the first
-/// item here but moved into the header's toggle cluster (issue #82; see
-/// `toggle_cluster`), leaving this menu with no reset trigger of its own.
+/// Forget learned bosses (issue #131), a separator, Minimize to tray, a
+/// separator, then Close. Reset used to be the first item here but moved
+/// into the header's toggle cluster (issue #82; see `toggle_cluster`),
+/// leaving this menu with no reset trigger of its own.
 /// Collapse/Expand (issue #54's collapse-to-header) used to be the item
 /// between Columns and Minimize; it was removed outright rather than
 /// reworked, since the chevron no longer indicates a collapse state to
@@ -2153,6 +2179,22 @@ fn draw_header_menu(
             let _ = tx_settings.send(settings.clone());
         }
     });
+
+    ui.separator();
+
+    // Issue #131: the escape hatch for a stale learned boss name (e.g. after
+    // a game patch changes a dungeon's final boss) — see
+    // `scene_bosses_cache`'s doc comment for why nothing invalidates the
+    // cache automatically. Placed here (the header dropdown) rather than
+    // the tray's native Win32 context menu (`platform::install_tray`)
+    // because this menu is already the smaller, cross-platform, plain-egui
+    // surface with a `tx_command` in scope — the tray menu would need new
+    // HMENU/message-id plumbing in `platform.rs` for what is otherwise a
+    // one-line addition here.
+    if ui.button("Forget learned bosses").clicked() {
+        let _ = tx_command.try_send(UiCommand::ForgetLearnedBosses);
+        ui.close();
+    }
 
     ui.separator();
 
@@ -5792,12 +5834,15 @@ mod tests {
         assert_eq!(encounter_title(&e), "Blazing Mech 05");
     }
 
+    // -- live boss now wins over the remembered one (issue #131) -----------
+
     #[test]
-    fn title_prefers_scene_boss_name_over_a_genuine_mid_dungeon_boss() {
-        // Even a *real* mid-dungeon boss (`is_boss: true`) must not displace
-        // the dungeon's remembered final boss — the design is "final boss
-        // only, always", not "final boss unless something else looks
-        // boss-like too".
+    fn title_prefers_the_live_boss_over_a_remembered_scene_boss() {
+        // Issue #131's precedence inversion: a genuine currently-engaged
+        // boss (`is_boss: true`) now outranks `scene_boss_name`, the
+        // opposite of issue #125's original "final boss only, always" rule.
+        // This is what makes the raid case below correct — see the raid
+        // test and `encounter_title`'s doc comment for why.
         let e = EncounterInfo {
             boss_monster_id: Some(103),
             boss_name: Some("Rathalos"),
@@ -5805,7 +5850,24 @@ mod tests {
             scene_boss_name: Some("Blazing Mech 05"),
             ..Default::default()
         };
-        assert_eq!(encounter_title(&e), "Blazing Mech 05");
+        assert_eq!(encounter_title(&e), "Rathalos");
+    }
+
+    #[test]
+    fn title_names_the_live_raid_boss_currently_being_fought_not_the_remembered_one() {
+        // The repo owner's issue #131 raid case: the same scene remembers
+        // boss C (whichever of the raid's several final bosses was engaged
+        // last, in an earlier pull or an earlier session), but boss A is
+        // the one actually being fought right now. The header must track
+        // the fight, not the stale remembered name.
+        let e = EncounterInfo {
+            boss_monster_id: Some(103),
+            boss_name: Some("Boss A"),
+            is_boss: true,
+            scene_boss_name: Some("Boss C"),
+            ..Default::default()
+        };
+        assert_eq!(encounter_title(&e), "Boss A");
     }
 
     #[test]

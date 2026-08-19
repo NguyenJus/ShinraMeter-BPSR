@@ -91,8 +91,10 @@ pub struct Meter {
     /// encounter reset (or a boss-HP rollback) happens mid-dungeon, and the
     /// whole point is for the remembered name to survive into the *next*
     /// pull and the *next* run of the same dungeon, not just the current
-    /// one. Not persisted to disk — see the issue #125 design note on
-    /// `recompute_boss`.
+    /// one. Cross-session persistence (issue #131) lives entirely in the app
+    /// crate — this crate stays free of disk I/O and only exposes seed/export
+    /// accessors (`with_scene_bosses`, `set_scene_bosses`,
+    /// `scene_bosses_for_save`) for the app crate to drive.
     scene_bosses: HashMap<u32, u32>,
     /// When the current fight ended, if it has (issue #78). `Some(t)` puts
     /// the meter in [`FightState::Ended`]: the snapshot is rendered as of
@@ -171,6 +173,38 @@ impl Meter {
         }
         m.names_seq = total;
         m
+    }
+
+    /// Seeds the learned scene -> final-boss map from a previously-persisted
+    /// value (issue #131), so a dungeon whose final boss was learned in an
+    /// earlier session already names it on entry this session, rather than
+    /// only after the first observed engagement falls back to naming it
+    /// mid-fight. Live observation (`recompute_boss`) always takes
+    /// precedence going forward: it overwrites a seeded entry the next time
+    /// that scene's real boss is engaged, the same way it converges on the
+    /// last boss engaged within one session (see `scene_bosses`' doc
+    /// comment).
+    pub fn with_scene_bosses(scene_bosses: HashMap<u32, u32>) -> Self {
+        Self {
+            scene_bosses,
+            ..Self::new()
+        }
+    }
+
+    /// Overwrites the learned scene -> final-boss map in place, for callers
+    /// (namely `Pipeline`, issue #131) that need to seed it on a `Meter`
+    /// already constructed for another reason (e.g. via `with_names_cache`)
+    /// rather than at construction time.
+    pub fn set_scene_bosses(&mut self, scene_bosses: HashMap<u32, u32>) {
+        self.scene_bosses = scene_bosses;
+    }
+
+    /// Exports the learned scene -> final-boss map for persistence (issue
+    /// #131), mirroring `names_for_save`. Unlike `names_for_save` this
+    /// carries no eviction cap or recency order to preserve — the caller
+    /// (`scene_bosses_cache` in the app crate) just needs the full map.
+    pub fn scene_bosses_for_save(&self) -> HashMap<u32, u32> {
+        self.scene_bosses.clone()
     }
 
     /// Reads a cached name/class/ability_score, bumping its recency for
@@ -798,8 +832,12 @@ impl Meter {
         // issue #125: the dungeon's remembered final boss, if `scene_id` is
         // known and a boss has been latched for it — see `scene_bosses`' doc
         // comment. Independent of `boss_monster_id`/`is_boss` above, which
-        // stay the raw facts about the currently-selected target; this is
-        // what `encounter_title` prefers over them.
+        // stay the raw facts about the currently-selected target. Issue
+        // #131 inverted which one `encounter_title` (`crates/app/src/ui.rs`)
+        // prefers: a genuinely recognized live boss (`is_boss`) now wins
+        // over this field, which is the fallback for "nothing engaged yet"
+        // and for a non-boss `boss_uid` target — see that function's doc
+        // comment for the full precedence and why.
         let scene_boss_name = self
             .scene_id
             .and_then(|scene| self.scene_bosses.get(&scene))
@@ -1560,6 +1598,100 @@ mod tests {
             let saved = m.names_for_save();
             assert_eq!(saved.len(), 1);
             assert_eq!(saved[0].0, 1);
+        }
+    }
+
+    /// Issue #131: the meter-side half of cross-session scene -> final-boss
+    /// persistence. `scene_bosses_cache` (app crate) owns the disk I/O; this
+    /// only covers the seed-in/export-out contract these tests exercise
+    /// directly against `Meter`, mirroring `mod names_cache` above.
+    mod scene_bosses {
+        use super::*;
+
+        fn boss_hit(uid: i64, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: uid,
+                target_kind: EntityKind::Monster,
+                value: 1,
+                timestamp_ms: ts,
+                ..Default::default()
+            })
+        }
+
+        fn hp(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::EnemyHp(EnemyHp {
+                uid,
+                curr_hp: Some(100),
+                max_hp: Some(100),
+                monster_id: Some(monster_id),
+                timestamp_ms: ts,
+            })
+        }
+
+        #[test]
+        fn seeded_scene_boss_resolves_before_any_hit_lands_this_session() {
+            // 1001 ("Tina's Mindrealm") is a dungeon scene; 103 ("Rathalos")
+            // is a genuine boss — seeding mirrors what a real run of this
+            // dungeon would have latched last session.
+            let mut m = Meter::with_scene_bosses(HashMap::from([(1001, 103)]));
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
+        }
+
+        #[test]
+        fn set_scene_bosses_seeds_a_meter_already_constructed_another_way() {
+            let cache = vec![(5, (Some("Cached".to_string()), None))];
+            let mut m = Meter::with_names_cache(cache);
+            m.set_scene_bosses(HashMap::from([(1001, 103)]));
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
+        }
+
+        #[test]
+        fn scene_bosses_for_save_returns_what_was_learned() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 103, 0));
+
+            assert_eq!(m.scene_bosses_for_save(), HashMap::from([(1001, 103)]));
+        }
+
+        #[test]
+        fn scene_bosses_for_save_is_empty_when_nothing_has_been_learned() {
+            let m = Meter::new();
+            assert_eq!(m.scene_bosses_for_save(), HashMap::new());
+        }
+
+        #[test]
+        fn a_reset_does_not_lose_a_seeded_scene_boss() {
+            let mut m = Meter::with_scene_bosses(HashMap::from([(1001, 103)]));
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            m.reset(ResetReason::Manual, 1000);
+
+            let snap = m.snapshot(2000);
+            assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
+            assert_eq!(m.scene_bosses_for_save(), HashMap::from([(1001, 103)]));
+        }
+
+        #[test]
+        fn live_observation_overwrites_a_seeded_entry() {
+            // A game patch (or just a different pull) can make the live
+            // final boss diverge from what was seeded — the freshly observed
+            // one must win, matching the within-session overwrite semantics
+            // `recompute_boss` already documents.
+            let mut m = Meter::with_scene_bosses(HashMap::from([(1001, 103)]));
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            m.apply(&boss_hit(11, 0));
+            m.apply(&hp(11, 103_108, 0));
+
+            assert_eq!(m.scene_bosses_for_save(), HashMap::from([(1001, 103_108)]));
         }
     }
 
