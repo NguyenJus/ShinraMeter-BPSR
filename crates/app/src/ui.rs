@@ -246,16 +246,74 @@ fn demo_enabled_from(var: Option<&str>) -> bool {
     var.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
 }
 
-/// `(name, class, damage, crit_pct, deaths)` for each demo row, in
-/// descending-damage order. Values intentionally mirror
-/// `docs/reference/new-shinra-ex.webp` so a demo-mode capture can be diffed
-/// against the reference screenshot.
-const DEMO_ROWS: [(&str, Class, i64, f32, u32); 5] = [
-    ("Blorp", Class::Stormblade, 55_300_000, 73.0, 0),
-    ("Glorbaxian", Class::FrostMage, 55_100_000, 76.0, 1),
-    ("Zog", Class::TwinStriker, 49_900_000, 54.0, 0),
-    ("Wibble", Class::WindKnight, 17_800_000, 59.0, 0),
-    ("Fizz", Class::VerdantOracle, 10_300_000, 29.0, 0),
+/// `(name, class, damage, crit_pct, deaths, imagines)` for one `DEMO_ROWS`
+/// entry. Named so the array below reads as one type, not clippy's
+/// `type_complexity` bait.
+type DemoRow = (&'static str, Class, i64, f32, u32, [Option<i32>; 2]);
+
+/// `(name, class, damage, crit_pct, deaths, imagines)` for each demo row, in
+/// descending-damage order. The damage, crit%, and death figures
+/// intentionally mirror `docs/reference/new-shinra-ex.webp` so a demo-mode
+/// capture can be diffed against the reference screenshot (issue #88). The
+/// *names* are deliberately fictional, not the reference screenshot's real
+/// character names — this repo is public, and `CONTRIBUTING.md` tells users
+/// not to share other players' names, so a demo capture headed for the
+/// README can't republish someone else's (issue #133). The names have no
+/// counterpart in the reference screenshot to mirror, since the reference's
+/// underlying screenshot predates the Imagine column (issue #33/#128).
+///
+/// `imagines` is each row's two equipped-Imagine skill ids, demo-only and
+/// with no reference-screenshot counterpart of its own (issue #133): the
+/// reference capture predates the Imagine column, so unlike this tuple's
+/// other fields these ids aren't mirroring anything — they're picked from
+/// `imagines::imagine_of_skill_id`'s curated table purely so a demo capture
+/// shows the column doing real work instead of ten blank placeholder
+/// circles. The last row keeps one slot empty on purpose, since not every
+/// real player fills both. Folded into this tuple (rather than a separate
+/// by-index array) so a row and its Imagine pair can never drift apart —
+/// reordering `DEMO_ROWS` carries its Imagines along, and there is no second
+/// array whose length or order could silently disagree.
+const DEMO_ROWS: [DemoRow; 5] = [
+    (
+        "Blorp",
+        Class::Stormblade,
+        55_300_000,
+        73.0,
+        0,
+        [Some(3901), Some(3902)],
+    ),
+    (
+        "Glorbaxian",
+        Class::FrostMage,
+        55_100_000,
+        76.0,
+        1,
+        [Some(3903), Some(3904)],
+    ),
+    (
+        "Zog",
+        Class::TwinStriker,
+        49_900_000,
+        54.0,
+        0,
+        [Some(3905), Some(3906)],
+    ),
+    (
+        "Wibble",
+        Class::WindKnight,
+        17_800_000,
+        59.0,
+        0,
+        [Some(3907), Some(3908)],
+    ),
+    (
+        "Fizz",
+        Class::VerdantOracle,
+        10_300_000,
+        29.0,
+        0,
+        [Some(3909), None],
+    ),
 ];
 
 /// The synthetic snapshot `demo_enabled` seeds the overlay with. Values
@@ -264,26 +322,28 @@ const DEMO_ROWS: [(&str, Class, i64, f32, u32); 5] = [
 /// — plus `DEMO_ROWS`'s per-row damage/crit% pairs, so a demo-mode capture
 /// can be compared directly against that reference.
 fn demo_snapshot() -> Snapshot {
-    let row_damage_sum: i64 = DEMO_ROWS.iter().map(|(_, _, dmg, _, _)| dmg).sum();
+    let row_damage_sum: i64 = DEMO_ROWS.iter().map(|(_, _, dmg, _, _, _)| dmg).sum();
     let duration_ms = 159_000u64;
     let rows = DEMO_ROWS
         .iter()
         .enumerate()
-        .map(|(i, &(name, class, damage, crit_pct, deaths))| PlayerRow {
-            uid: i as i64 + 1,
-            name: name.to_string(),
-            class: Some(class),
-            ability_score: None,
-            season_strength: None,
-            imagines: [None, None],
-            damage,
-            dps: damage as f64 / (duration_ms as f64 / 1000.0),
-            share_pct: damage as f32 / row_damage_sum as f32 * 100.0,
-            crit_pct,
-            lucky_pct: 20.0,
-            hits: 200,
-            deaths,
-        })
+        .map(
+            |(i, &(name, class, damage, crit_pct, deaths, imagine_ids))| PlayerRow {
+                uid: i as i64 + 1,
+                name: name.to_string(),
+                class: Some(class),
+                ability_score: None,
+                season_strength: None,
+                imagines: imagine_ids,
+                damage,
+                dps: damage as f64 / (duration_ms as f64 / 1000.0),
+                share_pct: damage as f32 / row_damage_sum as f32 * 100.0,
+                crit_pct,
+                lucky_pct: 20.0,
+                hits: 200,
+                deaths,
+            },
+        )
         .collect();
     Snapshot {
         duration_ms,
@@ -3740,6 +3800,49 @@ mod tests {
         let snapshot = initial_snapshot(false);
         assert!(snapshot.rows.is_empty());
         assert_eq!(snapshot.encounter.boss_name, None);
+    }
+
+    // -- DEMO_ROWS Imagine ids (issue #142 test-coverage finding) -----------
+
+    /// Every equipped-Imagine skill id baked into `DEMO_ROWS` must resolve
+    /// through `imagine_of_skill_id` to a real curated entry, and that
+    /// entry's icon basename must have compiled-in bytes in
+    /// `imagines::IMAGINE_ICON_BYTES` — otherwise the demo capture renders
+    /// a silent blank placeholder circle instead of the icon it's meant to
+    /// show, with nothing failing to say so. This is the test a typo'd id
+    /// would have caught.
+    #[test]
+    fn every_demo_row_imagine_id_resolves_to_a_known_icon_with_bytes() {
+        for &(name, _, _, _, _, ids) in &DEMO_ROWS {
+            for id in ids.into_iter().flatten() {
+                let imagine = imagines::imagine_of_skill_id(id)
+                    .unwrap_or_else(|| panic!("{name:?}'s Imagine id {id} is not curated"));
+                assert!(
+                    imagines::IMAGINE_ICON_BYTES
+                        .iter()
+                        .any(|&(icon, _)| icon == imagine.icon),
+                    "{name:?}'s Imagine id {id} resolves to icon {:?}, which has no compiled-in bytes",
+                    imagine.icon,
+                );
+            }
+        }
+    }
+
+    /// `demo_snapshot` now carries each row's Imagine slots on the same
+    /// `DEMO_ROWS` tuple entry rather than a separate by-index array, so a
+    /// row and its Imagines can't drift apart structurally — but pin one
+    /// specific row's name to its exact Imagine ids anyway, so an
+    /// accidental reorder of `DEMO_ROWS` (which would carry the wrong name
+    /// to the wrong ids) still fails a test, not just a compile.
+    #[test]
+    fn demo_snapshot_pairs_each_row_with_its_own_imagines() {
+        let snapshot = demo_snapshot();
+        let glorbaxian = snapshot
+            .rows
+            .iter()
+            .find(|row| row.name == "Glorbaxian")
+            .expect("demo snapshot must include Glorbaxian");
+        assert_eq!(glorbaxian.imagines, [Some(3903), Some(3904)]);
     }
 
     /// The regression this guards: a future refactor that deletes or
