@@ -246,7 +246,11 @@ impl Pipeline {
     }
 
     /// Applies one protocol event. Returns `Some(reason)` when the event
-    /// triggered a reset (boss-HP rollback or server change).
+    /// triggered a reset (boss-HP rollback, or the first hit of a new
+    /// fight — including one on the far side of a `ServerChanged`
+    /// reconnect, issue #138). A `ServerChanged` event itself never
+    /// triggers a reset: it only invalidates entity/scene state and
+    /// freezes the fight clock, leaving the displayed stats on screen.
     pub fn step(&mut self, ev: proto::ProtocolEvent) -> Option<meter::ResetReason> {
         let reason = self.meter.apply(&map_event(ev));
         if let Some(reason) = reason {
@@ -625,15 +629,18 @@ mod tests {
         assert!(snap.rows.is_empty());
     }
 
+    /// issue #138: zoning/reconnecting must not wipe the numbers the
+    /// player is still reading, so a `ServerChanged` event must not report
+    /// a reset and must leave the accumulated stats on screen.
     #[test]
-    fn server_changed_resets_the_meter() {
+    fn server_changed_keeps_the_snapshot_on_screen() {
         let mut p = Pipeline::new();
         p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)));
         let reason = p.step(proto::ProtocolEvent::ServerChanged);
-        assert_eq!(reason, Some(meter::ResetReason::ServerChange));
+        assert_eq!(reason, None);
         let snap = p.snapshot(2_000);
-        assert_eq!(snap.total_damage, 0);
-        assert!(snap.rows.is_empty());
+        assert_eq!(snap.total_damage, 700);
+        assert!(!snap.rows.is_empty());
     }
 
     mod names_cache_wiring {
@@ -696,9 +703,12 @@ mod tests {
         #[test]
         fn step_triggered_reset_persists_the_names_cache_to_disk() {
             // Covers the branch that actually fires during real play:
-            // `step()` driving a reset (here, a server change) persists the
+            // `step()` driving a reset (here, the next fight's first hit
+            // after a held fight, `ResetReason::NewFight`) persists the
             // cache via the background writer, not just the manual-reset
-            // path exercised above.
+            // path exercised above. `ServerChanged` can no longer cover
+            // this branch: it deliberately never triggers a reset (issue
+            // #138) — zoning must not wipe the numbers on screen.
             let path = scratch_path("step-reset");
             let mut p = Pipeline::with_names_cache_path(path.clone());
             p.step(proto::ProtocolEvent::Player(proto::PlayerInfo {
@@ -710,10 +720,12 @@ mod tests {
                 season_strength: None,
                 skill_ids: Vec::new(),
             }));
+            p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)));
+            p.tick(600_000);
 
             assert!(!path.exists());
-            let reason = p.step(proto::ProtocolEvent::ServerChanged);
-            assert_eq!(reason, Some(meter::ResetReason::ServerChange));
+            let reason = p.step(proto::ProtocolEvent::Damage(damage(1, 300, 600_000)));
+            assert_eq!(reason, Some(meter::ResetReason::NewFight));
 
             p.shutdown_names_cache();
             assert!(path.exists());
