@@ -496,6 +496,7 @@ impl eframe::App for OverlayApp {
             });
 
         track_window_position(&ctx, &mut self.settings, &self.tx_settings);
+        track_window_size(&ctx, &mut self.settings, &self.tx_settings);
 
         // ~10 Hz.
         ctx.request_repaint_after(Duration::from_millis(100));
@@ -530,6 +531,29 @@ fn track_window_position(
         return;
     }
     if let Some(updated) = settings.with_window_position_if_changed([rect.min.x, rect.min.y]) {
+        *settings = updated.clone();
+        let _ = tx_settings.send(updated);
+    }
+}
+
+/// Tracks the window's inner (content) size and persists it via the same
+/// settings-writer path position uses (issue #134). `inner_rect` is reported
+/// on every single frame — including every frame of a resize gesture — so
+/// `Settings::with_window_size_if_changed` gates the send on an actual
+/// change, the same way `track_window_position` gates on an actual move.
+///
+/// A minimized window is skipped entirely: some platforms report a zeroed
+/// or otherwise meaningless inner size while minimized, which would
+/// otherwise be persisted and reopen the overlay unusably small.
+fn track_window_size(ctx: &egui::Context, settings: &mut Settings, tx_settings: &Sender<Settings>) {
+    let (inner_rect, minimized) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().minimized));
+    if minimized == Some(true) {
+        return;
+    }
+    let Some(rect) = inner_rect else {
+        return;
+    };
+    if let Some(updated) = settings.with_window_size_if_changed([rect.width(), rect.height()]) {
         *settings = updated.clone();
         let _ = tx_settings.send(updated);
     }
@@ -3618,18 +3642,57 @@ fn default_inner_width() -> f32 {
         + HEADER_ROW_EXTRA_WIDTH
 }
 
+/// Sane upper bound, in points, for a persisted `window_size` axis —
+/// comfortably past any real display (an 8K panel spans roughly 7680
+/// logical px even before DPI scaling, and a multi-monitor span widens that
+/// further, but nowhere near this far) so a legitimate ultra-wide setup
+/// still restores fine while a corrupted settings.json (a bit-flipped or
+/// hand-edited float) can't ask wgpu to allocate a multi-million-point
+/// swapchain.
+const MAX_INNER_SIZE_DIMENSION: f32 = 20_000.0;
+
+/// Clamps a persisted `window_size` to something guaranteed openable, or
+/// rejects it outright back to `None` (today's default size) if it's beyond
+/// saving. Each axis is floored at `MIN_INNER_SIZE` — the same floor
+/// `with_min_inner_size` enforces below, so a restored size is never asked
+/// to start smaller than winit would allow anyway — and the whole value is
+/// rejected when either axis is non-finite or larger than
+/// `MAX_INNER_SIZE_DIMENSION`. A hand-edited or otherwise corrupted
+/// settings.json must never be able to open an unusable overlay.
+fn sanitize_window_size(size: [f32; 2]) -> Option<[f32; 2]> {
+    let [w, h] = size;
+    if !w.is_finite()
+        || !h.is_finite()
+        || w > MAX_INNER_SIZE_DIMENSION
+        || h > MAX_INNER_SIZE_DIMENSION
+    {
+        return None;
+    }
+    Some([w.max(MIN_INNER_SIZE.x), h.max(MIN_INNER_SIZE.y)])
+}
+
 /// Overlay window shape: always-on-top, borderless, transparent, sized to
 /// fit a full raid by default (issue #26). `window_position` is the
 /// last-saved position (issue #27, `Settings::window_position`) to reopen
 /// at, or `None` on a first launch / wiped settings file, which leaves the
-/// position to today's default OS/winit placement.
-pub fn viewport(window_position: Option<[f32; 2]>) -> egui::ViewportBuilder {
+/// position to today's default OS/winit placement. `window_size` is the
+/// last-saved inner size (issue #134, `Settings::window_size`), sanity-
+/// clamped by `sanitize_window_size` — a garbage or absent value falls back
+/// to `default_inner_width`/`default_inner_height`, never to something
+/// unusable.
+pub fn viewport(
+    window_position: Option<[f32; 2]>,
+    window_size: Option<[f32; 2]>,
+) -> egui::ViewportBuilder {
+    let inner_size = window_size
+        .and_then(sanitize_window_size)
+        .unwrap_or([default_inner_width(), default_inner_height()]);
     let mut builder = egui::ViewportBuilder::default()
         .with_always_on_top()
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(true)
-        .with_inner_size([default_inner_width(), default_inner_height()])
+        .with_inner_size(inner_size)
         .with_min_inner_size(MIN_INNER_SIZE);
     if let Some(position) = window_position {
         builder = builder.with_position(position);
@@ -7012,6 +7075,7 @@ mod tests {
         let mut settings = Settings {
             visible_columns: ColumnKind::ALL.to_vec(),
             window_position: None,
+            window_size: None,
         };
         settings.toggle(ColumnKind::Dps);
         let cols = settings.ordered_columns();
@@ -7465,6 +7529,150 @@ mod tests {
 
         assert!(sent.is_empty(), "a bogus position must not send");
         assert_eq!(settings.window_position, Some([100.0, 200.0]));
+    }
+
+    // -- window size tracking (issue #134) ---------------------------------
+
+    /// Runs one frame with `inner_rect`/`minimized` reported for the
+    /// viewport, calling `track_window_size` from inside it exactly like
+    /// `OverlayApp::update` does. Returns everything it sent on the
+    /// settings-writer channel.
+    fn track_size_one_frame(
+        settings: &mut Settings,
+        inner_rect: Option<egui::Rect>,
+        minimized: Option<bool>,
+    ) -> Vec<Settings> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut input = egui::RawInput::default();
+        input.viewports.insert(
+            input.viewport_id,
+            egui::ViewportInfo {
+                inner_rect,
+                minimized,
+                ..Default::default()
+            },
+        );
+
+        let ctx = egui::Context::default();
+        ctx.run_ui(input, |ui| track_window_size(ui.ctx(), settings, &tx))
+            .drop_without_applying_deltas();
+
+        drop(tx);
+        rx.try_iter().collect()
+    }
+
+    fn inner_rect_of(width: f32, height: f32) -> Option<egui::Rect> {
+        Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(width, height),
+        ))
+    }
+
+    #[test]
+    fn track_window_size_persists_a_resized_window() {
+        let mut settings = Settings::default();
+
+        let sent = track_size_one_frame(&mut settings, inner_rect_of(640.0, 480.0), Some(false));
+
+        assert_eq!(settings.window_size, Some([640.0, 480.0]));
+        assert_eq!(sent.len(), 1, "one resize, one send");
+        assert_eq!(sent[0].window_size, Some([640.0, 480.0]));
+    }
+
+    #[test]
+    fn track_window_size_stays_quiet_when_the_window_has_not_resized() {
+        let mut settings = Settings {
+            window_size: Some([640.0, 480.0]),
+            ..Settings::default()
+        };
+
+        let sent = track_size_one_frame(&mut settings, inner_rect_of(640.0, 480.0), Some(false));
+
+        assert!(sent.is_empty(), "an unresized window must not send");
+        assert_eq!(settings.window_size, Some([640.0, 480.0]));
+    }
+
+    /// A minimized window may report a meaningless (e.g. zeroed) inner
+    /// size, so nothing reported while minimized is persisted.
+    #[test]
+    fn track_window_size_ignores_a_minimized_window() {
+        let mut settings = Settings {
+            window_size: Some([640.0, 480.0]),
+            ..Settings::default()
+        };
+
+        let sent = track_size_one_frame(&mut settings, inner_rect_of(0.0, 0.0), Some(true));
+
+        assert!(sent.is_empty(), "a minimized window must not send");
+        assert_eq!(settings.window_size, Some([640.0, 480.0]));
+    }
+
+    // -- viewport() restore + sanity clamp (issue #134) --------------------
+
+    #[test]
+    fn viewport_applies_a_restored_size_when_some() {
+        let built = viewport(None, Some([640.0, 480.0]));
+
+        assert_eq!(built.inner_size, Some(egui::vec2(640.0, 480.0)));
+    }
+
+    #[test]
+    fn viewport_applies_the_default_size_when_none() {
+        let built = viewport(None, None);
+
+        assert_eq!(
+            built.inner_size,
+            Some(egui::vec2(default_inner_width(), default_inner_height()))
+        );
+    }
+
+    #[test]
+    fn viewport_falls_back_to_default_size_for_a_too_small_persisted_value() {
+        // Below `MIN_INNER_SIZE` on both axes; the restored size must still
+        // be clamped up to the floor rather than opening an unusable sliver.
+        let built = viewport(None, Some([1.0, 1.0]));
+
+        assert_eq!(
+            built.inner_size,
+            Some(egui::vec2(MIN_INNER_SIZE.x, MIN_INNER_SIZE.y))
+        );
+    }
+
+    #[test]
+    fn viewport_falls_back_to_default_size_for_a_non_finite_persisted_value() {
+        let built = viewport(None, Some([f32::NAN, 480.0]));
+
+        assert_eq!(
+            built.inner_size,
+            Some(egui::vec2(default_inner_width(), default_inner_height())),
+            "a non-finite persisted size must be rejected outright, not clamped"
+        );
+    }
+
+    #[test]
+    fn viewport_falls_back_to_default_size_for_an_absurdly_large_persisted_value() {
+        let built = viewport(None, Some([1.0e9, 480.0]));
+
+        assert_eq!(
+            built.inner_size,
+            Some(egui::vec2(default_inner_width(), default_inner_height())),
+            "a corrupted, absurdly large persisted size must be rejected outright"
+        );
+    }
+
+    #[test]
+    fn viewport_reset_ignores_any_persisted_size() {
+        // `main.rs`'s tray "Reset Window" action calls `viewport(None,
+        // None)` regardless of what's persisted — this just pins that the
+        // default-size call path is unaffected by a persisted size.
+        let reset = viewport(None, None);
+        let with_persisted = viewport(None, Some([999.0, 999.0]));
+
+        assert_ne!(reset.inner_size, with_persisted.inner_size);
+        assert_eq!(
+            reset.inner_size,
+            Some(egui::vec2(default_inner_width(), default_inner_height()))
+        );
     }
 
     // -- toolbar/menu icons (issue #41, #71) -------------------------------
