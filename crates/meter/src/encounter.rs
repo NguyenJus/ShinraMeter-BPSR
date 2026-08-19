@@ -104,6 +104,14 @@ pub struct Meter {
     fight_end_ms: Option<u64>,
     reset_cfg: ResetConfig,
     fight_cfg: FightConfig,
+    /// Count of `PlayerStats` rows created by the dungeon-gated preload path
+    /// (issue #12) in the *current* scene. `apply_player`/`name_upsert` have
+    /// zero per-player `log::` calls, deliberately, to avoid a per-raid-member
+    /// flood; this counter is what lets `prune_stale_preloads` log a single
+    /// sparse summary line per scene transition instead, answering whether
+    /// AOI actually delivers every party member's identity in a large raid.
+    /// Reset to zero on every real scene transition.
+    preload_count: u32,
 }
 
 impl Meter {
@@ -122,6 +130,7 @@ impl Meter {
             fight_end_ms: None,
             reset_cfg: ResetConfig::default(),
             fight_cfg: FightConfig::default(),
+            preload_count: 0,
         }
     }
 
@@ -332,6 +341,17 @@ impl Meter {
                 if let Some(msg) = scene_transition_log(self.scene_id, Some(*level_map_id)) {
                     log::info!("{msg}");
                 }
+                // issue #12: any real scene change (entering a dungeon,
+                // leaving one, or hopping dungeon -> different dungeon) can
+                // leave behind preloaded roster rows nobody ever damaged —
+                // drop those now, before the new scene id lands, so a stale
+                // party member from the last run doesn't linger into this
+                // one. Rows with real activity (damage, a miss, or a death)
+                // are untouched; the existing reset machinery still governs
+                // those.
+                if self.scene_id != Some(*level_map_id) {
+                    self.prune_stale_preloads();
+                }
                 self.scene_id = Some(*level_map_id);
                 None
             }
@@ -526,7 +546,67 @@ impl Meter {
             if merged.imagines.is_some() {
                 stats.imagines = merged.imagines;
             }
+        } else if self.in_dungeon_scene() && merged.name.is_some() {
+            // issue #12: preload the roster. In a dungeon/raid instance the
+            // only players in AOI range are the party, so eagerly creating a
+            // zero-stat row here shows the whole group immediately instead
+            // of only the players who have already hit or died. Gated
+            // strictly on `in_dungeon_scene` — the same preload in town would
+            // flood the meter with unrelated strangers passing through AOI
+            // range. Also gated on `merged.name` (the *upserted* value, so a
+            // cache hit counts too, per `name_upsert`): a row that would
+            // render as "Player {uid}" is worse than no row at all.
+            let mut stats = PlayerStats::new(p.uid);
+            stats.name = merged.name;
+            stats.class = merged.class;
+            stats.ability_score = merged.ability_score;
+            stats.season_strength = merged.season_strength;
+            stats.imagines = merged.imagines;
+            self.players.insert(p.uid, stats);
+            // issue #69/#12: no per-player log here by design (would flood
+            // a raid); just tally, and let `prune_stale_preloads` emit one
+            // sparse summary line when this scene ends.
+            self.preload_count += 1;
         }
+    }
+
+    /// Whether the meter currently believes it's inside a dungeon/raid
+    /// instance (issue #12), i.e. `scene_id` is known and resolves as a
+    /// dungeon scene via `tables::is_dungeon_scene`. `None` (no `Scene`
+    /// event seen yet this session, or cleared by `ServerChanged`) is
+    /// treated as "not a dungeon" — preloading requires positive
+    /// confirmation of AOI scope, never an absence of information.
+    fn in_dungeon_scene(&self) -> bool {
+        self.scene_id.is_some_and(tables::is_dungeon_scene)
+    }
+
+    /// Drops roster rows nobody has acted on yet: zero damage, zero hits,
+    /// zero deaths (issue #12). Called on every real scene transition so a
+    /// preloaded party member from the last dungeon (or a stray preload from
+    /// just before a `Scene` event resolved) doesn't linger into the next
+    /// one. Rows with any real activity are left alone — they still follow
+    /// the existing reset rules (`reset`, `ResetReason`), not this.
+    fn prune_stale_preloads(&mut self) {
+        // Counted before the retain call: every row `retain` is about to
+        // drop is, by construction, a zero-stat row, and the only path that
+        // creates one of those is the preload branch of `apply_player` (a
+        // row from real damage/hits/deaths is never all-zero). So this is
+        // exactly the untouched subset of this scene's `preload_count`.
+        let pruned = self
+            .players
+            .values()
+            .filter(|p| p.total_damage == 0 && p.hits == 0 && p.deaths == 0)
+            .count() as u32;
+        self.players
+            .retain(|_, p| p.total_damage != 0 || p.hits != 0 || p.deaths != 0);
+        // Sparse, transition-only diagnostic (issue #69/#12): one line per
+        // scene left, never per player. `self.scene_id` is still the scene
+        // being *left* here — `Meter::apply`'s `Scene` arm calls this before
+        // overwriting it with the new id.
+        if let Some(msg) = preload_summary_log(self.scene_id, self.preload_count, pruned) {
+            log::info!("{msg}");
+        }
+        self.preload_count = 0;
     }
 
     fn apply_enemy_hp(&mut self, e: &EnemyHp) -> Option<ResetReason> {
@@ -855,6 +935,23 @@ fn scene_transition_log(previous: Option<u32>, new_scene_id: Option<u32>) -> Opt
     })
 }
 
+/// Builds the "preload summary" diagnostic line (issue #12/#69) for the
+/// scene being *left*, or `None` when that scene doesn't resolve as a
+/// dungeon/raid instance via `tables::is_dungeon_scene` — no preloads can
+/// exist outside one, so the line would be pure noise. `preloaded` is the
+/// scene's `Meter::preload_count`; `pruned` is how many of those rows
+/// `prune_stale_preloads` just dropped as untouched, so `preloaded - pruned`
+/// is how many went on to record real activity. Never includes a player
+/// name or uid — only counts, since these logs get shared for debugging.
+/// Pure, like [`scene_transition_log`], for the same testability reason.
+fn preload_summary_log(scene_id: Option<u32>, preloaded: u32, pruned: u32) -> Option<String> {
+    let id = scene_id.filter(|id| tables::is_dungeon_scene(*id))?;
+    let active = preloaded.saturating_sub(pruned);
+    Some(format!(
+        "encounter: scene={id} preload summary: preloaded={preloaded} active={active} pruned={pruned}"
+    ))
+}
+
 /// Builds the "boss target changed" diagnostic line (issue #69), or `None`
 /// when `new_uid` matches `previous_uid` — `recompute_boss` runs on every
 /// damage/enemy-hp event, so without this guard the line would reproduce
@@ -996,6 +1093,255 @@ mod tests {
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].name, "Foo");
         assert_eq!(snap.rows[0].class, Some(Class::Stormblade));
+    }
+
+    fn player_info(uid: i64, name: &str) -> ProtocolEvent {
+        ProtocolEvent::Player(PlayerInfo {
+            uid,
+            name: Some(name.to_string()),
+            class: Some(Class::Stormblade),
+            ability_score: None,
+            season_strength: None,
+            imagines: None,
+        })
+    }
+
+    // -- issue #12: dungeon-gated name preload -----------------------------
+
+    #[test]
+    fn player_event_in_dungeon_preloads_a_zero_stat_row() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        }); // real dungeon id
+        m.apply(&player_info(1, "Alice"));
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows.len(), 1);
+        assert_eq!(snap.rows[0].uid, 1);
+        assert_eq!(snap.rows[0].name, "Alice");
+        assert_eq!(snap.rows[0].damage, 0);
+        assert_eq!(snap.rows[0].hits, 0);
+        assert!(!m.is_active(), "a preload must not start the fight clock");
+    }
+
+    #[test]
+    fn player_event_in_town_does_not_preload() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene { level_map_id: 8 }); // Asterleeds, not a dungeon
+        m.apply(&player_info(1, "Alice"));
+        let snap = m.snapshot(2000);
+        assert!(snap.rows.is_empty());
+    }
+
+    #[test]
+    fn player_event_in_gloomy_depths_does_not_preload() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene { level_map_id: 92 }); // Gloomy Depths, not a dungeon
+        m.apply(&player_info(1, "Alice"));
+        let snap = m.snapshot(2000);
+        assert!(snap.rows.is_empty());
+    }
+
+    #[test]
+    fn player_event_with_no_scene_does_not_preload() {
+        let mut m = Meter::new();
+        m.apply(&player_info(1, "Alice"));
+        let snap = m.snapshot(2000);
+        assert!(snap.rows.is_empty());
+    }
+
+    #[test]
+    fn preloaded_row_accumulates_damage_without_double_counting_or_losing_name() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        m.apply(&player_info(1, "Alice"));
+        m.apply(&dmg(1, 500, 1000));
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows.len(), 1);
+        assert_eq!(snap.rows[0].name, "Alice");
+        assert_eq!(snap.rows[0].damage, 500);
+        assert_eq!(snap.rows[0].hits, 1);
+        assert_eq!(snap.total_damage, 500);
+    }
+
+    #[test]
+    fn share_and_dps_stay_finite_with_mixed_preload_and_real_rows() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        // Two preloads, neither ever deals damage.
+        m.apply(&player_info(1, "Alice"));
+        m.apply(&player_info(2, "Bob"));
+        // One real attacker.
+        m.apply(&dmg(3, 1000, 1000));
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows.len(), 3);
+        let total_share: f32 = snap.rows.iter().map(|r| r.share_pct).sum();
+        for row in &snap.rows {
+            assert!(row.share_pct.is_finite());
+            assert!(row.dps.is_finite());
+            assert!(row.crit_pct.is_finite());
+            assert!(row.lucky_pct.is_finite());
+        }
+        assert!((total_share - 100.0).abs() < 0.01);
+        // Zero-damage preloads sort to the bottom, stably, behind the real
+        // attacker.
+        assert_eq!(snap.rows[0].uid, 3);
+    }
+
+    #[test]
+    fn leaving_a_dungeon_drops_untouched_preloads_but_keeps_active_rows() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        m.apply(&player_info(1, "Alice")); // never acts
+        m.apply(&player_info(2, "Bob"));
+        m.apply(&dmg(2, 200, 1000)); // Bob deals damage
+        // Leave the dungeon for a different scene.
+        m.apply(&ProtocolEvent::Scene { level_map_id: 8 });
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows.len(), 1);
+        assert_eq!(snap.rows[0].uid, 2);
+        assert_eq!(snap.rows[0].name, "Bob");
+        assert_eq!(snap.rows[0].damage, 200);
+    }
+
+    #[test]
+    fn dungeon_to_different_dungeon_drops_untouched_preloads() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        m.apply(&player_info(1, "Alice")); // never acts
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 31101,
+        }); // a different dungeon
+        let snap = m.snapshot(2000);
+        assert!(snap.rows.is_empty());
+    }
+
+    #[test]
+    fn preload_count_increments_only_via_the_preload_path() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        assert_eq!(m.preload_count, 0);
+        m.apply(&player_info(1, "Alice")); // preload
+        assert_eq!(m.preload_count, 1);
+        // A second Player event for the same uid updates the existing row,
+        // not a new preload.
+        m.apply(&player_info(1, "Alice"));
+        assert_eq!(m.preload_count, 1);
+        // Real damage for an already-preloaded uid doesn't touch the counter.
+        m.apply(&dmg(1, 100, 1000));
+        assert_eq!(m.preload_count, 1);
+    }
+
+    #[test]
+    fn preload_count_does_not_increment_outside_a_dungeon_scene() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene { level_map_id: 8 }); // town, not a dungeon
+        m.apply(&player_info(1, "Alice"));
+        assert_eq!(m.preload_count, 0);
+    }
+
+    #[test]
+    fn preload_count_resets_on_scene_entry() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        m.apply(&player_info(1, "Alice"));
+        m.apply(&player_info(2, "Bob"));
+        assert_eq!(m.preload_count, 2);
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 31101,
+        }); // a different dungeon
+        assert_eq!(m.preload_count, 0);
+        m.apply(&player_info(3, "Cara"));
+        assert_eq!(m.preload_count, 1);
+    }
+
+    #[test]
+    fn preload_accounting_balances_after_a_mixed_scenario() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        // Five preloaded party members; two go on to deal real damage.
+        for (uid, name) in [
+            (1, "Alice"),
+            (2, "Bob"),
+            (3, "Cara"),
+            (4, "Dan"),
+            (5, "Eve"),
+        ] {
+            m.apply(&player_info(uid, name));
+        }
+        let preloaded = m.preload_count;
+        assert_eq!(preloaded, 5);
+        m.apply(&dmg(2, 100, 1000));
+        m.apply(&dmg(4, 50, 1000));
+        // Leave the dungeon: `prune_stale_preloads` runs, drops the three
+        // untouched rows, and resets the counter for the new scene.
+        m.apply(&ProtocolEvent::Scene { level_map_id: 8 });
+        let snap = m.snapshot(2000);
+        let active = snap.rows.len() as u32;
+        let pruned = preloaded - active;
+        assert_eq!(active, 2);
+        assert_eq!(pruned, 3);
+        assert_eq!(
+            preloaded,
+            active + pruned,
+            "preloaded must equal still-active + pruned"
+        );
+        assert_eq!(m.preload_count, 0);
+    }
+
+    /// Raid-scale sanity check: up to 20 simultaneous party members (a full
+    /// raid, not just a 5-player dungeon party) is 4x anything the earlier
+    /// preload tests exercised. Preloads 20 distinct named players, mixes in
+    /// a couple of real-damage rows among them, and asserts every row
+    /// snapshots without panicking and with finite, sane stats.
+    #[test]
+    fn preloading_a_full_20_player_raid_snapshots_cleanly() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        for uid in 1..=20i64 {
+            m.apply(&player_info(uid, &format!("Player{uid}")));
+        }
+        // A couple of real attackers among the 20 preloads.
+        m.apply(&dmg(3, 700, 1000));
+        m.apply(&dmg(11, 300, 1000));
+
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows.len(), 20);
+
+        let total_share: f32 = snap.rows.iter().map(|r| r.share_pct).sum();
+        for row in &snap.rows {
+            assert!(row.share_pct.is_finite() && row.share_pct >= 0.0);
+            assert!(row.dps.is_finite() && row.dps >= 0.0);
+            assert!(row.crit_pct.is_finite());
+            assert!(row.lucky_pct.is_finite());
+        }
+        assert!((total_share - 100.0).abs() < 0.01);
+
+        // Stable sort: the two real-damage rows lead, ordered by damage;
+        // the 18 zero-damage preloads trail behind them, and their relative
+        // (insertion) order among themselves is otherwise unconstrained by
+        // this assertion — only that they're all *after* the real rows.
+        assert_eq!(snap.rows[0].uid, 3);
+        assert_eq!(snap.rows[1].uid, 11);
+        for row in &snap.rows[2..] {
+            assert_eq!(row.damage, 0);
+        }
     }
 
     #[test]
@@ -2556,6 +2902,29 @@ mod tests {
 
             let msg = scene_boss_latch_log(None, 999_999, 1001).unwrap();
             assert!(msg.contains("<unresolved>"));
+        }
+
+        #[test]
+        fn preload_summary_log_only_fires_for_a_dungeon_scene() {
+            assert!(preload_summary_log(Some(40001), 3, 1).is_some());
+            assert!(preload_summary_log(Some(8), 3, 1).is_none()); // town, not a dungeon
+            assert!(preload_summary_log(None, 3, 1).is_none()); // no scene known
+        }
+
+        #[test]
+        fn preload_summary_log_reports_preloaded_active_and_pruned_counts() {
+            let msg = preload_summary_log(Some(40001), 5, 2).unwrap();
+            assert!(msg.contains("scene=40001"));
+            assert!(msg.contains("preloaded=5"));
+            assert!(msg.contains("active=3"));
+            assert!(msg.contains("pruned=2"));
+        }
+
+        #[test]
+        fn preload_summary_log_never_leaks_a_name_or_uid() {
+            let msg = preload_summary_log(Some(40001), 5, 2).unwrap();
+            assert!(!msg.contains("uid"));
+            assert!(!msg.contains("name"));
         }
     }
 }
