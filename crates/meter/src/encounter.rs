@@ -1421,18 +1421,20 @@ mod tests {
         assert!(m.snapshot(2000).rows.is_empty());
     }
 
-    /// issue #145 finding 3: defensive cap on preloads per scene, guarding
-    /// against a misclassified dungeon scene preloading unboundedly.
+    /// The per-scene preload cap guards against a misclassified dungeon
+    /// scene preloading unboundedly.
     /// Preloads well past `MAX_PRELOADED_PLAYERS` and asserts both the
     /// counter and the roster stop growing at the cap, which sits
     /// comfortably above the largest real raid this meter supports (20
     /// players — see `preloading_a_full_20_player_raid_snapshots_cleanly`).
     #[test]
     fn preload_count_is_capped_per_scene() {
-        assert!(
-            MAX_PRELOADED_PLAYERS > 20,
-            "cap must comfortably exceed the largest real raid"
-        );
+        const {
+            assert!(
+                MAX_PRELOADED_PLAYERS > 20,
+                "cap must comfortably exceed the largest real raid"
+            )
+        };
         let mut m = Meter::new();
         m.apply(&ProtocolEvent::Scene {
             level_map_id: 40001,
