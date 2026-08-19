@@ -9,7 +9,7 @@ It reads game network traffic passively to build these stats. It does not
 modify the game client, inject code, or interact with the game process in
 any way.
 
-![The overlay showing a populated damage meter: a boss name and encounter timer in the header, followed by five player rows with damage, DPS, crit %, and death counts.](docs/images/overlay-demo.png)
+![The overlay showing a populated damage meter: the header shows the boss name, the dungeon name, and a stat row with elapsed time, total DPS, and total damage, followed by five player rows each with a class icon, DPS, crit %, lucky %, and death count.](docs/images/overlay-demo.png)
 
 *Captured in demo mode (`SHINRA_DEMO=1`), which seeds a fixed synthetic
 encounter — the names and figures shown are not from a real parse.*
