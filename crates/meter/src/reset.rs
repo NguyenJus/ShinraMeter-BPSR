@@ -44,6 +44,16 @@ pub struct EnemyState {
     pub peak_hp: Option<u64>,
     pub lowest_pct: Option<f64>,
     pub took_damage: bool,
+    /// Whether this enemy has been observed dying during the current fight
+    /// (issue #124) — either a `DamageEvent::is_dead` naming it as the
+    /// victim, or an `EnemyHp` syncing its `curr_hp` to 0. Per-encounter
+    /// like `took_damage`, and cleared by `Meter::reset` for the same
+    /// reason: the entity may respawn for the next pull.
+    ///
+    /// Exists so `Meter::end_fight_on_boss_death` can ask "is another boss in
+    /// this encounter still alive?" without depending on an HP sync that may
+    /// never arrive for a corpse.
+    pub dead: bool,
     /// Monster template id, from `EnemyHp::monster_id` (issue #9 slice 2).
     /// Survives `Meter::reset` like the rest of `EnemyState` — only a
     /// `ServerChange` clears the enemy map itself.
@@ -76,6 +86,19 @@ impl EnemyState {
         };
         Some(curr as f64 / denom as f64 * 100.0)
     }
+
+    /// Whether this enemy should be treated as still fighting (issue #124).
+    ///
+    /// An enemy whose HP was **never observed** counts as alive. That is the
+    /// deliberately conservative answer for the one caller,
+    /// `Meter::end_fight_on_boss_death`: mistaking a living boss for a dead
+    /// one ends the fight early and under-reports the rest of the encounter
+    /// (the bug issue #124 is about), while mistaking a dead boss for a
+    /// living one only skips the instant freeze and falls back to the idle
+    /// timeout, which is always safe.
+    pub fn is_alive(&self) -> bool {
+        !self.dead && self.curr_hp != Some(0)
+    }
 }
 
 /// True iff the enemy's HP dropped below `hp_drop_below_pct` at some point
@@ -102,6 +125,7 @@ mod tests {
             peak_hp: Some(max_hp),
             lowest_pct,
             took_damage: true,
+            dead: false,
             monster_id: None,
         }
     }
@@ -115,6 +139,7 @@ mod tests {
             peak_hp: Some(peak_hp),
             lowest_pct,
             took_damage: true,
+            dead: false,
             monster_id: None,
         }
     }
