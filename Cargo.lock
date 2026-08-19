@@ -591,6 +591,7 @@ dependencies = [
 name = "bpsr-protocol"
 version = "0.2.0"
 dependencies = [
+ "bpsr-test-support",
  "bytes",
  "log",
  "prost",
@@ -603,6 +604,11 @@ dependencies = [
 [[package]]
 name = "bpsr-test-support"
 version = "0.2.0"
+dependencies = [
+ "bpsr-protocol",
+ "prost",
+ "zstd",
+]
 
 [[package]]
 name = "bumpalo"

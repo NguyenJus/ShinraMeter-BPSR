@@ -1,0 +1,16 @@
+scenario=pet_damage_to_owner
+at_ms=3000
+fight_state=Idle
+duration_ms=1000
+total_damage=75000
+total_dps=75000.00
+encounter.boss_monster_id=103
+encounter.boss_name=Rathalos
+encounter.is_boss=true
+encounter.scene_id=1101
+encounter.scene_name=Towering Ruin
+encounter.scene_boss_name=Rathalos
+resets=
+rows=2
+row uid=1004 name=Nyx class=VerdantOracle ability_score=10000 season_strength=- imagines=[-,-] damage=45000 dps=45000.00 share=60.00 crit=0.00 lucky=0.00 hits=1 deaths=0
+row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=30000 dps=30000.00 share=40.00 crit=0.00 lucky=0.00 hits=1 deaths=0

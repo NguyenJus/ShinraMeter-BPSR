@@ -16,3 +16,6 @@ log = { workspace = true }
 # both), so this adds no new external dependency to the lockfile.
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+bpsr-test-support = { workspace = true }

@@ -1,0 +1,14 @@
+scenario=server_change_reset
+at_ms=13000
+fight_state=Idle
+duration_ms=0
+total_damage=0
+total_dps=0.00
+encounter.boss_monster_id=-
+encounter.boss_name=-
+encounter.is_boss=false
+encounter.scene_id=-
+encounter.scene_name=-
+encounter.scene_boss_name=-
+resets=ServerChange@12000
+rows=0

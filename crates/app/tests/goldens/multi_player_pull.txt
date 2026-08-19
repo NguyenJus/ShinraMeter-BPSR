@@ -1,0 +1,17 @@
+scenario=multi_player_pull
+at_ms=30000
+fight_state=Idle
+duration_ms=1500
+total_damage=173000
+total_dps=115333.33
+encounter.boss_monster_id=103
+encounter.boss_name=Rathalos
+encounter.is_boss=true
+encounter.scene_id=1101
+encounter.scene_name=Towering Ruin
+encounter.scene_boss_name=Rathalos
+resets=
+rows=3
+row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=95000 dps=63333.33 share=54.91 crit=75.00 lucky=0.00 hits=4 deaths=0
+row uid=1002 name=Brin class=FrostMage ability_score=11500 season_strength=- imagines=[-,-] damage=51000 dps=34000.00 share=29.48 crit=0.00 lucky=33.33 hits=3 deaths=0
+row uid=1003 name=Cade class=TwinStriker ability_score=10000 season_strength=- imagines=[-,-] damage=27000 dps=18000.00 share=15.61 crit=0.00 lucky=0.00 hits=3 deaths=0

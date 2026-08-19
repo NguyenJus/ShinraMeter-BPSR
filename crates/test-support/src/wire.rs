@@ -1,12 +1,42 @@
-//! Shared fixture builders for `bpsr-protocol` integration tests (plan
-//! T1.5). Every builder emits **big-endian** headers matching the wire
-//! format documented in `crates/protocol/src/frame.rs`. Not every helper is
-//! used by every test binary that includes this module, hence the blanket
-//! `dead_code` allowance.
-#![allow(dead_code)]
+//! Wire-level byte builders for scripting `bpsr-protocol` fixtures, shared
+//! across the workspace's crate test suites (promoted from
+//! `crates/protocol/tests/common/mod.rs`, plan `docs/plans/system-test-harness.md`
+//! §1.3/A2). Every builder emits **big-endian** headers matching the wire
+//! format documented in `crates/protocol/src/frame.rs`.
+//!
+//! This module is deliberately app-free: it produces raw bytes and
+//! `bpsr_protocol::pb` messages only, never touching `bpsr-meter` or the app
+//! crate. See `crate::scenario` for the higher-level DSL built on top of it.
 
+use crate::scenario::Hit;
 use bpsr_protocol::pb;
 use prost::Message;
+
+/// Packs a player uid into the wire uuid layout (`event.rs`):
+/// `uid << 16 | is_summon << 15 | is_client << 14 | entity_type << 6`, with
+/// `entity_type = 10` (player) giving low bits `640`.
+pub const fn player_uuid(uid: i64) -> i64 {
+    (uid << 16) | 640
+}
+
+/// Packs a monster uid into the wire uuid layout, `entity_type = 1`
+/// (monster) giving low bits `64`.
+pub const fn monster_uuid(uid: i64) -> i64 {
+    (uid << 16) | 64
+}
+
+/// Profession ids -> `bpsr_protocol::pb::Class` (`crates/protocol/src/pb.rs`).
+pub mod prof {
+    pub const STORMBLADE: i32 = 1;
+    pub const FROST_MAGE: i32 = 2;
+    pub const TWIN_STRIKER: i32 = 3;
+    pub const WIND_KNIGHT: i32 = 4;
+    pub const VERDANT_ORACLE: i32 = 5;
+    pub const HEAVY_GUARDIAN: i32 = 9;
+    pub const MARKSMAN: i32 = 11;
+    pub const SHIELD_KNIGHT: i32 = 12;
+    pub const BEAT_PERFORMER: i32 = 13;
+}
 
 /// Builds one outer frame: `[total_len: BE u32][packet_type: BE u16][body]`.
 /// `total_len` includes its own 4 bytes, per the wire format.
@@ -74,13 +104,64 @@ pub fn base_damage(attacker_uuid: i64, owner_id: i32, value: i64) -> pb::SyncDam
     }
 }
 
+/// Maps a `scenario::Hit` (meter-level damage description) onto the wire
+/// `pb::SyncDamageInfo` shape, per `decode.rs`'s flag semantics
+/// (`docs/plans/system-test-harness.md` §0.7).
+pub fn damage_info(hit: &Hit) -> pb::SyncDamageInfo {
+    pb::SyncDamageInfo {
+        is_miss: hit.miss,
+        r#type: if hit.miss {
+            pb::EDamageType::Miss as i32
+        } else if hit.heal {
+            pb::EDamageType::Heal as i32
+        } else {
+            pb::EDamageType::Normal as i32
+        },
+        type_flag: hit.crit as i32,
+        value: if hit.lucky { 0 } else { hit.value },
+        lucky_value: if hit.lucky { hit.value } else { 0 },
+        hp_lessen_value: hit.value,
+        attacker_uuid: player_uuid(hit.attacker_uid),
+        owner_id: hit.skill_id,
+        is_dead: hit.kills_target,
+        top_summoner_id: if hit.summoner_uid != 0 {
+            player_uuid(hit.summoner_uid)
+        } else {
+            0
+        },
+    }
+}
+
 /// Prost-encodes a `SyncNearDeltaInfo` payload (not wrapped in a frame)
 /// carrying a single `SyncDamageInfo` targeting `target_uuid`.
 pub fn damage_delta(target_uuid: i64, dmg: pb::SyncDamageInfo) -> Vec<u8> {
+    damage_delta_multi(target_uuid, vec![dmg])
+}
+
+/// Prost-encodes a `SyncNearDeltaInfo` payload (not wrapped in a frame)
+/// carrying N damage entries against `target_uuid`, in order.
+pub fn damage_delta_multi(target_uuid: i64, dmgs: Vec<pb::SyncDamageInfo>) -> Vec<u8> {
     let delta = pb::AoiSyncDelta {
         uuid: target_uuid,
         attrs: None,
-        skill_effects: Some(pb::SkillEffect { damages: vec![dmg] }),
+        skill_effects: Some(pb::SkillEffect { damages: dmgs }),
+    };
+    let msg = pb::SyncNearDeltaInfo {
+        delta_infos: vec![delta],
+    };
+    let mut payload = Vec::new();
+    msg.encode(&mut payload).unwrap();
+    payload
+}
+
+/// Prost-encodes a `SyncNearDeltaInfo` payload (not wrapped in a frame)
+/// carrying an attr-only delta against `uuid` (e.g. a boss HP update over
+/// time).
+pub fn attr_delta_payload(uuid: i64, attrs: Vec<pb::Attr>) -> Vec<u8> {
+    let delta = pb::AoiSyncDelta {
+        uuid,
+        attrs: Some(pb::AttrCollection { uuid, attrs }),
+        skill_effects: None,
     };
     let msg = pb::SyncNearDeltaInfo {
         delta_infos: vec![delta],
@@ -113,7 +194,8 @@ pub fn name_attr(name: &str) -> pb::Attr {
 }
 
 /// Builds a varint-encoded `Attr` for any of the numeric attr ids
-/// (`MONSTER_ID`, `HP`, `MAX_HP`, `PROFESSION_ID`, `FIGHT_POINT`).
+/// (`MONSTER_ID`, `HP`, `MAX_HP`, `PROFESSION_ID`, `FIGHT_POINT`,
+/// `SCENE_BASIC_ID`, ...).
 pub fn varint_attr(id: i32, value: u64) -> pb::Attr {
     let mut raw = Vec::new();
     prost::encoding::encode_varint(value, &mut raw);
@@ -162,7 +244,9 @@ pub fn sync_near_entities_payload(entities: Vec<pb::Entity>) -> Vec<u8> {
 }
 
 /// Prost-encodes a `SyncContainerData` payload (not wrapped in a frame)
-/// carrying a character name + profession id.
+/// carrying a character name + profession id. `char_id` is the **uid**
+/// directly (`on_sync_container_data` does not call `uid_of`), unlike the
+/// appear path.
 pub fn sync_container_data_payload(
     char_id: i64,
     name: &str,
@@ -185,4 +269,44 @@ pub fn sync_container_data_payload(
     let mut buf = Vec::new();
     msg.encode(&mut buf).unwrap();
     buf
+}
+
+/// Prost-encodes an `EnterScene` payload (not wrapped in a frame) carrying
+/// only the scene id, via `attr_id::SCENE_BASIC_ID` on the scene's attr
+/// channel.
+pub fn enter_scene_payload(scene_id: u32) -> Vec<u8> {
+    let msg = pb::EnterScene {
+        info: Some(pb::EnterSceneInfo {
+            attrs: Some(pb::AttrCollection {
+                uuid: 0,
+                attrs: vec![varint_attr(
+                    bpsr_protocol::attrs::attr_id::SCENE_BASIC_ID,
+                    scene_id as u64,
+                )],
+            }),
+        }),
+    };
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+    buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn damage_info_sets_top_summoner_id_for_a_pet_hit() {
+        let hit = Hit::new(500, 101, 1_000).by_pet_of(999);
+        let info = damage_info(&hit);
+        assert_eq!(info.attacker_uuid, player_uuid(500));
+        assert_eq!(info.top_summoner_id, player_uuid(999));
+    }
+
+    #[test]
+    fn damage_info_sets_type_flag_for_a_crit_hit() {
+        let hit = Hit::new(500, 101, 1_000).crit();
+        let info = damage_info(&hit);
+        assert_eq!(info.type_flag, 1);
+    }
 }
