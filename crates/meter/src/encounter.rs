@@ -18,6 +18,18 @@ use crate::tables;
 /// (issue #49).
 const DEATH_DEBOUNCE_MS: u64 = 2000;
 
+/// Defensive ceiling on preloaded roster rows per scene (issue #12/#145
+/// finding 3). The preload path in `apply_player` is gated on
+/// `in_dungeon_scene`, i.e. `tables::is_dungeon_scene` — generated data
+/// (see `tables.rs`) this code has no way to validate. If a scene is ever
+/// misclassified as a dungeon, this stops `players` from growing
+/// unboundedly instead of relying solely on that classification being
+/// correct. Set comfortably above the largest real raid this meter
+/// supports (20 players — see
+/// `preloading_a_full_20_player_raid_snapshots_cleanly`), so it never
+/// affects a real dungeon or raid.
+const MAX_PRELOADED_PLAYERS: u32 = 64;
+
 /// One player-identity cache entry. `seq` is a monotonic touch counter (set
 /// on both read and write) used purely to order entries by recency for
 /// [`Meter::names_for_save`] — it is never persisted itself, only the
@@ -52,6 +64,33 @@ struct CachedAttrs {
     season_strength: Option<u32>,
     // IMAGINE-TAKEDOWN: part of the imagines field chain (see plan D4 #5).
     imagines: Option<[Option<i32>; 2]>,
+}
+
+/// Copies the five cacheable identity fields (name/class/ability_score/
+/// season_strength/imagines) from `merged` onto `stats`, one at a time,
+/// skipping any field `merged` has no opinion on (issue #145 finding 6: this
+/// list used to be duplicated between `apply_player`'s existing-row and
+/// preload branches, so adding a sixth cached field meant editing both). A
+/// freshly `PlayerStats::new` row starts with every one of these fields at
+/// `None`, so the per-field guard is a no-op there — this same guarded copy
+/// is exactly equivalent to an unconditional one for a fresh row, which is
+/// what lets both branches share it.
+fn apply_cached_attrs(stats: &mut PlayerStats, merged: CachedAttrs) {
+    if merged.name.is_some() {
+        stats.name = merged.name;
+    }
+    if merged.class.is_some() {
+        stats.class = merged.class;
+    }
+    if merged.ability_score.is_some() {
+        stats.ability_score = merged.ability_score;
+    }
+    if merged.season_strength.is_some() {
+        stats.season_strength = merged.season_strength;
+    }
+    if merged.imagines.is_some() {
+        stats.imagines = merged.imagines;
+    }
 }
 
 pub struct Meter {
@@ -92,8 +131,10 @@ pub struct Meter {
     /// encounter reset (or a boss-HP rollback) happens mid-dungeon, and the
     /// whole point is for the remembered name to survive into the *next*
     /// pull and the *next* run of the same dungeon, not just the current
-    /// one. Not persisted to disk — see the issue #125 design note on
-    /// `recompute_boss`.
+    /// one. Cross-session persistence (issue #131) lives entirely in the app
+    /// crate — this crate stays free of disk I/O and only exposes seed/export
+    /// accessors (`with_scene_bosses`, `set_scene_bosses`,
+    /// `scene_bosses_for_save`) for the app crate to drive.
     scene_bosses: HashMap<u32, u32>,
     /// When the current fight ended, if it has (issue #78). `Some(t)` puts
     /// the meter in [`FightState::Ended`]: the snapshot is rendered as of
@@ -122,6 +163,14 @@ pub struct Meter {
     deaths_seen: u64,
     reset_cfg: ResetConfig,
     fight_cfg: FightConfig,
+    /// Count of `PlayerStats` rows created by the dungeon-gated preload path
+    /// (issue #12) in the *current* scene. `apply_player`/`name_upsert` have
+    /// zero per-player `log::` calls, deliberately, to avoid a per-raid-member
+    /// flood; this counter is what lets `prune_stale_preloads` log a single
+    /// sparse summary line per scene transition instead, answering whether
+    /// AOI actually delivers every party member's identity in a large raid.
+    /// Reset to zero on every real scene transition.
+    preload_count: u32,
 }
 
 impl Meter {
@@ -142,6 +191,7 @@ impl Meter {
             deaths_seen: 0,
             reset_cfg: ResetConfig::default(),
             fight_cfg: FightConfig::default(),
+            preload_count: 0,
         }
     }
 
@@ -191,6 +241,38 @@ impl Meter {
         }
         m.names_seq = total;
         m
+    }
+
+    /// Seeds the learned scene -> final-boss map from a previously-persisted
+    /// value (issue #131), so a dungeon whose final boss was learned in an
+    /// earlier session already names it on entry this session, rather than
+    /// only after the first observed engagement falls back to naming it
+    /// mid-fight. Live observation (`recompute_boss`) always takes
+    /// precedence going forward: it overwrites a seeded entry the next time
+    /// that scene's real boss is engaged, the same way it converges on the
+    /// last boss engaged within one session (see `scene_bosses`' doc
+    /// comment).
+    pub fn with_scene_bosses(scene_bosses: HashMap<u32, u32>) -> Self {
+        Self {
+            scene_bosses,
+            ..Self::new()
+        }
+    }
+
+    /// Overwrites the learned scene -> final-boss map in place, for callers
+    /// (namely `Pipeline`, issue #131) that need to seed it on a `Meter`
+    /// already constructed for another reason (e.g. via `with_names_cache`)
+    /// rather than at construction time.
+    pub fn set_scene_bosses(&mut self, scene_bosses: HashMap<u32, u32>) {
+        self.scene_bosses = scene_bosses;
+    }
+
+    /// Exports the learned scene -> final-boss map for persistence (issue
+    /// #131), mirroring `names_for_save`. Unlike `names_for_save` this
+    /// carries no eviction cap or recency order to preserve — the caller
+    /// (`scene_bosses_cache` in the app crate) just needs the full map.
+    pub fn scene_bosses_for_save(&self) -> HashMap<u32, u32> {
+        self.scene_bosses.clone()
     }
 
     /// Reads a cached name/class/ability_score, bumping its recency for
@@ -352,10 +434,28 @@ impl Meter {
                 if let Some(msg) = scene_transition_log(self.scene_id, Some(*level_map_id)) {
                     log::info!("{msg}");
                 }
+                // issue #12: any real scene change (entering a dungeon,
+                // leaving one, or hopping dungeon -> different dungeon) can
+                // leave behind preloaded roster rows nobody ever damaged —
+                // drop those now, before the new scene id lands, so a stale
+                // party member from the last run doesn't linger into this
+                // one. Rows with real activity (damage, a miss, or a death)
+                // are untouched; the existing reset machinery still governs
+                // those.
+                if self.scene_id != Some(*level_map_id) {
+                    self.prune_stale_preloads();
+                }
                 self.scene_id = Some(*level_map_id);
                 None
             }
             ProtocolEvent::ServerChanged { timestamp_ms } => {
+                // issue #12/#145 finding 4: a server change is as real a
+                // scene change as any (the old scene's preloads can't
+                // possibly still be in AOI range afterward), so mirror the
+                // Scene arm above and prune stale preloads — and log the
+                // same summary line — before `reset` clears `players` and
+                // `scene_id` is cleared below.
+                self.prune_stale_preloads();
                 self.reset(ResetReason::ServerChange, *timestamp_ms);
                 self.enemies.clear();
                 self.boss_uid = None;
@@ -734,22 +834,73 @@ impl Meter {
             },
         );
         if let Some(stats) = self.players.get_mut(&p.uid) {
-            if merged.name.is_some() {
-                stats.name = merged.name;
-            }
-            if merged.class.is_some() {
-                stats.class = merged.class;
-            }
-            if merged.ability_score.is_some() {
-                stats.ability_score = merged.ability_score;
-            }
-            if merged.season_strength.is_some() {
-                stats.season_strength = merged.season_strength;
-            }
-            if merged.imagines.is_some() {
-                stats.imagines = merged.imagines;
-            }
+            apply_cached_attrs(stats, merged);
+        } else if self.in_dungeon_scene()
+            && merged.name.is_some()
+            && self.preload_count < MAX_PRELOADED_PLAYERS
+        {
+            // issue #12: preload the roster. In a dungeon/raid instance the
+            // only players in AOI range are the party, so eagerly creating a
+            // zero-stat row here shows the whole group immediately instead
+            // of only the players who have already hit or died. Gated
+            // strictly on `in_dungeon_scene` — the same preload in town would
+            // flood the meter with unrelated strangers passing through AOI
+            // range. Also gated on `merged.name` (the *upserted* value, so a
+            // cache hit counts too, per `name_upsert`): a row that would
+            // render as "Player {uid}" is worse than no row at all. And
+            // gated on `MAX_PRELOADED_PLAYERS` (issue #145 finding 3) as a
+            // backstop against a misclassified scene preloading unbounded
+            // rows.
+            let mut stats = PlayerStats::new(p.uid);
+            apply_cached_attrs(&mut stats, merged);
+            self.players.insert(p.uid, stats);
+            // issue #69/#12: no per-player log here by design (would flood
+            // a raid); just tally, and let `prune_stale_preloads` emit one
+            // sparse summary line when this scene ends.
+            self.preload_count += 1;
         }
+    }
+
+    /// Whether the meter currently believes it's inside a dungeon/raid
+    /// instance (issue #12), i.e. `scene_id` is known and resolves as a
+    /// dungeon scene via `tables::is_dungeon_scene`. `None` (no `Scene`
+    /// event seen yet this session, or cleared by `ServerChanged`) is
+    /// treated as "not a dungeon" — preloading requires positive
+    /// confirmation of AOI scope, never an absence of information.
+    fn in_dungeon_scene(&self) -> bool {
+        self.scene_id.is_some_and(tables::is_dungeon_scene)
+    }
+
+    /// Drops roster rows nobody has acted on yet: zero damage, zero hits,
+    /// zero deaths (issue #12). Called on every real scene transition so a
+    /// preloaded party member from the last dungeon (or a stray preload from
+    /// just before a `Scene` event resolved) doesn't linger into the next
+    /// one. Rows with any real activity are left alone — they still follow
+    /// the existing reset rules (`reset`, `ResetReason`), not this.
+    fn prune_stale_preloads(&mut self) {
+        // Every row this drops is, by construction, a zero-stat row, and the
+        // only path that creates one of those is the preload branch of
+        // `apply_player` (a row from real damage/hits/deaths is never
+        // all-zero). So `pruned` is exactly the untouched subset of this
+        // scene's `preload_count`. Tallied inside the single `retain` pass
+        // (issue #145 finding 5) rather than a separate `filter().count()`
+        // pass first.
+        let mut pruned = 0u32;
+        self.players.retain(|_, p| {
+            let stale = p.total_damage == 0 && p.hits == 0 && p.deaths == 0;
+            if stale {
+                pruned += 1;
+            }
+            !stale
+        });
+        // Sparse, transition-only diagnostic (issue #69/#12): one line per
+        // scene left, never per player. `self.scene_id` is still the scene
+        // being *left* here — `Meter::apply`'s `Scene` arm calls this before
+        // overwriting it with the new id.
+        if let Some(msg) = preload_summary_log(self.scene_id, self.preload_count, pruned) {
+            log::info!("{msg}");
+        }
+        self.preload_count = 0;
     }
 
     fn apply_enemy_hp(&mut self, e: &EnemyHp) -> Option<ResetReason> {
@@ -980,6 +1131,15 @@ impl Meter {
         // needed the way scene/boss logging above requires one.
         log::info!("encounter: reset reason={reason:?}");
         self.players.clear();
+        // issue #12/#145 finding 1: `players` just got cleared, so any
+        // in-progress preload tally is now meaningless. The Scene and
+        // ServerChanged arms of `apply` already zero this themselves (via
+        // `prune_stale_preloads`, which also logs a summary first), but
+        // `reset` is also reached from paths with no scene transition at
+        // all — `BossHpRollback`, `NewFight`, and a `Manual` reset — so this
+        // is the backstop that keeps `preload_count` in sync with the
+        // cleared roster on every path, not just those two.
+        self.preload_count = 0;
         for enemy in self.enemies.values_mut() {
             enemy.lowest_pct = None;
             enemy.took_damage = false;
@@ -1080,8 +1240,12 @@ impl Meter {
         // issue #125: the dungeon's remembered final boss, if `scene_id` is
         // known and a boss has been latched for it — see `scene_bosses`' doc
         // comment. Independent of `boss_monster_id`/`is_boss` above, which
-        // stay the raw facts about the currently-selected target; this is
-        // what `encounter_title` prefers over them.
+        // stay the raw facts about the currently-selected target. Issue
+        // #131 inverted which one `encounter_title` (`crates/app/src/ui.rs`)
+        // prefers: a genuinely recognized live boss (`is_boss`) now wins
+        // over this field, which is the fallback for "nothing engaged yet"
+        // and for a non-boss `boss_uid` target — see that function's doc
+        // comment for the full precedence and why.
         let scene_boss_name = self
             .scene_id
             .and_then(|scene| self.scene_bosses.get(&scene))
@@ -1135,6 +1299,23 @@ fn scene_transition_log(previous: Option<u32>, new_scene_id: Option<u32>) -> Opt
             None => format!("encounter: scene changed to id={id} name=<unresolved>"),
         },
     })
+}
+
+/// Builds the "preload summary" diagnostic line (issue #12/#69) for the
+/// scene being *left*, or `None` when that scene doesn't resolve as a
+/// dungeon/raid instance via `tables::is_dungeon_scene` — no preloads can
+/// exist outside one, so the line would be pure noise. `preloaded` is the
+/// scene's `Meter::preload_count`; `pruned` is how many of those rows
+/// `prune_stale_preloads` just dropped as untouched, so `preloaded - pruned`
+/// is how many went on to record real activity. Never includes a player
+/// name or uid — only counts, since these logs get shared for debugging.
+/// Pure, like [`scene_transition_log`], for the same testability reason.
+fn preload_summary_log(scene_id: Option<u32>, preloaded: u32, pruned: u32) -> Option<String> {
+    let id = scene_id.filter(|id| tables::is_dungeon_scene(*id))?;
+    let active = preloaded.saturating_sub(pruned);
+    Some(format!(
+        "encounter: scene={id} preload summary: preloaded={preloaded} active={active} pruned={pruned}"
+    ))
 }
 
 /// Builds the "boss target changed" diagnostic line (issue #69), or `None`
@@ -1278,6 +1459,352 @@ mod tests {
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].name, "Foo");
         assert_eq!(snap.rows[0].class, Some(Class::Stormblade));
+    }
+
+    fn player_info(uid: i64, name: &str) -> ProtocolEvent {
+        ProtocolEvent::Player(PlayerInfo {
+            uid,
+            name: Some(name.to_string()),
+            class: Some(Class::Stormblade),
+            ability_score: None,
+            season_strength: None,
+            imagines: None,
+        })
+    }
+
+    // -- issue #12: dungeon-gated name preload -----------------------------
+
+    #[test]
+    fn player_event_in_dungeon_preloads_a_zero_stat_row() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        }); // real dungeon id
+        m.apply(&player_info(1, "Alice"));
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows.len(), 1);
+        assert_eq!(snap.rows[0].uid, 1);
+        assert_eq!(snap.rows[0].name, "Alice");
+        assert_eq!(snap.rows[0].damage, 0);
+        assert_eq!(snap.rows[0].hits, 0);
+        assert!(!m.is_active(), "a preload must not start the fight clock");
+    }
+
+    #[test]
+    fn player_event_in_town_does_not_preload() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene { level_map_id: 8 }); // Asterleeds, not a dungeon
+        m.apply(&player_info(1, "Alice"));
+        let snap = m.snapshot(2000);
+        assert!(snap.rows.is_empty());
+    }
+
+    #[test]
+    fn player_event_in_gloomy_depths_does_not_preload() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene { level_map_id: 92 }); // Gloomy Depths, not a dungeon
+        m.apply(&player_info(1, "Alice"));
+        let snap = m.snapshot(2000);
+        assert!(snap.rows.is_empty());
+    }
+
+    #[test]
+    fn player_event_with_no_scene_does_not_preload() {
+        let mut m = Meter::new();
+        m.apply(&player_info(1, "Alice"));
+        let snap = m.snapshot(2000);
+        assert!(snap.rows.is_empty());
+    }
+
+    #[test]
+    fn preloaded_row_accumulates_damage_without_double_counting_or_losing_name() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        m.apply(&player_info(1, "Alice"));
+        m.apply(&dmg(1, 500, 1000));
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows.len(), 1);
+        assert_eq!(snap.rows[0].name, "Alice");
+        assert_eq!(snap.rows[0].damage, 500);
+        assert_eq!(snap.rows[0].hits, 1);
+        assert_eq!(snap.total_damage, 500);
+    }
+
+    #[test]
+    fn share_and_dps_stay_finite_with_mixed_preload_and_real_rows() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        // Two preloads, neither ever deals damage.
+        m.apply(&player_info(1, "Alice"));
+        m.apply(&player_info(2, "Bob"));
+        // One real attacker.
+        m.apply(&dmg(3, 1000, 1000));
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows.len(), 3);
+        let total_share: f32 = snap.rows.iter().map(|r| r.share_pct).sum();
+        for row in &snap.rows {
+            assert!(row.share_pct.is_finite());
+            assert!(row.dps.is_finite());
+            assert!(row.crit_pct.is_finite());
+            assert!(row.lucky_pct.is_finite());
+        }
+        assert!((total_share - 100.0).abs() < 0.01);
+        // Zero-damage preloads sort to the bottom, stably, behind the real
+        // attacker.
+        assert_eq!(snap.rows[0].uid, 3);
+    }
+
+    #[test]
+    fn leaving_a_dungeon_drops_untouched_preloads_but_keeps_active_rows() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        m.apply(&player_info(1, "Alice")); // never acts
+        m.apply(&player_info(2, "Bob"));
+        m.apply(&dmg(2, 200, 1000)); // Bob deals damage
+        // Leave the dungeon for a different scene.
+        m.apply(&ProtocolEvent::Scene { level_map_id: 8 });
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows.len(), 1);
+        assert_eq!(snap.rows[0].uid, 2);
+        assert_eq!(snap.rows[0].name, "Bob");
+        assert_eq!(snap.rows[0].damage, 200);
+    }
+
+    #[test]
+    fn dungeon_to_different_dungeon_drops_untouched_preloads() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        m.apply(&player_info(1, "Alice")); // never acts
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 31101,
+        }); // a different dungeon
+        let snap = m.snapshot(2000);
+        assert!(snap.rows.is_empty());
+    }
+
+    #[test]
+    fn preload_count_increments_only_via_the_preload_path() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        assert_eq!(m.preload_count, 0);
+        m.apply(&player_info(1, "Alice")); // preload
+        assert_eq!(m.preload_count, 1);
+        // A second Player event for the same uid updates the existing row,
+        // not a new preload.
+        m.apply(&player_info(1, "Alice"));
+        assert_eq!(m.preload_count, 1);
+        // Real damage for an already-preloaded uid doesn't touch the counter.
+        m.apply(&dmg(1, 100, 1000));
+        assert_eq!(m.preload_count, 1);
+    }
+
+    #[test]
+    fn preload_count_does_not_increment_outside_a_dungeon_scene() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene { level_map_id: 8 }); // town, not a dungeon
+        m.apply(&player_info(1, "Alice"));
+        assert_eq!(m.preload_count, 0);
+    }
+
+    #[test]
+    fn preload_count_resets_on_scene_entry() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        m.apply(&player_info(1, "Alice"));
+        m.apply(&player_info(2, "Bob"));
+        assert_eq!(m.preload_count, 2);
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 31101,
+        }); // a different dungeon
+        assert_eq!(m.preload_count, 0);
+        m.apply(&player_info(3, "Cara"));
+        assert_eq!(m.preload_count, 1);
+    }
+
+    #[test]
+    fn preload_accounting_balances_after_a_mixed_scenario() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        // Five preloaded party members; two go on to deal real damage.
+        for (uid, name) in [
+            (1, "Alice"),
+            (2, "Bob"),
+            (3, "Cara"),
+            (4, "Dan"),
+            (5, "Eve"),
+        ] {
+            m.apply(&player_info(uid, name));
+        }
+        let preloaded = m.preload_count;
+        assert_eq!(preloaded, 5);
+        m.apply(&dmg(2, 100, 1000));
+        m.apply(&dmg(4, 50, 1000));
+        // Leave the dungeon: `prune_stale_preloads` runs, drops the three
+        // untouched rows, and resets the counter for the new scene.
+        m.apply(&ProtocolEvent::Scene { level_map_id: 8 });
+        let snap = m.snapshot(2000);
+        let active = snap.rows.len() as u32;
+        let pruned = preloaded - active;
+        assert_eq!(active, 2);
+        assert_eq!(pruned, 3);
+        assert_eq!(
+            preloaded,
+            active + pruned,
+            "preloaded must equal still-active + pruned"
+        );
+        assert_eq!(m.preload_count, 0);
+    }
+
+    /// issue #145 findings 1/2: `Meter::reset` used to clear `players`
+    /// without touching `preload_count`, so a reset that isn't a scene
+    /// transition (a `BossHpRollback` mid-dungeon, or a `Manual` reset) left
+    /// the counter carrying the previous pull's preloads into the next one.
+    /// Preloads once, resets mid-scene (no `Scene` event in between),
+    /// preloads again, then leaves the dungeon and checks the
+    /// `preloaded = active + pruned` invariant still holds — same shape as
+    /// `preload_accounting_balances_after_a_mixed_scenario`, but with a
+    /// reset spliced into the middle of the scene. Fails against the
+    /// pre-fix code: `preload_count` would read 5 (both preload batches
+    /// counted) while only the second batch's 3 rows are still in
+    /// `players`, so `pruned` comes out negative-equivalent (wraps as a
+    /// `u32`) instead of 2.
+    #[test]
+    fn preload_count_stays_in_sync_across_a_mid_dungeon_reset() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        // First pull: two preloads, no `Scene` event before the reset below.
+        m.apply(&player_info(1, "Alice"));
+        m.apply(&player_info(2, "Bob"));
+        assert_eq!(m.preload_count, 2);
+        m.reset(ResetReason::BossHpRollback, 1000);
+        assert_eq!(m.preload_count, 0);
+        assert!(m.snapshot(1000).rows.is_empty());
+        // Second pull, same scene: three fresh preloads, one goes on to hit.
+        m.apply(&player_info(3, "Cara"));
+        m.apply(&player_info(4, "Dan"));
+        m.apply(&player_info(5, "Eve"));
+        let preloaded = m.preload_count;
+        assert_eq!(preloaded, 3);
+        m.apply(&dmg(3, 100, 2000));
+        // Leave the dungeon: prune should only see this pull's preloads.
+        m.apply(&ProtocolEvent::Scene { level_map_id: 8 });
+        let snap = m.snapshot(3000);
+        let active = snap.rows.len() as u32;
+        let pruned = preloaded - active;
+        assert_eq!(active, 1);
+        assert_eq!(pruned, 2);
+        assert_eq!(
+            preloaded,
+            active + pruned,
+            "preloaded must equal still-active + pruned even across a mid-dungeon reset"
+        );
+        assert_eq!(m.preload_count, 0);
+    }
+
+    /// issue #145 finding 4: `ServerChanged` used to reset straight away
+    /// without pruning first, leaving `preload_count` stale (and skipping
+    /// the summary log) the same way an un-fixed `BossHpRollback` would.
+    /// Mirrors `preload_count_stays_in_sync_across_a_mid_dungeon_reset`, but
+    /// with the scene ending via `ServerChanged` instead of a same-scene
+    /// reset.
+    #[test]
+    fn server_changed_prunes_preloads_like_a_real_scene_change() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        m.apply(&player_info(1, "Alice"));
+        m.apply(&player_info(2, "Bob"));
+        assert_eq!(m.preload_count, 2);
+        m.apply(&dmg(1, 100, 1000));
+        m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 2000 });
+        assert_eq!(m.preload_count, 0);
+        // The one row with real activity doesn't survive `ServerChanged`
+        // either — `reset` still clears `players` outright — but the
+        // counter accounting is what this test is about.
+        assert!(m.snapshot(2000).rows.is_empty());
+    }
+
+    /// The per-scene preload cap guards against a misclassified dungeon
+    /// scene preloading unboundedly.
+    /// Preloads well past `MAX_PRELOADED_PLAYERS` and asserts both the
+    /// counter and the roster stop growing at the cap, which sits
+    /// comfortably above the largest real raid this meter supports (20
+    /// players — see `preloading_a_full_20_player_raid_snapshots_cleanly`).
+    #[test]
+    fn preload_count_is_capped_per_scene() {
+        const {
+            assert!(
+                MAX_PRELOADED_PLAYERS > 20,
+                "cap must comfortably exceed the largest real raid"
+            )
+        };
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        for uid in 1..=(MAX_PRELOADED_PLAYERS as i64 + 10) {
+            m.apply(&player_info(uid, &format!("Player{uid}")));
+        }
+        assert_eq!(m.preload_count, MAX_PRELOADED_PLAYERS);
+        assert_eq!(m.players.len() as u32, MAX_PRELOADED_PLAYERS);
+    }
+
+    /// Raid-scale sanity check: up to 20 simultaneous party members (a full
+    /// raid, not just a 5-player dungeon party) is 4x anything the earlier
+    /// preload tests exercised. Preloads 20 distinct named players, mixes in
+    /// a couple of real-damage rows among them, and asserts every row
+    /// snapshots without panicking and with finite, sane stats.
+    #[test]
+    fn preloading_a_full_20_player_raid_snapshots_cleanly() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        for uid in 1..=20i64 {
+            m.apply(&player_info(uid, &format!("Player{uid}")));
+        }
+        // A couple of real attackers among the 20 preloads.
+        m.apply(&dmg(3, 700, 1000));
+        m.apply(&dmg(11, 300, 1000));
+
+        let snap = m.snapshot(2000);
+        assert_eq!(snap.rows.len(), 20);
+
+        let total_share: f32 = snap.rows.iter().map(|r| r.share_pct).sum();
+        for row in &snap.rows {
+            assert!(row.share_pct.is_finite() && row.share_pct >= 0.0);
+            assert!(row.dps.is_finite() && row.dps >= 0.0);
+            assert!(row.crit_pct.is_finite());
+            assert!(row.lucky_pct.is_finite());
+        }
+        assert!((total_share - 100.0).abs() < 0.01);
+
+        // Stable sort: the two real-damage rows lead, ordered by damage;
+        // the 18 zero-damage preloads trail behind them, and their relative
+        // (insertion) order among themselves is otherwise unconstrained by
+        // this assertion — only that they're all *after* the real rows.
+        assert_eq!(snap.rows[0].uid, 3);
+        assert_eq!(snap.rows[1].uid, 11);
+        for row in &snap.rows[2..] {
+            assert_eq!(row.damage, 0);
+        }
     }
 
     #[test]
@@ -1842,6 +2369,100 @@ mod tests {
             let saved = m.names_for_save();
             assert_eq!(saved.len(), 1);
             assert_eq!(saved[0].0, 1);
+        }
+    }
+
+    /// Issue #131: the meter-side half of cross-session scene -> final-boss
+    /// persistence. `scene_bosses_cache` (app crate) owns the disk I/O; this
+    /// only covers the seed-in/export-out contract these tests exercise
+    /// directly against `Meter`, mirroring `mod names_cache` above.
+    mod scene_bosses {
+        use super::*;
+
+        fn boss_hit(uid: i64, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: uid,
+                target_kind: EntityKind::Monster,
+                value: 1,
+                timestamp_ms: ts,
+                ..Default::default()
+            })
+        }
+
+        fn hp(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::EnemyHp(EnemyHp {
+                uid,
+                curr_hp: Some(100),
+                max_hp: Some(100),
+                monster_id: Some(monster_id),
+                timestamp_ms: ts,
+            })
+        }
+
+        #[test]
+        fn seeded_scene_boss_resolves_before_any_hit_lands_this_session() {
+            // 1001 ("Tina's Mindrealm") is a dungeon scene; 103 ("Rathalos")
+            // is a genuine boss — seeding mirrors what a real run of this
+            // dungeon would have latched last session.
+            let mut m = Meter::with_scene_bosses(HashMap::from([(1001, 103)]));
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
+        }
+
+        #[test]
+        fn set_scene_bosses_seeds_a_meter_already_constructed_another_way() {
+            let cache = vec![(5, (Some("Cached".to_string()), None))];
+            let mut m = Meter::with_names_cache(cache);
+            m.set_scene_bosses(HashMap::from([(1001, 103)]));
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
+        }
+
+        #[test]
+        fn scene_bosses_for_save_returns_what_was_learned() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 103, 0));
+
+            assert_eq!(m.scene_bosses_for_save(), HashMap::from([(1001, 103)]));
+        }
+
+        #[test]
+        fn scene_bosses_for_save_is_empty_when_nothing_has_been_learned() {
+            let m = Meter::new();
+            assert_eq!(m.scene_bosses_for_save(), HashMap::new());
+        }
+
+        #[test]
+        fn a_reset_does_not_lose_a_seeded_scene_boss() {
+            let mut m = Meter::with_scene_bosses(HashMap::from([(1001, 103)]));
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            m.reset(ResetReason::Manual, 1000);
+
+            let snap = m.snapshot(2000);
+            assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
+            assert_eq!(m.scene_bosses_for_save(), HashMap::from([(1001, 103)]));
+        }
+
+        #[test]
+        fn live_observation_overwrites_a_seeded_entry() {
+            // A game patch (or just a different pull) can make the live
+            // final boss diverge from what was seeded — the freshly observed
+            // one must win, matching the within-session overwrite semantics
+            // `recompute_boss` already documents.
+            let mut m = Meter::with_scene_bosses(HashMap::from([(1001, 103)]));
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            m.apply(&boss_hit(11, 0));
+            m.apply(&hp(11, 103_108, 0));
+
+            assert_eq!(m.scene_bosses_for_save(), HashMap::from([(1001, 103_108)]));
         }
     }
 
@@ -3418,6 +4039,29 @@ mod tests {
 
             let msg = scene_boss_latch_log(None, 999_999, 1001).unwrap();
             assert!(msg.contains("<unresolved>"));
+        }
+
+        #[test]
+        fn preload_summary_log_only_fires_for_a_dungeon_scene() {
+            assert!(preload_summary_log(Some(40001), 3, 1).is_some());
+            assert!(preload_summary_log(Some(8), 3, 1).is_none()); // town, not a dungeon
+            assert!(preload_summary_log(None, 3, 1).is_none()); // no scene known
+        }
+
+        #[test]
+        fn preload_summary_log_reports_preloaded_active_and_pruned_counts() {
+            let msg = preload_summary_log(Some(40001), 5, 2).unwrap();
+            assert!(msg.contains("scene=40001"));
+            assert!(msg.contains("preloaded=5"));
+            assert!(msg.contains("active=3"));
+            assert!(msg.contains("pruned=2"));
+        }
+
+        #[test]
+        fn preload_summary_log_never_leaks_a_name_or_uid() {
+            let msg = preload_summary_log(Some(40001), 5, 2).unwrap();
+            assert!(!msg.contains("uid"));
+            assert!(!msg.contains("name"));
         }
     }
 }

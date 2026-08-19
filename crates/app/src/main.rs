@@ -15,6 +15,7 @@ mod logging;
 mod paths;
 mod pipeline;
 mod platform;
+mod scene_bosses_cache;
 mod settings;
 mod ui;
 
@@ -42,6 +43,25 @@ fn names_cache_path() -> PathBuf {
         &["ShinraMeter-BPSR", "names.json"],
         "ShinraMeter-BPSR-names.json",
         "APPDATA is not set; falling back to a working-directory file for the name cache",
+    );
+    if let Some(warning) = warning {
+        log::warn!("{warning}");
+    }
+    path
+}
+
+/// Where the cross-session scene -> final-boss cache (issue #131) lives:
+/// `%APPDATA%\ShinraMeter-BPSR\scene-bosses.json`. Mirrors
+/// `names_cache_path` exactly — see its doc comment for the fallback
+/// rationale. `bpsr-meter` deliberately knows nothing about this path
+/// either (see `scene_bosses_cache`'s module doc comment).
+fn scene_bosses_path() -> PathBuf {
+    let (path, warning) = paths::resolve(
+        None,
+        std::env::var("APPDATA").ok().as_deref(),
+        &["ShinraMeter-BPSR", "scene-bosses.json"],
+        "ShinraMeter-BPSR-scene-bosses.json",
+        "APPDATA is not set; falling back to a working-directory file for the scene-bosses cache",
     );
     if let Some(warning) = warning {
         log::warn!("{warning}");
@@ -251,7 +271,12 @@ fn main() -> eframe::Result {
         }
     };
 
-    let (rx_snapshot, pipeline_thread) = pipeline::spawn(rx_events, rx_command, names_cache_path());
+    let (rx_snapshot, pipeline_thread) = pipeline::spawn(
+        rx_events,
+        rx_command,
+        names_cache_path(),
+        scene_bosses_path(),
+    );
     let (tx_settings, settings_thread) = settings::spawn_writer();
 
     // Loaded once, here, rather than inside `OverlayApp::new`: issue #27
@@ -270,7 +295,7 @@ fn main() -> eframe::Result {
     // the size `ui::viewport` opens at on a first launch. Read back off a
     // default builder rather than re-deriving it, so `ui`'s private layout
     // constants stay private and the two can't drift apart.
-    let default_inner_size = ui::viewport(None).inner_size;
+    let default_inner_size = ui::viewport(None, None).inner_size;
 
     // Issue #89. Both halves of the transparency fix are decided here, before
     // any window exists, because both are creation-time-only: the wgpu backend
@@ -300,7 +325,7 @@ fn main() -> eframe::Result {
     }
 
     let native_options = eframe::NativeOptions {
-        viewport: ui::viewport(settings.window_position),
+        viewport: ui::viewport(settings.window_position, settings.window_size),
         // `unwrap_or_default()` is precisely "change nothing": it is the same
         // value `NativeOptions::default()` would have put here.
         wgpu_options: dx12_setup.unwrap_or_default(),

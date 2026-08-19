@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use libloading::Library;
-use windows::Win32::Foundation::{BOOL, HANDLE};
+use windows::Win32::Foundation::HANDLE;
+use windows::core::BOOL;
 
 use crate::error::{CaptureError, DriverRejection, ERROR_FILE_NOT_FOUND};
 use crate::install::{ensure_file, runtime_dir};
@@ -218,8 +219,13 @@ impl Api {
     pub unsafe fn shutdown_recv(&self, handle: HANDLE) {
         // SAFETY: delegated to the caller; `WinDivertShutdown` is documented
         // as callable concurrently with a blocked recv on the same handle.
+        //
+        // `BOOL` is `#[must_use]`, and the status is genuinely not wanted
+        // here: this runs on the teardown path, where the only thing a
+        // failure would change is that `recv` stays blocked a moment longer
+        // until the handle is closed below anyway.
         unsafe {
-            (self.shutdown)(handle, SHUTDOWN_RECV);
+            let _ = (self.shutdown)(handle, SHUTDOWN_RECV);
         }
     }
 
@@ -228,8 +234,12 @@ impl Api {
     /// other thread from here on.
     pub unsafe fn close(&self, handle: HANDLE) {
         // SAFETY: delegated to the caller.
+        //
+        // The `#[must_use]` `BOOL` is dropped for the same reason as in
+        // `shutdown_recv`: there is no recovery from a failed close of a
+        // handle nothing may touch again.
         unsafe {
-            (self.close)(handle);
+            let _ = (self.close)(handle);
         }
     }
 

@@ -9,6 +9,11 @@ It reads game network traffic passively to build these stats. It does not
 modify the game client, inject code, or interact with the game process in
 any way.
 
+![The overlay showing a populated damage meter: the header shows the boss name, the dungeon name, and a stat row with elapsed time, total DPS, and total damage, followed by five player rows each with a class icon, DPS, crit %, lucky %, and death count.](docs/images/overlay-demo.png)
+
+*Captured in demo mode (`SHINRA_DEMO=1`), which seeds a fixed synthetic
+encounter — the names and figures shown are not from a real parse.*
+
 ## Download
 
 1. Go to the [latest release](https://github.com/NguyenJus/ShinraMeter-BPSR/releases/latest).
