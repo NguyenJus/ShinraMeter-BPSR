@@ -251,16 +251,74 @@ fn demo_enabled_from(var: Option<&str>) -> bool {
     var.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
 }
 
-/// `(name, class, damage, crit_pct, deaths)` for each demo row, in
-/// descending-damage order. Values intentionally mirror
-/// `docs/reference/new-shinra-ex.webp` so a demo-mode capture can be diffed
-/// against the reference screenshot.
-const DEMO_ROWS: [(&str, Class, i64, f32, u32); 5] = [
-    ("Blorp", Class::Stormblade, 55_300_000, 73.0, 0),
-    ("Glorbaxian", Class::FrostMage, 55_100_000, 76.0, 1),
-    ("Zog", Class::TwinStriker, 49_900_000, 54.0, 0),
-    ("Wibble", Class::WindKnight, 17_800_000, 59.0, 0),
-    ("Fizz", Class::VerdantOracle, 10_300_000, 29.0, 0),
+/// `(name, class, damage, crit_pct, deaths, imagines)` for one `DEMO_ROWS`
+/// entry. Named so the array below reads as one type, not clippy's
+/// `type_complexity` bait.
+type DemoRow = (&'static str, Class, i64, f32, u32, [Option<i32>; 2]);
+
+/// `(name, class, damage, crit_pct, deaths, imagines)` for each demo row, in
+/// descending-damage order. The damage, crit%, and death figures
+/// intentionally mirror `docs/reference/new-shinra-ex.webp` so a demo-mode
+/// capture can be diffed against the reference screenshot (issue #88). The
+/// *names* are deliberately fictional, not the reference screenshot's real
+/// character names — this repo is public, and `CONTRIBUTING.md` tells users
+/// not to share other players' names, so a demo capture headed for the
+/// README can't republish someone else's (issue #133). The names have no
+/// counterpart in the reference screenshot to mirror, since the reference's
+/// underlying screenshot predates the Imagine column (issue #33/#128).
+///
+/// `imagines` is each row's two equipped-Imagine skill ids, demo-only and
+/// with no reference-screenshot counterpart of its own (issue #133): the
+/// reference capture predates the Imagine column, so unlike this tuple's
+/// other fields these ids aren't mirroring anything — they're picked from
+/// `imagines::imagine_of_skill_id`'s curated table purely so a demo capture
+/// shows the column doing real work instead of ten blank placeholder
+/// circles. The last row keeps one slot empty on purpose, since not every
+/// real player fills both. Folded into this tuple (rather than a separate
+/// by-index array) so a row and its Imagine pair can never drift apart —
+/// reordering `DEMO_ROWS` carries its Imagines along, and there is no second
+/// array whose length or order could silently disagree.
+const DEMO_ROWS: [DemoRow; 5] = [
+    (
+        "Blorp",
+        Class::Stormblade,
+        55_300_000,
+        73.0,
+        0,
+        [Some(3901), Some(3902)],
+    ),
+    (
+        "Glorbaxian",
+        Class::FrostMage,
+        55_100_000,
+        76.0,
+        1,
+        [Some(3903), Some(3904)],
+    ),
+    (
+        "Zog",
+        Class::TwinStriker,
+        49_900_000,
+        54.0,
+        0,
+        [Some(3905), Some(3906)],
+    ),
+    (
+        "Wibble",
+        Class::WindKnight,
+        17_800_000,
+        59.0,
+        0,
+        [Some(3907), Some(3908)],
+    ),
+    (
+        "Fizz",
+        Class::VerdantOracle,
+        10_300_000,
+        29.0,
+        0,
+        [Some(3909), None],
+    ),
 ];
 
 /// The synthetic snapshot `demo_enabled` seeds the overlay with. Values
@@ -269,26 +327,28 @@ const DEMO_ROWS: [(&str, Class, i64, f32, u32); 5] = [
 /// — plus `DEMO_ROWS`'s per-row damage/crit% pairs, so a demo-mode capture
 /// can be compared directly against that reference.
 fn demo_snapshot() -> Snapshot {
-    let row_damage_sum: i64 = DEMO_ROWS.iter().map(|(_, _, dmg, _, _)| dmg).sum();
+    let row_damage_sum: i64 = DEMO_ROWS.iter().map(|(_, _, dmg, _, _, _)| dmg).sum();
     let duration_ms = 159_000u64;
     let rows = DEMO_ROWS
         .iter()
         .enumerate()
-        .map(|(i, &(name, class, damage, crit_pct, deaths))| PlayerRow {
-            uid: i as i64 + 1,
-            name: name.to_string(),
-            class: Some(class),
-            ability_score: None,
-            season_strength: None,
-            imagines: [None, None],
-            damage,
-            dps: damage as f64 / (duration_ms as f64 / 1000.0),
-            share_pct: damage as f32 / row_damage_sum as f32 * 100.0,
-            crit_pct,
-            lucky_pct: 20.0,
-            hits: 200,
-            deaths,
-        })
+        .map(
+            |(i, &(name, class, damage, crit_pct, deaths, imagine_ids))| PlayerRow {
+                uid: i as i64 + 1,
+                name: name.to_string(),
+                class: Some(class),
+                ability_score: None,
+                season_strength: None,
+                imagines: imagine_ids,
+                damage,
+                dps: damage as f64 / (duration_ms as f64 / 1000.0),
+                share_pct: damage as f32 / row_damage_sum as f32 * 100.0,
+                crit_pct,
+                lucky_pct: 20.0,
+                hits: 200,
+                deaths,
+            },
+        )
         .collect();
     Snapshot {
         duration_ms,
@@ -500,7 +560,15 @@ impl eframe::App for OverlayApp {
                 }
             });
 
-        track_window_position(&ctx, &mut self.settings, &self.tx_settings);
+        // Read once and share with both trackers rather than each calling
+        // `ctx.input` separately — also what lets `minimized` be threaded
+        // through both as the exact same value for the same frame.
+        let (outer_rect, inner_rect, minimized) = ctx.input(|i| {
+            let viewport = i.viewport();
+            (viewport.outer_rect, viewport.inner_rect, viewport.minimized)
+        });
+        track_window_position(outer_rect, minimized, &mut self.settings, &self.tx_settings);
+        track_window_size(inner_rect, minimized, &mut self.settings, &self.tx_settings);
 
         // ~10 Hz.
         ctx.request_repaint_after(Duration::from_millis(100));
@@ -518,13 +586,16 @@ impl eframe::App for OverlayApp {
 /// A minimized window is skipped entirely: the platform parks it far
 /// off-screen (Windows uses -32000, -32000) and reports *that* as the outer
 /// position, which would otherwise be persisted and reopen the overlay
-/// somewhere the user cannot reach it.
+/// somewhere the user cannot reach it. `outer_rect` and `minimized` are read
+/// once per frame by the caller (`OverlayApp::update`) and shared with
+/// `track_window_size`, rather than each tracker re-reading `ctx.input`
+/// itself.
 fn track_window_position(
-    ctx: &egui::Context,
+    outer_rect: Option<egui::Rect>,
+    minimized: Option<bool>,
     settings: &mut Settings,
     tx_settings: &Sender<Settings>,
 ) {
-    let (outer_rect, minimized) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().minimized));
     if minimized == Some(true) {
         return;
     }
@@ -535,6 +606,39 @@ fn track_window_position(
         return;
     }
     if let Some(updated) = settings.with_window_position_if_changed([rect.min.x, rect.min.y]) {
+        *settings = updated.clone();
+        let _ = tx_settings.send(updated);
+    }
+}
+
+/// Tracks the window's inner (content) size and persists it via the same
+/// settings-writer path position uses (issue #134). `inner_rect` is reported
+/// on every single frame — including every frame of a resize gesture — so
+/// `Settings::with_window_size_if_changed` gates the send on an actual
+/// change, the same way `track_window_position` gates on an actual move.
+///
+/// A minimized window is skipped entirely: some platforms report a zeroed
+/// or otherwise meaningless inner size while minimized, which would
+/// otherwise be persisted and reopen the overlay unusably small. `inner_rect`
+/// and `minimized` are read once per frame by the caller
+/// (`OverlayApp::update`) and shared with `track_window_position`, rather
+/// than each tracker re-reading `ctx.input` itself.
+fn track_window_size(
+    inner_rect: Option<egui::Rect>,
+    minimized: Option<bool>,
+    settings: &mut Settings,
+    tx_settings: &Sender<Settings>,
+) {
+    if minimized == Some(true) {
+        return;
+    }
+    let Some(rect) = inner_rect else {
+        return;
+    };
+    if !is_plausible_size(rect.size()) {
+        return;
+    }
+    if let Some(updated) = settings.with_window_size_if_changed([rect.width(), rect.height()]) {
         *settings = updated.clone();
         let _ = tx_settings.send(updated);
     }
@@ -556,6 +660,22 @@ fn is_plausible_position(position: egui::Pos2) -> bool {
 /// real monitor arrangement, tight enough to catch Windows' -32000 parking
 /// spot for minimized windows.
 const MIN_PLAUSIBLE_COORD: f32 = -20_000.0;
+
+/// Whether a reported inner size is worth persisting at all — belt and
+/// braces behind `track_window_size`'s minimized guard, in case a platform
+/// reports a zeroed or otherwise meaningless inner size for a frame before
+/// the `minimized` flag catches up, mirroring `is_plausible_position`. The
+/// bounds are the same ones `sanitize_window_size` enforces when a
+/// persisted size is later restored, so nothing rejected here would have
+/// survived a restart anyway.
+fn is_plausible_size(size: egui::Vec2) -> bool {
+    size.x.is_finite()
+        && size.y.is_finite()
+        && size.x >= MIN_INNER_SIZE.x
+        && size.y >= MIN_INNER_SIZE.y
+        && size.x <= MAX_INNER_SIZE_DIMENSION
+        && size.y <= MAX_INNER_SIZE_DIMENSION
+}
 
 /// The persisted settings plus the channel that persists changes to disk,
 /// bundled because every draw site that touches settings needs both —
@@ -3660,18 +3780,70 @@ fn default_inner_width() -> f32 {
         + HEADER_ROW_EXTRA_WIDTH
 }
 
+/// Sane upper bound, in points, for a persisted `window_size` axis —
+/// comfortably past any real display (an 8K panel spans roughly 7680
+/// logical px even before DPI scaling, and a multi-monitor span widens that
+/// further, but nowhere near this far) so a legitimate ultra-wide setup
+/// still restores fine while a corrupted settings.json (a bit-flipped or
+/// hand-edited float) can't ask wgpu to allocate a multi-million-point
+/// swapchain.
+const MAX_INNER_SIZE_DIMENSION: f32 = 20_000.0;
+
+/// Sane upper bound, in points², for a persisted `window_size`'s total
+/// area. `MAX_INNER_SIZE_DIMENSION` alone only bounds each axis
+/// independently, so a value like `[19_999.0, 19_999.0]` — comfortably
+/// under the per-axis cap on both axes — would still ask wgpu for a
+/// ~400-million-point swapchain. 64,000,000 comfortably covers an 8K panel
+/// (7680x4320 ≈ 33.2 million) plus room for a wide multi-monitor span,
+/// while still rejecting a corrupted settings.json that maxes out both
+/// axes at once. Computed in f64 so the multiplication itself can never
+/// overflow, whatever the axis values are.
+const MAX_INNER_SIZE_AREA: f64 = 64_000_000.0;
+
+/// Clamps a persisted `window_size` to something guaranteed openable, or
+/// rejects it outright back to `None` (today's default size) if it's beyond
+/// saving. Each axis is floored at `MIN_INNER_SIZE` — the same floor
+/// `with_min_inner_size` enforces below, so a restored size is never asked
+/// to start smaller than winit would allow anyway — and the whole value is
+/// rejected when either axis is non-finite, either axis is larger than
+/// `MAX_INNER_SIZE_DIMENSION`, or the total area is larger than
+/// `MAX_INNER_SIZE_AREA`. A hand-edited or otherwise corrupted
+/// settings.json must never be able to open an unusable overlay.
+fn sanitize_window_size(size: [f32; 2]) -> Option<[f32; 2]> {
+    let [w, h] = size;
+    if !w.is_finite()
+        || !h.is_finite()
+        || w > MAX_INNER_SIZE_DIMENSION
+        || h > MAX_INNER_SIZE_DIMENSION
+        || (w as f64) * (h as f64) > MAX_INNER_SIZE_AREA
+    {
+        return None;
+    }
+    Some([w.max(MIN_INNER_SIZE.x), h.max(MIN_INNER_SIZE.y)])
+}
+
 /// Overlay window shape: always-on-top, borderless, transparent, sized to
 /// fit a full raid by default (issue #26). `window_position` is the
 /// last-saved position (issue #27, `Settings::window_position`) to reopen
 /// at, or `None` on a first launch / wiped settings file, which leaves the
-/// position to today's default OS/winit placement.
-pub fn viewport(window_position: Option<[f32; 2]>) -> egui::ViewportBuilder {
+/// position to today's default OS/winit placement. `window_size` is the
+/// last-saved inner size (issue #134, `Settings::window_size`), sanity-
+/// clamped by `sanitize_window_size` — a garbage or absent value falls back
+/// to `default_inner_width`/`default_inner_height`, never to something
+/// unusable.
+pub fn viewport(
+    window_position: Option<[f32; 2]>,
+    window_size: Option<[f32; 2]>,
+) -> egui::ViewportBuilder {
+    let inner_size = window_size
+        .and_then(sanitize_window_size)
+        .unwrap_or([default_inner_width(), default_inner_height()]);
     let mut builder = egui::ViewportBuilder::default()
         .with_always_on_top()
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(true)
-        .with_inner_size([default_inner_width(), default_inner_height()])
+        .with_inner_size(inner_size)
         .with_min_inner_size(MIN_INNER_SIZE);
     if let Some(position) = window_position {
         builder = builder.with_position(position);
@@ -3782,6 +3954,49 @@ mod tests {
         let snapshot = initial_snapshot(false);
         assert!(snapshot.rows.is_empty());
         assert_eq!(snapshot.encounter.boss_name, None);
+    }
+
+    // -- DEMO_ROWS Imagine ids (issue #142 test-coverage finding) -----------
+
+    /// Every equipped-Imagine skill id baked into `DEMO_ROWS` must resolve
+    /// through `imagine_of_skill_id` to a real curated entry, and that
+    /// entry's icon basename must have compiled-in bytes in
+    /// `imagines::IMAGINE_ICON_BYTES` — otherwise the demo capture renders
+    /// a silent blank placeholder circle instead of the icon it's meant to
+    /// show, with nothing failing to say so. This is the test a typo'd id
+    /// would have caught.
+    #[test]
+    fn every_demo_row_imagine_id_resolves_to_a_known_icon_with_bytes() {
+        for &(name, _, _, _, _, ids) in &DEMO_ROWS {
+            for id in ids.into_iter().flatten() {
+                let imagine = imagines::imagine_of_skill_id(id)
+                    .unwrap_or_else(|| panic!("{name:?}'s Imagine id {id} is not curated"));
+                assert!(
+                    imagines::IMAGINE_ICON_BYTES
+                        .iter()
+                        .any(|&(icon, _)| icon == imagine.icon),
+                    "{name:?}'s Imagine id {id} resolves to icon {:?}, which has no compiled-in bytes",
+                    imagine.icon,
+                );
+            }
+        }
+    }
+
+    /// `demo_snapshot` now carries each row's Imagine slots on the same
+    /// `DEMO_ROWS` tuple entry rather than a separate by-index array, so a
+    /// row and its Imagines can't drift apart structurally — but pin one
+    /// specific row's name to its exact Imagine ids anyway, so an
+    /// accidental reorder of `DEMO_ROWS` (which would carry the wrong name
+    /// to the wrong ids) still fails a test, not just a compile.
+    #[test]
+    fn demo_snapshot_pairs_each_row_with_its_own_imagines() {
+        let snapshot = demo_snapshot();
+        let glorbaxian = snapshot
+            .rows
+            .iter()
+            .find(|row| row.name == "Glorbaxian")
+            .expect("demo snapshot must include Glorbaxian");
+        assert_eq!(glorbaxian.imagines, [Some(3903), Some(3904)]);
     }
 
     /// The regression this guards: a future refactor that deletes or
@@ -7074,6 +7289,7 @@ mod tests {
         let mut settings = Settings {
             visible_columns: ColumnKind::ALL.to_vec(),
             window_position: None,
+            window_size: None,
         };
         settings.toggle(ColumnKind::Dps);
         let cols = settings.ordered_columns();
@@ -7439,30 +7655,18 @@ mod tests {
 
     // -- window position tracking (issue #27) -----------------------------
 
-    /// Runs one frame with `outer_rect`/`minimized` reported for the
-    /// viewport, calling `track_window_position` from inside it exactly like
-    /// `OverlayApp::update` does. Returns everything it sent on the
-    /// settings-writer channel.
+    /// Calls `track_window_position` with `outer_rect`/`minimized` exactly
+    /// as `OverlayApp::update` passes them post issue #134 review (read
+    /// once by the caller and shared with `track_window_size`, rather than
+    /// each tracker re-reading `ctx.input` itself). Returns everything it
+    /// sent on the settings-writer channel.
     fn track_one_frame(
         settings: &mut Settings,
         outer_rect: Option<egui::Rect>,
         minimized: Option<bool>,
     ) -> Vec<Settings> {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut input = egui::RawInput::default();
-        input.viewports.insert(
-            input.viewport_id,
-            egui::ViewportInfo {
-                outer_rect,
-                minimized,
-                ..Default::default()
-            },
-        );
-
-        let ctx = egui::Context::default();
-        ctx.run_ui(input, |ui| track_window_position(ui.ctx(), settings, &tx))
-            .drop_without_applying_deltas();
-
+        track_window_position(outer_rect, minimized, settings, &tx);
         drop(tx);
         rx.try_iter().collect()
     }
@@ -7527,6 +7731,167 @@ mod tests {
 
         assert!(sent.is_empty(), "a bogus position must not send");
         assert_eq!(settings.window_position, Some([100.0, 200.0]));
+    }
+
+    // -- window size tracking (issue #134) ---------------------------------
+
+    /// Calls `track_window_size` with `inner_rect`/`minimized` exactly as
+    /// `OverlayApp::update` passes them post issue #134 review (read once
+    /// by the caller and shared with `track_window_position`, rather than
+    /// each tracker re-reading `ctx.input` itself). Returns everything it
+    /// sent on the settings-writer channel.
+    fn track_size_one_frame(
+        settings: &mut Settings,
+        inner_rect: Option<egui::Rect>,
+        minimized: Option<bool>,
+    ) -> Vec<Settings> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        track_window_size(inner_rect, minimized, settings, &tx);
+        drop(tx);
+        rx.try_iter().collect()
+    }
+
+    fn inner_rect_of(width: f32, height: f32) -> Option<egui::Rect> {
+        Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(width, height),
+        ))
+    }
+
+    #[test]
+    fn track_window_size_persists_a_resized_window() {
+        let mut settings = Settings::default();
+
+        let sent = track_size_one_frame(&mut settings, inner_rect_of(640.0, 480.0), Some(false));
+
+        assert_eq!(settings.window_size, Some([640.0, 480.0]));
+        assert_eq!(sent.len(), 1, "one resize, one send");
+        assert_eq!(sent[0].window_size, Some([640.0, 480.0]));
+    }
+
+    #[test]
+    fn track_window_size_stays_quiet_when_the_window_has_not_resized() {
+        let mut settings = Settings {
+            window_size: Some([640.0, 480.0]),
+            ..Settings::default()
+        };
+
+        let sent = track_size_one_frame(&mut settings, inner_rect_of(640.0, 480.0), Some(false));
+
+        assert!(sent.is_empty(), "an unresized window must not send");
+        assert_eq!(settings.window_size, Some([640.0, 480.0]));
+    }
+
+    /// A minimized window may report a meaningless (e.g. zeroed) inner
+    /// size, so nothing reported while minimized is persisted.
+    #[test]
+    fn track_window_size_ignores_a_minimized_window() {
+        let mut settings = Settings {
+            window_size: Some([640.0, 480.0]),
+            ..Settings::default()
+        };
+
+        let sent = track_size_one_frame(&mut settings, inner_rect_of(0.0, 0.0), Some(true));
+
+        assert!(sent.is_empty(), "a minimized window must not send");
+        assert_eq!(settings.window_size, Some([640.0, 480.0]));
+    }
+
+    /// Same zeroed-size failure mode, but reported before the `minimized`
+    /// flag catches up — the plausibility floor is what rejects it.
+    #[test]
+    fn track_window_size_ignores_an_absurd_zeroed_size() {
+        let mut settings = Settings {
+            window_size: Some([640.0, 480.0]),
+            ..Settings::default()
+        };
+
+        let sent = track_size_one_frame(&mut settings, inner_rect_of(0.0, 0.0), None);
+
+        assert!(sent.is_empty(), "a bogus size must not send");
+        assert_eq!(settings.window_size, Some([640.0, 480.0]));
+    }
+
+    // -- viewport() restore + sanity clamp (issue #134) --------------------
+
+    #[test]
+    fn viewport_applies_a_restored_size_when_some() {
+        let built = viewport(None, Some([640.0, 480.0]));
+
+        assert_eq!(built.inner_size, Some(egui::vec2(640.0, 480.0)));
+    }
+
+    #[test]
+    fn viewport_applies_the_default_size_when_none() {
+        let built = viewport(None, None);
+
+        assert_eq!(
+            built.inner_size,
+            Some(egui::vec2(default_inner_width(), default_inner_height()))
+        );
+    }
+
+    #[test]
+    fn viewport_falls_back_to_default_size_for_a_too_small_persisted_value() {
+        // Below `MIN_INNER_SIZE` on both axes; the restored size must still
+        // be clamped up to the floor rather than opening an unusable sliver.
+        let built = viewport(None, Some([1.0, 1.0]));
+
+        assert_eq!(
+            built.inner_size,
+            Some(egui::vec2(MIN_INNER_SIZE.x, MIN_INNER_SIZE.y))
+        );
+    }
+
+    #[test]
+    fn viewport_falls_back_to_default_size_for_a_non_finite_persisted_value() {
+        let built = viewport(None, Some([f32::NAN, 480.0]));
+
+        assert_eq!(
+            built.inner_size,
+            Some(egui::vec2(default_inner_width(), default_inner_height())),
+            "a non-finite persisted size must be rejected outright, not clamped"
+        );
+    }
+
+    #[test]
+    fn viewport_falls_back_to_default_size_for_an_absurdly_large_persisted_value() {
+        let built = viewport(None, Some([1.0e9, 480.0]));
+
+        assert_eq!(
+            built.inner_size,
+            Some(egui::vec2(default_inner_width(), default_inner_height())),
+            "a corrupted, absurdly large persisted size must be rejected outright"
+        );
+    }
+
+    #[test]
+    fn viewport_falls_back_to_default_size_for_an_oversize_area_within_per_axis_bounds() {
+        // Each axis alone is under `MAX_INNER_SIZE_DIMENSION` (20,000), but
+        // the product is ~400 million points — the total-area bound is what
+        // must reject this, not the per-axis one.
+        let built = viewport(None, Some([19_999.0, 19_999.0]));
+
+        assert_eq!(
+            built.inner_size,
+            Some(egui::vec2(default_inner_width(), default_inner_height())),
+            "a per-axis-plausible but absurdly large-area persisted size must be rejected outright"
+        );
+    }
+
+    #[test]
+    fn viewport_reset_ignores_any_persisted_size() {
+        // `main.rs`'s tray "Reset Window" action calls `viewport(None,
+        // None)` regardless of what's persisted — this just pins that the
+        // default-size call path is unaffected by a persisted size.
+        let reset = viewport(None, None);
+        let with_persisted = viewport(None, Some([999.0, 999.0]));
+
+        assert_ne!(reset.inner_size, with_persisted.inner_size);
+        assert_eq!(
+            reset.inner_size,
+            Some(egui::vec2(default_inner_width(), default_inner_height()))
+        );
     }
 
     // -- toolbar/menu icons (issue #41, #71) -------------------------------

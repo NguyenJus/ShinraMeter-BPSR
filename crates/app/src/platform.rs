@@ -101,7 +101,11 @@ pub fn disable_aero_snap(cc: &eframe::CreationContext<'_>) {
         return;
     };
 
-    let hwnd = HWND(win32.hwnd.get());
+    // Since windows 0.62 every handle type is a newtype over `*mut c_void`
+    // rather than over `isize`, so winit's raw `NonZeroIsize` has to be cast
+    // to a pointer on the way in (and back to an integer on the way into
+    // `OVERLAY_HWND` below).
+    let hwnd = HWND(win32.hwnd.get() as *mut std::ffi::c_void);
     // Cached so `force_frame_recompute` — called from `ui.rs`, which only
     // ever has an `egui::Context`, never a window handle — can find this
     // window later without resorting to `GetForegroundWindow` or
@@ -109,7 +113,7 @@ pub fn disable_aero_snap(cc: &eframe::CreationContext<'_>) {
     // window. Stored unconditionally, even if the rest of this function
     // bails out below, since a partial Aero Snap workaround is still the
     // same live window `force_frame_recompute` needs to reach.
-    OVERLAY_HWND.store(hwnd.0, std::sync::atomic::Ordering::SeqCst);
+    OVERLAY_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::SeqCst);
     // SAFETY: `hwnd` is winit's own handle for the window that owns this
     // `CreationContext`, which is alive and on the current thread for the
     // duration of this call.
@@ -155,7 +159,10 @@ pub fn disable_aero_snap(cc: &eframe::CreationContext<'_>) {
     //
     // `SWP_NOMOVE | SWP_NOSIZE` means this call only asks for the
     // frame-change side effect, not an actual move/resize, so the
-    // position/size arguments are ignored.
+    // position/size arguments are ignored. `SWP_NOZORDER` likewise makes the
+    // `hWndInsertAfter` argument unused, which is what `None` spells now that
+    // windows models that parameter as an `Option<HWND>` rather than as the
+    // null handle `HWND(0)` used to stand in for.
     //
     // Wrapped in `app_driven_reposition` like every other direct
     // `SetWindowPos` in this crate. The wrapper is inert *today* — this runs
@@ -169,7 +176,7 @@ pub fn disable_aero_snap(cc: &eframe::CreationContext<'_>) {
     let framechanged = app_driven_reposition(|| unsafe {
         SetWindowPos(
             hwnd,
-            HWND(0),
+            None,
             0,
             0,
             0,
@@ -177,9 +184,9 @@ pub fn disable_aero_snap(cc: &eframe::CreationContext<'_>) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         )
     });
-    if !framechanged.as_bool() {
+    if let Err(err) = framechanged {
         log::warn!(
-            "SetWindowPos(SWP_FRAMECHANGED) failed; the WS_MAXIMIZEBOX clear may not have taken effect and Aero Snap may still trigger on drag"
+            "SetWindowPos(SWP_FRAMECHANGED) failed ({err}); the WS_MAXIMIZEBOX clear may not have taken effect and Aero Snap may still trigger on drag"
         );
     }
 
@@ -254,7 +261,10 @@ pub fn force_frame_recompute() {
         // handing `SetWindowPos` a null handle.
         return;
     }
-    let hwnd = HWND(raw);
+    // `OVERLAY_HWND` stores the handle as a bare integer (no atomic can hold
+    // a `*mut c_void`), so it is cast back to a pointer here — the inverse of
+    // the store in `disable_aero_snap`.
+    let hwnd = HWND(raw as *mut std::ffi::c_void);
 
     // SAFETY: `hwnd` was cached from winit's own handle for this window in
     // `disable_aero_snap`; the window lives for the whole process, so the
@@ -263,7 +273,7 @@ pub fn force_frame_recompute() {
     let framechanged = app_driven_reposition(|| unsafe {
         SetWindowPos(
             hwnd,
-            HWND(0),
+            None,
             0,
             0,
             0,
@@ -271,9 +281,9 @@ pub fn force_frame_recompute() {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         )
     });
-    if !framechanged.as_bool() {
+    if let Err(err) = framechanged {
         log::warn!(
-            "SetWindowPos(SWP_FRAMECHANGED) failed after an app-driven resize; the window's frame may be stale"
+            "SetWindowPos(SWP_FRAMECHANGED) failed after an app-driven resize ({err}); the window's frame may be stale"
         );
     }
 }
@@ -542,15 +552,14 @@ pub fn clamp_window_to_visible_area(cc: &eframe::CreationContext<'_>) {
         log::warn!("overlay window handle isn't a Win32 handle; skipping the position clamp");
         return;
     };
-    let hwnd = HWND(win32.hwnd.get());
+    let hwnd = HWND(win32.hwnd.get() as *mut std::ffi::c_void);
 
     let mut win_rect = RECT::default();
     // SAFETY: `hwnd` is winit's own handle for the window that owns this
     // `CreationContext`, alive and on the current thread; `win_rect` is a
     // valid, correctly-sized out-param for the duration of this call.
-    let got_rect = unsafe { GetWindowRect(hwnd, &mut win_rect) };
-    if !got_rect.as_bool() {
-        log::warn!("GetWindowRect failed; skipping the position clamp");
+    if let Err(err) = unsafe { GetWindowRect(hwnd, &mut win_rect) } {
+        log::warn!("GetWindowRect failed ({err}); skipping the position clamp");
         return;
     }
     let window = Rect {
@@ -578,11 +587,12 @@ pub fn clamp_window_to_visible_area(cc: &eframe::CreationContext<'_>) {
     // (`install_snap_blocker`) never mistakes this app-initiated
     // correction for a shell-driven Snap and vetoes it.
     // SAFETY: same as `GetWindowRect` above. `SWP_NOSIZE` means `cx`/`cy`
-    // are ignored, and `SWP_NOZORDER` means the second handle is ignored.
+    // are ignored, and `SWP_NOZORDER` means the `hWndInsertAfter` argument is
+    // unused — hence `None`.
     let moved = app_driven_reposition(|| unsafe {
         SetWindowPos(
             hwnd,
-            HWND(0),
+            None,
             x,
             y,
             0,
@@ -590,8 +600,8 @@ pub fn clamp_window_to_visible_area(cc: &eframe::CreationContext<'_>) {
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         )
     });
-    if !moved.as_bool() {
-        log::warn!("SetWindowPos failed while correcting the overlay's position");
+    if let Err(err) = moved {
+        log::warn!("SetWindowPos failed while correcting the overlay's position: {err}");
     }
 }
 
@@ -608,7 +618,7 @@ unsafe extern "system" fn monitor_enum_callback(
     _hdc: windows::Win32::Graphics::Gdi::HDC,
     _clip_rect: *mut windows::Win32::Foundation::RECT,
     lparam: windows::Win32::Foundation::LPARAM,
-) -> windows::Win32::Foundation::BOOL {
+) -> windows::core::BOOL {
     use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
 
     let mut info = MONITORINFO {
@@ -641,14 +651,16 @@ unsafe extern "system" fn monitor_enum_callback(
 #[cfg(windows)]
 fn enumerate_monitor_work_areas() -> Vec<Rect> {
     use windows::Win32::Foundation::LPARAM;
-    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC};
+    use windows::Win32::Graphics::Gdi::EnumDisplayMonitors;
 
     let mut monitors: Vec<Rect> = Vec::new();
     // SAFETY: see `monitor_enum_callback`'s doc comment above — same
-    // synchronous, single-threaded, non-retaining call.
+    // synchronous, single-threaded, non-retaining call. The `None` `hdc` is
+    // what the old null `HDC(0)` meant: enumerate over the whole virtual
+    // screen rather than clipping to some device context.
     let enumerated = unsafe {
         EnumDisplayMonitors(
-            HDC(0),
+            None,
             None,
             Some(monitor_enum_callback),
             LPARAM(std::ptr::addr_of_mut!(monitors) as isize),
@@ -1166,7 +1178,7 @@ pub fn install_snap_blocker(cc: &eframe::CreationContext<'_>) {
         );
         return;
     };
-    let hwnd = HWND(win32.hwnd.get());
+    let hwnd = HWND(win32.hwnd.get() as *mut std::ffi::c_void);
 
     // SAFETY: `hwnd` is winit's own handle for the window that owns this
     // `CreationContext`, alive and on the current thread; `window_proc` is
@@ -1224,7 +1236,7 @@ unsafe extern "system" fn window_proc(
         // callback; `current_rect` is a valid, correctly-sized out-param.
         let mut current_rect = RECT::default();
         let current_rect = unsafe { GetWindowRect(hwnd, &mut current_rect) }
-            .as_bool()
+            .is_ok()
             .then_some(Rect {
                 left: current_rect.left,
                 top: current_rect.top,
@@ -1594,7 +1606,7 @@ pub fn install_tray(cc: &eframe::CreationContext<'_>, default_inner_size: Option
         log::warn!("overlay window handle isn't a Win32 handle; skipping the tray subclass");
         return;
     };
-    let hwnd = HWND(win32.hwnd.get());
+    let hwnd = HWND(win32.hwnd.get() as *mut std::ffi::c_void);
 
     if let Some(size) = default_inner_size {
         DEFAULT_INNER_SIZE_PT.store(
@@ -1740,22 +1752,24 @@ const APP_ICON_RESOURCE_ID: u16 = 2;
 /// `DestroyIcon`.
 #[cfg(windows)]
 fn tray_icon_handle() -> windows::Win32::UI::WindowsAndMessaging::HICON {
-    use windows::Win32::Foundation::HMODULE;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{HICON, IDI_APPLICATION, LoadIconW};
 
     // SAFETY: `GetModuleHandleW(None)` asks for this process's own executable
     // module, which is loaded for the process's whole lifetime; the handle it
-    // returns is borrowed, not owned, so it must not be freed.
-    let module = unsafe { GetModuleHandleW(None) }.unwrap_or(HMODULE(0));
-    if module.0 != 0 {
+    // returns is borrowed, not owned, so it must not be freed. A null return
+    // is reported as `Err` rather than as a zero handle, so the failure case
+    // is the `else` of this `if let` rather than a `.0 != 0` check.
+    if let Ok(module) = unsafe { GetModuleHandleW(None) } {
         // `MAKEINTRESOURCE`: a numeric resource id is passed as a `PCWSTR`
         // whose pointer value *is* the id, not a pointer to a string.
         let name = windows::core::PCWSTR(APP_ICON_RESOURCE_ID as usize as *const u16);
         // SAFETY: `module` is this process's own module handle and `name` is
         // a well-formed `MAKEINTRESOURCE` id; a missing resource is reported
-        // as an error, not undefined behaviour.
-        if let Ok(icon) = unsafe { LoadIconW(module, name) } {
+        // as an error, not undefined behaviour. `LoadIconW` takes an
+        // `Option<HINSTANCE>`, a distinct newtype over the same pointer as
+        // `HMODULE`, so the handle is converted rather than passed through.
+        if let Ok(icon) = unsafe { LoadIconW(Some(module.into()), name) } {
             return icon;
         }
         log::info!(
@@ -1763,13 +1777,14 @@ fn tray_icon_handle() -> windows::Win32::UI::WindowsAndMessaging::HICON {
         );
     }
 
-    // SAFETY: a null module handle with an `IDI_*` id is the documented way
-    // to load a stock system icon.
-    match unsafe { LoadIconW(HMODULE(0), IDI_APPLICATION) } {
+    // SAFETY: no module handle at all (`None`, which the binding turns into
+    // the null `HINSTANCE` this used to pass explicitly) with an `IDI_*` id is
+    // the documented way to load a stock system icon.
+    match unsafe { LoadIconW(None, IDI_APPLICATION) } {
         Ok(icon) => icon,
         Err(err) => {
             log::warn!("LoadIconW(IDI_APPLICATION) failed; the tray entry will be iconless: {err}");
-            HICON(0)
+            HICON(std::ptr::null_mut())
         }
     }
 }
@@ -1841,8 +1856,10 @@ fn hide_to_tray(hwnd: windows::Win32::Foundation::HWND) {
     // on the current thread for the duration of this callback. `SW_HIDE`
     // sends `WM_WINDOWPOSCHANGING` with `SWP_NOMOVE | SWP_NOSIZE`, which
     // `window_proc`'s `already_pinned` check lets through untouched, so no
-    // `app_driven_reposition` exemption is needed.
-    unsafe { ShowWindow(hwnd, SW_HIDE) };
+    // `app_driven_reposition` exemption is needed. `ShowWindow`'s
+    // `#[must_use]` `BOOL` reports whether the window *was* visible, not
+    // whether the call succeeded, so there is nothing to check.
+    let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
     log::info!("overlay minimized to the notification area");
 }
 
@@ -1860,14 +1877,16 @@ fn restore_from_tray(hwnd: windows::Win32::Foundation::HWND) {
     // `SW_HIDE` took away.
     // SAFETY: `hwnd` is the window this subclass is installed on, alive and
     // on the current thread. Neither call moves or resizes the window, so
-    // neither can be vetoed by `window_proc`.
+    // neither can be vetoed by `window_proc`. Each `#[must_use]` `BOOL` is
+    // dropped on purpose: `ShowWindow`'s reports the window's *previous*
+    // visibility rather than success, and `SetForegroundWindow` is
+    // best-effort — Windows refuses foreground activation from a process that
+    // doesn't currently own it, and there is nothing useful to do about that
+    // beyond leaving the window visible.
     unsafe {
-        ShowWindow(hwnd, SW_SHOW);
-        ShowWindow(hwnd, SW_RESTORE);
-        // Best-effort: Windows refuses foreground activation from a process
-        // that doesn't currently own it, and there is nothing useful to do
-        // about that beyond leaving the window visible.
-        SetForegroundWindow(hwnd);
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = SetForegroundWindow(hwnd);
     }
     remove_tray_icon(hwnd);
     log::info!("overlay restored from the notification area");
@@ -1912,7 +1931,7 @@ fn monitor_work_area_for(hwnd: windows::Win32::Foundation::HWND) -> Option<Rect>
 /// DPI scale.
 #[cfg(windows)]
 fn reset_window(hwnd: windows::Win32::Foundation::HWND) {
-    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowRect, SW_RESTORE, SW_SHOW, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
@@ -1922,10 +1941,12 @@ fn reset_window(hwnd: windows::Win32::Foundation::HWND) {
     // Un-hide first: a reset that left the window invisible would defeat the
     // whole point of the command.
     // SAFETY: `hwnd` is the window this subclass is installed on, alive and
-    // on the current thread.
+    // on the current thread. The `#[must_use]` `BOOL`s are dropped for the
+    // same reason as in `restore_from_tray`: they report prior visibility,
+    // not success.
     unsafe {
-        ShowWindow(hwnd, SW_SHOW);
-        ShowWindow(hwnd, SW_RESTORE);
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(hwnd, SW_RESTORE);
     }
     remove_tray_icon(hwnd);
 
@@ -1953,8 +1974,8 @@ fn reset_window(hwnd: windows::Win32::Foundation::HWND) {
             let mut current = RECT::default();
             // SAFETY: same as above; `current` is a valid, correctly-sized
             // out-param.
-            if !unsafe { GetWindowRect(hwnd, &mut current) }.as_bool() {
-                log::warn!("GetWindowRect failed; can't reset the overlay's window");
+            if let Err(err) = unsafe { GetWindowRect(hwnd, &mut current) } {
+                log::warn!("GetWindowRect failed ({err}); can't reset the overlay's window");
                 return;
             }
             (current.right - current.left, current.bottom - current.top)
@@ -1966,12 +1987,12 @@ fn reset_window(hwnd: windows::Win32::Foundation::HWND) {
     // Snap blocker can't mistake this for a shell-driven Snap — a default
     // size centered on a work area can land within `SNAP_SHAPE_TOLERANCE` of
     // a half/quarter shape.
-    // SAFETY: same as above; `SWP_NOZORDER` means the second handle is
-    // ignored.
+    // SAFETY: same as above; `SWP_NOZORDER` means the `hWndInsertAfter`
+    // argument is unused — hence `None`.
     let moved = app_driven_reposition(|| unsafe {
         SetWindowPos(
             hwnd,
-            HWND(0),
+            None,
             target.left,
             target.top,
             target.width(),
@@ -1979,12 +2000,12 @@ fn reset_window(hwnd: windows::Win32::Foundation::HWND) {
             SWP_NOZORDER,
         )
     });
-    if !moved.as_bool() {
-        log::warn!("SetWindowPos failed while resetting the overlay's window");
+    if let Err(err) = moved {
+        log::warn!("SetWindowPos failed while resetting the overlay's window: {err}");
         return;
     }
     // SAFETY: same as above; best-effort, see `restore_from_tray`.
-    unsafe { SetForegroundWindow(hwnd) };
+    let _ = unsafe { SetForegroundWindow(hwnd) };
     log::info!(
         "reset the overlay to ({}, {}) {}x{}",
         target.left,
@@ -2029,45 +2050,54 @@ fn show_tray_menu(hwnd: windows::Win32::Foundation::HWND) {
             TRAY_MENU_RESET_WINDOW as usize,
             windows::core::w!("Reset Window"),
         )
-        .as_bool()
+        .is_ok()
             && AppendMenuW(
                 menu,
                 MF_STRING,
                 TRAY_MENU_EXIT as usize,
                 windows::core::w!("Exit"),
             )
-            .as_bool()
+            .is_ok()
     };
     if !appended {
         log::warn!("AppendMenuW failed; the tray menu would be incomplete, so it isn't shown");
         // SAFETY: `menu` is a live, unowned menu handle not attached to any
-        // window, so destroying it here is the only cleanup needed.
-        unsafe { DestroyMenu(menu) };
+        // window, so destroying it here is the only cleanup needed. The
+        // result is dropped: this is already the failure path, and a leaked
+        // menu handle is not something the app can do anything about.
+        let _ = unsafe { DestroyMenu(menu) };
         return;
     }
 
     let mut cursor = POINT::default();
     // SAFETY: `cursor` is a valid, correctly-sized out-param.
-    if !unsafe { GetCursorPos(&mut cursor) }.as_bool() {
-        log::warn!("GetCursorPos failed; showing the tray menu at the screen origin");
+    if let Err(err) = unsafe { GetCursorPos(&mut cursor) } {
+        log::warn!("GetCursorPos failed ({err}); showing the tray menu at the screen origin");
     }
 
     // SAFETY: `hwnd` is the window this subclass is installed on, alive and
     // on the current thread; `TPM_RETURNCMD` makes `TrackPopupMenu` return
     // the selected id (or 0) instead of posting a `WM_COMMAND`.
+    // `nReserved` is an `Option<i32>` documented as "must be zero", so `None`
+    // — which the binding turns into that zero — is the honest spelling. The
+    // three `#[must_use]` results around the `TrackPopupMenu` call are dropped
+    // deliberately: `SetForegroundWindow` is best-effort (see
+    // `restore_from_tray`), `PostMessageW` is the KB135788 dismissal nudge,
+    // and `DestroyMenu` tears down a menu that is already finished with —
+    // none of the three has a recovery worth writing.
     let selected = unsafe {
-        SetForegroundWindow(hwnd);
+        let _ = SetForegroundWindow(hwnd);
         let selected = TrackPopupMenu(
             menu,
             TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_BOTTOMALIGN,
             cursor.x,
             cursor.y,
-            0,
+            None,
             hwnd,
             None,
         );
-        PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
-        DestroyMenu(menu);
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
         selected
     };
 
@@ -2083,8 +2113,10 @@ fn show_tray_menu(hwnd: windows::Win32::Foundation::HWND) {
             remove_tray_icon(hwnd);
             // SAFETY: `hwnd` is this subclass's window; posting (rather than
             // sending) `WM_CLOSE` lets the menu's modal loop unwind first.
-            if !unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) }.as_bool() {
-                log::warn!("PostMessageW(WM_CLOSE) failed; the tray Exit command did nothing");
+            if let Err(err) = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) } {
+                log::warn!(
+                    "PostMessageW(WM_CLOSE) failed ({err}); the tray Exit command did nothing"
+                );
             }
         }
         None => {}
@@ -2132,9 +2164,9 @@ pub fn cursor_position(pixels_per_point: f32) -> Option<egui::Pos2> {
     let mut point = POINT::default();
     // SAFETY: `point` is a valid, correctly-sized out-param for the
     // duration of this call.
-    if !unsafe { GetCursorPos(&mut point) }.as_bool() {
+    if let Err(err) = unsafe { GetCursorPos(&mut point) } {
         log::warn!(
-            "GetCursorPos failed; falling back to the window-relative pointer reconstruction"
+            "GetCursorPos failed ({err}); falling back to the window-relative pointer reconstruction"
         );
         return None;
     }
