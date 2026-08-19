@@ -44,16 +44,22 @@ pub struct EnemyState {
     pub peak_hp: Option<u64>,
     pub lowest_pct: Option<f64>,
     pub took_damage: bool,
-    /// Whether this enemy has been observed dying during the current fight
-    /// (issue #124) — either a `DamageEvent::is_dead` naming it as the
-    /// victim, or an `EnemyHp` syncing its `curr_hp` to 0. Per-encounter
-    /// like `took_damage`, and cleared by `Meter::reset` for the same
-    /// reason: the entity may respawn for the next pull.
+    /// When this enemy was observed dying during the current fight (issue
+    /// #124), as a rank in the encounter's death order: `Some(1)` died
+    /// first, `Some(2)` second, `None` has not been seen to die. Set by
+    /// either a `DamageEvent::is_dead` naming it as the victim or an
+    /// `EnemyHp` syncing its `curr_hp` to 0, whichever lands first.
+    /// Per-encounter like `took_damage`, and cleared by `Meter::reset` for
+    /// the same reason: the entity may respawn for the next pull.
     ///
-    /// Exists so `Meter::end_fight_on_boss_death` can ask "is another boss in
-    /// this encounter still alive?" without depending on an HP sync that may
-    /// never arrive for a corpse.
-    pub dead: bool,
+    /// Recording an *order* rather than a bare flag serves
+    /// `Meter::recompute_boss`: once every damaged enemy in a multi-phase
+    /// fight is dead, the most recently killed one is the phase the party
+    /// actually just finished, and is what the header should keep naming.
+    /// A bare flag would leave that tie to be broken on `max_hp`, which in a
+    /// phased fight can name the *first* phase (issue #124's premise is that
+    /// an earlier phase carries the larger pool).
+    pub death_order: Option<u64>,
     /// Monster template id, from `EnemyHp::monster_id` (issue #9 slice 2).
     /// Survives `Meter::reset` like the rest of `EnemyState` — only a
     /// `ServerChange` clears the enemy map itself.
@@ -97,7 +103,7 @@ impl EnemyState {
     /// living one only skips the instant freeze and falls back to the idle
     /// timeout, which is always safe.
     pub fn is_alive(&self) -> bool {
-        !self.dead && self.curr_hp != Some(0)
+        self.death_order.is_none() && self.curr_hp != Some(0)
     }
 }
 
@@ -125,7 +131,7 @@ mod tests {
             peak_hp: Some(max_hp),
             lowest_pct,
             took_damage: true,
-            dead: false,
+            death_order: None,
             monster_id: None,
         }
     }
@@ -139,7 +145,7 @@ mod tests {
             peak_hp: Some(peak_hp),
             lowest_pct,
             took_damage: true,
-            dead: false,
+            death_order: None,
             monster_id: None,
         }
     }

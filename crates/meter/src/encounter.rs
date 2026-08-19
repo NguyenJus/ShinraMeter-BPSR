@@ -115,6 +115,11 @@ pub struct Meter {
     /// which is what the user means by it. Cleared by `reset` (and so by the
     /// `ServerChanged` path, which resets first).
     fight_end_boss_id: Option<u32>,
+    /// How many distinct enemies have been seen to die since the last reset
+    /// (issue #124). Hands out `EnemyState::death_order` ranks, which
+    /// `recompute_boss` uses to keep the most recently killed boss on the
+    /// header once a phased fight's phases are all dead.
+    deaths_seen: u64,
     reset_cfg: ResetConfig,
     fight_cfg: FightConfig,
 }
@@ -134,6 +139,7 @@ impl Meter {
             scene_bosses: HashMap::new(),
             fight_end_ms: None,
             fight_end_boss_id: None,
+            deaths_seen: 0,
             reset_cfg: ResetConfig::default(),
             fight_cfg: FightConfig::default(),
         }
@@ -431,13 +437,15 @@ impl Meter {
         }
 
         if d.target_kind == EntityKind::Monster {
-            let enemy = self.enemies.entry(d.target_uid).or_default();
-            enemy.took_damage = true;
-            // issue #124: remember that this one died, so the "is any other
-            // boss in this encounter still alive?" question below has an
-            // answer even when no HP sync ever reports the corpse at 0.
+            self.enemies.entry(d.target_uid).or_default().took_damage = true;
+            // issue #124: remember that this one died, and in what order, so
+            // the "is any other boss in this encounter still alive?" question
+            // below has an answer even when no HP sync ever reports the
+            // corpse at 0 — and so `recompute_boss` can keep the header on
+            // the phase that just fell. Must run before `recompute_boss`,
+            // which reads both.
             if d.is_dead {
-                enemy.dead = true;
+                self.mark_enemy_dead(d.target_uid);
             }
             self.recompute_boss();
             // issue #78: a recognized boss dying ends the fight now, rather
@@ -533,6 +541,25 @@ impl Meter {
         }
     }
 
+    /// Records that `uid` has died, assigning it the next rank in this
+    /// encounter's death order (issue #124). Idempotent: the first signal
+    /// wins, so a death packet followed by the corpse's HP sync to 0 (or a
+    /// retransmit of either) does not re-stamp the rank and reshuffle
+    /// `recompute_boss`'s view of who fell last.
+    fn mark_enemy_dead(&mut self, uid: i64) {
+        let next = self.deaths_seen + 1;
+        let assigned = match self.enemies.get_mut(&uid) {
+            Some(enemy) if enemy.death_order.is_none() => {
+                enemy.death_order = Some(next);
+                true
+            }
+            _ => false,
+        };
+        if assigned {
+            self.deaths_seen = next;
+        }
+    }
+
     /// Whether some enemy other than `dying_uid` is a recognized boss that
     /// has taken damage this fight and is not known to be dead (issue #124).
     ///
@@ -543,6 +570,14 @@ impl Meter {
     /// [`EnemyState::is_alive`], which counts an enemy whose HP was never
     /// observed as alive — see its doc comment for why that asymmetry is the
     /// safe one.
+    ///
+    /// Mostly a backstop, since `recompute_boss` now ranks a living
+    /// recognized boss above a dead one and so usually moves `boss_uid` off
+    /// the corpse before this is reached at all. What it still catches is the
+    /// enemy `recompute_boss` cannot rank: one with neither `max_hp` nor
+    /// `curr_hp` is filtered out of the ranking entirely, so a living damaged
+    /// boss known only by its `monster_id` would otherwise be invisible and
+    /// the dead phase's latch would fire over the top of it.
     fn has_other_living_boss(&self, dying_uid: i64) -> bool {
         self.enemies.iter().any(|(uid, e)| {
             *uid != dying_uid
@@ -658,15 +693,6 @@ impl Meter {
                 // high reads as 100% of peak rather than as a stale ratio.
                 // See `EnemyState::pct` for why the peak exists at all.
                 enemy.peak_hp = Some(enemy.peak_hp.map_or(curr, |peak| peak.max(curr)));
-                // issue #124: an HP sync to 0 is the other death signal (see
-                // the `end_fight_on_boss_death` call below), and it is the
-                // one that survives a missed death packet. Latch it the same
-                // way `apply_damage` latches `is_dead`, so a corpse whose HP
-                // later resyncs upward still reads as dead for the rest of
-                // this fight.
-                if curr == 0 {
-                    enemy.dead = true;
-                }
             }
             if e.max_hp.is_some() {
                 enemy.max_hp = e.max_hp;
@@ -677,6 +703,16 @@ impl Meter {
             if let Some(pct) = enemy.pct() {
                 enemy.lowest_pct = Some(enemy.lowest_pct.map_or(pct, |lp| lp.min(pct)));
             }
+        }
+
+        // issue #124: an HP sync to 0 is the other death signal (see the
+        // `end_fight_on_boss_death` call below), and the one that survives a
+        // missed death packet. Latched the same way `apply_damage` latches
+        // `is_dead`, so a corpse whose HP later resyncs upward still reads as
+        // dead for the rest of this fight. Before `recompute_boss`, which
+        // ranks on it.
+        if e.curr_hp == Some(0) {
+            self.mark_enemy_dead(e.uid);
         }
 
         self.recompute_boss();
@@ -749,7 +785,25 @@ impl Meter {
     ///    outranks everything else regardless of tier or HP. Without it,
     ///    within the `curr_hp`-only tier an *undamaged* trash add at 3M
     ///    outranks a real boss burned down to 2M of a 10M pool.
-    /// 2. **HP tier**: a known `max_hp` (tier 1) outranks a `curr_hp`-only
+    /// 2. **Alive** (issue #124). Among equally-recognized enemies a living
+    ///    one outranks a dead one, so once a phased boss's Origin phase has
+    ///    fallen and the party is hitting Continuation, the header follows
+    ///    the phase actually being fought — and Continuation's own death
+    ///    then latches the fight end through the ordinary
+    ///    `boss_uid == target_uid` path instead of falling through to the
+    ///    idle timeout. Deliberately *below* `recognized`: a dead recognized
+    ///    boss must still outrank a living unrecognized add, or the header
+    ///    would flip to a straggling trash mob the instant the boss died,
+    ///    which is exactly what issue #78's post-kill hold exists to avoid.
+    /// 3. **Death order** among the dead (issue #124): the most recently
+    ///    killed wins. This only ever discriminates when everything damaged
+    ///    is dead — the ordinary end of a fight — where it keeps the header
+    ///    on the boss the party just killed. A phased fight would otherwise
+    ///    fall back to `max_hp` here and name the *first* phase, since
+    ///    issue #124's premise is that an earlier phase carries the larger
+    ///    pool; that would also break the final phase's own death latch.
+    ///    Living enemies all share rank 0, so this never perturbs them.
+    /// 4. **HP tier**: a known `max_hp` (tier 1) outranks a `curr_hp`-only
     ///    enemy (tier 0), however large that current HP is — `max_hp` is the
     ///    real HP-side boss signal, while current HP is a moving number a
     ///    healthy trash mob can top while the boss sits at 10%. A
@@ -757,7 +811,7 @@ impl Meter {
     ///    of zero: otherwise a wire value that varint-decodes to 0 would win
     ///    tier 1 outright over a real mid-pull boss at 5M. This matches
     ///    `EnemyState::pct`, which already guards on `max > 0`.
-    /// 3. **HP magnitude** within a tier, then **uid** to tie-break
+    /// 5. **HP magnitude** within a tier, then **uid** to tie-break
     ///    deterministically: `HashMap` iteration order is unspecified, so
     ///    breaking ties on `hp` alone let `boss_uid` flip between calls for
     ///    two enemies sharing the same `max_hp`.
@@ -771,14 +825,20 @@ impl Meter {
             .filter(|(_, e)| e.took_damage)
             .filter_map(|(uid, e)| {
                 let recognized = u8::from(e.monster_id.is_some_and(tables::is_boss_monster));
+                let alive = u8::from(e.is_alive());
+                // Living enemies all share death rank 0 so the key is inert
+                // for them; among the dead it orders by who fell last.
+                let died = e.death_order.unwrap_or(0);
                 match (e.max_hp.filter(|max| *max > 0), e.curr_hp) {
-                    (Some(max), _) => Some((*uid, recognized, 1u8, max)),
-                    (None, Some(curr)) => Some((*uid, recognized, 0u8, curr)),
+                    (Some(max), _) => Some((*uid, recognized, alive, died, 1u8, max)),
+                    (None, Some(curr)) => Some((*uid, recognized, alive, died, 0u8, curr)),
                     (None, None) => None,
                 }
             })
-            .max_by_key(|(uid, recognized, tier, hp)| (*recognized, *tier, *hp, *uid))
-            .map(|(uid, _, _, _)| uid);
+            .max_by_key(|(uid, recognized, alive, died, tier, hp)| {
+                (*recognized, *alive, *died, *tier, *hp, *uid)
+            })
+            .map(|(uid, ..)| uid);
 
         let monster_id = self
             .boss_uid
@@ -840,9 +900,9 @@ impl Meter {
             enemy.lowest_pct = None;
             enemy.took_damage = false;
             // Per-encounter like `took_damage` (issue #124): the entity may
-            // respawn for the next pull, and a stale corpse flag would make
+            // respawn for the next pull, and a stale corpse rank would make
             // `has_other_living_boss` under-report a boss that is up again.
-            enemy.dead = false;
+            enemy.death_order = None;
         }
         self.fight_start_ms = None;
         // Every reset reason (manual, boss-HP rollback, server change, and
@@ -2278,6 +2338,11 @@ mod tests {
         /// "Boss - Crimson Foxen": a recognized boss in no phase group, so a
         /// stand-in for the *next* boss of a raid instance.
         const OTHER_BOSS: u32 = 10_041;
+        /// "Golden Nappo": named but `MonsterType == 0`, so a straggling add
+        /// that `is_boss_monster` rejects.
+        const TRASH: u32 = 10_900;
+        /// Any `tables::is_dungeon_scene` id, for the issue #125 latch.
+        const DUNGEON_SCENE: u32 = 1_001;
 
         fn window() -> u64 {
             FightConfig::default().phase_resume_window_ms
@@ -2359,17 +2424,21 @@ mod tests {
         }
 
         #[test]
-        fn a_damaged_boss_with_unobserved_hp_counts_as_living() {
-            // Pins the asymmetry documented on `EnemyState::is_alive`: an
-            // enemy whose current HP was never synced is treated as alive, so
-            // the latch is skipped and the idle timeout — always safe — ends
-            // the fight instead.
+        fn a_damaged_boss_with_no_hp_at_all_counts_as_living() {
+            // Pins `has_other_living_boss` on its own, without help from the
+            // ranking key: an enemy with neither `max_hp` nor `curr_hp` is
+            // unrankable, so `recompute_boss` cannot move `boss_uid` off the
+            // dying phase and the guard is the only thing standing between
+            // this fight and an early end. It also pins the asymmetry
+            // documented on `EnemyState::is_alive` — never-observed HP counts
+            // as alive, so the fight falls back to the idle timeout, which is
+            // always safe.
             let mut m = Meter::new();
             m.apply(&hp(10, 900, 1_000, ORIGIN, 0));
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
                 uid: 11,
                 curr_hp: None,
-                max_hp: Some(500),
+                max_hp: None,
                 monster_id: Some(CONTINUATION),
                 timestamp_ms: 0,
             }));
@@ -2377,6 +2446,7 @@ mod tests {
             m.apply(&hit(11, 100, 200, false));
             m.apply(&hit(10, 100, 300, true));
 
+            assert_eq!(m.boss_uid, Some(10), "the other boss is unrankable");
             assert_eq!(m.fight_end_ms, None);
         }
 
@@ -2496,26 +2566,120 @@ mod tests {
 
         #[test]
         fn a_three_phase_fight_stays_one_encounter_end_to_end() {
-            // Each phase is selected as boss in turn (increasing `max_hp`),
-            // dies, latches the end, and is resumed by the next — proving
-            // `fight_end_boss_id` re-arms rather than sticking to phase one.
+            // Deliberately in issue #124's shape: `max_hp` *decreases* across
+            // the phases, so on HP alone the first phase would stay selected
+            // forever. Each phase is selected in turn anyway, dies, latches
+            // the end, and is resumed by the next — proving both that
+            // `fight_end_boss_id` re-arms rather than sticking to phase one,
+            // and that the header follows the phase being fought.
             let mut m = Meter::new();
-            m.apply(&hp(10, 500, 500, ORIGIN, 0));
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: DUNGEON_SCENE,
+            });
+
+            m.apply(&hp(10, 2_000, 2_000, ORIGIN, 0));
             m.apply(&hit(10, 100, 100, false));
+            assert_eq!(m.snapshot(100).encounter.boss_monster_id, Some(ORIGIN));
             m.apply(&hit(10, 100, 1_000, true));
             assert_eq!(m.fight_end_boss_id, Some(ORIGIN));
 
             m.apply(&hp(11, 1_000, 1_000, CONTINUATION, 5_000));
             m.apply(&hit(11, 100, 5_000, false));
+            assert_eq!(
+                m.snapshot(5_000).encounter.boss_monster_id,
+                Some(CONTINUATION),
+                "the header follows the living phase, not the bigger corpse"
+            );
             m.apply(&hit(11, 100, 6_000, true));
             assert_eq!(m.fight_end_boss_id, Some(CONTINUATION));
 
-            m.apply(&hp(12, 2_000, 2_000, FINAL, 10_000));
+            m.apply(&hp(12, 500, 500, FINAL, 10_000));
             m.apply(&hit(12, 100, 10_000, false));
-
-            assert_eq!(m.fight_start_ms, Some(100));
+            assert_eq!(m.snapshot(10_000).encounter.boss_monster_id, Some(FINAL));
+            assert_eq!(m.fight_start_ms, Some(100), "one encounter throughout");
             assert_eq!(m.fight_state(10_100), FightState::Active);
-            assert_eq!(m.snapshot(10_100).total_damage, 500);
+
+            // The final phase's death latches through the ordinary
+            // `boss_uid == target_uid` path — no fall-through to the idle
+            // timeout — and the header holds on the phase just killed rather
+            // than snapping back to the larger-max-hp corpse.
+            m.apply(&hit(12, 100, 11_000, true));
+            assert_eq!(m.fight_end_ms, Some(11_000));
+            assert_eq!(m.fight_state(11_100), FightState::Ended);
+            assert_eq!(m.snapshot(11_100).encounter.boss_monster_id, Some(FINAL));
+            assert_eq!(m.snapshot(11_100).total_damage, 600);
+
+            // issue #125: the dungeon's learned final boss converges on the
+            // last phase engaged, which is the fight's real final phase.
+            assert_eq!(m.scene_bosses.get(&DUNGEON_SCENE), Some(&FINAL));
+        }
+
+        // -- boss selection (issue #124 extends `recompute_boss`) -----------
+
+        #[test]
+        fn a_dead_recognized_boss_still_outranks_a_living_trash_add() {
+            // The regression the key order exists to prevent: `recognized` is
+            // compared before `alive`, so issue #78's post-kill header holds
+            // on the boss instead of flipping to whatever straggler is still
+            // swinging — even though the add is alive and has the larger HP
+            // pool.
+            let mut m = Meter::new();
+            m.apply(&hp(10, 500, 500, ORIGIN, 0));
+            m.apply(&hp(11, 9_000, 9_000, TRASH, 0));
+            m.apply(&hit(10, 100, 100, false));
+            m.apply(&hit(11, 100, 150, false));
+            m.apply(&hit(10, 100, 200, true));
+
+            assert_eq!(m.boss_uid, Some(10));
+            assert_eq!(m.snapshot(300).encounter.boss_monster_id, Some(ORIGIN));
+            assert_eq!(m.fight_end_ms, Some(200), "the add cannot block the latch");
+        }
+
+        #[test]
+        fn when_every_damaged_enemy_is_dead_the_last_one_killed_stays_selected() {
+            // The ordinary end of a fight: `alive` is uniformly false, so
+            // selection falls to the death order and holds on the phase the
+            // party actually just finished. Without that key the larger-pool
+            // first phase would win on `max_hp` and the frozen header would
+            // name the wrong boss.
+            let mut m = Meter::new();
+            m.apply(&hp(10, 2_000, 2_000, ORIGIN, 0));
+            m.apply(&hp(11, 500, 500, CONTINUATION, 0));
+            m.apply(&hit(10, 100, 100, false));
+            m.apply(&hit(11, 100, 150, false));
+            m.apply(&hit(10, 100, 200, true));
+            m.apply(&hit(11, 100, 300, true));
+
+            assert_eq!(m.boss_uid, Some(11));
+            assert_eq!(
+                m.snapshot(400).encounter.boss_monster_id,
+                Some(CONTINUATION)
+            );
+        }
+
+        #[test]
+        fn a_single_boss_stays_selected_after_its_own_kill() {
+            // The degenerate case the key order must leave untouched.
+            let mut m = Meter::new();
+            m.apply(&hp(10, 500, 500, ORIGIN, 0));
+            m.apply(&hit(10, 100, 100, false));
+            m.apply(&hit(10, 100, 200, true));
+
+            assert_eq!(m.boss_uid, Some(10));
+            assert_eq!(m.snapshot(300).encounter.boss_monster_id, Some(ORIGIN));
+        }
+
+        #[test]
+        fn selection_moves_to_the_living_phase_even_with_a_smaller_hp_pool() {
+            let mut m = Meter::new();
+            m.apply(&hp(10, 2_000, 2_000, ORIGIN, 0));
+            m.apply(&hp(11, 500, 500, CONTINUATION, 0));
+            m.apply(&hit(10, 100, 100, false));
+            m.apply(&hit(11, 100, 150, false));
+            assert_eq!(m.boss_uid, Some(10), "both alive: the larger pool wins");
+
+            m.apply(&hit(10, 100, 200, true));
+            assert_eq!(m.boss_uid, Some(11), "the living phase takes over");
         }
     }
 
