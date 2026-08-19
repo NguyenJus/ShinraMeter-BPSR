@@ -252,7 +252,28 @@ impl Pipeline {
     /// triggers a reset: it only invalidates entity/scene state and
     /// freezes the fight clock, leaving the displayed stats on screen.
     pub fn step(&mut self, ev: proto::ProtocolEvent) -> Option<meter::ResetReason> {
-        let reason = self.meter.apply(&map_event(ev));
+        self.apply_mapped(map_event(ev))
+    }
+
+    /// `step`, but a `ServerChanged` event is stamped with `now_ms` instead
+    /// of the wall clock. Test-only seam: `map_event` reads the real clock
+    /// (`ServerChanged` carries no timestamp of its own), which makes the
+    /// production timescale — epoch milliseconds — impossible to control
+    /// from a test that also wants deterministic damage timestamps. This
+    /// lets a test drive both on the same, controllable scale.
+    #[cfg(test)]
+    pub fn step_at(&mut self, ev: proto::ProtocolEvent, now_ms: u64) -> Option<meter::ResetReason> {
+        let mapped = match map_event(ev) {
+            meter::ProtocolEvent::ServerChanged { .. } => meter::ProtocolEvent::ServerChanged {
+                timestamp_ms: now_ms,
+            },
+            other => other,
+        };
+        self.apply_mapped(mapped)
+    }
+
+    fn apply_mapped(&mut self, mapped: meter::ProtocolEvent) -> Option<meter::ResetReason> {
+        let reason = self.meter.apply(&mapped);
         if let Some(reason) = reason {
             log::debug!("meter reset: {reason:?}");
             self.save_names_cache();
@@ -631,16 +652,35 @@ mod tests {
 
     /// issue #138: zoning/reconnecting must not wipe the numbers the
     /// player is still reading, so a `ServerChanged` event must not report
-    /// a reset and must leave the accumulated stats on screen.
+    /// a reset, must leave the accumulated stats on screen, and must freeze
+    /// the fight clock at the moment of the reconnect rather than the
+    /// caller's clock. `ServerChanged` carries no timestamp of its own —
+    /// `map_event` stamps it with the real wall clock (epoch milliseconds)
+    /// — so this uses `step_at` to control that stamp on the same
+    /// epoch-scale timeline as the damage event below.
     #[test]
     fn server_changed_keeps_the_snapshot_on_screen() {
         let mut p = Pipeline::new();
-        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)));
-        let reason = p.step(proto::ProtocolEvent::ServerChanged);
+        let base = now_ms();
+        p.step(proto::ProtocolEvent::Damage(damage(1, 700, base)));
+        let reason = p.step_at(proto::ProtocolEvent::ServerChanged, base + 1_000);
         assert_eq!(reason, None);
-        let snap = p.snapshot(2_000);
+
+        let snap = p.snapshot(base + 2_000);
         assert_eq!(snap.total_damage, 700);
         assert!(!snap.rows.is_empty());
+        assert_eq!(
+            snap.duration_ms, 1_000,
+            "clock must freeze at the reconnect moment"
+        );
+
+        // The freeze must hold, not just happen to match at one snapshot
+        // time: a later snapshot must read the exact same duration.
+        let later = p.snapshot(base + 60_000);
+        assert_eq!(
+            later.duration_ms, 1_000,
+            "duration must stay pinned while held"
+        );
     }
 
     mod names_cache_wiring {

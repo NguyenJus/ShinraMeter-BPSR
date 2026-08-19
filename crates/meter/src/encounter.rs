@@ -1734,25 +1734,33 @@ mod tests {
         }
 
         #[test]
-        fn server_change_cooldown_uses_change_time_not_stale_last_event_ms() {
+        fn rollback_cooldown_anchors_on_the_reconnect_new_fight_reset() {
             let mut m = Meter::new();
             // Old fight, long since idle.
             m.apply(&boss_hit(10, 0));
             m.apply(&hp(10, 100, 100, 0));
 
-            // Server change detected 5 minutes later.
+            // Server change detected 5 minutes later. This no longer resets
+            // (issue #138) -- it only latches `fight_end_ms`, so it does
+            // *not* anchor the cooldown below.
             m.apply(&ProtocolEvent::ServerChanged {
                 timestamp_ms: 300_000,
             });
 
-            // New zone: boss picked up again almost immediately.
-            m.apply(&boss_hit(10, 300_050));
-            m.apply(&hp(10, 55, 100, 300_060));
-            let r = m.apply(&hp(10, 96, 100, 300_100));
+            // New zone: boss picked up again well after the reconnect
+            // signal itself. This hit is what actually anchors the
+            // cooldown -- it fires the `NewFight` reset
+            // (`last_reset_ms = 300_800`) that clears the held fight, not
+            // the `ServerChanged` moment above.
+            m.apply(&boss_hit(10, 300_800));
+            m.apply(&hp(10, 55, 100, 300_850));
+            let r = m.apply(&hp(10, 96, 100, 302_400));
 
-            // This looks like a rollback shape, but the cooldown (anchored to
-            // the server-change moment, not the stale last-event time) hasn't
-            // elapsed yet -> must be suppressed.
+            // 302_400 - 300_800 = 1_600ms: still inside the cooldown
+            // anchored on the reconnect hit -> suppressed. If the cooldown
+            // were (wrongly) anchored on the `ServerChanged` moment instead,
+            // 302_400 - 300_000 = 2_400ms would already be past the
+            // 2_000ms cooldown and this rollback shape would fire for real.
             assert_eq!(r, None);
         }
 
