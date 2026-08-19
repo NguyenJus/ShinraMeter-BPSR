@@ -17,6 +17,18 @@ use crate::tables;
 /// (issue #49).
 const DEATH_DEBOUNCE_MS: u64 = 2000;
 
+/// Defensive ceiling on preloaded roster rows per scene (issue #12/#145
+/// finding 3). The preload path in `apply_player` is gated on
+/// `in_dungeon_scene`, i.e. `tables::is_dungeon_scene` — generated data
+/// (see `tables.rs`) this code has no way to validate. If a scene is ever
+/// misclassified as a dungeon, this stops `players` from growing
+/// unboundedly instead of relying solely on that classification being
+/// correct. Set comfortably above the largest real raid this meter
+/// supports (20 players — see
+/// `preloading_a_full_20_player_raid_snapshots_cleanly`), so it never
+/// affects a real dungeon or raid.
+const MAX_PRELOADED_PLAYERS: u32 = 64;
+
 /// One player-identity cache entry. `seq` is a monotonic touch counter (set
 /// on both read and write) used purely to order entries by recency for
 /// [`Meter::names_for_save`] — it is never persisted itself, only the
@@ -51,6 +63,33 @@ struct CachedAttrs {
     season_strength: Option<u32>,
     // IMAGINE-TAKEDOWN: part of the imagines field chain (see plan D4 #5).
     imagines: Option<[Option<i32>; 2]>,
+}
+
+/// Copies the five cacheable identity fields (name/class/ability_score/
+/// season_strength/imagines) from `merged` onto `stats`, one at a time,
+/// skipping any field `merged` has no opinion on (issue #145 finding 6: this
+/// list used to be duplicated between `apply_player`'s existing-row and
+/// preload branches, so adding a sixth cached field meant editing both). A
+/// freshly `PlayerStats::new` row starts with every one of these fields at
+/// `None`, so the per-field guard is a no-op there — this same guarded copy
+/// is exactly equivalent to an unconditional one for a fresh row, which is
+/// what lets both branches share it.
+fn apply_cached_attrs(stats: &mut PlayerStats, merged: CachedAttrs) {
+    if merged.name.is_some() {
+        stats.name = merged.name;
+    }
+    if merged.class.is_some() {
+        stats.class = merged.class;
+    }
+    if merged.ability_score.is_some() {
+        stats.ability_score = merged.ability_score;
+    }
+    if merged.season_strength.is_some() {
+        stats.season_strength = merged.season_strength;
+    }
+    if merged.imagines.is_some() {
+        stats.imagines = merged.imagines;
+    }
 }
 
 pub struct Meter {
@@ -356,6 +395,13 @@ impl Meter {
                 None
             }
             ProtocolEvent::ServerChanged { timestamp_ms } => {
+                // issue #12/#145 finding 4: a server change is as real a
+                // scene change as any (the old scene's preloads can't
+                // possibly still be in AOI range afterward), so mirror the
+                // Scene arm above and prune stale preloads — and log the
+                // same summary line — before `reset` clears `players` and
+                // `scene_id` is cleared below.
+                self.prune_stale_preloads();
                 self.reset(ResetReason::ServerChange, *timestamp_ms);
                 self.enemies.clear();
                 self.boss_uid = None;
@@ -531,22 +577,11 @@ impl Meter {
             },
         );
         if let Some(stats) = self.players.get_mut(&p.uid) {
-            if merged.name.is_some() {
-                stats.name = merged.name;
-            }
-            if merged.class.is_some() {
-                stats.class = merged.class;
-            }
-            if merged.ability_score.is_some() {
-                stats.ability_score = merged.ability_score;
-            }
-            if merged.season_strength.is_some() {
-                stats.season_strength = merged.season_strength;
-            }
-            if merged.imagines.is_some() {
-                stats.imagines = merged.imagines;
-            }
-        } else if self.in_dungeon_scene() && merged.name.is_some() {
+            apply_cached_attrs(stats, merged);
+        } else if self.in_dungeon_scene()
+            && merged.name.is_some()
+            && self.preload_count < MAX_PRELOADED_PLAYERS
+        {
             // issue #12: preload the roster. In a dungeon/raid instance the
             // only players in AOI range are the party, so eagerly creating a
             // zero-stat row here shows the whole group immediately instead
@@ -555,13 +590,12 @@ impl Meter {
             // flood the meter with unrelated strangers passing through AOI
             // range. Also gated on `merged.name` (the *upserted* value, so a
             // cache hit counts too, per `name_upsert`): a row that would
-            // render as "Player {uid}" is worse than no row at all.
+            // render as "Player {uid}" is worse than no row at all. And
+            // gated on `MAX_PRELOADED_PLAYERS` (issue #145 finding 3) as a
+            // backstop against a misclassified scene preloading unbounded
+            // rows.
             let mut stats = PlayerStats::new(p.uid);
-            stats.name = merged.name;
-            stats.class = merged.class;
-            stats.ability_score = merged.ability_score;
-            stats.season_strength = merged.season_strength;
-            stats.imagines = merged.imagines;
+            apply_cached_attrs(&mut stats, merged);
             self.players.insert(p.uid, stats);
             // issue #69/#12: no per-player log here by design (would flood
             // a raid); just tally, and let `prune_stale_preloads` emit one
@@ -587,18 +621,21 @@ impl Meter {
     /// one. Rows with any real activity are left alone — they still follow
     /// the existing reset rules (`reset`, `ResetReason`), not this.
     fn prune_stale_preloads(&mut self) {
-        // Counted before the retain call: every row `retain` is about to
-        // drop is, by construction, a zero-stat row, and the only path that
-        // creates one of those is the preload branch of `apply_player` (a
-        // row from real damage/hits/deaths is never all-zero). So this is
-        // exactly the untouched subset of this scene's `preload_count`.
-        let pruned = self
-            .players
-            .values()
-            .filter(|p| p.total_damage == 0 && p.hits == 0 && p.deaths == 0)
-            .count() as u32;
-        self.players
-            .retain(|_, p| p.total_damage != 0 || p.hits != 0 || p.deaths != 0);
+        // Every row this drops is, by construction, a zero-stat row, and the
+        // only path that creates one of those is the preload branch of
+        // `apply_player` (a row from real damage/hits/deaths is never
+        // all-zero). So `pruned` is exactly the untouched subset of this
+        // scene's `preload_count`. Tallied inside the single `retain` pass
+        // (issue #145 finding 5) rather than a separate `filter().count()`
+        // pass first.
+        let mut pruned = 0u32;
+        self.players.retain(|_, p| {
+            let stale = p.total_damage == 0 && p.hits == 0 && p.deaths == 0;
+            if stale {
+                pruned += 1;
+            }
+            !stale
+        });
         // Sparse, transition-only diagnostic (issue #69/#12): one line per
         // scene left, never per player. `self.scene_id` is still the scene
         // being *left* here — `Meter::apply`'s `Scene` arm calls this before
@@ -791,6 +828,15 @@ impl Meter {
         // needed the way scene/boss logging above requires one.
         log::info!("encounter: reset reason={reason:?}");
         self.players.clear();
+        // issue #12/#145 finding 1: `players` just got cleared, so any
+        // in-progress preload tally is now meaningless. The Scene and
+        // ServerChanged arms of `apply` already zero this themselves (via
+        // `prune_stale_preloads`, which also logs a summary first), but
+        // `reset` is also reached from paths with no scene transition at
+        // all — `BossHpRollback`, `NewFight`, and a `Manual` reset — so this
+        // is the backstop that keeps `preload_count` in sync with the
+        // cleared roster on every path, not just those two.
+        self.preload_count = 0;
         for enemy in self.enemies.values_mut() {
             enemy.lowest_pct = None;
             enemy.took_damage = false;
@@ -1301,6 +1347,101 @@ mod tests {
             "preloaded must equal still-active + pruned"
         );
         assert_eq!(m.preload_count, 0);
+    }
+
+    /// issue #145 findings 1/2: `Meter::reset` used to clear `players`
+    /// without touching `preload_count`, so a reset that isn't a scene
+    /// transition (a `BossHpRollback` mid-dungeon, or a `Manual` reset) left
+    /// the counter carrying the previous pull's preloads into the next one.
+    /// Preloads once, resets mid-scene (no `Scene` event in between),
+    /// preloads again, then leaves the dungeon and checks the
+    /// `preloaded = active + pruned` invariant still holds — same shape as
+    /// `preload_accounting_balances_after_a_mixed_scenario`, but with a
+    /// reset spliced into the middle of the scene. Fails against the
+    /// pre-fix code: `preload_count` would read 5 (both preload batches
+    /// counted) while only the second batch's 3 rows are still in
+    /// `players`, so `pruned` comes out negative-equivalent (wraps as a
+    /// `u32`) instead of 2.
+    #[test]
+    fn preload_count_stays_in_sync_across_a_mid_dungeon_reset() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        // First pull: two preloads, no `Scene` event before the reset below.
+        m.apply(&player_info(1, "Alice"));
+        m.apply(&player_info(2, "Bob"));
+        assert_eq!(m.preload_count, 2);
+        m.reset(ResetReason::BossHpRollback, 1000);
+        assert_eq!(m.preload_count, 0);
+        assert!(m.snapshot(1000).rows.is_empty());
+        // Second pull, same scene: three fresh preloads, one goes on to hit.
+        m.apply(&player_info(3, "Cara"));
+        m.apply(&player_info(4, "Dan"));
+        m.apply(&player_info(5, "Eve"));
+        let preloaded = m.preload_count;
+        assert_eq!(preloaded, 3);
+        m.apply(&dmg(3, 100, 2000));
+        // Leave the dungeon: prune should only see this pull's preloads.
+        m.apply(&ProtocolEvent::Scene { level_map_id: 8 });
+        let snap = m.snapshot(3000);
+        let active = snap.rows.len() as u32;
+        let pruned = preloaded - active;
+        assert_eq!(active, 1);
+        assert_eq!(pruned, 2);
+        assert_eq!(
+            preloaded,
+            active + pruned,
+            "preloaded must equal still-active + pruned even across a mid-dungeon reset"
+        );
+        assert_eq!(m.preload_count, 0);
+    }
+
+    /// issue #145 finding 4: `ServerChanged` used to reset straight away
+    /// without pruning first, leaving `preload_count` stale (and skipping
+    /// the summary log) the same way an un-fixed `BossHpRollback` would.
+    /// Mirrors `preload_count_stays_in_sync_across_a_mid_dungeon_reset`, but
+    /// with the scene ending via `ServerChanged` instead of a same-scene
+    /// reset.
+    #[test]
+    fn server_changed_prunes_preloads_like_a_real_scene_change() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        m.apply(&player_info(1, "Alice"));
+        m.apply(&player_info(2, "Bob"));
+        assert_eq!(m.preload_count, 2);
+        m.apply(&dmg(1, 100, 1000));
+        m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 2000 });
+        assert_eq!(m.preload_count, 0);
+        // The one row with real activity doesn't survive `ServerChanged`
+        // either — `reset` still clears `players` outright — but the
+        // counter accounting is what this test is about.
+        assert!(m.snapshot(2000).rows.is_empty());
+    }
+
+    /// issue #145 finding 3: defensive cap on preloads per scene, guarding
+    /// against a misclassified dungeon scene preloading unboundedly.
+    /// Preloads well past `MAX_PRELOADED_PLAYERS` and asserts both the
+    /// counter and the roster stop growing at the cap, which sits
+    /// comfortably above the largest real raid this meter supports (20
+    /// players — see `preloading_a_full_20_player_raid_snapshots_cleanly`).
+    #[test]
+    fn preload_count_is_capped_per_scene() {
+        assert!(
+            MAX_PRELOADED_PLAYERS > 20,
+            "cap must comfortably exceed the largest real raid"
+        );
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Scene {
+            level_map_id: 40001,
+        });
+        for uid in 1..=(MAX_PRELOADED_PLAYERS as i64 + 10) {
+            m.apply(&player_info(uid, &format!("Player{uid}")));
+        }
+        assert_eq!(m.preload_count, MAX_PRELOADED_PLAYERS);
+        assert_eq!(m.players.len() as u32, MAX_PRELOADED_PLAYERS);
     }
 
     /// Raid-scale sanity check: up to 20 simultaneous party members (a full
