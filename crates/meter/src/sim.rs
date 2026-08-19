@@ -222,9 +222,11 @@ fn party_fight(
 /// Players fight for `PRE_MS`, a `ServerChanged` event fires at `PRE_MS`
 /// (simulating a disconnect), then the same players resume fighting a
 /// fresh boss instance for `POST_MS`. Applying this stream through `Meter`
-/// must yield exactly one `Some(ResetReason::ServerChange)` at the
-/// disconnect point, with the post-reconnect snapshot reflecting only
-/// post-reconnect damage (issue #40's edge-case open question).
+/// must yield exactly one `Some(ResetReason::NewFight)`, fired by the
+/// reconnecting party's first post-reconnect hit — `ServerChanged` itself
+/// only freezes the fight clock and invalidates entity/scene state, it does
+/// not reset (issue #138) — with the post-reconnect snapshot reflecting
+/// only post-reconnect damage (issue #40's edge-case open question).
 fn disconnect_rejoin(seed: u64) -> Vec<SimEvent> {
     const PARTY: i64 = 4;
     const PRE_MS: u64 = 10_000;
@@ -382,12 +384,17 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_rejoin_fires_exactly_one_server_change_reset() {
+    fn disconnect_rejoin_fires_exactly_one_new_fight_reset_on_reconnect() {
         let (resets, snapshot) = run(Scenario::DisconnectRejoin, 99);
-        assert_eq!(resets, vec![crate::reset::ResetReason::ServerChange]);
+        // issue #138: the `ServerChanged` event at the disconnect point
+        // freezes the fight clock and invalidates entity/scene state, but
+        // reports no reset of its own. The reconnecting party's first
+        // post-reconnect hit is what actually clears the held stats, via
+        // the ordinary `NewFight` path.
+        assert_eq!(resets, vec![crate::reset::ResetReason::NewFight]);
         // Every row's damage must come from the post-reconnect fight only:
-        // `reset` clears `players`, so pre-disconnect damage cannot survive
-        // into the final snapshot.
+        // `NewFight`'s reset clears `players`, so pre-disconnect damage
+        // cannot survive into the final snapshot.
         assert!(snapshot.total_damage > 0);
         assert_eq!(snapshot.rows.len(), 4);
     }
