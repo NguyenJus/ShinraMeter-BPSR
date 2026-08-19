@@ -495,8 +495,15 @@ impl eframe::App for OverlayApp {
                 }
             });
 
-        track_window_position(&ctx, &mut self.settings, &self.tx_settings);
-        track_window_size(&ctx, &mut self.settings, &self.tx_settings);
+        // Read once and share with both trackers rather than each calling
+        // `ctx.input` separately — also what lets `minimized` be threaded
+        // through both as the exact same value for the same frame.
+        let (outer_rect, inner_rect, minimized) = ctx.input(|i| {
+            let viewport = i.viewport();
+            (viewport.outer_rect, viewport.inner_rect, viewport.minimized)
+        });
+        track_window_position(outer_rect, minimized, &mut self.settings, &self.tx_settings);
+        track_window_size(inner_rect, minimized, &mut self.settings, &self.tx_settings);
 
         // ~10 Hz.
         ctx.request_repaint_after(Duration::from_millis(100));
@@ -514,13 +521,16 @@ impl eframe::App for OverlayApp {
 /// A minimized window is skipped entirely: the platform parks it far
 /// off-screen (Windows uses -32000, -32000) and reports *that* as the outer
 /// position, which would otherwise be persisted and reopen the overlay
-/// somewhere the user cannot reach it.
+/// somewhere the user cannot reach it. `outer_rect` and `minimized` are read
+/// once per frame by the caller (`OverlayApp::update`) and shared with
+/// `track_window_size`, rather than each tracker re-reading `ctx.input`
+/// itself.
 fn track_window_position(
-    ctx: &egui::Context,
+    outer_rect: Option<egui::Rect>,
+    minimized: Option<bool>,
     settings: &mut Settings,
     tx_settings: &Sender<Settings>,
 ) {
-    let (outer_rect, minimized) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().minimized));
     if minimized == Some(true) {
         return;
     }
@@ -544,15 +554,25 @@ fn track_window_position(
 ///
 /// A minimized window is skipped entirely: some platforms report a zeroed
 /// or otherwise meaningless inner size while minimized, which would
-/// otherwise be persisted and reopen the overlay unusably small.
-fn track_window_size(ctx: &egui::Context, settings: &mut Settings, tx_settings: &Sender<Settings>) {
-    let (inner_rect, minimized) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().minimized));
+/// otherwise be persisted and reopen the overlay unusably small. `inner_rect`
+/// and `minimized` are read once per frame by the caller
+/// (`OverlayApp::update`) and shared with `track_window_position`, rather
+/// than each tracker re-reading `ctx.input` itself.
+fn track_window_size(
+    inner_rect: Option<egui::Rect>,
+    minimized: Option<bool>,
+    settings: &mut Settings,
+    tx_settings: &Sender<Settings>,
+) {
     if minimized == Some(true) {
         return;
     }
     let Some(rect) = inner_rect else {
         return;
     };
+    if !is_plausible_size(rect.size()) {
+        return;
+    }
     if let Some(updated) = settings.with_window_size_if_changed([rect.width(), rect.height()]) {
         *settings = updated.clone();
         let _ = tx_settings.send(updated);
@@ -575,6 +595,22 @@ fn is_plausible_position(position: egui::Pos2) -> bool {
 /// real monitor arrangement, tight enough to catch Windows' -32000 parking
 /// spot for minimized windows.
 const MIN_PLAUSIBLE_COORD: f32 = -20_000.0;
+
+/// Whether a reported inner size is worth persisting at all — belt and
+/// braces behind `track_window_size`'s minimized guard, in case a platform
+/// reports a zeroed or otherwise meaningless inner size for a frame before
+/// the `minimized` flag catches up, mirroring `is_plausible_position`. The
+/// bounds are the same ones `sanitize_window_size` enforces when a
+/// persisted size is later restored, so nothing rejected here would have
+/// survived a restart anyway.
+fn is_plausible_size(size: egui::Vec2) -> bool {
+    size.x.is_finite()
+        && size.y.is_finite()
+        && size.x >= MIN_INNER_SIZE.x
+        && size.y >= MIN_INNER_SIZE.y
+        && size.x <= MAX_INNER_SIZE_DIMENSION
+        && size.y <= MAX_INNER_SIZE_DIMENSION
+}
 
 /// The persisted settings plus the channel that persists changes to disk,
 /// bundled because every draw site that touches settings needs both —
@@ -3651,13 +3687,25 @@ fn default_inner_width() -> f32 {
 /// swapchain.
 const MAX_INNER_SIZE_DIMENSION: f32 = 20_000.0;
 
+/// Sane upper bound, in points², for a persisted `window_size`'s total
+/// area. `MAX_INNER_SIZE_DIMENSION` alone only bounds each axis
+/// independently, so a value like `[19_999.0, 19_999.0]` — comfortably
+/// under the per-axis cap on both axes — would still ask wgpu for a
+/// ~400-million-point swapchain. 64,000,000 comfortably covers an 8K panel
+/// (7680x4320 ≈ 33.2 million) plus room for a wide multi-monitor span,
+/// while still rejecting a corrupted settings.json that maxes out both
+/// axes at once. Computed in f64 so the multiplication itself can never
+/// overflow, whatever the axis values are.
+const MAX_INNER_SIZE_AREA: f64 = 64_000_000.0;
+
 /// Clamps a persisted `window_size` to something guaranteed openable, or
 /// rejects it outright back to `None` (today's default size) if it's beyond
 /// saving. Each axis is floored at `MIN_INNER_SIZE` — the same floor
 /// `with_min_inner_size` enforces below, so a restored size is never asked
 /// to start smaller than winit would allow anyway — and the whole value is
-/// rejected when either axis is non-finite or larger than
-/// `MAX_INNER_SIZE_DIMENSION`. A hand-edited or otherwise corrupted
+/// rejected when either axis is non-finite, either axis is larger than
+/// `MAX_INNER_SIZE_DIMENSION`, or the total area is larger than
+/// `MAX_INNER_SIZE_AREA`. A hand-edited or otherwise corrupted
 /// settings.json must never be able to open an unusable overlay.
 fn sanitize_window_size(size: [f32; 2]) -> Option<[f32; 2]> {
     let [w, h] = size;
@@ -3665,6 +3713,7 @@ fn sanitize_window_size(size: [f32; 2]) -> Option<[f32; 2]> {
         || !h.is_finite()
         || w > MAX_INNER_SIZE_DIMENSION
         || h > MAX_INNER_SIZE_DIMENSION
+        || (w as f64) * (h as f64) > MAX_INNER_SIZE_AREA
     {
         return None;
     }
@@ -7441,30 +7490,18 @@ mod tests {
 
     // -- window position tracking (issue #27) -----------------------------
 
-    /// Runs one frame with `outer_rect`/`minimized` reported for the
-    /// viewport, calling `track_window_position` from inside it exactly like
-    /// `OverlayApp::update` does. Returns everything it sent on the
-    /// settings-writer channel.
+    /// Calls `track_window_position` with `outer_rect`/`minimized` exactly
+    /// as `OverlayApp::update` passes them post issue #134 review (read
+    /// once by the caller and shared with `track_window_size`, rather than
+    /// each tracker re-reading `ctx.input` itself). Returns everything it
+    /// sent on the settings-writer channel.
     fn track_one_frame(
         settings: &mut Settings,
         outer_rect: Option<egui::Rect>,
         minimized: Option<bool>,
     ) -> Vec<Settings> {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut input = egui::RawInput::default();
-        input.viewports.insert(
-            input.viewport_id,
-            egui::ViewportInfo {
-                outer_rect,
-                minimized,
-                ..Default::default()
-            },
-        );
-
-        let ctx = egui::Context::default();
-        ctx.run_ui(input, |ui| track_window_position(ui.ctx(), settings, &tx))
-            .drop_without_applying_deltas();
-
+        track_window_position(outer_rect, minimized, settings, &tx);
         drop(tx);
         rx.try_iter().collect()
     }
@@ -7533,30 +7570,18 @@ mod tests {
 
     // -- window size tracking (issue #134) ---------------------------------
 
-    /// Runs one frame with `inner_rect`/`minimized` reported for the
-    /// viewport, calling `track_window_size` from inside it exactly like
-    /// `OverlayApp::update` does. Returns everything it sent on the
-    /// settings-writer channel.
+    /// Calls `track_window_size` with `inner_rect`/`minimized` exactly as
+    /// `OverlayApp::update` passes them post issue #134 review (read once
+    /// by the caller and shared with `track_window_position`, rather than
+    /// each tracker re-reading `ctx.input` itself). Returns everything it
+    /// sent on the settings-writer channel.
     fn track_size_one_frame(
         settings: &mut Settings,
         inner_rect: Option<egui::Rect>,
         minimized: Option<bool>,
     ) -> Vec<Settings> {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut input = egui::RawInput::default();
-        input.viewports.insert(
-            input.viewport_id,
-            egui::ViewportInfo {
-                inner_rect,
-                minimized,
-                ..Default::default()
-            },
-        );
-
-        let ctx = egui::Context::default();
-        ctx.run_ui(input, |ui| track_window_size(ui.ctx(), settings, &tx))
-            .drop_without_applying_deltas();
-
+        track_window_size(inner_rect, minimized, settings, &tx);
         drop(tx);
         rx.try_iter().collect()
     }
@@ -7604,6 +7629,21 @@ mod tests {
         let sent = track_size_one_frame(&mut settings, inner_rect_of(0.0, 0.0), Some(true));
 
         assert!(sent.is_empty(), "a minimized window must not send");
+        assert_eq!(settings.window_size, Some([640.0, 480.0]));
+    }
+
+    /// Same zeroed-size failure mode, but reported before the `minimized`
+    /// flag catches up — the plausibility floor is what rejects it.
+    #[test]
+    fn track_window_size_ignores_an_absurd_zeroed_size() {
+        let mut settings = Settings {
+            window_size: Some([640.0, 480.0]),
+            ..Settings::default()
+        };
+
+        let sent = track_size_one_frame(&mut settings, inner_rect_of(0.0, 0.0), None);
+
+        assert!(sent.is_empty(), "a bogus size must not send");
         assert_eq!(settings.window_size, Some([640.0, 480.0]));
     }
 
@@ -7657,6 +7697,20 @@ mod tests {
             built.inner_size,
             Some(egui::vec2(default_inner_width(), default_inner_height())),
             "a corrupted, absurdly large persisted size must be rejected outright"
+        );
+    }
+
+    #[test]
+    fn viewport_falls_back_to_default_size_for_an_oversize_area_within_per_axis_bounds() {
+        // Each axis alone is under `MAX_INNER_SIZE_DIMENSION` (20,000), but
+        // the product is ~400 million points — the total-area bound is what
+        // must reject this, not the per-axis one.
+        let built = viewport(None, Some([19_999.0, 19_999.0]));
+
+        assert_eq!(
+            built.inner_size,
+            Some(egui::vec2(default_inner_width(), default_inner_height())),
+            "a per-axis-plausible but absurdly large-area persisted size must be rejected outright"
         );
     }
 
