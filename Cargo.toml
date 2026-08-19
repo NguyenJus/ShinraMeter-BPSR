@@ -14,7 +14,7 @@ zstd = "0.13"
 thiserror = "2"
 etherparse = "0.21"
 libloading = "0.9"
-windows = { version = "0.48", features = ["Win32_Foundation"] }
+windows = { version = "0.62", features = ["Win32_Foundation"] }
 raw-window-handle = "0.6"
 embed-resource = "3"
 eframe = "0.36"
