@@ -247,15 +247,19 @@ fn demo_enabled_from(var: Option<&str>) -> bool {
 }
 
 /// `(name, class, damage, crit_pct, deaths)` for each demo row, in
-/// descending-damage order. Values intentionally mirror
-/// `docs/reference/new-shinra-ex.webp` so a demo-mode capture can be diffed
-/// against the reference screenshot.
+/// descending-damage order. The damage, crit%, and death figures
+/// intentionally mirror `docs/reference/new-shinra-ex.webp` so a demo-mode
+/// capture can be diffed against the reference screenshot (issue #88). The
+/// *names* are deliberately fictional, not the reference screenshot's real
+/// character names — this repo is public, and `CONTRIBUTING.md` tells users
+/// not to share other players' names, so a demo capture headed for the
+/// README can't republish someone else's (issue #133).
 const DEMO_ROWS: [(&str, Class, i64, f32, u32); 5] = [
-    ("Quick", Class::Stormblade, 55_300_000, 73.0, 0),
-    ("Ranmori", Class::FrostMage, 55_100_000, 76.0, 1),
-    ("Aki", Class::TwinStriker, 49_900_000, 54.0, 0),
-    ("Izumik", Class::WindKnight, 17_800_000, 59.0, 0),
-    ("Lyzl", Class::VerdantOracle, 10_300_000, 29.0, 0),
+    ("Blorp", Class::Stormblade, 55_300_000, 73.0, 0),
+    ("Glorbaxian", Class::FrostMage, 55_100_000, 76.0, 1),
+    ("Zog", Class::TwinStriker, 49_900_000, 54.0, 0),
+    ("Wibble", Class::WindKnight, 17_800_000, 59.0, 0),
+    ("Fizz", Class::VerdantOracle, 10_300_000, 29.0, 0),
 ];
 
 /// The synthetic snapshot `demo_enabled` seeds the overlay with. Values
