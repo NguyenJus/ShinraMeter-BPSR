@@ -10,7 +10,7 @@
 //! thread's timestamp. [`now_ms`] is this crate's only `SystemTime` call site.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -138,41 +138,119 @@ pub fn map_event(ev: proto::ProtocolEvent) -> meter::ProtocolEvent {
     }
 }
 
-/// A name-cache snapshot as handed to the background writer thread — the
-/// same shape `meter::names_cache::save` takes.
-type NamesCacheSnapshot = Vec<(i64, Option<String>, Option<meter::Class>)>;
+/// What one cross-session cache knows about its own file: the snapshot its
+/// background writer carries, and how to persist — or delete — it. One
+/// zero-sized marker type per cache, so [`CacheWriter`] can be a single
+/// implementation shared by the name cache (issue #12) and the scene ->
+/// final-boss cache (issue #131) rather than two near-verbatim copies.
+trait CachePersist: Send + 'static {
+    /// The snapshot handed across the writer's channel.
+    type Snapshot: Send + 'static;
 
-/// Persists the name cache off the pipeline thread, so a slow disk can never
+    /// Names the writer thread, so a log line or a stack trace still says
+    /// which cache it belongs to.
+    const THREAD_NAME: &'static str;
+
+    /// Writes `snapshot` to `path`. Runs on the writer thread, so — like
+    /// both cache modules already do — it must log and swallow IO errors
+    /// rather than panic.
+    fn save(path: &Path, snapshot: &Self::Snapshot);
+
+    /// Deletes the file at `path`. Defaults to doing nothing because only
+    /// the scene -> final-boss cache has a user-facing "forget" (issue
+    /// #131); the name cache simply never sends [`CacheWriterMsg::Forget`].
+    fn forget(_path: &Path) {}
+}
+
+/// The cross-session uid -> (name, class) cache (issue #12).
+struct NamesCache;
+
+impl CachePersist for NamesCache {
+    /// The same shape `meter::names_cache::save` takes.
+    type Snapshot = Vec<(i64, Option<String>, Option<meter::Class>)>;
+    const THREAD_NAME: &'static str = "names-cache-writer";
+
+    fn save(path: &Path, snapshot: &Self::Snapshot) {
+        meter::names_cache::save(path, snapshot);
+    }
+}
+
+/// The cross-session scene -> final-boss cache (issue #131).
+struct SceneBosses;
+
+impl CachePersist for SceneBosses {
+    /// The same shape `scene_bosses_cache::save` takes.
+    type Snapshot = HashMap<u32, u32>;
+    const THREAD_NAME: &'static str = "scene-bosses-writer";
+
+    fn save(path: &Path, snapshot: &Self::Snapshot) {
+        scene_bosses_cache::save(path, snapshot);
+    }
+
+    fn forget(path: &Path) {
+        scene_bosses_cache::forget(path);
+    }
+}
+
+/// One command for a [`CacheWriter`]'s thread. Both variants state the
+/// file's next contents outright — "hold exactly this" / "hold nothing" —
+/// rather than amending them, which is what makes [`CacheWriter::send`]'s
+/// coalescing safe.
+enum CacheWriterMsg<T> {
+    Save(T),
+    Forget,
+}
+
+/// Persists one cache off the pipeline thread, so a slow disk can never
 /// stall the `select!` loop that drains the bounded capture-event channel.
-/// The channel has capacity 1 and coalesces: a snapshot still waiting to be
-/// written is dropped in favour of a newer one rather than queued, since only
-/// the latest name-cache state is ever worth persisting.
-struct CacheWriter {
-    tx: Sender<NamesCacheSnapshot>,
-    /// A second receiver handle used only to drain a stale, not-yet-written
-    /// snapshot out of the channel before enqueuing a newer one (mirrors
+/// The channel has capacity 1 and coalesces: a command still waiting to be
+/// carried out is dropped in favour of a newer one rather than queued,
+/// since only the latest state of the file is ever worth reaching.
+///
+/// Deletes ride this same channel instead of going out of band (issue
+/// #131): a `forget` that removed the file directly would race a save the
+/// writer thread had not drained yet, and that queued pre-forget snapshot
+/// would then recreate the file behind the user's back.
+struct CacheWriter<P: CachePersist> {
+    tx: Sender<CacheWriterMsg<P::Snapshot>>,
+    /// A second receiver handle used only to drain a stale, not-yet-executed
+    /// command out of the channel before enqueuing a newer one (mirrors
     /// `publish`'s drop-oldest pattern for UI snapshots below).
-    stale: Receiver<NamesCacheSnapshot>,
+    stale: Receiver<CacheWriterMsg<P::Snapshot>>,
     handle: Option<JoinHandle<()>>,
 }
 
-impl CacheWriter {
+impl<P: CachePersist> CacheWriter<P> {
     fn spawn(path: PathBuf) -> Self {
-        let (tx, rx) = bounded::<NamesCacheSnapshot>(1);
+        Self::spawn_inner(path, None)
+    }
+
+    /// `gate`, when set, parks the writer thread before it touches the
+    /// channel — a test seam (see `Pipeline::with_gated_scene_bosses_path`)
+    /// for pinning down interleavings that would otherwise depend on how
+    /// fast the disk is. It is always `None` outside tests.
+    fn spawn_inner(path: PathBuf, gate: Option<Receiver<()>>) -> Self {
+        let (tx, rx) = bounded::<CacheWriterMsg<P::Snapshot>>(1);
         let stale = rx.clone();
 
         let handle = std::thread::Builder::new()
-            .name("names-cache-writer".to_string())
+            .name(P::THREAD_NAME.to_string())
             .spawn(move || {
+                if let Some(gate) = gate {
+                    let _ = gate.recv();
+                }
                 // Keeps draining until every `Sender` (the pipeline's `tx`
                 // plus `stale`, once `CacheWriter` is dropped) is gone *and*
-                // the channel is empty — so a snapshot enqueued right before
-                // shutdown is still written before this thread exits.
-                while let Ok(snapshot) = rx.recv() {
-                    meter::names_cache::save(&path, &snapshot);
+                // the channel is empty — so a command enqueued right before
+                // shutdown is still carried out before this thread exits.
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        CacheWriterMsg::Save(snapshot) => P::save(&path, &snapshot),
+                        CacheWriterMsg::Forget => P::forget(&path),
+                    }
                 }
             })
-            .expect("failed to spawn the names-cache-writer thread");
+            .unwrap_or_else(|err| panic!("failed to spawn the {} thread: {err}", P::THREAD_NAME));
 
         Self {
             tx,
@@ -181,84 +259,50 @@ impl CacheWriter {
         }
     }
 
-    /// Enqueues `snapshot` to be written, dropping a still-pending stale
-    /// snapshot in its favour rather than blocking on the writer thread.
-    fn save(&self, snapshot: NamesCacheSnapshot) {
-        match self.tx.try_send(snapshot) {
+    /// Enqueues `snapshot` to be written.
+    fn save(&self, snapshot: P::Snapshot) {
+        self.send(CacheWriterMsg::Save(snapshot));
+    }
+
+    /// Enqueues a delete of the cache file, ordered behind every save this
+    /// writer has already been handed (issue #131's "Forget learned
+    /// bosses").
+    fn forget(&self) {
+        self.send(CacheWriterMsg::Forget);
+    }
+
+    /// Hands `msg` to the writer thread without ever blocking on it: when
+    /// the capacity-1 channel is full, the command still sitting in it is
+    /// drained and this newer one takes its place.
+    ///
+    /// Discarding that pending command can never change what ends up on
+    /// disk, because each command names the file's next contents outright:
+    ///
+    /// * a `Save` superseded by a newer `Save` is stale by definition —
+    ///   only the latest cache state is worth persisting;
+    /// * a `Save` superseded by a `Forget` *must* go: that snapshot is
+    ///   exactly the data the user asked to forget, and writing it after
+    ///   the delete is the race routing deletes through here closes;
+    /// * a `Forget` superseded by a newer `Save` lands on that snapshot
+    ///   either way, since `save` rewrites the whole file rather than
+    ///   merging into it — and that snapshot is necessarily a post-forget
+    ///   one, because saves and forgets are both issued by the pipeline
+    ///   thread and `forget_scene_bosses` clears the in-process map before
+    ///   it enqueues.
+    fn send(&self, msg: CacheWriterMsg<P::Snapshot>) {
+        match self.tx.try_send(msg) {
             Ok(()) => {}
-            Err(TrySendError::Full(snapshot)) => {
+            Err(TrySendError::Full(msg)) => {
                 let _ = self.stale.try_recv();
-                let _ = self.tx.try_send(snapshot);
+                let _ = self.tx.try_send(msg);
             }
             Err(TrySendError::Disconnected(_)) => {}
         }
     }
 
-    /// Closes the channel and blocks until the writer thread has drained
-    /// (and written) any pending snapshot. Must be called before process
-    /// exit so the final save is never lost.
-    fn shutdown(self) {
-        drop(self.tx);
-        drop(self.stale);
-        if let Some(handle) = self.handle {
-            let _ = handle.join();
-        }
-    }
-}
-
-/// A scene -> final-boss snapshot as handed to the background writer thread
-/// (issue #131) — the same shape `scene_bosses_cache::save` takes.
-type SceneBossesSnapshot = HashMap<u32, u32>;
-
-/// Persists the scene -> final-boss cache off the pipeline thread, mirroring
-/// `CacheWriter` exactly (same capacity-1 coalescing channel, same
-/// rationale) — see its doc comment.
-struct SceneBossesWriter {
-    tx: Sender<SceneBossesSnapshot>,
-    /// A second receiver handle used only to drain a stale, not-yet-written
-    /// snapshot out of the channel before enqueuing a newer one — mirrors
-    /// `CacheWriter::stale`.
-    stale: Receiver<SceneBossesSnapshot>,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl SceneBossesWriter {
-    fn spawn(path: PathBuf) -> Self {
-        let (tx, rx) = bounded::<SceneBossesSnapshot>(1);
-        let stale = rx.clone();
-
-        let handle = std::thread::Builder::new()
-            .name("scene-bosses-writer".to_string())
-            .spawn(move || {
-                while let Ok(snapshot) = rx.recv() {
-                    scene_bosses_cache::save(&path, &snapshot);
-                }
-            })
-            .expect("failed to spawn the scene-bosses-writer thread");
-
-        Self {
-            tx,
-            stale,
-            handle: Some(handle),
-        }
-    }
-
-    /// Enqueues `snapshot` to be written, dropping a still-pending stale
-    /// snapshot in its favour rather than blocking on the writer thread.
-    fn save(&self, snapshot: SceneBossesSnapshot) {
-        match self.tx.try_send(snapshot) {
-            Ok(()) => {}
-            Err(TrySendError::Full(snapshot)) => {
-                let _ = self.stale.try_recv();
-                let _ = self.tx.try_send(snapshot);
-            }
-            Err(TrySendError::Disconnected(_)) => {}
-        }
-    }
-
-    /// Closes the channel and blocks until the writer thread has drained
-    /// (and written) any pending snapshot. Must be called before process
-    /// exit so the final save is never lost.
+    /// Closes the channel and blocks until the writer thread has carried
+    /// out any pending command. Must be called before process exit so the
+    /// final save is never lost.
     fn shutdown(self) {
         drop(self.tx);
         drop(self.stale);
@@ -274,16 +318,12 @@ pub struct Pipeline {
     /// Background writer for the cross-session name cache (issue #12).
     /// `None` in tests / `Pipeline::new()` — no writer means no disk IO at
     /// all.
-    cache_writer: Option<CacheWriter>,
+    cache_writer: Option<CacheWriter<NamesCache>>,
     /// Background writer for the cross-session scene -> final-boss cache
     /// (issue #131). Same "`None` means no disk IO" contract as
-    /// `cache_writer`.
-    scene_bosses_writer: Option<SceneBossesWriter>,
-    /// The path `scene_bosses_writer` was spawned against, kept so
-    /// `forget_scene_bosses` can delete the file directly (issue #131's
-    /// "Forget learned bosses" action) rather than going through the
-    /// debounced writer, which only ever overwrites, never deletes.
-    scene_bosses_path: Option<PathBuf>,
+    /// `cache_writer`, and it owns the deletes behind "Forget learned
+    /// bosses" as well as the saves — see `CacheWriter`.
+    scene_bosses_writer: Option<CacheWriter<SceneBosses>>,
 }
 
 impl Pipeline {
@@ -292,7 +332,6 @@ impl Pipeline {
             meter: meter::Meter::new(),
             cache_writer: None,
             scene_bosses_writer: None,
-            scene_bosses_path: None,
         }
     }
 
@@ -307,7 +346,6 @@ impl Pipeline {
             meter: meter::Meter::with_names_cache(cached),
             cache_writer: Some(CacheWriter::spawn(path)),
             scene_bosses_writer: None,
-            scene_bosses_path: None,
         }
     }
 
@@ -320,11 +358,23 @@ impl Pipeline {
     /// `Meter::set_scene_bosses` (unlike `with_names_cache`, which builds a
     /// whole fresh `Meter`) is a plain in-place setter for exactly this
     /// reason.
-    pub fn with_scene_bosses_path(mut self, path: PathBuf) -> Self {
+    pub fn with_scene_bosses_path(self, path: PathBuf) -> Self {
+        self.with_scene_bosses_writer(path, None)
+    }
+
+    /// Test seam: `with_scene_bosses_path` with the writer thread parked on
+    /// `gate` until the test releases it, so a save can be *provably* still
+    /// in the channel when a forget lands on top of it (issue #131) instead
+    /// of that interleaving depending on how fast the disk is.
+    #[cfg(test)]
+    fn with_gated_scene_bosses_path(self, path: PathBuf, gate: Receiver<()>) -> Self {
+        self.with_scene_bosses_writer(path, Some(gate))
+    }
+
+    fn with_scene_bosses_writer(mut self, path: PathBuf, gate: Option<Receiver<()>>) -> Self {
         let cached = scene_bosses_cache::load(&path);
         self.meter.set_scene_bosses(cached);
-        self.scene_bosses_writer = Some(SceneBossesWriter::spawn(path.clone()));
-        self.scene_bosses_path = Some(path);
+        self.scene_bosses_writer = Some(CacheWriter::spawn_inner(path, gate));
         self
     }
 
@@ -350,15 +400,15 @@ impl Pipeline {
 
     /// Clears the learned scene -> final-boss map, both in-process and on
     /// disk (issue #131's "Forget learned bosses" menu action, wired from
-    /// `ui.rs`'s `UiCommand::ForgetLearnedBosses`). Runs on the pipeline
-    /// thread, same as `reset` — not the UI thread — and only on an
-    /// explicit, rare user action, so the direct blocking
-    /// `scene_bosses_cache::forget` call here (unlike the debounced writer
-    /// above) is not a stall risk in practice.
+    /// `ui.rs`'s `UiCommand::ForgetLearnedBosses`). The delete goes through
+    /// the same background writer as the saves, so it can never be undone
+    /// by a pre-forget snapshot that thread had not drained yet — and the
+    /// in-process map is cleared first, so any save enqueued behind this
+    /// one carries the cleared map (see `CacheWriter::send`).
     pub fn forget_scene_bosses(&mut self) {
         self.meter.set_scene_bosses(HashMap::new());
-        if let Some(path) = &self.scene_bosses_path {
-            scene_bosses_cache::forget(path);
+        if let Some(writer) = &self.scene_bosses_writer {
+            writer.forget();
         }
     }
 
@@ -951,19 +1001,56 @@ mod tests {
         fn forget_learned_bosses_clears_in_process_state_and_deletes_the_file() {
             let names_path = scratch_path("scene-bosses-forget-names");
             let scene_path = scratch_path("scene-bosses-forget");
+            scene_bosses_cache::save(&scene_path, &HashMap::from([(1001, 103)]));
+
             let mut p = Pipeline::with_names_cache_path(names_path.clone())
                 .with_scene_bosses_path(scene_path.clone());
             p.step(proto::ProtocolEvent::Scene { level_map_id: 1001 });
-            p.step(proto::ProtocolEvent::Damage(boss_hit(10, 0)));
-            p.step(proto::ProtocolEvent::EnemyHp(boss_hp(10, 103, 0)));
-            p.reset(1_000);
-            p.shutdown_scene_bosses();
-            assert!(scene_path.exists());
+            assert_eq!(
+                p.snapshot(1_000).encounter.scene_boss_name,
+                Some("Rathalos")
+            );
 
             p.forget_scene_bosses();
+            assert_eq!(p.snapshot(2_000).encounter.scene_boss_name, None);
+            // The delete is handed off to the background writer thread, same
+            // as the saves; flush and join it before asserting on disk.
+            p.shutdown_scene_bosses();
             assert!(!scene_path.exists());
-            let snap = p.snapshot(2_000);
-            assert_eq!(snap.encounter.scene_boss_name, None);
+
+            p.shutdown_names_cache();
+            let _ = std::fs::remove_file(&names_path);
+        }
+
+        /// The whole reason deletes ride the writer's channel instead of
+        /// going out of band: a save the writer has not drained yet must
+        /// never recreate the file a later forget removed.
+        ///
+        /// This pins the interleaving down rather than racing for it — the
+        /// writer thread is parked on a gate for the entire enqueue
+        /// sequence, so the save is *provably* still sitting in the channel
+        /// when the forget lands on top of it.
+        #[test]
+        fn a_forget_is_not_undone_by_a_save_the_writer_has_not_drained_yet() {
+            let names_path = scratch_path("scene-bosses-forget-race-names");
+            let scene_path = scratch_path("scene-bosses-forget-race");
+            scene_bosses_cache::save(&scene_path, &HashMap::from([(1001, 103)]));
+            assert!(scene_path.exists());
+
+            let (release, gate) = bounded::<()>(0);
+            let mut p = Pipeline::with_names_cache_path(names_path.clone())
+                .with_gated_scene_bosses_path(scene_path.clone(), gate);
+
+            // Queue exactly the data the user is about to forget (the map
+            // seeded from the file above), then forget it — both while the
+            // writer thread cannot possibly have run.
+            p.save_scene_bosses();
+            p.forget_scene_bosses();
+
+            // Release the writer, then block until it has drained.
+            drop(release);
+            p.shutdown_scene_bosses();
+            assert!(!scene_path.exists());
 
             p.shutdown_names_cache();
             let _ = std::fs::remove_file(&names_path);
