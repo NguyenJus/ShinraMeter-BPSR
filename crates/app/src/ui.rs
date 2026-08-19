@@ -253,13 +253,32 @@ fn demo_enabled_from(var: Option<&str>) -> bool {
 /// *names* are deliberately fictional, not the reference screenshot's real
 /// character names — this repo is public, and `CONTRIBUTING.md` tells users
 /// not to share other players' names, so a demo capture headed for the
-/// README can't republish someone else's (issue #133).
+/// README can't republish someone else's (issue #133). The names have no
+/// counterpart in the reference screenshot to mirror, since the reference's
+/// underlying screenshot predates the Imagine column (issue #33/#128); see
+/// `DEMO_IMAGINES` below.
 const DEMO_ROWS: [(&str, Class, i64, f32, u32); 5] = [
     ("Blorp", Class::Stormblade, 55_300_000, 73.0, 0),
     ("Glorbaxian", Class::FrostMage, 55_100_000, 76.0, 1),
     ("Zog", Class::TwinStriker, 49_900_000, 54.0, 0),
     ("Wibble", Class::WindKnight, 17_800_000, 59.0, 0),
     ("Fizz", Class::VerdantOracle, 10_300_000, 29.0, 0),
+];
+
+/// Equipped-Imagine skill ids for each `DEMO_ROWS` row's two slots, demo-only
+/// and with no reference-screenshot counterpart (issue #133): the reference
+/// capture predates the Imagine column, so unlike `DEMO_ROWS`'s other
+/// fields, these ids aren't mirroring anything — they're picked from
+/// `imagines::imagine_of_skill_id`'s curated table purely so a demo capture
+/// shows the column doing real work instead of ten blank placeholder
+/// circles. The last row keeps one slot empty on purpose, since not every
+/// real player fills both.
+const DEMO_IMAGINES: [[Option<i32>; 2]; 5] = [
+    [Some(3901), Some(3902)],
+    [Some(3903), Some(3904)],
+    [Some(3905), Some(3906)],
+    [Some(3907), Some(3908)],
+    [Some(3909), None],
 ];
 
 /// The synthetic snapshot `demo_enabled` seeds the overlay with. Values
@@ -279,7 +298,7 @@ fn demo_snapshot() -> Snapshot {
             class: Some(class),
             ability_score: None,
             season_strength: None,
-            imagines: [None, None],
+            imagines: DEMO_IMAGINES[i],
             damage,
             dps: damage as f64 / (duration_ms as f64 / 1000.0),
             share_pct: damage as f32 / row_damage_sum as f32 * 100.0,
