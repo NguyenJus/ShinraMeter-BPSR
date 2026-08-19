@@ -270,7 +270,7 @@ fn main() -> eframe::Result {
     // the size `ui::viewport` opens at on a first launch. Read back off a
     // default builder rather than re-deriving it, so `ui`'s private layout
     // constants stay private and the two can't drift apart.
-    let default_inner_size = ui::viewport(None).inner_size;
+    let default_inner_size = ui::viewport(None, None).inner_size;
 
     // Issue #89. Both halves of the transparency fix are decided here, before
     // any window exists, because both are creation-time-only: the wgpu backend
@@ -300,7 +300,7 @@ fn main() -> eframe::Result {
     }
 
     let native_options = eframe::NativeOptions {
-        viewport: ui::viewport(settings.window_position),
+        viewport: ui::viewport(settings.window_position, settings.window_size),
         // `unwrap_or_default()` is precisely "change nothing": it is the same
         // value `NativeOptions::default()` would have put here.
         wgpu_options: dx12_setup.unwrap_or_default(),
