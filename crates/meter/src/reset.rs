@@ -49,8 +49,14 @@ pub struct EnemyState {
     /// first, `Some(2)` second, `None` has not been seen to die. Set by
     /// either a `DamageEvent::is_dead` naming it as the victim or an
     /// `EnemyHp` syncing its `curr_hp` to 0, whichever lands first.
-    /// Per-encounter like `took_damage`, and cleared by `Meter::reset` for
-    /// the same reason: the entity may respawn for the next pull.
+    ///
+    /// Survives `Meter::reset` like the rest of `EnemyState` (PR #144 review,
+    /// finding 2): a reset is bookkeeping and says nothing about whether the
+    /// corpse got up. What clears it is the respawn itself — an `EnemyHp`
+    /// reporting `curr_hp > 0` for an entity that has taken no damage since
+    /// that reset. Ranks stay globally monotonic across resets, which is all
+    /// `Meter::recompute_boss` needs from them: it only ever compares two
+    /// enemies damaged in the *same* encounter.
     ///
     /// Recording an *order* rather than a bare flag serves
     /// `Meter::recompute_boss`: once every damaged enemy in a multi-phase
@@ -96,12 +102,19 @@ impl EnemyState {
     /// Whether this enemy should be treated as still fighting (issue #124).
     ///
     /// An enemy whose HP was **never observed** counts as alive. That is the
-    /// deliberately conservative answer for the one caller,
-    /// `Meter::end_fight_on_boss_death`: mistaking a living boss for a dead
-    /// one ends the fight early and under-reports the rest of the encounter
-    /// (the bug issue #124 is about), while mistaking a dead boss for a
-    /// living one only skips the instant freeze and falls back to the idle
-    /// timeout, which is always safe.
+    /// deliberately conservative answer for `Meter::end_fight_on_boss_death`:
+    /// mistaking a living boss for a dead one ends the fight early and
+    /// under-reports the rest of the encounter (the bug issue #124 is about),
+    /// while mistaking a dead boss for a living one only skips the instant
+    /// freeze and falls back to the idle timeout, which is always safe.
+    ///
+    /// That asymmetry only holds for *never observed*, and only because the
+    /// second consumer cannot afford it either way (PR #144 review, finding
+    /// 2): `Meter::recompute_boss` ranks a living enemy above a dead one, so
+    /// a false "alive" there puts the header on a corpse instead of on the
+    /// boss actually being fought. A corpse must therefore keep reading dead
+    /// for as long as it is one — which is why `death_order` outlives
+    /// `Meter::reset` rather than leaving this to a stale `curr_hp`.
     pub fn is_alive(&self) -> bool {
         self.death_order.is_none() && self.curr_hp != Some(0)
     }

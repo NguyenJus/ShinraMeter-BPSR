@@ -106,6 +106,18 @@ pub fn same_phase_group(a: u32, b: u32) -> bool {
     a != b && group_of(a).is_some_and(|g| Some(g) == group_of(b))
 }
 
+/// Whether `id` belongs to a curated multi-phase fight at all, and so *could*
+/// have a next phase (issue #124).
+///
+/// Distinct from [`same_phase_group`], which asks about a pair. This one asks
+/// about the boss whose death ended a fight: only for those is the resume
+/// window meaningful, so only for those may `Meter::apply_damage` soften its
+/// "any player hit starts a new fight" rule. A raid boss in no group answers
+/// `false` and keeps issue #78's behaviour untouched.
+pub fn has_phase_group(id: u32) -> bool {
+    group_of(id).is_some()
+}
+
 /// Index of the group containing `id`, if any. Linear over a table of a
 /// handful of short slices — this runs at most once per damage event while
 /// a fight is being held, never in a hot loop.
@@ -220,5 +232,18 @@ mod tests {
     fn an_unknown_monster_id_has_no_phase_group() {
         assert!(!same_phase_group(0, 103_108));
         assert!(!same_phase_group(103_108, 0));
+    }
+
+    #[test]
+    fn has_phase_group_answers_for_a_single_id() {
+        // Every curated id is grouped, including one that is its own group's
+        // last phase and so has no *later* phase to pair with.
+        assert!(has_phase_group(103_108));
+        assert!(has_phase_group(103_311));
+        assert!(has_phase_group(203));
+        // A recognized boss outside the table, and an id the tables do not
+        // know at all.
+        assert!(!has_phase_group(10_041));
+        assert!(!has_phase_group(0));
     }
 }
