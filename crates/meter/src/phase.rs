@@ -270,3 +270,146 @@ mod tests {
         assert!(!has_phase_group(0));
     }
 }
+
+/// The raid scenes, where the party *selects* which boss to pull rather than
+/// walking a fixed order to one final boss (issue #150).
+///
+/// Every raid in the game works this way (repo owner): you enter the
+/// instance, pick one of three bosses, fight it, and after a win **or** a
+/// wipe you can pick a different one without ever leaving the scene. Normal
+/// dungeons put one boss in front of you at a time and are untouched by any
+/// of this.
+///
+/// That breaks the premise `Meter::scene_bosses` learns under — "the last
+/// boss engaged here is this scene's final boss" — because in a raid the
+/// last boss engaged is merely the one that party happened to pick. So for
+/// these scenes the meter stops guessing: it reports
+/// [`crate::stats::EncounterInfo::multi_boss_scene`] and the header asks the
+/// player to select a boss until one is actually engaged.
+///
+/// # Maintenance
+///
+/// Curated for the same reason [`BOSS_PHASE_GROUPS`] is: nothing on the wire
+/// or in the vendored tables marks a scene as a raid. **A newly released
+/// raid has to be added here**, all of its difficulty tiers at once. The
+/// `Clash!` / `Brutal!` / `Purge!` prefix on `tables::scene_name` is the
+/// marker to look for — but the ids are curated rather than matched by
+/// string, because a name pattern tuned to today's content reads as a silent
+/// mis-detection the moment a season renames anything.
+///
+/// The observation-driven half of the rule (a scene seen hosting more than
+/// one distinct fight is offering a choice — see [`distinct_fight_count`])
+/// still covers a raid nobody has added yet, but only from its second
+/// selection onward; this table is what makes the known ones right on the
+/// very first visit.
+#[rustfmt::skip]
+const BOSS_SELECT_SCENES: &[u32] = &[
+    // Floating Island — Clash! / Brutal! / Purge! difficulty tiers.
+    13001, 13002, 13003,
+    // Dreambloom Ruins — Clash! / Brutal! / Purge!. One of its three
+    // selections (Caprahorn) spawns *two* equal-HP bosses fought at once,
+    // so nothing downstream may assume a selection resolves to exactly one
+    // boss entity.
+    13011, 13012, 13013,
+    // Field of Forgotten Illusions — Clash! / Brutal! / Purge!. The raid
+    // issue #150 was reported from: Origin, Continuation and Final
+    // confirmed engaged in one run of 13023, in an order the party chose.
+    13021, 13022, 13023,
+];
+
+/// Whether `scene_id` is a raid scene, i.e. one where the party selects
+/// which boss to fight (issue #150). See [`BOSS_SELECT_SCENES`].
+pub fn is_boss_select_scene(scene_id: u32) -> bool {
+    BOSS_SELECT_SCENES.contains(&scene_id)
+}
+
+/// How many *distinct fights* `monster_ids` represents (issue #150): ids in
+/// the same [`BOSS_PHASE_GROUPS`] slice belong to one fight and count once
+/// between them, every other id counts for itself.
+///
+/// This is what lets `Meter` tell "this scene hosted two different fights,
+/// so it offers a selection" from "this scene's one fight presents several
+/// monster ids" — the Dragonbane Golem's two separately targetable cannons
+/// must not make its dungeon look like a raid. Duplicate ids are not
+/// expected (the caller keeps an ordered set) and would each count once via
+/// the same grouping.
+pub fn distinct_fight_count(monster_ids: &[u32]) -> usize {
+    monster_ids
+        .iter()
+        .enumerate()
+        .filter(|(i, id)| {
+            !monster_ids[..*i]
+                .iter()
+                .any(|earlier| earlier == *id || same_phase_group(*earlier, **id))
+        })
+        .count()
+}
+
+#[cfg(test)]
+mod boss_select_scene_tests {
+    use super::*;
+    use crate::tables;
+
+    #[test]
+    fn every_curated_boss_select_scene_is_a_dungeon_scene() {
+        // The suppression this table drives only ever runs for a scene the
+        // tables call a dungeon, so an id that isn't one is a dead entry.
+        for &scene in BOSS_SELECT_SCENES {
+            assert!(
+                tables::is_dungeon_scene(scene),
+                "scene {scene} is not a dungeon scene"
+            );
+        }
+    }
+
+    #[test]
+    fn every_curated_boss_select_scene_is_named_as_a_raid_tier() {
+        // The `Clash!`/`Brutal!`/`Purge!` prefix is the game's own marker
+        // for a raid's three difficulty tiers — a curated id whose name
+        // doesn't carry it is a typo, not a raid.
+        for &scene in BOSS_SELECT_SCENES {
+            let name = tables::scene_name(scene).unwrap_or_else(|| panic!("scene {scene} unnamed"));
+            assert!(
+                name.starts_with("Clash!")
+                    || name.starts_with("Brutal!")
+                    || name.starts_with("Purge!"),
+                "scene {scene} ({name}) is not named as a raid tier"
+            );
+        }
+    }
+
+    #[test]
+    fn all_three_raids_are_curated_at_all_three_tiers() {
+        for scene in [
+            13001, 13002, 13003, 13011, 13012, 13013, 13021, 13022, 13023,
+        ] {
+            assert!(is_boss_select_scene(scene), "scene {scene} is missing");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_dungeon_scene_has_no_boss_select() {
+        assert!(!is_boss_select_scene(1001));
+        assert!(!is_boss_select_scene(8));
+    }
+
+    #[test]
+    fn parts_of_one_curated_fight_count_as_a_single_fight() {
+        // The golem's two separately targetable cannons, and the Goblin
+        // King's two forms.
+        assert_eq!(distinct_fight_count(&[103_110, 103_111]), 1);
+        assert_eq!(distinct_fight_count(&[203, 204]), 1);
+    }
+
+    #[test]
+    fn unrelated_bosses_count_separately() {
+        assert_eq!(distinct_fight_count(&[103, 103_110]), 2);
+        assert_eq!(distinct_fight_count(&[103, 103_110, 103_111]), 2);
+    }
+
+    #[test]
+    fn an_empty_or_single_observation_is_at_most_one_fight() {
+        assert_eq!(distinct_fight_count(&[]), 0);
+        assert_eq!(distinct_fight_count(&[103]), 1);
+    }
+}
