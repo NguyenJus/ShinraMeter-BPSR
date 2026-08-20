@@ -5,23 +5,10 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-mod dump;
-mod fonts;
-mod icons;
-// IMAGINE-TAKEDOWN: one of five sites — see `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
-mod imagines;
-mod inspect;
-mod logging;
-mod paths;
-mod pipeline;
-mod platform;
-mod scene_bosses_cache;
-mod settings;
-mod ui;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use bpsr_app::{fonts, inspect, logging, paths, pipeline, platform, settings, ui};
 use bpsr_protocol::ProtocolEvent;
 use crossbeam_channel::bounded;
 use ui::{OverlayApp, StatusLine, UiCommand};

@@ -3,3 +3,8 @@ name = "bpsr-test-support"
 version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-only"
+
+[dependencies]
+bpsr-protocol = { workspace = true }
+prost = { workspace = true }
+zstd = { workspace = true }

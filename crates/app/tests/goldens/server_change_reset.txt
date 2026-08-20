@@ -1,0 +1,16 @@
+scenario=server_change_reset
+at_ms=13000
+fight_state=Idle
+duration_ms=10000
+total_damage=65000
+total_dps=65000.00
+encounter.boss_monster_id=-
+encounter.boss_name=-
+encounter.is_boss=false
+encounter.scene_id=-
+encounter.scene_name=-
+encounter.scene_boss_name=-
+resets=
+rows=2
+row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=40000 dps=40000.00 share=61.54 crit=0.00 lucky=0.00 hits=1 deaths=0
+row uid=1002 name=Brin class=FrostMage ability_score=11500 season_strength=- imagines=[-,-] damage=25000 dps=25000.00 share=38.46 crit=0.00 lucky=0.00 hits=1 deaths=0

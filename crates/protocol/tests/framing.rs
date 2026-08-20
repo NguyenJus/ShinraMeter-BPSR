@@ -3,10 +3,8 @@
 //! boundaries, zstd-compressed and uncompressed Notifies, FrameDown nesting,
 //! and unknown opcodes interleaved with known ones.
 
-mod common;
-
 use bpsr_protocol::{Decoder, EntityKind, ProtocolEvent};
-use common::*;
+use bpsr_test_support::wire::*;
 
 const ATTACKER_UUID: i64 = (10i64 << 16) | 640; // player uid 10
 const TARGET_UUID: i64 = (20i64 << 16) | 64; // monster uid 20
@@ -292,7 +290,7 @@ fn skill_level_id_list_attr_on_entity_decodes_into_player_info() {
     let player = appear_entity(
         ATTACKER_UUID,
         10,
-        vec![common::skill_list_attr(&[3905, 102640, 71000])],
+        vec![skill_list_attr(&[3905, 102640, 71000])],
     );
     let payload = sync_near_entities_payload(vec![player]);
     let stream = notify(

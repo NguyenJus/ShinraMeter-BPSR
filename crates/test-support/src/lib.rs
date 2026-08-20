@@ -5,6 +5,9 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod scenario;
+pub mod wire;
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A fresh, never-yet-existing path under the OS temp dir, unique per call

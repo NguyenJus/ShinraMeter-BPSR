@@ -239,6 +239,8 @@ Logs and packet-inspection dumps may contain player names and other
 identifying traffic — never attach one to an issue or PR; mint a minimal
 synthetic repro instead.
 
-See also `docs/ui-debugging.md` for the WSL-to-Windows UI debugging harness.
+See also `docs/ui-debugging.md` for the WSL-to-Windows UI debugging harness,
+and `docs/replay-system-tests.md` for the synthetic-scenario system tests in
+`crates/app/tests/`.
 
 </details>

@@ -62,132 +62,15 @@
 
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bpsr_protocol::decode::{decode_notify, opcode};
+use bpsr_protocol::dump_format::{DumpRecord, append_records_from, rotated_sibling};
 use bpsr_protocol::frame::{Notify, SERVICE_UUID};
 use bpsr_protocol::inspect::InspectSink;
-use serde::Deserialize;
-
-/// One dump record after parsing, decoupled from the on-disk hex-string
-/// encoding — see `crates/app/src/dump.rs` for the JSON shape this comes
-/// from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DumpRecord {
-    ts_ms: u64,
-    service_uuid: u64,
-    method_id: u32,
-    payload: Vec<u8>,
-    /// `false` when the capture couldn't decompress this fragment, so
-    /// `payload` is the raw compressed bytes — replay counts it in the
-    /// service/method histograms but must not hand it to the decoder.
-    payload_decoded: bool,
-}
-
-/// The on-disk JSON shape, straight off the wire — see `crates/app/src/dump.rs`.
-#[derive(Deserialize)]
-struct RawLine {
-    ts_ms: u64,
-    service_uuid: String,
-    method_id: String,
-    payload_hex: String,
-    payload_decoded: bool,
-}
-
-fn parse_hex_u64(s: &str) -> Option<u64> {
-    u64::from_str_radix(s.strip_prefix("0x")?, 16).ok()
-}
-
-fn parse_hex_u32(s: &str) -> Option<u32> {
-    u32::from_str_radix(s.strip_prefix("0x")?, 16).ok()
-}
-
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
-        .collect()
-}
-
-/// Parses one JSONL line of the dump format into a `DumpRecord`. `Err`
-/// (never a panic) on malformed JSON, a non-`0x`-prefixed hex field, or an
-/// odd-length `payload_hex` — the caller skips the line and keeps going
-/// rather than aborting the whole replay on one bad line.
-fn parse_record(line: &str) -> Result<DumpRecord, String> {
-    let raw: RawLine = serde_json::from_str(line).map_err(|err| err.to_string())?;
-    let service_uuid = parse_hex_u64(&raw.service_uuid)
-        .ok_or_else(|| format!("bad service_uuid: {}", raw.service_uuid))?;
-    let method_id =
-        parse_hex_u32(&raw.method_id).ok_or_else(|| format!("bad method_id: {}", raw.method_id))?;
-    let payload = hex_decode(&raw.payload_hex)
-        .ok_or_else(|| format!("bad payload_hex: {}", raw.payload_hex))?;
-    Ok(DumpRecord {
-        ts_ms: raw.ts_ms,
-        service_uuid,
-        method_id,
-        payload,
-        payload_decoded: raw.payload_decoded,
-    })
-}
-
-/// The rotated sibling `dump.rs` would have renamed `path` to once it grew
-/// past `MAX_DUMP_BYTES`: `<path>.1`, replacing any previous one. Matches
-/// `crate::logging::rotated_path` / `crates/app/src/dump.rs`'s
-/// `rotated_path`, reimplemented here rather than shared because this binary
-/// intentionally doesn't depend on the app crate (see the module doc
-/// comment's "Why this lives here" section).
-fn rotated_sibling(path: &Path) -> PathBuf {
-    let mut rotated = path.as_os_str().to_owned();
-    rotated.push(".1");
-    PathBuf::from(rotated)
-}
-
-/// Opens `path`, parses every JSONL line with [`parse_record`], and appends
-/// the successfully-parsed records to `records` in file order. A malformed
-/// line is skipped (printed to stderr, `path` prefixed so it's clear which
-/// file it came from) rather than aborting the whole replay. `Err` only when
-/// `path` itself can't be opened — the caller decides whether that's fatal.
-/// Returns how many records were appended, for the caller to report.
-fn append_records_from(
-    path: &Path,
-    records: &mut Vec<DumpRecord>,
-) -> Result<usize, std::io::Error> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut appended = 0;
-    for (lineno, line) in reader.lines().enumerate() {
-        let line = match line {
-            Ok(l) => l,
-            Err(err) => {
-                eprintln!("{}: line {}: read error: {err}", path.display(), lineno + 1);
-                continue;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        match parse_record(&line) {
-            Ok(r) => {
-                records.push(r);
-                appended += 1;
-            }
-            Err(err) => eprintln!(
-                "{}: line {}: skipping malformed record: {err}",
-                path.display(),
-                lineno + 1
-            ),
-        }
-    }
-    Ok(appended)
-}
 
 /// Count, first/last-seen timestamp, and whether an observed id is one we
 /// currently decode.
@@ -522,10 +405,6 @@ mod tests {
     // entity, not a guessed constant.
     const PLAYER_UUID: i64 = (7i64 << 16) | 640;
 
-    fn to_hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
     fn delta_notify_payload(attr_id: i32, raw: Vec<u8>) -> Vec<u8> {
         let attrs = pb::AttrCollection {
             uuid: PLAYER_UUID,
@@ -549,134 +428,6 @@ mod tests {
 
     fn known_attr_payload() -> Vec<u8> {
         delta_notify_payload(bpsr_protocol::attrs::attr_id::NAME, vec![0xFF, b'H', b'i'])
-    }
-
-    #[test]
-    fn parse_record_parses_a_well_formed_dump_line() {
-        let payload = delta_notify_payload(0x7777, vec![0x01]);
-        let line = format!(
-            r#"{{"ts_ms":100,"service_uuid":"0x0000000063335342","method_id":"0x0000002d","payload_hex":"{}","payload_decoded":true}}"#,
-            to_hex(&payload)
-        );
-
-        let record = parse_record(&line).expect("well-formed line must parse");
-
-        assert_eq!(record.ts_ms, 100);
-        assert_eq!(record.service_uuid, SERVICE_UUID);
-        assert_eq!(record.method_id, opcode::SYNC_NEAR_DELTA_INFO);
-        assert_eq!(record.payload, payload);
-        assert!(record.payload_decoded);
-    }
-
-    /// A record the capture couldn't decompress parses like any other; the
-    /// flag is what tells replay not to decode its bytes.
-    #[test]
-    fn parse_record_carries_the_undecodable_payload_flag() {
-        let line = r#"{"ts_ms":1,"service_uuid":"0x0000000063335342","method_id":"0x0000002d","payload_hex":"deadbeef","payload_decoded":false}"#;
-
-        let record = parse_record(line).expect("well-formed line must parse");
-
-        assert!(!record.payload_decoded);
-        assert_eq!(record.payload, vec![0xDE, 0xAD, 0xBE, 0xEF]);
-    }
-
-    #[test]
-    fn parse_record_rejects_malformed_json() {
-        assert!(parse_record("not json").is_err());
-    }
-
-    #[test]
-    fn parse_record_rejects_odd_length_payload_hex() {
-        let line = r#"{"ts_ms":1,"service_uuid":"0x0000000063335342","method_id":"0x00000001","payload_hex":"abc","payload_decoded":true}"#;
-        assert!(parse_record(line).is_err());
-    }
-
-    // -- rotated-sibling consumption (PR #99 review: routine long sessions
-    // silently dropped their earliest records once dump.rs started rotating
-    // at 5 MiB by default) -----------------------------------------------
-
-    fn temp_path(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "bpsr-protocol-inspect-replay-test-{tag}-{}-{n}.jsonl",
-            std::process::id()
-        ))
-    }
-
-    fn dump_line(ts_ms: u64) -> String {
-        format!(
-            r#"{{"ts_ms":{ts_ms},"service_uuid":"0x0000000063335342","method_id":"0x0000002d","payload_hex":"","payload_decoded":true}}"#
-        )
-    }
-
-    #[test]
-    fn rotated_sibling_appends_dot_one_to_the_path() {
-        let path = PathBuf::from("/some/dir/dump-123.jsonl");
-        assert_eq!(
-            rotated_sibling(&path),
-            PathBuf::from("/some/dir/dump-123.jsonl.1")
-        );
-    }
-
-    #[test]
-    fn append_records_from_reports_the_open_error_for_a_missing_file() {
-        let path = temp_path("missing");
-        let mut records = Vec::new();
-        assert!(append_records_from(&path, &mut records).is_err());
-        assert!(records.is_empty());
-    }
-
-    #[test]
-    fn append_records_from_parses_valid_lines_and_skips_malformed_ones() {
-        let path = temp_path("append");
-        std::fs::write(
-            &path,
-            format!("{}\nnot json\n{}\n", dump_line(1), dump_line(2)),
-        )
-        .unwrap();
-
-        let mut records = Vec::new();
-        let count = append_records_from(&path, &mut records).expect("file must open");
-
-        assert_eq!(count, 2);
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].ts_ms, 1);
-        assert_eq!(records[1].ts_ms, 2);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// Regression test for the review finding on PR #99: `main` reads the
-    /// rotated `<path>.1` sibling before the live file, so records from a
-    /// dump.rs rotation stay in chronological order instead of being
-    /// silently dropped or reordered.
-    #[test]
-    fn rotated_sibling_records_are_read_before_the_live_files_and_stay_in_order() {
-        let path = temp_path("live");
-        let rotated = rotated_sibling(&path);
-        std::fs::write(
-            &rotated,
-            format!("{}\n{}\n", dump_line(100), dump_line(200)),
-        )
-        .unwrap();
-        std::fs::write(&path, format!("{}\n", dump_line(300))).unwrap();
-
-        let mut records = Vec::new();
-        let rotated_count =
-            append_records_from(&rotated, &mut records).expect("rotated file must open");
-        append_records_from(&path, &mut records).expect("live file must open");
-
-        assert_eq!(rotated_count, 2);
-        assert_eq!(records.len(), 3);
-        assert_eq!(
-            records.iter().map(|r| r.ts_ms).collect::<Vec<_>>(),
-            vec![100, 200, 300],
-            "rotated (older) records must come first, in their original order"
-        );
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&rotated);
     }
 
     #[test]

@@ -1,0 +1,16 @@
+scenario=boss_kill_title_held
+at_ms=48000
+fight_state=Ended
+duration_ms=1000
+total_damage=100000
+total_dps=100000.00
+encounter.boss_monster_id=103
+encounter.boss_name=Rathalos
+encounter.is_boss=true
+encounter.scene_id=1101
+encounter.scene_name=Towering Ruin
+encounter.scene_boss_name=Rathalos
+resets=
+rows=2
+row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=75000 dps=75000.00 share=75.00 crit=0.00 lucky=0.00 hits=2 deaths=0
+row uid=1002 name=Brin class=FrostMage ability_score=11500 season_strength=- imagines=[-,-] damage=25000 dps=25000.00 share=25.00 crit=0.00 lucky=0.00 hits=1 deaths=0

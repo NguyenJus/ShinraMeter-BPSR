@@ -8,6 +8,10 @@ license = "GPL-3.0-only"
 name = "ShinraMeter-BPSR"
 path = "src/main.rs"
 
+[lib]
+name = "bpsr_app"
+path = "src/lib.rs"
+
 [dependencies]
 eframe = { workspace = true }
 egui = { workspace = true }
@@ -59,3 +63,8 @@ embed-resource.workspace = true
 
 [dev-dependencies]
 bpsr-test-support = { workspace = true }
+# Only for decompressing crates/app/tests/fixtures/*.jsonl.zst (sanitized
+# replay fixtures produced by bpsr-protocol's sanitize-dump binary) in
+# integration tests. Already a workspace dependency of bpsr-protocol itself
+# (frame decompression), so this adds no new entry to the lockfile.
+zstd = { workspace = true }

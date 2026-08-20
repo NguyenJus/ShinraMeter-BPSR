@@ -34,30 +34,12 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Maps a protocol entity kind onto the meter's mirror type.
-pub fn map_kind(kind: proto::EntityKind) -> meter::EntityKind {
-    match kind {
-        proto::EntityKind::Player => meter::EntityKind::Player,
-        proto::EntityKind::Monster => meter::EntityKind::Monster,
-        proto::EntityKind::Unknown => meter::EntityKind::Unknown,
-    }
-}
-
-/// Maps a protocol class onto the meter's mirror type.
-pub fn map_class(class: proto::Class) -> meter::Class {
-    match class {
-        proto::Class::Stormblade => meter::Class::Stormblade,
-        proto::Class::FrostMage => meter::Class::FrostMage,
-        proto::Class::TwinStriker => meter::Class::TwinStriker,
-        proto::Class::WindKnight => meter::Class::WindKnight,
-        proto::Class::VerdantOracle => meter::Class::VerdantOracle,
-        proto::Class::HeavyGuardian => meter::Class::HeavyGuardian,
-        proto::Class::Marksman => meter::Class::Marksman,
-        proto::Class::ShieldKnight => meter::Class::ShieldKnight,
-        proto::Class::BeatPerformer => meter::Class::BeatPerformer,
-        proto::Class::Unknown => meter::Class::Unknown,
-    }
-}
+// `map_kind`/`map_class` are shared, byte-identical with the offline
+// sanitizer's copy — see `bpsr_protocol::map`'s doc comment (issue #146's
+// finding 2). Re-exported (rather than called via `proto::map::` at each
+// use site below) so this module's own call sites and unit tests keep
+// referring to them as plain `map_kind`/`map_class`.
+pub use bpsr_protocol::map::{map_class, map_kind};
 
 // IMAGINE-TAKEDOWN: classifies raw skill ids into up to two equipped-Imagine
 // slots. See `crates/app/src/imagines.rs` and the plan's D2/D4 and the spec's
@@ -92,50 +74,23 @@ fn imagine_slots(skill_ids: &[i32]) -> [Option<i32>; 2] {
     slots
 }
 
-/// Translates a `bpsr_protocol::ProtocolEvent` into the meter's mirror event.
-pub fn map_event(ev: proto::ProtocolEvent) -> meter::ProtocolEvent {
-    match ev {
-        proto::ProtocolEvent::Damage(d) => meter::ProtocolEvent::Damage(meter::DamageEvent {
-            attacker_uid: d.attacker_uid,
-            attacker_kind: map_kind(d.attacker_kind),
-            skill_id: d.skill_id,
-            value: d.value,
-            crit: d.crit,
-            lucky: d.lucky,
-            hp_lessen: d.hp_lessen,
-            is_miss: d.is_miss,
-            is_heal: d.is_heal,
-            target_uid: d.target_uid,
-            target_kind: map_kind(d.target_kind),
-            timestamp_ms: d.timestamp_ms,
-            is_dead: d.is_dead,
-        }),
-        proto::ProtocolEvent::Player(p) => meter::ProtocolEvent::Player(meter::PlayerInfo {
-            uid: p.uid,
-            name: p.name,
-            class: p.class.map(map_class),
-            ability_score: p.ability_score,
-            season_strength: p.season_strength,
-            // IMAGINE-TAKEDOWN: empty `skill_ids` means the attr was absent
-            // from this packet, so stay `None` rather than `Some([None,
-            // None])` — the meter's merge rule (T4) must not clobber a
-            // previously cached pair with an absent packet.
-            imagines: (!p.skill_ids.is_empty()).then(|| imagine_slots(&p.skill_ids)),
-        }),
-        proto::ProtocolEvent::EnemyHp(e) => meter::ProtocolEvent::EnemyHp(meter::EnemyHp {
-            uid: e.uid,
-            curr_hp: e.curr_hp,
-            max_hp: e.max_hp,
-            monster_id: e.monster_id,
-            timestamp_ms: e.timestamp_ms,
-        }),
-        proto::ProtocolEvent::Scene { level_map_id } => {
-            meter::ProtocolEvent::Scene { level_map_id }
+/// Translates a `bpsr_protocol::ProtocolEvent` into the meter's mirror
+/// event. Delegates the field-for-field mapping to `bpsr_protocol::map`
+/// (issue #146's finding 2 — shared with the offline sanitizer binary),
+/// resolving only the app-specific `imagines` slot pair here first, since
+/// the Imagine catalog (`crate::imagines`) is out of scope for that crate.
+pub fn map_event(ev: proto::ProtocolEvent, now_ms: u64) -> meter::ProtocolEvent {
+    // IMAGINE-TAKEDOWN: empty `skill_ids` means the attr was absent from
+    // this packet, so stay `None` rather than `Some([None, None])` — the
+    // meter's merge rule (T4) must not clobber a previously cached pair
+    // with an absent packet.
+    let imagines = match &ev {
+        proto::ProtocolEvent::Player(p) if !p.skill_ids.is_empty() => {
+            Some(imagine_slots(&p.skill_ids))
         }
-        proto::ProtocolEvent::ServerChanged => meter::ProtocolEvent::ServerChanged {
-            timestamp_ms: now_ms(),
-        },
-    }
+        _ => None,
+    };
+    bpsr_protocol::map::map_event(ev, now_ms, imagines)
 }
 
 /// What one cross-session cache knows about its own file: the snapshot its
@@ -418,29 +373,13 @@ impl Pipeline {
     /// reconnect, issue #138). A `ServerChanged` event itself never
     /// triggers a reset: it only invalidates entity/scene state and
     /// freezes the fight clock, leaving the displayed stats on screen.
-    pub fn step(&mut self, ev: proto::ProtocolEvent) -> Option<meter::ResetReason> {
-        self.apply_mapped(map_event(ev))
-    }
-
-    /// `step`, but a `ServerChanged` event is stamped with `now_ms` instead
-    /// of the wall clock. Test-only seam: `map_event` reads the real clock
-    /// (`ServerChanged` carries no timestamp of its own), which makes the
-    /// production timescale — epoch milliseconds — impossible to control
-    /// from a test that also wants deterministic damage timestamps. This
-    /// lets a test drive both on the same, controllable scale.
-    #[cfg(test)]
-    pub fn step_at(&mut self, ev: proto::ProtocolEvent, now_ms: u64) -> Option<meter::ResetReason> {
-        let mapped = match map_event(ev) {
-            meter::ProtocolEvent::ServerChanged { .. } => meter::ProtocolEvent::ServerChanged {
-                timestamp_ms: now_ms,
-            },
-            other => other,
-        };
-        self.apply_mapped(mapped)
-    }
-
-    fn apply_mapped(&mut self, mapped: meter::ProtocolEvent) -> Option<meter::ResetReason> {
-        let reason = self.meter.apply(&mapped);
+    ///
+    /// `now_ms` is supplied by the caller rather than read off the wall
+    /// clock inside, so the whole pipeline stays deterministic and
+    /// replayable (`crates/app/tests/`): events carrying no timestamp of
+    /// their own — `ServerChanged` above all — are stamped with it.
+    pub fn step(&mut self, ev: proto::ProtocolEvent, now_ms: u64) -> Option<meter::ResetReason> {
+        let reason = self.meter.apply(&map_event(ev, now_ms));
         if let Some(reason) = reason {
             log::debug!("meter reset: {reason:?}");
             self.save_names_cache();
@@ -552,7 +491,7 @@ fn run(
         select! {
             recv(events) -> msg => match msg {
                 Ok(ev) => {
-                    pipeline.step(ev);
+                    pipeline.step(ev, now_ms());
                 }
                 Err(_) => {
                     log::info!("capture channel closed; pipeline is idle");
@@ -657,7 +596,7 @@ mod tests {
     #[test]
     fn maps_damage_event_field_for_field() {
         let d = damage(11, 1234, 9_000);
-        let mapped = map_event(proto::ProtocolEvent::Damage(d.clone()));
+        let mapped = map_event(proto::ProtocolEvent::Damage(d.clone()), 0);
         let meter::ProtocolEvent::Damage(m) = mapped else {
             panic!("expected a damage event");
         };
@@ -682,7 +621,7 @@ mod tests {
             is_dead: true,
             ..damage(11, 1234, 9_000)
         };
-        let mapped = map_event(proto::ProtocolEvent::Damage(d));
+        let mapped = map_event(proto::ProtocolEvent::Damage(d), 0);
         let meter::ProtocolEvent::Damage(m) = mapped else {
             panic!("expected a damage event");
         };
@@ -691,15 +630,18 @@ mod tests {
 
     #[test]
     fn maps_player_info() {
-        let mapped = map_event(proto::ProtocolEvent::Player(proto::PlayerInfo {
-            uid: 42,
-            name: Some("Foo".to_string()),
-            class: Some(proto::Class::Marksman),
-            ability_score: Some(9_999),
-            season_level: Some(42),
-            season_strength: Some(3_333),
-            skill_ids: Vec::new(),
-        }));
+        let mapped = map_event(
+            proto::ProtocolEvent::Player(proto::PlayerInfo {
+                uid: 42,
+                name: Some("Foo".to_string()),
+                class: Some(proto::Class::Marksman),
+                ability_score: Some(9_999),
+                season_level: Some(42),
+                season_strength: Some(3_333),
+                skill_ids: Vec::new(),
+            }),
+            0,
+        );
         assert_eq!(
             mapped,
             meter::ProtocolEvent::Player(meter::PlayerInfo {
@@ -718,15 +660,18 @@ mod tests {
         // 3905 and 102640 are both the canonical Boar Imagine (see the spec's
         // "Many-to-one is expected" section); 3926 is a distinct Imagine.
         // 999_999_999 is not in the curated table and must not consume slot 2.
-        let mapped = map_event(proto::ProtocolEvent::Player(proto::PlayerInfo {
-            uid: 7,
-            name: None,
-            class: None,
-            ability_score: None,
-            season_level: None,
-            season_strength: None,
-            skill_ids: vec![3905, 102640, 3926, 999_999_999],
-        }));
+        let mapped = map_event(
+            proto::ProtocolEvent::Player(proto::PlayerInfo {
+                uid: 7,
+                name: None,
+                class: None,
+                ability_score: None,
+                season_level: None,
+                season_strength: None,
+                skill_ids: vec![3905, 102640, 3926, 999_999_999],
+            }),
+            0,
+        );
         let meter::ProtocolEvent::Player(p) = mapped else {
             panic!("expected a player event");
         };
@@ -735,15 +680,18 @@ mod tests {
 
     #[test]
     fn maps_player_info_leaves_imagines_none_when_skill_ids_is_empty() {
-        let mapped = map_event(proto::ProtocolEvent::Player(proto::PlayerInfo {
-            uid: 8,
-            name: None,
-            class: None,
-            ability_score: None,
-            season_level: None,
-            season_strength: None,
-            skill_ids: Vec::new(),
-        }));
+        let mapped = map_event(
+            proto::ProtocolEvent::Player(proto::PlayerInfo {
+                uid: 8,
+                name: None,
+                class: None,
+                ability_score: None,
+                season_level: None,
+                season_strength: None,
+                skill_ids: Vec::new(),
+            }),
+            0,
+        );
         let meter::ProtocolEvent::Player(p) = mapped else {
             panic!("expected a player event");
         };
@@ -752,13 +700,16 @@ mod tests {
 
     #[test]
     fn maps_enemy_hp() {
-        let mapped = map_event(proto::ProtocolEvent::EnemyHp(proto::EnemyHp {
-            uid: 10,
-            curr_hp: Some(55),
-            max_hp: Some(100),
-            monster_id: Some(3),
-            timestamp_ms: 1_234,
-        }));
+        let mapped = map_event(
+            proto::ProtocolEvent::EnemyHp(proto::EnemyHp {
+                uid: 10,
+                curr_hp: Some(55),
+                max_hp: Some(100),
+                monster_id: Some(3),
+                timestamp_ms: 1_234,
+            }),
+            0,
+        );
         assert_eq!(
             mapped,
             meter::ProtocolEvent::EnemyHp(meter::EnemyHp {
@@ -773,29 +724,26 @@ mod tests {
 
     #[test]
     fn maps_scene_event() {
-        let mapped = map_event(proto::ProtocolEvent::Scene { level_map_id: 4242 });
+        let mapped = map_event(proto::ProtocolEvent::Scene { level_map_id: 4242 }, 0);
         assert_eq!(mapped, meter::ProtocolEvent::Scene { level_map_id: 4242 });
     }
 
     #[test]
-    fn maps_server_changed_stamps_the_current_wall_clock_time() {
-        let before = now_ms();
-        let mapped = map_event(proto::ProtocolEvent::ServerChanged);
-        let after = now_ms();
-        let meter::ProtocolEvent::ServerChanged { timestamp_ms } = mapped else {
-            panic!("expected a server-changed event");
-        };
-        assert!(
-            (before..=after).contains(&timestamp_ms),
-            "expected {timestamp_ms} in [{before}, {after}]"
+    fn maps_server_changed_stamps_the_scripted_timestamp() {
+        let mapped = map_event(proto::ProtocolEvent::ServerChanged, 4_242);
+        assert_eq!(
+            mapped,
+            meter::ProtocolEvent::ServerChanged {
+                timestamp_ms: 4_242
+            }
         );
     }
 
     #[test]
     fn damage_accumulates_into_the_snapshot() {
         let mut p = Pipeline::new();
-        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)));
-        p.step(proto::ProtocolEvent::Damage(damage(2, 300, 1_000)));
+        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)), 1_000);
+        p.step(proto::ProtocolEvent::Damage(damage(2, 300, 1_000)), 1_000);
         let snap = p.snapshot(2_000);
         assert_eq!(snap.total_damage, 1_000);
         assert_eq!(snap.rows.len(), 2);
@@ -809,7 +757,7 @@ mod tests {
     fn a_quiet_meter_ticks_into_the_ended_state_and_holds_its_snapshot() {
         let idle = meter::FightConfig::default().idle_timeout_ms;
         let mut p = Pipeline::new();
-        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)));
+        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)), 1_000);
 
         assert_eq!(p.tick(1_000 + idle - 1), meter::FightState::Active);
         assert_eq!(p.tick(1_000 + idle), meter::FightState::Ended);
@@ -824,10 +772,13 @@ mod tests {
     #[test]
     fn the_next_fights_first_hit_clears_a_held_snapshot() {
         let mut p = Pipeline::new();
-        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)));
+        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)), 1_000);
         p.tick(600_000);
 
-        let reason = p.step(proto::ProtocolEvent::Damage(damage(1, 300, 600_000)));
+        let reason = p.step(
+            proto::ProtocolEvent::Damage(damage(1, 300, 600_000)),
+            600_000,
+        );
         assert_eq!(reason, Some(meter::ResetReason::NewFight));
         assert_eq!(p.snapshot(601_000).total_damage, 300);
         assert_eq!(p.tick(601_000), meter::FightState::Active);
@@ -836,7 +787,7 @@ mod tests {
     #[test]
     fn manual_reset_clears_the_snapshot() {
         let mut p = Pipeline::new();
-        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)));
+        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)), 1_000);
         p.reset(2_000);
         let snap = p.snapshot(3_000);
         assert_eq!(snap.total_damage, 0);
@@ -847,16 +798,15 @@ mod tests {
     /// player is still reading, so a `ServerChanged` event must not report
     /// a reset, must leave the accumulated stats on screen, and must freeze
     /// the fight clock at the moment of the reconnect rather than the
-    /// caller's clock. `ServerChanged` carries no timestamp of its own —
-    /// `map_event` stamps it with the real wall clock (epoch milliseconds)
-    /// — so this uses `step_at` to control that stamp on the same
-    /// epoch-scale timeline as the damage event below.
+    /// caller's clock. `ServerChanged` carries no timestamp of its own, so
+    /// `step`'s explicit `now_ms` is what stamps it — on the same
+    /// controllable timeline the damage event below sits on.
     #[test]
     fn server_changed_keeps_the_snapshot_on_screen() {
         let mut p = Pipeline::new();
-        let base = now_ms();
-        p.step(proto::ProtocolEvent::Damage(damage(1, 700, base)));
-        let reason = p.step_at(proto::ProtocolEvent::ServerChanged, base + 1_000);
+        let base = 1_000;
+        p.step(proto::ProtocolEvent::Damage(damage(1, 700, base)), base);
+        let reason = p.step(proto::ProtocolEvent::ServerChanged, base + 1_000);
         assert_eq!(reason, None);
 
         let snap = p.snapshot(base + 2_000);
@@ -898,7 +848,7 @@ mod tests {
             );
 
             let mut p = Pipeline::with_names_cache_path(path.clone());
-            p.step(proto::ProtocolEvent::Damage(damage(5, 100, 1_000)));
+            p.step(proto::ProtocolEvent::Damage(damage(5, 100, 1_000)), 1_000);
             let snap = p.snapshot(2_000);
             assert_eq!(snap.rows[0].name, "Cached");
 
@@ -910,15 +860,18 @@ mod tests {
         fn manual_reset_persists_the_names_cache_to_disk() {
             let path = scratch_path("manual-reset");
             let mut p = Pipeline::with_names_cache_path(path.clone());
-            p.step(proto::ProtocolEvent::Player(proto::PlayerInfo {
-                uid: 1,
-                name: Some("Foo".to_string()),
-                class: None,
-                ability_score: None,
-                season_level: None,
-                season_strength: None,
-                skill_ids: Vec::new(),
-            }));
+            p.step(
+                proto::ProtocolEvent::Player(proto::PlayerInfo {
+                    uid: 1,
+                    name: Some("Foo".to_string()),
+                    class: None,
+                    ability_score: None,
+                    season_level: None,
+                    season_strength: None,
+                    skill_ids: Vec::new(),
+                }),
+                1_000,
+            );
 
             assert!(!path.exists());
             p.reset(1_000);
@@ -944,20 +897,26 @@ mod tests {
             // #138) — zoning must not wipe the numbers on screen.
             let path = scratch_path("step-reset");
             let mut p = Pipeline::with_names_cache_path(path.clone());
-            p.step(proto::ProtocolEvent::Player(proto::PlayerInfo {
-                uid: 1,
-                name: Some("Foo".to_string()),
-                class: None,
-                ability_score: None,
-                season_level: None,
-                season_strength: None,
-                skill_ids: Vec::new(),
-            }));
-            p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)));
+            p.step(
+                proto::ProtocolEvent::Player(proto::PlayerInfo {
+                    uid: 1,
+                    name: Some("Foo".to_string()),
+                    class: None,
+                    ability_score: None,
+                    season_level: None,
+                    season_strength: None,
+                    skill_ids: Vec::new(),
+                }),
+                1_000,
+            );
+            p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)), 1_000);
             p.tick(600_000);
 
             assert!(!path.exists());
-            let reason = p.step(proto::ProtocolEvent::Damage(damage(1, 300, 600_000)));
+            let reason = p.step(
+                proto::ProtocolEvent::Damage(damage(1, 300, 600_000)),
+                600_000,
+            );
             assert_eq!(reason, Some(meter::ResetReason::NewFight));
 
             p.shutdown_names_cache();
@@ -1014,7 +973,7 @@ mod tests {
 
             let mut p = Pipeline::with_names_cache_path(names_path.clone())
                 .with_scene_bosses_path(scene_path.clone());
-            p.step(proto::ProtocolEvent::Scene { level_map_id: 1001 });
+            p.step(proto::ProtocolEvent::Scene { level_map_id: 1001 }, 0);
             let snap = p.snapshot(1_000);
             assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
 
@@ -1030,9 +989,9 @@ mod tests {
             let scene_path = scratch_path("scene-bosses-manual-reset");
             let mut p = Pipeline::with_names_cache_path(names_path.clone())
                 .with_scene_bosses_path(scene_path.clone());
-            p.step(proto::ProtocolEvent::Scene { level_map_id: 1001 });
-            p.step(proto::ProtocolEvent::Damage(boss_hit(10, 0)));
-            p.step(proto::ProtocolEvent::EnemyHp(boss_hp(10, 103, 0)));
+            p.step(proto::ProtocolEvent::Scene { level_map_id: 1001 }, 0);
+            p.step(proto::ProtocolEvent::Damage(boss_hit(10, 0)), 0);
+            p.step(proto::ProtocolEvent::EnemyHp(boss_hp(10, 103, 0)), 0);
 
             assert!(!scene_path.exists());
             p.reset(1_000);
@@ -1057,7 +1016,7 @@ mod tests {
 
             let mut p = Pipeline::with_names_cache_path(names_path.clone())
                 .with_scene_bosses_path(scene_path.clone());
-            p.step(proto::ProtocolEvent::Scene { level_map_id: 1001 });
+            p.step(proto::ProtocolEvent::Scene { level_map_id: 1001 }, 0);
             assert_eq!(
                 p.snapshot(1_000).encounter.scene_boss_name,
                 Some("Rathalos")
@@ -1112,16 +1071,19 @@ mod tests {
     #[test]
     fn player_info_names_a_row_that_already_has_damage() {
         let mut p = Pipeline::new();
-        p.step(proto::ProtocolEvent::Damage(damage(5, 100, 1_000)));
-        p.step(proto::ProtocolEvent::Player(proto::PlayerInfo {
-            uid: 5,
-            name: Some("Late".to_string()),
-            class: Some(proto::Class::FrostMage),
-            ability_score: None,
-            season_level: None,
-            season_strength: None,
-            skill_ids: Vec::new(),
-        }));
+        p.step(proto::ProtocolEvent::Damage(damage(5, 100, 1_000)), 1_000);
+        p.step(
+            proto::ProtocolEvent::Player(proto::PlayerInfo {
+                uid: 5,
+                name: Some("Late".to_string()),
+                class: Some(proto::Class::FrostMage),
+                ability_score: None,
+                season_level: None,
+                season_strength: None,
+                skill_ids: Vec::new(),
+            }),
+            1_000,
+        );
         let snap = p.snapshot(2_000);
         assert_eq!(snap.rows[0].name, "Late");
         assert_eq!(snap.rows[0].class, Some(meter::Class::FrostMage));
@@ -1130,16 +1092,19 @@ mod tests {
     #[test]
     fn ability_score_flows_from_protocol_player_info_to_the_snapshot_row() {
         let mut p = Pipeline::new();
-        p.step(proto::ProtocolEvent::Damage(damage(9, 100, 1_000)));
-        p.step(proto::ProtocolEvent::Player(proto::PlayerInfo {
-            uid: 9,
-            name: None,
-            class: None,
-            ability_score: Some(77_000),
-            season_level: None,
-            season_strength: None,
-            skill_ids: Vec::new(),
-        }));
+        p.step(proto::ProtocolEvent::Damage(damage(9, 100, 1_000)), 1_000);
+        p.step(
+            proto::ProtocolEvent::Player(proto::PlayerInfo {
+                uid: 9,
+                name: None,
+                class: None,
+                ability_score: Some(77_000),
+                season_level: None,
+                season_strength: None,
+                skill_ids: Vec::new(),
+            }),
+            1_000,
+        );
         let snap = p.snapshot(2_000);
         assert_eq!(snap.rows[0].ability_score, Some(77_000));
     }
@@ -1147,16 +1112,19 @@ mod tests {
     #[test]
     fn season_strength_flows_from_protocol_player_info_to_the_snapshot_row() {
         let mut p = Pipeline::new();
-        p.step(proto::ProtocolEvent::Damage(damage(10, 100, 1_000)));
-        p.step(proto::ProtocolEvent::Player(proto::PlayerInfo {
-            uid: 10,
-            name: None,
-            class: None,
-            ability_score: None,
-            season_level: None,
-            season_strength: Some(3_333),
-            skill_ids: Vec::new(),
-        }));
+        p.step(proto::ProtocolEvent::Damage(damage(10, 100, 1_000)), 1_000);
+        p.step(
+            proto::ProtocolEvent::Player(proto::PlayerInfo {
+                uid: 10,
+                name: None,
+                class: None,
+                ability_score: None,
+                season_level: None,
+                season_strength: Some(3_333),
+                skill_ids: Vec::new(),
+            }),
+            1_000,
+        );
         let snap = p.snapshot(2_000);
         assert_eq!(snap.rows[0].season_strength, Some(3_333));
     }

@@ -2,10 +2,8 @@
 //! small deterministic xorshift PRNG seeded from a fixed constant instead of
 //! an external fuzz dependency, so runs are reproducible.
 
-mod common;
-
 use bpsr_protocol::Decoder;
-use common::*;
+use bpsr_test_support::wire::*;
 
 /// A tiny deterministic xorshift64 PRNG. Not cryptographic — just needs to
 /// be fast, seedable, and reproducible across runs.
