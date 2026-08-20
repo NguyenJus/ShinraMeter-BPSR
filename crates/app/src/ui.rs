@@ -193,6 +193,18 @@ pub struct OverlayApp {
     /// discarded before the asynchronous reply could ever land, so every
     /// Share click failed).
     pending_screenshot_bound: Option<f32>,
+    /// Issue #156: whether a Share screenshot capture is currently in
+    /// flight — set the moment `toggle_cluster` fires the
+    /// `ViewportCommand::Screenshot` request, cleared the moment the
+    /// `Event::Screenshot` reply lands (`screenshot_capture_guard` is the
+    /// pure state transition). Read at the top of each frame and threaded
+    /// down through `draw_header` into `toggle_cluster` so the toggle
+    /// buttons can suppress their hover fill and tooltip on the frame that
+    /// actually gets captured, not just the frame the click happened on —
+    /// `ViewportCommand::Screenshot` captures "the next frame after" the
+    /// one that sends it, and the reply can land any number of frames
+    /// after that.
+    screenshot_capturing: bool,
     /// `demo_enabled()` cached at construction so `ui()` doesn't re-read the
     /// env var every frame; also lets `ui()` keep demo mode's synthetic
     /// snapshot from being clobbered by the per-frame `rx_snapshot` drain
@@ -450,6 +462,7 @@ impl OverlayApp {
             window_gesture: WindowGesture::default(),
             last_dpi_probe: None,
             pending_screenshot_bound: None,
+            screenshot_capturing: false,
             demo_mode,
         }
     }
@@ -528,9 +541,23 @@ impl eframe::App for OverlayApp {
         // in `handle_share_screenshot`, extracted out for the same
         // testability reason `handle_screenshot_events` is: see its doc
         // comment.
+        // Issue #156: whether this frame is the one that handles the Share
+        // round trip's `Event::Screenshot` reply — fed into `screenshot_
+        // capture_guard` below alongside whether this same frame's Share
+        // click fires a *new* request, to decide what `self.screenshot_
+        // capturing` must hold for the next frame's `draw_header` call.
+        let mut screenshot_event_landed = false;
         handle_share_screenshot(&ctx, &mut self.pending_screenshot_bound, |image| {
+            screenshot_event_landed = true;
             crate::platform::write_clipboard_image(&image);
         });
+        // The value `screenshot_capturing` held entering this frame — read
+        // once, before `draw_header` runs, so the toggle cluster's paint
+        // decision for *this* frame is based on whatever the previous
+        // frame's request/reply activity left it as (see `screenshot_
+        // capture_guard`'s doc comment for why the request frame itself
+        // can't be the one this suppresses).
+        let capturing = self.screenshot_capturing;
 
         // Loaded once, lazily: the `egui::Context` above isn't available yet
         // at `OverlayApp::new`, so the first frame is what actually uploads
@@ -565,6 +592,18 @@ impl eframe::App for OverlayApp {
                     },
                     icons,
                     &mut self.window_gesture,
+                    capturing,
+                );
+                // Issue #156: fold this frame's request/reply activity into
+                // the guard so the *next* frame's `draw_header` call —
+                // which, per `ViewportCommand::Screenshot`'s own doc
+                // comment, is the one that actually gets captured when
+                // `screenshot_requested` is true here — reads a guard
+                // that's already set.
+                self.screenshot_capturing = screenshot_capture_guard(
+                    capturing,
+                    screenshot_requested,
+                    screenshot_event_landed,
                 );
                 // After the header, so a gesture that started this frame is
                 // already anchored — and, being outside it, it is the one
@@ -726,6 +765,13 @@ struct SettingsHandle<'a> {
 /// end of this function) fired a screenshot request this frame — issue #96
 /// (PR #98 review): the caller uses this to know whether to stash this same
 /// frame's row-bottom bound into `OverlayApp::pending_screenshot_bound`.
+// Issue #156's new `capturing` parameter pushes this to 8 genuinely
+// independent dependencies (egui plumbing, the snapshot, the command
+// channel, the settings handle, icons, the drag gesture, and now the
+// screenshot guard) — `settings` already bundles two of what would
+// otherwise be separate parameters for the same reason. One more scalar
+// flag doesn't earn a second bundling struct of its own.
+#[allow(clippy::too_many_arguments)]
 fn draw_header(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -734,6 +780,13 @@ fn draw_header(
     settings: SettingsHandle<'_>,
     icons: &Icons,
     gesture: &mut WindowGesture,
+    // Issue #156: whether a Share screenshot capture is currently in
+    // flight (the request was fired and its `Event::Screenshot` reply has
+    // not landed yet) — threaded down to `toggle_cluster` so the toggle
+    // buttons can suppress their hover fill and tooltip on the frame that
+    // actually gets captured. See `screenshot_capture_guard`'s doc comment
+    // for why this can't just be "the frame the click happened on".
+    capturing: bool,
 ) -> bool {
     let title = encounter_title(&snapshot.encounter);
     let subtitle = encounter_subtitle(&snapshot.encounter);
@@ -776,10 +829,20 @@ fn draw_header(
     // subtitle, stat row — sits on top of it. Sized to the whole drag band
     // (issue #91), not the text rows alone (issue #81) and not the fixed
     // 98pt run before that: the gradient and the oversized emblem it carries
-    // are the header's background, so they run behind the stat-pill row too
-    // and stop exactly at the band's bottom edge, where the first player row
-    // starts. Derived from `band_height`, never a literal.
-    let wash_height = band_height - HEADER_WASH_INSET;
+    // are the header's background, so they run behind the stat-pill row too.
+    //
+    // Issue #158: `band_height` alone stops 8pt short of the first player
+    // row — `OverlayApp::ui` puts a `ui.separator()` between the header and
+    // the rows, and pays the layout's ordinary `ITEM_SPACING_Y` gap before
+    // it, neither of which is inside the band. Sizing the wash to just
+    // `band_height` left that 8pt strip showing the bare panel fill (with
+    // the separator's faint line inside it) between the wash's bottom edge
+    // and the first row — a hard, visible cutoff, not a fade. Extending to
+    // `first_player_row_top_offset` — the same function `default_inner_
+    // height` sums for the window's default open height — closes that gap
+    // and keeps the two derivations from ever drifting apart again. Never a
+    // literal.
+    let wash_height = first_player_row_top_offset(band_height) - HEADER_WASH_INSET;
     draw_header_wash(ui, panel, icons, wash_height);
 
     let drag_surface = ui.interact(band, ui.id().with("title_bar"), egui::Sense::drag());
@@ -892,7 +955,7 @@ fn draw_header(
                 icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
             ),
         );
-        toggle_cluster(ui, tx_command, icons)
+        toggle_cluster(ui, tx_command, icons, capturing)
     })
     .inner
 }
@@ -936,20 +999,33 @@ const TOGGLE_PAD_X: f32 = 4.0;
 /// hand-supplied `widget_info`/`on_hover_text` shape as `menu_chevron`, and
 /// for the same reason: a raw `interact` `Response` carries no `WidgetInfo`
 /// from anywhere.
-fn toggle_button(ui: &egui::Ui, rect: egui::Rect, label: &str) -> egui::Response {
+///
+/// `capturing` (issue #156) suppresses both the hover circle and the
+/// tooltip while a Share screenshot capture is in flight: the pointer is
+/// necessarily still over whichever button was clicked to start the
+/// capture, so on the frame that actually gets captured (see
+/// `screenshot_capture_guard`'s doc comment — it's *not* the click frame
+/// itself) both would otherwise paint straight into the image. Applies to
+/// every button in the cluster, not just Share, since `capturing` is one
+/// flag shared by the whole row.
+fn toggle_button(ui: &egui::Ui, rect: egui::Rect, label: &str, capturing: bool) -> egui::Response {
     let response = ui.interact(
         rect,
         ui.id().with(("toggle_cluster", label)),
         egui::Sense::click(),
     );
-    if response.hovered() {
+    if response.hovered() && !capturing {
         ui.painter()
             .circle_filled(rect.center(), rect.width() / 2.0 + 2.0, TOGGLE_HOVER_FILL);
     }
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label)
     });
-    response.on_hover_text(label)
+    if capturing {
+        response
+    } else {
+        response.on_hover_text(label)
+    }
 }
 
 /// Paints the toggle cluster: the Share and Reset buttons (issue #82) and
@@ -962,7 +1038,17 @@ fn toggle_button(ui: &egui::Ui, rect: egui::Rect, label: &str) -> egui::Response
 /// Returns whether Share was clicked this frame (issue #96, PR #98 review)
 /// — `draw_header` propagates this up so `OverlayApp::ui` knows to stash
 /// this frame's row-bottom bound for the async screenshot reply.
-fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Icons) -> bool {
+///
+/// `capturing` (issue #156) is threaded straight through to every
+/// `toggle_button` call so the whole cluster — Share, Reset, and any
+/// future button here — suppresses its hover fill and tooltip together
+/// while a capture is in flight, rather than special-casing Share alone.
+fn toggle_cluster(
+    ui: &mut egui::Ui,
+    tx_command: &Sender<UiCommand>,
+    icons: &Icons,
+    capturing: bool,
+) -> bool {
     let height = ui.spacing().interact_size.y;
     let width = 2.0 * TOGGLE_PAD_X
         + TOGGLE_MOUSE_SIDE
@@ -992,7 +1078,7 @@ fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Ico
         egui::Vec2::splat(TOGGLE_MOUSE_SIDE),
     );
     let mut screenshot_requested = false;
-    if toggle_button(ui, share_rect, "Copy screenshot to clipboard").clicked() {
+    if toggle_button(ui, share_rect, "Copy screenshot to clipboard", capturing).clicked() {
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         screenshot_requested = true;
@@ -1010,7 +1096,7 @@ fn toggle_cluster(ui: &mut egui::Ui, tx_command: &Sender<UiCommand>, icons: &Ico
         egui::pos2(x + TOGGLE_CLOUD_SIDE / 2.0, y),
         egui::Vec2::splat(TOGGLE_CLOUD_SIDE),
     );
-    if toggle_button(ui, reset_rect, "Reset").clicked() {
+    if toggle_button(ui, reset_rect, "Reset", capturing).clicked() {
         let _ = tx_command.try_send(UiCommand::Reset);
     }
     if let Some(reset) = icons.toolbar.get(ToolbarIcon::Reset) {
@@ -1191,6 +1277,35 @@ fn take_pending_screenshot_bound(pending: Option<f32>, event_landed: bool) -> (f
         (pending.unwrap_or(0.0), None)
     } else {
         (0.0, pending)
+    }
+}
+
+/// Issue #156: the state transition behind `OverlayApp::screenshot_
+/// capturing`, the guard `toggle_cluster`'s buttons read to decide whether
+/// to suppress their hover fill and tooltip this frame.
+///
+/// `egui::ViewportCommand::Screenshot`'s own doc comment says it captures
+/// "the next frame after" the one that sends it — not the request frame
+/// itself — and its `Event::Screenshot` reply is asynchronous, landing any
+/// number of frames later (the same round trip `take_pending_screenshot_
+/// bound` accounts for). So the guard can't just be "true on the frame
+/// `toggle_cluster` fires the request": it has to still be `true` on the
+/// *next* frame (the one actually captured), and every frame after that
+/// until the reply lands — otherwise a suppression that only covered the
+/// click frame would be a silent no-op, since that frame is never the one
+/// in the screenshot.
+///
+/// `requested_this_frame` is checked before `event_landed` so a new
+/// request that happens to land in the same frame as an old capture's
+/// reply keeps the guard set (a fresh capture is now in flight) rather
+/// than clearing it.
+fn screenshot_capture_guard(current: bool, requested_this_frame: bool, event_landed: bool) -> bool {
+    if requested_this_frame {
+        true
+    } else if event_landed {
+        false
+    } else {
+        current
     }
 }
 
@@ -1893,6 +2008,21 @@ fn header_band_height(button_row_height: f32) -> f32 {
     header_text_band_height() + HEADER_STAT_ROW_GAP + button_row_height
 }
 
+/// Issue #158: the panel-top-relative y where the first player row
+/// actually begins — which is *not* `band_height`. `OverlayApp::ui` puts a
+/// `ui.separator()` (`SEPARATOR_HEIGHT`, egui's own fixed 6.0) between the
+/// header and the row list, and egui's vertical layout pays its ordinary
+/// `ITEM_SPACING_Y` gap before that separator, same as between any other
+/// two consecutive widgets in the panel. So the band's own bottom edge is
+/// 8pt short of where the rows start; this is the single function both
+/// `default_inner_height` (the window's default open height) and the
+/// header wash (`draw_header`'s `wash_height`) derive the true offset from,
+/// so the two can never drift back out of sync the way `band_height` alone
+/// did.
+fn first_player_row_top_offset(band_height: f32) -> f32 {
+    band_height + ITEM_SPACING_Y + SEPARATOR_HEIGHT
+}
+
 /// Height of the header's *text* rows alone: the title line, the gap, and
 /// the subtitle line under it (issue #91's `22 + 2 + 16`, grown from the
 /// source's `Height="36"` grid).
@@ -2033,9 +2163,14 @@ fn header_emblem_rect(row: egui::Rect, text_band_height: f32) -> egui::Rect {
 /// itself, so its tail bled into the player rows — with a height derived
 /// from the content. Issue #91 settles which content: the whole header band
 /// (`header_band_height`), stat-pill row included. The gradient and the
-/// oversized emblem share one rect, so both now run the full band and both
-/// stop dead at its bottom edge, flush with the first player row. No fixed
-/// constant is left to drift out of sync with the content it sits behind.
+/// oversized emblem share one rect, so both now run the full band. Issue
+/// #91 believed that made both flush with the first player row; issue #158
+/// found the band's own bottom edge is actually 8pt short of it (the
+/// `ui.separator()` between the header and the rows, plus the layout's
+/// `ITEM_SPACING_Y` gap before it, are both outside the band) and extended
+/// the wash past the band to `first_player_row_top_offset` so it now really
+/// does stop flush with the first player row. No fixed constant is left to
+/// drift out of sync with the content it sits behind.
 /// Inset from the panel's edges the wash is painted at, so its square
 /// corners never poke past the panel's own `PANEL_CORNER_RADIUS`-rounded,
 /// `PANEL_BORDER_WIDTH`-thick border.
@@ -2087,10 +2222,11 @@ fn header_wash_emblem_rect(wash: egui::Rect) -> egui::Rect {
 /// panel with a huge, nearly-invisible emblem bleeding off its right edge —
 /// clipped to its own rect so it can never bleed into the rows below or over
 /// the panel's rounded corners. `panel` is the whole central panel's rect
-/// (not the drag band); `height` (issue #91, `header_band_height` less
-/// `HEADER_WASH_INSET`) is what actually bounds the wash — the whole header
-/// band, stat-pill row included, stopping exactly where the first player row
-/// begins (`wash_covers_the_stat_pill_row_but_stops_at_the_first_player_row`).
+/// (not the drag band); `height` (issue #158, `first_player_row_top_offset`
+/// of `header_band_height` less `HEADER_WASH_INSET`) is what actually
+/// bounds the wash — the whole header band plus the separator gap below
+/// it, stopping exactly where the first player row begins
+/// (`wash_covers_the_stat_pill_row_but_stops_at_the_first_player_row`).
 ///
 /// The source rounds the wash's top corners (`CornerRadius="7 7 0 0"`); egui
 /// cannot clip to a rounded rect this cheaply, so the wash keeps square
@@ -3765,9 +3901,14 @@ const MIN_COLUMN_SCALE: f32 = 0.6;
 ///
 ///   band (68.0) + separator (6.0) + 20 rows * 30.0 (600.0) + gap (2.0)
 ///     = 676.0
+///
+/// The band/gap/separator terms are `first_player_row_top_offset` — the
+/// same offset the header wash's height derives from (issue #158) — so
+/// this window's "no scrolling needed" promise and the wash's reach can
+/// never drift back out of sync with each other.
 fn default_inner_height() -> f32 {
     let rows = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
-    header_band_height(BUTTON_ROW_HEIGHT) + SEPARATOR_HEIGHT + rows + ITEM_SPACING_Y
+    first_player_row_top_offset(header_band_height(BUTTON_ROW_HEIGHT)) + rows
 }
 
 /// Extra width folded into `default_inner_width` on top of the row-column
@@ -4338,6 +4479,22 @@ mod tests {
         }
     }
 
+    /// Walks a painted `Shape`, collecting every `Shape::Circle`'s fill
+    /// color — how `toggle_button`'s hover wash (`ui.painter().circle_
+    /// filled(..., TOGGLE_HOVER_FILL)`) is found in issue #156's
+    /// suppression tests, since it's the only circle either button paints.
+    fn collect_circle_fills(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Circle(circle) => out.push(circle.fill),
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_circle_fills(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Renders `draw_header` and returns the text of every string it
     /// painted this frame (title, subtitle, and every `ui.label` in the
     /// button row) by walking the frame's raw `FullOutput::shapes` — the
@@ -4365,6 +4522,7 @@ mod tests {
                 },
                 &icons,
                 &mut WindowGesture::default(),
+                false,
             );
         });
         let mut texts = Vec::new();
@@ -4517,6 +4675,7 @@ mod tests {
                 },
                 &icons,
                 &mut WindowGesture::default(),
+                false,
             );
         });
         for clipped in &output.shapes {
@@ -4765,6 +4924,7 @@ mod tests {
                 },
                 &icons,
                 &mut WindowGesture::default(),
+                false,
             );
         });
         let update = output
@@ -4843,6 +5003,7 @@ mod tests {
                 },
                 &icons,
                 &mut WindowGesture::default(),
+                false,
             );
             interact_size_y = ui.spacing().interact_size.y;
             rendered_height = ui.min_rect().height();
@@ -5322,7 +5483,7 @@ mod tests {
 
         let mut blits = Vec::new();
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons);
+            toggle_cluster(ui, &tx_command, &icons, false);
         });
         for clipped in &output.shapes {
             collect_image_texture_tints(&clipped.shape, &mut blits);
@@ -5361,7 +5522,7 @@ mod tests {
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
 
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons);
+            toggle_cluster(ui, &tx_command, &icons, false);
         });
         let update = output
             .platform_output
@@ -5393,7 +5554,7 @@ mod tests {
         let (tx_command, rx_command) = crossbeam_channel::unbounded();
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons);
+            toggle_cluster(ui, &tx_command, &icons, false);
         });
         let update = layout
             .platform_output
@@ -5404,7 +5565,7 @@ mod tests {
         layout.drop_without_applying_deltas();
 
         let output = ctx.run_ui(click_at(share_pos), |ui| {
-            toggle_cluster(ui, &tx_command, &icons);
+            toggle_cluster(ui, &tx_command, &icons, false);
         });
         let commands = output
             .viewport_output
@@ -5437,7 +5598,7 @@ mod tests {
         let (tx_command, rx_command) = crossbeam_channel::unbounded();
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons);
+            toggle_cluster(ui, &tx_command, &icons, false);
         });
         let update = layout
             .platform_output
@@ -5448,7 +5609,7 @@ mod tests {
         layout.drop_without_applying_deltas();
 
         let output = ctx.run_ui(click_at(reset_pos), |ui| {
-            toggle_cluster(ui, &tx_command, &icons);
+            toggle_cluster(ui, &tx_command, &icons, false);
         });
         let commands = output
             .viewport_output
@@ -5470,6 +5631,68 @@ mod tests {
                 .iter()
                 .any(|cmd| matches!(cmd, egui::ViewportCommand::Screenshot(_))),
             "Reset must not also request a screenshot: {commands:?}"
+        );
+    }
+
+    /// Issue #156: the pointer is necessarily still over the Share button
+    /// on the frame right after the click that started a screenshot
+    /// capture (`ViewportCommand::Screenshot` captures "the next frame
+    /// after" the request, per its own doc comment), so `toggle_button`'s
+    /// hover circle would otherwise paint straight into the captured
+    /// image. `capturing: true` must suppress it — for every button in the
+    /// cluster, not just Share, since one guard covers the whole row.
+    ///
+    /// The `capturing: false` half is a sanity check on the test itself:
+    /// without it, a `toggle_button` that suppressed its hover fill
+    /// unconditionally would pass the `true` half for the wrong reason.
+    #[test]
+    fn toggle_button_suppresses_its_hover_fill_while_a_screenshot_capture_is_in_flight() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            toggle_cluster(ui, &tx_command, &icons, false);
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let share_pos = accessible_rect_for_label(&update, "Copy screenshot to clipboard").center();
+        layout.drop_without_applying_deltas();
+
+        let hover_input = || egui::RawInput {
+            events: vec![egui::Event::PointerMoved(share_pos)],
+            ..Default::default()
+        };
+
+        let fills_while_hovered = |capturing: bool| -> Vec<egui::Color32> {
+            let output = ctx.run_ui(hover_input(), |ui| {
+                toggle_cluster(ui, &tx_command, &icons, capturing);
+            });
+            let mut fills = Vec::new();
+            for clipped in &output.shapes {
+                collect_circle_fills(&clipped.shape, &mut fills);
+            }
+            output.drop_without_applying_deltas();
+            fills
+        };
+
+        let normal = fills_while_hovered(false);
+        assert!(
+            normal.contains(&TOGGLE_HOVER_FILL),
+            "sanity check: hovering Share with no capture in flight must \
+             still paint the hover fill: {normal:?}"
+        );
+
+        let while_capturing = fills_while_hovered(true);
+        assert!(
+            !while_capturing.contains(&TOGGLE_HOVER_FILL),
+            "the hover fill must be suppressed while a Share screenshot \
+             capture is in flight: {while_capturing:?}"
         );
     }
 
@@ -5777,6 +6000,85 @@ mod tests {
         let (bound_to_use, new_pending) = take_pending_screenshot_bound(None, true);
         assert_eq!(bound_to_use, 0.0);
         assert_eq!(new_pending, None);
+    }
+
+    // -- screenshot_capture_guard (issue #156) --------------------------
+
+    /// The guard must switch on the instant a Share click fires a new
+    /// request — regardless of what it held before — so `toggle_cluster`'s
+    /// suppression is armed before the very next frame, the one
+    /// `ViewportCommand::Screenshot` actually captures.
+    #[test]
+    fn screenshot_capture_guard_switches_on_the_frame_a_request_is_fired() {
+        assert!(screenshot_capture_guard(false, true, false));
+        // A request firing on the same frame an old capture's reply lands
+        // must still leave the guard set for the new capture in flight,
+        // not clear it because a reply also landed this frame.
+        assert!(screenshot_capture_guard(true, true, true));
+    }
+
+    /// A frame with neither a new request nor a landed reply must leave
+    /// the guard exactly as it found it — this is what keeps the
+    /// suppression alive across however many idle frames the async round
+    /// trip takes.
+    #[test]
+    fn screenshot_capture_guard_holds_steady_on_an_idle_frame() {
+        assert!(!screenshot_capture_guard(false, false, false));
+        assert!(screenshot_capture_guard(true, false, false));
+    }
+
+    /// The frame the `Event::Screenshot` reply lands on clears the guard —
+    /// suppression is only needed until the capture actually happens, and
+    /// by the time the reply arrives it already has.
+    #[test]
+    fn screenshot_capture_guard_clears_when_the_reply_lands() {
+        assert!(!screenshot_capture_guard(true, false, true));
+    }
+
+    /// The property the issue calls out explicitly: `ViewportCommand::
+    /// Screenshot` captures "the next frame after" the one that sends it,
+    /// and the `Event::Screenshot` reply can land any number of frames
+    /// after *that* — so a guard that only covered the request frame would
+    /// be a silent no-op (the request frame is never the one in the
+    /// screenshot). Driving `screenshot_capture_guard` across a simulated
+    /// frame sequence — request, the captured frame right after it, one
+    /// more idle frame while the reply is still in flight, then the reply
+    /// landing — proves the guard stays set for every frame in between,
+    /// not just the click.
+    #[test]
+    fn screenshot_capture_guard_stays_set_through_the_captured_frame_and_every_frame_until_the_reply_lands()
+     {
+        let mut capturing = false;
+
+        // Frame 0: the Share click fires the request. This frame itself is
+        // never captured (`ViewportCommand::Screenshot` captures the frame
+        // *after* this one), but the guard must already be set entering
+        // the next frame.
+        capturing = screenshot_capture_guard(capturing, true, false);
+        assert!(
+            capturing,
+            "the guard must be set the instant the request fires"
+        );
+
+        // Frame 1: this is the frame that actually gets captured. No new
+        // request, no reply yet — the guard must still be set here, or the
+        // suppression never covers the one frame that matters.
+        capturing = screenshot_capture_guard(capturing, false, false);
+        assert!(
+            capturing,
+            "the guard must still be set on the captured frame, one frame after the click"
+        );
+
+        // Frame 2: still waiting on the async `Event::Screenshot` reply.
+        capturing = screenshot_capture_guard(capturing, false, false);
+        assert!(
+            capturing,
+            "the guard must stay set for every frame the reply hasn't landed on yet"
+        );
+
+        // Frame 3: the reply finally lands — the guard clears.
+        capturing = screenshot_capture_guard(capturing, false, true);
+        assert!(!capturing, "the guard must clear once the reply has landed");
     }
 
     // -- handle_share_screenshot (the `OverlayApp::ui` sequencing itself) ---
@@ -6632,21 +6934,24 @@ mod tests {
 
     /// Issue #91 inverts issue #81's rule. The wash is the header band's
     /// *background*, so it must run behind the stat-pill row as well as the
-    /// text rows — `draw_header` sizes it to
-    /// `header_band_height - HEADER_WASH_INSET`, one rect carrying both the
-    /// gradient and the oversized emblem. What it must still never do is
-    /// bleed past the band into the first player row, which is exactly where
-    /// the old fixed `98.0`pt wash went wrong.
+    /// text rows. Issue #158 corrects where it must stop: not
+    /// `header_band_height` itself (that left an 8pt gap of bare panel fill,
+    /// with the separator's faint line inside it, between the wash and the
+    /// first row) but `first_player_row_top_offset` — the band plus the
+    /// `ui.separator()` and the layout gap before it, which is where the
+    /// first player row genuinely starts. What it must still never do is
+    /// bleed *past* that row, which is exactly where the old fixed `98.0`pt
+    /// wash went wrong.
     #[test]
     fn wash_covers_the_stat_pill_row_but_stops_at_the_first_player_row() {
         let panel = wash_test_panel();
         let button_row_height = 18.0;
         let text_band = header_text_band_height();
         let band = header_band_height(button_row_height);
-        let wash = header_wash_rect(panel, band - HEADER_WASH_INSET);
+        let wash = header_wash_rect(panel, first_player_row_top_offset(band) - HEADER_WASH_INSET);
         let stat_pill_row_top = panel.top() + text_band + HEADER_STAT_ROW_GAP;
         let stat_pill_row_bottom = stat_pill_row_top + button_row_height;
-        let first_player_row_top = panel.top() + band;
+        let first_player_row_top = panel.top() + first_player_row_top_offset(band);
 
         assert!(
             wash.top() < stat_pill_row_top,
@@ -6661,8 +6966,8 @@ mod tests {
         );
         assert!(
             wash.bottom() <= first_player_row_top,
-            "wash bottom {} bleeds past the header band into the first player \
-             row at {first_player_row_top}",
+            "wash bottom {} bleeds past the first player row at \
+             {first_player_row_top}",
             wash.bottom()
         );
         // Flush, not merely inside: the only slack is the inset the wash
@@ -6675,6 +6980,15 @@ mod tests {
     /// change that shrank the quad back to the text band while leaving the
     /// emblem alone would pass every pure-geometry test above and still be
     /// the bug.
+    ///
+    /// Issue #158: asserting the gradient's *height* against `band -
+    /// HEADER_WASH_INSET` is exactly what let the 8pt-short bug hide —
+    /// that assertion was true both before and after the fix, since it
+    /// never checks where the first player row actually starts. Asserting
+    /// the gradient's *bottom* against `first_player_row_top_offset`
+    /// instead (derived from `gradient.top()`, so this doesn't also have
+    /// to assume where the panel's own top edge landed) ties the two
+    /// together so they cannot drift apart again.
     #[test]
     fn the_wash_gradient_spans_the_whole_header_band() {
         let snapshot = header_test_snapshot(30_100_000_000);
@@ -6682,11 +6996,18 @@ mod tests {
         let gradient = frame.gradient_box();
 
         let band = header_band_height(BUTTON_ROW_HEIGHT);
+        // `gradient.top()` is `panel.top() + HEADER_WASH_INSET` (see
+        // `header_wash_rect`), so subtracting the inset back out recovers
+        // the panel's own top edge without this test having to assume a
+        // fixed value for it.
+        let panel_top = gradient.top() - HEADER_WASH_INSET;
+        let first_player_row_top = panel_top + first_player_row_top_offset(band);
         assert!(
-            (gradient.height() - (band - HEADER_WASH_INSET)).abs() < 0.01,
-            "the wash gradient is {}pt tall, not the header band's {}pt",
-            gradient.height(),
-            band - HEADER_WASH_INSET
+            (gradient.bottom() - first_player_row_top).abs() < 0.01,
+            "the wash gradient's bottom is {}, not the first player row's \
+             top at {first_player_row_top} — a wash that stops at the bare \
+             header band leaves a gap of bare panel fill above the rows",
+            gradient.bottom()
         );
 
         // …and it really is behind the stat row's ink, not merely tall.
@@ -8296,6 +8617,7 @@ mod tests {
                     },
                     &icons,
                     &mut gesture,
+                    false,
                 );
             });
             let update = output
