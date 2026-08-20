@@ -40,6 +40,26 @@ pub struct FightConfig {
     /// `tables::BOSS_MONSTER_IDS`, so trash dying mid-pull can never end a
     /// fight early.
     pub end_on_boss_death: bool,
+    /// How long after a boss-death fight end a hit on a **different phase of
+    /// the same boss fight** (`crate::phase::same_phase_group`) resumes the
+    /// held fight instead of clearing it and starting a new one (issue #124).
+    ///
+    /// A dungeon's final boss can fight through several phases, each a
+    /// distinct monster id whose predecessor genuinely dies; the meter must
+    /// keep accumulating across that. A raid's three sequential bosses are
+    /// *not* in one phase group, so they still reset — this window only ever
+    /// applies to a curated same-fight pair.
+    ///
+    /// 60s: generous enough for a phase-transition cutscene plus the
+    /// invulnerability/positioning window before the next phase can be hit,
+    /// and far shorter than the gap between two runs of the same dungeon.
+    /// Without a bound, re-entering that dungeon an hour later and hitting
+    /// the same boss family would silently graft the new pull onto the old
+    /// one's frozen numbers.
+    ///
+    /// `0` disables phase resumption, restoring the pre-#124 behaviour where
+    /// every post-hold hit starts a fresh fight.
+    pub phase_resume_window_ms: u64,
 }
 
 impl Default for FightConfig {
@@ -47,6 +67,7 @@ impl Default for FightConfig {
         Self {
             idle_timeout_ms: 9_000,
             end_on_boss_death: true,
+            phase_resume_window_ms: 60_000,
         }
     }
 }
@@ -63,6 +84,11 @@ mod tests {
     #[test]
     fn boss_death_detection_is_on_by_default() {
         assert!(FightConfig::default().end_on_boss_death);
+    }
+
+    #[test]
+    fn phase_resume_window_defaults_to_sixty_seconds() {
+        assert_eq!(FightConfig::default().phase_resume_window_ms, 60_000);
     }
 
     #[test]

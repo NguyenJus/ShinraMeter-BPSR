@@ -127,6 +127,11 @@ fn paint_bold_text(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiCommand {
     Reset,
+    /// Issue #131: clears the learned scene -> final-boss map, both
+    /// in-process and its on-disk cache. Sent from the header dropdown's
+    /// "Forget learned bosses" item (`draw_header_menu`); handled by
+    /// `pipeline::run` on the pipeline thread, not here — same as `Reset`.
+    ForgetLearnedBosses,
     Quit,
 }
 
@@ -555,7 +560,15 @@ impl eframe::App for OverlayApp {
                 }
             });
 
-        track_window_position(&ctx, &mut self.settings, &self.tx_settings);
+        // Read once and share with both trackers rather than each calling
+        // `ctx.input` separately — also what lets `minimized` be threaded
+        // through both as the exact same value for the same frame.
+        let (outer_rect, inner_rect, minimized) = ctx.input(|i| {
+            let viewport = i.viewport();
+            (viewport.outer_rect, viewport.inner_rect, viewport.minimized)
+        });
+        track_window_position(outer_rect, minimized, &mut self.settings, &self.tx_settings);
+        track_window_size(inner_rect, minimized, &mut self.settings, &self.tx_settings);
 
         // ~10 Hz.
         ctx.request_repaint_after(Duration::from_millis(100));
@@ -573,13 +586,16 @@ impl eframe::App for OverlayApp {
 /// A minimized window is skipped entirely: the platform parks it far
 /// off-screen (Windows uses -32000, -32000) and reports *that* as the outer
 /// position, which would otherwise be persisted and reopen the overlay
-/// somewhere the user cannot reach it.
+/// somewhere the user cannot reach it. `outer_rect` and `minimized` are read
+/// once per frame by the caller (`OverlayApp::update`) and shared with
+/// `track_window_size`, rather than each tracker re-reading `ctx.input`
+/// itself.
 fn track_window_position(
-    ctx: &egui::Context,
+    outer_rect: Option<egui::Rect>,
+    minimized: Option<bool>,
     settings: &mut Settings,
     tx_settings: &Sender<Settings>,
 ) {
-    let (outer_rect, minimized) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().minimized));
     if minimized == Some(true) {
         return;
     }
@@ -590,6 +606,39 @@ fn track_window_position(
         return;
     }
     if let Some(updated) = settings.with_window_position_if_changed([rect.min.x, rect.min.y]) {
+        *settings = updated.clone();
+        let _ = tx_settings.send(updated);
+    }
+}
+
+/// Tracks the window's inner (content) size and persists it via the same
+/// settings-writer path position uses (issue #134). `inner_rect` is reported
+/// on every single frame — including every frame of a resize gesture — so
+/// `Settings::with_window_size_if_changed` gates the send on an actual
+/// change, the same way `track_window_position` gates on an actual move.
+///
+/// A minimized window is skipped entirely: some platforms report a zeroed
+/// or otherwise meaningless inner size while minimized, which would
+/// otherwise be persisted and reopen the overlay unusably small. `inner_rect`
+/// and `minimized` are read once per frame by the caller
+/// (`OverlayApp::update`) and shared with `track_window_position`, rather
+/// than each tracker re-reading `ctx.input` itself.
+fn track_window_size(
+    inner_rect: Option<egui::Rect>,
+    minimized: Option<bool>,
+    settings: &mut Settings,
+    tx_settings: &Sender<Settings>,
+) {
+    if minimized == Some(true) {
+        return;
+    }
+    let Some(rect) = inner_rect else {
+        return;
+    };
+    if !is_plausible_size(rect.size()) {
+        return;
+    }
+    if let Some(updated) = settings.with_window_size_if_changed([rect.width(), rect.height()]) {
         *settings = updated.clone();
         let _ = tx_settings.send(updated);
     }
@@ -611,6 +660,22 @@ fn is_plausible_position(position: egui::Pos2) -> bool {
 /// real monitor arrangement, tight enough to catch Windows' -32000 parking
 /// spot for minimized windows.
 const MIN_PLAUSIBLE_COORD: f32 = -20_000.0;
+
+/// Whether a reported inner size is worth persisting at all — belt and
+/// braces behind `track_window_size`'s minimized guard, in case a platform
+/// reports a zeroed or otherwise meaningless inner size for a frame before
+/// the `minimized` flag catches up, mirroring `is_plausible_position`. The
+/// bounds are the same ones `sanitize_window_size` enforces when a
+/// persisted size is later restored, so nothing rejected here would have
+/// survived a restart anyway.
+fn is_plausible_size(size: egui::Vec2) -> bool {
+    size.x.is_finite()
+        && size.y.is_finite()
+        && size.x >= MIN_INNER_SIZE.x
+        && size.y >= MIN_INNER_SIZE.y
+        && size.x <= MAX_INNER_SIZE_DIMENSION
+        && size.y <= MAX_INNER_SIZE_DIMENSION
+}
 
 /// The persisted settings plus the channel that persists changes to disk,
 /// bundled because every draw site that touches settings needs both —
@@ -1592,30 +1657,34 @@ fn paint_stat_pill(
 const UV_FULL: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
 
 /// Header title text (issue #9 slice 2; gated to boss fights by issue #42;
-/// dungeon-final-boss precedence by issue #125).
+/// dungeon-final-boss precedence by issue #125; live-boss-first by issue
+/// #131).
 ///
 /// Precedence, highest first:
 ///
-/// 1. `scene_boss_name` — the current dungeon's *remembered final boss*
-///    (`Meter::scene_bosses`), if one has been learned. This outranks
-///    everything below, including a genuine currently-selected boss: a
-///    dungeon's trash clear routinely selects a mid-dungeon mech or boss as
-///    `boss_uid` (`Meter::recompute_boss`'s HP heuristic has no notion of
-///    "final"), and once the dungeon's real final boss is known, showing
-///    anything else in the header is a regression back to the "wrong name
-///    flashes mid-trash" problem issue #42 existed to fix. This is also what
-///    delivers "shown from the moment the player enters the dungeon": on a
-///    later run of the same dungeon this session, `scene_boss_name` is
-///    already populated before a single hit lands.
-/// 2. else the existing recognized-boss branch: the boss name when the
-///    current target is a recognized boss with a resolved name, `Monster
-///    #{id}` when it's a recognized boss whose name didn't resolve (the two
-///    vendored lists aren't guaranteed to agree — see `EncounterInfo::is_boss`),
-///    else blank for a non-boss pull. This is what a dungeon's first-ever run
-///    this session falls back to before its final boss has been observed,
-///    and what non-dungeon scenes (`tables::is_dungeon_scene`) use always,
-///    since `scene_boss_name` is never populated for them.
-/// 3. else "No target" when nothing has been hit yet.
+/// 1. The *live* boss, when the currently-selected target is a genuinely
+///    recognized boss (`is_boss`): its resolved name, or `Monster #{id}`
+///    when it's a recognized boss whose name didn't resolve (the two
+///    vendored lists aren't guaranteed to agree — see
+///    `EncounterInfo::is_boss`). This now outranks `scene_boss_name` —
+///    inverted from issue #125's original precedence — because a raid can
+///    string several *different* final bosses together in one instance
+///    (repo owner, issue #131): `Meter::scene_bosses` only ever remembers
+///    one boss per scene and overwrites, so once a second or third raid
+///    boss is actually engaged, showing the *previous* one instead of the
+///    boss currently being fought would be actively wrong, not just stale.
+///    A single-final-boss dungeon is unaffected: nothing else is ever
+///    `is_boss` there once the run's target is the remembered boss itself.
+/// 2. else `scene_boss_name` — the current dungeon's *remembered final
+///    boss* (`Meter::scene_bosses`), if one has been learned. This is what
+///    covers both "just walked in, nothing engaged yet" (`boss_monster_id`
+///    is still `None`) and the issue #125 case: `recompute_boss` selected a
+///    non-boss mid-dungeon mech or add as `boss_uid` (`is_boss` false), so
+///    branch 1 doesn't apply, but the header still shouldn't go blank or
+///    fall through to "No target" when the dungeon's real boss is already
+///    known.
+/// 3. else the pre-#125 fallback: blank for a non-boss pull with nothing
+///    remembered, "No target" when nothing has been hit yet at all.
 ///
 /// Always returns something (never omits the line) so `draw_header` can
 /// render it unconditionally and the header's height never jitters between
@@ -1631,16 +1700,32 @@ const UV_FULL: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui:
 /// different: it's a real boss fight, and an empty header would be
 /// indistinguishable from a trash pull — so that case still falls back to
 /// the raw id.
+///
+/// Known limitation (issue #131, not fixed here): on *entry* to a
+/// multi-boss raid, before anything has been engaged this session,
+/// `scene_boss_name` is whichever boss `Meter::scene_bosses` last latched
+/// for that scene — not necessarily the *first* one the raid will actually
+/// fight. The header only becomes correct once a boss is engaged and branch
+/// 1 takes over.
 fn encounter_title(e: &EncounterInfo) -> String {
+    if e.is_boss {
+        // `is_boss` is only ever true alongside a `Some` `boss_monster_id`
+        // (see `Meter::snapshot`), so the `None` arm here is unreachable in
+        // practice — kept only so this stays a total match rather than an
+        // `unwrap`.
+        return match e.boss_monster_id {
+            Some(id) => e
+                .boss_name
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Monster #{id}")),
+            None => String::new(),
+        };
+    }
     if let Some(name) = e.scene_boss_name {
         return name.to_string();
     }
     match e.boss_monster_id {
         None => "No target".to_string(),
-        Some(id) if e.is_boss => e
-            .boss_name
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("Monster #{id}")),
         Some(_) => String::new(),
     }
 }
@@ -2107,9 +2192,10 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
 ///
 /// Order matches the spec: a Columns disclosure section (issue #13's stat
 /// column toggles, unchanged in behavior — just relocated), a separator,
-/// Minimize to tray, a separator, then Close. Reset used to be the first
-/// item here but moved into the header's toggle cluster (issue #82; see
-/// `toggle_cluster`), leaving this menu with no reset trigger of its own.
+/// Forget learned bosses (issue #131), a separator, Minimize to tray, a
+/// separator, then Close. Reset used to be the first item here but moved
+/// into the header's toggle cluster (issue #82; see `toggle_cluster`),
+/// leaving this menu with no reset trigger of its own.
 /// Collapse/Expand (issue #54's collapse-to-header) used to be the item
 /// between Columns and Minimize; it was removed outright rather than
 /// reworked, since the chevron no longer indicates a collapse state to
@@ -2213,6 +2299,22 @@ fn draw_header_menu(
             let _ = tx_settings.send(settings.clone());
         }
     });
+
+    ui.separator();
+
+    // Issue #131: the escape hatch for a stale learned boss name (e.g. after
+    // a game patch changes a dungeon's final boss) — see
+    // `scene_bosses_cache`'s doc comment for why nothing invalidates the
+    // cache automatically. Placed here (the header dropdown) rather than
+    // the tray's native Win32 context menu (`platform::install_tray`)
+    // because this menu is already the smaller, cross-platform, plain-egui
+    // surface with a `tx_command` in scope — the tray menu would need new
+    // HMENU/message-id plumbing in `platform.rs` for what is otherwise a
+    // one-line addition here.
+    if ui.button("Forget learned bosses").clicked() {
+        let _ = tx_command.try_send(UiCommand::ForgetLearnedBosses);
+        ui.close();
+    }
 
     ui.separator();
 
@@ -3678,18 +3780,70 @@ fn default_inner_width() -> f32 {
         + HEADER_ROW_EXTRA_WIDTH
 }
 
+/// Sane upper bound, in points, for a persisted `window_size` axis —
+/// comfortably past any real display (an 8K panel spans roughly 7680
+/// logical px even before DPI scaling, and a multi-monitor span widens that
+/// further, but nowhere near this far) so a legitimate ultra-wide setup
+/// still restores fine while a corrupted settings.json (a bit-flipped or
+/// hand-edited float) can't ask wgpu to allocate a multi-million-point
+/// swapchain.
+const MAX_INNER_SIZE_DIMENSION: f32 = 20_000.0;
+
+/// Sane upper bound, in points², for a persisted `window_size`'s total
+/// area. `MAX_INNER_SIZE_DIMENSION` alone only bounds each axis
+/// independently, so a value like `[19_999.0, 19_999.0]` — comfortably
+/// under the per-axis cap on both axes — would still ask wgpu for a
+/// ~400-million-point swapchain. 64,000,000 comfortably covers an 8K panel
+/// (7680x4320 ≈ 33.2 million) plus room for a wide multi-monitor span,
+/// while still rejecting a corrupted settings.json that maxes out both
+/// axes at once. Computed in f64 so the multiplication itself can never
+/// overflow, whatever the axis values are.
+const MAX_INNER_SIZE_AREA: f64 = 64_000_000.0;
+
+/// Clamps a persisted `window_size` to something guaranteed openable, or
+/// rejects it outright back to `None` (today's default size) if it's beyond
+/// saving. Each axis is floored at `MIN_INNER_SIZE` — the same floor
+/// `with_min_inner_size` enforces below, so a restored size is never asked
+/// to start smaller than winit would allow anyway — and the whole value is
+/// rejected when either axis is non-finite, either axis is larger than
+/// `MAX_INNER_SIZE_DIMENSION`, or the total area is larger than
+/// `MAX_INNER_SIZE_AREA`. A hand-edited or otherwise corrupted
+/// settings.json must never be able to open an unusable overlay.
+fn sanitize_window_size(size: [f32; 2]) -> Option<[f32; 2]> {
+    let [w, h] = size;
+    if !w.is_finite()
+        || !h.is_finite()
+        || w > MAX_INNER_SIZE_DIMENSION
+        || h > MAX_INNER_SIZE_DIMENSION
+        || (w as f64) * (h as f64) > MAX_INNER_SIZE_AREA
+    {
+        return None;
+    }
+    Some([w.max(MIN_INNER_SIZE.x), h.max(MIN_INNER_SIZE.y)])
+}
+
 /// Overlay window shape: always-on-top, borderless, transparent, sized to
 /// fit a full raid by default (issue #26). `window_position` is the
 /// last-saved position (issue #27, `Settings::window_position`) to reopen
 /// at, or `None` on a first launch / wiped settings file, which leaves the
-/// position to today's default OS/winit placement.
-pub fn viewport(window_position: Option<[f32; 2]>) -> egui::ViewportBuilder {
+/// position to today's default OS/winit placement. `window_size` is the
+/// last-saved inner size (issue #134, `Settings::window_size`), sanity-
+/// clamped by `sanitize_window_size` — a garbage or absent value falls back
+/// to `default_inner_width`/`default_inner_height`, never to something
+/// unusable.
+pub fn viewport(
+    window_position: Option<[f32; 2]>,
+    window_size: Option<[f32; 2]>,
+) -> egui::ViewportBuilder {
+    let inner_size = window_size
+        .and_then(sanitize_window_size)
+        .unwrap_or([default_inner_width(), default_inner_height()]);
     let mut builder = egui::ViewportBuilder::default()
         .with_always_on_top()
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(true)
-        .with_inner_size([default_inner_width(), default_inner_height()])
+        .with_inner_size(inner_size)
         .with_min_inner_size(MIN_INNER_SIZE);
     if let Some(position) = window_position {
         builder = builder.with_position(position);
@@ -5895,12 +6049,15 @@ mod tests {
         assert_eq!(encounter_title(&e), "Blazing Mech 05");
     }
 
+    // -- live boss now wins over the remembered one (issue #131) -----------
+
     #[test]
-    fn title_prefers_scene_boss_name_over_a_genuine_mid_dungeon_boss() {
-        // Even a *real* mid-dungeon boss (`is_boss: true`) must not displace
-        // the dungeon's remembered final boss — the design is "final boss
-        // only, always", not "final boss unless something else looks
-        // boss-like too".
+    fn title_prefers_the_live_boss_over_a_remembered_scene_boss() {
+        // Issue #131's precedence inversion: a genuine currently-engaged
+        // boss (`is_boss: true`) now outranks `scene_boss_name`, the
+        // opposite of issue #125's original "final boss only, always" rule.
+        // This is what makes the raid case below correct — see the raid
+        // test and `encounter_title`'s doc comment for why.
         let e = EncounterInfo {
             boss_monster_id: Some(103),
             boss_name: Some("Rathalos"),
@@ -5908,7 +6065,24 @@ mod tests {
             scene_boss_name: Some("Blazing Mech 05"),
             ..Default::default()
         };
-        assert_eq!(encounter_title(&e), "Blazing Mech 05");
+        assert_eq!(encounter_title(&e), "Rathalos");
+    }
+
+    #[test]
+    fn title_names_the_live_raid_boss_currently_being_fought_not_the_remembered_one() {
+        // The repo owner's issue #131 raid case: the same scene remembers
+        // boss C (whichever of the raid's several final bosses was engaged
+        // last, in an earlier pull or an earlier session), but boss A is
+        // the one actually being fought right now. The header must track
+        // the fight, not the stale remembered name.
+        let e = EncounterInfo {
+            boss_monster_id: Some(103),
+            boss_name: Some("Boss A"),
+            is_boss: true,
+            scene_boss_name: Some("Boss C"),
+            ..Default::default()
+        };
+        assert_eq!(encounter_title(&e), "Boss A");
     }
 
     #[test]
@@ -7115,6 +7289,7 @@ mod tests {
         let mut settings = Settings {
             visible_columns: ColumnKind::ALL.to_vec(),
             window_position: None,
+            window_size: None,
         };
         settings.toggle(ColumnKind::Dps);
         let cols = settings.ordered_columns();
@@ -7480,30 +7655,18 @@ mod tests {
 
     // -- window position tracking (issue #27) -----------------------------
 
-    /// Runs one frame with `outer_rect`/`minimized` reported for the
-    /// viewport, calling `track_window_position` from inside it exactly like
-    /// `OverlayApp::update` does. Returns everything it sent on the
-    /// settings-writer channel.
+    /// Calls `track_window_position` with `outer_rect`/`minimized` exactly
+    /// as `OverlayApp::update` passes them post issue #134 review (read
+    /// once by the caller and shared with `track_window_size`, rather than
+    /// each tracker re-reading `ctx.input` itself). Returns everything it
+    /// sent on the settings-writer channel.
     fn track_one_frame(
         settings: &mut Settings,
         outer_rect: Option<egui::Rect>,
         minimized: Option<bool>,
     ) -> Vec<Settings> {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut input = egui::RawInput::default();
-        input.viewports.insert(
-            input.viewport_id,
-            egui::ViewportInfo {
-                outer_rect,
-                minimized,
-                ..Default::default()
-            },
-        );
-
-        let ctx = egui::Context::default();
-        ctx.run_ui(input, |ui| track_window_position(ui.ctx(), settings, &tx))
-            .drop_without_applying_deltas();
-
+        track_window_position(outer_rect, minimized, settings, &tx);
         drop(tx);
         rx.try_iter().collect()
     }
@@ -7568,6 +7731,167 @@ mod tests {
 
         assert!(sent.is_empty(), "a bogus position must not send");
         assert_eq!(settings.window_position, Some([100.0, 200.0]));
+    }
+
+    // -- window size tracking (issue #134) ---------------------------------
+
+    /// Calls `track_window_size` with `inner_rect`/`minimized` exactly as
+    /// `OverlayApp::update` passes them post issue #134 review (read once
+    /// by the caller and shared with `track_window_position`, rather than
+    /// each tracker re-reading `ctx.input` itself). Returns everything it
+    /// sent on the settings-writer channel.
+    fn track_size_one_frame(
+        settings: &mut Settings,
+        inner_rect: Option<egui::Rect>,
+        minimized: Option<bool>,
+    ) -> Vec<Settings> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        track_window_size(inner_rect, minimized, settings, &tx);
+        drop(tx);
+        rx.try_iter().collect()
+    }
+
+    fn inner_rect_of(width: f32, height: f32) -> Option<egui::Rect> {
+        Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(width, height),
+        ))
+    }
+
+    #[test]
+    fn track_window_size_persists_a_resized_window() {
+        let mut settings = Settings::default();
+
+        let sent = track_size_one_frame(&mut settings, inner_rect_of(640.0, 480.0), Some(false));
+
+        assert_eq!(settings.window_size, Some([640.0, 480.0]));
+        assert_eq!(sent.len(), 1, "one resize, one send");
+        assert_eq!(sent[0].window_size, Some([640.0, 480.0]));
+    }
+
+    #[test]
+    fn track_window_size_stays_quiet_when_the_window_has_not_resized() {
+        let mut settings = Settings {
+            window_size: Some([640.0, 480.0]),
+            ..Settings::default()
+        };
+
+        let sent = track_size_one_frame(&mut settings, inner_rect_of(640.0, 480.0), Some(false));
+
+        assert!(sent.is_empty(), "an unresized window must not send");
+        assert_eq!(settings.window_size, Some([640.0, 480.0]));
+    }
+
+    /// A minimized window may report a meaningless (e.g. zeroed) inner
+    /// size, so nothing reported while minimized is persisted.
+    #[test]
+    fn track_window_size_ignores_a_minimized_window() {
+        let mut settings = Settings {
+            window_size: Some([640.0, 480.0]),
+            ..Settings::default()
+        };
+
+        let sent = track_size_one_frame(&mut settings, inner_rect_of(0.0, 0.0), Some(true));
+
+        assert!(sent.is_empty(), "a minimized window must not send");
+        assert_eq!(settings.window_size, Some([640.0, 480.0]));
+    }
+
+    /// Same zeroed-size failure mode, but reported before the `minimized`
+    /// flag catches up — the plausibility floor is what rejects it.
+    #[test]
+    fn track_window_size_ignores_an_absurd_zeroed_size() {
+        let mut settings = Settings {
+            window_size: Some([640.0, 480.0]),
+            ..Settings::default()
+        };
+
+        let sent = track_size_one_frame(&mut settings, inner_rect_of(0.0, 0.0), None);
+
+        assert!(sent.is_empty(), "a bogus size must not send");
+        assert_eq!(settings.window_size, Some([640.0, 480.0]));
+    }
+
+    // -- viewport() restore + sanity clamp (issue #134) --------------------
+
+    #[test]
+    fn viewport_applies_a_restored_size_when_some() {
+        let built = viewport(None, Some([640.0, 480.0]));
+
+        assert_eq!(built.inner_size, Some(egui::vec2(640.0, 480.0)));
+    }
+
+    #[test]
+    fn viewport_applies_the_default_size_when_none() {
+        let built = viewport(None, None);
+
+        assert_eq!(
+            built.inner_size,
+            Some(egui::vec2(default_inner_width(), default_inner_height()))
+        );
+    }
+
+    #[test]
+    fn viewport_falls_back_to_default_size_for_a_too_small_persisted_value() {
+        // Below `MIN_INNER_SIZE` on both axes; the restored size must still
+        // be clamped up to the floor rather than opening an unusable sliver.
+        let built = viewport(None, Some([1.0, 1.0]));
+
+        assert_eq!(
+            built.inner_size,
+            Some(egui::vec2(MIN_INNER_SIZE.x, MIN_INNER_SIZE.y))
+        );
+    }
+
+    #[test]
+    fn viewport_falls_back_to_default_size_for_a_non_finite_persisted_value() {
+        let built = viewport(None, Some([f32::NAN, 480.0]));
+
+        assert_eq!(
+            built.inner_size,
+            Some(egui::vec2(default_inner_width(), default_inner_height())),
+            "a non-finite persisted size must be rejected outright, not clamped"
+        );
+    }
+
+    #[test]
+    fn viewport_falls_back_to_default_size_for_an_absurdly_large_persisted_value() {
+        let built = viewport(None, Some([1.0e9, 480.0]));
+
+        assert_eq!(
+            built.inner_size,
+            Some(egui::vec2(default_inner_width(), default_inner_height())),
+            "a corrupted, absurdly large persisted size must be rejected outright"
+        );
+    }
+
+    #[test]
+    fn viewport_falls_back_to_default_size_for_an_oversize_area_within_per_axis_bounds() {
+        // Each axis alone is under `MAX_INNER_SIZE_DIMENSION` (20,000), but
+        // the product is ~400 million points — the total-area bound is what
+        // must reject this, not the per-axis one.
+        let built = viewport(None, Some([19_999.0, 19_999.0]));
+
+        assert_eq!(
+            built.inner_size,
+            Some(egui::vec2(default_inner_width(), default_inner_height())),
+            "a per-axis-plausible but absurdly large-area persisted size must be rejected outright"
+        );
+    }
+
+    #[test]
+    fn viewport_reset_ignores_any_persisted_size() {
+        // `main.rs`'s tray "Reset Window" action calls `viewport(None,
+        // None)` regardless of what's persisted — this just pins that the
+        // default-size call path is unaffected by a persisted size.
+        let reset = viewport(None, None);
+        let with_persisted = viewport(None, Some([999.0, 999.0]));
+
+        assert_ne!(reset.inner_size, with_persisted.inner_size);
+        assert_eq!(
+            reset.inner_size,
+            Some(egui::vec2(default_inner_width(), default_inner_height()))
+        );
     }
 
     // -- toolbar/menu icons (issue #41, #71) -------------------------------

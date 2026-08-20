@@ -4,6 +4,7 @@ pub mod encounter;
 pub mod event;
 pub mod fight;
 pub mod names_cache;
+pub mod phase;
 pub mod reset;
 pub mod sim;
 pub mod stats;

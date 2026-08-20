@@ -82,8 +82,15 @@ fn boss_hp_rollback_auto_reset() {
 /// explicit `now_ms` instead of reading the wall clock for this event, so
 /// running it twice must produce byte-identical goldens (checked by the
 /// harness's own double-run verification, not by this test).
+///
+/// Issue #138: zoning/reconnecting is **not** a reset. The numbers the
+/// player is still reading stay on screen; only state keyed on
+/// server-session identifiers (`scene_id`, the enemy map, `boss_uid`) is
+/// invalidated, and the fight clock freezes at the reconnect moment so the
+/// held elapsed timer does not run while the connection is down. The next
+/// fight's first hit is what clears the stats (`ResetReason::NewFight`).
 #[test]
-fn server_change_reset() {
+fn server_change_holds_the_numbers() {
     let scenario = Scenario::new("server_change_reset")
         .at(1_000)
         .enter_scene(TOWERING_RUIN)
@@ -104,10 +111,23 @@ fn server_change_reset() {
 
     assert_eq!(captures.len(), 1);
     let capture = &captures[0];
-    assert_eq!(capture.resets, vec![(12_000, ResetReason::ServerChange)]);
-    assert_eq!(capture.snapshot.rows.len(), 0, "reset must clear all rows");
-    // ServerChanged clears scene_id/enemies/boss_uid, unlike a boss-HP-
-    // rollback reset.
+    assert!(
+        capture.resets.is_empty(),
+        "a reconnect must not reset: {:?}",
+        capture.resets
+    );
+    assert_eq!(
+        capture.snapshot.rows.len(),
+        2,
+        "both damaged rows must stay on screen across the reconnect"
+    );
+    assert_eq!(capture.snapshot.total_damage, 65_000);
+    // The clock freezes at the reconnect moment (12_000), not at the
+    // capture's `now_ms` (13_000): fight_start is the first hit at 2_000.
+    assert_eq!(capture.snapshot.duration_ms, 10_000);
+    // ...but state keyed on the old server session is still invalidated:
+    // uids are re-issued and the scene is unknown until the next
+    // `EnterScene`.
     assert_eq!(capture.snapshot.encounter.scene_id, None);
     assert_eq!(capture.snapshot.encounter.boss_monster_id, None);
     assert_eq!(capture.snapshot.encounter.scene_boss_name, None);

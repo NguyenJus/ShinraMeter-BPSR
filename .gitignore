@@ -15,6 +15,11 @@ docs/reference/
 # time the overlay is run on a dev box rather than on Windows.
 /ShinraMeter-BPSR-names.json
 
+# The scene -> final-boss cache `main.rs` falls back to when there is no
+# %APPDATA% (issue #131) — i.e. any time the overlay is run on a dev box
+# rather than on Windows.
+/ShinraMeter-BPSR-scene-bosses.json
+
 # The log file `logging.rs` falls back to when there is no %APPDATA% (issue
 # #69), plus its startup-rotation copy.
 /ShinraMeter-BPSR.log

@@ -1,16 +1,24 @@
-//! Reset triggers: manual reset, boss-HP-rollback heuristic, server-change
-//! clear (plan §T2.2).
-
+//! Reset triggers: manual reset, boss-HP-rollback heuristic, the next
+//! fight's first hit (plan §T2.2).
+//!
+//! `ServerChanged` is deliberately **not** one of these (issue #138): a
+//! server change invalidates entity/scene state (`Meter::apply`'s
+//! `ServerChanged` arm clears `enemies`/`boss_uid`/`scene_id` directly and
+//! freezes the fight clock) but never clears the displayed stats, so it
+//! never produces a `ResetReason`. The stats-clearing reset on the far side
+//! of a reconnect is `NewFight`, fired by the reconnecting player's first
+//! real hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ResetReason {
     Manual,
     BossHpRollback,
-    ServerChange,
     /// The previous fight had ended (see `crate::fight`) and its stats were
     /// being held on screen; the first damage of the next fight clears them
     /// (issue #78). Unlike the other reasons this one is *caused* by combat
     /// resuming, so the reset and the new fight's first hit are the same
-    /// event.
+    /// event. Also the reset that clears a held fight across a
+    /// `ServerChanged` reconnect (issue #138): the reconnect itself only
+    /// freezes the clock, it does not reset.
     NewFight,
 }
 
@@ -44,9 +52,33 @@ pub struct EnemyState {
     pub peak_hp: Option<u64>,
     pub lowest_pct: Option<f64>,
     pub took_damage: bool,
+    /// When this enemy was observed dying during the current fight (issue
+    /// #124), as a rank in the encounter's death order: `Some(1)` died
+    /// first, `Some(2)` second, `None` has not been seen to die. Set by
+    /// either a `DamageEvent::is_dead` naming it as the victim or an
+    /// `EnemyHp` syncing its `curr_hp` to 0, whichever lands first.
+    ///
+    /// Survives `Meter::reset` like the rest of `EnemyState` (PR #144 review,
+    /// finding 2): a reset is bookkeeping and says nothing about whether the
+    /// corpse got up. What clears it is the respawn itself — an `EnemyHp`
+    /// reporting `curr_hp > 0` for an entity that has taken no damage since
+    /// that reset. Ranks stay globally monotonic across resets, which is all
+    /// `Meter::recompute_boss` needs from them: it only ever compares two
+    /// enemies damaged in the *same* encounter.
+    ///
+    /// Recording an *order* rather than a bare flag serves
+    /// `Meter::recompute_boss`: once every damaged enemy in a multi-phase
+    /// fight is dead, the most recently killed one is the phase the party
+    /// actually just finished, and is what the header should keep naming.
+    /// A bare flag would leave that tie to be broken on `max_hp`, which in a
+    /// phased fight can name the *first* phase (issue #124's premise is that
+    /// an earlier phase carries the larger pool).
+    pub death_order: Option<u64>,
     /// Monster template id, from `EnemyHp::monster_id` (issue #9 slice 2).
     /// Survives `Meter::reset` like the rest of `EnemyState` — only a
-    /// `ServerChange` clears the enemy map itself.
+    /// `ProtocolEvent::ServerChanged` clears the enemy map itself (uids are
+    /// re-issued by the new server session, so entity state does not
+    /// survive a reconnect the way display state does — issue #138).
     pub monster_id: Option<u32>,
 }
 
@@ -76,6 +108,26 @@ impl EnemyState {
         };
         Some(curr as f64 / denom as f64 * 100.0)
     }
+
+    /// Whether this enemy should be treated as still fighting (issue #124).
+    ///
+    /// An enemy whose HP was **never observed** counts as alive. That is the
+    /// deliberately conservative answer for `Meter::end_fight_on_boss_death`:
+    /// mistaking a living boss for a dead one ends the fight early and
+    /// under-reports the rest of the encounter (the bug issue #124 is about),
+    /// while mistaking a dead boss for a living one only skips the instant
+    /// freeze and falls back to the idle timeout, which is always safe.
+    ///
+    /// That asymmetry only holds for *never observed*, and only because the
+    /// second consumer cannot afford it either way (PR #144 review, finding
+    /// 2): `Meter::recompute_boss` ranks a living enemy above a dead one, so
+    /// a false "alive" there puts the header on a corpse instead of on the
+    /// boss actually being fought. A corpse must therefore keep reading dead
+    /// for as long as it is one — which is why `death_order` outlives
+    /// `Meter::reset` rather than leaving this to a stale `curr_hp`.
+    pub fn is_alive(&self) -> bool {
+        self.death_order.is_none() && self.curr_hp != Some(0)
+    }
 }
 
 /// True iff the enemy's HP dropped below `hp_drop_below_pct` at some point
@@ -102,6 +154,7 @@ mod tests {
             peak_hp: Some(max_hp),
             lowest_pct,
             took_damage: true,
+            death_order: None,
             monster_id: None,
         }
     }
@@ -115,6 +168,7 @@ mod tests {
             peak_hp: Some(peak_hp),
             lowest_pct,
             took_damage: true,
+            death_order: None,
             monster_id: None,
         }
     }
