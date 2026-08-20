@@ -156,6 +156,19 @@ pub struct Meter {
     /// which is what the user means by it. Cleared by `reset` (and so by the
     /// `ServerChanged` path, which resets first).
     fight_end_boss_id: Option<u32>,
+    /// Whether the fight was ended by a **party wipe** and the attempt is
+    /// being held for review (issue #154). A wipe is the end of a pull, not
+    /// a reset: the rows freeze exactly as they do on a boss kill, and this
+    /// flag is what makes the hold ignore *everything* until the party is
+    /// truly re-engaged — the boss's bar refilling, its swings at the
+    /// corpses, an AoE tick clipping an add on the run-back. Only a player
+    /// damaging a recognized boss again lifts it, through the ordinary
+    /// `NewFight` path (see `withholds_after_wipe`).
+    ///
+    /// Cleared by `reset` — so by that same `NewFight` — and by a server
+    /// change, which invalidates the entity state the re-engagement test
+    /// reads and hands the hold back to issue #78's ordinary rule.
+    wipe_hold: bool,
     /// How many distinct enemies have been seen to die since the last reset
     /// (issue #124). Hands out `EnemyState::death_order` ranks, which
     /// `recompute_boss` uses to keep the most recently killed boss on the
@@ -188,6 +201,7 @@ impl Meter {
             scene_bosses: HashMap::new(),
             fight_end_ms: None,
             fight_end_boss_id: None,
+            wipe_hold: false,
             deaths_seen: 0,
             reset_cfg: ResetConfig::default(),
             fight_cfg: FightConfig::default(),
@@ -484,6 +498,13 @@ impl Meter {
                     self.latch_fight_end(FightEndCause::ServerChanged, *timestamp_ms);
                 }
 
+                // issue #154: the wipe hold's re-engagement test reads the
+                // enemy map that was just cleared, so it can no longer
+                // recognize anything. Leaving the instance hands the hold
+                // back to issue #78's ordinary rule, where the next real
+                // hit clears it.
+                self.wipe_hold = false;
+
                 None
             }
         }
@@ -537,6 +558,7 @@ impl Meter {
             && d.attacker_kind == EntityKind::Player
             && !d.is_heal
             && !self.withholds_new_fight(d)
+            && !self.withholds_after_wipe(d)
         {
             self.reset(ResetReason::NewFight, d.timestamp_ms);
             reason = Some(ResetReason::NewFight);
@@ -558,6 +580,15 @@ impl Meter {
         // return below so heal-typed death packets still record deaths.
         if d.is_dead && d.target_kind == EntityKind::Player {
             self.record_death(d.target_uid, d.timestamp_ms);
+            // issue #154: that death may have been the last one standing.
+            // A wipe is a fight *end* — the moment a damage meter is most
+            // useful — so latch the hold here instead of leaving the
+            // attempt to be destroyed by the HP-rollback heuristic when the
+            // boss's bar refills a second later.
+            if self.party_is_wiped() {
+                self.latch_fight_end(FightEndCause::Wipe, d.timestamp_ms);
+                self.wipe_hold = true;
+            }
         }
 
         // Healing view is a non-goal: heal events never touch damage totals
@@ -748,6 +779,44 @@ impl Meter {
                 && e.is_alive()
                 && e.monster_id.is_some_and(tables::is_boss_monster)
         })
+    }
+
+    /// Whether every party member the meter knows about is down (issue
+    /// #154), i.e. the fight in progress is over and lost.
+    ///
+    /// The roster is `players`: every uid the meter has seen act, plus the
+    /// party members preloaded from the game's own roster packet in an
+    /// instance (issue #12/#145/#149). `deaths` is per-encounter — `reset`
+    /// drops the rows that carry it — so "has died" means "has died in this
+    /// attempt", which is exactly the question. An empty roster is never a
+    /// wipe, and neither is a death outside a running fight.
+    ///
+    /// Detecting the wipe directly is what retires the HP-rollback
+    /// heuristic for this case: the rollback shape depends on how fast a
+    /// particular boss's bar refills relative to the 9s idle timeout, which
+    /// is why the same wipe used to go either way.
+    fn party_is_wiped(&self) -> bool {
+        self.fight_start_ms.is_some()
+            && self.fight_end_ms.is_none()
+            && !self.players.is_empty()
+            && self.players.values().all(|p| p.deaths > 0)
+    }
+
+    /// Whether the wipe hold forbids reading `d` as the first hit of the
+    /// next fight (issue #154).
+    ///
+    /// Re-engagement means a player damaging a *recognized* boss again —
+    /// nothing else. The run-back through an instance is full of player
+    /// damage that is not a new pull (AoE clipping adds, DoTs finishing off
+    /// trash), and clearing the attempt on any of it is the very thing the
+    /// hold exists to prevent. A target whose `monster_id` has not arrived
+    /// yet is undecidable, so it withholds too — packet order is not
+    /// guaranteed and the next hit decides once the `EnemyHp` lands.
+    fn withholds_after_wipe(&self, d: &DamageEvent) -> bool {
+        self.wipe_hold
+            && !self
+                .target_monster_id(d)
+                .is_some_and(tables::is_boss_monster)
     }
 
     /// Whether `d` is the next phase of the fight currently being held, and
@@ -1224,6 +1293,9 @@ impl Meter {
         // ...and with it the phase-resume arming (issue #124): the fight
         // whose boss died is gone, so nothing can be a continuation of it.
         self.fight_end_boss_id = None;
+        // ...and the wipe hold (issue #154): the attempt it was protecting
+        // is what just got cleared.
+        self.wipe_hold = false;
         self.last_reset_ms = Some(now_ms);
         // No enemy has `took_damage` anymore, so this clears `boss_uid`.
         // Otherwise a stale `boss_uid` from the previous pull would still
@@ -3339,6 +3411,190 @@ mod tests {
                 (m.snapshot(6_000).total_dps - before).abs() < 0.001,
                 "a monster's swing must not dilute DPS with idle time"
             );
+        }
+    }
+
+    /// Issue #154/#155: a party wipe is the *end of a pull*, not a reset.
+    /// The attempt's rows freeze for review, and nothing that happens
+    /// afterwards — the boss's HP bar refilling, adds swinging at corpses,
+    /// a stray AoE tick on trash during the run-back — touches them until
+    /// the party genuinely re-engages the boss.
+    mod wipe {
+        use super::*;
+
+        /// Any `tables::is_dungeon_scene` id: a wipe is an instance thing.
+        const RAID_SCENE: u32 = 1_001;
+        /// Paradox-Calamity Remnant (Origin), a recognized boss.
+        const BOSS: u32 = 103_108;
+        /// "Golden Nappo": named but `MonsterType == 0`, i.e. a trash add.
+        const TRASH: u32 = 10_900;
+        const BOSS_UID: i64 = 10;
+        const ADD_UID: i64 = 11;
+
+        fn hit(attacker_uid: i64, target_uid: i64, value: i64, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::Damage(DamageEvent {
+                attacker_uid,
+                attacker_kind: EntityKind::Player,
+                target_uid,
+                target_kind: EntityKind::Monster,
+                value,
+                timestamp_ms: ts,
+                ..Default::default()
+            })
+        }
+
+        fn enemy_hp(uid: i64, curr: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::EnemyHp(EnemyHp {
+                uid,
+                curr_hp: Some(curr),
+                max_hp: Some(1_000_000),
+                monster_id: Some(monster_id),
+                timestamp_ms: ts,
+            })
+        }
+
+        /// The boss landing a killing blow on a party member.
+        fn killing_blow(target_uid: i64, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: BOSS_UID,
+                attacker_kind: EntityKind::Monster,
+                target_uid,
+                target_kind: EntityKind::Player,
+                value: 9_999,
+                is_dead: true,
+                timestamp_ms: ts,
+                ..Default::default()
+            })
+        }
+
+        /// The boss carrying on swinging after the party is down.
+        fn monster_swing(target_uid: i64, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: BOSS_UID,
+                attacker_kind: EntityKind::Monster,
+                target_uid,
+                target_kind: EntityKind::Player,
+                value: 200,
+                timestamp_ms: ts,
+                ..Default::default()
+            })
+        }
+
+        /// A two-player party in an instance, both rows known from the
+        /// roster (issue #145/#149) and both engaged on the boss, which has
+        /// been burned to 20% of its bar.
+        fn pull() -> Meter {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: RAID_SCENE,
+            });
+            m.apply(&player_info(1, "Alpha"));
+            m.apply(&player_info(2, "Bravo"));
+            m.apply(&enemy_hp(BOSS_UID, 1_000_000, BOSS, 0));
+            m.apply(&hit(1, BOSS_UID, 5_000, 1_000));
+            m.apply(&hit(2, BOSS_UID, 5_000, 1_500));
+            m.apply(&enemy_hp(BOSS_UID, 200_000, BOSS, 4_000));
+            m
+        }
+
+        /// ...and then everybody dies.
+        fn wiped() -> Meter {
+            let mut m = pull();
+            m.apply(&killing_blow(1, 5_000));
+            m.apply(&killing_blow(2, 6_000));
+            m
+        }
+
+        #[test]
+        fn a_full_party_wipe_ends_the_fight_and_freezes_the_rows() {
+            let mut m = pull();
+            m.apply(&killing_blow(1, 5_000));
+            assert_eq!(
+                m.fight_state(5_500),
+                FightState::Active,
+                "one player down is not a wipe"
+            );
+
+            m.apply(&killing_blow(2, 6_000));
+            assert_eq!(m.fight_state(6_500), FightState::Ended);
+
+            // The attempt is still on screen a minute later, for review.
+            let snap = m.snapshot(66_000);
+            assert_eq!(snap.total_damage, 10_000);
+            assert_eq!(snap.rows.len(), 2);
+            assert_eq!(
+                snap.duration_ms, 5_000,
+                "frozen at the wipe (6_000) minus the first hit (1_000)"
+            );
+        }
+
+        #[test]
+        fn a_roster_member_still_standing_is_not_a_wipe() {
+            let mut m = pull();
+            // A third party member the roster named but who never attacked
+            // and never died: the party is not down.
+            m.apply(&player_info(3, "Cypress"));
+            m.apply(&killing_blow(1, 5_000));
+            m.apply(&killing_blow(2, 6_000));
+            assert_eq!(m.fight_state(6_500), FightState::Active);
+        }
+
+        #[test]
+        fn monster_damage_during_the_wipe_hold_does_not_restart_the_clock() {
+            let mut m = wiped();
+            for ts in (7_000..=60_000).step_by(1_000) {
+                m.apply(&monster_swing(1, ts));
+            }
+            assert_eq!(m.fight_state(61_000), FightState::Ended);
+            assert_eq!(m.snapshot(61_000).duration_ms, 5_000);
+            assert_eq!(m.snapshot(61_000).total_damage, 10_000);
+        }
+
+        #[test]
+        fn the_boss_bar_refilling_after_a_wipe_does_not_reset_the_attempt() {
+            let mut m = wiped();
+            // The bar snaps back to full a second after the last party
+            // member falls — the shape `check_hp_rollback` reads as a wipe,
+            // arriving well inside the 9s idle window that used to be the
+            // only thing making `held` true.
+            let r = m.apply(&enemy_hp(BOSS_UID, 1_000_000, BOSS, 7_000));
+            assert_eq!(r, None, "a wipe must freeze the attempt, not clear it");
+            assert_eq!(m.snapshot(8_000).total_damage, 10_000);
+            assert_eq!(m.fight_state(8_000), FightState::Ended);
+        }
+
+        #[test]
+        fn hitting_trash_during_the_wipe_hold_does_not_clear_the_held_rows() {
+            let mut m = wiped();
+            m.apply(&enemy_hp(ADD_UID, 50_000, TRASH, 19_000));
+            // Running back in, an AoE clips an add on the way to the boss.
+            let r = m.apply(&hit(1, ADD_UID, 900, 20_000));
+            assert_eq!(r, None);
+            assert_eq!(m.snapshot(21_000).total_damage, 10_000);
+            assert_eq!(m.fight_state(21_000), FightState::Ended);
+        }
+
+        #[test]
+        fn re_engaging_the_boss_after_a_wipe_starts_a_fresh_fight() {
+            let mut m = wiped();
+            let r = m.apply(&hit(1, BOSS_UID, 400, 30_000));
+            assert_eq!(r, Some(ResetReason::NewFight));
+            let snap = m.snapshot(31_000);
+            assert_eq!(snap.total_damage, 400, "the next pull starts clean");
+            assert_eq!(m.fight_state(31_000), FightState::Active);
+        }
+
+        #[test]
+        fn a_server_change_ends_the_wipe_hold() {
+            let mut m = wiped();
+            // Leaving the instance: uids are re-issued and no boss is
+            // identified on the far side, so the ordinary issue #78 rule
+            // takes back over and the next real hit clears the hold.
+            m.apply(&ProtocolEvent::ServerChanged {
+                timestamp_ms: 20_000,
+            });
+            let r = m.apply(&hit(1, 77, 300, 30_000));
+            assert_eq!(r, Some(ResetReason::NewFight));
         }
     }
 
