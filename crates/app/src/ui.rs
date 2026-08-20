@@ -204,7 +204,24 @@ pub struct OverlayApp {
     /// `ViewportCommand::Screenshot` captures "the next frame after" the
     /// one that sends it, and the reply can land any number of frames
     /// after that.
+    ///
+    /// Not latched forever if the reply never comes: egui-wgpu's
+    /// `Painter::paint_and_update_textures` has several early-return paths
+    /// (a failed surface recreate, or its `render_state`/`surface_state`
+    /// being `None`) that skip `read_screen_rgba` entirely, silently
+    /// dropping the queued screenshot with no `Event::Screenshot` ever
+    /// pushed. `screenshot_capture_frames_waited` bounds how long this
+    /// stays `true` with no landed reply — see `screenshot_capture_timed_
+    /// out`'s doc comment.
     screenshot_capturing: bool,
+    /// Issue #156: consecutive frames `screenshot_capturing` has been
+    /// held `true` with neither a new request nor a landed reply this
+    /// frame — reset to `0` by `advance_screenshot_capture_wait` the
+    /// instant either happens, incremented every frame in between. Compared
+    /// against `SCREENSHOT_CAPTURE_TIMEOUT_FRAMES` by `screenshot_capture_
+    /// timed_out` so a dropped reply can't suppress the toggle cluster's
+    /// hover fill and tooltip for the rest of the process.
+    screenshot_capture_frames_waited: u32,
     /// `demo_enabled()` cached at construction so `ui()` doesn't re-read the
     /// env var every frame; also lets `ui()` keep demo mode's synthetic
     /// snapshot from being clobbered by the per-frame `rx_snapshot` drain
@@ -463,6 +480,7 @@ impl OverlayApp {
             last_dpi_probe: None,
             pending_screenshot_bound: None,
             screenshot_capturing: false,
+            screenshot_capture_frames_waited: 0,
             demo_mode,
         }
     }
@@ -594,6 +612,18 @@ impl eframe::App for OverlayApp {
                     &mut self.window_gesture,
                     capturing,
                 );
+                // Issue #156: whether this frame's wait for the reply has
+                // gone on long enough that it's never coming — computed
+                // before the guard call below so a timeout is fed into
+                // `screenshot_capture_guard` as `event_landed`, the exact
+                // same pure transition that clears the guard on a real
+                // reply, rather than a second clearing path to keep in
+                // sync with it. Only meaningful while `capturing` is
+                // actually true; see `screenshot_capture_timed_out`'s doc
+                // comment for why the reply can be silently dropped and
+                // never arrive.
+                let screenshot_timed_out = capturing
+                    && screenshot_capture_timed_out(self.screenshot_capture_frames_waited);
                 // Issue #156: fold this frame's request/reply activity into
                 // the guard so the *next* frame's `draw_header` call —
                 // which, per `ViewportCommand::Screenshot`'s own doc
@@ -603,7 +633,12 @@ impl eframe::App for OverlayApp {
                 self.screenshot_capturing = screenshot_capture_guard(
                     capturing,
                     screenshot_requested,
-                    screenshot_event_landed,
+                    screenshot_event_landed || screenshot_timed_out,
+                );
+                self.screenshot_capture_frames_waited = advance_screenshot_capture_wait(
+                    self.screenshot_capture_frames_waited,
+                    screenshot_requested,
+                    screenshot_event_landed || screenshot_timed_out,
                 );
                 // After the header, so a gesture that started this frame is
                 // already anchored — and, being outside it, it is the one
@@ -1306,6 +1341,60 @@ fn screenshot_capture_guard(current: bool, requested_this_frame: bool, event_lan
         false
     } else {
         current
+    }
+}
+
+/// Issue #156: how many consecutive frames `screenshot_capturing` may stay
+/// latched with no landed `Event::Screenshot` reply before `screenshot_
+/// capture_timed_out` gives up on it and `OverlayApp::ui` forces the guard
+/// closed anyway.
+///
+/// The reply can be silently dropped rather than merely slow: egui-wgpu's
+/// `Painter::paint_and_update_textures` has several early-return paths — a
+/// failed surface recreate, or its `render_state`/`surface_state` being
+/// `None` — that return before `capture_data` ever reaches `read_screen_
+/// rgba`, so the queued screenshot is dropped and no `Event::Screenshot` is
+/// ever pushed. Without a bound, `screenshot_capture_guard` alone would
+/// leave `screenshot_capturing` latched `true` for the rest of the
+/// process, permanently suppressing the toggle cluster's hover fill and
+/// tooltip on both buttons (they share the one flag) with no error and no
+/// recovery short of restarting the app.
+///
+/// At the app's ~10Hz repaint cadence (`ctx.request_repaint_after` in
+/// `OverlayApp::ui`) this is about 2 seconds — comfortably longer than any
+/// real `ViewportCommand::Screenshot` round trip, short enough that a
+/// dropped reply doesn't leave the suppression visible for long.
+const SCREENSHOT_CAPTURE_TIMEOUT_FRAMES: u32 = 20;
+
+/// Issue #156: true once `screenshot_capture_frames_waited` has reached
+/// `SCREENSHOT_CAPTURE_TIMEOUT_FRAMES` — see that constant's doc comment
+/// for why the `Event::Screenshot` reply can be silently dropped and never
+/// arrive at all. `OverlayApp::ui` feeds this straight into `screenshot_
+/// capture_guard` as `event_landed`, so a timed-out wait clears the guard
+/// through the exact same pure transition a real reply does, rather than a
+/// second, separately-maintained clearing path.
+fn screenshot_capture_timed_out(frames_waited: u32) -> bool {
+    frames_waited >= SCREENSHOT_CAPTURE_TIMEOUT_FRAMES
+}
+
+/// Issue #156: the frame-count half of the timeout fallback — advances
+/// `OverlayApp::screenshot_capture_frames_waited` alongside `screenshot_
+/// capture_guard`, sharing the same two inputs so the two pure functions
+/// can never fall out of step with each other.
+///
+/// Resets to `0` the instant a new request fires or a reply (real or
+/// timed-out) lands — both already reset `screenshot_capturing` itself —
+/// and increments on every other frame, i.e. every frame the wait for the
+/// reply continues.
+fn advance_screenshot_capture_wait(
+    frames_waited: u32,
+    requested_this_frame: bool,
+    event_landed: bool,
+) -> u32 {
+    if requested_this_frame || event_landed {
+        0
+    } else {
+        frames_waited + 1
     }
 }
 
@@ -5696,6 +5785,87 @@ mod tests {
         );
     }
 
+    /// `toggle_button`'s doc comment and `capturing`'s call sites both claim
+    /// suppression covers the tooltip as well as the hover circle — but the
+    /// hover-fill test above only ever looks at painted circles, so it
+    /// cannot catch a regression in the separate `if capturing { response }
+    /// else { response.on_hover_text(label) }` branch that actually gates
+    /// the tooltip. This drives that branch directly: `response.
+    /// on_hover_text(label)` paints the label text itself (`ui.add(Label::
+    /// new(text))` inside `Tooltip`'s contents), so its presence or absence
+    /// in the painted `Shape::Text`s is a direct behavioral signature of
+    /// which branch ran.
+    ///
+    /// `tooltip_delay` is zeroed so the tooltip shows on the very same
+    /// frame the pointer arrives, instead of needing a run of frames with a
+    /// stationary pointer to clear egui's real (0.5s) delay — this test
+    /// only cares which branch `toggle_button` took, not egui's own hover
+    /// timing.
+    ///
+    /// The `capturing: false` half is the same kind of sanity check as the
+    /// hover-fill test's: without it, a harness that just can't produce a
+    /// tooltip at all (wrong style, wrong input shape, ...) would pass the
+    /// `true` half for the wrong reason.
+    #[test]
+    fn toggle_button_suppresses_its_tooltip_while_a_screenshot_capture_is_in_flight() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        ctx.global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        const SHARE_LABEL: &str = "Copy screenshot to clipboard";
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            toggle_cluster(ui, &tx_command, &icons, false);
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let share_pos = accessible_rect_for_label(&update, SHARE_LABEL).center();
+        layout.drop_without_applying_deltas();
+
+        let hover_input = || egui::RawInput {
+            events: vec![egui::Event::PointerMoved(share_pos)],
+            ..Default::default()
+        };
+
+        let texts_while_hovered = |capturing: bool| -> Vec<String> {
+            let output = ctx.run_ui(hover_input(), |ui| {
+                toggle_cluster(ui, &tx_command, &icons, capturing);
+            });
+            let mut texts = Vec::new();
+            for clipped in &output.shapes {
+                collect_text_shapes(&clipped.shape, &mut texts);
+            }
+            output.drop_without_applying_deltas();
+            texts
+        };
+
+        // Same reason the menu-chevron test (`accessible_rect_for_label`'s
+        // caller) needs a settle frame: `Popup::show` runs a just-opened
+        // Area through a `sizing_pass` with no prior measured size, so its
+        // first frame doesn't paint the same way every later frame does.
+        // This frame only arms the tooltip; nothing here is asserted on.
+        texts_while_hovered(false);
+
+        let normal = texts_while_hovered(false);
+        assert!(
+            normal.iter().any(|text| text == SHARE_LABEL),
+            "sanity check: hovering Share with no capture in flight must \
+             still show its tooltip: {normal:?}"
+        );
+
+        let while_capturing = texts_while_hovered(true);
+        assert!(
+            !while_capturing.iter().any(|text| text == SHARE_LABEL),
+            "the tooltip must be suppressed while a Share screenshot \
+             capture is in flight: {while_capturing:?}"
+        );
+    }
+
     /// `handle_screenshot_events` is the routing half of the Share round
     /// trip: it must find a synthesized `Event::Screenshot` in this frame's
     /// input and hand its image to the writer, without needing a live
@@ -6079,6 +6249,87 @@ mod tests {
         // Frame 3: the reply finally lands — the guard clears.
         capturing = screenshot_capture_guard(capturing, false, true);
         assert!(!capturing, "the guard must clear once the reply has landed");
+    }
+
+    /// `advance_screenshot_capture_wait` must reset to `0` on the exact
+    /// same two triggers that reset `screenshot_capturing` itself — a new
+    /// request, or a landed reply — so the two pure functions can never
+    /// fall out of step (a stale non-zero count surviving a request/reply
+    /// would let `screenshot_capture_timed_out` fire early on the next
+    /// capture).
+    #[test]
+    fn advance_screenshot_capture_wait_resets_on_request_or_reply_and_counts_otherwise() {
+        assert_eq!(advance_screenshot_capture_wait(0, true, false), 0);
+        assert_eq!(advance_screenshot_capture_wait(5, true, false), 0);
+        assert_eq!(advance_screenshot_capture_wait(5, false, true), 0);
+        assert_eq!(advance_screenshot_capture_wait(5, true, true), 0);
+        assert_eq!(advance_screenshot_capture_wait(0, false, false), 1);
+        assert_eq!(advance_screenshot_capture_wait(5, false, false), 6);
+    }
+
+    /// `screenshot_capture_timed_out` is a plain threshold check against
+    /// `SCREENSHOT_CAPTURE_TIMEOUT_FRAMES` — false below it, true at and
+    /// past it (never lands, just keeps latching the guard closed on every
+    /// later idle frame too).
+    #[test]
+    fn screenshot_capture_timed_out_trips_at_the_threshold() {
+        assert!(!screenshot_capture_timed_out(
+            SCREENSHOT_CAPTURE_TIMEOUT_FRAMES - 1
+        ));
+        assert!(screenshot_capture_timed_out(
+            SCREENSHOT_CAPTURE_TIMEOUT_FRAMES
+        ));
+        assert!(screenshot_capture_timed_out(
+            SCREENSHOT_CAPTURE_TIMEOUT_FRAMES + 1
+        ));
+    }
+
+    /// The actual bug this fallback exists for: a reply that never lands
+    /// at all (the queued screenshot silently dropped somewhere in
+    /// egui-wgpu's `Painter::paint_and_update_textures` — see
+    /// `SCREENSHOT_CAPTURE_TIMEOUT_FRAMES`'s doc comment). Driving the
+    /// three pure functions together, frame by frame, exactly as
+    /// `OverlayApp::ui` does — `event_landed` is always `false` here, on
+    /// every single frame — must still clear the guard once the timeout is
+    /// reached, or `screenshot_capturing` would latch `true` forever and
+    /// permanently suppress the toggle cluster's hover fill and tooltip.
+    #[test]
+    fn screenshot_capture_guard_clears_via_the_timeout_fallback_when_the_reply_never_lands() {
+        let mut capturing = false;
+        let mut frames_waited = 0u32;
+
+        // Frame 0: the Share click fires the request.
+        capturing = screenshot_capture_guard(capturing, true, false);
+        frames_waited = advance_screenshot_capture_wait(frames_waited, true, false);
+        assert!(capturing);
+
+        // Every frame after that: the reply never lands. The guard must
+        // still be set right up until the timeout, and clear exactly once
+        // it's reached — never later, and never by some other means.
+        for frame in 0..SCREENSHOT_CAPTURE_TIMEOUT_FRAMES {
+            let timed_out = screenshot_capture_timed_out(frames_waited);
+            assert!(
+                !timed_out,
+                "must not time out before frame {SCREENSHOT_CAPTURE_TIMEOUT_FRAMES}: at frame {frame}"
+            );
+            assert!(
+                capturing,
+                "the guard must stay set while waiting for a reply that hasn't timed out yet: frame {frame}"
+            );
+            capturing = screenshot_capture_guard(capturing, false, timed_out);
+            frames_waited = advance_screenshot_capture_wait(frames_waited, false, timed_out);
+        }
+
+        assert!(
+            screenshot_capture_timed_out(frames_waited),
+            "the wait must have reached the timeout by now"
+        );
+        let timed_out = screenshot_capture_timed_out(frames_waited);
+        capturing = screenshot_capture_guard(capturing, false, timed_out);
+        assert!(
+            !capturing,
+            "the guard must clear via the timeout fallback when the reply never lands"
+        );
     }
 
     // -- handle_share_screenshot (the `OverlayApp::ui` sequencing itself) ---
