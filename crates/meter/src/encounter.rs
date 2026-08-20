@@ -402,9 +402,14 @@ impl Meter {
 
     /// Whether the party is mid-pull on a boss that simply is not being hit
     /// right now (issue #151): still inside an instance
-    /// (`tables::is_dungeon_scene`), with a recognized boss
+    /// (`tables::is_dungeon_scene`), with *any* recognized boss
     /// (`tables::is_boss_monster`) that has taken damage this fight and is
     /// not known to be dead.
+    ///
+    /// Deliberately "any", not "`boss_uid`": a pull can have two bosses up
+    /// at once (Dreambloom Ruins' Caprahorn spawns a matched pair fought
+    /// together), and `boss_uid` can only name one of them. If the named
+    /// one dies first, the pull is still very much in progress.
     ///
     /// This is what stops the idle timeout from standing in for an
     /// encounter boundary it cannot represent. A raid's designed immunity
@@ -1227,7 +1232,8 @@ impl Meter {
         let damaged = self.rank_boss(|e| e.took_damage);
         // issue #157: an enemy the boss table does not recognize must not
         // hold the target while a recognized boss is still up in this
-        // encounter. The candidate set above is "damaged in the current
+        // encounter — one boss or several, since a pull can have more than
+        // one up at once. The candidate set above is "damaged in the current
         // fight", and `reset` clears `took_damage` on every enemy — so
         // immediately after any reset the set is empty and the first enemy
         // to take damage wins outright, no matter what it is. Party AoE
@@ -1235,7 +1241,9 @@ impl Meter {
         // cannot help, because the boss is not a candidate until someone
         // hits it. `is_alive` scopes the fallback to a boss actually still
         // being fought, so a corpse from the last pull cannot take the
-        // header back off the trash the party has moved on to.
+        // header back off the trash the party has moved on to; where two
+        // bosses are up together the ordinary ranking picks between them,
+        // exactly as it does once both have been damaged.
         self.boss_uid = match damaged {
             Some(uid) if !self.is_recognized_boss(uid) => self
                 .rank_boss(|e| e.is_alive() && e.monster_id.is_some_and(tables::is_boss_monster))
@@ -3529,6 +3537,9 @@ mod tests {
         const DUNGEON_SCENE: u32 = 1_001;
         /// "Rathalos", a recognized boss.
         const BOSS: u32 = 103;
+        /// "Moonstrike": the other half of Dreambloom Ruins' Caprahorn
+        /// pair, two recognized bosses spawned and fought together.
+        const PAIRED_BOSS: u32 = 102_801;
         /// "Golden Nappo": named but `MonsterType == 0`, i.e. trash.
         const TRASH: u32 = 10_900;
 
@@ -3569,6 +3580,28 @@ mod tests {
             m.apply(&hp(10, 50, Some(BOSS), 0));
             m.apply(&boss_hit(10, 1_000, false));
             assert_eq!(m.fight_state(1_000 + idle()), FightState::Ended);
+        }
+
+        #[test]
+        fn the_second_of_a_boss_pair_holds_the_pull_open_after_the_first_dies() {
+            // Dreambloom Ruins' Caprahorn spawns two recognized bosses of
+            // equal HP and the party fights both at once, so `boss_uid` can
+            // only ever name one of them. Neither the liveness gate nor the
+            // boss-death latch may read "the boss" as "the selected one".
+            let mut m = in_dungeon();
+            m.apply(&hp(10, 60, Some(BOSS), 0));
+            m.apply(&hp(11, 50, Some(PAIRED_BOSS), 0));
+            m.apply(&boss_hit(10, 1_000, false));
+            m.apply(&boss_hit(11, 1_100, false));
+
+            // The first of the pair falls; its twin is still up.
+            m.apply(&boss_hit(10, 2_000, true));
+            assert_eq!(m.fight_end_ms, None, "the pull is not over");
+            assert_eq!(m.fight_state(2_000 + 10 * idle()), FightState::Active);
+
+            // ...and once the twin falls too, the fight ends on the kill.
+            m.apply(&boss_hit(11, 3_000, true));
+            assert_eq!(m.fight_state(3_100), FightState::Ended);
         }
 
         #[test]
