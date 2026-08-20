@@ -360,11 +360,30 @@ mod boss_select_scene_tests {
     }
 
     #[test]
-    fn all_three_raids_are_curated_at_all_three_tiers() {
-        for scene in [
-            13001, 13002, 13003, 13011, 13012, 13013, 13021, 13022, 13023,
-        ] {
-            assert!(is_boss_select_scene(scene), "scene {scene} is missing");
+    fn every_raid_tier_named_scene_is_curated() {
+        // The two tests above check curated ids *forward* against the
+        // tables; this one checks the tables *backward* against the
+        // curated list, so a raid the curator forgot to add — rather than
+        // one it added wrong — also fails. It scans every scene name the
+        // generated tables know for the `Clash!`/`Brutal!`/`Purge!` raid-
+        // tier marker and asserts each such scene is in
+        // `BOSS_SELECT_SCENES`. Regenerating `tables.rs` for a newly
+        // released raid (issue #150) fails this test until the new raid's
+        // three tiers are added there, instead of silently falling back to
+        // the pre-#150 "name the last boss engaged" guess.
+        for scene in 0..1_000_000u32 {
+            let Some(name) = tables::scene_name(scene) else {
+                continue;
+            };
+            if name.starts_with("Clash!")
+                || name.starts_with("Brutal!")
+                || name.starts_with("Purge!")
+            {
+                assert!(
+                    is_boss_select_scene(scene),
+                    "scene {scene} ({name}) is named as a raid tier but missing from BOSS_SELECT_SCENES"
+                );
+            }
         }
     }
 
