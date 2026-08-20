@@ -24,6 +24,7 @@ dependencies = [
  "serde",
  "serde_json",
  "windows",
+ "zstd",
 ]
 
 [[package]]
@@ -591,6 +592,7 @@ dependencies = [
 name = "bpsr-protocol"
 version = "0.2.0"
 dependencies = [
+ "bpsr-meter",
  "bpsr-test-support",
  "bytes",
  "log",

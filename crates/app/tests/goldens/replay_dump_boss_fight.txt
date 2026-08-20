@@ -1,0 +1,19 @@
+scenario=replay_dump_boss_fight
+at_ms=227880
+fight_state=Ended
+duration_ms=139826
+total_damage=477564479
+total_dps=3415419.73
+encounter.boss_monster_id=1152
+encounter.boss_name=Kartgriff
+encounter.is_boss=true
+encounter.scene_id=8
+encounter.scene_name=Asterleeds
+encounter.scene_boss_name=-
+resets=
+rows=5
+row uid=100004 name=Player 100004 class=- ability_score=- season_strength=- imagines=[-,-] damage=174663501 dps=1249148.95 share=36.57 crit=0.00 lucky=0.00 hits=408 deaths=0
+row uid=100002 name=Player 100002 class=- ability_score=- season_strength=- imagines=[-,-] damage=106379489 dps=760799.06 share=22.28 crit=0.00 lucky=0.00 hits=206 deaths=0
+row uid=100001 name=Player 100001 class=- ability_score=- season_strength=- imagines=[-,-] damage=105328845 dps=753285.12 share=22.06 crit=0.00 lucky=0.00 hits=36 deaths=0
+row uid=100005 name=Player100005 class=ShieldKnight ability_score=62186 season_strength=- imagines=[-,-] damage=46209414 dps=330477.98 share=9.68 crit=9.90 lucky=2.18 hits=919 deaths=0
+row uid=100003 name=Player 100003 class=- ability_score=- season_strength=- imagines=[-,-] damage=44983230 dps=321708.62 share=9.42 crit=0.00 lucky=0.00 hits=184 deaths=0

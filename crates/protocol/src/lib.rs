@@ -2,6 +2,7 @@
 
 pub mod attrs;
 pub mod decode;
+pub mod dump_format;
 pub mod event;
 pub mod frame;
 pub mod inspect;

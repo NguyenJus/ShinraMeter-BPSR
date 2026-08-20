@@ -100,6 +100,58 @@ impl Rig {
         captures
     }
 
+    /// Feeds one already-decompressed Notify body straight into
+    /// `decode_notify -> Pipeline::step`, skipping `TcpReassembler`/
+    /// `Decoder::push_stream` entirely. For replaying dump-format records
+    /// (`bpsr_protocol::dump_format::DumpRecord`): those are already
+    /// post-zstd and post-frame-split, so re-entering at the TCP-byte layer
+    /// (`run`/`run_bytes`) would be the wrong seam — there is no raw stream
+    /// to reassemble, just a `(method_id, payload)` pair per record. Does
+    /// not touch `self.reassembler`/`self.decoder`, so it cannot perturb
+    /// `run`'s behavior; the two entry points share only `self.pipeline`
+    /// and `self.resets`.
+    pub fn feed_notify(&mut self, method_id: u32, payload: &[u8], ts_ms: u64) {
+        let notify = bpsr_protocol::frame::Notify {
+            method_id,
+            payload: payload.to_vec(),
+        };
+        let mut events = Vec::new();
+        bpsr_protocol::decode::decode_notify(&notify, ts_ms, &mut events, None);
+        for ev in events {
+            if let Some(reason) = self.pipeline.step(ev, ts_ms) {
+                self.resets.push((ts_ms, reason));
+            }
+        }
+    }
+
+    /// Advances the meter's idle-timeout state machine, mirroring what
+    /// `Step::Tick` does inside `run`. Exposed directly for
+    /// `feed_notify`-driven tests, which don't go through `Scenario`/`run`.
+    pub fn tick(&mut self, now_ms: u64) -> FightState {
+        self.fight_state = self.pipeline.tick(now_ms);
+        self.fight_state
+    }
+
+    /// Takes a snapshot without recording a `Capture`, for a
+    /// `feed_notify`-driven test that wants to build its own `Capture`
+    /// (label, at_ms, resets) around it.
+    pub fn snapshot(&self, now_ms: u64) -> Snapshot {
+        self.pipeline.snapshot(now_ms)
+    }
+
+    /// Every reset observed since the scenario started, in order — the same
+    /// data a `Capture` carries, for a `feed_notify`-driven test to build one
+    /// with directly.
+    pub fn resets(&self) -> Vec<(u64, ResetReason)> {
+        self.resets.clone()
+    }
+
+    /// The fight state as of the last `tick` (or `Idle` if `tick` was never
+    /// called).
+    pub fn fight_state(&self) -> FightState {
+        self.fight_state
+    }
+
     fn run_bytes(&mut self, at_ms: u64, bytes: &[u8], delivery: &Delivery) {
         // 1. Cut `bytes` into pieces, in stream order.
         let pieces = cut(bytes, delivery);

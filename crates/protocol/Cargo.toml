@@ -16,6 +16,11 @@ log = { workspace = true }
 # both), so this adds no new external dependency to the lockfile.
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Only used by the offline sanitizer binary (src/bin/sanitize-dump.rs) for its
+# mandatory self-check gate: replaying both the original and sanitized record
+# streams through `bpsr_meter::Meter` and comparing snapshot fingerprints.
+# `bpsr-meter` has no dependency back on this crate, so this is not a cycle.
+bpsr-meter = { workspace = true }
 
 [dev-dependencies]
 bpsr-test-support = { workspace = true }
