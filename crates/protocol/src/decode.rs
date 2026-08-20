@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use crate::attrs::{enemy_hp_from_attrs, player_info_from_attrs, scene_id_from_attrs};
 use crate::event::{DamageEvent, EntityKind, PlayerInfo, ProtocolEvent, kind_of, uid_of};
-use crate::frame::{Desync, MAX_TAIL_LEN, Notify, parse_frame, split_frames};
+use crate::frame::{
+    Desync, MAX_TAIL_LEN, Notify, SERVICE_UUID, TEAM_NTF_SERVICE_UUID, parse_frame, split_frames,
+};
 use crate::inspect::InspectSink;
 use crate::pb::{self, AoiSyncDelta, EDamageType};
 
@@ -34,38 +36,75 @@ pub mod opcode {
     pub const ENTER_SCENE: u32 = 0x0000_0003;
 }
 
+/// Method ids on `frame::TEAM_NTF_SERVICE_UUID` (`EServiceId.GrpcTeamNtf`,
+/// issue #146) — kept in their own module rather than mixed into `opcode`
+/// because the two services' method-id spaces overlap: `0x3` is
+/// `ENTER_SCENE` on the main service (`opcode::ENTER_SCENE`) and
+/// `NotifyJoinTeam` here. `decode_notify` dispatches on
+/// `(Notify.service_uuid, Notify.method_id)` together so these never
+/// collide with `opcode`'s constants despite sharing raw values.
+pub mod team_opcode {
+    /// `NotifyJoinTeam` — the bulk party-roster push, and the only
+    /// `GrpcTeamNtf` method this crate decodes (issue #146).
+    pub const NOTIFY_JOIN_TEAM: u32 = 0x3;
+    /// `NoticeUpdateTeamInfo`. No documented field tags (issue #146's
+    /// table covers only `NotifyJoinTeam`) — left unhandled on purpose so
+    /// traffic on this method falls through to the inspect sink instead of
+    /// being guessed at.
+    #[allow(dead_code)]
+    pub const NOTICE_UPDATE_TEAM_INFO: u32 = 0x1;
+    /// `NotifyLeaveTeam`. Same as `NOTICE_UPDATE_TEAM_INFO` above: no
+    /// documented field tags, deliberately unhandled.
+    #[allow(dead_code)]
+    pub const NOTIFY_LEAVE_TEAM: u32 = 0x4;
+}
+
 /// Decodes one Notify's payload and appends any resulting events to `out`.
 /// Unknown opcodes are skipped silently; a prost decode failure is dropped
 /// with a debug log. `sink` is the issue #25 slice A diagnostic hook: `None`
 /// on every normal (non-diagnostic) call site.
+///
+/// Dispatches on `(n.service_uuid, n.method_id)` together, never on
+/// `method_id` alone (issue #146): the main service and
+/// `frame::TEAM_NTF_SERVICE_UUID` have overlapping method-id spaces — `0x3`
+/// is `opcode::ENTER_SCENE` on the former and `team_opcode::NOTIFY_JOIN_TEAM`
+/// on the latter — so a method-id-only match would route team traffic into
+/// the scene decoder (or vice versa) whenever the two happened to share a
+/// value.
 pub fn decode_notify(
     n: &Notify,
     now_ms: u64,
     out: &mut Vec<ProtocolEvent>,
     sink: Option<&dyn InspectSink>,
 ) {
-    match n.method_id {
-        opcode::SYNC_NEAR_ENTITIES => match pb::SyncNearEntities::decode(n.payload.as_slice()) {
-            Ok(msg) => on_sync_near_entities(&msg, now_ms, out, sink),
-            Err(_) => log::debug!("bpsr-protocol: SyncNearEntities decode failed"),
-        },
-        opcode::SYNC_CONTAINER_DATA => match pb::SyncContainerData::decode(n.payload.as_slice()) {
-            Ok(msg) => on_sync_container_data(&msg, out),
-            Err(_) => log::debug!("bpsr-protocol: SyncContainerData decode failed"),
-        },
-        opcode::ENTER_SCENE => match pb::EnterScene::decode(n.payload.as_slice()) {
+    match (n.service_uuid, n.method_id) {
+        (SERVICE_UUID, opcode::SYNC_NEAR_ENTITIES) => {
+            match pb::SyncNearEntities::decode(n.payload.as_slice()) {
+                Ok(msg) => on_sync_near_entities(&msg, now_ms, out, sink),
+                Err(_) => log::debug!("bpsr-protocol: SyncNearEntities decode failed"),
+            }
+        }
+        (SERVICE_UUID, opcode::SYNC_CONTAINER_DATA) => {
+            match pb::SyncContainerData::decode(n.payload.as_slice()) {
+                Ok(msg) => on_sync_container_data(&msg, out),
+                Err(_) => log::debug!("bpsr-protocol: SyncContainerData decode failed"),
+            }
+        }
+        (SERVICE_UUID, opcode::ENTER_SCENE) => match pb::EnterScene::decode(n.payload.as_slice()) {
             Ok(msg) => on_enter_scene(&msg, out, sink),
             Err(_) => log::debug!("bpsr-protocol: EnterScene decode failed"),
         },
-        opcode::SYNC_NEAR_DELTA_INFO => match pb::SyncNearDeltaInfo::decode(n.payload.as_slice()) {
-            Ok(msg) => {
-                for delta in &msg.delta_infos {
-                    on_aoi_sync_delta(delta, delta.uuid, now_ms, out, sink);
+        (SERVICE_UUID, opcode::SYNC_NEAR_DELTA_INFO) => {
+            match pb::SyncNearDeltaInfo::decode(n.payload.as_slice()) {
+                Ok(msg) => {
+                    for delta in &msg.delta_infos {
+                        on_aoi_sync_delta(delta, delta.uuid, now_ms, out, sink);
+                    }
                 }
+                Err(_) => log::debug!("bpsr-protocol: SyncNearDeltaInfo decode failed"),
             }
-            Err(_) => log::debug!("bpsr-protocol: SyncNearDeltaInfo decode failed"),
-        },
-        opcode::SYNC_TO_ME_DELTA_INFO => {
+        }
+        (SERVICE_UUID, opcode::SYNC_TO_ME_DELTA_INFO) => {
             match pb::SyncToMeDeltaInfo::decode(n.payload.as_slice()) {
                 Ok(msg) => {
                     if let Some(to_me) = msg.delta_info {
@@ -85,7 +124,14 @@ pub fn decode_notify(
                 Err(_) => log::debug!("bpsr-protocol: SyncToMeDeltaInfo decode failed"),
             }
         }
-        // Every other opcode is skipped on purpose. The largest of them,
+        (TEAM_NTF_SERVICE_UUID, team_opcode::NOTIFY_JOIN_TEAM) => {
+            match pb::NotifyJoinTeam::decode(n.payload.as_slice()) {
+                Ok(msg) => on_notify_join_team(&msg, out),
+                Err(_) => log::debug!("bpsr-protocol: NotifyJoinTeam decode failed"),
+            }
+        }
+        // Every other (service, method) pair is skipped on purpose. The
+        // largest single main-service opcode left unhandled,
         // `SyncContainerDirtyData` (0x16, a few hundred messages a session), was
         // investigated against a real capture and is *not* worth decoding: all
         // 264 payloads in that capture share the shape
@@ -96,7 +142,9 @@ pub fn decode_notify(
         // PROFESSION_ID, 10030 FIGHT_POINT, 11310 HP, 11320 MAX_HP) appears
         // anywhere in it. It is a container/inventory diff channel, so every
         // entity attribute we care about still arrives on the four opcodes
-        // above.
+        // above. `team_opcode::NOTICE_UPDATE_TEAM_INFO` /
+        // `team_opcode::NOTIFY_LEAVE_TEAM` also fall through here (issue
+        // #146): no documented field tags for either.
         _ => {}
     }
 }
@@ -247,6 +295,80 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
         // (issue #33) — attr-list path only.
         skill_ids: Vec::new(),
     }));
+}
+
+/// `GrpcTeamNtf.NotifyJoinTeam` (`team_opcode::NOTIFY_JOIN_TEAM`, issue
+/// #146): the bulk party-roster push, emitting one `ProtocolEvent::Player`
+/// per roster member so party members' names/classes/ability scores arrive
+/// without depending on AOI proximity (issue #145 rides AOI and misses
+/// distant raid members).
+///
+/// Every sub-message on the path from `NotifyJoinTeamRequest` down to
+/// `TeamBasicData`/`TeamProfessionData`/`TeamUserAttrData` is independently
+/// optional and decoded defensively: a bot-like roster entry that carries
+/// only `char_id` (no `social_data` at all) must not panic and must not
+/// produce a name-less garbage row — it simply yields no event. An event is
+/// emitted only when at least one of name / class / ability_score is
+/// present.
+///
+/// `TeamBasicData.level` is decoded onto the pb struct (see its doc
+/// comment) but deliberately never read here: `PlayerInfo` has no `level`
+/// field and nothing downstream consumes one (issue #146 spec decision 3).
+fn on_notify_join_team(msg: &pb::NotifyJoinTeam, out: &mut Vec<ProtocolEvent>) {
+    let Some(request) = &msg.v_request else {
+        return;
+    };
+    for member in &request.member_data {
+        let social = member.social_data.as_ref();
+        let name = social
+            .and_then(|s| s.basic_data.as_ref())
+            .map(|b| b.name.as_str())
+            .filter(|n| !n.is_empty())
+            .map(str::to_string);
+        // An Imagine transform id (issue #37) yields `None` rather than
+        // `Some(Class::Unknown)` — see `pb::class_of_profession_id`'s doc
+        // comment. Same conversion `on_sync_container_data` uses above.
+        let class = social
+            .and_then(|s| s.profession_data.as_ref())
+            .and_then(|p| pb::class_of_profession_id(p.profession_id));
+        // Same zero-is-absent narrowing `on_sync_container_data` uses for
+        // `CharBaseInfo.fight_point` above, just from an `i64` source here.
+        let ability_score = social
+            .and_then(|s| s.user_attr_data.as_ref())
+            .and_then(|u| (u.fight_point > 0).then(|| u32::try_from(u.fight_point).ok()))
+            .flatten();
+        let season_strength = social
+            .and_then(|s| s.user_attr_data.as_ref())
+            .and_then(|u| (u.season_strength > 0).then(|| u32::try_from(u.season_strength).ok()))
+            .flatten();
+        if name.is_none() && class.is_none() && ability_score.is_none() {
+            continue;
+        }
+        // `TeamMemData.char_id` is the uid directly (issue #146: ZDPS's
+        // `EntityIdToUuid(charId, EntChar)` is exactly undone by our
+        // `uid_of = uuid >> 16`). A member missing it falls back to the copy
+        // inside `basicData`; with neither there is no uid to key a player
+        // row on, so the member is dropped rather than filed under uid 0.
+        let uid = match member.char_id {
+            0 => social
+                .and_then(|s| s.basic_data.as_ref())
+                .map(|b| b.char_id)
+                .unwrap_or(0),
+            id => id,
+        };
+        if uid == 0 {
+            continue;
+        }
+        out.push(ProtocolEvent::Player(PlayerInfo {
+            uid,
+            name,
+            class,
+            ability_score,
+            season_level: None,
+            season_strength,
+            skill_ids: Vec::new(),
+        }));
+    }
 }
 
 /// `WorldNtf.EnterScene` (issue #35): the current scene id, decoded from
@@ -426,6 +548,7 @@ mod tests {
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
         Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
             method_id: opcode::SYNC_NEAR_DELTA_INFO,
             payload,
         }
@@ -557,6 +680,7 @@ mod tests {
     #[test]
     fn unknown_opcode_produces_zero_events() {
         let n = Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
             method_id: 0x0000_0099,
             payload: Vec::new(),
         };
@@ -585,6 +709,7 @@ mod tests {
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
         let n = Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
             method_id: opcode::SYNC_NEAR_DELTA_INFO,
             payload,
         };
@@ -621,6 +746,7 @@ mod tests {
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
         Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
             method_id: opcode::SYNC_TO_ME_DELTA_INFO,
             payload,
         }
@@ -745,6 +871,7 @@ mod tests {
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
         let n = Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
             method_id: opcode::SYNC_NEAR_DELTA_INFO,
             payload,
         };
@@ -785,6 +912,7 @@ mod tests {
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
         let n = Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
             method_id: opcode::SYNC_NEAR_DELTA_INFO,
             payload,
         };
@@ -807,6 +935,7 @@ mod tests {
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
         Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
             method_id: opcode::SYNC_CONTAINER_DATA,
             payload,
         }
@@ -836,6 +965,239 @@ mod tests {
         }
     }
 
+    // -- NotifyJoinTeam party roster (issue #146) ----------------------
+
+    fn team_notify_for(request: pb::NotifyJoinTeamRequest) -> Notify {
+        let msg = pb::NotifyJoinTeam {
+            v_request: Some(request),
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        Notify {
+            service_uuid: crate::frame::TEAM_NTF_SERVICE_UUID,
+            method_id: team_opcode::NOTIFY_JOIN_TEAM,
+            payload,
+        }
+    }
+
+    fn full_team_member(
+        char_id: i64,
+        name: &str,
+        profession_id: i32,
+        fight_point: i64,
+    ) -> pb::TeamMemData {
+        pb::TeamMemData {
+            char_id,
+            scene_id: 0,
+            group_id: 0,
+            social_data: Some(pb::TeamMemberSocialData {
+                basic_data: Some(pb::TeamBasicData {
+                    char_id,
+                    name: name.to_string(),
+                    level: 0,
+                }),
+                profession_data: Some(pb::TeamProfessionData { profession_id }),
+                user_attr_data: Some(pb::TeamUserAttrData {
+                    fight_point,
+                    season_strength: 0,
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn notify_join_team_full_roster_yields_one_player_per_member() {
+        let request = pb::NotifyJoinTeamRequest {
+            base_info: Some(pb::TeamBaseInfo {}),
+            member_data: vec![
+                full_team_member(101, "Ari", 1, 12_345), // Stormblade
+                full_team_member(102, "Zed", 2, 22_222), // FrostMage
+                full_team_member(103, "Yin", 3, 33_333), // TwinStriker
+            ],
+        };
+        let n = team_notify_for(request);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 3);
+        let expected = [
+            (101, "Ari", pb::Class::Stormblade, 12_345u32),
+            (102, "Zed", pb::Class::FrostMage, 22_222u32),
+            (103, "Yin", pb::Class::TwinStriker, 33_333u32),
+        ];
+        for (event, (uid, name, class, ability_score)) in out.iter().zip(expected) {
+            match event {
+                ProtocolEvent::Player(p) => {
+                    assert_eq!(p.uid, uid);
+                    assert_eq!(p.name.as_deref(), Some(name));
+                    assert_eq!(p.class, Some(class));
+                    assert_eq!(p.ability_score, Some(ability_score));
+                }
+                other => panic!("expected Player, got {other:?}"),
+            }
+        }
+    }
+
+    /// A bot-like roster entry carrying only `char_id` (no `social_data` at
+    /// all — "bots are missing a lot of fields") must not panic and must
+    /// not produce a name-less garbage row.
+    #[test]
+    fn notify_join_team_member_with_only_char_id_yields_no_event_and_no_panic() {
+        let request = pb::NotifyJoinTeamRequest {
+            base_info: Some(pb::TeamBaseInfo {}),
+            member_data: vec![pb::TeamMemData {
+                char_id: 999,
+                scene_id: 0,
+                group_id: 0,
+                social_data: None,
+            }],
+        };
+        let n = team_notify_for(request);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.is_empty());
+    }
+
+    /// A member with a name but no profession/attr data still yields a
+    /// `Player` — with `class: None` and `ability_score: None`, not a
+    /// dropped event.
+    #[test]
+    fn notify_join_team_member_with_name_only_yields_player_with_no_class() {
+        let request = pb::NotifyJoinTeamRequest {
+            base_info: Some(pb::TeamBaseInfo {}),
+            member_data: vec![pb::TeamMemData {
+                char_id: 55,
+                scene_id: 0,
+                group_id: 0,
+                social_data: Some(pb::TeamMemberSocialData {
+                    basic_data: Some(pb::TeamBasicData {
+                        char_id: 55,
+                        name: "Nameonly".to_string(),
+                        level: 0,
+                    }),
+                    profession_data: None,
+                    user_attr_data: None,
+                }),
+            }],
+        };
+        let n = team_notify_for(request);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ProtocolEvent::Player(p) => {
+                assert_eq!(p.uid, 55);
+                assert_eq!(p.name.as_deref(), Some("Nameonly"));
+                assert_eq!(p.class, None);
+                assert_eq!(p.ability_score, None);
+            }
+            other => panic!("expected Player, got {other:?}"),
+        }
+    }
+
+    /// A member with a usable name but no uid anywhere — `TeamMemData.char_id`
+    /// zero and the `TeamBasicData.char_id` fallback zero too — is dropped
+    /// rather than filed under uid 0, where it would collide with every other
+    /// uid-less member. A valid member sharing the same roster still lands.
+    #[test]
+    fn notify_join_team_member_with_name_but_zero_char_id_yields_no_event() {
+        let request = pb::NotifyJoinTeamRequest {
+            base_info: Some(pb::TeamBaseInfo {}),
+            member_data: vec![
+                pb::TeamMemData {
+                    char_id: 0,
+                    scene_id: 0,
+                    group_id: 0,
+                    social_data: Some(pb::TeamMemberSocialData {
+                        basic_data: Some(pb::TeamBasicData {
+                            char_id: 0,
+                            name: "Uidless".to_string(),
+                            level: 0,
+                        }),
+                        profession_data: Some(pb::TeamProfessionData { profession_id: 1 }),
+                        user_attr_data: Some(pb::TeamUserAttrData {
+                            fight_point: 4_444,
+                            season_strength: 0,
+                        }),
+                    }),
+                },
+                full_team_member(101, "Ari", 1, 12_345),
+            ],
+        };
+        let n = team_notify_for(request);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 1, "the uid-less member must yield no event");
+        match &out[0] {
+            ProtocolEvent::Player(p) => {
+                assert_eq!(p.uid, 101);
+                assert_eq!(p.name.as_deref(), Some("Ari"));
+            }
+            other => panic!("expected Player, got {other:?}"),
+        }
+    }
+
+    /// The regression this slice exists to prevent: `NotifyJoinTeam`'s
+    /// method id (`0x3`) collides with `opcode::ENTER_SCENE` on the main
+    /// service. A `NotifyJoinTeam` payload delivered on the MAIN service
+    /// uuid must still be routed to the `EnterScene` decoder (and, since
+    /// the bytes don't match that shape meaningfully, fail cleanly — no
+    /// `Player` event materializes from team-roster bytes misread as a
+    /// scene).
+    #[test]
+    fn notify_join_team_payload_on_main_service_is_not_decoded_as_team_roster() {
+        let request = pb::NotifyJoinTeamRequest {
+            base_info: Some(pb::TeamBaseInfo {}),
+            member_data: vec![full_team_member(101, "Ari", 1, 12_345)],
+        };
+        let msg = pb::NotifyJoinTeam {
+            v_request: Some(request),
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let n = Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id: 0x3, // opcode::ENTER_SCENE on the main service
+            payload,
+        };
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(
+            out.iter().all(|e| !matches!(e, ProtocolEvent::Player(_))),
+            "a NotifyJoinTeam payload on the main service must never surface as a Player event: {out:?}"
+        );
+    }
+
+    /// The mirror image: an `EnterScene` payload delivered on the TEAM
+    /// service uuid at method `0x3` must NOT be treated as a scene change —
+    /// dispatch must key off `service_uuid` too, not `method_id` alone.
+    #[test]
+    fn enter_scene_payload_on_team_service_is_not_treated_as_scene_change() {
+        let msg = pb::EnterScene {
+            info: Some(pb::EnterSceneInfo {
+                attrs: Some(AttrCollection {
+                    uuid: 0,
+                    attrs: vec![pb::Attr {
+                        id: 341, // AttrSceneBasicId
+                        raw_data: vec![0x08],
+                    }],
+                }),
+            }),
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let n = Notify {
+            service_uuid: crate::frame::TEAM_NTF_SERVICE_UUID,
+            method_id: 0x3, // team_opcode::NOTIFY_JOIN_TEAM on the team service
+            payload,
+        };
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(
+            !out.iter().any(|e| matches!(e, ProtocolEvent::Scene { .. })),
+            "an EnterScene payload on the team service must never surface as a Scene event: {out:?}"
+        );
+    }
+
     // -- Scene, via EnterScene (issue #35) -----------------------------
 
     /// Builds an `EnterScene` notify carrying exactly `attrs` on the scene
@@ -849,6 +1211,7 @@ mod tests {
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
         Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
             method_id: opcode::ENTER_SCENE,
             payload,
         }

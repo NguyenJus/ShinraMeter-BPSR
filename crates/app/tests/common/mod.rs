@@ -106,12 +106,14 @@ impl Rig {
     /// (`bpsr_protocol::dump_format::DumpRecord`): those are already
     /// post-zstd and post-frame-split, so re-entering at the TCP-byte layer
     /// (`run`/`run_bytes`) would be the wrong seam — there is no raw stream
-    /// to reassemble, just a `(method_id, payload)` pair per record. Does
+    /// to reassemble, just a `(service_uuid, method_id, payload)` triple per
+    /// record. Does
     /// not touch `self.reassembler`/`self.decoder`, so it cannot perturb
     /// `run`'s behavior; the two entry points share only `self.pipeline`
     /// and `self.resets`.
-    pub fn feed_notify(&mut self, method_id: u32, payload: &[u8], ts_ms: u64) {
+    pub fn feed_notify(&mut self, service_uuid: u64, method_id: u32, payload: &[u8], ts_ms: u64) {
         let notify = bpsr_protocol::frame::Notify {
+            service_uuid,
             method_id,
             payload: payload.to_vec(),
         };

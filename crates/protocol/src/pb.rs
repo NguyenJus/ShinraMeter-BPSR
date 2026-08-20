@@ -303,6 +303,87 @@ pub fn class_of_profession_id(id: i32) -> Option<Class> {
     }
 }
 
+/// `GrpcTeamNtf.NotifyJoinTeam` (`decode::team_opcode::NOTIFY_JOIN_TEAM`,
+/// issue #146): the bulk party-roster push. Every tag on this struct and
+/// the `NotifyJoinTeamRequest` -> `TeamMemData` -> `TeamMemberSocialData` ->
+/// `{TeamBasicData, TeamProfessionData, TeamUserAttrData}` tree below was
+/// read directly off protoc-generated `FieldNumber` constants in the
+/// BPSR-ZDPS reference tool's .NET metadata, the same provenance discipline
+/// as `CharSerialize`/`EnterScene` above — not inferred from field order or
+/// ported from another project. All plain varint fields are `int32`/`int64`
+/// (never `sint*`/zigzag), matching how BPSR-ZDPS declares them.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NotifyJoinTeam {
+    #[prost(message, optional, tag = "1")]
+    pub v_request: Option<NotifyJoinTeamRequest>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NotifyJoinTeamRequest {
+    #[prost(message, optional, tag = "1")]
+    pub base_info: Option<TeamBaseInfo>,
+    #[prost(message, repeated, tag = "2")]
+    pub member_data: Vec<TeamMemData>,
+}
+
+/// An empty placeholder struct (issue #146): BPSR-ZDPS's `TeamBaseInfo` has
+/// no field tags documented in the issue's table, so nothing is modeled
+/// here yet. Kept as a distinct type (rather than dropping `base_info`
+/// entirely) so a future slice can add fields without touching
+/// `NotifyJoinTeamRequest`'s shape.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TeamBaseInfo {}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TeamMemData {
+    #[prost(int64, tag = "1")]
+    pub char_id: i64,
+    #[prost(int32, tag = "6")]
+    pub scene_id: i32,
+    #[prost(int32, tag = "8")]
+    pub group_id: i32,
+    #[prost(message, optional, tag = "9")]
+    pub social_data: Option<TeamMemberSocialData>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TeamMemberSocialData {
+    #[prost(message, optional, tag = "1")]
+    pub basic_data: Option<TeamBasicData>,
+    #[prost(message, optional, tag = "4")]
+    pub profession_data: Option<TeamProfessionData>,
+    #[prost(message, optional, tag = "8")]
+    pub user_attr_data: Option<TeamUserAttrData>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TeamBasicData {
+    #[prost(int64, tag = "1")]
+    pub char_id: i64,
+    #[prost(string, tag = "3")]
+    pub name: String,
+    /// Decoded but deliberately unemitted (issue #146 spec decision 3):
+    /// `PlayerInfo` has no `level` field and nothing downstream consumes
+    /// one, so `decode::on_notify_join_team` reads this only to leave it
+    /// unused, never mapping it into an event.
+    #[prost(int32, tag = "6")]
+    pub level: i32,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TeamProfessionData {
+    #[prost(int32, tag = "1")]
+    pub profession_id: i32,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TeamUserAttrData {
+    #[prost(int64, tag = "4")]
+    pub fight_point: i64,
+    #[prost(int32, tag = "5")]
+    pub season_strength: i32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

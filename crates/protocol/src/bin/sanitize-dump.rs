@@ -438,6 +438,7 @@ fn drive(records: &[DumpRecord]) -> (Vec<meter::Snapshot>, meter::Snapshot) {
             continue;
         }
         let n = Notify {
+            service_uuid: r.service_uuid,
             method_id: r.method_id,
             payload: r.payload.clone(),
         };
@@ -894,7 +895,7 @@ mod tests {
         let sanitized = sanitize::sanitize(opcode::SYNC_NEAR_DELTA_INFO, &payload, &mut r).unwrap();
         let record = DumpRecord {
             ts_ms: 1,
-            service_uuid: 0,
+            service_uuid: proto::frame::SERVICE_UUID,
             method_id: opcode::SYNC_NEAR_DELTA_INFO,
             payload: sanitized,
             payload_decoded: true,
@@ -943,7 +944,7 @@ mod tests {
         .encode_to_vec();
         let orig = vec![DumpRecord {
             ts_ms: 1_000,
-            service_uuid: 0,
+            service_uuid: proto::frame::SERVICE_UUID,
             method_id: opcode::SYNC_NEAR_DELTA_INFO,
             payload,
             payload_decoded: true,
