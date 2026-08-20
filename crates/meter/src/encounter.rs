@@ -1126,9 +1126,19 @@ impl Meter {
                 Some(last) => e.timestamp_ms.saturating_sub(last) >= self.reset_cfg.cooldown_ms,
                 None => true,
             };
+            // issue #157: `boss_uid` is not only a display choice — it
+            // selects whose HP bar the auto-reset heuristic watches, and
+            // `recompute_boss` can park it on a trash mob (its candidate
+            // set is "damaged in this fight", which after a reset the first
+            // add hit by party AoE wins outright). Measuring a wipe off an
+            // add is never right: adds die and respawn at full HP as a
+            // matter of course, which is the rollback signature. Trash can
+            // therefore never reset the meter, whatever the header is
+            // pointing at.
             let should_reset = {
                 let enemy = &self.enemies[&e.uid];
-                check_hp_rollback(enemy, &self.reset_cfg)
+                enemy.monster_id.is_some_and(tables::is_boss_monster)
+                    && check_hp_rollback(enemy, &self.reset_cfg)
             };
             // issue #78: while the last fight's stats are held, a boss HP bar
             // refilling (the corpse resyncing, or the next party pulling it)
@@ -1214,31 +1224,35 @@ impl Meter {
     /// An enemy with no HP of either kind is unrankable and stays out.
     fn recompute_boss(&mut self) {
         let previous_boss_uid = self.boss_uid;
-        self.boss_uid = self
-            .enemies
-            .iter()
-            .filter(|(_, e)| e.took_damage)
-            .filter_map(|(uid, e)| {
-                let recognized = u8::from(e.monster_id.is_some_and(tables::is_boss_monster));
-                let alive = u8::from(e.is_alive());
-                // Living enemies all share death rank 0 so the key is inert
-                // for them; among the dead it orders by who fell last.
-                let died = e.death_order.unwrap_or(0);
-                match (e.max_hp.filter(|max| *max > 0), e.curr_hp) {
-                    (Some(max), _) => Some((*uid, recognized, alive, died, 1u8, max)),
-                    (None, Some(curr)) => Some((*uid, recognized, alive, died, 0u8, curr)),
-                    (None, None) => None,
-                }
-            })
-            .max_by_key(|(uid, recognized, alive, died, tier, hp)| {
-                (*recognized, *alive, *died, *tier, *hp, *uid)
-            })
-            .map(|(uid, ..)| uid);
+        let damaged = self.rank_boss(|e| e.took_damage);
+        // issue #157: an enemy the boss table does not recognize must not
+        // hold the target while a recognized boss is still up in this
+        // encounter. The candidate set above is "damaged in the current
+        // fight", and `reset` clears `took_damage` on every enemy — so
+        // immediately after any reset the set is empty and the first enemy
+        // to take damage wins outright, no matter what it is. Party AoE
+        // landing on adds first is the ordinary case, and the ranking key
+        // cannot help, because the boss is not a candidate until someone
+        // hits it. `is_alive` scopes the fallback to a boss actually still
+        // being fought, so a corpse from the last pull cannot take the
+        // header back off the trash the party has moved on to.
+        self.boss_uid = match damaged {
+            Some(uid) if !self.is_recognized_boss(uid) => self
+                .rank_boss(|e| e.is_alive() && e.monster_id.is_some_and(tables::is_boss_monster))
+                .or(Some(uid)),
+            other => other,
+        };
 
-        let monster_id = self
+        let monster_id = self.boss_monster_id();
+        // Whether the selected boss is one this encounter actually engaged.
+        // Only the issue #157 fallback above can select an undamaged enemy,
+        // and issue #125's learned scene -> final-boss map means "the last
+        // boss *engaged* in this dungeon" — a boss merely standing in AOI
+        // range must not latch itself as one.
+        let engaged = self
             .boss_uid
             .and_then(|uid| self.enemies.get(&uid))
-            .and_then(|e| e.monster_id);
+            .is_some_and(|e| e.took_damage);
 
         // issue #125: learn this dungeon's final boss by observation. No
         // upstream table maps a scene to its final boss, so the last genuine
@@ -1250,6 +1264,7 @@ impl Meter {
         // fought in an open-world zone from pinning its name to every later
         // visit to that town or field.
         if let (Some(id), Some(scene)) = (monster_id, self.scene_id)
+            && engaged
             && tables::is_boss_monster(id)
             && tables::is_dungeon_scene(scene)
         {
@@ -1272,6 +1287,45 @@ impl Meter {
         {
             log::info!("{msg}");
         }
+    }
+
+    /// Ranks the enemies `candidate` accepts by the keys documented on
+    /// [`Self::recompute_boss`] and returns the winner's uid, or `None`
+    /// when nothing it accepted is rankable (an enemy with no HP of either
+    /// kind stays out).
+    ///
+    /// Split out so `recompute_boss` can ask the same question of two
+    /// candidate sets — the enemies damaged in this fight, and the
+    /// recognized bosses still up (issue #157) — without duplicating the
+    /// ranking.
+    fn rank_boss(&self, candidate: impl Fn(&EnemyState) -> bool) -> Option<i64> {
+        self.enemies
+            .iter()
+            .filter(|(_, e)| candidate(e))
+            .filter_map(|(uid, e)| {
+                let recognized = u8::from(e.monster_id.is_some_and(tables::is_boss_monster));
+                let alive = u8::from(e.is_alive());
+                // Living enemies all share death rank 0 so the key is inert
+                // for them; among the dead it orders by who fell last.
+                let died = e.death_order.unwrap_or(0);
+                match (e.max_hp.filter(|max| *max > 0), e.curr_hp) {
+                    (Some(max), _) => Some((*uid, recognized, alive, died, 1u8, max)),
+                    (None, Some(curr)) => Some((*uid, recognized, alive, died, 0u8, curr)),
+                    (None, None) => None,
+                }
+            })
+            .max_by_key(|(uid, recognized, alive, died, tier, hp)| {
+                (*recognized, *alive, *died, *tier, *hp, *uid)
+            })
+            .map(|(uid, ..)| uid)
+    }
+
+    /// Whether `uid` names an enemy whose monster id is in the boss table.
+    fn is_recognized_boss(&self, uid: i64) -> bool {
+        self.enemies
+            .get(&uid)
+            .and_then(|e| e.monster_id)
+            .is_some_and(tables::is_boss_monster)
     }
 
     /// Clears `players` and per-enemy `lowest_pct`; keeps `names`. Deaths
@@ -2680,13 +2734,24 @@ mod tests {
     mod reset {
         use super::*;
 
+        /// "Rathalos" (103), a recognized boss: `is_boss_monster` is what
+        /// gates the rollback reset (issue #157), so an enemy driving one
+        /// has to be one.
+        const BOSS: u32 = 103;
+        /// "Golden Nappo": named but `MonsterType == 0`, i.e. a trash add.
+        const TRASH: u32 = 10_900;
+
         fn hp(uid: i64, curr: u64, max: u64, ts: u64) -> ProtocolEvent {
+            identified(uid, curr, max, BOSS, ts)
+        }
+
+        fn identified(uid: i64, curr: u64, max: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(max),
+                monster_id: Some(monster_id),
                 timestamp_ms: ts,
-                ..Default::default()
             })
         }
 
@@ -2905,6 +2970,59 @@ mod tests {
             );
             assert!(m.enemies.is_empty());
             assert!(m.boss_uid.is_none());
+        }
+
+        // -- issue #157: trash must not hold the reset heuristic ---------
+
+        #[test]
+        fn an_add_does_not_hold_the_boss_target_while_a_recognized_boss_is_present() {
+            // The shape from issue #157's log: a reset clears `took_damage`
+            // on every enemy, so the next enemy hit wins `boss_uid`
+            // outright — and party AoE lands on adds first.
+            let mut m = Meter::new();
+            m.apply(&identified(10, 1_000_000, 1_000_000, BOSS, 0));
+            m.apply(&boss_hit(10, 0));
+            assert_eq!(m.boss_uid, Some(10));
+
+            m.reset(ResetReason::NewFight, 1_000);
+            m.apply(&identified(20, 50_000, 50_000, TRASH, 1_100));
+            m.apply(&boss_hit(20, 1_200));
+
+            assert_eq!(
+                m.boss_uid,
+                Some(10),
+                "the recognized boss keeps the target, not the add"
+            );
+        }
+
+        #[test]
+        fn a_dead_boss_does_not_take_the_target_back_from_a_live_add() {
+            // The fallback above only reaches for a boss that is still up:
+            // once the boss is dead and the party has moved on to trash,
+            // the trash is genuinely what is being fought.
+            let mut m = Meter::new();
+            m.apply(&identified(10, 1_000_000, 1_000_000, BOSS, 0));
+            m.apply(&boss_hit(10, 0));
+            m.apply(&identified(10, 0, 1_000_000, BOSS, 100));
+            m.reset(ResetReason::NewFight, 1_000);
+
+            m.apply(&identified(20, 50_000, 50_000, TRASH, 1_100));
+            m.apply(&boss_hit(20, 1_200));
+            assert_eq!(m.boss_uid, Some(20));
+        }
+
+        #[test]
+        fn an_unrecognized_enemys_hp_rollback_never_resets_the_encounter() {
+            // No recognized boss anywhere in the encounter, so the add
+            // legitimately holds `boss_uid` — and its bar snapping back
+            // must still not wipe everyone's numbers.
+            let mut m = Meter::new();
+            m.apply(&boss_hit(20, 0));
+            m.apply(&identified(20, 100, 100, TRASH, 0));
+            assert_eq!(m.boss_uid, Some(20));
+            m.apply(&identified(20, 55, 100, TRASH, 100));
+            assert_eq!(m.apply(&identified(20, 95, 100, TRASH, 200)), None);
+            assert_eq!(m.snapshot(300).total_damage, 1);
         }
 
         #[test]
@@ -3363,12 +3481,14 @@ mod tests {
         #[test]
         fn a_boss_hp_rollback_still_resets_during_a_live_fight() {
             // Guards the change above from over-reaching: an in-progress
-            // wipe/rollback must keep resetting exactly as before.
+            // wipe/rollback must keep resetting exactly as before. The
+            // target has to be a recognized boss for that — issue #157
+            // gates the rollback on it, so trash can never reset the meter.
             let mut m = Meter::new();
             m.apply(&boss_hit(10, 0, false));
-            m.apply(&hp(10, 100, None, 0));
-            m.apply(&hp(10, 55, None, 100));
-            let reason = m.apply(&hp(10, 95, None, 200));
+            m.apply(&hp(10, 100, Some(103), 0));
+            m.apply(&hp(10, 55, Some(103), 100));
+            let reason = m.apply(&hp(10, 95, Some(103), 200));
             assert_eq!(reason, Some(ResetReason::BossHpRollback));
         }
 
