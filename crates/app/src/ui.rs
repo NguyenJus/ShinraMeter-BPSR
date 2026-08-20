@@ -425,6 +425,7 @@ fn demo_snapshot() -> Snapshot {
             scene_id: Some(13_023),
             scene_name: Some("Purge! Field of Forgotten Illusions"),
             scene_boss_name: None,
+            multi_boss_scene: false,
         },
     }
 }
@@ -1921,7 +1922,17 @@ const UV_FULL: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui:
 ///    branch 1 doesn't apply, but the header still shouldn't go blank or
 ///    fall through to "No target" when the dungeon's real boss is already
 ///    known.
-/// 3. else the pre-#125 fallback: blank for a non-boss pull with nothing
+/// 3. else, with nothing engaged at all in a scene that offers a *choice*
+///    of bosses (`multi_boss_scene`, issue #150): "Select a boss". Every
+///    raid lets the party pick one of three bosses, and picking again after
+///    a win or a wipe never leaves the scene — so this is the caption for
+///    the whole time the party is standing in the instance with nothing
+///    selected. Naming a boss there (branch 2 is suppressed for these
+///    scenes precisely because the remembered one is a wrong guess two
+///    times out of three) or calling it "No target" would both misdescribe
+///    the moment. Branch 1 takes back over the instant *any* recognized
+///    boss is engaged.
+/// 4. else the pre-#125 fallback: blank for a non-boss pull with nothing
 ///    remembered, "No target" when nothing has been hit yet at all.
 ///
 /// Always returns something (never omits the line) so `draw_header` can
@@ -1939,12 +1950,16 @@ const UV_FULL: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui:
 /// indistinguishable from a trash pull — so that case still falls back to
 /// the raw id.
 ///
-/// Known limitation (issue #131, not fixed here): on *entry* to a
-/// multi-boss raid, before anything has been engaged this session,
-/// `scene_boss_name` is whichever boss `Meter::scene_bosses` last latched
-/// for that scene — not necessarily the *first* one the raid will actually
-/// fight. The header only becomes correct once a boss is engaged and branch
-/// 1 takes over.
+/// The issue #131 limitation this used to carry — on entry to a multi-boss
+/// raid, `scene_boss_name` naming whichever boss was latched last rather
+/// than the one the party will actually fight — is what issue #150 fixed,
+/// by having `Meter::snapshot` suppress that fallback for such a scene and
+/// set `multi_boss_scene` instead. Branch 3 is the resulting caption.
+///
+/// While a finished fight is being held on screen, every field here
+/// describes *that* fight rather than live state (issue #152), so nothing
+/// in this precedence has to know about zoning: the header keeps naming the
+/// boss whose frozen numbers are on the rows below it.
 fn encounter_title(e: &EncounterInfo) -> String {
     if e.is_boss {
         // `is_boss` is only ever true alongside a `Some` `boss_monster_id`
@@ -1963,6 +1978,7 @@ fn encounter_title(e: &EncounterInfo) -> String {
         return name.to_string();
     }
     match e.boss_monster_id {
+        None if e.multi_boss_scene => "Select a boss".to_string(),
         None => "No target".to_string(),
         Some(_) => String::new(),
     }
@@ -4524,6 +4540,7 @@ mod tests {
                 scene_id: None,
                 scene_name: None,
                 scene_boss_name: None,
+                multi_boss_scene: false,
             },
         }
     }
@@ -6781,6 +6798,51 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(encounter_title(&e), "Rathalos");
+    }
+
+    // -- multi-boss scenes ask for a selection (issue #150) ----------------
+
+    #[test]
+    fn title_asks_for_a_boss_selection_in_a_multi_boss_scene_with_nothing_engaged() {
+        // Issue #150: in a raid that offers three separately selectable
+        // bosses, `scene_boss_name` is deliberately suppressed (naming one
+        // is a guess that is wrong two times out of three). "No target" is
+        // the wrong caption for that: there is a target, the party just
+        // hasn't picked it yet.
+        let e = EncounterInfo {
+            boss_monster_id: None,
+            scene_boss_name: None,
+            multi_boss_scene: true,
+            ..Default::default()
+        };
+        assert_eq!(encounter_title(&e), "Select a boss");
+    }
+
+    #[test]
+    fn title_names_the_engaged_boss_in_a_multi_boss_scene_rather_than_the_placeholder() {
+        // The placeholder is only for "nothing engaged": once the party
+        // pulls, the header names the boss that was selected.
+        let e = EncounterInfo {
+            boss_monster_id: Some(103_309),
+            boss_name: Some("Paradox-Calamity Remnant - Final"),
+            is_boss: true,
+            multi_boss_scene: true,
+            ..Default::default()
+        };
+        assert_eq!(encounter_title(&e), "Paradox-Calamity Remnant - Final");
+    }
+
+    #[test]
+    fn title_keeps_no_target_in_an_ordinary_scene_with_nothing_engaged() {
+        // The regression guard: an ordinary dungeon (or town) with nothing
+        // engaged and nothing remembered is unchanged by issue #150.
+        let e = EncounterInfo {
+            boss_monster_id: None,
+            scene_boss_name: None,
+            multi_boss_scene: false,
+            ..Default::default()
+        };
+        assert_eq!(encounter_title(&e), "No target");
     }
 
     #[test]

@@ -93,6 +93,12 @@ fn boss_hp_rollback_auto_reset() {
 /// invalidated, and the fight clock freezes at the reconnect moment so the
 /// held elapsed timer does not run while the connection is down. The next
 /// fight's first hit is what clears the stats (`ResetReason::NewFight`).
+///
+/// Issue #152: the *header* is part of what stays on screen. The meter's
+/// own live state is invalidated as above, but the snapshot describes the
+/// fight being held — the boss it was against and the scene it happened
+/// in — so the caption cannot drift onto the town the player walked into
+/// while the rows below it are still the dungeon's.
 #[test]
 fn server_change_holds_the_numbers() {
     let scenario = Scenario::new("server_change_reset")
@@ -129,12 +135,13 @@ fn server_change_holds_the_numbers() {
     // The clock freezes at the reconnect moment (12_000), not at the
     // capture's `now_ms` (13_000): fight_start is the first hit at 2_000.
     assert_eq!(capture.snapshot.duration_ms, 10_000);
-    // ...but state keyed on the old server session is still invalidated:
-    // uids are re-issued and the scene is unknown until the next
-    // `EnterScene`.
-    assert_eq!(capture.snapshot.encounter.scene_id, None);
-    assert_eq!(capture.snapshot.encounter.boss_monster_id, None);
-    assert_eq!(capture.snapshot.encounter.scene_boss_name, None);
+    // ...and the header stays pinned to the fight those rows belong to
+    // (issue #152), even though the meter's live scene and boss target were
+    // both invalidated by the reconnect.
+    assert_eq!(capture.snapshot.encounter.scene_id, Some(TOWERING_RUIN));
+    assert_eq!(capture.snapshot.encounter.scene_name, Some("Towering Ruin"));
+    assert_eq!(capture.snapshot.encounter.boss_monster_id, Some(RATHALOS));
+    assert_eq!(capture.snapshot.encounter.boss_name, Some("Rathalos"));
 
     assert_golden(capture);
 }

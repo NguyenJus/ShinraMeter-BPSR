@@ -126,7 +126,21 @@ pub struct EncounterInfo {
     /// target; `encounter_title` in `crates/app/src/ui.rs` prefers this
     /// field over them so a mid-dungeon mech (or even a genuine mid-dungeon
     /// boss) never displaces the dungeon's final boss name once it's known.
+    ///
+    /// `None` in a scene that can present more than one *selectable* boss
+    /// (issue #150) — see `multi_boss_scene` below, and `Meter::snapshot`
+    /// for the suppression itself.
     pub scene_boss_name: Option<&'static str>,
+    /// Whether this scene is known to offer more than one separately
+    /// selectable boss (issue #150): a raid where the party picks which of
+    /// three bosses to pull. True for the curated raid scenes
+    /// (`phase::is_boss_select_scene`), which is the only source — the meter
+    /// cannot tell a raid's selections from an ordinary dungeon's boss order
+    /// by observation. Drives `encounter_title`'s
+    /// "Select a boss" placeholder in `crates/app/src/ui.rs`: with nothing
+    /// engaged there is genuinely no target *yet*, as opposed to the
+    /// no-target-at-all case "No target" names.
+    pub multi_boss_scene: bool,
 }
 
 /// Cheap, immutable snapshot of the current encounter, sorted by damage
