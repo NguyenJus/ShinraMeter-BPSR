@@ -251,39 +251,59 @@ fn demo_enabled_from(var: Option<&str>) -> bool {
     var.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
 }
 
-/// `(name, class, damage, crit_pct, deaths, imagines)` for one `DEMO_ROWS`
-/// entry. Named so the array below reads as one type, not clippy's
-/// `type_complexity` bait.
-type DemoRow = (&'static str, Class, i64, f32, u32, [Option<i32>; 2]);
+/// `(name, class, damage, crit_pct, lucky_pct, hits, deaths, imagines)` for
+/// one `DEMO_ROWS` entry. Named so the array below reads as one type, not
+/// clippy's `type_complexity` bait.
+type DemoRow = (
+    &'static str,
+    Class,
+    i64,
+    f32,
+    f32,
+    u64,
+    u32,
+    [Option<i32>; 2],
+);
 
-/// `(name, class, damage, crit_pct, deaths, imagines)` for each demo row, in
-/// descending-damage order. The damage, crit%, and death figures
-/// intentionally mirror `docs/reference/new-shinra-ex.webp` so a demo-mode
-/// capture can be diffed against the reference screenshot (issue #88). The
-/// *names* are deliberately fictional, not the reference screenshot's real
-/// character names — this repo is public, and `CONTRIBUTING.md` tells users
-/// not to share other players' names, so a demo capture headed for the
-/// README can't republish someone else's (issue #133). The names have no
-/// counterpart in the reference screenshot to mirror, since the reference's
-/// underlying screenshot predates the Imagine column (issue #33/#128).
+/// `(name, class, damage, crit_pct, lucky_pct, hits, deaths, imagines)` for
+/// each demo row, in descending-damage order (issue #148). A realistic
+/// dungeon/raid comp — one tank (`Thudd`, blue `ShieldKnight`), one healer
+/// (`Fizz`, green `VerdantOracle`), three damage dealers — rather than five
+/// DPS rows, per `Class::role()`. The *names* are deliberately fictional,
+/// never a real character name — this repo is public, and
+/// `CONTRIBUTING.md` tells users not to share other players' names, so a
+/// demo capture headed for the README can't republish someone else's
+/// (issue #133).
 ///
-/// `imagines` is each row's two equipped-Imagine skill ids, demo-only and
-/// with no reference-screenshot counterpart of its own (issue #133): the
-/// reference capture predates the Imagine column, so unlike this tuple's
-/// other fields these ids aren't mirroring anything — they're picked from
-/// `imagines::imagine_of_skill_id`'s curated table purely so a demo capture
-/// shows the column doing real work instead of ten blank placeholder
-/// circles. The last row keeps one slot empty on purpose, since not every
-/// real player fills both. Folded into this tuple (rather than a separate
-/// by-index array) so a row and its Imagine pair can never drift apart —
-/// reordering `DEMO_ROWS` carries its Imagines along, and there is no second
-/// array whose length or order could silently disagree.
+/// Crit/lucky pairs are shaped to read as draws from one shared substat
+/// budget, clamped to a plausible 5-70% range: `Blorp` and `Fizz` build
+/// nearly all-in on one stat (sums ~75-76%), `Zog` splits close to evenly
+/// (sum ~73%, and so sits lower on both axes than the all-in rows),
+/// and `Glorbaxian` lands in between (sum ~74%). `Thudd` (the tank) pairs
+/// a conservative 22% crit with 18% lucky (sum 40%)—intentionally modest
+/// to reflect a tank's priority on survivability and mitigation over
+/// offensive stats. Hits and deaths are shaped on a real tank-vs-DPS
+/// ratio — `Thudd` racks up far more hits (a tank's rotation is
+/// faster/lower per hit) and nobody but `Glorbaxian` dies.
+///
+/// `imagines` is each row's two equipped-Imagine skill ids, demo-only:
+/// they're picked from `imagines::imagine_of_skill_id`'s curated table
+/// purely so a demo capture shows the column doing real work instead of ten
+/// blank placeholder circles. The ids aren't class-locked, so `Thudd`
+/// reuses the ids of the DPS row it replaces. The last row keeps one slot
+/// empty on purpose, since not every real player fills both. Folded into
+/// this tuple (rather than a separate by-index array) so a row and its
+/// Imagine pair can never drift apart — reordering `DEMO_ROWS` carries its
+/// Imagines along, and there is no second array whose length or order could
+/// silently disagree.
 const DEMO_ROWS: [DemoRow; 5] = [
     (
         "Blorp",
         Class::Stormblade,
         55_300_000,
-        73.0,
+        68.0,
+        8.0,
+        150,
         0,
         [Some(3901), Some(3902)],
     ),
@@ -291,7 +311,9 @@ const DEMO_ROWS: [DemoRow; 5] = [
         "Glorbaxian",
         Class::FrostMage,
         55_100_000,
-        76.0,
+        52.0,
+        22.0,
+        180,
         1,
         [Some(3903), Some(3904)],
     ),
@@ -299,15 +321,19 @@ const DEMO_ROWS: [DemoRow; 5] = [
         "Zog",
         Class::TwinStriker,
         49_900_000,
-        54.0,
+        38.0,
+        35.0,
+        210,
         0,
         [Some(3905), Some(3906)],
     ),
     (
-        "Wibble",
-        Class::WindKnight,
+        "Thudd",
+        Class::ShieldKnight,
         17_800_000,
-        59.0,
+        22.0,
+        18.0,
+        540,
         0,
         [Some(3907), Some(3908)],
     ),
@@ -315,52 +341,60 @@ const DEMO_ROWS: [DemoRow; 5] = [
         "Fizz",
         Class::VerdantOracle,
         10_300_000,
-        29.0,
+        10.0,
+        65.0,
+        90,
         0,
         [Some(3909), None],
     ),
 ];
 
-/// The synthetic snapshot `demo_enabled` seeds the overlay with. Values
-/// chosen to render as "2:39", "188.0M/s", and "30.10B" — the same duration,
-/// DPS, and total-damage figures shown in `docs/reference/new-shinra-ex.webp`
-/// — plus `DEMO_ROWS`'s per-row damage/crit% pairs, so a demo-mode capture
-/// can be compared directly against that reference.
+/// The synthetic snapshot `demo_enabled` seeds the overlay with. The header's
+/// `total_damage`/`total_dps` are derived from `DEMO_ROWS` rather than a
+/// separate literal (issue #148), so the two can never disagree the way they
+/// used to (the old header borrowed a duration/DPS/total-damage figure from
+/// `docs/reference/new-shinra-ex.webp` independent of the row data, two
+/// orders of magnitude off from what the rows actually summed to). Boss and
+/// scene are a real BPSR pull: `Purge! Field of Forgotten Illusions`'s final
+/// boss, `Paradox-Calamity Remnant - Final` (`tables.rs`), a fight that runs
+/// well within this snapshot's 159s duration in practice.
 fn demo_snapshot() -> Snapshot {
-    let row_damage_sum: i64 = DEMO_ROWS.iter().map(|(_, _, dmg, _, _, _)| dmg).sum();
+    let row_damage_sum: i64 = DEMO_ROWS.iter().map(|(_, _, dmg, ..)| dmg).sum();
     let duration_ms = 159_000u64;
     let rows = DEMO_ROWS
         .iter()
         .enumerate()
         .map(
-            |(i, &(name, class, damage, crit_pct, deaths, imagine_ids))| PlayerRow {
-                uid: i as i64 + 1,
-                name: name.to_string(),
-                class: Some(class),
-                ability_score: None,
-                season_strength: None,
-                imagines: imagine_ids,
-                damage,
-                dps: damage as f64 / (duration_ms as f64 / 1000.0),
-                share_pct: damage as f32 / row_damage_sum as f32 * 100.0,
-                crit_pct,
-                lucky_pct: 20.0,
-                hits: 200,
-                deaths,
+            |(i, &(name, class, damage, crit_pct, lucky_pct, hits, deaths, imagine_ids))| {
+                PlayerRow {
+                    uid: i as i64 + 1,
+                    name: name.to_string(),
+                    class: Some(class),
+                    ability_score: None,
+                    season_strength: None,
+                    imagines: imagine_ids,
+                    damage,
+                    dps: damage as f64 / (duration_ms as f64 / 1000.0),
+                    share_pct: damage as f32 / row_damage_sum as f32 * 100.0,
+                    crit_pct,
+                    lucky_pct,
+                    hits,
+                    deaths,
+                }
             },
         )
         .collect();
     Snapshot {
         duration_ms,
-        total_damage: 30_100_000_000,
-        total_dps: 188_000_000.0,
+        total_damage: row_damage_sum,
+        total_dps: row_damage_sum as f64 / (duration_ms as f64 / 1000.0),
         rows,
         encounter: EncounterInfo {
-            boss_monster_id: Some(1),
-            boss_name: Some("Bahaar"),
+            boss_monster_id: Some(103_309),
+            boss_name: Some("Paradox-Calamity Remnant - Final"),
             is_boss: true,
-            scene_id: None,
-            scene_name: Some("Frozen Bahaar's Sanctum"),
+            scene_id: Some(13_023),
+            scene_name: Some("Purge! Field of Forgotten Illusions"),
             scene_boss_name: None,
         },
     }
@@ -3943,7 +3977,10 @@ mod tests {
     fn initial_snapshot_seeds_the_demo_encounter_when_demo_mode_is_on() {
         let snapshot = initial_snapshot(true);
         assert!(!snapshot.rows.is_empty(), "demo mode must seed player rows");
-        assert_eq!(snapshot.encounter.boss_name, Some("Bahaar"));
+        assert_eq!(
+            snapshot.encounter.boss_name,
+            Some("Paradox-Calamity Remnant - Final")
+        );
     }
 
     /// Without demo mode, a fresh `OverlayApp` starts on the ordinary empty
@@ -3967,7 +4004,7 @@ mod tests {
     /// would have caught.
     #[test]
     fn every_demo_row_imagine_id_resolves_to_a_known_icon_with_bytes() {
-        for &(name, _, _, _, _, ids) in &DEMO_ROWS {
+        for &(name, _, _, _, _, _, _, ids) in &DEMO_ROWS {
             for id in ids.into_iter().flatten() {
                 let imagine = imagines::imagine_of_skill_id(id)
                     .unwrap_or_else(|| panic!("{name:?}'s Imagine id {id} is not curated"));
@@ -3999,6 +4036,84 @@ mod tests {
         assert_eq!(glorbaxian.imagines, [Some(3903), Some(3904)]);
     }
 
+    /// Issue #148: the demo header used to show a `total_damage`/`total_dps`
+    /// borrowed from the old reference screenshot, independent of
+    /// `DEMO_ROWS` — so the header and the rows disagreed by two orders of
+    /// magnitude. This guards that the header is always derived from the
+    /// rows (not a separate literal), that every row's `share_pct` derives
+    /// from that same total, that crit/lucky stay in the plausible 5-70%
+    /// band, and that the party has exactly one Tank and one Healer with the
+    /// rest on Damage — a realistic dungeon/raid comp, not five DPS.
+    #[test]
+    fn demo_snapshot_header_and_rows_are_internally_consistent() {
+        let snapshot = demo_snapshot();
+
+        let row_damage_sum: i64 = snapshot.rows.iter().map(|row| row.damage).sum();
+        assert_eq!(
+            snapshot.total_damage, row_damage_sum,
+            "header total_damage must equal the sum of the row damages"
+        );
+
+        let expected_dps = row_damage_sum as f64 / (snapshot.duration_ms as f64 / 1000.0);
+        assert!(
+            (snapshot.total_dps - expected_dps).abs() < 0.01,
+            "header total_dps must equal total_damage / duration, got {} expected {}",
+            snapshot.total_dps,
+            expected_dps
+        );
+
+        let mut share_sum = 0.0f32;
+        for row in &snapshot.rows {
+            let expected_share = row.damage as f32 / row_damage_sum as f32 * 100.0;
+            assert!(
+                (row.share_pct - expected_share).abs() < 0.01,
+                "row {}'s share_pct must derive from the row damage sum",
+                row.name
+            );
+            share_sum += row.share_pct;
+
+            assert!(
+                (5.0..=70.0).contains(&row.crit_pct),
+                "row {}'s crit_pct {} must be within 5-70%",
+                row.name,
+                row.crit_pct
+            );
+            assert!(
+                (5.0..=70.0).contains(&row.lucky_pct),
+                "row {}'s lucky_pct {} must be within 5-70%",
+                row.name,
+                row.lucky_pct
+            );
+        }
+        assert!(
+            (share_sum - 100.0).abs() < 0.1,
+            "row shares must sum to ~100%, got {share_sum}"
+        );
+
+        let tanks = snapshot
+            .rows
+            .iter()
+            .filter(|row| row.class.and_then(|c| c.role()) == Some(Role::Tank))
+            .count();
+        let healers = snapshot
+            .rows
+            .iter()
+            .filter(|row| row.class.and_then(|c| c.role()) == Some(Role::Healer))
+            .count();
+        let damage_dealers = snapshot
+            .rows
+            .iter()
+            .filter(|row| row.class.and_then(|c| c.role()) == Some(Role::Damage))
+            .count();
+        assert_eq!(tanks, 1, "the demo party must have exactly one tank");
+        assert_eq!(healers, 1, "the demo party must have exactly one healer");
+        assert_eq!(
+            damage_dealers,
+            snapshot.rows.len() - 2,
+            "everyone else in the demo party must be on the Damage role"
+        );
+    }
+
     /// The regression this guards: a future refactor that deletes or
     /// inverts `drain_snapshots`'s `if !self.demo_mode` check would compile
     /// and pass every other test while silently clobbering demo mode's
@@ -4018,7 +4133,7 @@ mod tests {
 
         assert_eq!(
             app.snapshot.encounter.boss_name,
-            Some("Bahaar"),
+            Some("Paradox-Calamity Remnant - Final"),
             "a real snapshot arriving on the channel must not clobber demo mode's capture"
         );
     }
