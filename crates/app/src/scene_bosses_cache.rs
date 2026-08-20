@@ -1,5 +1,4 @@
-//! Cross-session scene -> observed-bosses cache persistence (issue #131,
-//! widened to a list per scene by issue #150).
+//! Cross-session scene -> final-boss cache persistence (issue #131).
 //!
 //! Mirrors `bpsr_meter::names_cache`'s shape and posture (missing/corrupt
 //! file degrades to empty, logged, never a panic), but — unlike that
@@ -24,20 +23,12 @@ use serde::{Deserialize, Serialize};
 /// mismatched `version` is discarded and treated as empty rather than
 /// guessing at a migration — see `load`'s doc comment for why this is
 /// deliberately *not* how game-patch staleness is handled.
-const VERSION: u32 = 2;
+const VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
 struct SceneBossEntry {
     scene_id: u32,
-    /// Every boss observed in this scene, in engagement order, most recent
-    /// last — `Meter::scene_bosses`' value verbatim. Issue #150 widened this
-    /// from a single `monster_id`: one id per scene cannot express a raid
-    /// that offers a *choice* of bosses, which is the case the meter has to
-    /// stop guessing in. Version 1 files (the single-id shape) are simply
-    /// discarded by the `VERSION` check — this project keeps no backward
-    /// compatibility, and the map re-learns itself on the next run of each
-    /// dungeon anyway.
-    monster_ids: Vec<u32>,
+    monster_id: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -46,7 +37,7 @@ struct CachedFile {
     entries: Vec<SceneBossEntry>,
 }
 
-/// Loads the scene -> observed-bosses map from `path`. A missing file is the
+/// Loads the scene -> final-boss map from `path`. A missing file is the
 /// expected first-run state and resolves silently to an empty map; a
 /// corrupt/unparseable file or a `version` that doesn't match [`VERSION`]
 /// both resolve to an empty map too, logged at `warn` — see the module doc
@@ -61,7 +52,7 @@ struct CachedFile {
 /// hatch for "I don't trust what's cached right now" is the "Forget learned
 /// bosses" menu action (`ui.rs`'s `draw_header_menu`), which calls
 /// [`forget`] below.
-pub fn load(path: &Path) -> HashMap<u32, Vec<u32>> {
+pub fn load(path: &Path) -> HashMap<u32, u32> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
@@ -93,7 +84,7 @@ pub fn load(path: &Path) -> HashMap<u32, Vec<u32>> {
 
     file.entries
         .into_iter()
-        .map(|e| (e.scene_id, e.monster_ids))
+        .map(|e| (e.scene_id, e.monster_id))
         .collect()
 }
 
@@ -104,12 +95,12 @@ pub fn load(path: &Path) -> HashMap<u32, Vec<u32>> {
 /// a truncated/corrupt cache file behind. Any IO or serialization error is
 /// logged at `warn` and otherwise ignored — a failed save must never panic
 /// or interrupt the caller.
-pub fn save(path: &Path, scene_bosses: &HashMap<u32, Vec<u32>>) {
+pub fn save(path: &Path, scene_bosses: &HashMap<u32, u32>) {
     let mut entries: Vec<SceneBossEntry> = scene_bosses
         .iter()
-        .map(|(&scene_id, monster_ids)| SceneBossEntry {
+        .map(|(&scene_id, &monster_id)| SceneBossEntry {
             scene_id,
-            monster_ids: monster_ids.clone(),
+            monster_id,
         })
         .collect();
     // Deterministic on-disk order purely so two saves of the same map diff
@@ -179,14 +170,11 @@ mod tests {
     #[test]
     fn round_trip_load_after_save() {
         let path = scratch_path("scene-bosses-round-trip");
-        let map = HashMap::from([(1001, vec![103]), (2002, vec![103_108, 103_208])]);
+        let map = HashMap::from([(1001, 103), (2002, 103_108)]);
         save(&path, &map);
 
         let loaded = load(&path);
         assert_eq!(loaded, map);
-        // Engagement order is what "the last boss engaged" is read from, so
-        // it has to survive the disk round trip (issue #150).
-        assert_eq!(loaded[&2002], vec![103_108, 103_208]);
 
         let _ = fs::remove_file(&path);
     }
@@ -214,7 +202,7 @@ mod tests {
         let path = scratch_path("scene-bosses-no-version");
         fs::write(
             &path,
-            br#"{"entries":[{"scene_id":1001,"monster_ids":[103]}]}"#,
+            br#"{"entries":[{"scene_id":1001,"monster_id":103}]}"#,
         )
         .unwrap();
 
@@ -230,7 +218,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                r#"{{"version":{},"entries":[{{"scene_id":1001,"monster_ids":[103]}}]}}"#,
+                r#"{{"version":{},"entries":[{{"scene_id":1001,"monster_id":103}}]}}"#,
                 VERSION + 1
             ),
         )
@@ -245,7 +233,7 @@ mod tests {
     #[test]
     fn save_leaves_no_temp_file_behind() {
         let path = scratch_path("scene-bosses-no-tmp");
-        save(&path, &HashMap::from([(1001, vec![103])]));
+        save(&path, &HashMap::from([(1001, 103)]));
 
         assert!(path.exists());
         assert!(!path.with_extension("json.tmp").exists());
@@ -256,7 +244,7 @@ mod tests {
     #[test]
     fn forget_removes_an_existing_file() {
         let path = scratch_path("scene-bosses-forget");
-        save(&path, &HashMap::from([(1001, vec![103])]));
+        save(&path, &HashMap::from([(1001, 103)]));
         assert!(path.exists());
 
         forget(&path);

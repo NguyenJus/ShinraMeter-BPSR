@@ -135,7 +135,7 @@ struct SceneBosses;
 
 impl CachePersist for SceneBosses {
     /// The same shape `scene_bosses_cache::save` takes.
-    type Snapshot = HashMap<u32, Vec<u32>>;
+    type Snapshot = HashMap<u32, u32>;
     const THREAD_NAME: &'static str = "scene-bosses-writer";
 
     fn save(path: &Path, snapshot: &Self::Snapshot) {
@@ -969,7 +969,7 @@ mod tests {
             // is a genuine boss.
             let names_path = scratch_path("scene-bosses-seed-names");
             let scene_path = scratch_path("scene-bosses-seed");
-            scene_bosses_cache::save(&scene_path, &HashMap::from([(1001, vec![103])]));
+            scene_bosses_cache::save(&scene_path, &HashMap::from([(1001, 103)]));
 
             let mut p = Pipeline::with_names_cache_path(names_path.clone())
                 .with_scene_bosses_path(scene_path.clone());
@@ -1001,7 +1001,7 @@ mod tests {
             assert!(scene_path.exists());
 
             let loaded = scene_bosses_cache::load(&scene_path);
-            assert_eq!(loaded.get(&1001), Some(&vec![103]));
+            assert_eq!(loaded.get(&1001), Some(&103));
 
             p.shutdown_names_cache();
             let _ = std::fs::remove_file(&names_path);
@@ -1012,7 +1012,7 @@ mod tests {
         fn forget_learned_bosses_clears_in_process_state_and_deletes_the_file() {
             let names_path = scratch_path("scene-bosses-forget-names");
             let scene_path = scratch_path("scene-bosses-forget");
-            scene_bosses_cache::save(&scene_path, &HashMap::from([(1001, vec![103])]));
+            scene_bosses_cache::save(&scene_path, &HashMap::from([(1001, 103)]));
 
             let mut p = Pipeline::with_names_cache_path(names_path.clone())
                 .with_scene_bosses_path(scene_path.clone());
@@ -1045,7 +1045,7 @@ mod tests {
         fn a_forget_is_not_undone_by_a_save_the_writer_has_not_drained_yet() {
             let names_path = scratch_path("scene-bosses-forget-race-names");
             let scene_path = scratch_path("scene-bosses-forget-race");
-            scene_bosses_cache::save(&scene_path, &HashMap::from([(1001, vec![103])]));
+            scene_bosses_cache::save(&scene_path, &HashMap::from([(1001, 103)]));
             assert!(scene_path.exists());
 
             let (release, gate) = bounded::<()>(0);

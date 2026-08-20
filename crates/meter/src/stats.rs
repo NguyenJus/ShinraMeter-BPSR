@@ -133,9 +133,10 @@ pub struct EncounterInfo {
     pub scene_boss_name: Option<&'static str>,
     /// Whether this scene is known to offer more than one separately
     /// selectable boss (issue #150): a raid where the party picks which of
-    /// three bosses to pull. True for a curated scene
-    /// (`phase::is_multi_boss_scene`) and for any scene observed to have
-    /// hosted two unrelated bosses. Drives `encounter_title`'s
+    /// three bosses to pull. True for the curated raid scenes
+    /// (`phase::is_boss_select_scene`), which is the only source — the meter
+    /// cannot tell a raid's selections from an ordinary dungeon's boss order
+    /// by observation. Drives `encounter_title`'s
     /// "Select a boss" placeholder in `crates/app/src/ui.rs`: with nothing
     /// engaged there is genuinely no target *yet*, as opposed to the
     /// no-target-at-all case "No target" names.

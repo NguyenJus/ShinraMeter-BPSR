@@ -297,11 +297,14 @@ mod tests {
 /// string, because a name pattern tuned to today's content reads as a silent
 /// mis-detection the moment a season renames anything.
 ///
-/// The observation-driven half of the rule (a scene seen hosting more than
-/// one distinct fight is offering a choice — see [`distinct_fight_count`])
-/// still covers a raid nobody has added yet, but only from its second
-/// selection onward; this table is what makes the known ones right on the
-/// very first visit.
+/// A raid that is missing from this table is treated as an ordinary
+/// dungeon: the meter falls back to naming the last boss engaged there,
+/// which is the pre-#150 guess. Observation cannot stand in for curation
+/// here — a raid's successive selections and an ordinary dungeon's boss
+/// order look identical from the meter's seat (distinct bosses engaged one
+/// after another in one scene), so treating "more than one boss seen in
+/// this scene" as proof of a choice would silence the remembered name for
+/// every multi-boss dungeon instead.
 #[rustfmt::skip]
 const BOSS_SELECT_SCENES: &[u32] = &[
     // Floating Island — Clash! / Brutal! / Purge! difficulty tiers.
@@ -321,28 +324,6 @@ const BOSS_SELECT_SCENES: &[u32] = &[
 /// which boss to fight (issue #150). See [`BOSS_SELECT_SCENES`].
 pub fn is_boss_select_scene(scene_id: u32) -> bool {
     BOSS_SELECT_SCENES.contains(&scene_id)
-}
-
-/// How many *distinct fights* `monster_ids` represents (issue #150): ids in
-/// the same [`BOSS_PHASE_GROUPS`] slice belong to one fight and count once
-/// between them, every other id counts for itself.
-///
-/// This is what lets `Meter` tell "this scene hosted two different fights,
-/// so it offers a selection" from "this scene's one fight presents several
-/// monster ids" — the Dragonbane Golem's two separately targetable cannons
-/// must not make its dungeon look like a raid. Duplicate ids are not
-/// expected (the caller keeps an ordered set) and would each count once via
-/// the same grouping.
-pub fn distinct_fight_count(monster_ids: &[u32]) -> usize {
-    monster_ids
-        .iter()
-        .enumerate()
-        .filter(|(i, id)| {
-            !monster_ids[..*i]
-                .iter()
-                .any(|earlier| earlier == *id || same_phase_group(*earlier, **id))
-        })
-        .count()
 }
 
 #[cfg(test)]
@@ -391,25 +372,5 @@ mod boss_select_scene_tests {
     fn an_ordinary_dungeon_scene_has_no_boss_select() {
         assert!(!is_boss_select_scene(1001));
         assert!(!is_boss_select_scene(8));
-    }
-
-    #[test]
-    fn parts_of_one_curated_fight_count_as_a_single_fight() {
-        // The golem's two separately targetable cannons, and the Goblin
-        // King's two forms.
-        assert_eq!(distinct_fight_count(&[103_110, 103_111]), 1);
-        assert_eq!(distinct_fight_count(&[203, 204]), 1);
-    }
-
-    #[test]
-    fn unrelated_bosses_count_separately() {
-        assert_eq!(distinct_fight_count(&[103, 103_110]), 2);
-        assert_eq!(distinct_fight_count(&[103, 103_110, 103_111]), 2);
-    }
-
-    #[test]
-    fn an_empty_or_single_observation_is_at_most_one_fight() {
-        assert_eq!(distinct_fight_count(&[]), 0);
-        assert_eq!(distinct_fight_count(&[103]), 1);
     }
 }
