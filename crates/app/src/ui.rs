@@ -277,11 +277,14 @@ type DemoRow = (
 ///
 /// Crit/lucky pairs are shaped to read as draws from one shared substat
 /// budget, clamped to a plausible 5-70% range: `Blorp` and `Fizz` build
-/// nearly all-in on one stat, `Zog` splits close to evenly (and so sits
-/// lower on both axes than the all-in rows), and `Glorbaxian`/`Thudd` land
-/// in between. Hits and deaths are shaped on a real tank-vs-DPS ratio —
-/// `Thudd` racks up far more hits (a tank's rotation is faster/lower per
-/// hit) and nobody but `Glorbaxian` dies.
+/// nearly all-in on one stat (sums ~75-76%), `Zog` splits close to evenly
+/// (sum ~73%, and so sits lower on both axes than the all-in rows),
+/// and `Glorbaxian` lands in between (sum ~74%). `Thudd` (the tank) pairs
+/// a conservative 22% crit with 18% lucky (sum 40%)—intentionally modest
+/// to reflect a tank's priority on survivability and mitigation over
+/// offensive stats. Hits and deaths are shaped on a real tank-vs-DPS
+/// ratio — `Thudd` racks up far more hits (a tank's rotation is
+/// faster/lower per hit) and nobody but `Glorbaxian` dies.
 ///
 /// `imagines` is each row's two equipped-Imagine skill ids, demo-only:
 /// they're picked from `imagines::imagine_of_skill_id`'s curated table
