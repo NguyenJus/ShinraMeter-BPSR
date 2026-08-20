@@ -116,7 +116,12 @@ fn replay_dump_boss_fight() {
         if !record.payload_decoded {
             continue;
         }
-        rig.feed_notify(record.method_id, &record.payload, record.ts_ms);
+        rig.feed_notify(
+            record.service_uuid,
+            record.method_id,
+            &record.payload,
+            record.ts_ms,
+        );
         rig.tick(record.ts_ms);
         last_ts = record.ts_ms;
     }

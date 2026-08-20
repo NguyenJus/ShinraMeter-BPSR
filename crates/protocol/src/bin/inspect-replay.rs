@@ -231,6 +231,7 @@ fn build_histogram(
         }
         sink.set_current_ts(record.ts_ms);
         let notify = Notify {
+            service_uuid: record.service_uuid,
             method_id: record.method_id,
             payload: record.payload,
         };

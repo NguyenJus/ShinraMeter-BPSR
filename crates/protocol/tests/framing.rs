@@ -3,7 +3,7 @@
 //! boundaries, zstd-compressed and uncompressed Notifies, FrameDown nesting,
 //! and unknown opcodes interleaved with known ones.
 
-use bpsr_protocol::{Decoder, EntityKind, ProtocolEvent};
+use bpsr_protocol::{Decoder, EntityKind, ProtocolEvent, pb};
 use bpsr_test_support::wire::*;
 
 const ATTACKER_UUID: i64 = (10i64 << 16) | 640; // player uid 10
@@ -469,5 +469,62 @@ fn two_full_frames_plus_partial_tail_across_two_pushes() {
     match &second_events[0] {
         ProtocolEvent::Damage(d) => assert_eq!(d.value, 33),
         other => panic!("expected Damage, got {other:?}"),
+    }
+}
+
+/// `GrpcTeamNtf.NotifyJoinTeam` end-to-end through `Decoder::push_stream`
+/// (issue #146): a roster of a fully-populated member, a name-only member,
+/// and a bot-like member with no `social_data` at all. Also exercises the
+/// method-id collision this slice exists to prevent — `0x3` is
+/// `NotifyJoinTeam` on `TEAM_NTF_SERVICE_UUID` and `ENTER_SCENE` on the main
+/// `SERVICE_UUID` — by delivering it on the team service uuid and asserting
+/// it decodes as a roster, not a scene change.
+#[test]
+fn team_ntf_notify_join_team_decodes_roster_end_to_end() {
+    let payload = notify_join_team_payload(vec![
+        team_member(101, "Ari", 1, 12_345), // Stormblade
+        pb::TeamMemData {
+            char_id: 102,
+            scene_id: 0,
+            group_id: 0,
+            social_data: Some(pb::TeamMemberSocialData {
+                basic_data: Some(pb::TeamBasicData {
+                    char_id: 102,
+                    name: "NameOnly".to_string(),
+                    level: 0,
+                }),
+                profession_data: None,
+                user_attr_data: None,
+            }),
+        },
+        bot_team_member(103),
+    ]);
+    let stream = notify_with_service(
+        bpsr_protocol::frame::TEAM_NTF_SERVICE_UUID,
+        bpsr_protocol::decode::team_opcode::NOTIFY_JOIN_TEAM,
+        &payload,
+        false,
+    );
+
+    let mut decoder = Decoder::new();
+    let events = decoder.push_stream(&stream, 5);
+    assert_eq!(events.len(), 2, "the bot-like member must yield no event");
+    match &events[0] {
+        ProtocolEvent::Player(p) => {
+            assert_eq!(p.uid, 101);
+            assert_eq!(p.name.as_deref(), Some("Ari"));
+            assert_eq!(p.class, Some(bpsr_protocol::Class::Stormblade));
+            assert_eq!(p.ability_score, Some(12_345));
+        }
+        other => panic!("expected Player, got {other:?}"),
+    }
+    match &events[1] {
+        ProtocolEvent::Player(p) => {
+            assert_eq!(p.uid, 102);
+            assert_eq!(p.name.as_deref(), Some("NameOnly"));
+            assert_eq!(p.class, None);
+            assert_eq!(p.ability_score, None);
+        }
+        other => panic!("expected Player, got {other:?}"),
     }
 }

@@ -24,6 +24,11 @@ pub const MAX_TAIL_LEN: usize = MAX_FRAME_LEN as usize;
 /// `SERVICE_UUID = 0x0000_0000_6333_5342` — Notify fragments carrying any
 /// other service uuid are dropped.
 pub const SERVICE_UUID: u64 = 0x0000_0000_6333_5342;
+/// `EServiceId.GrpcTeamNtf` — a second protobuf service riding the same
+/// already-adopted TCP connection as `SERVICE_UUID` (issue #146). Notify
+/// fragments carrying this uuid are accepted alongside `SERVICE_UUID`; every
+/// other service uuid is still dropped.
+pub const TEAM_NTF_SERVICE_UUID: u64 = 0x0000_0000_399F_CA69;
 pub const MAX_FRAMEDOWN_DEPTH: usize = 4;
 /// Highest raw fragment-type discriminant the wire format defines. Used to
 /// sanity-check a header before trusting its length prefix.
@@ -59,6 +64,7 @@ impl From<u16> for FragmentType {
 /// source frame carried the zstd flag).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Notify {
+    pub service_uuid: u64,
     pub method_id: u32,
     pub payload: Vec<u8>,
 }
@@ -262,6 +268,14 @@ fn parse_notify_body(body: &[u8]) -> Option<NotifyBody<'_>> {
     })
 }
 
+/// Whether `service_uuid` is one of the services this crate accepts onto
+/// `out` — `SERVICE_UUID` or `TEAM_NTF_SERVICE_UUID` (issue #146). Both
+/// guards in `handle_notify` call this single predicate so they cannot
+/// drift apart.
+fn is_accepted_service(service_uuid: u64) -> bool {
+    service_uuid == SERVICE_UUID || service_uuid == TEAM_NTF_SERVICE_UUID
+}
+
 fn handle_notify(
     body: &[u8],
     is_zstd: bool,
@@ -273,12 +287,12 @@ fn handle_notify(
         return;
     };
     // Without a diagnostic sink this is the pre-#25 code path: an
-    // unrecognized service uuid returns before any decompression happens, so
+    // unaccepted service uuid returns before any decompression happens, so
     // a normal run pays nothing extra for traffic it was always going to
     // drop. With a sink, we decompress regardless of service uuid so
     // `sink.on_notify` observes every Notify-shaped fragment — including the
     // ones a normal run drops right here.
-    if sink.is_none() && body.service_uuid != SERVICE_UUID {
+    if sink.is_none() && !is_accepted_service(body.service_uuid) {
         return;
     }
     let payload = decode_payload(body.raw_payload, is_zstd);
@@ -299,7 +313,7 @@ fn handle_notify(
             now_ms,
         );
     }
-    if body.service_uuid != SERVICE_UUID {
+    if !is_accepted_service(body.service_uuid) {
         return;
     }
     // A decompression failure drops the fragment in both modes: `out` only
@@ -308,6 +322,7 @@ fn handle_notify(
         return;
     };
     out.push(Notify {
+        service_uuid: body.service_uuid,
         method_id: body.method_id,
         payload,
     });
@@ -645,6 +660,36 @@ mod tests {
         assert_eq!(
             *seen,
             vec![(other_service, 0x42, b"hello".to_vec(), true, 123)]
+        );
+    }
+
+    /// Second-service acceptance (issue #146): a Notify on
+    /// `TEAM_NTF_SERVICE_UUID` survives `handle_notify` — even without a
+    /// diagnostic sink — and keeps its `service_uuid` intact, while a third,
+    /// unrelated uuid is still dropped exactly as before.
+    #[test]
+    fn team_ntf_service_uuid_is_accepted_alongside_the_main_service() {
+        let body = build_notify_body_with_service(TEAM_NTF_SERVICE_UUID, 0x3, b"roster");
+        let frame = build_frame(2, false, &body);
+        let mut out = Vec::new();
+
+        parse_frame(&frame, 0, &mut out, None, 0);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].service_uuid, TEAM_NTF_SERVICE_UUID);
+        assert_eq!(out[0].method_id, 0x3);
+        assert_eq!(out[0].payload, b"roster");
+
+        let unrelated = TEAM_NTF_SERVICE_UUID.wrapping_add(1);
+        let other_body = build_notify_body_with_service(unrelated, 0x3, b"roster");
+        let other_frame = build_frame(2, false, &other_body);
+        let mut other_out = Vec::new();
+
+        parse_frame(&other_frame, 0, &mut other_out, None, 0);
+
+        assert!(
+            other_out.is_empty(),
+            "an unrelated third service must still be dropped"
         );
     }
 

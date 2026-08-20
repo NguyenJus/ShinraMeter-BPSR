@@ -206,6 +206,35 @@ Imagine transform in-game, note it against the attr-id log/dump, and confirm
 `cur_profession_id`/`ATTR_PROFESSION_ID` reads the expected id for its
 duration and reverts afterward.
 
+## Step 4 — party roster (`GrpcTeamNtf`, #146)
+
+Issue #146 adopted a **second** protobuf service riding the same
+already-adopted TCP connection: `GrpcTeamNtf`
+(`bpsr_protocol::frame::TEAM_NTF_SERVICE_UUID`, `0x0000_0000_399F_CA69`).
+Its `NotifyJoinTeam` method (`0x3` on this service —
+`bpsr_protocol::decode::team_opcode::NOTIFY_JOIN_TEAM`, distinct from
+`ENTER_SCENE`'s `0x3` on the main service; `decode_notify` dispatches on the
+`(service_uuid, method_id)` pair specifically so the two don't collide)
+carries a bulk party-roster push: name, class, and ability score for every
+member, decoded into a `ProtocolEvent::Player` per member the same way
+`SyncContainerData` and the AOI attr paths already are.
+
+**Field tags are not reference-derived here** — unlike `SEASON_LEVEL` /
+`IMAGINE_PROFESSION_IDS` above, the `NotifyJoinTeam` message tree's tags
+were read directly off protoc-generated `FieldNumber` constants in the
+BPSR-ZDPS reference tool's .NET metadata, the same provenance as
+`WorldNtf.EnterScene`'s opcode. What is **still unconfirmed** is whether this
+traffic actually arrives on the connection this crate adopts at all: no
+game session was available while building this (issue #146 step 1), so the
+decode is inert in practice until someone runs the Setup procedure above
+during an in-party session and confirms `GrpcTeamNtf` Notify fragments show
+up (or don't) alongside the main service's. If they do, the fixture-based
+unit/integration tests already in `crates/protocol/src/decode.rs` and
+`crates/protocol/tests/framing.rs` (synthetic payloads only — see below) are
+the regression coverage; if the traffic never appears in a real capture, or
+its shape doesn't match the field-tag table, that's the next thing to fix
+here.
+
 ## Recording a result
 
 Once a constant is confirmed:

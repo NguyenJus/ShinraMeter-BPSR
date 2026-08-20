@@ -59,13 +59,30 @@ pub fn frame(fragment_type: u16, compressed: bool, body: &[u8]) -> Vec<u8> {
 /// crate's `SERVICE_UUID`) + `stub_id` (ignored, always 0) + `method_id` +
 /// `payload`, optionally zstd-compressed.
 pub fn notify(method_id: u32, payload: &[u8], compressed: bool) -> Vec<u8> {
+    notify_with_service(
+        bpsr_protocol::frame::SERVICE_UUID,
+        method_id,
+        payload,
+        compressed,
+    )
+}
+
+/// Like [`notify`], but for an arbitrary `service_uuid` — e.g.
+/// `bpsr_protocol::frame::TEAM_NTF_SERVICE_UUID` (issue #146) — instead of
+/// always the crate's main `SERVICE_UUID`.
+pub fn notify_with_service(
+    service_uuid: u64,
+    method_id: u32,
+    payload: &[u8],
+    compressed: bool,
+) -> Vec<u8> {
     let raw = if compressed {
         zstd::stream::encode_all(payload, 0).expect("zstd encode")
     } else {
         payload.to_vec()
     };
     let mut body = Vec::new();
-    body.extend_from_slice(&bpsr_protocol::frame::SERVICE_UUID.to_be_bytes());
+    body.extend_from_slice(&service_uuid.to_be_bytes());
     body.extend_from_slice(&0u32.to_be_bytes()); // stub_id, ignored by the decoder
     body.extend_from_slice(&method_id.to_be_bytes());
     body.extend_from_slice(&raw);
@@ -284,6 +301,59 @@ pub fn enter_scene_payload(scene_id: u32) -> Vec<u8> {
                     scene_id as u64,
                 )],
             }),
+        }),
+    };
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+    buf
+}
+
+/// Builds a fully-populated `TeamMemData` roster entry (issue #146) — a
+/// name, class, and ability score, so a test only has to override what it
+/// cares about via the individual fields.
+pub fn team_member(
+    char_id: i64,
+    name: &str,
+    profession_id: i32,
+    fight_point: i64,
+) -> pb::TeamMemData {
+    pb::TeamMemData {
+        char_id,
+        scene_id: 0,
+        group_id: 0,
+        social_data: Some(pb::TeamMemberSocialData {
+            basic_data: Some(pb::TeamBasicData {
+                char_id,
+                name: name.to_string(),
+                level: 0,
+            }),
+            profession_data: Some(pb::TeamProfessionData { profession_id }),
+            user_attr_data: Some(pb::TeamUserAttrData {
+                fight_point,
+                season_strength: 0,
+            }),
+        }),
+    }
+}
+
+/// A roster entry carrying only `char_id` — the "bots are missing a lot of
+/// fields" case (issue #146): no `social_data` at all.
+pub fn bot_team_member(char_id: i64) -> pb::TeamMemData {
+    pb::TeamMemData {
+        char_id,
+        scene_id: 0,
+        group_id: 0,
+        social_data: None,
+    }
+}
+
+/// Prost-encodes a `NotifyJoinTeam` payload (not wrapped in a frame)
+/// carrying `members` as the roster.
+pub fn notify_join_team_payload(members: Vec<pb::TeamMemData>) -> Vec<u8> {
+    let msg = pb::NotifyJoinTeam {
+        v_request: Some(pb::NotifyJoinTeamRequest {
+            base_info: Some(pb::TeamBaseInfo {}),
+            member_data: members,
         }),
     };
     let mut buf = Vec::new();
