@@ -30,6 +30,58 @@ const DEATH_DEBOUNCE_MS: u64 = 2000;
 /// affects a real dungeon or raid.
 const MAX_PRELOADED_PLAYERS: u32 = 64;
 
+/// How long after the last hit on a recognized boss that boss still counts
+/// as the one the fight is about, for `Meter::recompute_boss`'s issue #157
+/// fallback (PR #163 re-review).
+///
+/// The fallback exists because `Meter::reset` clears `took_damage` on every
+/// enemy, so for the instant after a mid-pull reset — a wipe-and-re-pull's
+/// `BossHpRollback`, a `Manual` reset, the `NewFight` reset that starts the
+/// next attempt — the first thing hit wins `boss_uid` outright, and party
+/// AoE lands on adds first. It therefore has to reach back past the reset,
+/// to an enemy with no damage *in this fight at all*. That reach is what
+/// needs bounding: "alive and damaged at some point" also describes a boss
+/// the party gave up on and left standing, since `EnemyState::is_alive`
+/// reads a boss never observed dying as alive forever, and nothing but a
+/// `ServerChanged` ever clears `enemies`.
+///
+/// Nothing structural separates those two cases — both are "damaged, then a
+/// reset, then something else takes a hit" — so the separator is elapsed
+/// time, and the window has to clear the longest lull *inside* a pull. That
+/// rules out `FightConfig::idle_timeout_ms`: at 9s it is deliberately
+/// shorter than a raid's immunity and mechanic windows (see its own doc
+/// comment), so a boss going untargetable while the party burns an add wave
+/// would hand the header to the adds — issue #157's bug. It also rules out
+/// keying off fight or reset boundaries: the re-pull after a wipe crosses a
+/// fight end and a reset exactly like walking away does.
+///
+/// 60s is sized like `FightConfig::phase_resume_window_ms`, and for the same
+/// reason: long enough for a cutscene, a corpse run or an add phase plus the
+/// window before the boss can be hit again, far shorter than the gap before
+/// a party that abandoned a boss finds its next pull. Being a bound on a
+/// heuristic's blast radius rather than a user-visible behaviour, it is not
+/// a `FightConfig` tunable — a zero there would silently revert issue #157.
+const BOSS_ENGAGEMENT_WINDOW_MS: u64 = 60_000;
+
+/// Whether an enemy last damaged at `last_damaged_ms` was still being
+/// fought when the enemy now holding the target was hit at `engaged_at`,
+/// per [`BOSS_ENGAGEMENT_WINDOW_MS`].
+///
+/// An enemy that has never been damaged is never in the window — that is
+/// the AOI-only boss of PR #163 review finding 2. A missing `engaged_at`
+/// means the current target has no damage clock to compare against (only
+/// reachable from a hand-built `EnemyState`), so the check degrades to the
+/// plain "ever damaged" question rather than dropping the fallback.
+/// Damage *newer* than `engaged_at` — an `EnemyHp` packet arriving between
+/// two hits — is trivially inside the window, not outside it.
+fn engaged_within_window(last_damaged_ms: Option<u64>, engaged_at: Option<u64>) -> bool {
+    match (last_damaged_ms, engaged_at) {
+        (Some(last), Some(now)) => now.saturating_sub(last) <= BOSS_ENGAGEMENT_WINDOW_MS,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 /// One player-identity cache entry. `seq` is a monotonic touch counter (set
 /// on both read and write) used purely to order entries by recency for
 /// [`Meter::names_for_save`] — it is never persisted itself, only the
@@ -669,12 +721,16 @@ impl Meter {
         if d.target_kind == EntityKind::Monster {
             let enemy = self.enemies.entry(d.target_uid).or_default();
             enemy.took_damage = true;
-            // The same fact minus the reset (PR #163 review, finding 2):
-            // `recompute_boss`'s issue #157 fallback has to tell a boss
-            // this party has been fighting from one that has only ever
-            // stood in AOI range, and `took_damage` cannot answer that in
-            // the window right after a reset clears it.
-            enemy.ever_damaged = true;
+            // The same fact minus the reset, and with a clock on it (PR
+            // #163 review, finding 2): `recompute_boss`'s issue #157
+            // fallback has to tell a boss this party is fighting *now*
+            // from one that has only ever stood in AOI range, and from one
+            // the party fought an hour ago and abandoned — and
+            // `took_damage` cannot answer either question in the window
+            // right after a reset clears it. `max` keeps it monotonic, so
+            // an out-of-order packet cannot make the engagement look older
+            // than it is.
+            enemy.last_damaged_ms = enemy.last_damaged_ms.max(Some(d.timestamp_ms));
             // issue #124: remember that this one died, and in what order, so
             // the "is any other boss in this encounter still alive?" question
             // below has an answer even when no HP sync ever reports the
@@ -1276,26 +1332,38 @@ impl Meter {
         // to take damage wins outright, no matter what it is. Party AoE
         // landing on adds first is the ordinary case, and the ranking key
         // cannot help, because the boss is not a candidate until someone
-        // hits it. `is_alive` and `ever_damaged` together scope the
-        // fallback to a boss actually still being fought: a corpse from the
-        // last pull cannot take the header back off the trash the party has
-        // moved on to, and neither can a boss nobody has ever touched — one
-        // merely synced into the map by an AOI `EnemyHp` packet would
-        // otherwise name the header and own the HP bar while the party
-        // fights the adds (PR #163 review, finding 2). `ever_damaged`
-        // rather than `took_damage`, because the whole point of the
-        // fallback is the window where `reset` has just cleared the
-        // per-fight flag. Where two bosses are up together the ordinary
-        // ranking picks between them, exactly as it does once both have
-        // been damaged.
+        // hits it. `is_alive`, `last_damaged_ms` and the recency window
+        // together scope the fallback to a boss actually still being
+        // fought: a corpse from the last pull cannot take the header back
+        // off the trash the party has moved on to; neither can a boss
+        // nobody has ever touched — one merely synced into the map by an
+        // AOI `EnemyHp` packet would otherwise name the header and own the
+        // HP bar while the party fights the adds (PR #163 review, finding
+        // 2); and neither can a boss the party damaged, gave up on and
+        // left standing, which "ever damaged and alive" alone matches
+        // forever (PR #163 re-review). `last_damaged_ms` rather than
+        // `took_damage`, because the whole point of the fallback is the
+        // window where `reset` has just cleared the per-fight flag. Where
+        // two bosses are up together the ordinary ranking picks between
+        // them, exactly as it does once both have been damaged.
+        //
+        // The clock this recency is measured against is the damage clock of
+        // the enemy currently holding the target, not a wall clock: the
+        // question is whether the boss was being fought *around the time*
+        // the thing now taking hits was, which is exactly what separates
+        // the two cases (see `BOSS_ENGAGEMENT_WINDOW_MS`). It also keeps
+        // `recompute_boss` callable from the `EnemyHp` path, which carries
+        // no timestamp of its own.
         self.boss_uid = match damaged {
-            Some(uid) if !self.is_recognized_boss(uid) => self
-                .rank_boss(|e| {
+            Some(uid) if !self.is_recognized_boss(uid) => {
+                let engaged_at = self.enemies.get(&uid).and_then(|e| e.last_damaged_ms);
+                self.rank_boss(|e| {
                     e.is_alive()
-                        && e.ever_damaged
+                        && engaged_within_window(e.last_damaged_ms, engaged_at)
                         && e.monster_id.is_some_and(tables::is_boss_monster)
                 })
-                .or(Some(uid)),
+                .or(Some(uid))
+            }
             other => other,
         };
 
@@ -1303,7 +1371,7 @@ impl Meter {
         // Whether the selected boss is one *this encounter* engaged. Only
         // the issue #157 fallback above can select an enemy that has taken
         // no damage since the last reset (it deliberately reaches for one
-        // the party fought before it — see `EnemyState::ever_damaged`),
+        // the party fought before it — see `EnemyState::last_damaged_ms`),
         // and issue #125's learned scene -> final-boss map means "the last
         // boss *engaged* in this dungeon" — a boss merely standing in AOI
         // range must not latch itself as one.
@@ -3088,6 +3156,53 @@ mod tests {
             m.apply(&identified(20, 50_000, 50_000, TRASH, 1_100));
             m.apply(&boss_hit(20, 1_200));
             assert_eq!(m.boss_uid, Some(20));
+        }
+
+        #[test]
+        fn an_abandoned_boss_does_not_take_the_target_back_from_a_live_add() {
+            // PR #163 re-review of finding 2: the boss never died — the
+            // party gave up on it and pulled an unrelated pack minutes
+            // later, elsewhere in the same scene. "Alive and once damaged"
+            // stays true of that boss forever (`is_alive` counts a
+            // never-observed death as living), so recency is the only thing
+            // that separates it from issue #157's boss, whose `took_damage`
+            // a mid-pull reset cleared moments ago.
+            let mut m = Meter::new();
+            m.apply(&identified(10, 1_000_000, 1_000_000, BOSS, 0));
+            m.apply(&boss_hit(10, 0));
+            assert_eq!(m.boss_uid, Some(10));
+            m.reset(ResetReason::Manual, 1_000);
+
+            let much_later = 5 * 60_000;
+            m.apply(&identified(20, 50_000, 50_000, TRASH, much_later));
+            m.apply(&boss_hit(20, much_later + 100));
+            assert_eq!(
+                m.boss_uid,
+                Some(20),
+                "the pack being fought now holds the target, not the boss \
+                 the party walked away from"
+            );
+        }
+
+        #[test]
+        fn a_boss_still_being_fought_holds_the_target_through_an_add_phase() {
+            // The near side of the same window, and the reason it cannot be
+            // tightened to the idle timeout: a boss goes immune, the party
+            // spends the phase on adds, and the boss is still what the
+            // fight is about when it comes back. Well inside
+            // `BOSS_ENGAGEMENT_WINDOW_MS`, unlike the case above.
+            let mut m = Meter::new();
+            m.apply(&identified(10, 1_000_000, 1_000_000, BOSS, 0));
+            m.apply(&boss_hit(10, 0));
+            m.reset(ResetReason::BossHpRollback, 1_000);
+
+            m.apply(&identified(20, 50_000, 50_000, TRASH, 1_100));
+            m.apply(&boss_hit(20, 30_000));
+            assert_eq!(
+                m.boss_uid,
+                Some(10),
+                "the boss the party is still on keeps the target"
+            );
         }
 
         #[test]
