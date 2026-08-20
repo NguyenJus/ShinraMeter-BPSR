@@ -21,6 +21,10 @@ const PET_UID: i64 = 5001;
 const M_BOSS: i64 = 2001;
 const RATHALOS: u32 = 103;
 const TOWERING_RUIN: u32 = 1101;
+/// An open-world zone (`tables::is_dungeon_scene` is false for it), where
+/// the idle timeout is still the only thing that ends a pull — issue #151
+/// holds a pull open only inside an instance.
+const ASTERIA_PLAINS: u32 = 7;
 
 /// A wipe/re-pull: boss HP dips below `hp_drop_below_pct` (60%) then rolls
 /// back up to `hp_rollback_at_pct` (90%), which must auto-reset the
@@ -141,11 +145,17 @@ fn server_change_holds_the_numbers() {
 /// still advancing or decaying — until real combat resumes. Captured once
 /// right at the freeze and again 46s later to prove the hold, not just the
 /// initial latch (`crates/meter/src/fight.rs`).
+///
+/// Set in an **open-world zone** on purpose: issue #151 stops the idle
+/// timeout from ending a pull while a damaged, recognized boss is alive
+/// *inside an instance*, which is what `dungeon_boss_lull_does_not_end_the_pull`
+/// covers. Everywhere else — a field pull, a trash pack, a boss already
+/// dead — the timeout is still what freezes the meter.
 #[test]
 fn idle_timeout_freeze() {
     let scenario = Scenario::new("idle_timeout_freeze")
         .at(1_000)
-        .enter_scene(TOWERING_RUIN)
+        .enter_scene(ASTERIA_PLAINS)
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
         .player_appear(P_BRIN, "Brin", prof::FROST_MAGE, 11_500)
         .monster_appear(M_BOSS, RATHALOS, 5_000_000, 5_000_000)
@@ -194,6 +204,68 @@ fn idle_timeout_freeze() {
 
     assert_golden(at_freeze);
     assert_golden(held);
+}
+
+/// Issue #151: a lull inside an instance is not the end of a pull. This
+/// raid-shaped scenario is the one the previous test deliberately moved out
+/// of the dungeon: a recognized boss, damaged and still alive, with a
+/// mechanic window far longer than the 9s idle timeout in the middle of the
+/// pull. Ending the fight there froze the meter mid-encounter and then
+/// cleared every row the moment the party resumed (`ResetReason::NewFight`
+/// is only reachable from an already-ended fight), which is exactly what
+/// issue #151 was reported as.
+#[test]
+fn dungeon_boss_lull_does_not_end_the_pull() {
+    let scenario = Scenario::new("dungeon_boss_lull")
+        .at(1_000)
+        .enter_scene(TOWERING_RUIN)
+        .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
+        .player_appear(P_BRIN, "Brin", prof::FROST_MAGE, 11_500)
+        .monster_appear(M_BOSS, RATHALOS, 5_000_000, 5_000_000)
+        .at(1_500)
+        .hit(P_ARIA, M_BOSS, 101, 40_000)
+        .at(3_000)
+        .hit(P_BRIN, M_BOSS, 202, 25_000)
+        // The boss goes untargetable for 30s while the party runs a
+        // mechanic: more than three idle timeouts, and still the same pull.
+        .at(33_000)
+        .tick()
+        .capture("dungeon_boss_lull")
+        // The party resumes on the same boss.
+        .at(34_000)
+        .hit(P_ARIA, M_BOSS, 101, 10_000)
+        .at(34_500)
+        .capture("dungeon_boss_lull_resumed");
+
+    let mut rig = Rig::new();
+    let captures = rig.run(&scenario);
+
+    assert_eq!(captures.len(), 2);
+    let mid_lull = &captures[0];
+    let resumed = &captures[1];
+
+    assert_eq!(
+        mid_lull.fight_state,
+        FightState::Active,
+        "the pull is still live: the boss is damaged, alive, and in the instance"
+    );
+    assert_eq!(mid_lull.snapshot.total_damage, 65_000);
+    assert!(
+        resumed.resets.is_empty(),
+        "resuming must not clear the pull: {:?}",
+        resumed.resets
+    );
+    assert_eq!(
+        resumed.snapshot.total_damage, 75_000,
+        "the earlier damage is still on the board"
+    );
+    assert_eq!(resumed.snapshot.rows.len(), 2);
+    // Still running, so the elapsed timer is capture time minus the first
+    // hit rather than frozen at the last one.
+    assert_eq!(resumed.snapshot.duration_ms, 33_000);
+
+    assert_golden(mid_lull);
+    assert_golden(resumed);
 }
 
 /// Pet/summon damage must be credited to the owner's row, not to a
