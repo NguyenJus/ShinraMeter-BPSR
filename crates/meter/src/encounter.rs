@@ -3223,12 +3223,14 @@ mod tests {
     mod multi_phase_boss {
         use super::*;
 
-        /// Paradox-Calamity Remnant, the fight issue #124 was filed about:
-        /// Origin -> Continuation -> Final, all three recognized bosses and
-        /// all three in one curated phase group.
-        const ORIGIN: u32 = 103_108;
-        const CONTINUATION: u32 = 103_207;
-        const FINAL: u32 = 103_308;
+        /// Dragonbane Golem's cannons (issue #160): all in one curated
+        /// phase group, so a stand-in for a three-phase fight without
+        /// depending on Paradox-Calamity Remnant, which issue #153 removed
+        /// from `BOSS_PHASE_GROUPS` (those ids are three separately
+        /// selectable raid bosses, not phases of one fight).
+        const ORIGIN: u32 = 103_110;
+        const CONTINUATION: u32 = 103_111;
+        const FINAL: u32 = 103_301;
         /// "Boss - Crimson Foxen": a recognized boss in no phase group, so a
         /// stand-in for the *next* boss of a raid instance.
         const OTHER_BOSS: u32 = 10_041;
