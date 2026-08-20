@@ -106,10 +106,7 @@
 #[rustfmt::skip]
 const BOSS_PHASE_GROUPS: &[&[u32]] = &[
     // Paradox-Calamity Remnant is deliberately NOT here — see "Where these
-    // ids came from" above (issue #153). Re-add
-    // `&[103300, 103308, 103309, 103310, 103311]` only if a log shows the
-    // Final entity's uid dying and a Phantom uid spawning inside the
-    // resume window.
+    // ids came from" above (issue #153) for when to re-add this group.
     // Dragonbane Golem: right and left cannon, at both dungeon tiers.
     &[103110, 103111, 103301, 103302],
     // Goblin King: Aegis form and Staff form.
