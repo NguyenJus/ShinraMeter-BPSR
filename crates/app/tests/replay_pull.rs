@@ -118,6 +118,11 @@ fn build_multi_player_pull(
                 },
             ],
         )
+        // Captured well after the last hit, but the boss is a recognized,
+        // damaged, still-living boss in a dungeon scene, so the pull is
+        // still live (issue #151) and `duration_ms` runs to the capture.
+        // This scenario is about identity and damage attribution; the
+        // fight-lifecycle cases live in `replay_lifecycle.rs`.
         .at(30_000)
         .capture(capture_label)
 }

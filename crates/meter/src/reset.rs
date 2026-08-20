@@ -52,6 +52,28 @@ pub struct EnemyState {
     pub peak_hp: Option<u64>,
     pub lowest_pct: Option<f64>,
     pub took_damage: bool,
+    /// Timestamp of the most recent damage this enemy took, as opposed to
+    /// [`Self::took_damage`], which is a per-encounter flag that
+    /// `Meter::reset` clears on every enemy (PR #163 review, finding 2).
+    /// Survives `Meter::reset` for the same reason `death_order` does: a
+    /// reset is bookkeeping about the *display*, and says nothing about
+    /// whether this is an entity the party has been fighting.
+    ///
+    /// `Meter::recompute_boss` needs exactly that distinction. Its issue
+    /// #157 fallback reaches past the enemies damaged in the current fight
+    /// — an empty set for the instant after every reset — to the recognized
+    /// boss still up, and without this it cannot tell that boss from one
+    /// that has only ever stood in AOI range untouched.
+    ///
+    /// A *timestamp* rather than the bare `ever_damaged` flag it replaces
+    /// (PR #163 re-review): "has been damaged at some point" is a fact that
+    /// never expires, so on its own it also matches a boss the party gave
+    /// up on and walked away from — [`Self::is_alive`] reads a boss that
+    /// was never observed dying as alive forever. Recency is the only
+    /// signal that separates that boss from the one issue #157 is about,
+    /// whose damage a mid-pull reset erased seconds ago; see
+    /// `Meter::recompute_boss`.
+    pub last_damaged_ms: Option<u64>,
     /// When this enemy was observed dying during the current fight (issue
     /// #124), as a rank in the encounter's death order: `Some(1)` died
     /// first, `Some(2)` second, `None` has not been seen to die. Set by
@@ -154,6 +176,7 @@ mod tests {
             peak_hp: Some(max_hp),
             lowest_pct,
             took_damage: true,
+            last_damaged_ms: Some(0),
             death_order: None,
             monster_id: None,
         }
@@ -168,6 +191,7 @@ mod tests {
             peak_hp: Some(peak_hp),
             lowest_pct,
             took_damage: true,
+            last_damaged_ms: Some(0),
             death_order: None,
             monster_id: None,
         }

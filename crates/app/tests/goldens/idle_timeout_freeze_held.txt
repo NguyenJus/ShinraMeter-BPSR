@@ -7,9 +7,9 @@ total_dps=22857.14
 encounter.boss_monster_id=103
 encounter.boss_name=Rathalos
 encounter.is_boss=true
-encounter.scene_id=1101
-encounter.scene_name=Towering Ruin
-encounter.scene_boss_name=Rathalos
+encounter.scene_id=7
+encounter.scene_name=Asteria Plains
+encounter.scene_boss_name=-
 resets=
 rows=2
 row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=55000 dps=15714.29 share=68.75 crit=0.00 lucky=0.00 hits=2 deaths=0

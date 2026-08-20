@@ -12,6 +12,6 @@ pub mod tables;
 
 pub use encounter::Meter;
 pub use event::{Class, DamageEvent, EnemyHp, EntityKind, PlayerInfo, ProtocolEvent, Role};
-pub use fight::{FightConfig, FightState};
+pub use fight::{FightConfig, FightEndCause, FightState};
 pub use reset::{EnemyState, ResetConfig, ResetReason, check_hp_rollback};
 pub use stats::{EncounterInfo, PlayerRow, PlayerStats, Snapshot};
