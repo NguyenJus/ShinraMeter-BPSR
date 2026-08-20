@@ -46,12 +46,6 @@
 /// found by scanning `tables.rs` for boss names containing `" - "` and
 /// `"Phase"`:
 ///
-/// * **Paradox-Calamity Remnant** — `- Origin` (103100/103107/103108),
-///   `- Continuation` (103200/103207/103208), `- Final`
-///   (103300/103308/103309), `- Final Phantom` (103310/103311). This is the
-///   fight issue #124 was filed about: the Origin phase carries the larger
-///   `max_hp`, so it wins `Meter::recompute_boss` and its death used to
-///   freeze the meter while the party was still fighting Continuation.
 /// * **Dragonbane Golem** — `- Right Cannon` (103110/103301) and
 ///   `- Left Cannon` (103111/103302). One golem with two separately
 ///   targetable, separately killable cannons, appearing at two dungeon
@@ -59,6 +53,32 @@
 /// * **Goblin King** — `- AegisTransformation` (203) and
 ///   `- Staff Transformation` (204): the two forms one Goblin King
 ///   transforms between.
+///
+/// **Paradox-Calamity Remnant** (`- Origin` 103100/103107/103108,
+/// `- Continuation` 103200/103207/103208, `- Final` 103300/103308/103309,
+/// `- Final Phantom` 103310/103311) is deliberately *not* listed above
+/// (issue #153), even though issue #124 — the reason this module exists —
+/// was filed about it. In-game evidence (a live session log, scene 13023)
+/// showed Origin, Continuation and Final as three separately selectable
+/// raid bosses with distinct entity uids, engaged in whatever order the
+/// party picked — not sequential phases of one fight, and not even in the
+/// `Origin -> Continuation -> Final` order the old grouping's comment
+/// assumed. That grouping was, in the end, exactly the `" - "` name-stem
+/// heuristic the "Why this is curated" section above rejects.
+///
+/// Splitting into one group per boss instead of deleting the entry
+/// outright does not work either: each boss's own ids (Origin's
+/// 103100/103107/103108, say) are that one boss's *difficulty-tier*
+/// variants, and only one difficulty's ids ever spawn in a given instance —
+/// across both available session logs only 103108, 103208 and 103309 ever
+/// appear, never the other eight — so a same-boss-different-tier group
+/// could never fire, which the "pointless group" rule below already rules
+/// out.
+///
+/// Re-add `&[103300, 103308, 103309, 103310, 103311]` (Final + Final
+/// Phantom) if a log ever shows the Final entity's uid dying and a Phantom
+/// uid spawning inside the resume window — no such transition has been
+/// observed in either available log.
 ///
 /// # Adding a new multi-phase boss
 ///
@@ -85,8 +105,11 @@
 /// be listed until the boss table recognizes them.
 #[rustfmt::skip]
 const BOSS_PHASE_GROUPS: &[&[u32]] = &[
-    // Paradox-Calamity Remnant: Origin -> Continuation -> Final (+ Phantom).
-    &[103100, 103107, 103108, 103200, 103207, 103208, 103300, 103308, 103309, 103310, 103311],
+    // Paradox-Calamity Remnant is deliberately NOT here — see "Where these
+    // ids came from" above (issue #153). Re-add
+    // `&[103300, 103308, 103309, 103310, 103311]` only if a log shows the
+    // Final entity's uid dying and a Phantom uid spawning inside the
+    // resume window.
     // Dragonbane Golem: right and left cannon, at both dungeon tiers.
     &[103110, 103111, 103301, 103302],
     // Goblin King: Aegis form and Staff form.
@@ -171,18 +194,16 @@ mod tests {
     }
 
     #[test]
-    fn the_three_paradox_calamity_phases_are_one_fight() {
-        // Origin / Continuation / Final — the exact ids issue #124 names.
-        assert!(same_phase_group(103_108, 103_207));
-        assert!(same_phase_group(103_207, 103_308));
-        assert!(same_phase_group(103_108, 103_308));
-        // ...and symmetric.
-        assert!(same_phase_group(103_308, 103_108));
-    }
-
-    #[test]
-    fn the_final_phantom_is_in_the_paradox_calamity_fight() {
-        assert!(same_phase_group(103_308, 103_310));
+    fn the_paradox_calamity_remnant_selectable_bosses_are_not_one_fight() {
+        // Issue #153: Origin, Continuation and Final are three separately
+        // selectable raid bosses with distinct entity uids, not phases of
+        // one fight — confirmed in the live session log (scene 13023),
+        // which engaged 103309 then 103108 then 103208, not even in the
+        // Origin -> Continuation -> Final order the old grouping assumed.
+        assert!(!same_phase_group(103_309, 103_108));
+        assert!(!same_phase_group(103_108, 103_309));
+        assert!(!same_phase_group(103_108, 103_208));
+        assert!(!same_phase_group(103_208, 103_309));
     }
 
     #[test]
@@ -197,15 +218,15 @@ mod tests {
 
     #[test]
     fn a_boss_in_the_table_is_not_grouped_with_one_outside_it() {
-        // Sequential raid bosses: the Paradox-Calamity Remnant's Final phase
-        // against an unrelated boss must reset, not resume.
-        assert!(!same_phase_group(103_308, 10_041));
-        assert!(!same_phase_group(10_041, 103_308));
+        // A Dragonbane Golem cannon against an unrelated boss must reset,
+        // not resume.
+        assert!(!same_phase_group(103_110, 10_041));
+        assert!(!same_phase_group(10_041, 103_110));
     }
 
     #[test]
     fn an_id_is_never_its_own_next_phase() {
-        assert!(!same_phase_group(103_308, 103_308));
+        assert!(!same_phase_group(103_110, 103_110));
         // Also true for an id the table doesn't know at all.
         assert!(!same_phase_group(10_041, 10_041));
     }
@@ -222,27 +243,32 @@ mod tests {
     }
 
     #[test]
-    fn the_golem_cannons_are_not_the_paradox_calamity_fight() {
-        // Adjacent ids in the same dungeon's template block, different
-        // encounters — the table must keep them apart.
+    fn the_golem_cannons_are_not_grouped_with_an_adjacent_dungeon_boss() {
+        // 103108 (Paradox-Calamity Remnant - Origin) sits right next to the
+        // golem's template ids in the id space but is an unrelated,
+        // ungrouped boss (issue #153) — adjacency in the id space must not
+        // be mistaken for a shared fight.
         assert!(!same_phase_group(103_110, 103_108));
     }
 
     #[test]
     fn an_unknown_monster_id_has_no_phase_group() {
-        assert!(!same_phase_group(0, 103_108));
-        assert!(!same_phase_group(103_108, 0));
+        assert!(!same_phase_group(0, 103_110));
+        assert!(!same_phase_group(103_110, 0));
     }
 
     #[test]
     fn has_phase_group_answers_for_a_single_id() {
         // Every curated id is grouped, including one that is its own group's
         // last phase and so has no *later* phase to pair with.
-        assert!(has_phase_group(103_108));
-        assert!(has_phase_group(103_311));
+        assert!(has_phase_group(103_110));
+        assert!(has_phase_group(103_302));
         assert!(has_phase_group(203));
-        // A recognized boss outside the table, and an id the tables do not
-        // know at all.
+        // A recognized boss outside the table (including the ungrouped
+        // Paradox-Calamity Remnant ids, issue #153), and an id the tables
+        // do not know at all.
+        assert!(!has_phase_group(103_108));
+        assert!(!has_phase_group(103_309));
         assert!(!has_phase_group(10_041));
         assert!(!has_phase_group(0));
     }
