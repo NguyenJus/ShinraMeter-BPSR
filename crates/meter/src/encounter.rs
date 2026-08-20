@@ -373,10 +373,12 @@ impl Meter {
     /// Two ways a fight ends (issue #78):
     /// * an explicit end signal already latched into `fight_end_ms` — today
     ///   only a recognized boss dying, see `FightConfig::end_on_boss_death`;
-    /// * the idle timeout: no damage event for `idle_timeout_ms`. That one is
-    ///   derived from `last_event_ms` on every call rather than requiring a
-    ///   `tick`, so a caller that only ever calls `snapshot` still gets the
-    ///   hold — `tick` merely pins it.
+    /// * the idle timeout: no player damage for `idle_timeout_ms`. That one
+    ///   is derived from `last_event_ms` on every call rather than requiring
+    ///   a `tick`, so a caller that only ever calls `snapshot` still gets
+    ///   the hold — `tick` merely pins it. Suppressed while
+    ///   [`Self::engaged_boss_still_up`] (issue #151): a lull is not the end
+    ///   of a pull the party is still standing in.
     ///
     /// The end time is the last damage event, not "now": the fight really
     /// ended when the hitting stopped, and using it keeps the frozen elapsed
@@ -388,11 +390,46 @@ impl Meter {
             return Some(end_ms);
         }
         let idle = self.fight_cfg.idle_timeout_ms;
-        if idle > 0 && now_ms.saturating_sub(self.last_event_ms) >= idle {
+        if idle > 0
+            && now_ms.saturating_sub(self.last_event_ms) >= idle
+            && !self.engaged_boss_still_up()
+        {
             Some(self.last_event_ms)
         } else {
             None
         }
+    }
+
+    /// Whether the party is mid-pull on a boss that simply is not being hit
+    /// right now (issue #151): still inside an instance
+    /// (`tables::is_dungeon_scene`), with a recognized boss
+    /// (`tables::is_boss_monster`) that has taken damage this fight and is
+    /// not known to be dead.
+    ///
+    /// This is what stops the idle timeout from standing in for an
+    /// encounter boundary it cannot represent. A raid's designed immunity
+    /// and mechanic windows exceed `idle_timeout_ms` by design, and ending
+    /// the fight in one of them freezes the meter mid-pull and then wipes
+    /// every row when the party resumes (the `NewFight` reset, which is
+    /// only reachable from an already-ended fight). Raising the timeout
+    /// would only move the guess; this uses state the meter already has and
+    /// covers every cause of a lull — immunity, untargetable, retreat,
+    /// add-clear — rather than just phase changes.
+    ///
+    /// A pull held open this way still ends: the boss dying latches it
+    /// (`end_fight_on_boss_death`), a party wipe latches it (issue #154),
+    /// leaving the instance clears `scene_id` and hands the fight straight
+    /// back to the idle timeout — which, being derived rather than stored,
+    /// then ends it retroactively at the last hit.
+    ///
+    /// Deliberately scoped by `took_damage`, like `has_other_living_boss`:
+    /// a boss standing in the room the party walked past is not a pull in
+    /// progress.
+    fn engaged_boss_still_up(&self) -> bool {
+        self.in_dungeon_scene()
+            && self.enemies.values().any(|e| {
+                e.took_damage && e.is_alive() && e.monster_id.is_some_and(tables::is_boss_monster)
+            })
     }
 
     /// Where the meter is in the fight lifecycle as of `now_ms`.
@@ -3364,6 +3401,83 @@ mod tests {
             m.apply(&dmg(1, 100, 0));
             m.apply(&dmg(1, 100, 100_000));
             assert_eq!(m.snapshot(101_000).rows[0].name, "Foo");
+        }
+
+        // -- issue #151: the idle timeout must not end a live pull --------
+
+        /// Any `tables::is_dungeon_scene` id.
+        const DUNGEON_SCENE: u32 = 1_001;
+        /// "Rathalos", a recognized boss.
+        const BOSS: u32 = 103;
+        /// "Golden Nappo": named but `MonsterType == 0`, i.e. trash.
+        const TRASH: u32 = 10_900;
+
+        fn in_dungeon() -> Meter {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: DUNGEON_SCENE,
+            });
+            m
+        }
+
+        #[test]
+        fn an_idle_lull_does_not_end_the_fight_while_a_dungeon_boss_is_still_up() {
+            // The raid immunity/mechanic window from issue #151: nothing can
+            // be hit for far longer than the 9s idle timeout, but the pull is
+            // still very much in progress.
+            let mut m = in_dungeon();
+            m.apply(&hp(10, 50, Some(BOSS), 0));
+            m.apply(&boss_hit(10, 1_000, false));
+            assert_eq!(m.fight_state(1_000 + 10 * idle()), FightState::Active);
+            assert_eq!(m.tick(1_000 + 10 * idle()), FightState::Active);
+        }
+
+        #[test]
+        fn the_idle_timeout_still_ends_a_pull_on_trash_in_a_dungeon() {
+            let mut m = in_dungeon();
+            m.apply(&hp(10, 50, Some(TRASH), 0));
+            m.apply(&boss_hit(10, 1_000, false));
+            assert_eq!(m.fight_state(1_000 + idle()), FightState::Ended);
+        }
+
+        #[test]
+        fn the_idle_timeout_still_ends_a_boss_fight_outside_a_dungeon() {
+            // A world boss in an open-world zone: no instance to be stuck
+            // in, so the ordinary freeze applies.
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 8 });
+            m.apply(&hp(10, 50, Some(BOSS), 0));
+            m.apply(&boss_hit(10, 1_000, false));
+            assert_eq!(m.fight_state(1_000 + idle()), FightState::Ended);
+        }
+
+        #[test]
+        fn a_dead_dungeon_boss_does_not_hold_the_fight_open() {
+            // The control for the case above: the same boss in the same
+            // instance, but dead. The kill still freezes the meter
+            // instantly, and nothing holds the fight open afterwards.
+            let mut m = in_dungeon();
+            m.apply(&hp(10, 50, Some(BOSS), 0));
+            m.apply(&boss_hit(10, 1_000, false));
+            m.apply(&boss_hit(10, 2_000, true));
+            assert_eq!(m.fight_state(2_100), FightState::Ended);
+        }
+
+        #[test]
+        fn leaving_the_dungeon_lets_the_idle_timeout_end_a_held_boss_pull() {
+            let mut m = in_dungeon();
+            m.apply(&hp(10, 50, Some(BOSS), 0));
+            m.apply(&boss_hit(10, 1_000, false));
+            assert_eq!(m.fight_state(60_000), FightState::Active);
+
+            // Walking out of the instance: the pull is over.
+            m.apply(&ProtocolEvent::Scene { level_map_id: 8 });
+            assert_eq!(m.fight_state(60_000), FightState::Ended);
+            assert_eq!(
+                m.snapshot(60_000).duration_ms,
+                1,
+                "the fight still ended at its last hit, not on leaving"
+            );
         }
 
         // -- issue #155: monster damage must not extend the fight ---------
