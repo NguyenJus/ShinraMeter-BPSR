@@ -6,6 +6,7 @@ pub mod dump_format;
 pub mod event;
 pub mod frame;
 pub mod inspect;
+pub mod map;
 pub mod pb;
 pub mod reader;
 

@@ -34,30 +34,12 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Maps a protocol entity kind onto the meter's mirror type.
-pub fn map_kind(kind: proto::EntityKind) -> meter::EntityKind {
-    match kind {
-        proto::EntityKind::Player => meter::EntityKind::Player,
-        proto::EntityKind::Monster => meter::EntityKind::Monster,
-        proto::EntityKind::Unknown => meter::EntityKind::Unknown,
-    }
-}
-
-/// Maps a protocol class onto the meter's mirror type.
-pub fn map_class(class: proto::Class) -> meter::Class {
-    match class {
-        proto::Class::Stormblade => meter::Class::Stormblade,
-        proto::Class::FrostMage => meter::Class::FrostMage,
-        proto::Class::TwinStriker => meter::Class::TwinStriker,
-        proto::Class::WindKnight => meter::Class::WindKnight,
-        proto::Class::VerdantOracle => meter::Class::VerdantOracle,
-        proto::Class::HeavyGuardian => meter::Class::HeavyGuardian,
-        proto::Class::Marksman => meter::Class::Marksman,
-        proto::Class::ShieldKnight => meter::Class::ShieldKnight,
-        proto::Class::BeatPerformer => meter::Class::BeatPerformer,
-        proto::Class::Unknown => meter::Class::Unknown,
-    }
-}
+// `map_kind`/`map_class` are shared, byte-identical with the offline
+// sanitizer's copy — see `bpsr_protocol::map`'s doc comment (issue #146's
+// finding 2). Re-exported (rather than called via `proto::map::` at each
+// use site below) so this module's own call sites and unit tests keep
+// referring to them as plain `map_kind`/`map_class`.
+pub use bpsr_protocol::map::{map_class, map_kind};
 
 // IMAGINE-TAKEDOWN: classifies raw skill ids into up to two equipped-Imagine
 // slots. See `crates/app/src/imagines.rs` and the plan's D2/D4 and the spec's
@@ -92,50 +74,23 @@ fn imagine_slots(skill_ids: &[i32]) -> [Option<i32>; 2] {
     slots
 }
 
-/// Translates a `bpsr_protocol::ProtocolEvent` into the meter's mirror event.
+/// Translates a `bpsr_protocol::ProtocolEvent` into the meter's mirror
+/// event. Delegates the field-for-field mapping to `bpsr_protocol::map`
+/// (issue #146's finding 2 — shared with the offline sanitizer binary),
+/// resolving only the app-specific `imagines` slot pair here first, since
+/// the Imagine catalog (`crate::imagines`) is out of scope for that crate.
 pub fn map_event(ev: proto::ProtocolEvent, now_ms: u64) -> meter::ProtocolEvent {
-    match ev {
-        proto::ProtocolEvent::Damage(d) => meter::ProtocolEvent::Damage(meter::DamageEvent {
-            attacker_uid: d.attacker_uid,
-            attacker_kind: map_kind(d.attacker_kind),
-            skill_id: d.skill_id,
-            value: d.value,
-            crit: d.crit,
-            lucky: d.lucky,
-            hp_lessen: d.hp_lessen,
-            is_miss: d.is_miss,
-            is_heal: d.is_heal,
-            target_uid: d.target_uid,
-            target_kind: map_kind(d.target_kind),
-            timestamp_ms: d.timestamp_ms,
-            is_dead: d.is_dead,
-        }),
-        proto::ProtocolEvent::Player(p) => meter::ProtocolEvent::Player(meter::PlayerInfo {
-            uid: p.uid,
-            name: p.name,
-            class: p.class.map(map_class),
-            ability_score: p.ability_score,
-            season_strength: p.season_strength,
-            // IMAGINE-TAKEDOWN: empty `skill_ids` means the attr was absent
-            // from this packet, so stay `None` rather than `Some([None,
-            // None])` — the meter's merge rule (T4) must not clobber a
-            // previously cached pair with an absent packet.
-            imagines: (!p.skill_ids.is_empty()).then(|| imagine_slots(&p.skill_ids)),
-        }),
-        proto::ProtocolEvent::EnemyHp(e) => meter::ProtocolEvent::EnemyHp(meter::EnemyHp {
-            uid: e.uid,
-            curr_hp: e.curr_hp,
-            max_hp: e.max_hp,
-            monster_id: e.monster_id,
-            timestamp_ms: e.timestamp_ms,
-        }),
-        proto::ProtocolEvent::Scene { level_map_id } => {
-            meter::ProtocolEvent::Scene { level_map_id }
+    // IMAGINE-TAKEDOWN: empty `skill_ids` means the attr was absent from
+    // this packet, so stay `None` rather than `Some([None, None])` — the
+    // meter's merge rule (T4) must not clobber a previously cached pair
+    // with an absent packet.
+    let imagines = match &ev {
+        proto::ProtocolEvent::Player(p) if !p.skill_ids.is_empty() => {
+            Some(imagine_slots(&p.skill_ids))
         }
-        proto::ProtocolEvent::ServerChanged => meter::ProtocolEvent::ServerChanged {
-            timestamp_ms: now_ms,
-        },
-    }
+        _ => None,
+    };
+    bpsr_protocol::map::map_event(ev, now_ms, imagines)
 }
 
 /// What one cross-session cache knows about its own file: the snapshot its

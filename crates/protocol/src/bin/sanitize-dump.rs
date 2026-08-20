@@ -403,76 +403,26 @@ mod sanitize {
     }
 }
 
-fn map_class(c: proto::pb::Class) -> meter::Class {
-    use proto::pb::Class as P;
-    match c {
-        P::Stormblade => meter::Class::Stormblade,
-        P::FrostMage => meter::Class::FrostMage,
-        P::TwinStriker => meter::Class::TwinStriker,
-        P::WindKnight => meter::Class::WindKnight,
-        P::VerdantOracle => meter::Class::VerdantOracle,
-        P::HeavyGuardian => meter::Class::HeavyGuardian,
-        P::Marksman => meter::Class::Marksman,
-        P::ShieldKnight => meter::Class::ShieldKnight,
-        P::BeatPerformer => meter::Class::BeatPerformer,
-        P::Unknown => meter::Class::Unknown,
-    }
-}
-
-fn map_kind(k: proto::EntityKind) -> meter::EntityKind {
-    match k {
-        proto::EntityKind::Player => meter::EntityKind::Player,
-        proto::EntityKind::Monster => meter::EntityKind::Monster,
-        proto::EntityKind::Unknown => meter::EntityKind::Unknown,
-    }
-}
-
-fn map_event(ev: proto::ProtocolEvent, now_ms: u64) -> meter::ProtocolEvent {
-    match ev {
-        proto::ProtocolEvent::Damage(d) => meter::ProtocolEvent::Damage(meter::DamageEvent {
-            attacker_uid: d.attacker_uid,
-            attacker_kind: map_kind(d.attacker_kind),
-            skill_id: d.skill_id,
-            value: d.value,
-            crit: d.crit,
-            lucky: d.lucky,
-            hp_lessen: d.hp_lessen,
-            is_miss: d.is_miss,
-            is_heal: d.is_heal,
-            target_uid: d.target_uid,
-            target_kind: map_kind(d.target_kind),
-            timestamp_ms: d.timestamp_ms,
-            is_dead: d.is_dead,
-        }),
-        proto::ProtocolEvent::Player(p) => meter::ProtocolEvent::Player(meter::PlayerInfo {
-            uid: p.uid,
-            name: p.name,
-            class: p.class.map(map_class),
-            ability_score: p.ability_score,
-            season_strength: p.season_strength,
-            imagines: None,
-        }),
-        proto::ProtocolEvent::EnemyHp(e) => meter::ProtocolEvent::EnemyHp(meter::EnemyHp {
-            uid: e.uid,
-            curr_hp: e.curr_hp,
-            max_hp: e.max_hp,
-            monster_id: e.monster_id,
-            timestamp_ms: e.timestamp_ms,
-        }),
-        proto::ProtocolEvent::Scene { level_map_id } => {
-            meter::ProtocolEvent::Scene { level_map_id }
-        }
-        proto::ProtocolEvent::ServerChanged => meter::ProtocolEvent::ServerChanged {
-            timestamp_ms: now_ms,
-        },
-    }
-}
+// `map_class`/`map_kind`/`map_event` used to be duplicated here field-for-
+// field with `crates/app/src/pipeline.rs` (issue #146's finding 2); both
+// now share `bpsr_protocol::map`, called directly at `drive`'s one call
+// site below (this binary has no Imagine catalog, so it always passes
+// `None`).
 
 /// Drives the meter over `records` (assumed already time-ordered) and
 /// returns every fight-end snapshot plus the snapshot as of the last record.
+///
+/// Defense in depth: `records` should never actually be empty here (callers
+/// are expected to refuse before reaching this point — see `main`'s
+/// `clean.is_empty()` check), but an empty slice is handled rather than
+/// indexed into blindly, so a caller mistake produces an empty result
+/// instead of a panic.
 fn drive(records: &[DumpRecord]) -> (Vec<meter::Snapshot>, meter::Snapshot) {
     let mut m = meter::Meter::new();
-    let mut clock = records[0].ts_ms;
+    let Some(first) = records.first() else {
+        return (Vec::new(), m.snapshot(0));
+    };
+    let mut clock = first.ts_ms;
     let mut state = meter::FightState::Idle;
     let mut ends = Vec::new();
     for r in records {
@@ -494,7 +444,7 @@ fn drive(records: &[DumpRecord]) -> (Vec<meter::Snapshot>, meter::Snapshot) {
         let mut evs = Vec::new();
         decode_notify(&n, r.ts_ms, &mut evs, None);
         for ev in evs {
-            m.apply(&map_event(ev, r.ts_ms));
+            m.apply(&proto::map::map_event(ev, r.ts_ms, None));
         }
         clock = clock.max(r.ts_ms);
         let st = m.fight_state(clock);
@@ -778,6 +728,15 @@ fn main() -> ExitCode {
     let mut clean: Vec<DumpRecord> = Vec::with_capacity(orig.len());
     let mut failed = 0u64;
     for r in &orig {
+        // A record the original capture couldn't decompress carries raw
+        // compressed bytes, not protobuf — sanitize() would just fail to
+        // parse it. Skip it like `drive` and the replay-dump test do (see
+        // `DumpRecord::payload_decoded`'s doc comment), rather than letting
+        // it silently pad the "failed to decode" count below with fragments
+        // that were never modeled data in the first place.
+        if !r.payload_decoded {
+            continue;
+        }
         match sanitize::sanitize(r.method_id, &r.payload, &mut remap) {
             Some(payload) => clean.push(DumpRecord {
                 ts_ms: r.ts_ms,
@@ -796,6 +755,15 @@ fn main() -> ExitCode {
         );
     }
     eprintln!("distinct uids remapped: {}", remap.uids.len());
+
+    if clean.is_empty() {
+        eprintln!(
+            "SELF-CHECK FAILED (fingerprint equality): no records survived sanitization ({failed} of {} modeled record(s) failed to decode/re-encode); nothing to compare.",
+            orig.len()
+        );
+        eprintln!("refusing to write output.");
+        return ExitCode::FAILURE;
+    }
 
     eprintln!("running self-check 1/2: fingerprint equality...");
     if let Err(err) = check_fingerprints(&orig, &clean) {
@@ -932,5 +900,60 @@ mod tests {
             payload_decoded: true,
         };
         assert!(check_no_residual_strings(&[record]).is_ok());
+    }
+
+    #[test]
+    fn drive_handles_an_empty_slice_without_panicking() {
+        // Defense in depth for the same case `check_fingerprints_...` below
+        // exercises at the `main`-refusal level: `drive` used to index
+        // `records[0]` unconditionally.
+        let (ends, fin) = drive(&[]);
+        assert!(ends.is_empty());
+        assert_eq!(fin.duration_ms, 0);
+        assert_eq!(fin.total_damage, 0);
+    }
+
+    #[test]
+    fn check_fingerprints_reports_an_error_instead_of_panicking_when_clean_is_empty() {
+        // Models the case `main` must now refuse before ever reaching this
+        // function: every record in `orig` failed to sanitize, so `clean`
+        // is empty. Before this fix, `check_fingerprints` -> `drive(clean)`
+        // indexed `records[0]` on the empty slice and panicked instead of
+        // returning the tool's normal "SELF-CHECK FAILED" diagnosis.
+        let payload = proto::pb::SyncNearDeltaInfo {
+            delta_infos: vec![proto::pb::AoiSyncDelta {
+                uuid: (2i64 << 16) | 64, // a monster, the damage's target
+                attrs: None,
+                skill_effects: Some(proto::pb::SkillEffect {
+                    damages: vec![proto::pb::SyncDamageInfo {
+                        is_miss: false,
+                        r#type: proto::pb::EDamageType::Normal as i32,
+                        type_flag: 0,
+                        value: 1000,
+                        lucky_value: 0,
+                        hp_lessen_value: 0,
+                        attacker_uuid: (1i64 << 16) | 640, // a player, the attacker
+                        owner_id: 1,
+                        is_dead: false,
+                        top_summoner_id: 0,
+                    }],
+                }),
+            }],
+        }
+        .encode_to_vec();
+        let orig = vec![DumpRecord {
+            ts_ms: 1_000,
+            service_uuid: 0,
+            method_id: opcode::SYNC_NEAR_DELTA_INFO,
+            payload,
+            payload_decoded: true,
+        }];
+
+        let err = check_fingerprints(&orig, &[])
+            .expect_err("an empty clean must not fingerprint-match a non-empty orig");
+        assert!(
+            err.contains("mismatch"),
+            "expected a diagnosable mismatch message, got: {err}"
+        );
     }
 }
