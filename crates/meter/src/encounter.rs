@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use crate::event::{Class, DamageEvent, EnemyHp, EntityKind, PlayerInfo, ProtocolEvent};
-use crate::fight::{FightConfig, FightState};
+use crate::fight::{FightConfig, FightEndCause, FightState};
 use crate::phase;
 use crate::reset::{EnemyState, ResetConfig, ResetReason, check_hp_rollback};
 use crate::stats::{EncounterInfo, PlayerRow, PlayerStats, Snapshot};
@@ -406,7 +406,7 @@ impl Meter {
     /// to screenshot.
     pub fn tick(&mut self, now_ms: u64) -> FightState {
         if let Some(end_ms) = self.fight_ended_at(now_ms) {
-            self.fight_end_ms = Some(end_ms);
+            self.latch_fight_end(FightEndCause::IdleTimeout, end_ms);
             FightState::Ended
         } else if self.fight_start_ms.is_some() {
             FightState::Active
@@ -481,7 +481,7 @@ impl Meter {
                 // reconnecting player's first real hit. A fight already
                 // held (or none running at all) is left exactly as-is.
                 if self.fight_start_ms.is_some() && self.fight_end_ms.is_none() {
-                    self.fight_end_ms = Some(*timestamp_ms);
+                    self.latch_fight_end(FightEndCause::ServerChanged, *timestamp_ms);
                 }
 
                 None
@@ -495,7 +495,7 @@ impl Meter {
         // without ever producing a row, which would otherwise drag an
         // already-ended fight back into `Active`.
         if let Some(end_ms) = self.fight_ended_at(d.timestamp_ms) {
-            self.fight_end_ms = Some(end_ms);
+            self.latch_fight_end(FightEndCause::IdleTimeout, end_ms);
         }
 
         // issue #124: before the hold is allowed to clear the board, check
@@ -587,8 +587,6 @@ impl Meter {
             }
         }
 
-        self.last_event_ms = self.last_event_ms.max(d.timestamp_ms);
-
         // Only player attackers start the fight clock and produce rows;
         // monster damage is tracked above for boss-selection/reset purposes
         // only. Starting the clock on monster damage would let a boss
@@ -597,6 +595,18 @@ impl Meter {
         if d.attacker_kind != EntityKind::Player {
             return reason;
         }
+
+        // issue #155: below the early return, not above it. `last_event_ms`
+        // is read by exactly two things — the idle-timeout half of
+        // `fight_ended_at` and the DPS window in `snapshot` — and both mean
+        // "player combat activity". Advancing it on monster damage let a
+        // boss swinging at the party's corpses after a wipe push the idle
+        // deadline out forever: the fight never ended, the elapsed timer ran
+        // on, and every row's DPS decayed as dead time was divided into it —
+        // the exact dilution the early return above was written to prevent.
+        // Nothing needs monster-activity timing, so there is no second field
+        // to track it in.
+        self.last_event_ms = self.last_event_ms.max(d.timestamp_ms);
 
         if self.fight_start_ms.is_none() {
             self.fight_start_ms = Some(d.timestamp_ms);
@@ -666,9 +676,32 @@ impl Meter {
             && self.fight_end_ms.is_none()
             && !self.has_other_living_boss(uid)
         {
-            self.fight_end_ms = Some(now_ms);
+            self.latch_fight_end(FightEndCause::BossDeath, now_ms);
             self.fight_end_boss_id = monster_id;
         }
+    }
+
+    /// Latches the fight end at `end_ms` and logs the single `info`-level
+    /// line that says a fight ended and why (issue #151's diagnostics gap).
+    ///
+    /// Every path that ends a fight goes through here — boss death, idle
+    /// timeout, party wipe, server change — so the line fires exactly once
+    /// per fight end: a fight already latched returns untouched, which is
+    /// also what makes the repeated "pin the end" calls in `apply_damage`
+    /// and `tick` idempotent.
+    fn latch_fight_end(&mut self, cause: FightEndCause, end_ms: u64) {
+        if self.fight_end_ms.is_some() {
+            return;
+        }
+        self.fight_end_ms = Some(end_ms);
+        log::info!("{}", fight_end_log(cause, self.boss_monster_id()));
+    }
+
+    /// The monster id of the currently selected boss target, if it has one.
+    fn boss_monster_id(&self) -> Option<u32> {
+        self.boss_uid
+            .and_then(|uid| self.enemies.get(&uid))
+            .and_then(|e| e.monster_id)
     }
 
     /// Records that `uid` has died, assigning it the next rank in this
@@ -1150,7 +1183,15 @@ impl Meter {
         // `reset` is itself already an event, never a per-snapshot poll, so
         // this is naturally sparse (issue #69) — no transition-only guard
         // needed the way scene/boss logging above requires one.
-        log::info!("encounter: reset reason={reason:?}");
+        let boss_hp_pct = self
+            .boss_uid
+            .and_then(|uid| self.enemies.get(&uid))
+            .and_then(|e| e.pct());
+        let party_down = self.players.values().filter(|p| p.deaths > 0).count();
+        log::info!(
+            "{}",
+            reset_log(reason, boss_hp_pct, party_down, self.players.len())
+        );
         self.players.clear();
         // issue #12/#145 finding 1: `players` just got cleared, so any
         // in-progress preload tally is now meaningless. The Scene and
@@ -1369,6 +1410,44 @@ fn boss_transition_log(
             None => format!("encounter: boss target changed to uid={uid} monster_id=<unknown>"),
         },
     })
+}
+
+/// Builds the "fight ended" diagnostic line (issue #151's diagnostics gap).
+/// Unlike the transition-only builders above this always returns a line —
+/// its only caller, [`Meter::latch_fight_end`], already fires exactly once
+/// per fight end. Carries the boss's monster id and catalogued name only:
+/// never a player name or uid, since these logs get shared for debugging
+/// (`crates/app/src/logging.rs`). Pure, like the builders around it, for
+/// the same testability reason.
+fn fight_end_log(cause: FightEndCause, boss_monster_id: Option<u32>) -> String {
+    let cause = cause.label();
+    match boss_monster_id {
+        Some(id) => {
+            let name = tables::monster_name(id).unwrap_or("<unresolved>");
+            format!("encounter: fight ended cause={cause} boss_monster_id={id} name={name}")
+        }
+        None => format!("encounter: fight ended cause={cause} boss_monster_id=<unknown>"),
+    }
+}
+
+/// Builds the `reset` diagnostic line. The boss HP percentage and the
+/// party down count are what make a `BossHpRollback` and a genuine wipe
+/// distinguishable in a log (issue #151's diagnostics gap, issue #154):
+/// the rollback shape alone reads the same either way. Counts only — never
+/// a player name or uid.
+fn reset_log(
+    reason: ResetReason,
+    boss_hp_pct: Option<f64>,
+    party_down: usize,
+    party_known: usize,
+) -> String {
+    let hp = match boss_hp_pct {
+        Some(pct) => format!("{pct:.1}"),
+        None => "<unknown>".to_string(),
+    };
+    format!(
+        "encounter: reset reason={reason:?} boss_hp_pct={hp} party_down={party_down}/{party_known}"
+    )
 }
 
 /// Builds the "dungeon final boss learned/changed" diagnostic line (issue
@@ -3214,6 +3293,53 @@ mod tests {
             m.apply(&dmg(1, 100, 100_000));
             assert_eq!(m.snapshot(101_000).rows[0].name, "Foo");
         }
+
+        // -- issue #155: monster damage must not extend the fight ---------
+
+        /// A monster swinging at a player: the shape that keeps arriving
+        /// after a wipe, when the boss carries on hitting corpses.
+        fn monster_hit(target_uid: i64, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 99,
+                attacker_kind: EntityKind::Monster,
+                target_uid,
+                target_kind: EntityKind::Player,
+                value: 200,
+                timestamp_ms: ts,
+                ..Default::default()
+            })
+        }
+
+        #[test]
+        fn monster_damage_does_not_hold_the_fight_open_past_the_idle_window() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 5_000, 1_000));
+            // The party is down; the boss keeps swinging once a second for
+            // far longer than the idle window. None of it is a reason to
+            // keep the elapsed timer running.
+            for ts in (2_000..=30_000).step_by(1_000) {
+                m.apply(&monster_hit(1, ts));
+            }
+            assert_eq!(m.fight_state(30_500), FightState::Ended);
+            assert_eq!(
+                m.snapshot(30_500).duration_ms,
+                1,
+                "the elapsed timer must freeze at the last player damage"
+            );
+        }
+
+        #[test]
+        fn monster_damage_does_not_extend_the_dps_window() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 10_000, 0));
+            m.apply(&dmg(1, 10_000, 2_000));
+            let before = m.snapshot(2_000).total_dps;
+            m.apply(&monster_hit(1, 6_000));
+            assert!(
+                (m.snapshot(6_000).total_dps - before).abs() < 0.001,
+                "a monster's swing must not dilute DPS with idle time"
+            );
+        }
     }
 
     /// Issue #124: a dungeon's final boss may fight through several phases,
@@ -4247,6 +4373,52 @@ mod tests {
             let msg = preload_summary_log(Some(40001), 5, 2).unwrap();
             assert!(!msg.contains("uid"));
             assert!(!msg.contains("name"));
+        }
+
+        // -- issue #151: the fight-end / reset diagnostics gap -------------
+
+        #[test]
+        fn fight_end_log_names_the_cause_and_the_boss() {
+            let msg = fight_end_log(FightEndCause::BossDeath, Some(103));
+            assert!(msg.contains("cause=boss_death"));
+            assert!(msg.contains("boss_monster_id=103"));
+            assert!(msg.contains("name=Rathalos"));
+
+            let msg = fight_end_log(FightEndCause::IdleTimeout, Some(999_999));
+            assert!(msg.contains("cause=idle_timeout"));
+            assert!(msg.contains("<unresolved>"));
+
+            let msg = fight_end_log(FightEndCause::Wipe, None);
+            assert!(msg.contains("cause=wipe"));
+            assert!(msg.contains("boss_monster_id=<unknown>"));
+
+            let msg = fight_end_log(FightEndCause::ServerChanged, None);
+            assert!(msg.contains("cause=server_changed"));
+        }
+
+        #[test]
+        fn reset_log_reports_the_boss_hp_and_the_party_down_count() {
+            // The pair issue #151 could not tell apart in a log: a rollback
+            // with the party up...
+            let msg = reset_log(ResetReason::BossHpRollback, Some(97.4), 0, 4);
+            assert!(msg.contains("reason=BossHpRollback"));
+            assert!(msg.contains("boss_hp_pct=97.4"));
+            assert!(msg.contains("party_down=0/4"));
+
+            // ...and the same shape with everyone dead.
+            let msg = reset_log(ResetReason::NewFight, None, 4, 4);
+            assert!(msg.contains("reason=NewFight"));
+            assert!(msg.contains("boss_hp_pct=<unknown>"));
+            assert!(msg.contains("party_down=4/4"));
+        }
+
+        #[test]
+        fn fight_end_and_reset_logs_never_leak_a_player_name_or_uid() {
+            let msg = reset_log(ResetReason::Manual, Some(50.0), 1, 4);
+            assert!(!msg.contains("uid"));
+            assert!(!msg.contains("Player"));
+            let msg = fight_end_log(FightEndCause::Wipe, Some(103));
+            assert!(!msg.contains("uid"));
         }
     }
 }

@@ -23,6 +23,37 @@ pub enum FightState {
     Ended,
 }
 
+/// Why the current fight ended, for the `info`-level fight-end diagnostic
+/// (issue #151's "Diagnostics gap": nothing was logged when a fight ended,
+/// so the downstream `reset reason=NewFight` was the only clue in the log
+/// and telling an idle-timeout end from a boss kill took in-game
+/// confirmation).
+///
+/// Purely a diagnostic label — no meter behaviour branches on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FightEndCause {
+    /// A recognized boss died (see [`FightConfig::end_on_boss_death`]).
+    BossDeath,
+    /// [`FightConfig::idle_timeout_ms`] elapsed with no player damage.
+    IdleTimeout,
+    /// Every known party member was down (issue #154).
+    Wipe,
+    /// The connection or zone changed under a running fight (issue #138).
+    ServerChanged,
+}
+
+impl FightEndCause {
+    /// Snake-case tag used in the log line, so causes stay greppable.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BossDeath => "boss_death",
+            Self::IdleTimeout => "idle_timeout",
+            Self::Wipe => "wipe",
+            Self::ServerChanged => "server_changed",
+        }
+    }
+}
+
 /// Tunables for fight-end detection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FightConfig {
@@ -89,6 +120,20 @@ mod tests {
     #[test]
     fn phase_resume_window_defaults_to_sixty_seconds() {
         assert_eq!(FightConfig::default().phase_resume_window_ms, 60_000);
+    }
+
+    #[test]
+    fn every_fight_end_cause_has_its_own_label() {
+        let labels = [
+            FightEndCause::BossDeath.label(),
+            FightEndCause::IdleTimeout.label(),
+            FightEndCause::Wipe.label(),
+            FightEndCause::ServerChanged.label(),
+        ];
+        let mut unique = labels.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), labels.len(), "labels must be distinguishable");
     }
 
     #[test]
