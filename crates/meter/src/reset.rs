@@ -52,6 +52,19 @@ pub struct EnemyState {
     pub peak_hp: Option<u64>,
     pub lowest_pct: Option<f64>,
     pub took_damage: bool,
+    /// Whether this enemy has **ever** been damaged by a player, as opposed
+    /// to [`Self::took_damage`], which is per-encounter and which
+    /// `Meter::reset` clears on every enemy (PR #163 review, finding 2).
+    /// Survives `Meter::reset` for the same reason `death_order` does: a
+    /// reset is bookkeeping about the *display*, and says nothing about
+    /// whether this is an entity the party has been fighting.
+    ///
+    /// `Meter::recompute_boss` needs exactly that distinction. Its issue
+    /// #157 fallback reaches past the enemies damaged in the current fight
+    /// — an empty set for the instant after every reset — to the recognized
+    /// boss still up, and without this it cannot tell that boss from one
+    /// that has only ever stood in AOI range untouched.
+    pub ever_damaged: bool,
     /// When this enemy was observed dying during the current fight (issue
     /// #124), as a rank in the encounter's death order: `Some(1)` died
     /// first, `Some(2)` second, `None` has not been seen to die. Set by
@@ -154,6 +167,7 @@ mod tests {
             peak_hp: Some(max_hp),
             lowest_pct,
             took_damage: true,
+            ever_damaged: true,
             death_order: None,
             monster_id: None,
         }
@@ -168,6 +182,7 @@ mod tests {
             peak_hp: Some(peak_hp),
             lowest_pct,
             took_damage: true,
+            ever_damaged: true,
             death_order: None,
             monster_id: None,
         }
