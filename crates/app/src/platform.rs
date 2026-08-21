@@ -320,6 +320,16 @@ impl Rect {
     fn center(self) -> (i32, i32) {
         (self.left + self.width() / 2, self.top + self.height() / 2)
     }
+
+    /// Whether `point` (physical pixels, same coordinate space as the rect
+    /// itself) falls inside — left/top inclusive, right/bottom exclusive,
+    /// matching this type's own doc comment and Win32's `RECT` convention.
+    /// Used by `click_through_hit_test` to decide whether a `WM_NCHITTEST`
+    /// point lands on the click-through button's published hit box (issue
+    /// #167 rehash).
+    fn contains(self, point: (i32, i32)) -> bool {
+        point.0 >= self.left && point.0 < self.right && point.1 >= self.top && point.1 < self.bottom
+    }
 }
 
 /// Height, in physical pixels, of the drag band `ui::draw_header` actually
@@ -1128,6 +1138,73 @@ fn should_veto_snap(current: Rect, proposed: Rect, monitors: &[Rect]) -> bool {
     is_snap_shaped(proposed, monitors) && window_is_reachable(current, monitors)
 }
 
+/// What a `WM_NCHITTEST` point should resolve to (issue #167 rehash).
+///
+/// Replaces the shipped `Ctrl+Alt+P` hotkey escape hatch for click-through,
+/// which turned out not to work: egui only sees key events while the
+/// overlay holds keyboard focus, and the entire point of click-through is
+/// to click the game *behind* the overlay, which takes focus away from the
+/// window the hotkey needed it on. `window_proc`'s `WM_NCHITTEST` branch
+/// intercepts the hit test directly instead, so the decision is made by
+/// Windows' own mouse routing rather than by whichever window currently
+/// has focus.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClickThroughHitTest {
+    /// Click-through is off: don't touch the hit test at all — let
+    /// `DefSubclassProc` (and winit's own handling underneath it) decide,
+    /// exactly as if this subclass never intercepted `WM_NCHITTEST`.
+    PassThrough,
+    /// Click-through is on, but the point is inside the click-through
+    /// button's published hit box (or no hit box has been published yet —
+    /// see `click_through_hit_test`'s doc comment): treat it as ordinary
+    /// client-area interaction, so the button stays clickable.
+    Client,
+    /// Click-through is on and the point is outside the button: report
+    /// `HTTRANSPARENT` so Windows re-does the hit test against whatever
+    /// sits behind this window — the game.
+    Transparent,
+}
+
+/// The pure decision behind `window_proc`'s `WM_NCHITTEST` handling (issue
+/// #167 rehash). `point` and `button_rect` are both client-area physical
+/// pixels — the space `ScreenToClient` converts a real `WM_NCHITTEST`
+/// point into, and the space `set_click_through_button_rect` stores its
+/// rect in.
+///
+/// The click-through button is deliberately excluded from passthrough by
+/// this carve-out — it is never itself click-through-able — so it stays
+/// reachable with the mouse in every state, unlike the whole-window
+/// `ViewportCommand::MousePassthrough` this replaces (which made the
+/// button that turns click-through off unclickable the moment click-through
+/// turned on). The tray menu's "Turn off click-through" entry
+/// (`install_tray`) is kept anyway, as a belt-and-braces fallback for the
+/// case this carve-out ever fails or the button ends up off-screen.
+///
+/// `button_rect` being `None` — rather than a real rect that simply
+/// doesn't contain `point` — means `toggle_cluster` hasn't published one
+/// yet: the window has only just been created, before its first frame.
+/// Resolving that to `Client` rather than `Transparent` is the deliberate
+/// safe choice — a `None` that resolved to `Transparent` would make the
+/// *entire* window click-through with no carve-out at all for however many
+/// frames that startup gap lasts, which is exactly the kind of stranding
+/// this mechanism exists to prevent.
+#[cfg(any(windows, test))]
+fn click_through_hit_test(
+    point: (i32, i32),
+    button_rect: Option<Rect>,
+    click_through_on: bool,
+) -> ClickThroughHitTest {
+    if !click_through_on {
+        return ClickThroughHitTest::PassThrough;
+    }
+    match button_rect {
+        None => ClickThroughHitTest::Client,
+        Some(rect) if rect.contains(point) => ClickThroughHitTest::Client,
+        Some(_) => ClickThroughHitTest::Transparent,
+    }
+}
+
 /// Subclass ID passed to `SetWindowSubclass`; unique among any subclasses
 /// this crate installs on the same `HWND` (there's currently only this
 /// one).
@@ -1155,10 +1232,16 @@ const SNAP_BLOCKER_SUBCLASS_ID: usize = 1;
 ///   every such site must hold one, or it risks being vetoed here.
 /// - `WM_SYSCOMMAND` / `SC_MAXIMIZE`: a backstop for the shell's maximize
 ///   command directly, independent of whatever rect it would propose.
+/// - `WM_NCHITTEST` (issue #167 rehash): while `Settings::click_through`
+///   is on, carves the click-through button's published hit box
+///   (`set_click_through_button_rect`) out of an otherwise fully
+///   click-through window — `click_through_hit_test` is the pure decision,
+///   see its doc comment for why this replaced `ViewportCommand::
+///   MousePassthrough` and the `Ctrl+Alt+P` hotkey that came with it.
 ///
-/// Neither handler touches focus or z-order, so always-on-top and the
-/// game keeping focus are unaffected; every other message falls through
-/// to `DefSubclassProc` unchanged.
+/// Neither the Snap handlers nor the click-through one touch focus or
+/// z-order, so always-on-top and the game keeping focus are unaffected;
+/// every other message falls through to `DefSubclassProc` unchanged.
 #[cfg(windows)]
 pub fn install_snap_blocker(cc: &eframe::CreationContext<'_>) {
     use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
@@ -1208,12 +1291,13 @@ unsafe extern "system" fn window_proc(
     _uidsubclass: usize,
     _dwrefdata: usize,
 ) -> windows::Win32::Foundation::LRESULT {
-    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Foundation::{POINT, RECT};
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Shell::DefSubclassProc;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowRect, SC_MAXIMIZE, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS, WM_DPICHANGED,
-        WM_SYSCOMMAND, WM_WINDOWPOSCHANGING,
+        GetWindowRect, HTTRANSPARENT, SC_MAXIMIZE, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS,
+        WM_DPICHANGED, WM_NCHITTEST, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING,
     };
 
     if msg == WM_WINDOWPOSCHANGING {
@@ -1343,6 +1427,36 @@ unsafe extern "system" fn window_proc(
             suggested.right - suggested.left,
             suggested.bottom - suggested.top
         );
+    } else if msg == WM_NCHITTEST && CLICK_THROUGH_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        // `WM_NCHITTEST`'s `lParam` packs the point as two signed 16-bit
+        // words in *screen* coordinates (never a pointer, unlike the
+        // `WINDOWPOS`/`RECT` messages above) — sign-extended through `i16`
+        // first, since a point on a monitor above/left of the primary one
+        // (see `Rect`'s doc comment) is legitimately negative.
+        let raw = lparam.0 as u32;
+        let mut point = POINT {
+            x: (raw & 0xFFFF) as u16 as i16 as i32,
+            y: ((raw >> 16) & 0xFFFF) as u16 as i16 as i32,
+        };
+        // SAFETY: `hwnd` is the window this subclass is installed on,
+        // alive and on the current thread; `point` is a valid in/out
+        // pointer `ScreenToClient` overwrites with the client-relative
+        // equivalent in place.
+        let converted = unsafe { ScreenToClient(hwnd, &mut point) }.as_bool();
+        // A failed conversion is treated the same as "no button rect
+        // published yet" — `click_through_hit_test`'s safe default
+        // (`Client`) — rather than guessing at a point that might be
+        // wrong, which could otherwise carve out the wrong region.
+        let button_rect = converted.then(click_through_button_rect).flatten();
+        if let ClickThroughHitTest::Transparent =
+            click_through_hit_test((point.x, point.y), button_rect, true)
+        {
+            return windows::Win32::Foundation::LRESULT(HTTRANSPARENT as isize);
+        }
+        // `Client` (inside the button, or no rect published yet) falls
+        // through to `DefSubclassProc` below unchanged, same as a normal
+        // hit test on a borderless window.
     }
 
     // SAFETY: `hwnd`/`msg`/`wparam`/`lparam` are exactly what this
@@ -1350,6 +1464,118 @@ unsafe extern "system" fn window_proc(
     // `DefSubclassProc` is how every message this handler doesn't
     // explicitly veto keeps reaching winit's own window procedure.
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+/// Whether `window_proc`'s `WM_NCHITTEST` branch should carve out the
+/// click-through button (issue #167 rehash). Mirrors `Settings::
+/// click_through` — `ui.rs` calls `set_click_through` every time that
+/// field changes: on the toggle-cluster button's own click, when
+/// `OverlayApp::ui` re-applies a saved setting on its first frame, and
+/// when a tray-issued turn-off request is synced. A plain atomic for the
+/// same reason `TRAY_ICON_ADDED` is one: this crate's Win32 message pump
+/// and `ui()` both run on the single UI thread, so there is no real
+/// concurrency to protect against, just a way to read a value written
+/// from a different call stack.
+#[cfg(windows)]
+static CLICK_THROUGH_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The click-through button's current hit box, in physical-pixel
+/// client-area coordinates — the same space `ScreenToClient` converts a
+/// `WM_NCHITTEST` point into. Published every frame by `toggle_cluster`
+/// via `set_click_through_button_rect`, regardless of whether
+/// click-through is currently on: the button can move between frames (a
+/// resize, a DPI change) even while click-through is off, and publishing
+/// unconditionally means `window_proc` never reads a rect stale enough to
+/// belong to a previous layout. `CLICK_THROUGH_BUTTON_RECT_SET` is `false`
+/// until the first such publish, which is what `click_through_hit_test`'s
+/// `None` case exists for.
+#[cfg(windows)]
+static CLICK_THROUGH_BUTTON_LEFT: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+#[cfg(windows)]
+static CLICK_THROUGH_BUTTON_TOP: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+#[cfg(windows)]
+static CLICK_THROUGH_BUTTON_RIGHT: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+#[cfg(windows)]
+static CLICK_THROUGH_BUTTON_BOTTOM: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+#[cfg(windows)]
+static CLICK_THROUGH_BUTTON_RECT_SET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the tray menu's "Turn off click-through" command
+/// (`request_click_through_off`) and taken (checked and cleared) by
+/// `ui.rs`'s `OverlayApp::ui` once per frame via
+/// `take_tray_click_through_off_request`, the same "poll a flag every
+/// frame" shape the deleted `Ctrl+Alt+P` hotkey check used. The actual
+/// OS-level passthrough is already off the instant the tray click lands —
+/// `request_click_through_off` clears `CLICK_THROUGH_ENABLED` itself,
+/// directly, for immediacy — so this flag exists only to catch `Settings::
+/// click_through` and the toggle-cluster button's displayed state up to
+/// what the window is already doing.
+#[cfg(windows)]
+static TRAY_CLICK_THROUGH_OFF_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turns the `WM_NCHITTEST` click-through carve-out on or off (issue #167
+/// rehash). See `CLICK_THROUGH_ENABLED`'s doc comment for the call sites.
+#[cfg(windows)]
+pub fn set_click_through(enabled: bool) {
+    CLICK_THROUGH_ENABLED.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(not(windows))]
+pub fn set_click_through(_enabled: bool) {}
+
+/// Publishes the click-through button's current hit box, in physical
+/// pixels, client-area-relative (issue #167 rehash) — see
+/// `CLICK_THROUGH_BUTTON_LEFT`'s doc comment. `toggle_cluster` is the only
+/// caller; it converts its egui `Rect` (points, already client-relative)
+/// with `pixels_per_point` and pads it slightly before calling this, so
+/// the hit target isn't razor-thin at its edges.
+#[cfg(windows)]
+pub fn set_click_through_button_rect(left: i32, top: i32, right: i32, bottom: i32) {
+    CLICK_THROUGH_BUTTON_LEFT.store(left, std::sync::atomic::Ordering::SeqCst);
+    CLICK_THROUGH_BUTTON_TOP.store(top, std::sync::atomic::Ordering::SeqCst);
+    CLICK_THROUGH_BUTTON_RIGHT.store(right, std::sync::atomic::Ordering::SeqCst);
+    CLICK_THROUGH_BUTTON_BOTTOM.store(bottom, std::sync::atomic::Ordering::SeqCst);
+    CLICK_THROUGH_BUTTON_RECT_SET.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(not(windows))]
+pub fn set_click_through_button_rect(_left: i32, _top: i32, _right: i32, _bottom: i32) {}
+
+/// Reads back the click-through button's published hit box, or `None` if
+/// `set_click_through_button_rect` has never run — see
+/// `CLICK_THROUGH_BUTTON_LEFT`'s doc comment. `window_proc`'s
+/// `WM_NCHITTEST` branch is the only reader.
+#[cfg(windows)]
+fn click_through_button_rect() -> Option<Rect> {
+    if !CLICK_THROUGH_BUTTON_RECT_SET.load(std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    Some(Rect {
+        left: CLICK_THROUGH_BUTTON_LEFT.load(std::sync::atomic::Ordering::SeqCst),
+        top: CLICK_THROUGH_BUTTON_TOP.load(std::sync::atomic::Ordering::SeqCst),
+        right: CLICK_THROUGH_BUTTON_RIGHT.load(std::sync::atomic::Ordering::SeqCst),
+        bottom: CLICK_THROUGH_BUTTON_BOTTOM.load(std::sync::atomic::Ordering::SeqCst),
+    })
+}
+
+/// Takes (checks and clears) a pending tray "Turn off click-through"
+/// request — see `TRAY_CLICK_THROUGH_OFF_REQUESTED`'s doc comment.
+/// `OverlayApp::ui` calls this once per frame.
+#[cfg(windows)]
+pub fn take_tray_click_through_off_request() -> bool {
+    TRAY_CLICK_THROUGH_OFF_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(windows))]
+pub fn take_tray_click_through_off_request() -> bool {
+    false
 }
 
 /// Subclass ID for the notification-area subclass (issue #53), distinct
@@ -1383,6 +1609,20 @@ const TRAY_MENU_RESET_WINDOW: u32 = 1;
 /// Menu-item id for "Exit" in the tray context menu.
 #[cfg(any(windows, test))]
 const TRAY_MENU_EXIT: u32 = 2;
+
+/// Menu-item id for "Turn off click-through" (issue #167 rehash) — the
+/// tray's belt-and-braces fallback for click-through, alongside the
+/// always-clickable carve-out `window_proc`'s `WM_NCHITTEST` branch gives
+/// the toggle-cluster button itself. A plain one-shot item rather than a
+/// checkable toggle: the button already covers turning click-through *on*
+/// (and back off, now that it's reachable in every state), so this only
+/// ever needs to do the one thing a stranded user could still be asking
+/// for — the same "least new machinery" reasoning `install_tray`'s
+/// existing `MF_STRING`-only `AppendMenuW` calls already follow, with no
+/// per-open state read (a checkable item's `MF_CHECKED` would need one)
+/// to keep in sync.
+#[cfg(any(windows, test))]
+const TRAY_MENU_CLICK_THROUGH_OFF: u32 = 3;
 
 /// Windows message ids the shell packs into the `lParam` of
 /// `TRAY_CALLBACK_MESSAGE`. Kept as plain literals — rather than the
@@ -1442,6 +1682,11 @@ enum TrayCommand {
     ResetWindow,
     /// Close the overlay, which runs `main.rs`'s normal shutdown.
     Exit,
+    /// Turn click-through off (issue #167 rehash) — the tray's fallback
+    /// for the case the toggle-cluster button's own carve-out ever fails
+    /// or ends up off-screen. See `TRAY_MENU_CLICK_THROUGH_OFF`'s doc
+    /// comment.
+    ClickThroughOff,
 }
 
 /// Maps a `TrackPopupMenu(TPM_RETURNCMD)` return value to the command it
@@ -1454,6 +1699,7 @@ fn tray_command_for(menu_id: u32) -> Option<TrayCommand> {
     match menu_id {
         TRAY_MENU_RESET_WINDOW => Some(TrayCommand::ResetWindow),
         TRAY_MENU_EXIT => Some(TrayCommand::Exit),
+        TRAY_MENU_CLICK_THROUGH_OFF => Some(TrayCommand::ClickThroughOff),
         _ => None,
     }
 }
@@ -2054,6 +2300,13 @@ fn show_tray_menu(hwnd: windows::Win32::Foundation::HWND) {
             && AppendMenuW(
                 menu,
                 MF_STRING,
+                TRAY_MENU_CLICK_THROUGH_OFF as usize,
+                windows::core::w!("Turn off click-through"),
+            )
+            .is_ok()
+            && AppendMenuW(
+                menu,
+                MF_STRING,
                 TRAY_MENU_EXIT as usize,
                 windows::core::w!("Exit"),
             )
@@ -2103,6 +2356,7 @@ fn show_tray_menu(hwnd: windows::Win32::Foundation::HWND) {
 
     match tray_command_for(selected.0 as u32) {
         Some(TrayCommand::ResetWindow) => reset_window(hwnd),
+        Some(TrayCommand::ClickThroughOff) => request_click_through_off(),
         Some(TrayCommand::Exit) => {
             // Routed through `WM_CLOSE` rather than `ExitProcess` so this is
             // the exact same shutdown the header's close button and alt-F4
@@ -2121,6 +2375,26 @@ fn show_tray_menu(hwnd: windows::Win32::Foundation::HWND) {
         }
         None => {}
     }
+}
+
+/// The tray menu's "Turn off click-through" command (issue #167 rehash) —
+/// see `TRAY_MENU_CLICK_THROUGH_OFF`'s doc comment for why this exists
+/// alongside the toggle-cluster button's own always-clickable carve-out.
+///
+/// Clears `CLICK_THROUGH_ENABLED` directly, here, rather than only raising
+/// `TRAY_CLICK_THROUGH_OFF_REQUESTED` and waiting for `ui.rs` to act on it
+/// next frame: this is the fallback for when the carve-out itself might be
+/// unreliable, so the actual OS-level passthrough should stop the instant
+/// the tray command runs, independent of whether or when another frame
+/// happens to render. The flag is raised too, so `OverlayApp::ui` still
+/// syncs `Settings::click_through` and the button's displayed state to
+/// match on its next frame — see `TRAY_CLICK_THROUGH_OFF_REQUESTED`'s doc
+/// comment.
+#[cfg(windows)]
+fn request_click_through_off() {
+    CLICK_THROUGH_ENABLED.store(false, std::sync::atomic::Ordering::SeqCst);
+    TRAY_CLICK_THROUGH_OFF_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    log::info!("tray: turned click-through off");
 }
 
 /// The pointer's current position in screen space (egui points), sourced
@@ -2776,6 +3050,10 @@ mod tests {
             Some(TrayCommand::ResetWindow)
         );
         assert_eq!(tray_command_for(TRAY_MENU_EXIT), Some(TrayCommand::Exit));
+        assert_eq!(
+            tray_command_for(TRAY_MENU_CLICK_THROUGH_OFF),
+            Some(TrayCommand::ClickThroughOff)
+        );
     }
 
     #[test]
@@ -2785,6 +3063,82 @@ mod tests {
         // command id.
         assert_eq!(tray_command_for(0), None);
         assert_eq!(tray_command_for(99), None);
+    }
+
+    #[test]
+    fn click_through_off_passes_every_point_through_to_default() {
+        // Click-through off is the common case, and must never be
+        // second-guessed by this subclass at all — `PassThrough` means
+        // `window_proc` doesn't touch the hit test, whatever `button_rect`
+        // says.
+        let button = rect(0, 0, 20, 20);
+        assert_eq!(
+            click_through_hit_test((5, 5), Some(button), false),
+            ClickThroughHitTest::PassThrough
+        );
+        assert_eq!(
+            click_through_hit_test((500, 500), Some(button), false),
+            ClickThroughHitTest::PassThrough
+        );
+        assert_eq!(
+            click_through_hit_test((5, 5), None, false),
+            ClickThroughHitTest::PassThrough
+        );
+    }
+
+    #[test]
+    fn click_through_on_keeps_the_button_itself_clickable() {
+        let button = rect(10, 10, 30, 30);
+        assert_eq!(
+            click_through_hit_test((10, 10), Some(button), true),
+            ClickThroughHitTest::Client,
+            "top-left corner is inclusive"
+        );
+        assert_eq!(
+            click_through_hit_test((20, 20), Some(button), true),
+            ClickThroughHitTest::Client
+        );
+        assert_eq!(
+            click_through_hit_test((29, 29), Some(button), true),
+            ClickThroughHitTest::Client,
+            "just inside the exclusive bottom-right edge"
+        );
+    }
+
+    #[test]
+    fn click_through_on_makes_everywhere_else_transparent() {
+        let button = rect(10, 10, 30, 30);
+        assert_eq!(
+            click_through_hit_test((0, 0), Some(button), true),
+            ClickThroughHitTest::Transparent
+        );
+        assert_eq!(
+            click_through_hit_test((30, 30), Some(button), true),
+            ClickThroughHitTest::Transparent,
+            "the bottom-right edge is exclusive, so it's already outside"
+        );
+        assert_eq!(
+            click_through_hit_test((1000, 1000), Some(button), true),
+            ClickThroughHitTest::Transparent
+        );
+    }
+
+    #[test]
+    fn click_through_on_with_no_published_rect_defaults_to_client() {
+        // Safe-by-construction: a `None` rect means `toggle_cluster` hasn't
+        // run its first frame yet. Resolving that to `Transparent` would
+        // make the *whole* window click-through with no carve-out at all
+        // for however long that startup gap lasts — exactly the stranding
+        // this mechanism exists to prevent — so `Client` (i.e. behave as
+        // if click-through were off) is the only safe default.
+        assert_eq!(
+            click_through_hit_test((0, 0), None, true),
+            ClickThroughHitTest::Client
+        );
+        assert_eq!(
+            click_through_hit_test((99999, 99999), None, true),
+            ClickThroughHitTest::Client
+        );
     }
 
     #[test]

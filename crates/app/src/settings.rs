@@ -296,9 +296,13 @@ pub struct Settings {
     #[serde(default = "default_opacity")]
     pub opacity: f32,
     /// OS-level mouse passthrough (issue #167): while `true`, the window
-    /// ignores every mouse event and clicks fall through to whatever sits
-    /// behind it — applied via `ViewportCommand::MousePassthrough`, both
-    /// on `OverlayApp`'s first frame (`ui::OverlayApp::ui`) and from
+    /// ignores every mouse event *except clicks on the toggle-cluster
+    /// click-through button itself*, which stays reachable by design —
+    /// applied via `platform::set_click_through` (issue #167 rehash: a
+    /// `WM_NCHITTEST` carve-out in `platform::window_proc`, not
+    /// `ViewportCommand::MousePassthrough`, which had no way to exempt a
+    /// region and so made that very button unreachable), both on
+    /// `OverlayApp`'s first frame (`ui::OverlayApp::ui`) and from
     /// `ui::toggle_cluster`'s click-through button. `#[serde(default)]`
     /// gives a settings.json written before this field `false`
     /// (`bool::default()`) — the same value this toggle starts at on a
@@ -465,9 +469,10 @@ impl Settings {
     /// `draw_header_menu`'s column checkboxes use around `toggle` above,
     /// rather than the report-every-frame `with_..._if_changed` idiom
     /// `window_position`/`window_size` use below: this only ever changes on
-    /// a deliberate button click (or the click-through escape-hatch
-    /// hotkey, `ui::click_through_after_hotkey`), so there is no per-frame
-    /// jitter to gate against.
+    /// a deliberate button click, or the tray menu's "Turn off
+    /// click-through" escape hatch (`ui::click_through_after_tray_request`
+    /// — issue #167 rehash), so there is no per-frame jitter to gate
+    /// against.
     pub fn toggle_click_through(&mut self) {
         self.click_through = !self.click_through;
     }

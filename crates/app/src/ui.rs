@@ -227,14 +227,17 @@ pub struct OverlayApp {
     /// snapshot from being clobbered by the per-frame `rx_snapshot` drain
     /// below (see that call site).
     demo_mode: bool,
-    /// Whether `ui()` has already sent the startup `ViewportCommand::
-    /// MousePassthrough`/`WindowLevel` pair that re-applies `Settings::
-    /// click_through`/`always_on_top` (issue #167). `send_viewport_cmd`
-    /// needs a live `egui::Context`, which — same as `icons` above — does
-    /// not exist yet at `OverlayApp::new`, so this is set on the first
-    /// `ui()` call and never again; every later frame's toggle state
-    /// instead flows through `toggle_cluster`'s own click handling and the
-    /// click-through hotkey, not this flag.
+    /// Whether `ui()` has already applied the startup click-through/
+    /// always-on-top pair that re-applies `Settings::click_through`/
+    /// `always_on_top` (issue #167) — `platform::set_click_through` for
+    /// the former (issue #167 rehash: no longer a `ViewportCommand`, see
+    /// that function's doc comment) and `ViewportCommand::WindowLevel` for
+    /// the latter. The `WindowLevel` half needs a live `egui::Context`,
+    /// which — same as `icons` above — does not exist yet at
+    /// `OverlayApp::new`, so this is set on the first `ui()` call and
+    /// never again; every later frame's toggle state instead flows
+    /// through `toggle_cluster`'s own click handling and the tray menu's
+    /// "Turn off click-through" escape hatch, not this flag.
     startup_toggles_applied: bool,
 }
 
@@ -560,12 +563,10 @@ impl eframe::App for OverlayApp {
         // builder — this is only needed to *correct* that for a returning
         // user whose last session turned either toggle away from its
         // default, and to turn click-through on at all, since nothing in
-        // `viewport()` ever requests `MousePassthrough`.
+        // `viewport()` sets it up front.
         if !self.startup_toggles_applied {
             self.startup_toggles_applied = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(
-                self.settings.click_through,
-            ));
+            crate::platform::set_click_through(self.settings.click_through);
             let level = if self.settings.always_on_top {
                 egui::WindowLevel::AlwaysOnTop
             } else {
@@ -574,18 +575,25 @@ impl eframe::App for OverlayApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
         }
 
-        // Issue #167: the click-through escape hatch — see `click_through_
-        // after_hotkey`'s doc comment for why a hotkey, checked every
-        // frame regardless of `click_through`'s current value, is the only
-        // way back once `MousePassthrough(true)` has made the toggle
-        // button itself unreachable to the mouse.
-        let click_through_hotkey_pressed =
-            ctx.input(|i| i.modifiers.ctrl && i.modifiers.alt && i.key_pressed(egui::Key::P));
+        // Issue #167 rehash: syncs `Settings::click_through` (and the
+        // toggle-cluster button's displayed state) with a "Turn off
+        // click-through" request raised by the tray menu — the escape
+        // hatch that replaced the `Ctrl+Alt+P` hotkey, which turned out
+        // not to work (egui only sees key events while the overlay holds
+        // keyboard focus, and click-through's whole point is clicking the
+        // game *behind* the overlay, which takes focus away). The actual
+        // OS-level passthrough is already off by the time this runs —
+        // `platform::request_click_through_off` clears it directly, for
+        // immediacy, the instant the tray command fires — so this only
+        // catches Settings and the button's paint up to what the window
+        // is already doing. See `click_through_after_tray_request`'s doc
+        // comment for the pure decision.
+        let tray_click_through_off = crate::platform::take_tray_click_through_off_request();
         let click_through =
-            click_through_after_hotkey(self.settings.click_through, click_through_hotkey_pressed);
+            click_through_after_tray_request(self.settings.click_through, tray_click_through_off);
         if click_through != self.settings.click_through {
             self.settings.click_through = click_through;
-            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(click_through));
+            crate::platform::set_click_through(click_through);
             let _ = self.tx_settings.send(self.settings.clone());
         }
 
@@ -1115,10 +1123,26 @@ fn draw_header(
 // queue gauge ring inert, since there was still no upload queue for it to
 // show. Issue #167 drops that still-inert ring entirely (there is still no
 // queue, and none planned) and adds two real, unrelated toggles in its place
-// and one new slot alongside it: OS-level mouse click-through
-// (`ViewportCommand::MousePassthrough`) and runtime always-on-top
-// (`ViewportCommand::WindowLevel`). The pill now holds four real controls —
-// Share, Reset, Click-through, Always-on-top — and nothing decorative.
+// and one new slot alongside it: OS-level mouse click-through and runtime
+// always-on-top (`ViewportCommand::WindowLevel`). The pill now holds four
+// real controls — Share, Reset, Click-through, Always-on-top — and nothing
+// decorative.
+//
+// Click-through (issue #167 rehash) is *not* `ViewportCommand::
+// MousePassthrough` — that sets `WS_EX_TRANSPARENT` on the whole window
+// with no per-region carve-out, so once it was on, the very button that
+// turns it back off became unclickable too, with only a keyboard hotkey
+// (which needs focus that click-through's whole point is to give away) as
+// an escape hatch. Instead, `platform::set_click_through` flips a flag
+// `platform::window_proc`'s `WM_NCHITTEST` handling reads directly: it
+// reports `HTTRANSPARENT` for the whole window *except* the click-through
+// button's own hit box (published every frame below via `platform::
+// set_click_through_button_rect`), which always reports normal
+// (`HTCLIENT`) hit-testing. The button is therefore reachable with the
+// mouse in every state — it is deliberately excluded from its own
+// passthrough — and the tray menu's "Turn off click-through" entry
+// (`platform::install_tray`) exists only as a belt-and-braces fallback for
+// the case that carve-out ever fails or the window ends up off-screen.
 
 /// Tint a toggle-cluster button paints with while its state is "off" — the
 /// source's `OffBrush="#1fff"`, originally the still-inert queue ring's
@@ -1147,6 +1171,11 @@ const TOGGLE_CLICK_THROUGH_SIDE: f32 = 14.0;
 const TOGGLE_ALWAYS_ON_TOP_SIDE: f32 = 14.0;
 const TOGGLE_GAP: f32 = 5.0;
 const TOGGLE_PAD_X: f32 = 4.0;
+/// Points the click-through button's published hit box (`platform::
+/// set_click_through_button_rect`) is padded out by on every side, so the
+/// `WM_NCHITTEST` carve-out that keeps it reachable under click-through
+/// (issue #167 rehash) isn't razor-thin right at the glyph's edges.
+const CLICK_THROUGH_HIT_PAD: f32 = 2.0;
 
 /// One toggle-cluster button's hit box, hover highlight and accessible
 /// label. The painted glyph itself is the caller's job — Share and Reset
@@ -1198,28 +1227,22 @@ fn toggle_state_tint(active: bool) -> egui::Color32 {
     }
 }
 
-/// The click-through escape hatch (issue #167). `ViewportCommand::
-/// MousePassthrough(true)` makes the *whole window* ignore mouse input —
-/// including clicks on the click-through button itself — so once it's on,
-/// the only way back is a keyboard shortcut, checked every frame
-/// regardless of `click_through`'s current value (`OverlayApp::ui` reads
-/// `ctx.input` for `Ctrl+Alt+P` and calls this). This assumes the overlay
-/// still holds keyboard focus, which passthrough alone does not take away
-/// — only clicking a *different* window would — so the hotkey keeps
-/// working right up until the user deliberately focuses something else,
-/// at which point they no longer need it to reach this window anyway.
+/// The click-through tray escape hatch (issue #167 rehash). The button
+/// itself is always clickable now (`platform::window_proc`'s `WM_NCHITTEST`
+/// carve-out — see the section comment above), so this is only the
+/// belt-and-braces fallback for when the tray's "Turn off click-through"
+/// entry fires: `requested` is whatever `OverlayApp::ui` read from
+/// `platform::take_tray_click_through_off_request` this frame.
 ///
-/// A plain toggle rather than "only ever turns it off": the button already
-/// covers turning click-through *on* while it's reachable, so a hotkey
-/// that also turns it on is harmless symmetry, not a second code path to
-/// keep in sync. Pure so this — the one behavior an escape-hatch bug would
-/// strand a user over — is unit-testable without a live `egui::Context`.
-fn click_through_after_hotkey(click_through: bool, hotkey_pressed: bool) -> bool {
-    if hotkey_pressed {
-        !click_through
-    } else {
-        click_through
-    }
+/// Unlike the deleted `Ctrl+Alt+P` hotkey this replaced, a tray request
+/// only ever turns click-through *off* — there's no tray item for turning
+/// it on, since the always-reachable button already owns that — so this is
+/// not a toggle: a request forces `false` outright, and an idle frame
+/// leaves `click_through` exactly as it found it. Pure so this is
+/// unit-testable without a live `egui::Context` or the platform layer's
+/// real atomics.
+fn click_through_after_tray_request(click_through: bool, requested: bool) -> bool {
+    if requested { false } else { click_through }
 }
 
 /// Paints the toggle cluster: Share and Reset (issue #82), plus
@@ -1312,32 +1335,53 @@ fn toggle_cluster(
     }
     x += TOGGLE_CLOUD_SIDE + TOGGLE_GAP;
 
-    // Click-through (issue #167): OS-level mouse passthrough for the whole
-    // window — while on, every mouse event, including this very button's
-    // own click, falls through to whatever sits behind the overlay.
+    // Click-through (issue #167; mechanism replaced — issue #167 rehash):
+    // OS-level mouse passthrough for the whole overlay *except this very
+    // button*, which stays clickable in every state by design — see the
+    // section comment above for why `platform::set_click_through` plus a
+    // `WM_NCHITTEST` carve-out replaced `ViewportCommand::
+    // MousePassthrough` and the `Ctrl+Alt+P` hotkey that came with it.
     // `GlyphIcon::MouseOff`'s literal "mouse disabled" glyph is the closest
     // fit the vendored set has, and happens to be exactly what the
     // original ShinraMeter source used for this same LED slot before issue
     // #82 repurposed it as Share (see the section comment above). Persisted
     // to `Settings::click_through` so it survives a restart, re-applied on
-    // `OverlayApp`'s first frame; reachable again once it's on only via the
-    // `Ctrl+Alt+P` hotkey (`click_through_after_hotkey`'s doc comment
-    // explains why that's the escape hatch rather than another click).
+    // `OverlayApp`'s first frame. The tray menu's "Turn off click-through"
+    // entry is a belt-and-braces fallback, not the primary way back — this
+    // button is.
     let click_through_rect = egui::Rect::from_center_size(
         egui::pos2(x + TOGGLE_CLICK_THROUGH_SIDE / 2.0, y),
         egui::Vec2::splat(TOGGLE_CLICK_THROUGH_SIDE),
     );
+
+    // Published every frame, click or not, and regardless of whether
+    // click-through is currently on: `platform::window_proc`'s
+    // `WM_NCHITTEST` branch only *consults* this while click-through is
+    // on, but the button's position can change between frames (a resize,
+    // a DPI change) even while it's off, and publishing unconditionally
+    // means that branch never reads a rect stale enough to belong to a
+    // previous layout. Padded by `CLICK_THROUGH_HIT_PAD` points so the
+    // carve-out isn't razor-thin at its edges, then converted from egui
+    // points (already client-area-relative, matching what `ScreenToClient`
+    // produces) to the physical pixels `WM_NCHITTEST` actually hit-tests
+    // in.
+    let padded_click_through_rect = click_through_rect.expand(CLICK_THROUGH_HIT_PAD);
+    let scale = ui.ctx().pixels_per_point();
+    crate::platform::set_click_through_button_rect(
+        (padded_click_through_rect.left() * scale).round() as i32,
+        (padded_click_through_rect.top() * scale).round() as i32,
+        (padded_click_through_rect.right() * scale).round() as i32,
+        (padded_click_through_rect.bottom() * scale).round() as i32,
+    );
+
     let click_through_label = if settings.click_through {
-        "Click-through: on (Ctrl+Alt+P to turn off)"
+        "Click-through: on"
     } else {
         "Click-through: off"
     };
     if toggle_button(ui, click_through_rect, click_through_label, capturing).clicked() {
         settings.toggle_click_through();
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::MousePassthrough(
-                settings.click_through,
-            ));
+        crate::platform::set_click_through(settings.click_through);
         let _ = tx_settings.send(settings.clone());
     }
     if let Some(mouse_off) = icons.glyphs.get(GlyphIcon::MouseOff) {
@@ -6170,8 +6214,9 @@ mod tests {
     }
 
     /// Clicking the click-through button flips `Settings::click_through`,
-    /// sends `ViewportCommand::MousePassthrough` with the new value, and
-    /// persists the change (issue #167).
+    /// tells the platform layer (`platform::set_click_through` — issue
+    /// #167 rehash; a no-op stub off-Windows, so not independently
+    /// observable from this test), and persists the change (issue #167).
     #[test]
     fn clicking_click_through_toggles_and_persists_it() {
         let ctx = egui::Context::default();
@@ -6215,20 +6260,9 @@ mod tests {
                 false,
             );
         });
-        let commands = output
-            .viewport_output
-            .get(&egui::ViewportId::ROOT)
-            .map(|viewport| viewport.commands.clone())
-            .unwrap_or_default();
         output.drop_without_applying_deltas();
 
         assert!(settings.click_through, "the click must flip the flag on");
-        assert!(
-            commands
-                .iter()
-                .any(|cmd| matches!(cmd, egui::ViewportCommand::MousePassthrough(true))),
-            "the click must request MousePassthrough(true): {commands:?}"
-        );
         let persisted = rx_settings.try_recv().expect("the click must persist");
         assert!(persisted.click_through);
     }
@@ -7091,23 +7125,22 @@ mod tests {
         assert_eq!(toggle_state_tint(false), TOGGLE_OFF_COLOR);
     }
 
-    /// The escape hatch: a hotkey press must flip `click_through`,
-    /// regardless of which state it was in — this is the only way back
-    /// once `MousePassthrough(true)` has made the toggle button itself
-    /// unclickable. See `click_through_after_hotkey`'s doc comment.
+    /// The tray escape hatch: a "Turn off click-through" request must force
+    /// `click_through` off, regardless of which state it was in — see
+    /// `click_through_after_tray_request`'s doc comment.
     #[test]
-    fn click_through_after_hotkey_flips_on_a_press() {
-        assert!(click_through_after_hotkey(false, true));
-        assert!(!click_through_after_hotkey(true, true));
+    fn click_through_after_tray_request_forces_it_off() {
+        assert!(!click_through_after_tray_request(false, true));
+        assert!(!click_through_after_tray_request(true, true));
     }
 
-    /// An idle frame (no hotkey press) must leave `click_through` exactly
-    /// as it found it, in either state — this is what keeps the hotkey
-    /// from fighting the toggle button's own clicks on every other frame.
+    /// An idle frame (no tray request) must leave `click_through` exactly
+    /// as it found it, in either state — this is what keeps the poll from
+    /// fighting the toggle button's own clicks on every other frame.
     #[test]
-    fn click_through_after_hotkey_holds_steady_with_no_press() {
-        assert!(!click_through_after_hotkey(false, false));
-        assert!(click_through_after_hotkey(true, false));
+    fn click_through_after_tray_request_holds_steady_with_no_request() {
+        assert!(!click_through_after_tray_request(false, false));
+        assert!(click_through_after_tray_request(true, false));
     }
 
     // -- handle_share_screenshot (the `OverlayApp::ui` sequencing itself) ---
