@@ -295,12 +295,42 @@ pub struct Settings {
     /// silent-upgrade regression this field must not cause.
     #[serde(default = "default_opacity")]
     pub opacity: f32,
+    /// OS-level mouse passthrough (issue #167): while `true`, the window
+    /// ignores every mouse event and clicks fall through to whatever sits
+    /// behind it — applied via `ViewportCommand::MousePassthrough`, both
+    /// on `OverlayApp`'s first frame (`ui::OverlayApp::ui`) and from
+    /// `ui::toggle_cluster`'s click-through button. `#[serde(default)]`
+    /// gives a settings.json written before this field `false`
+    /// (`bool::default()`) — the same value this toggle starts at on a
+    /// first launch, so nothing changes for an existing install.
+    #[serde(default)]
+    pub click_through: bool,
+    /// Whether the overlay stays pinned above other windows (issue #167),
+    /// applied via `ViewportCommand::WindowLevel` at the same two points
+    /// as `click_through`. Mirrors `ui::viewport`'s hardcoded
+    /// `.with_always_on_top()` — that builder call is still what a fresh
+    /// window opens with, before any `Settings` value has reached it, so
+    /// this field's default has to agree with it or the very first frame's
+    /// re-apply would immediately contradict the window it just opened.
+    /// `#[serde(default = "default_always_on_top")]` rather than plain
+    /// `#[serde(default)]`: `bool::default()` is `false`, which would flip
+    /// a settings.json written before this field existed to "off" the
+    /// instant it loaded, silently changing every existing install's
+    /// always-on-top behavior rather than preserving it.
+    #[serde(default = "default_always_on_top")]
+    pub always_on_top: bool,
 }
 
 /// The `opacity` default for a settings.json predating issue #166: fully
 /// opaque, i.e. the fixed look every existing user already sees today.
 fn default_opacity() -> f32 {
     1.0
+}
+
+/// `Settings::always_on_top`'s serde default (issue #167) — see that
+/// field's doc comment for why this can't just be `#[serde(default)]`.
+fn default_always_on_top() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -321,6 +351,8 @@ impl Default for Settings {
             window_position: None,
             window_size: None,
             opacity: default_opacity(),
+            click_through: false,
+            always_on_top: true,
         }
     }
 }
@@ -426,6 +458,24 @@ impl Settings {
             return Self::OPACITY_MAX;
         }
         value.clamp(Self::OPACITY_MIN, Self::OPACITY_MAX)
+    }
+
+    /// Flips `click_through` (issue #167) — see its field doc comment for
+    /// what it drives. In-place-then-clone-and-send is the same shape
+    /// `draw_header_menu`'s column checkboxes use around `toggle` above,
+    /// rather than the report-every-frame `with_..._if_changed` idiom
+    /// `window_position`/`window_size` use below: this only ever changes on
+    /// a deliberate button click (or the click-through escape-hatch
+    /// hotkey, `ui::click_through_after_hotkey`), so there is no per-frame
+    /// jitter to gate against.
+    pub fn toggle_click_through(&mut self) {
+        self.click_through = !self.click_through;
+    }
+
+    /// Flips `always_on_top` (issue #167) — see `toggle_click_through`'s
+    /// doc comment for the shape this mirrors and why.
+    pub fn toggle_always_on_top(&mut self) {
+        self.always_on_top = !self.always_on_top;
     }
 
     /// Returns an updated copy with `window_position` set to `position`, or
@@ -676,7 +726,7 @@ mod tests {
             visible_columns: vec![ColumnKind::Damage],
             window_position: None,
             window_size: None,
-            opacity: default_opacity(),
+            ..Settings::default()
         };
 
         settings.toggle(ColumnKind::Damage);
@@ -843,7 +893,7 @@ mod tests {
             visible_columns: vec![],
             window_position: None,
             window_size: None,
-            opacity: default_opacity(),
+            ..Settings::default()
         };
         assert_eq!(settings.sanitized(), Settings::default());
     }
@@ -1240,7 +1290,7 @@ mod tests {
             visible_columns: vec![ColumnKind::Damage],
             window_position: None,
             window_size: None,
-            opacity: default_opacity(),
+            ..Settings::default()
         };
         a.toggle(ColumnKind::Hits);
         a.toggle(ColumnKind::CritPct);
@@ -1249,7 +1299,7 @@ mod tests {
             visible_columns: vec![ColumnKind::Damage],
             window_position: None,
             window_size: None,
-            opacity: default_opacity(),
+            ..Settings::default()
         };
         b.toggle(ColumnKind::CritPct);
         b.toggle(ColumnKind::Hits);
@@ -1397,7 +1447,7 @@ mod tests {
             visible_columns: ColumnKind::ALL.to_vec(),
             window_position: None,
             window_size: None,
-            opacity: default_opacity(),
+            ..Settings::default()
         };
         assert_eq!(all.ordered_columns().last(), Some(&ColumnKind::Deaths));
     }
@@ -1477,6 +1527,98 @@ mod tests {
             vec![ColumnKind::Dps, ColumnKind::CritPct, ColumnKind::LuckyPct]
         );
         assert!(!loaded.is_visible(ColumnKind::Deaths));
+        let _ = fs::remove_file(&path);
+    }
+
+    // -- click-through / always-on-top (issue #167) ------------------------
+
+    /// Click-through starts off — a fresh install must never open with the
+    /// window unclickable before the user has ever touched the toggle.
+    #[test]
+    fn default_click_through_is_off() {
+        assert!(!Settings::default().click_through);
+    }
+
+    /// Always-on-top starts on, matching `ui::viewport`'s hardcoded
+    /// `.with_always_on_top()` — the window a fresh process opens with is
+    /// already pinned, so the settings default has to agree or the very
+    /// first frame's re-apply (`OverlayApp::ui`) would immediately fight
+    /// the window it just opened.
+    #[test]
+    fn default_always_on_top_is_on() {
+        assert!(Settings::default().always_on_top);
+    }
+
+    #[test]
+    fn toggle_click_through_flips_the_flag() {
+        let mut settings = Settings::default();
+        assert!(!settings.click_through);
+
+        settings.toggle_click_through();
+        assert!(settings.click_through);
+
+        settings.toggle_click_through();
+        assert!(!settings.click_through);
+    }
+
+    #[test]
+    fn toggle_click_through_leaves_other_fields_unchanged() {
+        let mut settings = Settings::default();
+        settings.toggle_click_through();
+
+        assert_eq!(settings.always_on_top, Settings::default().always_on_top);
+        assert_eq!(
+            settings.visible_columns,
+            Settings::default().visible_columns
+        );
+    }
+
+    #[test]
+    fn toggle_always_on_top_flips_the_flag() {
+        let mut settings = Settings::default();
+        assert!(settings.always_on_top);
+
+        settings.toggle_always_on_top();
+        assert!(!settings.always_on_top);
+
+        settings.toggle_always_on_top();
+        assert!(settings.always_on_top);
+    }
+
+    #[test]
+    fn round_trip_preserves_click_through_and_always_on_top() {
+        let path = temp_settings_path("toggles-roundtrip");
+        let mut settings = Settings::default();
+        settings.toggle_click_through();
+        settings.toggle_always_on_top();
+        save_to(&path, &settings);
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded, settings);
+        assert!(loaded.click_through);
+        assert!(!loaded.always_on_top);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A settings.json written before issue #167 has neither key at all; it
+    /// must keep deserializing, with `click_through` falling back to `false`
+    /// and `always_on_top` falling back to `true` — the same back-compat
+    /// guarantee `window_position`/`window_size` make, and the only one
+    /// `#[serde(default = ...)]` is for (never a migration).
+    #[test]
+    fn settings_json_without_toggle_keys_falls_back_to_their_defaults() {
+        let path = temp_settings_path("legacy-no-toggles");
+        fs::write(
+            &path,
+            br#"{"visible_columns":["Dps","CritPct","LuckyPct"]}"#,
+        )
+        .expect("write legacy fixture");
+
+        let loaded = load_from(&path);
+
+        assert!(!loaded.click_through);
+        assert!(loaded.always_on_top);
         let _ = fs::remove_file(&path);
     }
 }

@@ -227,6 +227,15 @@ pub struct OverlayApp {
     /// snapshot from being clobbered by the per-frame `rx_snapshot` drain
     /// below (see that call site).
     demo_mode: bool,
+    /// Whether `ui()` has already sent the startup `ViewportCommand::
+    /// MousePassthrough`/`WindowLevel` pair that re-applies `Settings::
+    /// click_through`/`always_on_top` (issue #167). `send_viewport_cmd`
+    /// needs a live `egui::Context`, which — same as `icons` above — does
+    /// not exist yet at `OverlayApp::new`, so this is set on the first
+    /// `ui()` call and never again; every later frame's toggle state
+    /// instead flows through `toggle_cluster`'s own click handling and the
+    /// click-through hotkey, not this flag.
+    startup_toggles_applied: bool,
 }
 
 /// All icon textures the overlay paints, bundled so `OverlayApp` has exactly
@@ -509,6 +518,7 @@ impl OverlayApp {
             screenshot_capturing: false,
             screenshot_capture_frames_waited: 0,
             demo_mode,
+            startup_toggles_applied: false,
         }
     }
 
@@ -542,6 +552,42 @@ impl eframe::App for OverlayApp {
 
         let ctx = ui.ctx().clone();
         apply_theme(&ctx);
+
+        // Issue #167: re-applies `Settings::click_through`/`always_on_top`
+        // exactly once, on the first frame a live `egui::Context` exists
+        // (same one-shot shape as the icon load right below). `viewport()`
+        // already bakes `always_on_top`'s hardcoded default into the window
+        // builder — this is only needed to *correct* that for a returning
+        // user whose last session turned either toggle away from its
+        // default, and to turn click-through on at all, since nothing in
+        // `viewport()` ever requests `MousePassthrough`.
+        if !self.startup_toggles_applied {
+            self.startup_toggles_applied = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(
+                self.settings.click_through,
+            ));
+            let level = if self.settings.always_on_top {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        }
+
+        // Issue #167: the click-through escape hatch — see `click_through_
+        // after_hotkey`'s doc comment for why a hotkey, checked every
+        // frame regardless of `click_through`'s current value, is the only
+        // way back once `MousePassthrough(true)` has made the toggle
+        // button itself unreachable to the mouse.
+        let click_through_hotkey_pressed =
+            ctx.input(|i| i.modifiers.ctrl && i.modifiers.alt && i.key_pressed(egui::Key::P));
+        let click_through =
+            click_through_after_hotkey(self.settings.click_through, click_through_hotkey_pressed);
+        if click_through != self.settings.click_through {
+            self.settings.click_through = click_through;
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(click_through));
+            let _ = self.tx_settings.send(self.settings.clone());
+        }
 
         // Issue #83: a prior investigation of "player rows render shorter/
         // more compact than the reference" found no code-level defect —
@@ -974,10 +1020,25 @@ fn draw_header(
     // `draw_header_menu`'s doc comment), the default would dismiss the
     // whole dropdown on every checkbox toggle. Minimize/Close call
     // `ui.close()` themselves to still dismiss on click.
+    // `settings` (a `SettingsHandle<'_>`) is reborrowed rather than moved
+    // into this closure — issue #167 added a second use of it below
+    // (`toggle_cluster`), and `SettingsHandle`'s `&mut Settings` field
+    // can't be moved out twice. `&mut *settings.settings` is an ordinary
+    // reborrow through that field, scoped to just this `.show(...)` call,
+    // so `settings` is still whole and usable afterward.
     egui::Popup::menu(&chevron_response)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
-            draw_header_menu(ui, ctx, tx_command, settings, icons);
+            draw_header_menu(
+                ui,
+                ctx,
+                tx_command,
+                SettingsHandle {
+                    settings: &mut *settings.settings,
+                    tx_settings: settings.tx_settings,
+                },
+                icons,
+            );
         });
     draw_subtitle_line(ui, subtitle.as_deref().unwrap_or(""));
 
@@ -1028,31 +1089,48 @@ fn draw_header(
                 icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
             ),
         );
-        toggle_cluster(ui, tx_command, icons, capturing)
+        toggle_cluster(
+            ui,
+            tx_command,
+            SettingsHandle {
+                settings: &mut *settings.settings,
+                tx_settings: settings.tx_settings,
+            },
+            icons,
+            capturing,
+        )
     })
     .inner
 }
 
-// -- status indicators (issue #62, #82) -----------------------------------
+// -- toggle cluster (issue #62, #82, #167) --------------------------------
 //
 // The source's fourth stat-row cell: a click-through LED, a cloud-upload LED
 // and a queue gauge, in a 22pt pill. We had none of those features, so all
 // three used to render **in their off state and inert** — no click
 // handling, no settings, no tooltip. Issue #62 was explicit that a use for
-// these slots would be decided later; issue #82 decides two of them: the
-// click-through and cloud-upload LEDs are repurposed as real buttons
-// (Share — copy a screenshot to the clipboard — and Reset, moved out of the
-// header dropdown), leaving only the queue gauge ring inert, since there is
-// still no upload queue for it to show.
+// these slots would be decided later; issue #82 repurposed the click-through
+// and cloud-upload LEDs as real buttons (Share — copy a screenshot to the
+// clipboard — and Reset, moved out of the header dropdown), leaving only the
+// queue gauge ring inert, since there was still no upload queue for it to
+// show. Issue #167 drops that still-inert ring entirely (there is still no
+// queue, and none planned) and adds two real, unrelated toggles in its place
+// and one new slot alongside it: OS-level mouse click-through
+// (`ViewportCommand::MousePassthrough`) and runtime always-on-top
+// (`ViewportCommand::WindowLevel`). The pill now holds four real controls —
+// Share, Reset, Click-through, Always-on-top — and nothing decorative.
 
-/// Tint the still-inert queue ring (and its check glyph) is painted with —
-/// the source's `OffBrush="#1fff"`.
+/// Tint a toggle-cluster button paints with while its state is "off" — the
+/// source's `OffBrush="#1fff"`, originally the still-inert queue ring's
+/// stroke color, now `toggle_state_tint`'s off case for the click-through
+/// and always-on-top buttons (issue #167).
 const TOGGLE_OFF_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x11);
-/// Tint the toggle cluster's two real buttons are painted with — the same
-/// half-white `TOOLBAR_ICON_TINT` every other clickable icon in this module
-/// uses, now that these two read as active controls rather than inert
-/// decoration.
+/// Tint the toggle cluster's buttons are painted with while active — the
+/// same half-white `TOOLBAR_ICON_TINT` every other clickable icon in this
+/// module uses. Share and Reset (one-shot actions, not on/off state) always
+/// paint at this tint; click-through and always-on-top use it only in their
+/// "on" state (`toggle_state_tint`).
 const TOGGLE_ACTIVE_COLOR: egui::Color32 = TOOLBAR_ICON_TINT;
 /// Circular hover wash painted behind a toggle-cluster button, matching the
 /// oval pill's own shape rather than a foreign square badge.
@@ -1060,8 +1138,13 @@ const TOGGLE_HOVER_FILL: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 30);
 const TOGGLE_MOUSE_SIDE: f32 = 12.0;
 const TOGGLE_CLOUD_SIDE: f32 = 14.0;
-const TOGGLE_QUEUE_SIDE: f32 = 14.0;
-const TOGGLE_QUEUE_GLYPH_SIDE: f32 = 6.0;
+/// Click-through button glyph side (issue #167) — same 14pt as `TOGGLE_
+/// CLOUD_SIDE`/the old queue slot, keeping every non-Share button in the
+/// cluster the same visual size.
+const TOGGLE_CLICK_THROUGH_SIDE: f32 = 14.0;
+/// Always-on-top button glyph side (issue #167) — see `TOGGLE_CLICK_
+/// THROUGH_SIDE`'s doc comment.
+const TOGGLE_ALWAYS_ON_TOP_SIDE: f32 = 14.0;
 const TOGGLE_GAP: f32 = 5.0;
 const TOGGLE_PAD_X: f32 = 4.0;
 
@@ -1101,34 +1184,85 @@ fn toggle_button(ui: &egui::Ui, rect: egui::Rect, label: &str, capturing: bool) 
     }
 }
 
-/// Paints the toggle cluster: the Share and Reset buttons (issue #82) and
-/// the still-inert queue gauge ring (an empty ring — the source's `Ellipse
-/// 14x14 Fill="#0aaa"` has alpha 0, so only the stroke is drawn — with the
-/// check glyph centered in it; no backlog arc, since there is still no
-/// queue for it to show). All in one `PILL_FILL` oval, matching the
-/// DPS/damage pills' chrome.
+/// Which tint a toggle-cluster on/off button paints its glyph with (issue
+/// #167): `TOGGLE_ACTIVE_COLOR` — the same half-white every clickable icon
+/// in this cluster uses — while the state is on, `TOGGLE_OFF_COLOR` — the
+/// near-invisible tint the old inert queue ring painted with — while off.
+/// Pure so the state -> color mapping is unit-testable without a live
+/// `egui::Context`; `toggle_cluster` is the only caller.
+fn toggle_state_tint(active: bool) -> egui::Color32 {
+    if active {
+        TOGGLE_ACTIVE_COLOR
+    } else {
+        TOGGLE_OFF_COLOR
+    }
+}
+
+/// The click-through escape hatch (issue #167). `ViewportCommand::
+/// MousePassthrough(true)` makes the *whole window* ignore mouse input —
+/// including clicks on the click-through button itself — so once it's on,
+/// the only way back is a keyboard shortcut, checked every frame
+/// regardless of `click_through`'s current value (`OverlayApp::ui` reads
+/// `ctx.input` for `Ctrl+Alt+P` and calls this). This assumes the overlay
+/// still holds keyboard focus, which passthrough alone does not take away
+/// — only clicking a *different* window would — so the hotkey keeps
+/// working right up until the user deliberately focuses something else,
+/// at which point they no longer need it to reach this window anyway.
+///
+/// A plain toggle rather than "only ever turns it off": the button already
+/// covers turning click-through *on* while it's reachable, so a hotkey
+/// that also turns it on is harmless symmetry, not a second code path to
+/// keep in sync. Pure so this — the one behavior an escape-hatch bug would
+/// strand a user over — is unit-testable without a live `egui::Context`.
+fn click_through_after_hotkey(click_through: bool, hotkey_pressed: bool) -> bool {
+    if hotkey_pressed {
+        !click_through
+    } else {
+        click_through
+    }
+}
+
+/// Paints the toggle cluster: Share and Reset (issue #82), plus
+/// click-through and always-on-top (issue #167) — four real controls, no
+/// decorative slot left (see the section comment above). All in one
+/// `PILL_FILL` oval, matching the DPS/damage pills' chrome.
 ///
 /// Returns whether Share was clicked this frame (issue #96, PR #98 review)
 /// — `draw_header` propagates this up so `OverlayApp::ui` knows to stash
 /// this frame's row-bottom bound for the async screenshot reply.
 ///
 /// `capturing` (issue #156) is threaded straight through to every
-/// `toggle_button` call so the whole cluster — Share, Reset, and any
-/// future button here — suppresses its hover fill and tooltip together
-/// while a capture is in flight, rather than special-casing Share alone.
+/// `toggle_button` call so the whole cluster — all four buttons —
+/// suppresses its hover fill and tooltip together while a capture is in
+/// flight, rather than special-casing Share alone.
+///
+/// `settings` carries both the mutable `Settings` the click-through and
+/// always-on-top buttons flip and persist, and the sender that hands the
+/// updated value to the settings-writer thread — the same
+/// `SettingsHandle` `draw_header_menu`'s column checkboxes use, reborrowed
+/// by `draw_header` rather than moved so both call sites in the same
+/// function can use it.
 fn toggle_cluster(
     ui: &mut egui::Ui,
     tx_command: &Sender<UiCommand>,
+    settings: SettingsHandle<'_>,
     icons: &Icons,
     capturing: bool,
 ) -> bool {
+    let SettingsHandle {
+        settings,
+        tx_settings,
+    } = settings;
+
     let height = ui.spacing().interact_size.y;
     let width = 2.0 * TOGGLE_PAD_X
         + TOGGLE_MOUSE_SIDE
         + TOGGLE_GAP
         + TOGGLE_CLOUD_SIDE
         + TOGGLE_GAP
-        + TOGGLE_QUEUE_SIDE;
+        + TOGGLE_CLICK_THROUGH_SIDE
+        + TOGGLE_GAP
+        + TOGGLE_ALWAYS_ON_TOP_SIDE;
     let (rect, _response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
 
     if !ui.is_rect_visible(rect) {
@@ -1178,18 +1312,82 @@ fn toggle_cluster(
     }
     x += TOGGLE_CLOUD_SIDE + TOGGLE_GAP;
 
-    // The queue gauge stays inert — see the section comment above.
-    let queue_center = egui::pos2(x + TOGGLE_QUEUE_SIDE / 2.0, y);
-    ui.painter().circle_stroke(
-        queue_center,
-        TOGGLE_QUEUE_SIDE / 2.0,
-        egui::Stroke::new(1.0, TOGGLE_OFF_COLOR),
+    // Click-through (issue #167): OS-level mouse passthrough for the whole
+    // window — while on, every mouse event, including this very button's
+    // own click, falls through to whatever sits behind the overlay.
+    // `GlyphIcon::MouseOff`'s literal "mouse disabled" glyph is the closest
+    // fit the vendored set has, and happens to be exactly what the
+    // original ShinraMeter source used for this same LED slot before issue
+    // #82 repurposed it as Share (see the section comment above). Persisted
+    // to `Settings::click_through` so it survives a restart, re-applied on
+    // `OverlayApp`'s first frame; reachable again once it's on only via the
+    // `Ctrl+Alt+P` hotkey (`click_through_after_hotkey`'s doc comment
+    // explains why that's the escape hatch rather than another click).
+    let click_through_rect = egui::Rect::from_center_size(
+        egui::pos2(x + TOGGLE_CLICK_THROUGH_SIDE / 2.0, y),
+        egui::Vec2::splat(TOGGLE_CLICK_THROUGH_SIDE),
     );
-    if let Some(check) = icons.glyphs.get(GlyphIcon::Check) {
-        let icon_rect =
-            egui::Rect::from_center_size(queue_center, egui::Vec2::splat(TOGGLE_QUEUE_GLYPH_SIDE));
-        ui.painter()
-            .image(check.id(), icon_rect, UV_FULL, TOGGLE_OFF_COLOR);
+    let click_through_label = if settings.click_through {
+        "Click-through: on (Ctrl+Alt+P to turn off)"
+    } else {
+        "Click-through: off"
+    };
+    if toggle_button(ui, click_through_rect, click_through_label, capturing).clicked() {
+        settings.toggle_click_through();
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::MousePassthrough(
+                settings.click_through,
+            ));
+        let _ = tx_settings.send(settings.clone());
+    }
+    if let Some(mouse_off) = icons.glyphs.get(GlyphIcon::MouseOff) {
+        ui.painter().image(
+            mouse_off.id(),
+            click_through_rect,
+            UV_FULL,
+            toggle_state_tint(settings.click_through),
+        );
+    }
+    x += TOGGLE_CLICK_THROUGH_SIDE + TOGGLE_GAP;
+
+    // Always-on-top (issue #167): whether the overlay stays pinned above
+    // other windows, via `ViewportCommand::WindowLevel` — the runtime
+    // counterpart to `viewport()`'s hardcoded `.with_always_on_top()`,
+    // which only ever sets the *initial* level a fresh process opens with.
+    // No pin/stacking glyph exists in the vendored set (`icons.rs`'s
+    // `GlyphIcon`, and "do not add new asset files" rules out drawing one),
+    // so this reuses `GlyphIcon::CloudOff` — the second status-LED slot the
+    // source reserved and this app never gave a use to (see the section
+    // comment above) — purely as a neutral on/off dot, not for its literal
+    // "cloud" meaning. Persisted to `Settings::always_on_top` the same way
+    // `click_through` is.
+    let always_on_top_rect = egui::Rect::from_center_size(
+        egui::pos2(x + TOGGLE_ALWAYS_ON_TOP_SIDE / 2.0, y),
+        egui::Vec2::splat(TOGGLE_ALWAYS_ON_TOP_SIDE),
+    );
+    let always_on_top_label = if settings.always_on_top {
+        "Always on top: on"
+    } else {
+        "Always on top: off"
+    };
+    if toggle_button(ui, always_on_top_rect, always_on_top_label, capturing).clicked() {
+        settings.toggle_always_on_top();
+        let level = if settings.always_on_top {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        };
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        let _ = tx_settings.send(settings.clone());
+    }
+    if let Some(cloud_off) = icons.glyphs.get(GlyphIcon::CloudOff) {
+        ui.painter().image(
+            cloud_off.id(),
+            always_on_top_rect,
+            UV_FULL,
+            toggle_state_tint(settings.always_on_top),
+        );
     }
 
     screenshot_requested
@@ -5852,14 +6050,16 @@ mod tests {
             row_height,
         )
         .x;
-        // The toggle cluster (decision 5, issue #82): a fixed-width pill,
-        // not measured text.
+        // The toggle cluster (decision 5, issue #82; four buttons as of
+        // issue #167): a fixed-width pill, not measured text.
         let toggles = 2.0 * TOGGLE_PAD_X
             + TOGGLE_MOUSE_SIDE
             + TOGGLE_GAP
             + TOGGLE_CLOUD_SIDE
             + TOGGLE_GAP
-            + TOGGLE_QUEUE_SIDE;
+            + TOGGLE_CLICK_THROUGH_SIDE
+            + TOGGLE_GAP
+            + TOGGLE_ALWAYS_ON_TOP_SIDE;
 
         // Three gaps between the outer horizontal's four direct children
         // (timer, dps, dmg, toggle cluster).
@@ -5875,63 +6075,85 @@ mod tests {
         );
     }
 
-    /// Share and Reset (issue #82) are real buttons now, painted at
-    /// `TOGGLE_ACTIVE_COLOR`; only the still-inert queue gauge's check
-    /// glyph keeps the source's `OffBrush="#1fff"` tint.
+    /// Share and Reset (issue #82) always paint at `TOGGLE_ACTIVE_COLOR`;
+    /// click-through and always-on-top (issue #167) paint at
+    /// `toggle_state_tint` of their default `Settings` value — off
+    /// (`TOGGLE_OFF_COLOR`) for click-through, on (`TOGGLE_ACTIVE_COLOR`)
+    /// for always-on-top.
     #[test]
-    fn the_toggle_cluster_renders_two_active_buttons_and_one_inert_gauge() {
+    fn the_toggle_cluster_renders_every_button_at_its_state_tint() {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         ctx.run_ui(egui::RawInput::default(), |_ui| {})
             .drop_without_applying_deltas();
         let icons = Icons::load(&ctx);
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
         let share = icons.glyphs.get(GlyphIcon::Share).unwrap().id();
         let reset = icons.toolbar.get(ToolbarIcon::Reset).unwrap().id();
-        let check = icons.glyphs.get(GlyphIcon::Check).unwrap().id();
+        let click_through = icons.glyphs.get(GlyphIcon::MouseOff).unwrap().id();
+        let always_on_top = icons.glyphs.get(GlyphIcon::CloudOff).unwrap().id();
 
         let mut blits = Vec::new();
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         for clipped in &output.shapes {
             collect_image_texture_tints(&clipped.shape, &mut blits);
         }
         output.drop_without_applying_deltas();
 
-        for expected in [share, reset] {
-            let tint = blits
-                .iter()
-                .find(|(id, _)| *id == expected)
-                .map(|(_, c)| *c);
+        let tint_of = |id: egui::TextureId| blits.iter().find(|(t, _)| *t == id).map(|(_, c)| *c);
+        for expected in [share, reset, always_on_top] {
             assert_eq!(
-                tint,
+                tint_of(expected),
                 Some(TOGGLE_ACTIVE_COLOR),
                 "{expected:?} was not blitted at TOGGLE_ACTIVE_COLOR: {blits:?}"
             );
         }
-        let check_tint = blits.iter().find(|(id, _)| *id == check).map(|(_, c)| *c);
         assert_eq!(
-            check_tint,
+            tint_of(click_through),
             Some(TOGGLE_OFF_COLOR),
-            "the queue gauge's check glyph was not blitted at TOGGLE_OFF_COLOR: {blits:?}"
+            "click-through defaults to off, so it must blit at TOGGLE_OFF_COLOR: {blits:?}"
         );
     }
 
-    /// The queue gauge stays strictly non-interactive (issue #62, #82): no
-    /// click handling, no hover cursor, no tooltip that implies it works.
-    /// Share and Reset, by contrast, must each expose exactly one `Button`
-    /// accesskit node — so the tree has exactly two, never three.
+    /// All four toggle-cluster controls (issue #167: Share, Reset,
+    /// click-through, always-on-top) are real buttons — the tree must
+    /// expose exactly four `Button` accesskit nodes, with no leftover
+    /// inert decoration (the old queue gauge this replaced never exposed
+    /// one at all).
     #[test]
-    fn the_queue_gauge_stays_inert_while_share_and_reset_are_real_buttons() {
+    fn the_toggle_cluster_exposes_four_buttons() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
 
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         let update = output
             .platform_output
@@ -5946,9 +6168,138 @@ mod tests {
             .filter(|(_, node)| node.role() == egui::accesskit::Role::Button)
             .count();
         assert_eq!(
-            button_count, 2,
-            "expected exactly Share and Reset to expose a Button role, got {button_count}"
+            button_count, 4,
+            "expected Share, Reset, click-through and always-on-top to each expose a Button role, got {button_count}"
         );
+    }
+
+    /// Clicking the click-through button flips `Settings::click_through`,
+    /// sends `ViewportCommand::MousePassthrough` with the new value, and
+    /// persists the change (issue #167).
+    #[test]
+    fn clicking_click_through_toggles_and_persists_it() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        assert!(!settings.click_through);
+        let (tx_settings, rx_settings) = crossbeam_channel::unbounded();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let pos = accessible_rect_for_label(&update, "Click-through: off").center();
+        layout.drop_without_applying_deltas();
+
+        let output = ctx.run_ui(click_at(pos), |ui| {
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
+        });
+        let commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
+        output.drop_without_applying_deltas();
+
+        assert!(settings.click_through, "the click must flip the flag on");
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::MousePassthrough(true))),
+            "the click must request MousePassthrough(true): {commands:?}"
+        );
+        let persisted = rx_settings.try_recv().expect("the click must persist");
+        assert!(persisted.click_through);
+    }
+
+    /// Clicking the always-on-top button flips `Settings::always_on_top`,
+    /// sends `ViewportCommand::WindowLevel(Normal)` (it starts on, so a
+    /// click turns it off), and persists the change (issue #167).
+    #[test]
+    fn clicking_always_on_top_toggles_and_persists_it() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        assert!(settings.always_on_top);
+        let (tx_settings, rx_settings) = crossbeam_channel::unbounded();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let pos = accessible_rect_for_label(&update, "Always on top: on").center();
+        layout.drop_without_applying_deltas();
+
+        let output = ctx.run_ui(click_at(pos), |ui| {
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
+        });
+        let commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
+        output.drop_without_applying_deltas();
+
+        assert!(!settings.always_on_top, "the click must flip the flag off");
+        assert!(
+            commands.iter().any(|cmd| matches!(
+                cmd,
+                egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal)
+            )),
+            "the click must request WindowLevel(Normal): {commands:?}"
+        );
+        let persisted = rx_settings.try_recv().expect("the click must persist");
+        assert!(!persisted.always_on_top);
     }
 
     /// Clicking the Share button fires the screenshot capture request; the
@@ -5961,9 +6312,20 @@ mod tests {
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
         let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         let update = layout
             .platform_output
@@ -5974,7 +6336,16 @@ mod tests {
         layout.drop_without_applying_deltas();
 
         let output = ctx.run_ui(click_at(share_pos), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         let commands = output
             .viewport_output
@@ -6005,9 +6376,20 @@ mod tests {
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
         let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         let update = layout
             .platform_output
@@ -6018,7 +6400,16 @@ mod tests {
         layout.drop_without_applying_deltas();
 
         let output = ctx.run_ui(click_at(reset_pos), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         let commands = output
             .viewport_output
@@ -6061,9 +6452,20 @@ mod tests {
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         let update = layout
             .platform_output
@@ -6078,9 +6480,18 @@ mod tests {
             ..Default::default()
         };
 
-        let fills_while_hovered = |capturing: bool| -> Vec<egui::Color32> {
+        let mut fills_while_hovered = |capturing: bool| -> Vec<egui::Color32> {
             let output = ctx.run_ui(hover_input(), |ui| {
-                toggle_cluster(ui, &tx_command, &icons, capturing);
+                toggle_cluster(
+                    ui,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    capturing,
+                );
             });
             let mut fills = Vec::new();
             for clipped in &output.shapes {
@@ -6134,10 +6545,21 @@ mod tests {
         ctx.global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
         let icons = Icons::load(&ctx);
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
         const SHARE_LABEL: &str = "Copy screenshot to clipboard";
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         let update = layout
             .platform_output
@@ -6152,9 +6574,18 @@ mod tests {
             ..Default::default()
         };
 
-        let texts_while_hovered = |capturing: bool| -> Vec<String> {
+        let mut texts_while_hovered = |capturing: bool| -> Vec<String> {
             let output = ctx.run_ui(hover_input(), |ui| {
-                toggle_cluster(ui, &tx_command, &icons, capturing);
+                toggle_cluster(
+                    ui,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    capturing,
+                );
             });
             let mut texts = Vec::new();
             for clipped in &output.shapes {
@@ -6650,6 +7081,37 @@ mod tests {
             !capturing,
             "the guard must clear via the timeout fallback when the reply never lands"
         );
+    }
+
+    // -- toggle_cluster: click-through / always-on-top (issue #167) --------
+
+    #[test]
+    fn toggle_state_tint_is_active_color_when_on() {
+        assert_eq!(toggle_state_tint(true), TOGGLE_ACTIVE_COLOR);
+    }
+
+    #[test]
+    fn toggle_state_tint_is_off_color_when_off() {
+        assert_eq!(toggle_state_tint(false), TOGGLE_OFF_COLOR);
+    }
+
+    /// The escape hatch: a hotkey press must flip `click_through`,
+    /// regardless of which state it was in — this is the only way back
+    /// once `MousePassthrough(true)` has made the toggle button itself
+    /// unclickable. See `click_through_after_hotkey`'s doc comment.
+    #[test]
+    fn click_through_after_hotkey_flips_on_a_press() {
+        assert!(click_through_after_hotkey(false, true));
+        assert!(!click_through_after_hotkey(true, true));
+    }
+
+    /// An idle frame (no hotkey press) must leave `click_through` exactly
+    /// as it found it, in either state — this is what keeps the hotkey
+    /// from fighting the toggle button's own clicks on every other frame.
+    #[test]
+    fn click_through_after_hotkey_holds_steady_with_no_press() {
+        assert!(!click_through_after_hotkey(false, false));
+        assert!(click_through_after_hotkey(true, false));
     }
 
     // -- handle_share_screenshot (the `OverlayApp::ui` sequencing itself) ---
@@ -8424,7 +8886,7 @@ mod tests {
             visible_columns: ColumnKind::ALL.to_vec(),
             window_position: None,
             window_size: None,
-            opacity: 1.0,
+            ..Settings::default()
         };
         settings.toggle(ColumnKind::Dps);
         let cols = settings.ordered_columns();
