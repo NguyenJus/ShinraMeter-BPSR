@@ -45,18 +45,24 @@ pub use bpsr_protocol::map::{map_class, map_kind};
 // slots. See `crates/app/src/imagines.rs` and the plan's D2/D4 and the spec's
 // "Many-to-one is expected" section for why dedup is keyed on the whole
 // `Imagine` value (equivalently, its `icon`) rather than `name` or raw id.
-/// Walks `skill_ids` in wire order, resolves each through
-/// [`imagines::imagine_of_skill_id`], skips unknown ids (they must never
-/// occupy a slot), and dedups by the resolved `Imagine` value so that variant
-/// ids sharing one canonical Imagine collapse to a single slot even when
-/// their own `name` differs from the canonical one (e.g. `102651`/`102655`
-/// vs. `3905`). Returns the *representative skill id* — the first id seen for
-/// each distinct Imagine — for up to two distinct Imagines, in wire order.
-fn imagine_slots(skill_ids: &[i32]) -> [Option<i32>; 2] {
-    let mut slots: [Option<i32>; 2] = [None, None];
+/// Walks `skill_ids` (each a `(skill_id, remodel_level)` pair — `remodel_level`
+/// is the tier field issues #169/#170 thread through, BPSR-ZDPS's `Tier`) in
+/// wire order, resolves each id through [`imagines::imagine_of_skill_id`],
+/// skips unknown ids (they must never occupy a slot), and dedups by the
+/// resolved `Imagine` value so that variant ids sharing one canonical
+/// Imagine collapse to a single slot even when their own `name` differs
+/// from the canonical one (e.g. `102651`/`102655` vs. `3905`). Returns two
+/// parallel arrays — the *representative skill id* and that same id's own
+/// tier, both from the first occurrence seen for each distinct Imagine —
+/// for up to two distinct Imagines, in wire order. A dedup'd-away variant's
+/// tier is never consulted: only the representative occurrence's tier ever
+/// reaches a slot.
+fn imagine_slots(skill_ids: &[(i32, i32)]) -> ([Option<i32>; 2], [Option<i32>; 2]) {
+    let mut ids: [Option<i32>; 2] = [None, None];
+    let mut tiers: [Option<i32>; 2] = [None, None];
     let mut seen: Vec<imagines::Imagine> = Vec::with_capacity(2);
 
-    for &id in skill_ids {
+    for &(id, tier) in skill_ids {
         let Some(imagine) = imagines::imagine_of_skill_id(id) else {
             continue;
         };
@@ -64,33 +70,38 @@ fn imagine_slots(skill_ids: &[i32]) -> [Option<i32>; 2] {
             continue;
         }
         let slot_index = seen.len();
-        if slot_index >= slots.len() {
+        if slot_index >= ids.len() {
             break;
         }
         seen.push(imagine);
-        slots[slot_index] = Some(id);
+        ids[slot_index] = Some(id);
+        tiers[slot_index] = Some(tier);
     }
 
-    slots
+    (ids, tiers)
 }
 
 /// Translates a `bpsr_protocol::ProtocolEvent` into the meter's mirror
 /// event. Delegates the field-for-field mapping to `bpsr_protocol::map`
 /// (issue #146's finding 2 — shared with the offline sanitizer binary),
-/// resolving only the app-specific `imagines` slot pair here first, since
-/// the Imagine catalog (`crate::imagines`) is out of scope for that crate.
+/// resolving only the app-specific `imagines`/`imagine_tiers` slot pairs
+/// here first, since the Imagine catalog (`crate::imagines`) is out of
+/// scope for that crate.
 pub fn map_event(ev: proto::ProtocolEvent, now_ms: u64) -> meter::ProtocolEvent {
     // IMAGINE-TAKEDOWN: empty `skill_ids` means the attr was absent from
     // this packet, so stay `None` rather than `Some([None, None])` — the
     // meter's merge rule (T4) must not clobber a previously cached pair
-    // with an absent packet.
-    let imagines = match &ev {
+    // with an absent packet. Same rule applies to `imagine_tiers` (issues
+    // #169/#170): it is `Some` exactly when `imagines` is `Some`, never
+    // independently.
+    let (imagines, imagine_tiers) = match &ev {
         proto::ProtocolEvent::Player(p) if !p.skill_ids.is_empty() => {
-            Some(imagine_slots(&p.skill_ids))
+            let (ids, tiers) = imagine_slots(&p.skill_ids);
+            (Some(ids), Some(tiers))
         }
-        _ => None,
+        _ => (None, None),
     };
-    bpsr_protocol::map::map_event(ev, now_ms, imagines)
+    bpsr_protocol::map::map_event(ev, now_ms, imagines, imagine_tiers)
 }
 
 /// What one cross-session cache knows about its own file: the snapshot its
@@ -651,6 +662,7 @@ mod tests {
                 ability_score: Some(9_999),
                 season_strength: Some(3_333),
                 imagines: None,
+                imagine_tiers: None,
             })
         );
     }
@@ -660,6 +672,8 @@ mod tests {
         // 3905 and 102640 are both the canonical Boar Imagine (see the spec's
         // "Many-to-one is expected" section); 3926 is a distinct Imagine.
         // 999_999_999 is not in the curated table and must not consume slot 2.
+        // Tiers (issues #169/#170) are deliberately distinct per id so a
+        // wrong-slot or wrong-source tier mixup would fail this assertion.
         let mapped = map_event(
             proto::ProtocolEvent::Player(proto::PlayerInfo {
                 uid: 7,
@@ -668,7 +682,7 @@ mod tests {
                 ability_score: None,
                 season_level: None,
                 season_strength: None,
-                skill_ids: vec![3905, 102640, 3926, 999_999_999],
+                skill_ids: vec![(3905, 1), (102640, 4), (3926, 3), (999_999_999, 9)],
             }),
             0,
         );
@@ -676,6 +690,7 @@ mod tests {
             panic!("expected a player event");
         };
         assert_eq!(p.imagines, Some([Some(3905), Some(3926)]));
+        assert_eq!(p.imagine_tiers, Some([Some(1), Some(3)]));
     }
 
     #[test]
@@ -696,6 +711,7 @@ mod tests {
             panic!("expected a player event");
         };
         assert_eq!(p.imagines, None);
+        assert_eq!(p.imagine_tiers, None);
     }
 
     #[test]
@@ -1132,9 +1148,18 @@ mod tests {
     mod imagine_slots_classification {
         use super::*;
 
+        /// `ids` with an implicit tier of 0 each — for tests that only care
+        /// about id classification, not tier.
+        fn ids_only(ids: &[i32]) -> Vec<(i32, i32)> {
+            ids.iter().map(|&id| (id, 0)).collect()
+        }
+
         #[test]
         fn two_distinct_imagines_fill_both_slots_in_wire_order() {
-            assert_eq!(imagine_slots(&[3926, 3905]), [Some(3926), Some(3905)]);
+            assert_eq!(
+                imagine_slots(&ids_only(&[3926, 3905])),
+                ([Some(3926), Some(3905)], [Some(0), Some(0)])
+            );
         }
 
         #[test]
@@ -1143,21 +1168,24 @@ mod tests {
             // names that diverge from the canonical 3905 ("Stunt! Boarrier
             // Rush"), so this only passes if dedup is keyed on the resolved
             // `Imagine` (== icon), not on `name` or raw skill id.
-            let ids = [3905, 102640, 102651, 102655, 102658, 3926];
-            assert_eq!(imagine_slots(&ids), [Some(3905), Some(3926)]);
+            let ids = ids_only(&[3905, 102640, 102651, 102655, 102658, 3926]);
+            assert_eq!(imagine_slots(&ids).0, [Some(3905), Some(3926)]);
         }
 
         #[test]
         fn a_name_divergent_variant_still_collapses_with_its_canonical_pair() {
             // 2002840 ("Arcane! Swift Vortex") is a variant of the canonical
             // 3926 ("Arcane! Meteor Shower") and shares its icon.
-            assert_eq!(imagine_slots(&[3926, 2002840]), [Some(3926), None]);
+            assert_eq!(
+                imagine_slots(&ids_only(&[3926, 2002840])).0,
+                [Some(3926), None]
+            );
         }
 
         #[test]
         fn unknown_ids_are_skipped_and_never_consume_a_slot() {
             assert_eq!(
-                imagine_slots(&[999_999_999, 3905, -1, 3926]),
+                imagine_slots(&ids_only(&[999_999_999, 3905, -1, 3926])).0,
                 [Some(3905), Some(3926)]
             );
         }
@@ -1166,12 +1194,49 @@ mod tests {
         fn more_than_two_known_imagines_truncates_to_the_first_two() {
             // 3905, 3926, and a third distinct Imagine (3901) — only the
             // first two distinct Imagines seen should occupy slots.
-            assert_eq!(imagine_slots(&[3905, 3926, 3901]), [Some(3905), Some(3926)]);
+            assert_eq!(
+                imagine_slots(&ids_only(&[3905, 3926, 3901])).0,
+                [Some(3905), Some(3926)]
+            );
         }
 
         #[test]
         fn an_empty_list_yields_two_empty_slots() {
-            assert_eq!(imagine_slots(&[]), [None, None]);
+            assert_eq!(imagine_slots(&[]), ([None, None], [None, None]));
+        }
+
+        // -- Tier narrowing (issues #169/#170) -------------------------------
+
+        /// Each equipped slot must carry the tier that was paired with its
+        /// own representative skill id in the wire-order list, not some
+        /// other slot's tier or an unrelated default.
+        #[test]
+        fn each_slot_carries_its_own_equipped_ids_tier() {
+            assert_eq!(
+                imagine_slots(&[(3905, 2), (3926, 5)]),
+                ([Some(3905), Some(3926)], [Some(2), Some(5)])
+            );
+        }
+
+        /// Dedup keeps the *first* occurrence of a many-to-one group's
+        /// representative id (see `the_boar_variant_group_dedups_...`
+        /// above) — its tier must come from that same first occurrence,
+        /// not a later variant's.
+        #[test]
+        fn dedup_keeps_the_first_seen_variants_tier() {
+            // 102640 is a Boar variant of the canonical 3905.
+            assert_eq!(
+                imagine_slots(&[(3905, 1), (102640, 4)]),
+                ([Some(3905), None], [Some(1), None])
+            );
+        }
+
+        #[test]
+        fn a_zero_tier_is_kept_as_a_real_value_not_dropped() {
+            assert_eq!(
+                imagine_slots(&[(3905, 0)]),
+                ([Some(3905), None], [Some(0), None])
+            );
         }
     }
 }

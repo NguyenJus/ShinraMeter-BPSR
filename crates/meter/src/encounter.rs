@@ -101,6 +101,10 @@ struct NameEntry {
     season_strength: Option<u32>,
     // IMAGINE-TAKEDOWN: part of the imagines field chain (see plan D4 #5).
     imagines: Option<[Option<i32>; 2]>,
+    /// Each equipped slot's tier (issues #169/#170). Cached alongside
+    /// `imagines` for the same reason and under the same live-wins rule —
+    /// see `apply_cached_attrs`/`name_upsert`.
+    imagine_tiers: Option<[Option<i32>; 2]>,
     seq: u64,
 }
 
@@ -116,17 +120,20 @@ struct CachedAttrs {
     season_strength: Option<u32>,
     // IMAGINE-TAKEDOWN: part of the imagines field chain (see plan D4 #5).
     imagines: Option<[Option<i32>; 2]>,
+    /// Each equipped slot's tier (issues #169/#170) — see `NameEntry`'s
+    /// field of the same name.
+    imagine_tiers: Option<[Option<i32>; 2]>,
 }
 
-/// Copies the five cacheable identity fields (name/class/ability_score/
-/// season_strength/imagines) from `merged` onto `stats`, one at a time,
-/// skipping any field `merged` has no opinion on (issue #145 finding 6: this
-/// list used to be duplicated between `apply_player`'s existing-row and
-/// preload branches, so adding a sixth cached field meant editing both). A
-/// freshly `PlayerStats::new` row starts with every one of these fields at
-/// `None`, so the per-field guard is a no-op there — this same guarded copy
-/// is exactly equivalent to an unconditional one for a fresh row, which is
-/// what lets both branches share it.
+/// Copies the six cacheable identity fields (name/class/ability_score/
+/// season_strength/imagines/imagine_tiers) from `merged` onto `stats`, one
+/// at a time, skipping any field `merged` has no opinion on (issue #145
+/// finding 6: this list used to be duplicated between `apply_player`'s
+/// existing-row and preload branches, so adding a sixth cached field meant
+/// editing both). A freshly `PlayerStats::new` row starts with every one of
+/// these fields at `None`, so the per-field guard is a no-op there — this
+/// same guarded copy is exactly equivalent to an unconditional one for a
+/// fresh row, which is what lets both branches share it.
 fn apply_cached_attrs(stats: &mut PlayerStats, merged: CachedAttrs) {
     if merged.name.is_some() {
         stats.name = merged.name;
@@ -142,6 +149,9 @@ fn apply_cached_attrs(stats: &mut PlayerStats, merged: CachedAttrs) {
     }
     if merged.imagines.is_some() {
         stats.imagines = merged.imagines;
+    }
+    if merged.imagine_tiers.is_some() {
+        stats.imagine_tiers = merged.imagine_tiers;
     }
 }
 
@@ -343,6 +353,7 @@ impl Meter {
                     ability_score: None,
                     season_strength: None,
                     imagines: None,
+                    imagine_tiers: None,
                     seq,
                 },
             );
@@ -396,6 +407,7 @@ impl Meter {
                 ability_score: entry.ability_score,
                 season_strength: entry.season_strength,
                 imagines: entry.imagines,
+                imagine_tiers: entry.imagine_tiers,
             }
         })
     }
@@ -423,6 +435,9 @@ impl Meter {
         if incoming.imagines.is_some() {
             entry.imagines = incoming.imagines;
         }
+        if incoming.imagine_tiers.is_some() {
+            entry.imagine_tiers = incoming.imagine_tiers;
+        }
         entry.seq = seq;
         CachedAttrs {
             name: entry.name.clone(),
@@ -430,6 +445,7 @@ impl Meter {
             ability_score: entry.ability_score,
             season_strength: entry.season_strength,
             imagines: entry.imagines,
+            imagine_tiers: entry.imagine_tiers,
         }
     }
 
@@ -1131,6 +1147,7 @@ impl Meter {
                 ability_score: p.ability_score,
                 season_strength: p.season_strength,
                 imagines: p.imagines,
+                imagine_tiers: p.imagine_tiers,
             },
         );
         if let Some(stats) = self.players.get_mut(&p.uid) {
@@ -1627,6 +1644,7 @@ impl Meter {
                     ability_score: p.ability_score,
                     season_strength: p.season_strength,
                     imagines: p.imagines.unwrap_or_default(),
+                    imagine_tiers: p.imagine_tiers.unwrap_or_default(),
                     damage: p.total_damage,
                     dps,
                     share_pct,
@@ -1938,6 +1956,7 @@ mod tests {
             ability_score: None,
             season_strength: None,
             imagines: None,
+            imagine_tiers: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].name, "Foo");
@@ -1952,6 +1971,7 @@ mod tests {
             ability_score: None,
             season_strength: None,
             imagines: None,
+            imagine_tiers: None,
         })
     }
 
@@ -2303,6 +2323,7 @@ mod tests {
             ability_score: Some(45_000),
             season_strength: None,
             imagines: None,
+            imagine_tiers: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].ability_score, Some(45_000));
@@ -2318,6 +2339,7 @@ mod tests {
             ability_score: Some(1000),
             season_strength: None,
             imagines: None,
+            imagine_tiers: None,
         }));
         m.apply(&dmg(3, 100, 0));
         m.reset(ResetReason::Manual, 1000);
@@ -2340,6 +2362,7 @@ mod tests {
             ability_score: None,
             season_strength: None,
             imagines: Some([Some(3905), None]),
+            imagine_tiers: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].imagines, [Some(3905), None]);
@@ -2359,6 +2382,7 @@ mod tests {
             ability_score: None,
             season_strength: None,
             imagines: Some([Some(3905), Some(102640)]),
+            imagine_tiers: None,
         }));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
             uid: 9,
@@ -2367,6 +2391,7 @@ mod tests {
             ability_score: None,
             season_strength: None,
             imagines: None,
+            imagine_tiers: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].imagines, [Some(3905), Some(102640)]);
@@ -2386,6 +2411,7 @@ mod tests {
             ability_score: None,
             season_strength: None,
             imagines: Some([Some(3905), Some(102640)]),
+            imagine_tiers: None,
         }));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
             uid: 9,
@@ -2394,6 +2420,7 @@ mod tests {
             ability_score: None,
             season_strength: None,
             imagines: Some([None, None]),
+            imagine_tiers: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].imagines, [None, None]);
@@ -2420,6 +2447,7 @@ mod tests {
             ability_score: None,
             season_strength: Some(12_345),
             imagines: None,
+            imagine_tiers: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].season_strength, Some(12_345));
@@ -2435,6 +2463,7 @@ mod tests {
             ability_score: None,
             season_strength: Some(999),
             imagines: None,
+            imagine_tiers: None,
         }));
         m.apply(&dmg(4, 100, 0));
         m.reset(ResetReason::Manual, 1000);
@@ -2660,6 +2689,7 @@ mod tests {
                 ability_score: None,
                 season_strength: None,
                 imagines: None,
+                imagine_tiers: None,
             }));
             m.apply(&dmg(5, 100, 1000));
 
@@ -2681,6 +2711,7 @@ mod tests {
                 ability_score: None,
                 season_strength: None,
                 imagines: None,
+                imagine_tiers: None,
             }));
             m.apply(&dmg(5, 100, 1000));
 
@@ -2707,6 +2738,7 @@ mod tests {
                 ability_score: None,
                 season_strength: None,
                 imagines: None,
+                imagine_tiers: None,
             }));
             m.apply(&dmg(5, 100, 1000));
 
@@ -2719,6 +2751,7 @@ mod tests {
                 ability_score: None,
                 season_strength: None,
                 imagines: None,
+                imagine_tiers: None,
             }));
 
             let snap = m.snapshot(2000);
@@ -2770,6 +2803,7 @@ mod tests {
                 ability_score: None,
                 season_strength: None,
                 imagines: None,
+                imagine_tiers: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
                 uid: 2,
@@ -2778,6 +2812,7 @@ mod tests {
                 ability_score: None,
                 season_strength: None,
                 imagines: None,
+                imagine_tiers: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
                 uid: 3,
@@ -2786,6 +2821,7 @@ mod tests {
                 ability_score: None,
                 season_strength: None,
                 imagines: None,
+                imagine_tiers: None,
             }));
             // Re-touch uid 1 so it becomes the most recently used, ahead of
             // 3 and 2 (in that order).
@@ -2796,6 +2832,7 @@ mod tests {
                 ability_score: None,
                 season_strength: None,
                 imagines: None,
+                imagine_tiers: None,
             }));
 
             let before = m.names_for_save();
@@ -2823,6 +2860,7 @@ mod tests {
                 ability_score: None,
                 season_strength: None,
                 imagines: None,
+                imagine_tiers: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
                 uid: 2,
@@ -2831,6 +2869,7 @@ mod tests {
                 ability_score: None,
                 season_strength: None,
                 imagines: None,
+                imagine_tiers: None,
             }));
 
             let saved = m.names_for_save();
@@ -2848,6 +2887,7 @@ mod tests {
                 ability_score: None,
                 season_strength: None,
                 imagines: None,
+                imagine_tiers: None,
             }));
             m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 1000 });
 
@@ -3423,6 +3463,7 @@ mod tests {
                 ability_score: None,
                 season_strength: None,
                 imagines: None,
+                imagine_tiers: None,
             }));
             m.apply(&dmg(1, 100, 0));
             m.reset(ResetReason::Manual, 1000);
@@ -3914,6 +3955,7 @@ mod tests {
                 ability_score: None,
                 season_strength: None,
                 imagines: None,
+                imagine_tiers: None,
             }));
             m.apply(&dmg(1, 100, 0));
             m.apply(&dmg(1, 100, 100_000));

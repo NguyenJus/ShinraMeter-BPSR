@@ -304,7 +304,7 @@ fn skill_level_id_list_attr_on_entity_decodes_into_player_info() {
     assert_eq!(events.len(), 1);
     match &events[0] {
         ProtocolEvent::Player(p) => {
-            assert_eq!(p.skill_ids, vec![3905, 102640, 71000]);
+            assert_eq!(p.skill_ids, vec![(3905, 0), (102640, 0), (71000, 0)]);
         }
         other => panic!("expected Player, got {other:?}"),
     }

@@ -47,10 +47,19 @@ pub fn map_class(class: Class) -> meter::Class {
 /// is an app-level, UI-facing concern this protocol crate has no business
 /// knowing about — `bpsr-protocol`'s own caller (`sanitize-dump`) always
 /// passes `None`.
+///
+/// `imagine_tiers` (issues #169/#170) is each equipped slot's tier
+/// (`remodel_level`), positionally paired with `imagines` the same way — a
+/// `Some` at index `i` in `imagines` should have its tier, if known, at the
+/// same index `i` in `imagine_tiers`. Kept as a second parallel array
+/// rather than folded into `imagines`'s element type so the well-established
+/// `[Option<i32>; 2]` id shape (and every existing caller/test of it) is
+/// undisturbed by tier's addition.
 pub fn map_event(
     ev: ProtocolEvent,
     now_ms: u64,
     imagines: Option<[Option<i32>; 2]>,
+    imagine_tiers: Option<[Option<i32>; 2]>,
 ) -> meter::ProtocolEvent {
     match ev {
         ProtocolEvent::Damage(d) => meter::ProtocolEvent::Damage(meter::DamageEvent {
@@ -75,6 +84,7 @@ pub fn map_event(
             ability_score: p.ability_score,
             season_strength: p.season_strength,
             imagines,
+            imagine_tiers,
         }),
         ProtocolEvent::EnemyHp(e) => meter::ProtocolEvent::EnemyHp(meter::EnemyHp {
             uid: e.uid,

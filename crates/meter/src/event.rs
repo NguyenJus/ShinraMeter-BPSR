@@ -174,6 +174,15 @@ pub struct PlayerInfo {
     /// `name_upsert` already applies to `ability_score`/`season_strength`.
     // IMAGINE-TAKEDOWN: part of the imagines field chain (see plan D4 #5).
     pub imagines: Option<[Option<i32>; 2]>,
+    /// Each equipped slot's tier (`remodel_level`, issues #169/#170;
+    /// BPSR-ZDPS calls it `Tier`), positionally paired with `imagines` —
+    /// index `i` here is `imagines[i]`'s tier, if known. Same `None`/
+    /// `Some([None, None])` semantics as `imagines`: `None` means no `0x74`
+    /// packet has been seen yet, so a cached pair must not be clobbered.
+    /// Kept as a separate field rather than folded into `imagines`'s
+    /// element type to leave that already-established `[Option<i32>; 2]`
+    /// id shape (and its many existing callers/tests) undisturbed.
+    pub imagine_tiers: Option<[Option<i32>; 2]>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

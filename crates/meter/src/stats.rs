@@ -20,6 +20,10 @@ pub struct PlayerStats {
     /// `event::PlayerInfo::imagines` for the full merge-rule doc.
     // IMAGINE-TAKEDOWN: part of the imagines field chain (see plan D4 #5).
     pub imagines: Option<[Option<i32>; 2]>,
+    /// Each equipped slot's tier (issues #169/#170). See
+    /// `event::PlayerInfo::imagine_tiers` for the full merge-rule doc —
+    /// mirrors `imagines`'s `None`/`Some` semantics one-for-one.
+    pub imagine_tiers: Option<[Option<i32>; 2]>,
     pub total_damage: i64,
     pub hits: u64,
     pub crit_hits: u64,
@@ -46,6 +50,7 @@ impl PlayerStats {
             ability_score: None,
             season_strength: None,
             imagines: None,
+            imagine_tiers: None,
             total_damage: 0,
             hits: 0,
             crit_hits: 0,
@@ -92,6 +97,10 @@ pub struct PlayerRow {
     /// missing packet (that distinction lives on `PlayerStats::imagines`).
     // IMAGINE-TAKEDOWN: part of the imagines field chain (see plan D4 #5).
     pub imagines: [Option<i32>; 2],
+    /// Each equipped slot's tier (issues #169/#170), positionally paired
+    /// with `imagines` — always exactly two slots, `None` per-slot meaning
+    /// empty/unresolved/unknown, same convention as `imagines` itself.
+    pub imagine_tiers: [Option<i32>; 2],
     pub damage: i64,
     pub dps: f64,
     pub share_pct: f32,

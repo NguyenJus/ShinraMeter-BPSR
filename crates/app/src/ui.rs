@@ -280,9 +280,9 @@ fn demo_enabled_from(var: Option<&str>) -> bool {
     var.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
 }
 
-/// `(name, class, damage, crit_pct, lucky_pct, hits, deaths, imagines)` for
-/// one `DEMO_ROWS` entry. Named so the array below reads as one type, not
-/// clippy's `type_complexity` bait.
+/// `(name, class, damage, crit_pct, lucky_pct, hits, deaths, imagines,
+/// imagine_tiers)` for one `DEMO_ROWS` entry. Named so the array below
+/// reads as one type, not clippy's `type_complexity` bait.
 type DemoRow = (
     &'static str,
     Class,
@@ -292,10 +292,12 @@ type DemoRow = (
     u64,
     u32,
     [Option<i32>; 2],
+    [Option<i32>; 2],
 );
 
-/// `(name, class, damage, crit_pct, lucky_pct, hits, deaths, imagines)` for
-/// each demo row, in descending-damage order (issue #148). A realistic
+/// `(name, class, damage, crit_pct, lucky_pct, hits, deaths, imagines,
+/// imagine_tiers)` for each demo row, in descending-damage order (issue
+/// #148). A realistic
 /// dungeon/raid comp — one tank (`Thudd`, blue `ShieldKnight`), one healer
 /// (`Fizz`, green `VerdantOracle`), three damage dealers — rather than five
 /// DPS rows, per `Class::role()`. The *names* are deliberately fictional,
@@ -325,6 +327,11 @@ type DemoRow = (
 /// Imagine pair can never drift apart — reordering `DEMO_ROWS` carries its
 /// Imagines along, and there is no second array whose length or order could
 /// silently disagree.
+///
+/// `imagine_tiers` (issues #169/#170) is each slot's demo tier, positionally
+/// paired with `imagines`. `Glorbaxian`'s first slot is deliberately pinned
+/// at `IMAGINE_MAX_TIER` so the demo capture actually shows the gold ring
+/// doing real work, not just the tooltip text.
 const DEMO_ROWS: [DemoRow; 5] = [
     (
         "Blorp",
@@ -335,6 +342,7 @@ const DEMO_ROWS: [DemoRow; 5] = [
         150,
         0,
         [Some(3901), Some(3902)],
+        [Some(3), Some(1)],
     ),
     (
         "Glorbaxian",
@@ -345,6 +353,7 @@ const DEMO_ROWS: [DemoRow; 5] = [
         180,
         1,
         [Some(3903), Some(3904)],
+        [Some(IMAGINE_MAX_TIER), Some(2)],
     ),
     (
         "Zog",
@@ -355,6 +364,7 @@ const DEMO_ROWS: [DemoRow; 5] = [
         210,
         0,
         [Some(3905), Some(3906)],
+        [Some(0), Some(4)],
     ),
     (
         "Thudd",
@@ -365,6 +375,7 @@ const DEMO_ROWS: [DemoRow; 5] = [
         540,
         0,
         [Some(3907), Some(3908)],
+        [Some(1), Some(1)],
     ),
     (
         "Fizz",
@@ -375,6 +386,7 @@ const DEMO_ROWS: [DemoRow; 5] = [
         90,
         0,
         [Some(3909), None],
+        [Some(2), None],
     ),
 ];
 
@@ -394,7 +406,20 @@ fn demo_snapshot() -> Snapshot {
         .iter()
         .enumerate()
         .map(
-            |(i, &(name, class, damage, crit_pct, lucky_pct, hits, deaths, imagine_ids))| {
+            |(
+                i,
+                &(
+                    name,
+                    class,
+                    damage,
+                    crit_pct,
+                    lucky_pct,
+                    hits,
+                    deaths,
+                    imagine_ids,
+                    imagine_tiers,
+                ),
+            )| {
                 PlayerRow {
                     uid: i as i64 + 1,
                     name: name.to_string(),
@@ -402,6 +427,7 @@ fn demo_snapshot() -> Snapshot {
                     ability_score: None,
                     season_strength: None,
                     imagines: imagine_ids,
+                    imagine_tiers,
                     damage,
                     dps: damage as f64 / (duration_ms as f64 / 1000.0),
                     share_pct: damage as f32 / row_damage_sum as f32 * 100.0,
@@ -3367,24 +3393,33 @@ fn draw_row(
     //
     // The two Imagine slots (issue #33): a filled slot paints the equipped
     // Imagine's icon (pre-masked to a circle at asset-prep time, so no
-    // runtime clip is needed) with a name tooltip on hover; an empty slot,
-    // an id outside the curated table, or a texture that failed to decode
-    // all degrade to the same blank-circle placeholder — one branch, never
-    // a panic (D4's runtime-degrade path).
+    // runtime clip is needed) with a name+tier tooltip on hover (issue
+    // #169) and a gold ring at max tier (issue #170); an empty slot, an id
+    // outside the curated table, or a texture that failed to decode all
+    // degrade to the same blank-circle placeholder — one branch, never a
+    // panic (D4's runtime-degrade path).
     for (i, slot) in imagine_slots.into_iter().enumerate() {
         let filled = row.imagines[i]
             .and_then(imagines::imagine_of_skill_id)
             .and_then(|im| icons.imagines.get(im.icon).map(|texture| (im, texture)));
         match filled {
             Some((im, texture)) => {
+                let tier = row.imagine_tiers[i];
                 ui.painter()
                     .image(texture.id(), slot, UV_FULL, CLASS_ICON_TINT);
+                if imagine_ring_visible(tier) {
+                    ui.painter().circle_stroke(
+                        slot.center(),
+                        IMAGINE_SIZE / 2.0,
+                        egui::Stroke::new(IMAGINE_MAX_TIER_RING_WIDTH, IMAGINE_MAX_TIER_RING_COLOR),
+                    );
+                }
                 ui.interact(
                     slot,
                     ui.id().with(("imagine", row.uid, i)),
                     egui::Sense::hover(),
                 )
-                .on_hover_text(im.name);
+                .on_hover_text(imagine_hover_text(im.name, tier));
             }
             None => {
                 ui.painter()
@@ -3757,6 +3792,58 @@ const IMAGINE_GUTTER_WIDTH: f32 = 2.0 * (IMAGINE_GAP + IMAGINE_SIZE);
 /// undecoded-texture Imagine slot paints instead of an icon — in the same
 /// register as `CLASS_ICON_TINT`.
 const IMAGINE_SLOT_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x55, 0x55, 0x55);
+
+/// Highest Imagine tier (issues #169/#170), the gate for the gold ring
+/// `draw_row` paints around a filled, maxed-out slot.
+///
+/// **Inferred, not directly observed.** This repo's only real packet
+/// capture (`crates/app/tests/fixtures/dump-2976-boss-fight.jsonl.zst`)
+/// happened to carry no nonzero `remodel_level` samples at all — see
+/// `attrs::decode_skill_ids`'s doc comment — so neither whether the wire
+/// value is 0-based or 1-based, nor whether `5` is truly the ceiling, has
+/// been seen in the wild. `5` is taken from BPSR-ZDPS's own domain naming
+/// (`Tier`) alone. `decode_skill_ids` logs the first live nonzero
+/// `remodel_level` it observes at `debug`, specifically so a real capture's
+/// log file can eventually confirm or correct this constant.
+///
+/// The ring predicate (`imagine_ring_visible`) gates on `tier >=
+/// IMAGINE_MAX_TIER` rather than `tier == IMAGINE_MAX_TIER` on purpose: if
+/// live tiers turn out to run higher than 5 (this constant is wrong-low),
+/// `>=` still fires once the real max is reached instead of never firing;
+/// the failure mode of `>=` under a wrong-high guess is merely "no ring
+/// yet" until data proves otherwise, never a stuck-wrong ring.
+const IMAGINE_MAX_TIER: i32 = 5;
+
+/// Stroke color of the gold/yellow ring `draw_row` paints around a
+/// filled Imagine slot at `IMAGINE_MAX_TIER` (issue #170). Exact value is
+/// implementation's call per the issue — a warm gold distinct from
+/// `CLASS_ICON_TINT`'s neutral light gray so it reads as a deliberate
+/// highlight, not a tint variation.
+const IMAGINE_MAX_TIER_RING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xFF, 0xD7, 0x00);
+
+/// Width of the gold max-tier ring's stroke (issue #170). Thin enough not
+/// to visually enlarge the 14pt `IMAGINE_SIZE` slot it circles.
+const IMAGINE_MAX_TIER_RING_WIDTH: f32 = 1.5;
+
+/// Hover-tooltip text for an equipped Imagine slot (issue #169): the plain
+/// `name` when `tier` is absent or the wire-default `0` (proto3's
+/// omit-when-default means "no tier observed yet" and "tier is genuinely
+/// zero" are indistinguishable on the wire, so both read as "nothing to
+/// add"), otherwise `"{name} · Tier {tier}"`.
+fn imagine_hover_text(name: &str, tier: Option<i32>) -> String {
+    match tier {
+        Some(t) if t > 0 => format!("{name} · Tier {t}"),
+        _ => name.to_string(),
+    }
+}
+
+/// Whether a filled Imagine slot should get the gold max-tier ring (issue
+/// #170): `tier >= IMAGINE_MAX_TIER`. `None` (unresolved/no tier data) and
+/// any tier below the max both yield `false` — see `IMAGINE_MAX_TIER`'s doc
+/// comment for why this is `>=` rather than `==`.
+fn imagine_ring_visible(tier: Option<i32>) -> bool {
+    tier.is_some_and(|t| t >= IMAGINE_MAX_TIER)
+}
 
 /// Fixed left-hand gutter `draw_row` reserves for the class icon plus its
 /// two Imagine slots (issue #33): a margin, the class icon, the Imagine
@@ -4183,6 +4270,64 @@ mod tests {
     use crate::settings::{ColumnKind, Settings};
     use bpsr_meter::Class;
 
+    // -- Imagine tier hover text / gold ring (issues #169/#170) -------------
+
+    #[test]
+    fn imagine_hover_text_plain_name_when_tier_is_zero() {
+        assert_eq!(
+            imagine_hover_text("Stunt! Boarrier Rush", Some(0)),
+            "Stunt! Boarrier Rush"
+        );
+    }
+
+    #[test]
+    fn imagine_hover_text_plain_name_when_tier_is_unresolved() {
+        assert_eq!(
+            imagine_hover_text("Stunt! Boarrier Rush", None),
+            "Stunt! Boarrier Rush"
+        );
+    }
+
+    #[test]
+    fn imagine_hover_text_appends_tier_when_positive() {
+        assert_eq!(
+            imagine_hover_text("Stunt! Boarrier Rush", Some(3)),
+            "Stunt! Boarrier Rush · Tier 3"
+        );
+    }
+
+    #[test]
+    fn imagine_hover_text_appends_max_tier() {
+        assert_eq!(
+            imagine_hover_text("Stunt! Boarrier Rush", Some(IMAGINE_MAX_TIER)),
+            "Stunt! Boarrier Rush · Tier 5"
+        );
+    }
+
+    #[test]
+    fn imagine_ring_visible_false_when_tier_unresolved() {
+        assert!(!imagine_ring_visible(None));
+    }
+
+    #[test]
+    fn imagine_ring_visible_false_below_max_tier() {
+        assert!(!imagine_ring_visible(Some(IMAGINE_MAX_TIER - 1)));
+        assert!(!imagine_ring_visible(Some(0)));
+    }
+
+    #[test]
+    fn imagine_ring_visible_true_at_max_tier() {
+        assert!(imagine_ring_visible(Some(IMAGINE_MAX_TIER)));
+    }
+
+    /// Gated `>=` rather than `==` (see `IMAGINE_MAX_TIER`'s doc comment):
+    /// if live data ever shows a tier above the guessed max, the ring
+    /// should still fire rather than silently stop.
+    #[test]
+    fn imagine_ring_visible_true_above_max_tier() {
+        assert!(imagine_ring_visible(Some(IMAGINE_MAX_TIER + 1)));
+    }
+
     // -- demo_enabled_from (issue #91) --------------------------------------
 
     #[test]
@@ -4250,7 +4395,7 @@ mod tests {
     /// would have caught.
     #[test]
     fn every_demo_row_imagine_id_resolves_to_a_known_icon_with_bytes() {
-        for &(name, _, _, _, _, _, _, ids) in &DEMO_ROWS {
+        for &(name, _, _, _, _, _, _, ids, _) in &DEMO_ROWS {
             for id in ids.into_iter().flatten() {
                 let imagine = imagines::imagine_of_skill_id(id)
                     .unwrap_or_else(|| panic!("{name:?}'s Imagine id {id} is not curated"));
@@ -4280,6 +4425,7 @@ mod tests {
             .find(|row| row.name == "Glorbaxian")
             .expect("demo snapshot must include Glorbaxian");
         assert_eq!(glorbaxian.imagines, [Some(3903), Some(3904)]);
+        assert_eq!(glorbaxian.imagine_tiers, [Some(IMAGINE_MAX_TIER), Some(2)]);
     }
 
     /// Issue #148: the demo header used to show a `total_damage`/`total_dps`
@@ -6888,6 +7034,7 @@ mod tests {
             ability_score,
             season_strength: None,
             imagines: [None, None],
+            imagine_tiers: [None, None],
         }
     }
 
@@ -7563,6 +7710,7 @@ mod tests {
             ability_score: Some(99_999),
             season_strength: Some(9_999),
             imagines: [Some(99_999), Some(99_999)],
+            imagine_tiers: [Some(IMAGINE_MAX_TIER), Some(IMAGINE_MAX_TIER)],
         };
 
         for (kind, column) in ColumnKind::ALL

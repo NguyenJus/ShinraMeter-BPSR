@@ -1092,6 +1092,7 @@ mod tests {
             ability_score: None,
             season_strength: None,
             imagines: [None, None],
+            imagine_tiers: [None, None],
         };
         assert_eq!((ColumnKind::Deaths.spec().text)(&row), "12");
     }
