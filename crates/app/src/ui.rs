@@ -586,8 +586,16 @@ impl eframe::App for OverlayApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
-                    .fill(PANEL_FILL)
-                    .stroke(egui::Stroke::new(PANEL_BORDER_WIDTH, PANEL_BORDER_COLOR))
+                    // Issue #166: the opacity slider (in the header's
+                    // Columns/settings dropdown, `draw_header_menu`) scales
+                    // the background fill and border chrome only — row
+                    // text, icons, and stat-pill colors are untouched (see
+                    // `scaled`'s doc comment).
+                    .fill(scaled(PANEL_FILL, self.settings.opacity))
+                    .stroke(egui::Stroke::new(
+                        PANEL_BORDER_WIDTH,
+                        scaled(PANEL_BORDER_COLOR, self.settings.opacity),
+                    ))
                     .corner_radius(egui::CornerRadius::same(PANEL_CORNER_RADIUS)),
             )
             .show(ui, |ui| {
@@ -2577,6 +2585,36 @@ fn draw_header_menu(
 
     ui.separator();
 
+    // Issue #166: its own labelled section (not nested inside the Columns
+    // disclosure above) since it toggles a single overlay-wide value rather
+    // than a per-column list — a `CollapsingHeader` would just be an extra
+    // click for something that's already only one control. Placed in the
+    // header's settings dropdown, alongside Columns, rather than the
+    // header's toggle-cluster pill (a separate, unrelated header surface —
+    // see `toggle_cluster` — that a different issue is changing in
+    // parallel).
+    ui.label("Opacity");
+    let mut opacity = settings.opacity;
+    let opacity_response = ui.add(
+        egui::Slider::new(&mut opacity, Settings::OPACITY_MIN..=Settings::OPACITY_MAX)
+            .show_value(false),
+    );
+    if opacity_response.changed() {
+        // Applied immediately (same frame): `draw_header_menu` mutates the
+        // caller's `&mut Settings` in place, and `OverlayApp::ui` reads
+        // `self.settings.opacity` fresh when it builds the panel `Frame`
+        // right after `draw_header` returns — no extra repaint request
+        // needed, unlike an async round trip such as the Share screenshot's.
+        settings.set_opacity(opacity);
+        // Same persistence path as the Columns checkboxes just above:
+        // blocking file IO stays off this render thread, and a dropped
+        // writer thread just leaves the in-memory value correct for the
+        // rest of this session.
+        let _ = tx_settings.send(settings.clone());
+    }
+
+    ui.separator();
+
     // Issue #131: the escape hatch for a stale learned boss name (e.g. after
     // a game patch changes a dungeon's final boss) — see
     // `scene_bosses_cache`'s doc comment for why nothing invalidates the
@@ -4146,6 +4184,43 @@ const PANEL_BORDER_COLOR: egui::Color32 =
 const PANEL_BORDER_WIDTH: f32 = 1.0;
 /// `TopmostBorderStyle`'s `CornerRadius="8"`.
 const PANEL_CORNER_RADIUS: u8 = 8;
+
+/// Scales `color` down by `opacity` (issue #166's opacity slider) so it
+/// reads as more transparent, without changing its unmultiplied hue —
+/// see the premultiplied-alpha explanation below for why that means
+/// scaling all four stored channels, not just the stored alpha byte.
+/// `opacity` is clamped to `0.0..=1.0` here as well as at
+/// `Settings::set_opacity`/load time — belt-and-braces, since this is the
+/// last step before a color actually reaches the screen.
+///
+/// Only ever applied to background/chrome colors (`PANEL_FILL`,
+/// `PANEL_BORDER_COLOR`) at their `CentralPanel` `Frame` call site, never to
+/// row text, icons, or stat-pill colors — the slider is meant to fade the
+/// backdrop out from under the numbers, not the numbers themselves.
+///
+/// `Color32` stores its channels *premultiplied* (`.r()`/`.g()`/`.b()`
+/// return `unmultiplied_rgb * alpha`, not the raw unmultiplied color — see
+/// the "Internally this uses ... premultiplied alpha" doc on `Color32`
+/// itself). Scaling *only* the stored alpha byte here and rebuilding via an
+/// unmultiplied constructor would therefore premultiply a second time and
+/// darken the RGB far more than intended. The fix is to scale all four
+/// stored bytes — r, g, b, *and* a — by the same `opacity` factor and
+/// rebuild with `from_rgba_premultiplied` (which stores its bytes as
+/// given, no further premultiplication): since stored_rgb ==
+/// unmultiplied_rgb * stored_alpha, scaling both by `opacity` yields
+/// unmultiplied_rgb * (stored_alpha * opacity) — exactly the same
+/// unmultiplied color at a lower alpha, which is what "more transparent"
+/// is supposed to mean.
+fn scaled(color: egui::Color32, opacity: f32) -> egui::Color32 {
+    let opacity = opacity.clamp(0.0, 1.0);
+    let scale = |channel: u8| (channel as f32 * opacity).round() as u8;
+    egui::Color32::from_rgba_premultiplied(
+        scale(color.r()),
+        scale(color.g()),
+        scale(color.b()),
+        scale(color.a()),
+    )
+}
 /// Height of `draw_header`'s stat-pill / window-control row — the source's
 /// `Height="22"` stat pills. Named because `apply_theme` installs it as
 /// `interact_size.y` *and* `default_inner_height` budgets for it; reading
@@ -7880,6 +7955,63 @@ mod tests {
         );
     }
 
+    // -- opacity slider alpha scaling (issue #166) --------------------------
+
+    /// Opacity 1.0 (the pre-issue-166 default) must be an exact no-op on
+    /// every existing chrome color — nobody who hasn't touched the new
+    /// slider should see so much as a rounding-error difference.
+    #[test]
+    fn scaled_at_full_opacity_is_a_no_op_on_every_existing_color() {
+        for color in [
+            PANEL_FILL,
+            PANEL_BORDER_COLOR,
+            egui::Color32::WHITE,
+            egui::Color32::BLACK,
+            egui::Color32::TRANSPARENT,
+            egui::Color32::from_rgba_unmultiplied(10, 20, 30, 40),
+        ] {
+            assert_eq!(scaled(color, 1.0), color, "{color:?}");
+        }
+    }
+
+    #[test]
+    fn scaled_scales_the_alpha_channel_proportionally() {
+        let half = scaled(PANEL_FILL, 0.5);
+        assert_eq!(half.a(), (PANEL_FILL.a() as f32 * 0.5).round() as u8);
+    }
+
+    /// `Color32`'s stored RGB is premultiplied by alpha (`stored_rgb ==
+    /// unmultiplied_rgb * stored_alpha`), so preserving the same
+    /// unmultiplied hue at a lower alpha means the *stored* RGB bytes must
+    /// shrink right alongside the stored alpha byte, by the same factor —
+    /// not stay pinned at their full-opacity values (which would double-
+    /// premultiply and darken the color far more than the slider asked
+    /// for).
+    #[test]
+    fn scaled_shrinks_stored_rgb_by_the_same_factor_as_alpha() {
+        let scaled_color = scaled(PANEL_FILL, 0.3);
+        assert_eq!(
+            scaled_color.r(),
+            (PANEL_FILL.r() as f32 * 0.3).round() as u8
+        );
+        assert_eq!(
+            scaled_color.g(),
+            (PANEL_FILL.g() as f32 * 0.3).round() as u8
+        );
+        assert_eq!(
+            scaled_color.b(),
+            (PANEL_FILL.b() as f32 * 0.3).round() as u8
+        );
+    }
+
+    #[test]
+    fn scaled_at_the_opacity_floor_still_leaves_some_alpha() {
+        // `Settings::OPACITY_MIN` (0.2) applied to the fully opaque border —
+        // never all the way down to fully invisible chrome.
+        let dimmed = scaled(egui::Color32::from_rgba_unmultiplied(1, 2, 3, 255), 0.2);
+        assert_eq!(dimmed.a(), 51); // (255.0 * 0.2).round()
+    }
+
     // -- share bar role coloring (issue #44) --------------------------------
     //
     // Confirms the answer to issue #44's second open question directly:
@@ -8039,6 +8171,7 @@ mod tests {
             visible_columns: ColumnKind::ALL.to_vec(),
             window_position: None,
             window_size: None,
+            opacity: 1.0,
         };
         settings.toggle(ColumnKind::Dps);
         let cols = settings.ordered_columns();

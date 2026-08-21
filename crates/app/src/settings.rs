@@ -246,6 +246,35 @@ pub struct Settings {
     /// all and still deserializes.
     #[serde(default)]
     pub window_size: Option<[f32; 2]>,
+    /// Overlay-wide panel opacity (issue #166): a single multiplier applied
+    /// to the alpha channel of the panel's background fill and chrome (its
+    /// border stroke) — see `ui::scaled_alpha`, `ui::PANEL_FILL`,
+    /// `ui::PANEL_BORDER_COLOR`. Deliberately *not* applied to row/text
+    /// alpha, so dragging this down dims the backdrop rather than the stats
+    /// drawn on top of it.
+    ///
+    /// Clamped to `OPACITY_MIN..=OPACITY_MAX` (0.2..=1.0) both on every
+    /// `set_opacity` call and on load (`sanitized`), so neither a slider
+    /// drag nor a hand-edited settings.json can ever make the overlay fully
+    /// transparent and unrecoverable — at that point there is no chrome
+    /// left to find the slider with.
+    ///
+    /// `#[serde(default = "default_opacity")]` is the same back-compat
+    /// guarantee `window_position`/`window_size` make with `#[serde(default)]`:
+    /// a settings.json written before issue #166 has no `opacity` key at
+    /// all and still deserializes. A named default function is used instead
+    /// of `Option`'s bare `None` because `f32` has no single sensible
+    /// `Default::default()` here — `0.0` would render every existing
+    /// user's overlay invisible on their very next launch, exactly the
+    /// silent-upgrade regression this field must not cause.
+    #[serde(default = "default_opacity")]
+    pub opacity: f32,
+}
+
+/// The `opacity` default for a settings.json predating issue #166: fully
+/// opaque, i.e. the fixed look every existing user already sees today.
+fn default_opacity() -> f32 {
+    1.0
 }
 
 impl Default for Settings {
@@ -265,6 +294,7 @@ impl Default for Settings {
             ],
             window_position: None,
             window_size: None,
+            opacity: default_opacity(),
         }
     }
 }
@@ -284,6 +314,14 @@ const POSITION_EPSILON: f32 = 1.0;
 const SIZE_EPSILON: f32 = 1.0;
 
 impl Settings {
+    /// Floor of the `opacity` range (issue #166): low enough to read as
+    /// "mostly see-through", but never 0.0 — the overlay has to stay
+    /// visible enough to find and drag its own opacity slider back up.
+    pub const OPACITY_MIN: f32 = 0.2;
+    /// Ceiling of the `opacity` range: fully opaque, the pre-issue-166
+    /// fixed look.
+    pub const OPACITY_MAX: f32 = 1.0;
+
     /// Whether `col` is currently enabled.
     pub fn is_visible(&self, col: ColumnKind) -> bool {
         self.visible_columns.contains(&col)
@@ -309,6 +347,28 @@ impl Settings {
         } else {
             self.visible_columns.push(col);
         }
+    }
+
+    /// Sets `opacity` to `value`, clamped to `OPACITY_MIN..=OPACITY_MAX`
+    /// (issue #166). Mutates in place, unlike `with_window_position_if_
+    /// changed`/`with_window_size_if_changed`'s copy-on-change idiom:
+    /// those exist to *detect* whether a per-frame report is a real change
+    /// worth persisting, but an egui `Slider`'s `changed()` already answers
+    /// that question for opacity, so there is no equivalent detection work
+    /// left for this method to do.
+    pub fn set_opacity(&mut self, value: f32) {
+        self.opacity = Self::clamp_opacity(value);
+    }
+
+    /// Clamps `value` into `OPACITY_MIN..=OPACITY_MAX`. Handles non-finite
+    /// input explicitly: `f32::clamp` compares with `<`/`>`, both of which
+    /// are false against NaN, so `NaN.clamp(min, max)` would otherwise pass
+    /// NaN straight through instead of landing in range.
+    fn clamp_opacity(value: f32) -> f32 {
+        if !value.is_finite() {
+            return Self::OPACITY_MAX;
+        }
+        value.clamp(Self::OPACITY_MIN, Self::OPACITY_MAX)
     }
 
     /// Returns an updated copy with `window_position` set to `position`, or
@@ -355,6 +415,12 @@ impl Settings {
         if self.visible_columns.is_empty() {
             self.visible_columns = Self::default().visible_columns;
         }
+        // Issue #166: an out-of-range (or hand-edited-to-NaN) `opacity`
+        // must be repaired on load too, not only on the next slider drag —
+        // `set_opacity` is not called during deserialization, so this is
+        // the only place a loaded value gets clamped before it ever
+        // reaches rendering.
+        self.opacity = Self::clamp_opacity(self.opacity);
         self
     }
 }
@@ -553,6 +619,7 @@ mod tests {
             visible_columns: vec![ColumnKind::Damage],
             window_position: None,
             window_size: None,
+            opacity: default_opacity(),
         };
 
         settings.toggle(ColumnKind::Damage);
@@ -640,6 +707,7 @@ mod tests {
             visible_columns: vec![],
             window_position: None,
             window_size: None,
+            opacity: default_opacity(),
         };
         assert_eq!(settings.sanitized(), Settings::default());
     }
@@ -944,12 +1012,99 @@ mod tests {
         assert_eq!(updated.window_size, Some([640.0, 480.0]));
     }
 
+    // -- opacity (issue #166) ------------------------------------------
+
+    #[test]
+    fn default_opacity_is_fully_opaque() {
+        // Existing users must see no change on upgrade: a settings.json
+        // predating issue #166 has no `opacity` key, and the freshly
+        // installed default must render exactly as opaque as it always has.
+        assert_eq!(Settings::default().opacity, 1.0);
+    }
+
+    #[test]
+    fn round_trip_preserves_opacity() {
+        let path = temp_settings_path("opacity-roundtrip");
+        let mut settings = Settings::default();
+        settings.set_opacity(0.6);
+        save_to(&path, &settings);
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded, settings);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A settings.json written before issue #166 (no `opacity` key at all)
+    /// must still deserialize — the same `#[serde(default = "...")]`
+    /// back-compat guarantee `window_position`/`window_size` make, just
+    /// with a named default function instead of `Option`'s `None` since
+    /// `f32` has no single sensible `Default::default()` for this field
+    /// (`0.0` would render the overlay invisible on upgrade).
+    #[test]
+    fn settings_json_without_opacity_key_falls_back_to_default() {
+        let path = temp_settings_path("no-opacity-key");
+        fs::write(&path, br#"{"visible_columns":["Damage","Dps","SharePct"]}"#)
+            .expect("write pre-#166 fixture");
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded.opacity, 1.0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_opacity_clamps_below_the_floor() {
+        let mut settings = Settings::default();
+        settings.set_opacity(0.0);
+        // Floored at `OPACITY_MIN`, not 0.0: a fully transparent panel has
+        // no chrome left to drag the slider back up with, so the slider
+        // itself must never be able to make the overlay disappear.
+        assert_eq!(settings.opacity, Settings::OPACITY_MIN);
+    }
+
+    #[test]
+    fn set_opacity_clamps_above_the_ceiling() {
+        let mut settings = Settings::default();
+        settings.set_opacity(2.5);
+        assert_eq!(settings.opacity, Settings::OPACITY_MAX);
+    }
+
+    /// Guards the pure clamp helper directly against a NaN drag value (an
+    /// egui `Slider` should never hand one back, but the clamp is the last
+    /// line of defense against ending up with an unusable, comparison-proof
+    /// opacity either way — `NaN.clamp()` alone would silently pass NaN
+    /// through unchanged).
+    #[test]
+    fn set_opacity_clamps_a_nan_value() {
+        let mut settings = Settings::default();
+        settings.set_opacity(f32::NAN);
+        assert_eq!(settings.opacity, Settings::OPACITY_MAX);
+    }
+
+    /// A hand-edited (or otherwise corrupted) settings.json with an
+    /// out-of-range `opacity` must be clamped on load, not merely on the
+    /// next slider drag — `sanitized()` is what `load_from` always runs a
+    /// freshly deserialized `Settings` through.
+    #[test]
+    fn loading_settings_json_with_an_out_of_range_opacity_clamps_it() {
+        let path = temp_settings_path("out-of-range-opacity");
+        fs::write(&path, br#"{"visible_columns":["Damage"],"opacity":5.0}"#)
+            .expect("write fixture");
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded.opacity, Settings::OPACITY_MAX);
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn ordered_columns_follows_canonical_order_regardless_of_toggle_order() {
         let mut a = Settings {
             visible_columns: vec![ColumnKind::Damage],
             window_position: None,
             window_size: None,
+            opacity: default_opacity(),
         };
         a.toggle(ColumnKind::Hits);
         a.toggle(ColumnKind::CritPct);
@@ -958,6 +1113,7 @@ mod tests {
             visible_columns: vec![ColumnKind::Damage],
             window_position: None,
             window_size: None,
+            opacity: default_opacity(),
         };
         b.toggle(ColumnKind::CritPct);
         b.toggle(ColumnKind::Hits);
@@ -1065,6 +1221,7 @@ mod tests {
             visible_columns: ColumnKind::ALL.to_vec(),
             window_position: None,
             window_size: None,
+            opacity: default_opacity(),
         };
         assert_eq!(all.ordered_columns().last(), Some(&ColumnKind::Deaths));
     }
