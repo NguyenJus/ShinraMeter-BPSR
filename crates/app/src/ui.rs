@@ -3431,6 +3431,17 @@ fn draw_row(
     // wide it rendered. Dimmed relative to the name's own opaque white
     // (`NAME_SUFFIX_ALPHA`) so it reads as secondary metadata trailing the
     // name, not as part of the name itself.
+    //
+    // Deliberately unclipped and never truncated/elided (issue #168
+    // follow-up decision), same as the plain name text above it: a long
+    // name plus both scores is allowed to visually run into the stat
+    // columns rather than lose characters. That is safe specifically
+    // because this paint happens *before* the stat-column loop below —
+    // egui paints shapes in call order, so the columns' own paints land
+    // on top of whatever the suffix already put down, and the row always
+    // reads correctly at the columns' fixed anchors no matter how far the
+    // suffix bleeds under them. Do not add a clip rect or a length cap
+    // here — that would be undoing this decision, not fixing an oversight.
     if let Some(suffix) = name_suffix(row, layout.settings) {
         paint_text(
             ui.painter(),
@@ -3876,6 +3887,15 @@ fn row_name(row: &PlayerRow) -> String {
 /// brackets, no leading space — when neither column is enabled, or both
 /// are enabled but both values are still `None`; `draw_row` paints
 /// nothing extra after the name in either case.
+///
+/// This function never truncates, elides, or otherwise clamps the
+/// returned string to any width budget, and never will — that is an
+/// explicit issue #168 follow-up decision, not an oversight: a long name
+/// plus both scores is allowed to run into (and, since `draw_row` paints
+/// it before the stat-column loop, visually underneath) the stat columns
+/// rather than lose characters. `draw_row`'s own comment at the paint
+/// site has the z-order reasoning; this function's job stays just the
+/// string, in full, every time.
 fn name_suffix(row: &PlayerRow, settings: &Settings) -> Option<String> {
     let mut parts = Vec::new();
     if settings.is_visible(ColumnKind::AbilityScore) {
@@ -7076,6 +7096,24 @@ mod tests {
         settings.toggle(ColumnKind::SeasonStrength);
         let row = sample_score_row(None, None);
         assert_eq!(name_suffix(&row, &settings), None);
+    }
+
+    /// Issue #168 follow-up: the suffix is allowed to visually overlap the
+    /// stat columns rather than being truncated/elided, so `name_suffix`
+    /// itself must never clamp its output to any width or length budget —
+    /// widest-plausible-value in (ability score's real in-game ceiling is
+    /// 5 digits, season strength's is 4, per `ColumnKind::spec`'s doc
+    /// comments) must come back out whole, not cut down to fit anything.
+    #[test]
+    fn name_suffix_is_never_truncated_for_the_widest_plausible_values() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::AbilityScore);
+        settings.toggle(ColumnKind::SeasonStrength);
+        let row = sample_score_row(Some(99_999), Some(9_999));
+        assert_eq!(
+            name_suffix(&row, &settings),
+            Some("[99999 / 9999]".to_string())
+        );
     }
 
     fn window() -> egui::Rect {
