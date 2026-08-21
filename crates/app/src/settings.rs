@@ -80,6 +80,22 @@ impl ColumnKind {
         }
     }
 
+    /// Whether this column renders its value inline with the player's name
+    /// (issue #168) rather than in its own reserved stat-column slot. Only
+    /// `AbilityScore`/`SeasonStrength` do — the doc comment on `ALL` above
+    /// already treats the two as a different kind of column, a static
+    /// gear-score/season-progression snapshot that "reads better next to
+    /// the row's name" than the combat-derived columns; issue #168 acts on
+    /// that by moving them from painting *next to* the name (a leading
+    /// stat column) to painting *as part of* the name text itself.
+    /// `Settings::stat_columns` uses this to exclude both from the
+    /// reserved-width stat-column layout while enabled; `ui`'s
+    /// `name_suffix` composes the value each one leaves behind into the
+    /// name slot instead.
+    pub fn renders_inline_with_name(self) -> bool {
+        matches!(self, ColumnKind::AbilityScore | ColumnKind::SeasonStrength)
+    }
+
     /// This column's fixed on-screen width plus the formatter that renders
     /// its value, handed over together in one `StatColumn` so the two can
     /// never be wired up independently — a new `ColumnKind` cannot reserve
@@ -295,6 +311,22 @@ impl Settings {
         ColumnKind::ALL
             .into_iter()
             .filter(|c| self.is_visible(*c))
+            .collect()
+    }
+
+    /// The enabled columns that still reserve their own stat-column slot
+    /// in the row layout — `ordered_columns` minus whichever of
+    /// `AbilityScore`/`SeasonStrength` are enabled (issue #168: those two
+    /// render inline with the player's name instead, via `ui::
+    /// name_suffix`, so they must not also reserve stat-column width and
+    /// an anchor via `column_anchors`). `draw_rows` calls this — not
+    /// `ordered_columns` — to build the enabled-column set it hands to
+    /// `stat_columns_for`/`column_anchors`. Canonical order is preserved,
+    /// same guarantee as `ordered_columns`.
+    pub fn stat_columns(&self) -> Vec<ColumnKind> {
+        self.ordered_columns()
+            .into_iter()
+            .filter(|c| !c.renders_inline_with_name())
             .collect()
     }
 
@@ -966,6 +998,46 @@ mod tests {
         assert_eq!(
             a.ordered_columns(),
             vec![ColumnKind::Damage, ColumnKind::CritPct, ColumnKind::Hits]
+        );
+    }
+
+    // -- inline name-suffix columns excluded from the layout set (#168) ---
+
+    #[test]
+    fn stat_columns_excludes_ability_score_and_season_strength_when_visible() {
+        let settings = Settings {
+            visible_columns: ColumnKind::ALL.to_vec(),
+            window_position: None,
+            window_size: None,
+        };
+        let stat_columns = settings.stat_columns();
+        assert!(!stat_columns.contains(&ColumnKind::AbilityScore));
+        assert!(!stat_columns.contains(&ColumnKind::SeasonStrength));
+        // Every other enabled column is still present, same canonical
+        // order `ordered_columns` would give it.
+        assert_eq!(
+            stat_columns,
+            vec![
+                ColumnKind::Damage,
+                ColumnKind::Dps,
+                ColumnKind::SharePct,
+                ColumnKind::CritPct,
+                ColumnKind::LuckyPct,
+                ColumnKind::Hits,
+                ColumnKind::Deaths,
+            ]
+        );
+    }
+
+    #[test]
+    fn stat_columns_matches_ordered_columns_when_neither_inline_column_is_visible() {
+        // Neither `AbilityScore` nor `SeasonStrength` is in the default
+        // set, so the two methods agree for it — `stat_columns` only
+        // diverges from `ordered_columns` once one of the two is toggled
+        // on (the test above).
+        assert_eq!(
+            Settings::default().stat_columns(),
+            Settings::default().ordered_columns()
         );
     }
 

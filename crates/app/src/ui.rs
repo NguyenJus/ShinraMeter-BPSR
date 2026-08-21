@@ -658,7 +658,7 @@ impl eframe::App for OverlayApp {
                 // false])`.
                 let rows_top = ui.cursor().top();
                 let rows_area_height = ui.available_height();
-                draw_rows(ui, &self.snapshot, &self.settings.ordered_columns(), icons);
+                draw_rows(ui, &self.snapshot, &self.settings, icons);
                 if screenshot_requested {
                     self.pending_screenshot_bound = Some(rows_content_bottom_y(
                         rows_top,
@@ -3040,13 +3040,18 @@ fn row_content_width(viewport_width: f32, stat_columns_total: f32) -> f32 {
 fn draw_rows(
     ui: &mut egui::Ui,
     snapshot: &Snapshot,
-    columns: &[ColumnKind],
+    settings: &Settings,
     icons: &Icons,
 ) -> egui::Vec2 {
-    // The enabled-column set (and therefore the column widths) is identical
-    // for every row in a frame, so it's computed once here rather than once
-    // per row inside `draw_row`.
-    let stat_columns = stat_columns_for(columns);
+    // `Settings::stat_columns`, not `ordered_columns` (issue #168):
+    // `AbilityScore`/`SeasonStrength`, even when enabled, must not reserve
+    // stat-column width or an anchor here — they render inline with the
+    // name instead (`draw_row`'s `name_suffix` call). The enabled-column
+    // set (and therefore the column widths) is identical for every row in
+    // a frame, so it's computed once here rather than once per row inside
+    // `draw_row`.
+    let columns = settings.stat_columns();
+    let stat_columns = stat_columns_for(&columns);
     let stat_columns_total: f32 = stat_columns.iter().map(|c| c.width).sum();
     let content_width = row_content_width(ui.available_width(), stat_columns_total);
 
@@ -3090,9 +3095,10 @@ fn draw_rows(
                 COLUMN_RIGHT_MARGIN,
             );
             let layout = RowLayout {
-                kinds: columns,
+                kinds: &columns,
                 columns: &stat_columns,
                 anchors: &anchors,
+                settings,
             };
 
             // Issue #73: each row's damage-share bar is now scaled to the
@@ -3297,6 +3303,14 @@ struct RowLayout<'a> {
     kinds: &'a [ColumnKind],
     columns: &'a [StatColumn],
     anchors: &'a [f32],
+    /// Issue #168: `draw_row` needs the live `Settings` (not just `kinds`,
+    /// which now excludes `AbilityScore`/`SeasonStrength` — see
+    /// `Settings::stat_columns`) to compose the name-suffix text via
+    /// `name_suffix`. Bundled into `RowLayout` alongside the three fields
+    /// above for the same reason they are: keeps `draw_row`'s own argument
+    /// count under clippy's limit rather than adding a fourth loose
+    /// parameter.
+    settings: &'a Settings,
 }
 
 fn draw_row(
@@ -3398,7 +3412,7 @@ fn draw_row(
     // comes from color, and the name is already the brightest thing left of
     // the stat columns at plain white.
     let name = row_name(row);
-    paint_text(
+    let name_rect = paint_text(
         ui.painter(),
         rect.left_center() + egui::vec2(name_offset, 0.0),
         egui::Align2::LEFT_CENTER,
@@ -3407,6 +3421,27 @@ fn draw_row(
         egui::Color32::WHITE,
         false,
     );
+    // Issue #168: `AbilityScore`/`SeasonStrength`, when enabled, paint as a
+    // bracketed suffix immediately after the name rather than as their own
+    // stat columns — `layout.kinds` already excludes both
+    // (`Settings::stat_columns`), so this is the one place their value
+    // reaches the screen. Painted from `name_rect.right_center()` (the
+    // real painted extent `paint_text` just handed back, not a fixed
+    // offset), so the suffix always starts flush against the name however
+    // wide it rendered. Dimmed relative to the name's own opaque white
+    // (`NAME_SUFFIX_ALPHA`) so it reads as secondary metadata trailing the
+    // name, not as part of the name itself.
+    if let Some(suffix) = name_suffix(row, layout.settings) {
+        paint_text(
+            ui.painter(),
+            name_rect.right_center(),
+            egui::Align2::LEFT_CENTER,
+            &format!(" {suffix}"),
+            regular(FONT_SIZE_ROW),
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, NAME_SUFFIX_ALPHA),
+            false,
+        );
+    }
 
     // Each stat gets its own fixed-width column (issue #8) so a
     // digit-count change (e.g. `9.9K` -> `10.1K`) shifts only that
@@ -3819,6 +3854,49 @@ fn row_name(row: &PlayerRow) -> String {
     }
 }
 
+/// Composes the bracketed suffix `draw_row` paints immediately after the
+/// player name when `AbilityScore` and/or `SeasonStrength` are enabled
+/// (issue #168) — the two columns `Settings::stat_columns` excludes from
+/// the ordinary stat-column layout because they read better folded into
+/// the name slot than laid out as their own leading columns (the same
+/// reasoning `ColumnKind::ALL`'s doc comment already gives for why they
+/// lead the canonical column order, and `ColumnKind::renders_inline_with_
+/// name`'s doc comment restates for this issue specifically).
+///
+/// Format, decided by the issue rather than left to this function: a
+/// single bracketed group, Ability Score first then Season Strength,
+/// joined by `" / "` when both are present (`"[12345 / 678]"`), or just
+/// the one enabled value's own brackets when only one is on
+/// (`"[12345]"`). Each value comes from that column's own `StatColumn::
+/// text` (`ColumnKind::spec`), so the None-is-blank behavior already
+/// documented there carries over unchanged: a `None` reading (no
+/// FIGHT_POINT packet seen yet for this player) produces an empty string
+/// from `text`, which this function treats as "omit this slot" rather
+/// than painting an empty bracket entry. `None` is returned — no
+/// brackets, no leading space — when neither column is enabled, or both
+/// are enabled but both values are still `None`; `draw_row` paints
+/// nothing extra after the name in either case.
+fn name_suffix(row: &PlayerRow, settings: &Settings) -> Option<String> {
+    let mut parts = Vec::new();
+    if settings.is_visible(ColumnKind::AbilityScore) {
+        let text = (ColumnKind::AbilityScore.spec().text)(row);
+        if !text.is_empty() {
+            parts.push(text);
+        }
+    }
+    if settings.is_visible(ColumnKind::SeasonStrength) {
+        let text = (ColumnKind::SeasonStrength.spec().text)(row);
+        if !text.is_empty() {
+            parts.push(text);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("[{}]", parts.join(" / ")))
+    }
+}
+
 /// Compact damage/DPS abbreviation (issue #118): `999`, `1.23K`, `12.34K`,
 /// `123.4K`, `1.23M`, `1000K`. Below 1000 raw the value is left as a plain
 /// integer — no suffix, no decimals. At or above 1000 it is scaled by
@@ -3959,6 +4037,14 @@ const ITEM_SPACING_Y: f32 = 2.0;
 /// name" budget.
 const NAME_LEFT_PAD: f32 = 2.0;
 
+/// Alpha `draw_row` paints the `AbilityScore`/`SeasonStrength` name-suffix
+/// text at (issue #168) — a dimmed variant of the name's own opaque white,
+/// so the bracketed score reads as secondary metadata trailing the name
+/// rather than as part of the name itself. `0x99` (~60%) is dim enough to
+/// read as de-emphasized against the name's full white while staying
+/// comfortably legible against the row background.
+const NAME_SUFFIX_ALPHA: u8 = 0x99;
+
 /// Budgeted width for the name itself. `draw_row` paints names unclipped,
 /// regular weight and proportional at `FONT_SIZE_ROW` (issues #56, #62) —
 /// truncation/ellipsis is explicitly out of scope for issue #26 — so this is
@@ -4047,7 +4133,7 @@ const HEADER_ROW_EXTRA_WIDTH: f32 = 20.0;
 /// Issue #33's `IMAGINE_GUTTER_WIDTH` addend widens this the same way: the
 /// name budget stays `150.0` rather than being squeezed to make room.
 fn default_inner_width() -> f32 {
-    let columns_width: f32 = stat_columns_for(&Settings::default().ordered_columns())
+    let columns_width: f32 = stat_columns_for(&Settings::default().stat_columns())
         .iter()
         .map(|c| c.width)
         .sum();
@@ -6930,6 +7016,68 @@ mod tests {
         assert_eq!((column.text)(&row), "12345678");
     }
 
+    // -- name_suffix (issue #168): AbilityScore/SeasonStrength inline with
+    // the name instead of their own stat column ---------------------------
+
+    fn sample_score_row(ability_score: Option<u32>, season_strength: Option<u32>) -> PlayerRow {
+        PlayerRow {
+            season_strength,
+            ..sample_row(ability_score)
+        }
+    }
+
+    #[test]
+    fn name_suffix_is_none_when_neither_column_is_enabled() {
+        let row = sample_score_row(Some(12345), Some(678));
+        assert_eq!(name_suffix(&row, &Settings::default()), None);
+    }
+
+    #[test]
+    fn name_suffix_shows_ability_score_alone() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::AbilityScore);
+        let row = sample_score_row(Some(12345), Some(678));
+        assert_eq!(name_suffix(&row, &settings), Some("[12345]".to_string()));
+    }
+
+    #[test]
+    fn name_suffix_shows_season_strength_alone() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::SeasonStrength);
+        let row = sample_score_row(Some(12345), Some(678));
+        assert_eq!(name_suffix(&row, &settings), Some("[678]".to_string()));
+    }
+
+    #[test]
+    fn name_suffix_shows_both_ability_score_then_season_strength() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::AbilityScore);
+        settings.toggle(ColumnKind::SeasonStrength);
+        let row = sample_score_row(Some(12345), Some(678));
+        assert_eq!(
+            name_suffix(&row, &settings),
+            Some("[12345 / 678]".to_string())
+        );
+    }
+
+    #[test]
+    fn name_suffix_omits_a_none_value_slot_when_both_enabled() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::AbilityScore);
+        settings.toggle(ColumnKind::SeasonStrength);
+        let row = sample_score_row(None, Some(678));
+        assert_eq!(name_suffix(&row, &settings), Some("[678]".to_string()));
+    }
+
+    #[test]
+    fn name_suffix_is_none_when_both_enabled_but_both_values_are_none() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::AbilityScore);
+        settings.toggle(ColumnKind::SeasonStrength);
+        let row = sample_score_row(None, None);
+        assert_eq!(name_suffix(&row, &settings), None);
+    }
+
     fn window() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(340.0, 220.0))
     }
@@ -8101,7 +8249,7 @@ mod tests {
 
     #[test]
     fn default_inner_width_matches_icon_gutter_plus_name_budget_plus_columns() {
-        let columns_width: f32 = stat_columns_for(&Settings::default().ordered_columns())
+        let columns_width: f32 = stat_columns_for(&Settings::default().stat_columns())
             .iter()
             .map(|c| c.width)
             .sum();
@@ -8126,7 +8274,7 @@ mod tests {
 
     #[test]
     fn default_inner_width_exceeds_the_default_stat_columns_width() {
-        let columns_width: f32 = stat_columns_for(&Settings::default().ordered_columns())
+        let columns_width: f32 = stat_columns_for(&Settings::default().stat_columns())
             .iter()
             .map(|c| c.width)
             .sum();
@@ -8281,7 +8429,7 @@ mod tests {
             meshes: Vec::new(),
         };
         let output = ctx.run_ui(input, |ui| {
-            draw_rows(ui, snapshot, &Settings::default().ordered_columns(), &icons);
+            draw_rows(ui, snapshot, &Settings::default(), &icons);
         });
         for clipped in &output.shapes {
             collect_row_boxes(&clipped.shape, clipped.clip_rect, &mut frame);
@@ -8307,7 +8455,7 @@ mod tests {
         };
         let mut content_size = egui::Vec2::ZERO;
         let output = ctx.run_ui(input, |ui| {
-            content_size = draw_rows(ui, snapshot, &Settings::default().ordered_columns(), &icons);
+            content_size = draw_rows(ui, snapshot, &Settings::default(), &icons);
         });
         output.drop_without_applying_deltas();
         content_size
