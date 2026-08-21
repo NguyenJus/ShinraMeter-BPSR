@@ -1354,13 +1354,9 @@ fn toggle_cluster(
     // other windows, via `ViewportCommand::WindowLevel` — the runtime
     // counterpart to `viewport()`'s hardcoded `.with_always_on_top()`,
     // which only ever sets the *initial* level a fresh process opens with.
-    // No pin/stacking glyph exists in the vendored set (`icons.rs`'s
-    // `GlyphIcon`, and "do not add new asset files" rules out drawing one),
-    // so this reuses `GlyphIcon::CloudOff` — the second status-LED slot the
-    // source reserved and this app never gave a use to (see the section
-    // comment above) — purely as a neutral on/off dot, not for its literal
-    // "cloud" meaning. Persisted to `Settings::always_on_top` the same way
-    // `click_through` is.
+    // `GlyphIcon::Pin` — MDI's pushpin glyph — is a literal fit for
+    // "pinned above other windows". Persisted to `Settings::always_on_top`
+    // the same way `click_through` is.
     let always_on_top_rect = egui::Rect::from_center_size(
         egui::pos2(x + TOGGLE_ALWAYS_ON_TOP_SIDE / 2.0, y),
         egui::Vec2::splat(TOGGLE_ALWAYS_ON_TOP_SIDE),
@@ -1381,9 +1377,9 @@ fn toggle_cluster(
             .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
         let _ = tx_settings.send(settings.clone());
     }
-    if let Some(cloud_off) = icons.glyphs.get(GlyphIcon::CloudOff) {
+    if let Some(pin) = icons.glyphs.get(GlyphIcon::Pin) {
         ui.painter().image(
-            cloud_off.id(),
+            pin.id(),
             always_on_top_rect,
             UV_FULL,
             toggle_state_tint(settings.always_on_top),
@@ -6093,7 +6089,7 @@ mod tests {
         let share = icons.glyphs.get(GlyphIcon::Share).unwrap().id();
         let reset = icons.toolbar.get(ToolbarIcon::Reset).unwrap().id();
         let click_through = icons.glyphs.get(GlyphIcon::MouseOff).unwrap().id();
-        let always_on_top = icons.glyphs.get(GlyphIcon::CloudOff).unwrap().id();
+        let always_on_top = icons.glyphs.get(GlyphIcon::Pin).unwrap().id();
 
         let mut blits = Vec::new();
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {

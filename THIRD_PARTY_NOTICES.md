@@ -128,11 +128,11 @@ WinDivert's LGPL-3.0 option is compatible.
 
 ## Google Material Symbols
 
-- Files: `crates/app/assets/icons/svg/{timer,speed,heart,cloud_off,check}.svg`
+- Files: `crates/app/assets/icons/svg/{timer,speed,heart}.svg`
   and the correspondingly named PNGs under
   `crates/app/assets/icons/glyphs/`
 - Upstream: <https://github.com/google/material-design-icons> — the
-  `timer`, `speed`, `favorite`, `cloud_off` and `check` symbols
+  `timer`, `speed`, and `favorite` symbols
 - Copyright (c) Google LLC
 - License: Apache License 2.0, which is compatible with this project's
   GPL-3.0-only licence.
@@ -146,10 +146,10 @@ WinDivert's LGPL-3.0 option is compatible.
 
 ## Material Design Icons (Pictogrammers)
 
-- Files: `crates/app/assets/icons/svg/{skull,mouse_off,share}.svg` and the
+- Files: `crates/app/assets/icons/svg/{skull,mouse_off,pin,share}.svg` and the
   correspondingly named PNGs under `crates/app/assets/icons/glyphs/`
 - Upstream: <https://github.com/Templarian/MaterialDesign> — the `skull`,
-  `cursor-default-click-outline` (struck-through), and `export` icons
+  `cursor-default-click-outline` (struck-through), `pin`, and `export` icons
 - Copyright (c) Austin Andrews and the Pictogrammers contributors
 - License: Apache License 2.0, which is compatible with this project's
   GPL-3.0-only licence.
