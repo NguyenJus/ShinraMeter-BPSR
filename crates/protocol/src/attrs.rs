@@ -699,6 +699,43 @@ mod tests {
         assert_eq!(decode_skill_ids(&raw), Some(vec![(3905, 3), (102640, 5)]));
     }
 
+    /// Pins `NONZERO_TIER_LOGGED`'s once-per-process gate itself, not just
+    /// `decode_skill_ids`'s returned tuples (which the tests above already
+    /// cover). The gate is a process-global static shared with every other
+    /// test in this binary, so this test resets it immediately before use —
+    /// that makes it the sole observer of the false→true transition instead
+    /// of racing whichever other test (e.g.
+    /// `decode_skill_ids_keeps_nonzero_remodel_level_as_tier`, above) may
+    /// already have tripped it. No production code path ever sets the flag
+    /// back to `false`, so this reset cannot invalidate another test's
+    /// assertions — none of them read the flag.
+    #[test]
+    fn decode_skill_ids_logs_first_nonzero_tier_only_once_per_process() {
+        use std::sync::atomic::Ordering;
+
+        NONZERO_TIER_LOGGED.store(false, Ordering::Relaxed);
+
+        // First sighting of a nonzero remodel_level: the gate's
+        // compare_exchange(false, true) succeeds, flipping it.
+        let raw = encode_skill_list(&[(3905, 3)]);
+        assert_eq!(decode_skill_ids(&raw), Some(vec![(3905, 3)]));
+        assert!(
+            NONZERO_TIER_LOGGED.load(Ordering::Relaxed),
+            "first nonzero remodel_level must flip the gate to logged"
+        );
+
+        // Second sighting: the gate must stay tripped and take the
+        // already-logged branch rather than resetting — a refactor that
+        // reset the flag, or moved the check so it re-evaluates from
+        // scratch per call, would leave this false again.
+        let raw = encode_skill_list(&[(102640, 5)]);
+        assert_eq!(decode_skill_ids(&raw), Some(vec![(102640, 5)]));
+        assert!(
+            NONZERO_TIER_LOGGED.load(Ordering::Relaxed),
+            "gate must remain tripped after a second nonzero remodel_level"
+        );
+    }
+
     #[test]
     fn skill_level_id_list_attr_sets_skill_ids_on_player_info() {
         let attrs = vec![pb::Attr {
