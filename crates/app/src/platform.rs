@@ -1572,6 +1572,75 @@ fn click_through_button_rect() -> Option<Rect> {
     })
 }
 
+/// Issue #183: whether the overlay's window should be OS-level
+/// mouse-passthrough *right now* — the value `ui.rs` reconciles into
+/// `egui::ViewportCommand::MousePassthrough` (winit's `WS_EX_TRANSPARENT`)
+/// once per frame.
+///
+/// Why this exists on top of `window_proc`'s `WM_NCHITTEST` carve-out: an
+/// `HTTRANSPARENT` reply is documented to forward the hit test only to
+/// other windows *in the same thread*. It never hands the click to another
+/// process's window, which is the entire point of click-through for a game
+/// overlay — so the `WM_NCHITTEST` branch alone could not pass a click to
+/// the game underneath no matter how correct its carve-out was, and the
+/// toggle looked enabled while doing nothing. `WS_EX_TRANSPARENT` is the
+/// bit that actually does it.
+///
+/// `WS_EX_TRANSPARENT` was rejected the first time round (see `ui.rs`'s
+/// toggle-cluster section comment) because it is a whole-window flag with
+/// no per-region carve-out, so the very button that turns click-through
+/// back off went unclickable with it. That is what this function solves:
+/// the flag is reconciled *every frame against the OS cursor's own
+/// position*, so while the cursor is inside the published button hit box
+/// the answer is `false` and the button is reachable exactly as before, and
+/// it flips back to `true` the moment the cursor leaves. `OverlayApp::ui`
+/// repaints at ~10Hz unconditionally, which is what keeps that
+/// reconciliation running while the window itself receives no mouse input
+/// at all.
+///
+/// The decision is `click_through_hit_test`'s, not a second copy of it: a
+/// point that would hit-test `Transparent` is exactly a point the window
+/// should not receive. So the safe defaults are shared too — click-through
+/// off, no button rect published yet, or a failed coordinate conversion all
+/// resolve to "not passthrough" rather than stranding the user under a
+/// window they cannot click.
+#[cfg(windows)]
+pub fn click_through_passthrough_wanted() -> bool {
+    use windows::Win32::Foundation::{HWND, POINT};
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let click_through_on = CLICK_THROUGH_ENABLED.load(std::sync::atomic::Ordering::SeqCst);
+    if !click_through_on {
+        return false;
+    }
+    let raw = OVERLAY_HWND.load(std::sync::atomic::Ordering::SeqCst);
+    if raw == 0 {
+        return false;
+    }
+    // `OVERLAY_HWND` stores the handle as a bare integer — the inverse of
+    // `disable_aero_snap`'s store, same as `force_frame_recompute` does.
+    let hwnd = HWND(raw as *mut std::ffi::c_void);
+
+    let mut point = POINT::default();
+    // SAFETY: `point` is a valid, correctly-sized out-param for the
+    // duration of both calls; `hwnd` is the overlay's own window, alive for
+    // the whole process, and `ScreenToClient` overwrites `point` in place
+    // with the client-relative equivalent.
+    let located = unsafe { GetCursorPos(&mut point) }.is_ok()
+        && unsafe { ScreenToClient(hwnd, &mut point) }.as_bool();
+    let button_rect = located.then(click_through_button_rect).flatten();
+    matches!(
+        click_through_hit_test((point.x, point.y), button_rect, true),
+        ClickThroughHitTest::Transparent
+    )
+}
+
+#[cfg(not(windows))]
+pub fn click_through_passthrough_wanted() -> bool {
+    false
+}
+
 /// Takes (checks and clears) a pending tray "Turn off click-through"
 /// request — see `TRAY_CLICK_THROUGH_OFF_REQUESTED`'s doc comment.
 /// `OverlayApp::ui` calls this once per frame.
@@ -2480,10 +2549,15 @@ fn cursor_points(x: i32, y: i32, pixels_per_point: f32) -> egui::Pos2 {
 /// Writes `image` to the system clipboard as an image (issue #82's Share
 /// button — `ui.rs`'s `handle_screenshot_events` calls this once an
 /// `Event::Screenshot` reply arrives). Windows-gated like the rest of this
-/// module, per the app's own convention: it only ships on Windows in
-/// practice, and a failed clipboard write is a `log::warn!`, not a panic —
-/// there is no user-visible failure mode worth surfacing beyond the log for
-/// something this incidental.
+/// module, per the app's own convention.
+///
+/// Issue #183: this used to swallow both failure modes into a `log::warn!`
+/// and return `()`, which is why "the Copy button does nothing" was
+/// indistinguishable from "the Copy button worked" without a log file. It
+/// now returns the failure to the caller, which raises it as a
+/// `StatusLine::Error` banner — the same one-line surface the packet
+/// pipeline's errors already use — so a clipboard that could not be opened
+/// (another process holding it is routine on Windows) says so on screen.
 ///
 /// `arboard::Clipboard::new` opens (and implicitly closes, on `Drop`) a
 /// fresh clipboard handle per call rather than caching one on `OverlayApp`:
@@ -2491,26 +2565,23 @@ fn cursor_points(x: i32, y: i32, pixels_per_point: f32) -> egui::Pos2 {
 /// short-lived handle can never be blamed for holding the system clipboard
 /// open across frames.
 #[cfg(windows)]
-pub fn write_clipboard_image(image: &egui::ColorImage) {
+pub fn write_clipboard_image(image: &egui::ColorImage) -> Result<(), String> {
     let [width, height] = image.size;
     let data = arboard::ImageData {
         width,
         height,
         bytes: std::borrow::Cow::Borrowed(image.as_raw()),
     };
-    match arboard::Clipboard::new() {
-        Ok(mut clipboard) => {
-            if let Err(err) = clipboard.set_image(data) {
-                log::warn!("failed to write the screenshot to the clipboard: {err}");
-            }
-        }
-        Err(err) => log::warn!("failed to open the system clipboard: {err}"),
-    }
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|err| format!("could not open the system clipboard: {err}"))?;
+    clipboard
+        .set_image(data)
+        .map_err(|err| format!("could not write the screenshot to the clipboard: {err}"))
 }
 
 #[cfg(not(windows))]
-pub fn write_clipboard_image(_image: &egui::ColorImage) {
-    log::warn!("clipboard image write is not supported on this platform");
+pub fn write_clipboard_image(_image: &egui::ColorImage) -> Result<(), String> {
+    Err("clipboard image writes are only implemented on Windows".to_string())
 }
 
 /// Issue #171: the manual "Check for updates" header-menu item needs an
