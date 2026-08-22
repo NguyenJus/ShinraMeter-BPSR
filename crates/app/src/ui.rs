@@ -11,7 +11,7 @@
 //! layer, because the app layer has no channel of its own suited to a
 //! single manual, UI-triggered request/reply.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bpsr_meter::{
     Class, EncounterInfo, PlayerRow, Role, SkillRow, SkillStats, Snapshot, skill_row_from_stats,
@@ -161,11 +161,30 @@ pub enum StatusLine {
     Error(String),
 }
 
+/// How long a *transient* `StatusLine::Error` stays up before taking
+/// itself down again (PR #197 review). Long enough to read at a glance,
+/// short enough that a momentary clipboard blip doesn't outlive the
+/// encounter it happened during — see `OverlayApp::status_expires_at` for
+/// which banners expire and which are permanent.
+const TRANSIENT_STATUS_LINGER: Duration = Duration::from_secs(5);
+
 /// The overlay's eframe app: holds the latest snapshot plus the channel
 /// endpoints used to receive updates and send commands.
 pub struct OverlayApp {
     snapshot: Snapshot,
     status: StatusLine,
+    /// When the current `status` banner stops being drawn — `Some` only
+    /// while a *transient* banner is up (PR #197 review). The Share
+    /// clipboard failure `ui()` raises is the only one: Windows hands the
+    /// clipboard out under a lock, so a write can fail purely because some
+    /// other process held it for an instant, and nothing used to clear the
+    /// banner afterwards — no timer, no success path, not even a later
+    /// Share that worked — so one blip left the red line under the header
+    /// for the rest of the session. `None` for `StatusLine::Ok` and for the
+    /// permanent capture-init failure `main.rs` seeds through
+    /// `with_status`, which must stay up forever precisely because it is
+    /// still true on every later frame.
+    status_expires_at: Option<Instant>,
     settings: Settings,
     rx_snapshot: Receiver<Snapshot>,
     tx_command: Sender<UiCommand>,
@@ -674,6 +693,7 @@ impl OverlayApp {
         Self {
             snapshot,
             status: StatusLine::Ok,
+            status_expires_at: None,
             settings,
             rx_snapshot,
             tx_command,
@@ -696,9 +716,43 @@ impl OverlayApp {
         }
     }
 
+    /// Seeds the *permanent* status banner from `main.rs` — today only the
+    /// capture-init failure, which no later frame can undo. Deliberately
+    /// leaves `status_expires_at` at `None`, and that is the whole of what
+    /// exempts this banner from the timeout and from a successful Share
+    /// clearing it (PR #197 review); see `status_expires_at`.
     pub fn with_status(mut self, status: StatusLine) -> Self {
         self.status = status;
         self
+    }
+
+    /// Raises a transient error banner (PR #197 review). It is the expiry
+    /// this stamps alongside the message — not the `StatusLine::Error`
+    /// itself — that marks the banner as one `clear_transient_status` and
+    /// `expire_transient_status` are allowed to take back down.
+    fn raise_transient_status(&mut self, message: String, now: Instant) {
+        self.status = StatusLine::Error(message);
+        self.status_expires_at = Some(now + TRANSIENT_STATUS_LINGER);
+    }
+
+    /// Takes a transient banner down at once — what a Share that *worked*
+    /// does, so a failure followed by a success stops claiming the copy
+    /// failed. A permanent banner carries no expiry, so this leaves it
+    /// exactly where it is.
+    fn clear_transient_status(&mut self) {
+        if self.status_expires_at.take().is_some() {
+            self.status = StatusLine::Ok;
+        }
+    }
+
+    /// The same clear on a timer rather than on a success, for the failure
+    /// no later Share ever follows. Called once per frame from `ui()`,
+    /// which is tick enough: the app repaints unconditionally at ~10Hz
+    /// (`ctx.request_repaint_after` at the end of `ui()`).
+    fn expire_transient_status(&mut self, now: Instant) {
+        if self.status_expires_at.is_some_and(|at| now >= at) {
+            self.clear_transient_status();
+        }
     }
 
     /// Drains `rx_snapshot`, keeping only the most recent snapshot. Demo
@@ -874,9 +928,19 @@ impl eframe::App for OverlayApp {
         // (`StatusLine::Error`, drawn just under the header) rather than
         // swallowed into a log nobody reads, so a Share click that failed no
         // longer looks identical to one that worked.
+        // PR #197 review: raised *transiently*. A locked clipboard is a
+        // momentary condition, so the banner clears itself after
+        // `TRANSIENT_STATUS_LINGER` and is taken down early by the next
+        // Share round trip that lands without an error — it used to be the
+        // only write to `status` after construction, with no reader that
+        // ever reset it, so a single blip stuck for the session.
+        let now = Instant::now();
         if let Some(err) = share_error {
-            self.status = StatusLine::Error(format!("Copy screenshot failed: {err}"));
+            self.raise_transient_status(format!("Copy screenshot failed: {err}"), now);
+        } else if screenshot_event_landed {
+            self.clear_transient_status();
         }
+        self.expire_transient_status(now);
         // Issue #183: reconcile the OS-level mouse passthrough with what
         // click-through wants *this* frame — see `platform::click_through_
         // passthrough_wanted` for why `window_proc`'s `WM_NCHITTEST`
@@ -1749,18 +1813,41 @@ fn click_through_hit_box_px(
 /// itself) both would otherwise paint straight into the image. Applies to
 /// every button in the cluster, not just Share, since `capturing` is one
 /// flag shared by the whole row.
-fn toggle_button(ui: &egui::Ui, rect: egui::Rect, label: &str, capturing: bool) -> egui::Response {
+///
+/// `enabled` (PR #197 review) is the widget's real interactive state, not a
+/// paint hint: `false` drops it to `Sense::hover()`, so it registers no
+/// click and accesskit publishes no `Action::Click`, and reports
+/// `enabled: false` in the `WidgetInfo`, which is what makes a screen
+/// reader announce it as disabled. That is the `add_enabled(..)` behaviour
+/// the History item had back in `draw_header_menu`; gating only the click's
+/// *effect* at the call site left the button sounding perfectly usable
+/// while doing nothing.
+fn toggle_button(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    label: &str,
+    capturing: bool,
+    enabled: bool,
+) -> egui::Response {
     let response = ui.interact(
         rect,
         ui.id().with(("toggle_cluster", label)),
-        egui::Sense::click(),
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
     );
     if response.hovered() && !capturing {
         ui.painter()
             .circle_filled(rect.center(), rect.width() / 2.0 + 2.0, TOGGLE_HOVER_FILL);
     }
     response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label)
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            enabled && response.enabled(),
+            label,
+        )
     });
     if capturing {
         response
@@ -1857,7 +1944,15 @@ fn toggle_cluster(
         egui::Vec2::splat(TOGGLE_MOUSE_SIDE),
     );
     let mut screenshot_requested = false;
-    if toggle_button(ui, share_rect, "Copy screenshot to clipboard", capturing).clicked() {
+    if toggle_button(
+        ui,
+        share_rect,
+        "Copy screenshot to clipboard",
+        capturing,
+        true,
+    )
+    .clicked()
+    {
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         screenshot_requested = true;
@@ -1875,7 +1970,7 @@ fn toggle_cluster(
         egui::pos2(x + TOGGLE_CLOUD_SIDE / 2.0, y),
         egui::Vec2::splat(TOGGLE_CLOUD_SIDE),
     );
-    if toggle_button(ui, reset_rect, "Reset", capturing).clicked() {
+    if toggle_button(ui, reset_rect, "Reset", capturing, true).clicked() {
         let _ = tx_command.try_send(UiCommand::Reset);
     }
     if let Some(reset) = icons.toolbar.get(ToolbarIcon::Reset) {
@@ -1891,11 +1986,15 @@ fn toggle_cluster(
     //
     // The disabled state the menu item carried (`add_enabled(has_history,
     // ..)`, for history off in settings.json or a database that could not be
-    // opened) survives the move as `toggle_state_tint(has_history)` plus an
-    // ignored click — the same dim "off" tint the click-through and
-    // always-on-top buttons wear, which is what "inert" already looks like
-    // in this chrome. The tooltip is what explains it, so the button is
-    // still self-describing rather than silently doing nothing.
+    // opened) survives the move as `toggle_state_tint(has_history)` — the
+    // same dim "off" tint the click-through and always-on-top buttons wear,
+    // which is what "inert" already looks like in this chrome — plus
+    // `toggle_button`'s `enabled` flag, which carries the half of
+    // `add_enabled` the tint cannot (PR #197 review): gating only the
+    // click's effect here left the widget sensing clicks and telling
+    // accesskit it was enabled, so a screen reader announced a usable
+    // button that did nothing. The tooltip is what explains it, so the
+    // button is still self-describing rather than silently inert.
     let history_rect = egui::Rect::from_center_size(
         egui::pos2(x + TOGGLE_HISTORY_SIDE / 2.0, y),
         egui::Vec2::splat(TOGGLE_HISTORY_SIDE),
@@ -1905,7 +2004,7 @@ fn toggle_cluster(
     } else {
         "History: unavailable"
     };
-    if toggle_button(ui, history_rect, history_label, capturing).clicked() && has_history {
+    if toggle_button(ui, history_rect, history_label, capturing, has_history).clicked() {
         *open_history = true;
     }
     if let Some(history) = icons.glyphs.get(GlyphIcon::History) {
@@ -1988,7 +2087,7 @@ fn title_row_toggles(
     } else {
         "Click-through: off"
     };
-    if toggle_button(ui, click_through_rect, click_through_label, capturing).clicked() {
+    if toggle_button(ui, click_through_rect, click_through_label, capturing, true).clicked() {
         settings.toggle_click_through();
         crate::platform::set_click_through(settings.click_through);
         let _ = tx_settings.send(settings.clone());
@@ -2024,7 +2123,7 @@ fn title_row_toggles(
     } else {
         "Always on top: off"
     };
-    if toggle_button(ui, always_on_top_rect, always_on_top_label, capturing).clicked() {
+    if toggle_button(ui, always_on_top_rect, always_on_top_label, capturing, true).clicked() {
         settings.toggle_always_on_top();
         let level = if settings.always_on_top {
             egui::WindowLevel::AlwaysOnTop
@@ -6869,6 +6968,66 @@ mod tests {
         assert_eq!(app.snapshot.rows.len(), 2);
     }
 
+    /// PR #197 review: the Share clipboard failure is a *transient* banner
+    /// — a later Share that works takes it down, and it times out on its
+    /// own if none ever does — while the capture-init failure `main.rs`
+    /// seeds through `with_status` is permanent and neither path may touch
+    /// it. Exercises `OverlayApp`'s own state rather than an egui round
+    /// trip, the same way the `pending_screenshot_bound` test does.
+    #[test]
+    fn a_transient_status_error_clears_itself_but_a_permanent_one_never_does() {
+        let new_app = || {
+            let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+            let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+            let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+            OverlayApp::new(
+                rx_snapshot,
+                tx_command,
+                tx_settings,
+                Settings::default(),
+                None,
+            )
+        };
+        let failed = || "Copy screenshot failed: the clipboard was busy".to_owned();
+        let now = Instant::now();
+
+        // A Share that lands without an error takes the banner down.
+        let mut app = new_app();
+        app.raise_transient_status(failed(), now);
+        assert!(matches!(app.status, StatusLine::Error(_)));
+        app.clear_transient_status();
+        assert_eq!(
+            app.status,
+            StatusLine::Ok,
+            "a copy that worked must clear the banner a copy that failed raised"
+        );
+
+        // With no later Share at all, the timeout alone takes it down.
+        let mut app = new_app();
+        app.raise_transient_status(failed(), now);
+        app.expire_transient_status(now + TRANSIENT_STATUS_LINGER - Duration::from_millis(1));
+        assert!(
+            matches!(app.status, StatusLine::Error(_)),
+            "the banner must stay up until it actually expires"
+        );
+        app.expire_transient_status(now + TRANSIENT_STATUS_LINGER);
+        assert_eq!(
+            app.status,
+            StatusLine::Ok,
+            "the banner must clear itself once TRANSIENT_STATUS_LINGER is up"
+        );
+
+        // `with_status` stamps no expiry, so neither path may clear it.
+        let permanent = StatusLine::Error("screen capture is unavailable".to_owned());
+        let mut app = new_app().with_status(permanent.clone());
+        app.clear_transient_status();
+        app.expire_transient_status(now + Duration::from_secs(3_600));
+        assert_eq!(
+            app.status, permanent,
+            "the permanent capture-init banner must survive both clearing paths"
+        );
+    }
+
     #[test]
     fn fmt_short_below_thousand_is_plain() {
         assert_eq!(fmt_short(999), "999");
@@ -8153,6 +8312,48 @@ mod tests {
         assert_eq!(
             button_count, 3,
             "expected Share, Reset and History to each expose a Button role, got {button_count}"
+        );
+    }
+
+    /// PR #197 review: with no history thread the History button must be
+    /// *genuinely* disabled, not merely dim and click-gated — accesskit has
+    /// to publish `enabled: false`, or a screen-reader user hears a usable
+    /// "History: unavailable" button, activates it, and nothing happens.
+    #[test]
+    fn the_history_button_reports_itself_disabled_without_history() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+
+        let disabled = |has_history: bool, label: &str| -> bool {
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                toggle_cluster(ui, &tx_command, &icons, false, has_history, &mut false);
+            });
+            let update = output
+                .platform_output
+                .accesskit_update
+                .clone()
+                .expect("accesskit was enabled for this frame");
+            output.drop_without_applying_deltas();
+            // A direct `==` for the same target-dependent reason
+            // `accessible_rect_for_label` spells out.
+            update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label().is_some_and(|s| s == label))
+                .map(|(_, node)| node.is_disabled())
+                .unwrap_or_else(|| panic!("no accessible node labeled {label:?} painted"))
+        };
+
+        assert!(
+            disabled(false, "History: unavailable"),
+            "History must report enabled: false with no history thread"
+        );
+        assert!(
+            !disabled(true, "History"),
+            "History must stay enabled when there is a history thread"
         );
     }
 
