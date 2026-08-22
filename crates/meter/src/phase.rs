@@ -280,10 +280,10 @@ mod tests {
 /// dungeons put one boss in front of you at a time and are untouched by any
 /// of this.
 ///
-/// That breaks the premise `Meter::scene_bosses` learns under — "the last
-/// boss engaged here is this scene's final boss" — because in a raid the
-/// last boss engaged is merely the one that party happened to pick. So for
-/// these scenes the meter stops guessing: it reports
+/// So a raid has no single pre-pull caption the way a one-boss dungeon does
+/// (`tables::SCENE_FINAL_BOSSES`, issue #201): whichever boss the party will
+/// pick is unknowable until they pick it. For these scenes the meter stops
+/// guessing: it reports
 /// [`crate::stats::EncounterInfo::multi_boss_scene`] and the header asks the
 /// player to select a boss until one is actually engaged.
 ///
@@ -355,6 +355,21 @@ mod boss_select_scene_tests {
                     || name.starts_with("Brutal!")
                     || name.starts_with("Purge!"),
                 "scene {scene} ({name}) is not named as a raid tier"
+            );
+        }
+    }
+
+    #[test]
+    fn no_curated_scene_final_boss_is_a_boss_select_scene() {
+        // Issue #201: `tables::SCENE_FINAL_BOSSES` is only ever allowed to
+        // name a dungeon with a *single* boss, so a raid tier appearing there
+        // is a curation mistake — `Meter::snapshot` suppresses the caption for
+        // these scenes anyway, and an entry here would be a silent no-op that
+        // reads as intent.
+        for &(scene, _) in tables::SCENE_FINAL_BOSSES {
+            assert!(
+                !is_boss_select_scene(scene),
+                "scene {scene} is a boss-select raid tier but carries a curated final boss"
             );
         }
     }

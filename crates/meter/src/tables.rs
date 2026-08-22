@@ -13611,13 +13611,12 @@ pub fn is_boss_monster(id: u32) -> bool {
 /// as a dungeon instance's `SceneID` — 572 distinct ids (min 1001, max
 /// 171001). No upstream table maps a scene/dungeon to its final boss (issue
 /// #125's investigation checked every `BPSR-ZDPS/Data/*.json` table and both
-/// community data repos), so `Meter::recompute_boss`
-/// (`crates/meter/src/encounter.rs`) instead *learns* a dungeon's final boss
-/// by observation — the last genuine boss engaged in a scene — and remembers
-/// it per scene for the rest of the session. This table is what gates that
-/// latch to actual dungeons: without it, killing a world boss in an
-/// open-world zone would pin its name to the banner for every later visit to
-/// that town or field.
+/// community data repos), which is why [`SCENE_FINAL_BOSSES`] is curated by
+/// hand instead (issue #201). This table is the wider "is this an instance at
+/// all" answer, used by `Meter::apply`'s scene-change handling
+/// (`crates/meter/src/encounter.rs`) and by issue #151's in-dungeon fight
+/// hold, neither of which should treat an open-world town or field as a
+/// dungeon.
 ///
 /// Generated from `crates/meter/data/DungeonSceneIds.json`, itself filtered
 /// from BPSR-ZDPS's `DungeonsTable.json` — the same URL vendored as
@@ -13672,10 +13671,50 @@ const DUNGEON_SCENE_IDS: &[u32] = &[
 ];
 
 /// Whether `id` is a known dungeon scene id (issue #125) — i.e. whether
-/// the final-boss latch in `Meter::recompute_boss` may record a
-/// remembered boss for it.
+/// the party is inside a dungeon instance rather than an open-world
+/// town or field.
 pub fn is_dungeon_scene(id: u32) -> bool {
     DUNGEON_SCENE_IDS.binary_search(&id).is_ok()
+}
+
+/// Curated dungeon scene -> final-boss monster id (issue #201).
+///
+/// Hand-maintained in `crates/meter/data/SceneFinalBosses.json` — nothing
+/// upstream carries this mapping (issue #125's investigation checked every
+/// `BPSR-ZDPS/Data/*.json` table and both community data repos), and issue
+/// #201 replaced issue #131's runtime learning of it with a written-down
+/// table: there are few enough dungeons in the game that learning one boss per
+/// scene at runtime — and shipping an "I don't trust the cache" reset button
+/// to go with it — cost more than curating them.
+///
+/// **Single-boss dungeons only.** This is what `Meter::snapshot` puts in
+/// `EncounterInfo::scene_boss_name`, i.e. the header caption *before* — or
+/// without — a boss hit. The moment a recognized boss is actually engaged the
+/// live lock in `Meter::recompute_boss` takes over and `encounter_title`
+/// (`crates/app/src/ui.rs`) prefers it, so a multi-boss dungeon has nothing to
+/// gain here and everything to get wrong. Raid scenes
+/// (`phase::is_boss_select_scene`) are suppressed outright and must never
+/// appear.
+///
+/// A dungeon absent from this table simply has no pre-pull caption; that is
+/// the expected state for most of the 572 ids `is_dungeon_scene` knows.
+///
+/// Sorted by scene id; `scene_final_boss` binary-searches it.
+#[rustfmt::skip]
+pub(crate) const SCENE_FINAL_BOSSES: &[(u32, u32)] = &[
+    (1154, 1152), // Unstable - Towering Ruin -> Kartgriff
+    (6521, 33500), // Chaotic - Mech Facility -> Thanatos - Final Form
+    (8002, 60141), // Canyon Battle -> Apocalypse Destroyer
+];
+
+/// The curated final boss of dungeon scene `id` (issue #201), if it is a
+/// single-boss dungeon someone has written down. See
+/// [`SCENE_FINAL_BOSSES`].
+pub fn scene_final_boss(id: u32) -> Option<u32> {
+    SCENE_FINAL_BOSSES
+        .binary_search_by_key(&id, |&(scene, _)| scene)
+        .ok()
+        .map(|i| SCENE_FINAL_BOSSES[i].1)
 }
 
 #[cfg(test)]
@@ -13812,6 +13851,50 @@ mod tests {
         // backfill calls it "Basic Attack: Scorching Swing"; the curated
         // override calls it "Blazing Swing - Stage 2", which must win.
         assert_eq!(skill_name(1602), Some("Blazing Swing - Stage 2"));
+    }
+
+    #[test]
+    fn scene_final_boss_names_a_curated_single_boss_dungeon() {
+        // Issue #201: scene 1154 ("Unstable - Towering Ruin") -> monster 1152
+        // ("Kartgriff"), from `crates/meter/data/SceneFinalBosses.json`.
+        assert_eq!(scene_final_boss(1154), Some(1152));
+    }
+
+    #[test]
+    fn scene_final_boss_is_none_for_an_uncurated_dungeon_scene() {
+        // Most dungeons are not curated, and that is fine — the header simply
+        // has no caption for them until a boss is engaged.
+        assert!(is_dungeon_scene(1001));
+        assert_eq!(scene_final_boss(1001), None);
+    }
+
+    #[test]
+    fn scene_final_boss_is_none_for_a_non_dungeon_scene() {
+        assert_eq!(scene_final_boss(8), None);
+    }
+
+    #[test]
+    fn every_curated_scene_final_boss_resolves_in_the_generated_tables() {
+        // The Rust-side half of `filter_scene_final_bosses`' validation: a
+        // curated entry must name a real dungeon scene and a real, *named*
+        // boss monster, since an unnamed one would caption nothing at all.
+        for &(scene, boss) in SCENE_FINAL_BOSSES {
+            assert!(is_dungeon_scene(scene), "scene {scene} is not a dungeon");
+            assert!(is_boss_monster(boss), "monster {boss} is not a boss");
+            assert!(scene_name(scene).is_some(), "scene {scene} is unnamed");
+            assert!(monster_name(boss).is_some(), "monster {boss} is unnamed");
+        }
+    }
+
+    #[test]
+    fn curated_scene_final_bosses_are_sorted_and_unique() {
+        // `scene_final_boss` binary-searches, so unsorted or duplicated scene
+        // ids would silently stop resolving.
+        let scenes: Vec<u32> = SCENE_FINAL_BOSSES.iter().map(|&(scene, _)| scene).collect();
+        let mut sorted = scenes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(scenes, sorted);
     }
 
     #[test]

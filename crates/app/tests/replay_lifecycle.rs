@@ -32,9 +32,8 @@ const ASTERIA_PLAINS: u32 = 7;
 ///
 /// Also the scenario that proves the reset is *selective*: `boss_uid`
 /// (and so `boss_monster_id`/`is_boss`) is recomputed from scratch and
-/// finds nothing (no enemy has `took_damage` any more), but `scene_id` and
-/// the latched `scene_boss_name` (issue #125 — a dungeon's final boss is
-/// session-lifetime, deliberately not cleared by `Meter::reset`) survive.
+/// finds nothing (no enemy has `took_damage` any more), but `scene_id`
+/// survives.
 #[test]
 fn boss_hp_rollback_auto_reset() {
     let scenario = Scenario::new("boss_hp_rollback_reset")
@@ -70,10 +69,13 @@ fn boss_hp_rollback_auto_reset() {
     // `took_damage`)...
     assert_eq!(capture.snapshot.encounter.boss_monster_id, None);
     assert!(!capture.snapshot.encounter.is_boss);
-    // ...but the scene and its latched final-boss name are untouched by a
-    // `BossHpRollback` reset (only `ServerChanged` clears scene_id).
+    // ...but the scene is untouched by a `BossHpRollback` reset (only
+    // `ServerChanged` clears scene_id).
     assert_eq!(capture.snapshot.encounter.scene_id, Some(TOWERING_RUIN));
-    assert_eq!(capture.snapshot.encounter.scene_boss_name, Some("Rathalos"));
+    // Issue #201: `scene_boss_name` now comes from the curated
+    // `tables::SCENE_FINAL_BOSSES`, which does not cover this scene — nothing
+    // is learned from the pull any more, so there is no caption to survive.
+    assert_eq!(capture.snapshot.encounter.scene_boss_name, None);
 
     assert_golden(capture);
 }

@@ -218,7 +218,10 @@ fn boss_kill_title() {
         assert_eq!(capture.snapshot.encounter.boss_name, Some("Rathalos"));
         assert!(capture.snapshot.encounter.is_boss);
         assert_eq!(capture.snapshot.encounter.scene_name, Some("Towering Ruin"));
-        assert_eq!(capture.snapshot.encounter.scene_boss_name, Some("Rathalos"));
+        // Issue #201: the header names the boss through the *live* lock
+        // (`boss_name`/`is_boss` above), not through the curated
+        // `tables::SCENE_FINAL_BOSSES` — which does not cover this scene.
+        assert_eq!(capture.snapshot.encounter.scene_boss_name, None);
     }
     assert_eq!(at_kill.snapshot.duration_ms, held.snapshot.duration_ms);
     assert_eq!(at_kill.snapshot.total_dps, held.snapshot.total_dps);

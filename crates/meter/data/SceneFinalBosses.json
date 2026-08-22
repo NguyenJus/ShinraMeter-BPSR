@@ -1,0 +1,40 @@
+{
+  "_README": [
+    "Hand-maintained dungeon scene id -> final boss monster id (issue #201).",
+    "",
+    "Unlike every other file in this directory this one is NOT vendored from",
+    "upstream and is NOT rewritten by `gen-name-tables.py --refresh`: nothing",
+    "in BPSR-ZDPS or either community tracker maps a dungeon to its boss, so",
+    "this is curation, by hand, from what a real run of the dungeon shows.",
+    "",
+    "Only add a dungeon that has exactly ONE boss. This table supplies the",
+    "header caption *before* (or without) a boss hit; once a boss is actually",
+    "engaged the live hit-based lock in `Meter::recompute_boss` takes over and",
+    "outranks it. A dungeon with several bosses has no single right answer",
+    "before the pull, and a raid (`phase::BOSS_SELECT_SCENES`) is suppressed",
+    "outright.",
+    "",
+    "`scene` and `boss` are documentation AND a guard: `gen-name-tables.py`",
+    "fails if either stops matching the generated name tables, so a game patch",
+    "that renames or re-ids something is caught instead of silently shipping a",
+    "wrong caption. Copy them verbatim from `scene_name` / `monster_name`.",
+    "",
+    "After editing: `python3 scripts/gen-name-tables.py && cargo fmt -p bpsr-meter`."
+  ],
+
+  "1154": {
+    "scene": "Unstable - Towering Ruin",
+    "boss_id": 1152,
+    "boss": "Kartgriff"
+  },
+  "6521": {
+    "scene": "Chaotic - Mech Facility",
+    "boss_id": 33500,
+    "boss": "Thanatos - Final Form"
+  },
+  "8002": {
+    "scene": "Canyon Battle",
+    "boss_id": 60141,
+    "boss": "Apocalypse Destroyer"
+  }
+}

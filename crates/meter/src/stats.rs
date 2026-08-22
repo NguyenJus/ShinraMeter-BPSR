@@ -190,17 +190,19 @@ pub struct EncounterInfo {
     pub is_boss: bool,
     pub scene_id: Option<u32>,
     pub scene_name: Option<&'static str>,
-    /// The current dungeon scene's remembered final boss (issue #125), if
-    /// one has been learned — see `Meter::scene_bosses`' doc comment for how
-    /// it's learned. Independent of `boss_monster_id`/`boss_name`/`is_boss`
-    /// above, which remain the raw facts about the currently-selected
-    /// target; `encounter_title` in `crates/app/src/ui.rs` prefers this
-    /// field over them so a mid-dungeon mech (or even a genuine mid-dungeon
-    /// boss) never displaces the dungeon's final boss name once it's known.
+    /// The current dungeon scene's final boss (issue #125), when it is one of
+    /// the curated single-boss dungeons in `tables::SCENE_FINAL_BOSSES`
+    /// (issue #201 — this used to be learned at runtime and cached to disk).
+    /// Independent of `boss_monster_id`/`boss_name`/`is_boss` above, which
+    /// remain the raw facts about the currently-selected target;
+    /// `encounter_title` in `crates/app/src/ui.rs` falls back to this field
+    /// so a mid-dungeon mech (or even a genuine mid-dungeon boss) never
+    /// displaces the dungeon's final boss name.
     ///
-    /// `None` in a scene that can present more than one *selectable* boss
-    /// (issue #150) — see `multi_boss_scene` below, and `Meter::snapshot`
-    /// for the suppression itself.
+    /// `None` for a dungeon nobody has curated — most of them — and `None` in
+    /// a scene that can present more than one *selectable* boss (issue #150),
+    /// see `multi_boss_scene` below and `Meter::snapshot` for the suppression
+    /// itself.
     pub scene_boss_name: Option<&'static str>,
     /// Whether this scene is known to offer more than one separately
     /// selectable boss (issue #150): a raid where the party picks which of

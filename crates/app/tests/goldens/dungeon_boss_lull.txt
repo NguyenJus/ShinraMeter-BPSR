@@ -9,7 +9,7 @@ encounter.boss_name=Rathalos
 encounter.is_boss=true
 encounter.scene_id=1101
 encounter.scene_name=Towering Ruin
-encounter.scene_boss_name=Rathalos
+encounter.scene_boss_name=-
 resets=
 rows=2
 row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=40000 dps=26666.67 share=61.54 crit=0.00 lucky=0.00 hits=1 deaths=0
