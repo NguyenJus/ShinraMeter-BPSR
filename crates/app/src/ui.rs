@@ -900,6 +900,10 @@ impl eframe::App for OverlayApp {
                     // Columns/settings dropdown, `draw_header_menu`) scales
                     // the background fill and border chrome only — row
                     // text, icons, and stat-pill colors are untouched.
+                    // That is also the recovery path for issue #182's 0%
+                    // floor: with the backdrop gone the glyphs still paint,
+                    // so the header stays draggable and the gear stays
+                    // clickable (see `Settings::OPACITY_MIN`).
                     // `Color32::gamma_multiply` does the premultiplied-alpha
                     // scaling correctly (see its doc comment on `Color32`
                     // storing channels premultiplied), so there is no need
@@ -3313,6 +3317,9 @@ fn draw_header_menu(
     // see `toggle_cluster` — that a different issue is changing in
     // parallel).
     ui.label("Opacity");
+    // Issue #182: the rail spans the full 0%-100%, floor included. Nothing
+    // here has to guard the bottom end — `Settings::OPACITY_MIN` documents
+    // why a fully transparent backdrop stays recoverable.
     let mut opacity = settings.opacity;
     let opacity_response = ui.add(
         egui::Slider::new(&mut opacity, Settings::OPACITY_MIN..=Settings::OPACITY_MAX)
@@ -5221,15 +5228,28 @@ pub fn viewport(
     builder
 }
 
-/// Panel fill: translucent near-black, the overlay's own value rather than the
-/// source's `WindowData.DefaultBackgroundColor` `#232830` @ 0.5. That slate
-/// grey reads as washed-out over game footage; the original ShinraMeter
-/// silhouette is near-black, so we keep `#121216` at 200/255 here. Fixed
-/// constants deliberately — the source binds all three of these to a settings
-/// VM, and user-configurable chrome is out of scope for now.
-const PANEL_FILL: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(18, 18, 22, 200);
+/// Panel fill: near-black, the overlay's own value rather than the source's
+/// `WindowData.DefaultBackgroundColor` `#232830` @ 0.5. That slate grey reads
+/// as washed-out over game footage; the original ShinraMeter silhouette is
+/// near-black, so we keep `#121216` here. Fixed constants deliberately — the
+/// source binds all three of these to a settings VM, and user-configurable
+/// chrome is out of scope for now.
+///
+/// Fully opaque at rest (issue #182). This used to carry a baked-in 200/255,
+/// which meant `settings.opacity` multiplied *two* transparencies together
+/// and the slider's 100% end painted a ~78%-opaque panel — the endpoints did
+/// not mean what they said. Transparency now comes from exactly one place,
+/// `settings.opacity` at the `Frame` call site, so 0% is gone and 100% is
+/// solid. The pre-#182 look is still reachable, one slider drag away at ~78%.
+/// The skill window's fills follow the same rule (issue #184), which is what
+/// makes the two windows track each other at a given slider value.
+const PANEL_FILL: egui::Color32 = egui::Color32::from_rgb(18, 18, 22);
 /// Panel border: `DefaultBorderColor` `#717b85`, at the same 0.5 opacity the
-/// source applies to the whole Border (fill and stroke alike).
+/// source applies to the whole Border (fill and stroke alike). Unlike
+/// `PANEL_FILL` above, this alpha deliberately survives issue #182: it is a
+/// *color* choice — it is what makes a 1px edge read as a hairline against
+/// the fill rather than a bright grey outline — not a second transparency
+/// knob competing with the slider. It still fades to nothing at 0%.
 const PANEL_BORDER_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(0x71, 0x7b, 0x85, 128);
 /// `TopmostBorderStyle`'s `BorderThickness="1"`.
@@ -5276,16 +5296,27 @@ pub fn apply_theme(ctx: &egui::Context) {
 // deliberately distinct window from `TopmostBorderStyle`'s panel, not a
 // variant of it.
 
-/// Window/bar fill — the reference's `#111117`.
+/// Window/bar fill — the reference's `#111117`. Opaque at rest, the same
+/// baseline `PANEL_FILL` now uses (issue #184): both windows put their whole
+/// transparency in `settings.opacity`, so a given slider value reads the same
+/// on each. Only the *colors* stay distinct (see the block comment above) —
+/// #184 is about the opacity response, not about unifying the palettes.
 const SKILL_CHROME_FILL: egui::Color32 = egui::Color32::from_rgb(0x11, 0x11, 0x17);
 /// Panel/tab background, and the Deaths pill's fill — the reference's
-/// `#212127`.
+/// `#212127`. Same opaque-baseline rule as `SKILL_CHROME_FILL`.
 const SKILL_PANEL_FILL: egui::Color32 = egui::Color32::from_rgb(0x21, 0x21, 0x27);
 /// Dps column-header text — the reference's `#ef5350`.
 const SKILL_HEADER_RGB: egui::Color32 = egui::Color32::from_rgb(0xef, 0x53, 0x50);
 /// Close glyph — the reference's `LightRed #ff5555`.
 const SKILL_CLOSE_RGB: egui::Color32 = egui::Color32::from_rgb(0xff, 0x55, 0x55);
-/// Translucent-white row hover — the reference's `#10FFFFFF`.
+/// Translucent-white row hover — the reference's `#10FFFFFF`. Its alpha is
+/// the highlight's own weight; issue #184 multiplies `settings.opacity` in on
+/// top of it at the paint site, because this fill is part of the window's
+/// chrome layer (it paints straight onto `SKILL_CHROME_FILL`, under the row's
+/// text) and would otherwise be left hovering over nothing once the rest of
+/// the window faded. The main row list's `row_hover_quads` gradient is
+/// knowingly *not* treated this way: it belongs to the row-content layer that
+/// #166 keeps at full alpha.
 const SKILL_ROW_HOVER_FILL: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(0xff, 0xff, 0xff, 0x10);
 
@@ -5476,7 +5507,10 @@ fn draw_skill_window(
         icon_color: COUNTER_ICON_COLOR,
         icon_first: true,
         corner_radius: egui::CornerRadius::same(SKILL_PILL_CORNER_RADIUS),
-        fill: SKILL_PANEL_FILL,
+        // Issue #184: every filled surface in this window takes `opacity`,
+        // the pill included — it used to be the one chrome element that
+        // stayed solid while the window around it faded.
+        fill: SKILL_PANEL_FILL.gamma_multiply(opacity),
         stroke: None,
     };
     let deaths_text_size = pill_text_size(&painter, &deaths_pill);
@@ -5605,8 +5639,13 @@ fn draw_skill_window(
                     egui::Sense::hover(),
                 );
                 if response.hovered() {
-                    ui.painter()
-                        .rect_filled(skill_rect, 0.0, SKILL_ROW_HOVER_FILL);
+                    // Issue #184: fades with the rest of the chrome, same
+                    // as the tab strip and the header pill.
+                    ui.painter().rect_filled(
+                        skill_rect,
+                        0.0,
+                        SKILL_ROW_HOVER_FILL.gamma_multiply(opacity),
+                    );
                 }
                 for (&anchor_x, kind) in anchors.iter().zip(SKILL_COLUMN_ORDER.iter()) {
                     let width = kind.width();
@@ -10290,10 +10329,40 @@ mod tests {
     /// `assertions_on_constants`) — same trick
     /// `font_scale_matches_the_source_metrics` uses.
     #[test]
-    fn chrome_border_and_fill_are_translucent() {
+    fn chrome_border_is_translucent_but_the_fill_is_not() {
         assert_eq!(PANEL_BORDER_COLOR.a(), 128);
-        let fill_alpha = PANEL_FILL.a();
-        assert!(fill_alpha > 0 && fill_alpha < 255, "{fill_alpha}");
+        // Issue #182: no baked-in baseline left to multiply against, so the
+        // slider owns the panel's transparency outright.
+        assert_eq!(PANEL_FILL.a(), 255);
+    }
+
+    /// Issue #182: the slider's endpoints have to mean what they say. A
+    /// full-range drag must land on a completely solid and a completely
+    /// absent backdrop, with nothing baked in to cap either end.
+    #[test]
+    fn panel_opacity_endpoints_are_solid_and_gone() {
+        assert_eq!(
+            PANEL_FILL.gamma_multiply(Settings::OPACITY_MAX).a(),
+            255,
+            "100% must paint a fully opaque panel"
+        );
+        assert_eq!(
+            PANEL_FILL.gamma_multiply(Settings::OPACITY_MIN).a(),
+            0,
+            "0% must paint no panel at all"
+        );
+    }
+
+    /// Issue #184: the skill window tracks the main panel because its fills
+    /// share the main panel's opaque baseline — same slider value, same
+    /// perceived transparency, however different the colors underneath.
+    #[test]
+    fn skill_window_fills_share_the_panel_opacity_baseline() {
+        for (name, fill) in [("chrome", SKILL_CHROME_FILL), ("panel", SKILL_PANEL_FILL)] {
+            assert_eq!(fill.a(), PANEL_FILL.a(), "{name}");
+            let half = fill.gamma_multiply(0.5).a();
+            assert_eq!(half, PANEL_FILL.gamma_multiply(0.5).a(), "{name} at 50%");
+        }
     }
 
     /// The panel is deliberately *not* the source's slate `#232830` — that
@@ -10302,10 +10371,7 @@ mod tests {
     fn panel_fill_is_near_black_not_slate() {
         // Compare through the same constructor: `Color32` stores premultiplied
         // channels, so `to_tuple()` would not round-trip the (18, 18, 22).
-        assert_eq!(
-            PANEL_FILL,
-            egui::Color32::from_rgba_unmultiplied(18, 18, 22, 200)
-        );
+        assert_eq!(PANEL_FILL, egui::Color32::from_rgb(18, 18, 22));
     }
 
     // -- share bar role coloring (issue #44) --------------------------------
