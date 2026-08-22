@@ -122,10 +122,19 @@ impl ColumnKind {
             // rounded up to the next multiple of 8, the same small-margin
             // convention `Damage`/`Hits` below use. The field is decoded
             // straight off the packet with no clamp, so a value past this
-            // assumed ceiling is still possible; `draw_row` clips each
-            // column's paint to its own slot (`column_clip_rect`) so that
-            // case degrades to a cut-off string instead of overlapping the
-            // next column.
+            // assumed ceiling is still possible — but since issue #168 this
+            // column no longer occupies a stat slot while enabled
+            // (`renders_inline_with_name`, honoured by
+            // `Settings::stat_columns`), so `column_clip_rect` never sees
+            // it: its only paint path is `ui::name_suffix`, rendered inline
+            // after the player's name and deliberately unclipped and
+            // uncapped. An over-ceiling value therefore just makes that
+            // suffix wider and bleeds *under* the stat columns (which paint
+            // after it) rather than being cut off. `width` stays the budget
+            // the formatter is held to by
+            // `widest_formatted_text_fits_its_column_width_budget`, and the
+            // slot it would reserve again if the inline treatment were ever
+            // reverted.
             ColumnKind::AbilityScore => StatColumn {
                 width: 40.0,
                 text: |row| match row.ability_score {
@@ -139,7 +148,8 @@ impl ColumnKind {
             // ceiling is a 4-digit stat, max 9_999, per the repo owner,
             // measured at 31.3125pt and rounded up to the next multiple of
             // 8. Same unclamped-packet caveat as `AbilityScore` above, and
-            // the same `draw_row` clip covers it.
+            // the same inline-suffix path handles it — no clip, no cap,
+            // just a wider `ui::name_suffix`.
             ColumnKind::SeasonStrength => StatColumn {
                 width: 32.0,
                 text: |row| match row.season_strength {
@@ -332,10 +342,25 @@ impl Settings {
 
     /// Toggles a column on/off. Refuses to disable the last remaining
     /// visible column, so the row can never end up with nothing to show —
-    /// the "all columns disabled" nonsense state guarded against by #13.
+    /// the "all columns disabled" nonsense state guarded against by #13 —
+    /// and, since issue #168, also refuses to disable the last column that
+    /// still occupies a stat slot.
+    ///
+    /// The second guard exists because `AbilityScore`/`SeasonStrength` no
+    /// longer occupy one (`renders_inline_with_name`): with only the
+    /// last-visible check, a user with either of them enabled could switch
+    /// the grid columns off one at a time — every single step passing
+    /// `len() > 1` — and land on e.g. `[AbilityScore]`, where
+    /// `stat_columns` is empty and the row paints as a name plus a
+    /// bracketed suffix with the whole stat area blank. Toggling the inline
+    /// columns themselves off stays allowed: removing one can never empty
+    /// `stat_columns`, so they are exempt from the second guard (only the
+    /// last-visible one still applies to them).
     pub fn toggle(&mut self, col: ColumnKind) {
         if self.is_visible(col) {
-            if self.visible_columns.len() > 1 {
+            let empties_the_stat_grid =
+                !col.renders_inline_with_name() && !self.stat_columns().iter().any(|c| *c != col);
+            if self.visible_columns.len() > 1 && !empties_the_stat_grid {
                 self.visible_columns.retain(|c| *c != col);
             }
         } else {
@@ -590,6 +615,85 @@ mod tests {
         settings.toggle(ColumnKind::Damage);
 
         assert_eq!(settings.visible_columns, vec![ColumnKind::Damage]);
+    }
+
+    /// Issue #168 review: `AbilityScore`/`SeasonStrength` no longer occupy
+    /// a stat slot, so the last-visible-column guard alone would let a user
+    /// walk the grid columns off one at a time and end up with an empty
+    /// `stat_columns` — a row that is just a name and a bracketed suffix.
+    #[test]
+    fn toggle_refuses_to_disable_the_last_column_that_occupies_a_stat_slot() {
+        let mut settings = Settings {
+            visible_columns: vec![ColumnKind::Damage, ColumnKind::AbilityScore],
+            window_position: None,
+            window_size: None,
+        };
+
+        settings.toggle(ColumnKind::Damage);
+
+        assert_eq!(
+            settings.visible_columns,
+            vec![ColumnKind::Damage, ColumnKind::AbilityScore],
+            "removing the last slot-occupying column must be refused"
+        );
+        assert!(!settings.stat_columns().is_empty());
+    }
+
+    /// The walk that reaches that state one legal-looking step at a time:
+    /// every intermediate toggle passes `len() > 1`, so only the
+    /// stat-slot guard can stop the last one.
+    #[test]
+    fn toggling_grid_columns_off_one_by_one_still_leaves_a_stat_column() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::AbilityScore);
+
+        for col in ColumnKind::ALL {
+            if !col.renders_inline_with_name() && settings.is_visible(col) {
+                settings.toggle(col);
+            }
+        }
+
+        assert!(
+            !settings.stat_columns().is_empty(),
+            "walking every grid column off one at a time must still leave a stat slot: {:?}",
+            settings.visible_columns
+        );
+        assert!(settings.is_visible(ColumnKind::AbilityScore));
+    }
+
+    /// The inline columns are exempt from the stat-slot guard — turning
+    /// both of them off (and back on) has to keep working, since neither
+    /// contributes a slot in the first place.
+    #[test]
+    fn toggle_still_allows_turning_both_inline_columns_off_and_on() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::AbilityScore);
+        settings.toggle(ColumnKind::SeasonStrength);
+        assert!(settings.is_visible(ColumnKind::AbilityScore));
+        assert!(settings.is_visible(ColumnKind::SeasonStrength));
+
+        settings.toggle(ColumnKind::AbilityScore);
+        settings.toggle(ColumnKind::SeasonStrength);
+
+        assert!(!settings.is_visible(ColumnKind::AbilityScore));
+        assert!(!settings.is_visible(ColumnKind::SeasonStrength));
+    }
+
+    /// Even with no stat column left to protect, the inline pair stays
+    /// toggleable — `stat_columns` is already empty here (a hand-edited
+    /// settings file could deserialize into it), so the stat-slot guard
+    /// must not latch and only the last-visible-column guard applies.
+    #[test]
+    fn toggle_allows_disabling_an_inline_column_when_no_stat_column_is_left() {
+        let mut settings = Settings {
+            visible_columns: vec![ColumnKind::AbilityScore, ColumnKind::SeasonStrength],
+            window_position: None,
+            window_size: None,
+        };
+
+        settings.toggle(ColumnKind::SeasonStrength);
+
+        assert_eq!(settings.visible_columns, vec![ColumnKind::AbilityScore]);
     }
 
     #[test]

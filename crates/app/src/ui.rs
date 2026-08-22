@@ -3262,13 +3262,22 @@ pub fn column_anchors(
 /// text for the column is designed, and tested
 /// (`widest_formatted_text_fits_its_column_width_budget`), to fit.
 ///
-/// This is what keeps an out-of-range value (e.g. a packet-decoded
-/// `ability_score`/`season_strength` past the in-game ceiling `StatColumn`'s
-/// `width` budget assumes — see `ColumnKind::spec`) from painting
-/// arbitrarily far left across the row: `draw_row` clips every column's text
-/// draw to this rect rather than trusting the formatted string to fit
-/// `width`, so an overlong string loses its leading glyphs after one
-/// column's worth instead of running over its neighbors.
+/// This is what keeps an out-of-range value (e.g. a packet-decoded stat
+/// past the in-game ceiling `StatColumn`'s `width` budget assumes — see
+/// `ColumnKind::spec`) from painting arbitrarily far left across the row:
+/// `draw_row` clips every stat column's text draw to this rect rather than
+/// trusting the formatted string to fit `width`, so an overlong string
+/// loses its leading glyphs after one column's worth instead of running
+/// over its neighbors.
+///
+/// Its reach is exactly the columns that occupy a stat slot — the ones
+/// `Settings::stat_columns` hands `draw_rows`. `AbilityScore`/
+/// `SeasonStrength` are no longer among them while enabled (issue #168):
+/// they leave the grid entirely and reach the screen only through
+/// `draw_row`'s inline name suffix (`name_suffix`), which is deliberately
+/// unclipped and uncapped, so an over-ceiling value there widens the suffix
+/// and bleeds *under* the stat columns instead of losing glyphs. The
+/// z-order reasoning that makes that safe lives at that paint site.
 ///
 /// The slot is the *nominal* `width`, deliberately not the gap between this
 /// column's anchor and the previous one. The two are identical whenever the
@@ -8389,7 +8398,13 @@ mod tests {
     /// rects, because `draw_row` paints the share bar and hover highlight
     /// as gradient meshes (`Shape::Mesh`), never a flat `Shape::Rect`.
     struct RowFrame {
-        texts: Vec<(String, egui::Rect)>,
+        /// In paint order, so a test can compare two texts' indices to pin
+        /// z-order (egui paints shapes in call order) — that is how the
+        /// inline name suffix is proven to paint *before* the stat-column
+        /// loop. The `Color32` is the galley's own text color, which is
+        /// what makes the suffix's dimming (`NAME_SUFFIX_ALPHA`) checkable
+        /// from the painted output rather than from the call site.
+        texts: Vec<(String, egui::Rect, egui::Color32)>,
         meshes: Vec<egui::Rect>,
     }
 
@@ -8399,9 +8414,20 @@ mod tests {
         fn text_box(&self, value: &str) -> egui::Rect {
             self.texts
                 .iter()
-                .filter(|(painted, _)| painted == value)
-                .map(|(_, rect)| *rect)
+                .filter(|(painted, ..)| painted == value)
+                .map(|(_, rect, _)| *rect)
                 .reduce(egui::Rect::union)
+                .unwrap_or_else(|| panic!("draw_rows never painted {value:?}: {:?}", self.texts))
+        }
+
+        /// The index in paint order of the first text shape painted for
+        /// `value`, plus the color it was painted in.
+        fn text_paint(&self, value: &str) -> (usize, egui::Color32) {
+            self.texts
+                .iter()
+                .enumerate()
+                .find(|(_, (painted, ..))| painted == value)
+                .map(|(i, (_, _, color))| (i, *color))
                 .unwrap_or_else(|| panic!("draw_rows never painted {value:?}: {:?}", self.texts))
         }
 
@@ -8431,6 +8457,16 @@ mod tests {
             egui::Shape::Text(text) => frame.texts.push((
                 text.galley.text().to_string(),
                 egui::Rect::from_min_size(text.pos, text.galley.size()).intersect(clip),
+                text.override_text_color
+                    .or_else(|| {
+                        text.galley
+                            .job
+                            .sections
+                            .first()
+                            .map(|section| section.format.color)
+                    })
+                    .filter(|color| *color != egui::Color32::PLACEHOLDER)
+                    .unwrap_or(text.fallback_color),
             )),
             egui::Shape::Mesh(mesh) => frame.meshes.push(mesh.calc_bounds().intersect(clip)),
             egui::Shape::Vec(shapes) => {
@@ -8451,6 +8487,19 @@ mod tests {
     /// `collect_row_boxes` intersects every shape with the clip rect it was
     /// actually painted under — exactly like `collect_painted_boxes` does.
     fn rows_painted_boxes(snapshot: &Snapshot, width: f32, height: f32) -> RowFrame {
+        rows_painted_boxes_with(snapshot, &Settings::default(), width, height)
+    }
+
+    /// `rows_painted_boxes` with the settings under test spelled out —
+    /// needed by anything that has to render a non-default column set
+    /// (issue #168's inline `AbilityScore`/`SeasonStrength`, which
+    /// `Settings::default` does not enable).
+    fn rows_painted_boxes_with(
+        snapshot: &Snapshot,
+        settings: &Settings,
+        width: f32,
+        height: f32,
+    ) -> RowFrame {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
@@ -8467,7 +8516,7 @@ mod tests {
             meshes: Vec::new(),
         };
         let output = ctx.run_ui(input, |ui| {
-            draw_rows(ui, snapshot, &Settings::default(), &icons);
+            draw_rows(ui, snapshot, settings, &icons);
         });
         for clipped in &output.shapes {
             collect_row_boxes(&clipped.shape, clipped.clip_rect, &mut frame);
@@ -8586,6 +8635,86 @@ mod tests {
                 row_rect.center().y
             );
         }
+    }
+
+    /// Issue #168's render-level contract, driven through `draw_rows`
+    /// rather than through `name_suffix` alone (which the pure-string
+    /// tests above already cover): with `AbilityScore`/`SeasonStrength`
+    /// enabled, the bracketed suffix must actually reach the screen, sit
+    /// flush against the painted name, be dimmed relative to it, and be
+    /// painted *before* the stat-column loop so the columns win z-order.
+    /// That last point is the whole reason the suffix is allowed to be
+    /// unclipped and uncapped, so it is pinned here from paint order, not
+    /// assumed from the call site.
+    #[test]
+    fn the_inline_score_suffix_paints_flush_dimmed_and_beneath_the_stat_columns() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::AbilityScore);
+        settings.toggle(ColumnKind::SeasonStrength);
+        let row = PlayerRow {
+            name: "Zoe".to_string(),
+            damage: 1_000,
+            dps: 1_234.0,
+            ..sample_score_row(Some(12_345), Some(678))
+        };
+        let snapshot = Snapshot {
+            duration_ms: 90_000,
+            total_damage: row.damage,
+            total_dps: row.dps,
+            rows: vec![row.clone()],
+            encounter: EncounterInfo::default(),
+        };
+
+        let frame = rows_painted_boxes_with(
+            &snapshot,
+            &settings,
+            default_inner_width(),
+            default_inner_height(),
+        );
+
+        // Painted whole, exactly as `name_suffix` composed it, with the
+        // single separating space `draw_row` prepends — no elision.
+        let suffix_text = format!(" {}", name_suffix(&row, &settings).expect("a suffix"));
+        assert_eq!(suffix_text, " [12345 / 678]");
+        let name_box = frame.text_box(&row.name);
+        let suffix_box = frame.text_box(&suffix_text);
+        assert!(
+            (suffix_box.left() - name_box.right()).abs() < 0.5,
+            "suffix {suffix_box:?} must start where the name {name_box:?} ends"
+        );
+        assert!(
+            (suffix_box.center().y - name_box.center().y).abs() < 0.5,
+            "suffix {suffix_box:?} must share the name's baseline row {name_box:?}"
+        );
+
+        // Dimmed: the same white as the name, at `NAME_SUFFIX_ALPHA`.
+        let (suffix_index, suffix_color) = frame.text_paint(&suffix_text);
+        let (name_index, name_color) = frame.text_paint(&row.name);
+        assert_eq!(
+            suffix_color,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, NAME_SUFFIX_ALPHA)
+        );
+        assert!(
+            suffix_color.a() < name_color.a(),
+            "suffix {suffix_color:?} must be dimmer than the name {name_color:?}"
+        );
+
+        // Paint order: name, then suffix, then every stat column — so the
+        // columns land on top of whatever the suffix bled under them.
+        let stat_text = (ColumnKind::Dps.spec().text)(&row);
+        let (stat_index, _) = frame.text_paint(&stat_text);
+        assert!(
+            name_index < suffix_index && suffix_index < stat_index,
+            "expected name ({name_index}) then suffix ({suffix_index}) then stat column {stat_text:?} ({stat_index})"
+        );
+
+        // And the inline pair really did leave the grid: neither value is
+        // painted a second time as its own column.
+        assert!(
+            !frame.texts.iter().any(|(painted, ..)| painted == "12345"),
+            "ability score must not also paint as a stat column: {:?}",
+            frame.texts
+        );
     }
 
     // -- window position tracking (issue #27) -----------------------------
