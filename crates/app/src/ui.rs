@@ -227,6 +227,18 @@ pub struct OverlayApp {
     /// snapshot from being clobbered by the per-frame `rx_snapshot` drain
     /// below (see that call site).
     demo_mode: bool,
+    /// Whether `ui()` has already applied the startup click-through/
+    /// always-on-top pair that re-applies `Settings::click_through`/
+    /// `always_on_top` (issue #167) — `platform::set_click_through` for
+    /// the former (issue #167 rehash: no longer a `ViewportCommand`, see
+    /// that function's doc comment) and `ViewportCommand::WindowLevel` for
+    /// the latter. The `WindowLevel` half needs a live `egui::Context`,
+    /// which — same as `icons` above — does not exist yet at
+    /// `OverlayApp::new`, so this is set on the first `ui()` call and
+    /// never again; every later frame's toggle state instead flows
+    /// through `toggle_cluster`'s own click handling and the tray menu's
+    /// "Turn off click-through" escape hatch, not this flag.
+    startup_toggles_applied: bool,
 }
 
 /// All icon textures the overlay paints, bundled so `OverlayApp` has exactly
@@ -509,6 +521,7 @@ impl OverlayApp {
             screenshot_capturing: false,
             screenshot_capture_frames_waited: 0,
             demo_mode,
+            startup_toggles_applied: false,
         }
     }
 
@@ -542,6 +555,47 @@ impl eframe::App for OverlayApp {
 
         let ctx = ui.ctx().clone();
         apply_theme(&ctx);
+
+        // Issue #167: re-applies `Settings::click_through`/`always_on_top`
+        // exactly once, on the first frame a live `egui::Context` exists
+        // (same one-shot shape as the icon load right below). `viewport()`
+        // already bakes `always_on_top`'s hardcoded default into the window
+        // builder — this is only needed to *correct* that for a returning
+        // user whose last session turned either toggle away from its
+        // default, and to turn click-through on at all, since nothing in
+        // `viewport()` sets it up front.
+        if !self.startup_toggles_applied {
+            self.startup_toggles_applied = true;
+            crate::platform::set_click_through(self.settings.click_through);
+            let level = if self.settings.always_on_top {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        }
+
+        // Issue #167 rehash: syncs `Settings::click_through` (and the
+        // toggle-cluster button's displayed state) with a "Turn off
+        // click-through" request raised by the tray menu — the escape
+        // hatch that replaced the `Ctrl+Alt+P` hotkey, which turned out
+        // not to work (egui only sees key events while the overlay holds
+        // keyboard focus, and click-through's whole point is clicking the
+        // game *behind* the overlay, which takes focus away). The actual
+        // OS-level passthrough is already off by the time this runs —
+        // `platform::request_click_through_off` clears it directly, for
+        // immediacy, the instant the tray command fires — so this only
+        // catches Settings and the button's paint up to what the window
+        // is already doing. See `click_through_after_tray_request`'s doc
+        // comment for the pure decision.
+        let tray_click_through_off = crate::platform::take_tray_click_through_off_request();
+        let click_through =
+            click_through_after_tray_request(self.settings.click_through, tray_click_through_off);
+        if click_through != self.settings.click_through {
+            self.settings.click_through = click_through;
+            crate::platform::set_click_through(click_through);
+            let _ = self.tx_settings.send(self.settings.clone());
+        }
 
         // Issue #83: a prior investigation of "player rows render shorter/
         // more compact than the reference" found no code-level defect —
@@ -974,10 +1028,25 @@ fn draw_header(
     // `draw_header_menu`'s doc comment), the default would dismiss the
     // whole dropdown on every checkbox toggle. Minimize/Close call
     // `ui.close()` themselves to still dismiss on click.
+    // `settings` (a `SettingsHandle<'_>`) is reborrowed rather than moved
+    // into this closure — issue #167 added a second use of it below
+    // (`toggle_cluster`), and `SettingsHandle`'s `&mut Settings` field
+    // can't be moved out twice. `&mut *settings.settings` is an ordinary
+    // reborrow through that field, scoped to just this `.show(...)` call,
+    // so `settings` is still whole and usable afterward.
     egui::Popup::menu(&chevron_response)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
-            draw_header_menu(ui, ctx, tx_command, settings, icons);
+            draw_header_menu(
+                ui,
+                ctx,
+                tx_command,
+                SettingsHandle {
+                    settings: &mut *settings.settings,
+                    tx_settings: settings.tx_settings,
+                },
+                icons,
+            );
         });
     draw_subtitle_line(ui, subtitle.as_deref().unwrap_or(""));
 
@@ -1028,31 +1097,64 @@ fn draw_header(
                 icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
             ),
         );
-        toggle_cluster(ui, tx_command, icons, capturing)
+        toggle_cluster(
+            ui,
+            tx_command,
+            SettingsHandle {
+                settings: &mut *settings.settings,
+                tx_settings: settings.tx_settings,
+            },
+            icons,
+            capturing,
+        )
     })
     .inner
 }
 
-// -- status indicators (issue #62, #82) -----------------------------------
+// -- toggle cluster (issue #62, #82, #167) --------------------------------
 //
 // The source's fourth stat-row cell: a click-through LED, a cloud-upload LED
 // and a queue gauge, in a 22pt pill. We had none of those features, so all
 // three used to render **in their off state and inert** — no click
 // handling, no settings, no tooltip. Issue #62 was explicit that a use for
-// these slots would be decided later; issue #82 decides two of them: the
-// click-through and cloud-upload LEDs are repurposed as real buttons
-// (Share — copy a screenshot to the clipboard — and Reset, moved out of the
-// header dropdown), leaving only the queue gauge ring inert, since there is
-// still no upload queue for it to show.
+// these slots would be decided later; issue #82 repurposed the click-through
+// and cloud-upload LEDs as real buttons (Share — copy a screenshot to the
+// clipboard — and Reset, moved out of the header dropdown), leaving only the
+// queue gauge ring inert, since there was still no upload queue for it to
+// show. Issue #167 drops that still-inert ring entirely (there is still no
+// queue, and none planned) and adds two real, unrelated toggles in its place
+// and one new slot alongside it: OS-level mouse click-through and runtime
+// always-on-top (`ViewportCommand::WindowLevel`). The pill now holds four
+// real controls — Share, Reset, Click-through, Always-on-top — and nothing
+// decorative.
+//
+// Click-through (issue #167 rehash) is *not* `ViewportCommand::
+// MousePassthrough` — that sets `WS_EX_TRANSPARENT` on the whole window
+// with no per-region carve-out, so once it was on, the very button that
+// turns it back off became unclickable too, with only a keyboard hotkey
+// (which needs focus that click-through's whole point is to give away) as
+// an escape hatch. Instead, `platform::set_click_through` flips a flag
+// `platform::window_proc`'s `WM_NCHITTEST` handling reads directly: it
+// reports `HTTRANSPARENT` for the whole window *except* the click-through
+// button's own hit box (published every frame below via `platform::
+// set_click_through_button_rect`), which always reports normal
+// (`HTCLIENT`) hit-testing. The button is therefore reachable with the
+// mouse in every state — it is deliberately excluded from its own
+// passthrough — and the tray menu's "Turn off click-through" entry
+// (`platform::install_tray`) exists only as a belt-and-braces fallback for
+// the case that carve-out ever fails or the window ends up off-screen.
 
-/// Tint the still-inert queue ring (and its check glyph) is painted with —
-/// the source's `OffBrush="#1fff"`.
+/// Tint a toggle-cluster button paints with while its state is "off" — the
+/// source's `OffBrush="#1fff"`, originally the still-inert queue ring's
+/// stroke color, now `toggle_state_tint`'s off case for the click-through
+/// and always-on-top buttons (issue #167).
 const TOGGLE_OFF_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x11);
-/// Tint the toggle cluster's two real buttons are painted with — the same
-/// half-white `TOOLBAR_ICON_TINT` every other clickable icon in this module
-/// uses, now that these two read as active controls rather than inert
-/// decoration.
+/// Tint the toggle cluster's buttons are painted with while active — the
+/// same half-white `TOOLBAR_ICON_TINT` every other clickable icon in this
+/// module uses. Share and Reset (one-shot actions, not on/off state) always
+/// paint at this tint; click-through and always-on-top use it only in their
+/// "on" state (`toggle_state_tint`).
 const TOGGLE_ACTIVE_COLOR: egui::Color32 = TOOLBAR_ICON_TINT;
 /// Circular hover wash painted behind a toggle-cluster button, matching the
 /// oval pill's own shape rather than a foreign square badge.
@@ -1060,10 +1162,78 @@ const TOGGLE_HOVER_FILL: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 30);
 const TOGGLE_MOUSE_SIDE: f32 = 12.0;
 const TOGGLE_CLOUD_SIDE: f32 = 14.0;
-const TOGGLE_QUEUE_SIDE: f32 = 14.0;
-const TOGGLE_QUEUE_GLYPH_SIDE: f32 = 6.0;
+/// Click-through button glyph side (issue #167) — same 14pt as `TOGGLE_
+/// CLOUD_SIDE`/the old queue slot, keeping every non-Share button in the
+/// cluster the same visual size.
+const TOGGLE_CLICK_THROUGH_SIDE: f32 = 14.0;
+/// Always-on-top button glyph side (issue #167) — see `TOGGLE_CLICK_
+/// THROUGH_SIDE`'s doc comment.
+const TOGGLE_ALWAYS_ON_TOP_SIDE: f32 = 14.0;
 const TOGGLE_GAP: f32 = 5.0;
 const TOGGLE_PAD_X: f32 = 4.0;
+/// Points the click-through button's published hit box (`platform::
+/// set_click_through_button_rect`) is padded out by on every side, so the
+/// `WM_NCHITTEST` carve-out that keeps it reachable under click-through
+/// (issue #167 rehash) isn't razor-thin right at the glyph's edges.
+const CLICK_THROUGH_HIT_PAD: f32 = 2.0;
+
+/// Horizontal offset, in points, from the toggle cluster's left edge to the
+/// left edge of the click-through button's glyph box — the same running
+/// cursor `toggle_cluster` walks across the Share and Reset slots, spelled
+/// once so the hit box can be computed before the cluster is laid out (see
+/// `click_through_button_slot`).
+const CLICK_THROUGH_SLOT_OFFSET_X: f32 =
+    TOGGLE_PAD_X + TOGGLE_MOUSE_SIDE + TOGGLE_GAP + TOGGLE_CLOUD_SIDE + TOGGLE_GAP;
+
+/// The click-through button's glyph box, in points, derived from the whole
+/// toggle cluster's allocated rect. Pure so `toggle_cluster` can publish the
+/// button's `WM_NCHITTEST` hit box (issue #167 rehash) before it starts
+/// painting — and so the geometry is unit-testable on every platform, unlike
+/// the `cfg(windows)` publish itself.
+fn click_through_button_slot(cluster: egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        egui::pos2(
+            cluster.left() + CLICK_THROUGH_SLOT_OFFSET_X + TOGGLE_CLICK_THROUGH_SIDE / 2.0,
+            cluster.center().y,
+        ),
+        egui::Vec2::splat(TOGGLE_CLICK_THROUGH_SIDE),
+    )
+}
+
+/// Converts the click-through button's egui rect (points, already
+/// client-area-relative — matching what `ScreenToClient` produces) into the
+/// physical-pixel `left, top, right, bottom` bounds `platform::
+/// set_click_through_button_rect` publishes for `WM_NCHITTEST`. Padded by
+/// `CLICK_THROUGH_HIT_PAD` points first so the carve-out isn't razor-thin at
+/// the glyph's edges.
+///
+/// A non-finite or non-positive `pixels_per_point` is treated as `1.0`, the
+/// same guard (and for the same reason) as `platform::cursor_points`:
+/// multiplying by `0.0`/NaN would round every bound to `0`, and a
+/// zero-area rect can never `contains` anything — so `click_through_hit_test`
+/// would resolve `Transparent` for *every* point, including the button that
+/// turns click-through back off. Identity scaling leaves the button a few
+/// pixels off; a degenerate rect strands the user.
+///
+/// Pure so the points-to-pixels transform is unit-testable off-Windows; the
+/// `cfg`-gated publish call is the only Windows-only part.
+fn click_through_hit_box_px(
+    button_rect: egui::Rect,
+    pixels_per_point: f32,
+) -> (i32, i32, i32, i32) {
+    let scale = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    let padded = button_rect.expand(CLICK_THROUGH_HIT_PAD);
+    (
+        (padded.left() * scale).round() as i32,
+        (padded.top() * scale).round() as i32,
+        (padded.right() * scale).round() as i32,
+        (padded.bottom() * scale).round() as i32,
+    )
+}
 
 /// One toggle-cluster button's hit box, hover highlight and accessible
 /// label. The painted glyph itself is the caller's job — Share and Reset
@@ -1101,35 +1271,95 @@ fn toggle_button(ui: &egui::Ui, rect: egui::Rect, label: &str, capturing: bool) 
     }
 }
 
-/// Paints the toggle cluster: the Share and Reset buttons (issue #82) and
-/// the still-inert queue gauge ring (an empty ring — the source's `Ellipse
-/// 14x14 Fill="#0aaa"` has alpha 0, so only the stroke is drawn — with the
-/// check glyph centered in it; no backlog arc, since there is still no
-/// queue for it to show). All in one `PILL_FILL` oval, matching the
-/// DPS/damage pills' chrome.
+/// Which tint a toggle-cluster on/off button paints its glyph with (issue
+/// #167): `TOGGLE_ACTIVE_COLOR` — the same half-white every clickable icon
+/// in this cluster uses — while the state is on, `TOGGLE_OFF_COLOR` — the
+/// near-invisible tint the old inert queue ring painted with — while off.
+/// Pure so the state -> color mapping is unit-testable without a live
+/// `egui::Context`; `toggle_cluster` is the only caller.
+fn toggle_state_tint(active: bool) -> egui::Color32 {
+    if active {
+        TOGGLE_ACTIVE_COLOR
+    } else {
+        TOGGLE_OFF_COLOR
+    }
+}
+
+/// The click-through tray escape hatch (issue #167 rehash). The button
+/// itself is always clickable now (`platform::window_proc`'s `WM_NCHITTEST`
+/// carve-out — see the section comment above), so this is only the
+/// belt-and-braces fallback for when the tray's "Turn off click-through"
+/// entry fires: `requested` is whatever `OverlayApp::ui` read from
+/// `platform::take_tray_click_through_off_request` this frame.
+///
+/// Unlike the deleted `Ctrl+Alt+P` hotkey this replaced, a tray request
+/// only ever turns click-through *off* — there's no tray item for turning
+/// it on, since the always-reachable button already owns that — so this is
+/// not a toggle: a request forces `false` outright, and an idle frame
+/// leaves `click_through` exactly as it found it. Pure so this is
+/// unit-testable without a live `egui::Context` or the platform layer's
+/// real atomics.
+fn click_through_after_tray_request(click_through: bool, requested: bool) -> bool {
+    if requested { false } else { click_through }
+}
+
+/// Paints the toggle cluster: Share and Reset (issue #82), plus
+/// click-through and always-on-top (issue #167) — four real controls, no
+/// decorative slot left (see the section comment above). All in one
+/// `PILL_FILL` oval, matching the DPS/damage pills' chrome.
 ///
 /// Returns whether Share was clicked this frame (issue #96, PR #98 review)
 /// — `draw_header` propagates this up so `OverlayApp::ui` knows to stash
 /// this frame's row-bottom bound for the async screenshot reply.
 ///
 /// `capturing` (issue #156) is threaded straight through to every
-/// `toggle_button` call so the whole cluster — Share, Reset, and any
-/// future button here — suppresses its hover fill and tooltip together
-/// while a capture is in flight, rather than special-casing Share alone.
+/// `toggle_button` call so the whole cluster — all four buttons —
+/// suppresses its hover fill and tooltip together while a capture is in
+/// flight, rather than special-casing Share alone.
+///
+/// `settings` carries both the mutable `Settings` the click-through and
+/// always-on-top buttons flip and persist, and the sender that hands the
+/// updated value to the settings-writer thread — the same
+/// `SettingsHandle` `draw_header_menu`'s column checkboxes use, reborrowed
+/// by `draw_header` rather than moved so both call sites in the same
+/// function can use it.
 fn toggle_cluster(
     ui: &mut egui::Ui,
     tx_command: &Sender<UiCommand>,
+    settings: SettingsHandle<'_>,
     icons: &Icons,
     capturing: bool,
 ) -> bool {
+    let SettingsHandle {
+        settings,
+        tx_settings,
+    } = settings;
+
     let height = ui.spacing().interact_size.y;
     let width = 2.0 * TOGGLE_PAD_X
         + TOGGLE_MOUSE_SIDE
         + TOGGLE_GAP
         + TOGGLE_CLOUD_SIDE
         + TOGGLE_GAP
-        + TOGGLE_QUEUE_SIDE;
+        + TOGGLE_CLICK_THROUGH_SIDE
+        + TOGGLE_GAP
+        + TOGGLE_ALWAYS_ON_TOP_SIDE;
     let (rect, _response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+
+    // Invariant: the published hit box always describes *this* frame's
+    // layout, even on a frame egui culls the cluster — publishing before the
+    // visibility early return below is what guarantees it, because a culled
+    // frame that returned early would leave `WM_NCHITTEST` consulting a rect
+    // from a previous layout and a click at the button's real position would
+    // resolve `Transparent`, stranding the user under click-through. Clearing
+    // the rect on the culled path was the alternative; publishing wins
+    // because it keeps the button reachable rather than merely un-stale.
+    // See `click_through_hit_box_px` for the points-to-pixels conversion and
+    // `platform::CLICK_THROUGH_BUTTON_LEFT` for why it's unconditional.
+    let click_through_rect = click_through_button_slot(rect);
+    let (hit_left, hit_top, hit_right, hit_bottom) =
+        click_through_hit_box_px(click_through_rect, ui.ctx().pixels_per_point());
+    crate::platform::set_click_through_button_rect(hit_left, hit_top, hit_right, hit_bottom);
 
     if !ui.is_rect_visible(rect) {
         return false;
@@ -1176,20 +1406,81 @@ fn toggle_cluster(
         ui.painter()
             .image(reset.id(), reset_rect, UV_FULL, TOGGLE_ACTIVE_COLOR);
     }
-    x += TOGGLE_CLOUD_SIDE + TOGGLE_GAP;
 
-    // The queue gauge stays inert — see the section comment above.
-    let queue_center = egui::pos2(x + TOGGLE_QUEUE_SIDE / 2.0, y);
-    ui.painter().circle_stroke(
-        queue_center,
-        TOGGLE_QUEUE_SIDE / 2.0,
-        egui::Stroke::new(1.0, TOGGLE_OFF_COLOR),
+    // Click-through (issue #167; mechanism replaced — issue #167 rehash):
+    // OS-level mouse passthrough for the whole overlay *except this very
+    // button*, which stays clickable in every state by design — see the
+    // section comment above for why `platform::set_click_through` plus a
+    // `WM_NCHITTEST` carve-out replaced `ViewportCommand::
+    // MousePassthrough` and the `Ctrl+Alt+P` hotkey that came with it.
+    // `GlyphIcon::MouseOff`'s literal "mouse disabled" glyph is the closest
+    // fit the vendored set has, and happens to be exactly what the
+    // original ShinraMeter source used for this same LED slot before issue
+    // #82 repurposed it as Share (see the section comment above). Persisted
+    // to `Settings::click_through` so it survives a restart, re-applied on
+    // `OverlayApp`'s first frame. The tray menu's "Turn off click-through"
+    // entry is a belt-and-braces fallback, not the primary way back — this
+    // button is.
+    // `click_through_rect` is `click_through_button_slot(rect)`, already
+    // computed and published up top (the hit box has to exist before the
+    // visibility check, so the slot can't wait for the running `x` cursor to
+    // reach it). The cursor picks back up off that slot's right edge below,
+    // so the two can never drift apart.
+
+    let click_through_label = if settings.click_through {
+        "Click-through: on"
+    } else {
+        "Click-through: off"
+    };
+    if toggle_button(ui, click_through_rect, click_through_label, capturing).clicked() {
+        settings.toggle_click_through();
+        crate::platform::set_click_through(settings.click_through);
+        let _ = tx_settings.send(settings.clone());
+    }
+    if let Some(mouse_off) = icons.glyphs.get(GlyphIcon::MouseOff) {
+        ui.painter().image(
+            mouse_off.id(),
+            click_through_rect,
+            UV_FULL,
+            toggle_state_tint(settings.click_through),
+        );
+    }
+    x = click_through_rect.right() + TOGGLE_GAP;
+
+    // Always-on-top (issue #167): whether the overlay stays pinned above
+    // other windows, via `ViewportCommand::WindowLevel` — the runtime
+    // counterpart to `viewport()`'s hardcoded `.with_always_on_top()`,
+    // which only ever sets the *initial* level a fresh process opens with.
+    // `GlyphIcon::Pin` — MDI's pushpin glyph — is a literal fit for
+    // "pinned above other windows". Persisted to `Settings::always_on_top`
+    // the same way `click_through` is.
+    let always_on_top_rect = egui::Rect::from_center_size(
+        egui::pos2(x + TOGGLE_ALWAYS_ON_TOP_SIDE / 2.0, y),
+        egui::Vec2::splat(TOGGLE_ALWAYS_ON_TOP_SIDE),
     );
-    if let Some(check) = icons.glyphs.get(GlyphIcon::Check) {
-        let icon_rect =
-            egui::Rect::from_center_size(queue_center, egui::Vec2::splat(TOGGLE_QUEUE_GLYPH_SIDE));
-        ui.painter()
-            .image(check.id(), icon_rect, UV_FULL, TOGGLE_OFF_COLOR);
+    let always_on_top_label = if settings.always_on_top {
+        "Always on top: on"
+    } else {
+        "Always on top: off"
+    };
+    if toggle_button(ui, always_on_top_rect, always_on_top_label, capturing).clicked() {
+        settings.toggle_always_on_top();
+        let level = if settings.always_on_top {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        };
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        let _ = tx_settings.send(settings.clone());
+    }
+    if let Some(pin) = icons.glyphs.get(GlyphIcon::Pin) {
+        ui.painter().image(
+            pin.id(),
+            always_on_top_rect,
+            UV_FULL,
+            toggle_state_tint(settings.always_on_top),
+        );
     }
 
     screenshot_requested
@@ -5852,14 +6143,16 @@ mod tests {
             row_height,
         )
         .x;
-        // The toggle cluster (decision 5, issue #82): a fixed-width pill,
-        // not measured text.
+        // The toggle cluster (decision 5, issue #82; four buttons as of
+        // issue #167): a fixed-width pill, not measured text.
         let toggles = 2.0 * TOGGLE_PAD_X
             + TOGGLE_MOUSE_SIDE
             + TOGGLE_GAP
             + TOGGLE_CLOUD_SIDE
             + TOGGLE_GAP
-            + TOGGLE_QUEUE_SIDE;
+            + TOGGLE_CLICK_THROUGH_SIDE
+            + TOGGLE_GAP
+            + TOGGLE_ALWAYS_ON_TOP_SIDE;
 
         // Three gaps between the outer horizontal's four direct children
         // (timer, dps, dmg, toggle cluster).
@@ -5875,63 +6168,85 @@ mod tests {
         );
     }
 
-    /// Share and Reset (issue #82) are real buttons now, painted at
-    /// `TOGGLE_ACTIVE_COLOR`; only the still-inert queue gauge's check
-    /// glyph keeps the source's `OffBrush="#1fff"` tint.
+    /// Share and Reset (issue #82) always paint at `TOGGLE_ACTIVE_COLOR`;
+    /// click-through and always-on-top (issue #167) paint at
+    /// `toggle_state_tint` of their default `Settings` value — off
+    /// (`TOGGLE_OFF_COLOR`) for click-through, on (`TOGGLE_ACTIVE_COLOR`)
+    /// for always-on-top.
     #[test]
-    fn the_toggle_cluster_renders_two_active_buttons_and_one_inert_gauge() {
+    fn the_toggle_cluster_renders_every_button_at_its_state_tint() {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         ctx.run_ui(egui::RawInput::default(), |_ui| {})
             .drop_without_applying_deltas();
         let icons = Icons::load(&ctx);
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
         let share = icons.glyphs.get(GlyphIcon::Share).unwrap().id();
         let reset = icons.toolbar.get(ToolbarIcon::Reset).unwrap().id();
-        let check = icons.glyphs.get(GlyphIcon::Check).unwrap().id();
+        let click_through = icons.glyphs.get(GlyphIcon::MouseOff).unwrap().id();
+        let always_on_top = icons.glyphs.get(GlyphIcon::Pin).unwrap().id();
 
         let mut blits = Vec::new();
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         for clipped in &output.shapes {
             collect_image_texture_tints(&clipped.shape, &mut blits);
         }
         output.drop_without_applying_deltas();
 
-        for expected in [share, reset] {
-            let tint = blits
-                .iter()
-                .find(|(id, _)| *id == expected)
-                .map(|(_, c)| *c);
+        let tint_of = |id: egui::TextureId| blits.iter().find(|(t, _)| *t == id).map(|(_, c)| *c);
+        for expected in [share, reset, always_on_top] {
             assert_eq!(
-                tint,
+                tint_of(expected),
                 Some(TOGGLE_ACTIVE_COLOR),
                 "{expected:?} was not blitted at TOGGLE_ACTIVE_COLOR: {blits:?}"
             );
         }
-        let check_tint = blits.iter().find(|(id, _)| *id == check).map(|(_, c)| *c);
         assert_eq!(
-            check_tint,
+            tint_of(click_through),
             Some(TOGGLE_OFF_COLOR),
-            "the queue gauge's check glyph was not blitted at TOGGLE_OFF_COLOR: {blits:?}"
+            "click-through defaults to off, so it must blit at TOGGLE_OFF_COLOR: {blits:?}"
         );
     }
 
-    /// The queue gauge stays strictly non-interactive (issue #62, #82): no
-    /// click handling, no hover cursor, no tooltip that implies it works.
-    /// Share and Reset, by contrast, must each expose exactly one `Button`
-    /// accesskit node — so the tree has exactly two, never three.
+    /// All four toggle-cluster controls (issue #167: Share, Reset,
+    /// click-through, always-on-top) are real buttons — the tree must
+    /// expose exactly four `Button` accesskit nodes, with no leftover
+    /// inert decoration (the old queue gauge this replaced never exposed
+    /// one at all).
     #[test]
-    fn the_queue_gauge_stays_inert_while_share_and_reset_are_real_buttons() {
+    fn the_toggle_cluster_exposes_four_buttons() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
 
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         let update = output
             .platform_output
@@ -5946,9 +6261,128 @@ mod tests {
             .filter(|(_, node)| node.role() == egui::accesskit::Role::Button)
             .count();
         assert_eq!(
-            button_count, 2,
-            "expected exactly Share and Reset to expose a Button role, got {button_count}"
+            button_count, 4,
+            "expected Share, Reset, click-through and always-on-top to each expose a Button role, got {button_count}"
         );
+    }
+
+    /// Clicking the click-through button flips `Settings::click_through`,
+    /// tells the platform layer (`platform::set_click_through` — issue
+    /// #167 rehash; a no-op stub off-Windows, so not independently
+    /// observable from this test), and persists the change (issue #167).
+    #[test]
+    fn clicking_click_through_toggles_and_persists_it() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        assert!(!settings.click_through);
+        let (tx_settings, rx_settings) = crossbeam_channel::unbounded();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let pos = accessible_rect_for_label(&update, "Click-through: off").center();
+        layout.drop_without_applying_deltas();
+
+        let output = ctx.run_ui(click_at(pos), |ui| {
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
+        });
+        output.drop_without_applying_deltas();
+
+        assert!(settings.click_through, "the click must flip the flag on");
+        let persisted = rx_settings.try_recv().expect("the click must persist");
+        assert!(persisted.click_through);
+    }
+
+    /// Clicking the always-on-top button flips `Settings::always_on_top`,
+    /// sends `ViewportCommand::WindowLevel(Normal)` (it starts on, so a
+    /// click turns it off), and persists the change (issue #167).
+    #[test]
+    fn clicking_always_on_top_toggles_and_persists_it() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        assert!(settings.always_on_top);
+        let (tx_settings, rx_settings) = crossbeam_channel::unbounded();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let pos = accessible_rect_for_label(&update, "Always on top: on").center();
+        layout.drop_without_applying_deltas();
+
+        let output = ctx.run_ui(click_at(pos), |ui| {
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
+        });
+        let commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
+        output.drop_without_applying_deltas();
+
+        assert!(!settings.always_on_top, "the click must flip the flag off");
+        assert!(
+            commands.iter().any(|cmd| matches!(
+                cmd,
+                egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal)
+            )),
+            "the click must request WindowLevel(Normal): {commands:?}"
+        );
+        let persisted = rx_settings.try_recv().expect("the click must persist");
+        assert!(!persisted.always_on_top);
     }
 
     /// Clicking the Share button fires the screenshot capture request; the
@@ -5961,9 +6395,20 @@ mod tests {
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
         let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         let update = layout
             .platform_output
@@ -5974,7 +6419,16 @@ mod tests {
         layout.drop_without_applying_deltas();
 
         let output = ctx.run_ui(click_at(share_pos), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         let commands = output
             .viewport_output
@@ -6005,9 +6459,20 @@ mod tests {
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
         let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         let update = layout
             .platform_output
@@ -6018,7 +6483,16 @@ mod tests {
         layout.drop_without_applying_deltas();
 
         let output = ctx.run_ui(click_at(reset_pos), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         let commands = output
             .viewport_output
@@ -6061,9 +6535,20 @@ mod tests {
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         let update = layout
             .platform_output
@@ -6078,9 +6563,18 @@ mod tests {
             ..Default::default()
         };
 
-        let fills_while_hovered = |capturing: bool| -> Vec<egui::Color32> {
+        let mut fills_while_hovered = |capturing: bool| -> Vec<egui::Color32> {
             let output = ctx.run_ui(hover_input(), |ui| {
-                toggle_cluster(ui, &tx_command, &icons, capturing);
+                toggle_cluster(
+                    ui,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    capturing,
+                );
             });
             let mut fills = Vec::new();
             for clipped in &output.shapes {
@@ -6134,10 +6628,21 @@ mod tests {
         ctx.global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
         let icons = Icons::load(&ctx);
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
         const SHARE_LABEL: &str = "Copy screenshot to clipboard";
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false);
+            toggle_cluster(
+                ui,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                false,
+            );
         });
         let update = layout
             .platform_output
@@ -6152,9 +6657,18 @@ mod tests {
             ..Default::default()
         };
 
-        let texts_while_hovered = |capturing: bool| -> Vec<String> {
+        let mut texts_while_hovered = |capturing: bool| -> Vec<String> {
             let output = ctx.run_ui(hover_input(), |ui| {
-                toggle_cluster(ui, &tx_command, &icons, capturing);
+                toggle_cluster(
+                    ui,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    capturing,
+                );
             });
             let mut texts = Vec::new();
             for clipped in &output.shapes {
@@ -6650,6 +7164,36 @@ mod tests {
             !capturing,
             "the guard must clear via the timeout fallback when the reply never lands"
         );
+    }
+
+    // -- toggle_cluster: click-through / always-on-top (issue #167) --------
+
+    #[test]
+    fn toggle_state_tint_is_active_color_when_on() {
+        assert_eq!(toggle_state_tint(true), TOGGLE_ACTIVE_COLOR);
+    }
+
+    #[test]
+    fn toggle_state_tint_is_off_color_when_off() {
+        assert_eq!(toggle_state_tint(false), TOGGLE_OFF_COLOR);
+    }
+
+    /// The tray escape hatch: a "Turn off click-through" request must force
+    /// `click_through` off, regardless of which state it was in — see
+    /// `click_through_after_tray_request`'s doc comment.
+    #[test]
+    fn click_through_after_tray_request_forces_it_off() {
+        assert!(!click_through_after_tray_request(false, true));
+        assert!(!click_through_after_tray_request(true, true));
+    }
+
+    /// An idle frame (no tray request) must leave `click_through` exactly
+    /// as it found it, in either state — this is what keeps the poll from
+    /// fighting the toggle button's own clicks on every other frame.
+    #[test]
+    fn click_through_after_tray_request_holds_steady_with_no_request() {
+        assert!(!click_through_after_tray_request(false, false));
+        assert!(click_through_after_tray_request(true, false));
     }
 
     // -- handle_share_screenshot (the `OverlayApp::ui` sequencing itself) ---
@@ -8424,7 +8968,7 @@ mod tests {
             visible_columns: ColumnKind::ALL.to_vec(),
             window_position: None,
             window_size: None,
-            opacity: 1.0,
+            ..Settings::default()
         };
         settings.toggle(ColumnKind::Dps);
         let cols = settings.ordered_columns();
@@ -10217,5 +10761,74 @@ mod tests {
         // the tip when pointing down.
         assert!(points[1].y > points[0].y);
         assert!(points[1].y > points[2].y);
+    }
+
+    // -- click-through hit box (issue #167 rehash) --------------------------
+
+    /// The cluster rect the header allocates for `toggle_cluster`, at a
+    /// round origin so the expected bounds below are readable.
+    fn toggle_cluster_rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(100.0, 10.0), egui::vec2(80.0, 20.0))
+    }
+
+    #[test]
+    fn the_click_through_slot_sits_after_share_and_reset() {
+        let cluster = toggle_cluster_rect();
+        let slot = click_through_button_slot(cluster);
+        // Same running cursor `toggle_cluster` walks: pad, Share, gap,
+        // Reset, gap — then the glyph box itself.
+        assert_eq!(slot.left(), cluster.left() + CLICK_THROUGH_SLOT_OFFSET_X);
+        assert_eq!(slot.width(), TOGGLE_CLICK_THROUGH_SIDE);
+        assert_eq!(slot.height(), TOGGLE_CLICK_THROUGH_SIDE);
+        assert_eq!(slot.center().y, cluster.center().y);
+    }
+
+    #[test]
+    fn the_hit_box_pads_the_glyph_at_scale_one() {
+        let button = egui::Rect::from_min_max(egui::pos2(20.0, 30.0), egui::pos2(34.0, 44.0));
+        assert_eq!(
+            click_through_hit_box_px(button, 1.0),
+            (
+                (20.0 - CLICK_THROUGH_HIT_PAD) as i32,
+                (30.0 - CLICK_THROUGH_HIT_PAD) as i32,
+                (34.0 + CLICK_THROUGH_HIT_PAD) as i32,
+                (44.0 + CLICK_THROUGH_HIT_PAD) as i32,
+            )
+        );
+    }
+
+    #[test]
+    fn the_hit_box_scales_to_physical_pixels() {
+        let button = egui::Rect::from_min_max(egui::pos2(20.0, 30.0), egui::pos2(34.0, 44.0));
+        // 2x DPI: every padded bound doubles.
+        assert_eq!(click_through_hit_box_px(button, 2.0), (36, 56, 72, 92));
+        // A fractional scale rounds rather than truncating.
+        assert_eq!(click_through_hit_box_px(button, 1.5), (27, 42, 54, 69));
+    }
+
+    /// A bad `pixels_per_point` must never collapse the hit box: every bound
+    /// would round to `0`, and `platform::Rect::contains` can't be true for a
+    /// zero-area rect, so `WM_NCHITTEST` would answer `Transparent` for every
+    /// point — including the button that turns click-through back off.
+    #[test]
+    fn a_degenerate_scale_falls_back_to_identity() {
+        let button = egui::Rect::from_min_max(egui::pos2(20.0, 30.0), egui::pos2(34.0, 44.0));
+        let identity = click_through_hit_box_px(button, 1.0);
+        for bad in [0.0, -1.0, -0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let (left, top, right, bottom) = click_through_hit_box_px(button, bad);
+            assert_eq!(
+                (left, top, right, bottom),
+                identity,
+                "pixels_per_point {bad} should fall back to 1.0"
+            );
+            assert!(
+                right > left,
+                "hit box must have area (pixels_per_point {bad})"
+            );
+            assert!(
+                bottom > top,
+                "hit box must have area (pixels_per_point {bad})"
+            );
+        }
     }
 }
