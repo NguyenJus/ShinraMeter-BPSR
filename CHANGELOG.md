@@ -50,8 +50,8 @@ affiliated with the game's publisher.
   indefinitely, diluting every row's DPS with dead time. Only player
   activity extends a fight now.
 - A wipe now ends the attempt the same way a boss kill does: the rows
-  freeze for review, and nothing the boss does afterwards - its health bar
-  refilling, its swings, an AoE clipping an add on the run back - restarts
+  freeze for review, and nothing the boss does afterwards — its health bar
+  refilling, its swings, an AoE clipping an add on the run back — restarts
   the clock or clears the board. The next fight begins when a player
   damages a recognized boss again.
 - A long immunity or mechanic window no longer ended a live pull. While a
@@ -70,7 +70,7 @@ affiliated with the game's publisher.
 - Paradox-Calamity Remnant's three raid bosses were treated as phases of a
   single fight, so fighting a second one continued the first one's numbers
   instead of starting fresh. They are separate fights again.
-- The header could name a fight other than the one on screen - in
+- The header could name a fight other than the one on screen — in
   particular, a raid's remembered boss was only ever a guess, since a raid
   lets you pick a different one of its three bosses without leaving the
   instance. The header now names the fight it is actually showing.
