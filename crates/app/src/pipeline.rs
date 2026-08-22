@@ -862,8 +862,6 @@ mod tests {
         }
     }
 
-    /// Issue #131: `Pipeline`-level wiring for the scene -> final-boss
-    /// cache, mirroring `names_cache_wiring` above.
     #[test]
     fn player_info_names_a_row_that_already_has_damage() {
         let mut p = Pipeline::new();
