@@ -174,28 +174,35 @@ WinDivert's LGPL-3.0 option is compatible.
   scalings) don't have to stretch a neighbouring frame. No other pixel data
   was changed.
 
-## Monster and scene name tables (community)
+## Monster, scene and skill name tables (community)
 
-- Files: `crates/meter/data/MonsterName.json`, `crates/meter/data/SceneName.json`
-  (from `resonance-logs/resonance-logs`, GPL-3.0) and
-  `crates/meter/data/MonsterNameCrowdsource.json` (from `winjwinj/bpsr-logs`,
-  GPL-3.0).
+- Files: `crates/meter/data/MonsterName.json`, `crates/meter/data/SceneName.json`,
+  `crates/meter/data/SkillName.json` (from `resonance-logs/resonance-logs`,
+  GPL-3.0) and `crates/meter/data/MonsterNameCrowdsource.json` (from
+  `winjwinj/bpsr-logs`, GPL-3.0).
 - Upstream: <https://github.com/resonance-logs/resonance-logs>,
   <https://github.com/winjwinj/bpsr-logs>
 - License: GPL-3.0, matching this project's own licence
 - Not shipped as files: compiled into `crates/meter/src/tables.rs` by
   `scripts/gen-name-tables.py` at development time, then built into the
   executable as Rust source.
-- These are the hand-checked, player-facing names, and the generator ranks them
-  *above* the BPSR-ZDPS tables below wherever the two disagree on an id.
+- For monsters and scenes, these are the hand-checked, player-facing names,
+  and the generator ranks them *above* the BPSR-ZDPS tables below wherever
+  the two disagree on an id. **`SkillName.json` is the exception (issue
+  #16): it is an 8891-entry machine-translated bulk dump — it contains
+  internal-only entries such as "AI: Air blade spike count" alongside real
+  skill names — so for skills it is the *backfill* layer, ranked below
+  BPSR-ZDPS's curated `SkillOverridesNames.json` in the section below.**
 
-## Monster and scene name tables (BPSR-ZDPS)
+## Monster, scene and skill name tables (BPSR-ZDPS)
 
 - Files: `crates/meter/data/MonsterTableNames.json`,
   `crates/meter/data/SceneTableNames.json`,
-  `crates/meter/data/DungeonsTableNames.json`
+  `crates/meter/data/DungeonsTableNames.json`,
+  `crates/meter/data/SkillOverridesNames.json`
 - Upstream: <https://github.com/Blue-Protocol-Source/BPSR-ZDPS> —
-  `BPSR-ZDPS/Data/MonsterTable.json`, `SceneTable.json`, `DungeonsTable.json`
+  `BPSR-ZDPS/Data/MonsterTable.json`, `SceneTable.json`, `DungeonsTable.json`,
+  `SkillOverrides.en.json`
 - Copyright (c) 2025 Blue-Protocol-Source
 - License: **MIT — note this differs from the GPL-3.0 of the community tables
   above.** MIT is the more permissive of the two and imposes only the
@@ -203,17 +210,25 @@ WinDivert's LGPL-3.0 option is compatible.
   work is fine; the combined result is governed by this project's GPL-3.0-only
   licence. BPSR-ZDPS states its licence once, at the repository root, with no
   carve-out for `Data/`.
-- **Filtered, not verbatim.** Upstream these three files are roughly 6.5 MB,
-  0.6 MB and 1.1 MB of full row data — stats, drop tables, AI references and
-  asset paths. What is vendored here is only the `{id: name}` projection of
-  each (about 97 KB, 19 KB and 17 KB), produced by `filter_id_names` in
-  `scripts/gen-name-tables.py`; nothing else from those rows is copied into
-  this repository. Re-run `scripts/gen-name-tables.py --refresh` to reproduce
-  the filtering from upstream.
+- **Filtered, not verbatim.** Upstream `MonsterTable.json`, `SceneTable.json`
+  and `DungeonsTable.json` are roughly 6.5 MB, 0.6 MB and 1.1 MB of full row
+  data — stats, drop tables, AI references and asset paths. What is vendored
+  here is only the `{id: name}` projection of each (about 97 KB, 19 KB and
+  17 KB), produced by `filter_id_names` in `scripts/gen-name-tables.py`;
+  nothing else from those rows is copied into this repository. `SkillOverrides.en.json`
+  is filtered the same way: upstream it is ~152 KB of `{id: {Name, Icon}}`
+  objects, and only the `{id: Name}` projection (~56 KB) is vendored as
+  `SkillOverridesNames.json` — the `Icon` field is dropped, since skill icons
+  are issue #9's unsolved problem and are out of scope here. Re-run
+  `scripts/gen-name-tables.py --refresh` to reproduce the filtering from
+  upstream.
 - Added by issue #36 to backfill the ids the community tables do not cover:
   they take `monster_name` from 216 to 3,094 ids and `scene_name` from 340 to
   605, so far fewer encounters fall back to a raw `Monster #40010` /
-  `Scene #1201` placeholder in the header.
+  `Scene #1201` placeholder in the header. `SkillOverridesNames.json` was
+  added by issue #16 as the curated, player-facing layer for `skill_name`
+  (1487 entries), ranked above `SkillName.json`'s bulk backfill (see the
+  community section above for why the precedence is inverted here).
 - Not shipped as files: like the community tables, they are compiled into
   `crates/meter/src/tables.rs` at development time and built into the
   executable as Rust source.

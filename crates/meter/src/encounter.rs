@@ -7,7 +7,7 @@ use crate::event::{Class, DamageEvent, EnemyHp, EntityKind, PlayerInfo, Protocol
 use crate::fight::{FightConfig, FightEndCause, FightState};
 use crate::phase;
 use crate::reset::{EnemyState, ResetConfig, ResetReason, check_hp_rollback};
-use crate::stats::{EncounterInfo, PlayerRow, PlayerStats, Snapshot};
+use crate::stats::{EncounterInfo, PlayerRow, PlayerStats, SkillRow, Snapshot};
 use crate::tables;
 
 /// Debounce window for `DamageEvent::is_dead`: a death for the same uid
@@ -854,15 +854,26 @@ impl Meter {
         }
 
         stats.hits += 1;
+        // Per-skill `hits` is bumped outside the `!d.is_miss` guard below so
+        // it stays definitionally identical to the player-level `hits` above
+        // — a miss is a swing on some skill, not a non-event.
+        let skill = stats.skills.entry(d.skill_id).or_default();
+        skill.hits += 1;
         if !d.is_miss {
             stats.total_damage += d.value;
+            skill.total_damage += d.value;
             if d.crit {
                 stats.crit_hits += 1;
                 stats.crit_damage += d.value;
+                skill.crit_hits += 1;
+                skill.crit_damage += d.value;
+                skill.max_crit = skill.max_crit.max(d.value);
             }
             if d.lucky {
                 stats.lucky_hits += 1;
                 stats.lucky_damage += d.value;
+                skill.lucky_hits += 1;
+                skill.lucky_damage += d.value;
             }
         }
 
@@ -1634,6 +1645,7 @@ impl Meter {
                 } else {
                     0.0
                 };
+                let skills = skill_rows(p, dps_duration_ms);
                 PlayerRow {
                     uid: p.uid,
                     name: p
@@ -1652,6 +1664,7 @@ impl Meter {
                     lucky_pct: p.lucky_pct(),
                     hits: p.hits,
                     deaths: p.deaths,
+                    skills,
                 }
             })
             .collect();
@@ -1741,6 +1754,63 @@ impl Meter {
     pub fn is_active(&self) -> bool {
         self.fight_start_ms.is_some()
     }
+}
+
+/// Builds one player's `SkillRow`s from their skill accumulators, damage
+/// descending (issue #16) — split out from `Meter::snapshot` as a pure
+/// function so the per-skill arithmetic sits beside its own unit tests
+/// rather than buried in the row-building closure. `dps_duration_ms` is
+/// `Meter::snapshot`'s shared DPS denominator (D8), so `hits_per_min` can
+/// never disagree with the row's own DPS window.
+fn skill_rows(stats: &PlayerStats, dps_duration_ms: u64) -> Vec<SkillRow> {
+    let mut rows: Vec<SkillRow> = stats
+        .skills
+        .iter()
+        .map(|(&skill_id, skill)| {
+            let share_pct = if stats.total_damage > 0 {
+                (skill.total_damage as f64 / stats.total_damage as f64 * 100.0) as f32
+            } else {
+                0.0
+            };
+            let crit_pct = if skill.hits > 0 {
+                skill.crit_hits as f32 / skill.hits as f32 * 100.0
+            } else {
+                0.0
+            };
+            let avg = if skill.hits > 0 {
+                skill.total_damage as f64 / skill.hits as f64
+            } else {
+                0.0
+            };
+            let avg_crit = if skill.crit_hits > 0 {
+                skill.crit_damage as f64 / skill.crit_hits as f64
+            } else {
+                0.0
+            };
+            let white_hits = skill.hits - skill.crit_hits;
+            let avg_white = if white_hits > 0 {
+                (skill.total_damage - skill.crit_damage) as f64 / white_hits as f64
+            } else {
+                0.0
+            };
+            let hits_per_min = skill.hits as f64 / (dps_duration_ms as f64 / 60_000.0);
+            SkillRow {
+                skill_id,
+                damage: skill.total_damage,
+                share_pct,
+                crit_pct,
+                max_crit: skill.max_crit,
+                avg_crit,
+                avg_white,
+                avg,
+                hits: skill.hits,
+                crit_hits: skill.crit_hits,
+                hits_per_min,
+            }
+        })
+        .collect();
+    rows.sort_by_key(|s| std::cmp::Reverse(s.damage));
+    rows
 }
 
 /// Builds the "scene changed" diagnostic line (issue #69), or `None` when
@@ -1943,6 +2013,127 @@ mod tests {
         assert_eq!(snap.rows.len(), 1);
         assert_eq!(snap.rows[0].hits, 1);
         assert_eq!(snap.rows[0].damage, 0);
+    }
+
+    // -- issue #16: per-skill breakdown -------------------------------------
+
+    fn skill_dmg(
+        attacker_uid: i64,
+        skill_id: i32,
+        value: i64,
+        crit: bool,
+        ts: u64,
+    ) -> ProtocolEvent {
+        ProtocolEvent::Damage(DamageEvent {
+            attacker_uid,
+            attacker_kind: EntityKind::Player,
+            skill_id,
+            value,
+            crit,
+            timestamp_ms: ts,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn avg_white_is_zero_when_every_hit_crits() {
+        let mut m = Meter::new();
+        m.apply(&skill_dmg(1, 42, 100, true, 1000));
+        m.apply(&skill_dmg(1, 42, 200, true, 2000));
+        let snap = m.snapshot(3000);
+        let skill = &snap.rows[0].skills[0];
+        assert_eq!(skill.hits, 2);
+        assert_eq!(skill.crit_hits, 2);
+        assert_eq!(skill.avg_white, 0.0);
+    }
+
+    #[test]
+    fn a_lucky_non_crit_hit_counts_as_a_white_hit() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Damage(DamageEvent {
+            attacker_uid: 1,
+            attacker_kind: EntityKind::Player,
+            skill_id: 7,
+            value: 150,
+            crit: false,
+            lucky: true,
+            timestamp_ms: 1000,
+            ..Default::default()
+        }));
+        let snap = m.snapshot(2000);
+        let skill = &snap.rows[0].skills[0];
+        assert_eq!(skill.hits, 1);
+        assert_eq!(skill.crit_hits, 0);
+        // A lucky non-crit hit is still a white hit (D6) — the average is
+        // not zeroed just because `lucky` is set.
+        assert!((skill.avg_white - 150.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn max_crit_tracks_the_largest_crit_only() {
+        let mut m = Meter::new();
+        m.apply(&skill_dmg(1, 9, 500, false, 1000));
+        m.apply(&skill_dmg(1, 9, 300, true, 2000));
+        m.apply(&skill_dmg(1, 9, 700, true, 3000));
+        let snap = m.snapshot(4000);
+        let skill = &snap.rows[0].skills[0];
+        // The 500 non-crit hit must never be considered even though it's
+        // the largest raw value — max_crit only ever looks at crit hits.
+        assert_eq!(skill.max_crit, 700);
+    }
+
+    #[test]
+    fn a_missed_swing_bumps_per_skill_hits_but_not_damage() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Damage(DamageEvent {
+            attacker_uid: 1,
+            attacker_kind: EntityKind::Player,
+            skill_id: 3,
+            value: 999,
+            is_miss: true,
+            timestamp_ms: 1000,
+            ..Default::default()
+        }));
+        let snap = m.snapshot(2000);
+        let skill = &snap.rows[0].skills[0];
+        assert_eq!(skill.hits, 1);
+        assert_eq!(skill.damage, 0);
+    }
+
+    #[test]
+    fn per_skill_hits_sum_to_the_player_hit_count() {
+        let mut m = Meter::new();
+        m.apply(&skill_dmg(1, 1, 100, false, 1000));
+        m.apply(&skill_dmg(1, 1, 100, false, 1500));
+        m.apply(&skill_dmg(1, 2, 200, true, 2000));
+        m.apply(&ProtocolEvent::Damage(DamageEvent {
+            attacker_uid: 1,
+            attacker_kind: EntityKind::Player,
+            skill_id: 2,
+            value: 999,
+            is_miss: true,
+            timestamp_ms: 2500,
+            ..Default::default()
+        }));
+        let snap = m.snapshot(3000);
+        let row = &snap.rows[0];
+        let skill_hit_sum: u64 = row.skills.iter().map(|s| s.hits).sum();
+        assert_eq!(skill_hit_sum, row.hits);
+    }
+
+    #[test]
+    fn hits_per_minute_uses_the_snapshot_dps_window() {
+        let mut m = Meter::new();
+        // fight_start_ms = 0 (first event), last_event_ms = 25_000 (last
+        // event, i=5) -> dps_duration_ms = 25_000ms. 6 hits over 25s is
+        // 14.4 hits/min — the same denominator `Meter::snapshot` uses for
+        // the row's own DPS, per D8.
+        for i in 0..6 {
+            m.apply(&skill_dmg(1, 5, 10, false, i * 5_000));
+        }
+        let snap = m.snapshot(40_000);
+        let skill = &snap.rows[0].skills[0];
+        assert!((skill.hits_per_min - 14.4).abs() < 0.001);
     }
 
     #[test]

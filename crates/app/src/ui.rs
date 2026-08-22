@@ -464,6 +464,9 @@ fn demo_snapshot() -> Snapshot {
                     lucky_pct,
                     hits,
                     deaths,
+                    // T5 fills in demo skill breakdowns; left empty here so
+                    // this compiles without T1 owning the demo-data change.
+                    skills: Vec::new(),
                 }
             },
         )
@@ -7899,6 +7902,7 @@ mod tests {
             season_strength: None,
             imagines: [None, None],
             imagine_tiers: [None, None],
+            skills: Vec::new(),
         }
     }
 
@@ -8655,6 +8659,7 @@ mod tests {
             season_strength: Some(9_999),
             imagines: [Some(99_999), Some(99_999)],
             imagine_tiers: [Some(IMAGINE_MAX_TIER), Some(IMAGINE_MAX_TIER)],
+            skills: Vec::new(),
         };
 
         for (kind, column) in ColumnKind::ALL

@@ -1,6 +1,24 @@
 //! Per-player stats and the UI-facing snapshot read model (plan §T2.1).
 
 use crate::event::Class;
+use std::collections::HashMap;
+
+/// Per-skill accumulator (issue #16). Keyed by the raw wire skill id — BPSR
+/// self-reports a stable id on every sub-hit, so no normalisation, no
+/// divide-by-100, no parent/sub-skill remap.
+#[derive(Debug, Clone, Default)]
+pub struct SkillStats {
+    pub total_damage: i64,
+    pub hits: u64,
+    pub crit_hits: u64,
+    pub crit_damage: i64,
+    pub lucky_hits: u64,
+    pub lucky_damage: i64,
+    /// D7: running max of *crit* hit values. No upstream tracker keeps this
+    /// (resonance-logs, bpsr-logs and BPSR-ZDPS all sum but never max a
+    /// crit), so it is ours to maintain — one comparison per crit event.
+    pub max_crit: i64,
+}
 
 #[derive(Debug, Clone)]
 pub struct PlayerStats {
@@ -34,6 +52,14 @@ pub struct PlayerStats {
     /// (issue #49). This counts the *victim*, not the attacker — see
     /// `Meter::apply_damage`.
     pub deaths: u32,
+    /// Per-skill breakdown (issue #16), keyed by raw skill id. Emitted in
+    /// every snapshot rather than behind a subscription: resonance-logs
+    /// gates its equivalent because it serialises to a webview per tick;
+    /// ours is an in-process clone of at most a raid's players times a few
+    /// dozen skills, and `SkillRow` carries the raw id (name resolved at
+    /// draw time from the static table), so nothing allocates per skill per
+    /// tick.
+    pub skills: HashMap<i32, SkillStats>,
     /// Timestamp (event clock, not wall time) of the last death counted for
     /// this player, used to debounce a retransmitted/duplicated delta packet
     /// from double-counting a single death (issue #49). `pub(crate)`, not
@@ -58,6 +84,7 @@ impl PlayerStats {
             lucky_hits: 0,
             lucky_damage: 0,
             deaths: 0,
+            skills: HashMap::new(),
             last_death_ms: None,
         }
     }
@@ -110,6 +137,41 @@ pub struct PlayerRow {
     /// Times this player died this encounter (issue #49). See
     /// `PlayerStats::deaths`.
     pub deaths: u32,
+    /// This player's per-skill breakdown, damage-descending (issue #16). One
+    /// row per raw skill id — the reference's sub-skill "short name"
+    /// grouping has no analogue in BPSR's flat ids, so there is deliberately
+    /// no expander/grouping tier here (D12).
+    pub skills: Vec<SkillRow>,
+}
+
+/// One row of a player's skill breakdown (issue #16). This is the contract
+/// the skills-window UI consumes — do not change it without updating that
+/// consumer.
+#[derive(Debug, Clone)]
+pub struct SkillRow {
+    /// Raw wire skill id; the display name is resolved at draw time via
+    /// `tables::skill_name`, so no `String` is allocated per skill per tick.
+    pub skill_id: i32,
+    pub damage: i64,
+    /// Share of this *player's* damage, not the encounter's.
+    pub share_pct: f32,
+    pub crit_pct: f32,
+    pub max_crit: i64,
+    /// Mean crit hit; `0.0` when this skill has never crit.
+    pub avg_crit: f64,
+    /// D6: mean non-crit hit, `(total_damage - crit_damage) / (hits -
+    /// crit_hits)`. Lucky is deliberately *not* excluded — lucky and crit
+    /// are orthogonal flags in BPSR, so a lucky non-crit hit is still a
+    /// white hit. `0.0` when every hit crit, matching the reference's
+    /// literal `0`.
+    pub avg_white: f64,
+    pub avg: f64,
+    pub hits: u64,
+    pub crit_hits: u64,
+    /// D8: hits per minute over `Meter::snapshot`'s shared
+    /// `dps_duration_ms`, so a skill's rate can never disagree with the
+    /// row's own DPS window.
+    pub hits_per_min: f64,
 }
 
 /// What the meter believes is being fought, as far as the packet stream reveals
