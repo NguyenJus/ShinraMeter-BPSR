@@ -7,7 +7,7 @@ use crate::event::{Class, DamageEvent, EnemyHp, EntityKind, PlayerInfo, Protocol
 use crate::fight::{FightConfig, FightEndCause, FightState};
 use crate::phase;
 use crate::reset::{EnemyState, ResetConfig, ResetReason, check_hp_rollback};
-use crate::stats::{EncounterInfo, PlayerRow, PlayerStats, SkillRow, Snapshot};
+use crate::stats::{EncounterInfo, PlayerRow, PlayerStats, SkillRow, SkillStats, Snapshot};
 use crate::tables;
 
 /// Debounce window for `DamageEvent::is_dead`: a death for the same uid
@@ -1756,57 +1756,73 @@ impl Meter {
     }
 }
 
+/// Builds one `SkillRow` from a skill's raw accumulator and the player's
+/// total damage (issue #16) — the single source of truth for the per-skill
+/// arithmetic (share/crit/avg/hits-per-min), so both the real aggregator
+/// ([`skill_rows`], below) and `bpsr-app`'s demo seed (`demo_skill_rows`) go
+/// through the same formulas and can never quietly drift apart. Takes
+/// `&SkillStats` rather than its fields spelled out (`lucky_hits`/
+/// `lucky_damage` go unused here) so the arg count stays reasonable.
+/// `dps_duration_ms` is `Meter::snapshot`'s shared DPS denominator (D8), so
+/// `hits_per_min` can never disagree with the row's own DPS window.
+pub fn skill_row_from_stats(
+    skill_id: i32,
+    skill: &SkillStats,
+    player_damage: i64,
+    dps_duration_ms: u64,
+) -> SkillRow {
+    let share_pct = if player_damage > 0 {
+        (skill.total_damage as f64 / player_damage as f64 * 100.0) as f32
+    } else {
+        0.0
+    };
+    let crit_pct = if skill.hits > 0 {
+        skill.crit_hits as f32 / skill.hits as f32 * 100.0
+    } else {
+        0.0
+    };
+    let avg = if skill.hits > 0 {
+        skill.total_damage as f64 / skill.hits as f64
+    } else {
+        0.0
+    };
+    let avg_crit = if skill.crit_hits > 0 {
+        skill.crit_damage as f64 / skill.crit_hits as f64
+    } else {
+        0.0
+    };
+    let white_hits = skill.hits - skill.crit_hits;
+    let avg_white = if white_hits > 0 {
+        (skill.total_damage - skill.crit_damage) as f64 / white_hits as f64
+    } else {
+        0.0
+    };
+    let hits_per_min = skill.hits as f64 / (dps_duration_ms as f64 / 60_000.0);
+    SkillRow {
+        skill_id,
+        damage: skill.total_damage,
+        share_pct,
+        crit_pct,
+        max_crit: skill.max_crit,
+        avg_crit,
+        avg_white,
+        avg,
+        hits: skill.hits,
+        crit_hits: skill.crit_hits,
+        hits_per_min,
+    }
+}
+
 /// Builds one player's `SkillRow`s from their skill accumulators, damage
 /// descending (issue #16) — split out from `Meter::snapshot` as a pure
 /// function so the per-skill arithmetic sits beside its own unit tests
-/// rather than buried in the row-building closure. `dps_duration_ms` is
-/// `Meter::snapshot`'s shared DPS denominator (D8), so `hits_per_min` can
-/// never disagree with the row's own DPS window.
+/// rather than buried in the row-building closure.
 fn skill_rows(stats: &PlayerStats, dps_duration_ms: u64) -> Vec<SkillRow> {
     let mut rows: Vec<SkillRow> = stats
         .skills
         .iter()
         .map(|(&skill_id, skill)| {
-            let share_pct = if stats.total_damage > 0 {
-                (skill.total_damage as f64 / stats.total_damage as f64 * 100.0) as f32
-            } else {
-                0.0
-            };
-            let crit_pct = if skill.hits > 0 {
-                skill.crit_hits as f32 / skill.hits as f32 * 100.0
-            } else {
-                0.0
-            };
-            let avg = if skill.hits > 0 {
-                skill.total_damage as f64 / skill.hits as f64
-            } else {
-                0.0
-            };
-            let avg_crit = if skill.crit_hits > 0 {
-                skill.crit_damage as f64 / skill.crit_hits as f64
-            } else {
-                0.0
-            };
-            let white_hits = skill.hits - skill.crit_hits;
-            let avg_white = if white_hits > 0 {
-                (skill.total_damage - skill.crit_damage) as f64 / white_hits as f64
-            } else {
-                0.0
-            };
-            let hits_per_min = skill.hits as f64 / (dps_duration_ms as f64 / 60_000.0);
-            SkillRow {
-                skill_id,
-                damage: skill.total_damage,
-                share_pct,
-                crit_pct,
-                max_crit: skill.max_crit,
-                avg_crit,
-                avg_white,
-                avg,
-                hits: skill.hits,
-                crit_hits: skill.crit_hits,
-                hits_per_min,
-            }
+            skill_row_from_stats(skill_id, skill, stats.total_damage, dps_duration_ms)
         })
         .collect();
     rows.sort_by_key(|s| std::cmp::Reverse(s.damage));

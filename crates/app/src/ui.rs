@@ -13,7 +13,9 @@
 
 use std::time::Duration;
 
-use bpsr_meter::{Class, EncounterInfo, PlayerRow, Role, SkillRow, Snapshot};
+use bpsr_meter::{
+    Class, EncounterInfo, PlayerRow, Role, SkillRow, SkillStats, Snapshot, skill_row_from_stats,
+};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui;
 
@@ -326,9 +328,10 @@ fn demo_enabled_from(var: Option<&str>) -> bool {
 /// field — only a running `max_crit`) because a `SkillRow`'s `avg_crit` and
 /// `avg_white` are *means*, and a literal fixture has no per-hit event
 /// stream to mean over; carrying `crit_damage` explicitly is the minimum
-/// needed for [`demo_skill_rows`] to derive every `SkillRow` field with the
-/// same formulas `bpsr_meter::encounter::skill_rows` uses, rather than
-/// inventing a second, looser set of demo-only ones.
+/// needed for [`demo_skill_rows`] to hand every field off to
+/// `bpsr_meter::skill_row_from_stats` — the same formulas the real
+/// aggregator uses, rather than inventing a second, looser set of
+/// demo-only ones.
 type DemoSkill = (i32, i64, u64, u64, i64, i64);
 
 /// `(name, class, damage, crit_pct, lucky_pct, hits, deaths, imagines,
@@ -495,6 +498,33 @@ const DEMO_ROWS: [DemoRow; 5] = [
     ),
 ];
 
+/// Derives one demo row's `SkillRow`s from its `DemoSkill` fixture list
+/// (issue #16) via `bpsr_meter::skill_row_from_stats` — the same formulas
+/// the real aggregator uses, kept in sync by construction instead of a
+/// second copy of the arithmetic living here. Sorted damage-descending
+/// like the real snapshot, so the breakdown window's default sort (D9) is
+/// a no-op on first paint here too.
+fn demo_skill_rows(skills: &[DemoSkill], player_damage: i64, duration_ms: u64) -> Vec<SkillRow> {
+    let mut rows: Vec<SkillRow> = skills
+        .iter()
+        .map(
+            |&(skill_id, damage, hits, crit_hits, crit_damage, max_crit)| {
+                let stats = SkillStats {
+                    total_damage: damage,
+                    hits,
+                    crit_hits,
+                    crit_damage,
+                    max_crit,
+                    ..Default::default()
+                };
+                skill_row_from_stats(skill_id, &stats, player_damage, duration_ms)
+            },
+        )
+        .collect();
+    rows.sort_by_key(|s| std::cmp::Reverse(s.damage));
+    rows
+}
+
 /// The synthetic snapshot `demo_enabled` seeds the overlay with. The header's
 /// `total_damage`/`total_dps` are derived from `DEMO_ROWS` rather than a
 /// separate literal (issue #148), so the two can never disagree the way they
@@ -504,71 +534,6 @@ const DEMO_ROWS: [DemoRow; 5] = [
 /// scene are a real BPSR pull: `Purge! Field of Forgotten Illusions`'s final
 /// boss, `Paradox-Calamity Remnant - Final` (`tables.rs`), a fight that runs
 /// well within this snapshot's 159s duration in practice.
-/// Derives one demo row's `SkillRow`s from its `DemoSkill` fixture list
-/// (issue #16), mirroring `bpsr_meter::encounter::skill_rows`'s formulas
-/// exactly — `share_pct` against `player_damage`, `avg`/`avg_crit`/
-/// `avg_white` as means computed over the fixture's explicit `crit_damage`
-/// (a demo literal has no per-hit event stream to derive that mean from the
-/// way the real aggregator does), and `hits_per_min` over the same
-/// `duration_ms` the demo header derives its DPS from. The arithmetic is
-/// duplicated here rather than run through `skill_rows` on a synthesized
-/// `PlayerStats` because that function is private to
-/// `bpsr_meter::encounter` and this task (plan T5) touches only the demo
-/// seed, not the aggregation. Sorted damage-descending like the real
-/// snapshot, so the breakdown window's default sort (D9) is a no-op on
-/// first paint here too.
-fn demo_skill_rows(skills: &[DemoSkill], player_damage: i64, duration_ms: u64) -> Vec<SkillRow> {
-    let mut rows: Vec<SkillRow> = skills
-        .iter()
-        .map(
-            |&(skill_id, damage, hits, crit_hits, crit_damage, max_crit)| {
-                let share_pct = if player_damage > 0 {
-                    (damage as f64 / player_damage as f64 * 100.0) as f32
-                } else {
-                    0.0
-                };
-                let crit_pct = if hits > 0 {
-                    crit_hits as f32 / hits as f32 * 100.0
-                } else {
-                    0.0
-                };
-                let avg = if hits > 0 {
-                    damage as f64 / hits as f64
-                } else {
-                    0.0
-                };
-                let avg_crit = if crit_hits > 0 {
-                    crit_damage as f64 / crit_hits as f64
-                } else {
-                    0.0
-                };
-                let white_hits = hits - crit_hits;
-                let avg_white = if white_hits > 0 {
-                    (damage - crit_damage) as f64 / white_hits as f64
-                } else {
-                    0.0
-                };
-                let hits_per_min = hits as f64 / (duration_ms as f64 / 60_000.0);
-                SkillRow {
-                    skill_id,
-                    damage,
-                    share_pct,
-                    crit_pct,
-                    max_crit,
-                    avg_crit,
-                    avg_white,
-                    avg,
-                    hits,
-                    crit_hits,
-                    hits_per_min,
-                }
-            },
-        )
-        .collect();
-    rows.sort_by_key(|s| std::cmp::Reverse(s.damage));
-    rows
-}
-
 fn demo_snapshot() -> Snapshot {
     let row_damage_sum: i64 = DEMO_ROWS.iter().map(|(_, _, dmg, ..)| dmg).sum();
     let duration_ms = 159_000u64;
@@ -3989,7 +3954,21 @@ pub fn column_anchors(
     columns: &[StatColumn],
     margin: f32,
 ) -> Vec<f32> {
-    let total_width: f32 = columns.iter().map(|c| c.width).sum();
+    let widths: Vec<f32> = columns.iter().map(|c| c.width).collect();
+    column_anchors_from_widths(rect_left, rect_right, &widths, margin)
+}
+
+/// Same anchor placement as [`column_anchors`], over bare widths rather
+/// than full `StatColumn`s — for a caller (`draw_skill_window`) that has a
+/// fixed width per column but no per-row `text`/`color` to paint through a
+/// `StatColumn`.
+pub fn column_anchors_from_widths(
+    rect_left: f32,
+    rect_right: f32,
+    widths: &[f32],
+    margin: f32,
+) -> Vec<f32> {
+    let total_width: f32 = widths.iter().sum();
     let available = (rect_right - rect_left - margin).max(0.0);
     let scale = if total_width > available && total_width > 0.0 {
         available / total_width
@@ -3997,11 +3976,11 @@ pub fn column_anchors(
         1.0
     };
 
-    let mut anchors = Vec::with_capacity(columns.len());
+    let mut anchors = Vec::with_capacity(widths.len());
     let mut x = rect_right - margin;
-    for col in columns.iter().rev() {
+    for &width in widths.iter().rev() {
         anchors.push(x);
-        x -= col.width * scale;
+        x -= width * scale;
     }
     anchors.reverse();
     anchors
@@ -5239,9 +5218,9 @@ fn skill_windows_to_draw<'a>(
 /// Painted with explicit rects via `ui.painter()`, mirroring `draw_row`'s
 /// style, rather than egui's widget-flow layout: the window is fixed-size
 /// and non-resizable, so every position is a known constant, and the
-/// column grid reuses `column_anchors`' right-aligned-anchor scheme
-/// exactly like the main row list does — the anchor maths is not
-/// re-derived here.
+/// column grid reuses `column_anchors_from_widths`' right-aligned-anchor
+/// scheme, the same maths `column_anchors` uses for the main row list —
+/// the anchor maths is not re-derived here.
 fn draw_skill_window(
     ui: &mut egui::Ui,
     row: &PlayerRow,
@@ -5381,21 +5360,11 @@ fn draw_skill_window(
         egui::pos2(rect.left(), tabs_rect.bottom()),
         egui::vec2(rect.width(), SKILL_COLUMN_HEADER_HEIGHT),
     );
-    let stat_columns: Vec<StatColumn> = SKILL_COLUMN_ORDER
-        .iter()
-        .map(|c| StatColumn {
-            width: c.width(),
-            // Never called: only `width` feeds `column_anchors`'
-            // right-to-left allocation below. `SkillColumn::text` (not
-            // `StatColumn::text`) is what actually renders a value.
-            text: |_row: &PlayerRow| String::new(),
-            color: egui::Color32::WHITE,
-        })
-        .collect();
-    let anchors = column_anchors(
+    let widths: Vec<f32> = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).collect();
+    let anchors = column_anchors_from_widths(
         col_header_rect.left() + SKILL_HEADER_PAD_X,
         col_header_rect.right() - SKILL_HEADER_PAD_X,
-        &stat_columns,
+        &widths,
         0.0,
     );
     for (i, (&anchor_x, kind)) in anchors.iter().zip(SKILL_COLUMN_ORDER.iter()).enumerate() {
@@ -12125,6 +12094,105 @@ mod tests {
         assert!(
             windows.contains_key(&2),
             "a uid missing from the snapshot must stay open, not be closed"
+        );
+    }
+
+    fn sample_skill_row(skill_id: i32) -> SkillRow {
+        SkillRow {
+            skill_id,
+            damage: 1_000,
+            share_pct: 50.0,
+            crit_pct: 10.0,
+            max_crit: 200,
+            avg_crit: 150.0,
+            avg_white: 90.0,
+            avg: 100.0,
+            hits: 10,
+            crit_hits: 1,
+            hits_per_min: 5.0,
+        }
+    }
+
+    /// Two-frame click harness for `draw_skill_window`, the same shape as
+    /// `opened_uid_after_click`: frame 1 lays the window out with no input
+    /// and reads back where `value`'s text actually painted (not knowable
+    /// ahead of a real run); frame 2 (the same `Context`, so the interact
+    /// ids line up) sends a synthesized left click there and returns
+    /// whatever this run reports the `X` glyph did, leaving `sort` mutated
+    /// in place for the caller to inspect.
+    fn click_skill_window_at(row: &PlayerRow, sort: &mut skills::SkillSort, value: &str) -> bool {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_SIZE);
+
+        let layout = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_skill_window(ui, row, sort, &icons, 1.0);
+            },
+        );
+        let mut frame = RowFrame {
+            texts: Vec::new(),
+            meshes: Vec::new(),
+        };
+        for clipped in &layout.shapes {
+            collect_row_boxes(&clipped.shape, clipped.clip_rect, &mut frame);
+        }
+        let pos = frame.text_box(value).center();
+        layout.drop_without_applying_deltas();
+
+        let mut clicked = false;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..click_at_with_button(pos, egui::PointerButton::Primary)
+            },
+            |ui| {
+                clicked = draw_skill_window(ui, row, sort, &icons, 1.0);
+            },
+        );
+        output.drop_without_applying_deltas();
+        clicked
+    }
+
+    #[test]
+    fn clicking_a_column_header_toggles_its_sort() {
+        let row = PlayerRow {
+            skills: vec![sample_skill_row(1550), sample_skill_row(1551)],
+            ..sample_row(None)
+        };
+        let mut sort = skills::SkillSort::default();
+        assert_eq!(sort.column, skills::SkillColumn::Damage);
+
+        // "Skill name" is the `Name` header's plain (unselected) label —
+        // the default sort is `Damage`, so this is never the active-sort
+        // text `header_label` would instead paint.
+        click_skill_window_at(&row, &mut sort, "Skill name");
+
+        assert_eq!(sort.column, skills::SkillColumn::Name);
+        assert!(
+            sort.descending,
+            "a newly-clicked column always starts descending (D9)"
+        );
+    }
+
+    #[test]
+    fn clicking_the_close_glyph_closes_the_window() {
+        let row = PlayerRow {
+            skills: vec![sample_skill_row(1550)],
+            ..sample_row(None)
+        };
+        let mut sort = skills::SkillSort::default();
+
+        let closed = click_skill_window_at(&row, &mut sort, "\u{2715}");
+
+        assert!(
+            closed,
+            "clicking the close glyph must report the window closed (D2)"
         );
     }
 }
