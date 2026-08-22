@@ -5337,7 +5337,19 @@ const SKILL_ICON_SIZE: f32 = 24.0;
 /// flat disc the Imagine slots degrade to, so an empty slot reads as a
 /// deliberate blank rather than a rendering failure.
 const SKILL_ICON_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x3B);
-const SKILL_HEADER_ICON_SIZE: f32 = 32.0;
+/// Issue #190: the reference's `Skills.xaml:151-154` draws the class icon
+/// at 50x50, but that number comes from an `Height="Auto"` header row where
+/// the icon *is* the tallest child and therefore sets the row's height —
+/// there's no independent header height to match. Ours works the other way
+/// around (`SKILL_HEADER_HEIGHT` is a fixed 56.0), so porting 50 verbatim
+/// would exceed the header's padded content area (`SKILL_HEADER_HEIGHT -
+/// 2 * SKILL_HEADER_PAD_Y` = 40) and break the `SKILL_HEADER_PAD_Y`
+/// padding it's centered within. Sized instead to exactly fill that content
+/// area — the same 40 the Deaths pill is already sized to (`deaths_pill_size`
+/// below) — reproducing the reference's "icon fills the row" relationship
+/// within our fixed-height header, up from the old 32.0 which left a
+/// visually undersized 12px of slack above and below the icon.
+const SKILL_HEADER_ICON_SIZE: f32 = 40.0;
 const SKILL_HEADER_PAD_X: f32 = 12.0;
 const SKILL_HEADER_PAD_Y: f32 = 8.0;
 const SKILL_CLOSE_SIZE: f32 = 20.0;
