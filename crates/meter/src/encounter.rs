@@ -614,27 +614,104 @@ impl Meter {
                 if let Some(msg) = scene_transition_log(self.scene_id, Some(*level_map_id)) {
                     log::info!("{msg}");
                 }
-                // issue #12: any real scene change (entering a dungeon,
-                // leaving one, or hopping dungeon -> different dungeon) can
-                // leave behind preloaded roster rows nobody ever damaged —
-                // drop those now, before the new scene id lands, so a stale
-                // party member from the last run doesn't linger into this
-                // one. Rows with real activity (damage, a miss, or a death)
-                // are untouched; the existing reset machinery still governs
-                // those.
+                // issue #191: a repeat sync reporting the *same* scene id
+                // is not a real transition — issue #78's hold is untouched
+                // by it, which is what keeps a just-finished fight's
+                // numbers on screen for the user to screenshot as long as
+                // they're in the instance it was fought in.
+                let mut reason = None;
                 if self.scene_id != Some(*level_map_id) {
+                    // issue #12: drop preloaded roster rows nobody ever
+                    // damaged, logging a summary first — a stale party
+                    // member from the last run must not linger even in the
+                    // sliver of time before the id below actually lands.
                     self.prune_stale_preloads();
+
+                    // issue #191: a fight still running when the scene
+                    // changes out from under it never gets to end on its
+                    // own — latch it here, exactly as the `ServerChanged`
+                    // arm below already does for the same reason (issue
+                    // #138). Timestamped by the last real damage, not "now"
+                    // (see `fight_ended_at`): the fight really ended when
+                    // the hitting stopped, not whenever this packet
+                    // happened to arrive. Applies regardless of the
+                    // destination — a fight cut short by a same-shard
+                    // transition into the open world deserves to freeze and
+                    // be recorded too, even when the reset below won't fire
+                    // for it.
+                    let cut_short = self.fight_start_ms.is_some() && self.fight_end_ms.is_none();
+                    if cut_short {
+                        self.latch_fight_end(FightEndCause::ServerChanged, self.last_event_ms);
+                    }
+
+                    // issue #191: only entering a *dungeon/raid* scene
+                    // clears the roster immediately. That is the one
+                    // transition where new preloaded rows are about to
+                    // start landing — `apply_player`'s preload path is
+                    // gated on `in_dungeon_scene`, i.e. this exact same
+                    // `tables::is_dungeon_scene` check — so it's the one
+                    // place the scene being left and the scene being
+                    // entered could otherwise collide in the same roster.
+                    // Any other destination (town, the open world) hands
+                    // the roster back to issue #78's ordinary hold instead:
+                    // no new preload rows can land there to collide with
+                    // anything, and clearing eagerly would cut short the
+                    // very feature issue #152 exists for — keeping a
+                    // just-finished dungeon run's numbers on screen after
+                    // zoning out to town.
+                    //
+                    // Gated on `!cut_short` too: a fight the `latch` above
+                    // just froze has not had a single tick to be observed
+                    // as `Ended` and recorded to history yet — resetting it
+                    // in this same call would erase it before any external
+                    // caller ever sees it, silently dropping the encounter.
+                    // Deferring to the ordinary `NewFight` reset instead
+                    // (fired by the new dungeon's first real hit) gives the
+                    // publish loop the tick it needs first, exactly as
+                    // issue #138's own `ServerChanged`-cut-short case
+                    // already relies on. The tradeoff: a preload row for
+                    // the new dungeon can still land next to this held
+                    // fight's rows for the brief window until that first
+                    // real hit — narrower than the bug this fixes (which
+                    // had no such hit to eventually clean it up at all),
+                    // but not eliminated by it.
+                    //
+                    // And gated on `self.scene_id.is_some()`: a `None`
+                    // scene id going in is *unknown*, not *different* — it
+                    // can mean a genuinely new instance (after a
+                    // `ServerChanged`), but it can just as well mean this
+                    // very `Scene` packet is the *late* confirmation of the
+                    // instance the currently-held fight was already fought
+                    // in (`a_scene_learned_after_the_boss_was_still_captions_the_held_fight`,
+                    // issue #152: `EnterScene` can land after the pull
+                    // already started). The meter has no way to tell those
+                    // two apart from here, and wrongly clearing the second
+                    // one would erase a fight's identity in the same call
+                    // that was supposed to fill it in. Only a scene change
+                    // *positively confirmed* by a known previous id is
+                    // resolved immediately; the unknown-origin case still
+                    // falls back to `prune_stale_preloads` plus the
+                    // ordinary `NewFight` reset, exactly as before #191.
+                    if tables::is_dungeon_scene(*level_map_id)
+                        && !cut_short
+                        && self.scene_id.is_some()
+                    {
+                        self.reset(ResetReason::SceneChanged, self.last_event_ms);
+                        reason = Some(ResetReason::SceneChanged);
+                    }
+
                     // issue #154 / PR #163 review, finding 1: a wipe hold
                     // belongs to the pull it froze, and that pull is in the
                     // scene being left. Carrying it out of the instance
                     // would leave the meter withholding every hit that is
                     // not on a recognized boss — out in the world, where
-                    // there may never be one again. The `ServerChanged` arm
-                    // below drops it for the same reason.
+                    // there may never be one again. Already dropped above
+                    // when `reset` ran; set unconditionally here too since
+                    // that only happens for a dungeon destination.
                     self.wipe_hold = false;
                 }
                 self.scene_id = Some(*level_map_id);
-                None
+                reason
             }
             ProtocolEvent::ServerChanged { timestamp_ms } => {
                 // issue #138: a server change (reconnect/zone transition)
@@ -642,10 +719,14 @@ impl Meter {
                 // valid within one server session — uids are re-issued by
                 // the new server, and the scene id is unknown until the
                 // next `EnterScene`. It deliberately does **not** clear
-                // `players`/totals: those are display state, and a
-                // reconnect does not make them wrong. The next real fight's
-                // `NewFight` reset (`apply_damage`, below) is what clears
-                // them, exactly as it does after an idle-timeout hold.
+                // `players`/totals itself: those are display state, and a
+                // reconnect does not make them wrong — issue #152 relies on
+                // exactly that to keep a held fight's numbers on screen
+                // across a zone-out to town. Unlike the `Scene` arm above,
+                // this event carries no destination scene id, so it cannot
+                // tell a real dungeon-entry transition (issue #191) from a
+                // same-instance reconnect; that call is left to the `Scene`
+                // event that always follows once the destination is known.
                 //
                 // issue #12: a server change is as real a scene change as
                 // any (the old scene's preloads can't possibly still be in
@@ -658,8 +739,10 @@ impl Meter {
                 // idle timeout does, so the held elapsed timer does not run
                 // while the connection is down — and so `fight_end_ms`
                 // being `Some` arms the `NewFight` path for the
-                // reconnecting player's first real hit. A fight already
-                // held (or none running at all) is left exactly as-is.
+                // reconnecting player's first real hit, or the `Scene` arm's
+                // own `SceneChanged` reset if that hit lands in a dungeon.
+                // A fight already held (or none running at all) is left
+                // exactly as-is.
                 //
                 // Latched *before* the entity state is dropped below (PR
                 // #163 review, finding 3): `latch_fight_end` logs the boss
@@ -3907,6 +3990,55 @@ mod tests {
             assert_eq!(reason, None, "a server change must not report a reset");
             let snap = m.snapshot(200_000);
             assert_eq!(snap.total_damage, 5_000);
+            assert!(!snap.rows.is_empty());
+            assert_eq!(m.fight_state(200_000), FightState::Ended);
+        }
+
+        /// issue #191: entering a genuinely different dungeon must not
+        /// leave the previous instance's roster on screen next to the new
+        /// one — the `Scene` arm has to clear it itself rather than wait on
+        /// `NewFight`, which only fires once real damage lands in the new
+        /// instance.
+        #[test]
+        fn scene_change_to_a_different_dungeon_clears_the_held_roster() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 }); // Tina's Mindrealm
+            m.apply(&dmg(1, 5_000, 0));
+            assert_eq!(m.tick(100_000), FightState::Ended);
+
+            let reason = m.apply(&ProtocolEvent::Scene {
+                level_map_id: 31101,
+            }); // a different dungeon
+            assert_eq!(reason, Some(ResetReason::SceneChanged));
+
+            let snap = m.snapshot(100_100);
+            assert!(
+                snap.rows.is_empty(),
+                "the old dungeon's roster must not linger into the new one"
+            );
+            assert_eq!(snap.total_damage, 0);
+            assert_eq!(m.fight_state(100_100), FightState::Idle);
+        }
+
+        /// issue #78, preserved by #191: a scene sync that keeps reporting
+        /// the *same* dungeon (a resend, an AOI refresh) is not a real
+        /// transition, so the held fight's numbers must stay on screen for
+        /// the user to screenshot.
+        #[test]
+        fn repeated_scene_event_for_the_same_dungeon_does_not_clear_the_held_roster() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            m.apply(&dmg(1, 5_000, 0));
+            assert_eq!(m.tick(100_000), FightState::Ended);
+
+            let reason = m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            assert_eq!(reason, None, "a same-scene resync must not report a reset");
+
+            let snap = m.snapshot(200_000);
+            assert_eq!(
+                snap.total_damage, 5_000,
+                "issue #78's hold must survive a same-scene resync"
+            );
             assert!(!snap.rows.is_empty());
             assert_eq!(m.fight_state(200_000), FightState::Ended);
         }

@@ -402,11 +402,14 @@ impl Pipeline {
     }
 
     /// Applies one protocol event. Returns `Some(reason)` when the event
-    /// triggered a reset (boss-HP rollback, or the first hit of a new
-    /// fight — including one on the far side of a `ServerChanged`
-    /// reconnect, issue #138). A `ServerChanged` event itself never
-    /// triggers a reset: it only invalidates entity/scene state and
-    /// freezes the fight clock, leaving the displayed stats on screen.
+    /// triggered a reset: boss-HP rollback, the first hit of a new fight —
+    /// including one on the far side of a `ServerChanged` reconnect, issue
+    /// #138 — or `Scene` resolving to a dungeon/raid id different from the
+    /// one already held (issue #191). A `ServerChanged` event itself never
+    /// triggers a reset: it carries no destination scene id, so it only
+    /// invalidates entity/scene state and freezes the fight clock, leaving
+    /// the displayed stats on screen for the `Scene` event that follows to
+    /// judge once the destination is known.
     ///
     /// `now_ms` is supplied by the caller rather than read off the wall
     /// clock inside, so the whole pipeline stays deterministic and
