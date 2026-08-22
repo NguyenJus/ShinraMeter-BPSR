@@ -38,8 +38,15 @@ pub enum FightEndCause {
     IdleTimeout,
     /// Every known party member was down (issue #154).
     Wipe,
-    /// The connection or zone changed under a running fight (issue #138).
+    /// The server session changed under a running fight — a reconnect, or
+    /// a transition that re-issues uids (issue #138).
     ServerChanged,
+    /// The player left the scene the fight was being fought in under a
+    /// running fight (issue #191). Distinct from [`Self::ServerChanged`] on
+    /// purpose: an ordinary same-shard dungeon transition is not a
+    /// reconnect, and labelling it as one gives false hits to anyone
+    /// grepping these lines for connection bugs.
+    SceneChanged,
 }
 
 impl FightEndCause {
@@ -50,6 +57,7 @@ impl FightEndCause {
             Self::IdleTimeout => "idle_timeout",
             Self::Wipe => "wipe",
             Self::ServerChanged => "server_changed",
+            Self::SceneChanged => "scene_changed",
         }
     }
 }
@@ -137,6 +145,7 @@ mod tests {
             FightEndCause::IdleTimeout.label(),
             FightEndCause::Wipe.label(),
             FightEndCause::ServerChanged.label(),
+            FightEndCause::SceneChanged.label(),
         ];
         let mut unique = labels.to_vec();
         unique.sort_unstable();

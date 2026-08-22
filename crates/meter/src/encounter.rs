@@ -631,7 +631,12 @@ impl Meter {
                     // changes out from under it never gets to end on its
                     // own — latch it here, exactly as the `ServerChanged`
                     // arm below already does for the same reason (issue
-                    // #138). Timestamped by the last real damage, not "now"
+                    // #138), but under its own `SceneChanged` cause: an
+                    // ordinary same-shard dungeon transition is not a
+                    // reconnect, and stamping it `server_changed` would give
+                    // false hits to anyone grepping issue #151's fight-end
+                    // diagnostic for connection bugs. Timestamped by the
+                    // last real damage, not "now"
                     // (see `fight_ended_at`): the fight really ended when
                     // the hitting stopped, not whenever this packet
                     // happened to arrive. Applies regardless of the
@@ -641,7 +646,7 @@ impl Meter {
                     // for it.
                     let cut_short = self.fight_start_ms.is_some() && self.fight_end_ms.is_none();
                     if cut_short {
-                        self.latch_fight_end(FightEndCause::ServerChanged, self.last_event_ms);
+                        self.latch_fight_end(FightEndCause::SceneChanged, self.last_event_ms);
                     }
 
                     // issue #191: only entering a *dungeon/raid* scene
@@ -697,6 +702,30 @@ impl Meter {
                         && self.scene_id.is_some()
                     {
                         self.reset(ResetReason::SceneChanged, self.last_event_ms);
+                        // PR #198 review, finding 1: `reset` is shared with
+                        // every in-instance reason (manual, `NewFight`,
+                        // `BossHpRollback`), so it deliberately keeps the
+                        // enemy map and only clears the per-fight flags on
+                        // it. That is the wrong answer for a dungeon entry,
+                        // which breaks entity identity as thoroughly as a
+                        // reconnect does — so mirror the `ServerChanged`
+                        // arm below and drop the old instance's entities
+                        // outright. Left in place, issue #157's fallback in
+                        // `recompute_boss` still ranks over them, and the
+                        // previous run's never-killed boss — alive, and
+                        // engaged well inside `BOSS_ENGAGEMENT_WINDOW_MS` —
+                        // wins the new run's first hit on an unrecognized
+                        // add, naming the wrong boss in the header, on the
+                        // HP bar and in recorded history.
+                        //
+                        // Cleared *after* the reset, not before, so
+                        // `reset_log` still reports the boss HP of the pull
+                        // being cleared (PR #163 review, finding 3, for the
+                        // same reason the `ServerChanged` arm latches before
+                        // it clears). `boss_uid` needs no separate clearing:
+                        // `reset` ends in `recompute_boss`, which finds no
+                        // enemy damaged this fight and so leaves it `None`.
+                        self.enemies.clear();
                         reason = Some(ResetReason::SceneChanged);
                     }
 
@@ -4041,6 +4070,96 @@ mod tests {
             );
             assert!(!snap.rows.is_empty());
             assert_eq!(m.fight_state(200_000), FightState::Ended);
+        }
+
+        /// issue #191: a scene change landing while the fight is still
+        /// `Active` — the party zoned out mid-pull — must latch
+        /// `fight_end_ms` to the last real damage, freezing the clock and
+        /// keeping the accumulated stats, exactly as the `ServerChanged`
+        /// arm does for a reconnect (issue #138). The clear is deliberately
+        /// *not* done in the same call, even though the destination is a
+        /// dungeon: the fight just latched has not had a tick to be
+        /// observed as `Ended` and recorded, so it is left to the new
+        /// dungeon's first hit and the ordinary `NewFight` reset.
+        #[test]
+        fn scene_change_mid_fight_latches_the_clock_and_keeps_the_stats() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 }); // Tina's Mindrealm
+            m.apply(&dmg(1, 700, 0));
+            m.apply(&boss_hit(10, 500, false));
+            m.apply(&hp(10, 50, Some(103), 500));
+
+            // Well inside the idle window: still active, not yet held.
+            assert_eq!(m.fight_state(1_000), FightState::Active);
+            let reason = m.apply(&ProtocolEvent::Scene {
+                level_map_id: 31101,
+            }); // a different dungeon
+            assert_eq!(
+                reason, None,
+                "a cut-short fight defers its clear to the next fight's first hit"
+            );
+
+            assert_eq!(m.fight_state(600_000), FightState::Ended);
+            let snap = m.snapshot(600_000);
+            assert_eq!(
+                snap.total_damage, 800,
+                "player totals must survive zoning out mid-pull"
+            );
+            assert!(!snap.rows.is_empty());
+            assert_eq!(
+                snap.duration_ms, 500,
+                "the clock latches to the last real damage, not fight_start_ms drifting"
+            );
+            assert_eq!(m.scene_id, Some(31101));
+            // issue #152: the numbers on screen are the cut-short pull's, so
+            // the header keeps naming the fight they were fought in.
+            assert_eq!(snap.encounter.boss_monster_id, Some(103));
+        }
+
+        /// PR #198 review, finding 1: entering a new dungeon must not let
+        /// the previous run's boss caption the new one. The old boss is
+        /// still alive and was engaged well inside
+        /// `BOSS_ENGAGEMENT_WINDOW_MS`, so if its `EnemyState` survives the
+        /// transition, issue #157's fallback hands it the new run's first
+        /// hit on an unrecognized add — putting the wrong boss in the
+        /// header, on the HP bar and in recorded history, which is the very
+        /// bleed-through issue #191 exists to stop.
+        #[test]
+        fn a_new_dungeon_does_not_inherit_the_previous_ones_living_boss() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 }); // Tina's Mindrealm
+            m.apply(&dmg(1, 5_000, 1_000));
+            m.apply(&boss_hit(10, 1_000, false));
+            m.apply(&hp(10, 50, Some(103), 1_000));
+            assert_eq!(m.snapshot(1_000).encounter.boss_monster_id, Some(103));
+
+            // Out to town first, which latches the abandoned pull: the
+            // dungeon entry below is then an ordinary `!cut_short`
+            // transition, the one path that resets.
+            m.apply(&ProtocolEvent::Scene { level_map_id: 8 }); // Asterleeds
+            assert_eq!(m.fight_state(2_000), FightState::Ended);
+
+            let reason = m.apply(&ProtocolEvent::Scene {
+                level_map_id: 31101,
+            }); // a different dungeon
+            assert_eq!(reason, Some(ResetReason::SceneChanged));
+
+            // The new run's first hit lands on an add the boss table does
+            // not recognize, which is exactly what arms issue #157's
+            // fallback — and it is still inside the engagement window of
+            // the boss left standing in the last dungeon.
+            m.apply(&boss_hit(20, 20_000, false));
+            m.apply(&hp(20, 50, None, 20_000));
+
+            assert!(
+                !m.enemies.contains_key(&10),
+                "the old instance's entities must not survive into the new one"
+            );
+            assert_eq!(
+                m.snapshot(20_000).encounter.boss_monster_id,
+                None,
+                "the new dungeon must not inherit the old one's boss"
+            );
         }
 
         /// A reconnect mid-fight (still `Active`, not yet held) must latch
