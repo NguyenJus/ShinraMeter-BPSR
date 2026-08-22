@@ -540,6 +540,19 @@ impl Settings {
         self.opacity = Self::clamp_opacity(value);
     }
 
+    /// Public entry point for the `opacity` default (issue #203): the
+    /// header dropdown's "Reset to defaults" item calls this to restore
+    /// full opacity via `set_opacity`, the same way it already calls
+    /// `Settings::default()` — indirectly, through `ColumnKind` — for its
+    /// window-size math. The free `default_opacity()` function above backs
+    /// `#[serde(default)]` and `Default for Settings`, but is private to
+    /// this module, so this just re-exposes the same value under the
+    /// struct's own namespace instead of a caller reaching for
+    /// `Settings::default().opacity` or hardcoding `1.0`.
+    pub fn default_opacity() -> f32 {
+        default_opacity()
+    }
+
     /// Clamps `value` into `OPACITY_MIN..=OPACITY_MAX`. Handles non-finite
     /// input explicitly: `f32::clamp` compares with `<`/`>`, both of which
     /// are false against NaN, so `NaN.clamp(min, max)` would otherwise pass
@@ -1324,6 +1337,16 @@ mod tests {
         // predating issue #166 has no `opacity` key, and the freshly
         // installed default must render exactly as opaque as it always has.
         assert_eq!(Settings::default().opacity, 1.0);
+    }
+
+    /// Issue #203: the header dropdown's "Reset to defaults" item needs a
+    /// public entry point for this value — the free `default_opacity()`
+    /// function above is private to this module. It must agree with what a
+    /// fresh `Settings::default()` actually carries, not just happen to
+    /// repeat `1.0`.
+    #[test]
+    fn default_opacity_public_fn_matches_the_struct_default() {
+        assert_eq!(Settings::default_opacity(), Settings::default().opacity);
     }
 
     #[test]
