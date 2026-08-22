@@ -131,6 +131,7 @@ fn player_info_event(uid: i64, ts: u64) -> SimEvent {
             ability_score: Some(1000 + uid as u32 * 10),
             season_strength: Some(1),
             imagines: None,
+            imagine_tiers: None,
         }),
     }
 }

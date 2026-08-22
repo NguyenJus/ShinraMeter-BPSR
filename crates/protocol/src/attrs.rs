@@ -133,24 +133,60 @@ pub fn decode_varint_u32(raw: &[u8]) -> Option<u32> {
     decode_varint_u64(raw).and_then(|v| u32::try_from(v).ok())
 }
 
-/// `raw_data` for `attr_id::SKILL_LEVEL_ID_LIST` → the equipped skill ids, in
-/// wire order, with `0` entries dropped (matching the crate's zero-is-absent
-/// convention). `None` on malformed input (prost decode failure), per this
-/// module's non-panicking convention — `player_info_from_attrs` treats
-/// `None` the same as "no ids".
+/// Set once a nonzero `remodel_level` (tier) has been observed on any
+/// decoded skill, so `decode_skill_ids` logs the first live sighting
+/// exactly once per process rather than once per packet. Issues #169/#170
+/// thread this field through as "tier", but its value semantics (0- vs.
+/// 1-based, whether 5 is really the max — see `ui::IMAGINE_MAX_TIER`'s doc
+/// comment) are inferred from BPSR-ZDPS's naming, not yet observed in a
+/// real capture (every sample in `dump-2976-boss-fight.jsonl.zst` decoded
+/// to `remodel_level == 0`) — the first real nonzero value is worth a
+/// durable log line so a live run can confirm the true range.
+static NONZERO_TIER_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `raw_data` for `attr_id::SKILL_LEVEL_ID_LIST` → the equipped skills, in
+/// wire order, as `(skill_id, remodel_level)` pairs, with `skill_id == 0`
+/// entries dropped (matching the crate's zero-is-absent convention).
+/// `remodel_level` is BPSR-ZDPS's `Tier` (`zdps/BPSR-ZDPS/DataTypes/Skills.cs:28`,
+/// `Tier = skillLevelInfo.RemodelLevel`) — see `pb::SkillLevelInfo`'s doc
+/// comment for the full wire-tag correspondence (issues #169/#170). `None`
+/// on malformed input (prost decode failure), per this module's
+/// non-panicking convention — `player_info_from_attrs` treats `None` the
+/// same as "no ids".
 ///
 /// Uses `pb::SkillLevelIdList`, whose wrapper tag is an unverified constant
 /// (see its doc comment). If that tag is wrong, a non-empty `raw` still
 /// parses as *zero* skills rather than erroring — a silent, non-crashing
 /// miss (issue #33's open question #2) — so that specific case is logged at
 /// `debug` to keep the failure diagnosable from a user's log.
-pub fn decode_skill_ids(raw: &[u8]) -> Option<Vec<i32>> {
+pub fn decode_skill_ids(raw: &[u8]) -> Option<Vec<(i32, i32)>> {
     let list = pb::SkillLevelIdList::decode(raw).ok()?;
-    let ids: Vec<i32> = list
+    let ids: Vec<(i32, i32)> = list
         .skills
         .into_iter()
-        .map(|s| s.skill_id)
-        .filter(|&id| id != 0)
+        .filter(|s| s.skill_id != 0)
+        .map(|s| {
+            if s.remodel_level != 0
+                && NONZERO_TIER_LOGGED
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                log::debug!(
+                    "attr_id::SKILL_LEVEL_ID_LIST: first observed nonzero remodel_level \
+                     (tier) = {} for skill_id {} — live confirmation for issues #169/#170's \
+                     tier range (see ui::IMAGINE_MAX_TIER's doc comment)",
+                    s.remodel_level,
+                    s.skill_id
+                );
+            }
+            (s.skill_id, s.remodel_level)
+        })
         .collect();
     if !raw.is_empty() && ids.is_empty() {
         log::debug!(
@@ -592,16 +628,19 @@ mod tests {
         assert_eq!(info.class, None);
     }
 
-    // -- Skill level id list (issue #33) -----------------------------------
+    // -- Skill level id list (issue #33, tier issues #169/#170) ------------
 
-    fn encode_skill_list(ids: &[i32]) -> Vec<u8> {
+    /// `pairs` is `(skill_id, remodel_level)` — the same shape
+    /// `decode_skill_ids` now returns, so a test can round-trip an
+    /// arbitrary tier value through the wire encoding.
+    fn encode_skill_list(pairs: &[(i32, i32)]) -> Vec<u8> {
         let msg = pb::SkillLevelIdList {
-            skills: ids
+            skills: pairs
                 .iter()
-                .map(|&skill_id| pb::SkillLevelInfo {
+                .map(|&(skill_id, remodel_level)| pb::SkillLevelInfo {
                     skill_id,
                     current_level: 1,
-                    remodel_level: 0,
+                    remodel_level,
                 })
                 .collect(),
         };
@@ -610,10 +649,20 @@ mod tests {
         buf
     }
 
+    /// `ids` with an implicit tier of 0 each — for tests that only care
+    /// about id classification, not tier.
+    fn encode_skill_ids(ids: &[i32]) -> Vec<u8> {
+        let pairs: Vec<(i32, i32)> = ids.iter().map(|&id| (id, 0)).collect();
+        encode_skill_list(&pairs)
+    }
+
     #[test]
     fn decode_skill_ids_well_formed_payload_decodes_in_order() {
-        let raw = encode_skill_list(&[3905, 102640, 71000]);
-        assert_eq!(decode_skill_ids(&raw), Some(vec![3905, 102640, 71000]));
+        let raw = encode_skill_ids(&[3905, 102640, 71000]);
+        assert_eq!(
+            decode_skill_ids(&raw),
+            Some(vec![(3905, 0), (102640, 0), (71000, 0)])
+        );
     }
 
     #[test]
@@ -636,19 +685,66 @@ mod tests {
 
     #[test]
     fn decode_skill_ids_drops_zero_ids() {
-        let raw = encode_skill_list(&[3905, 0, 102640]);
-        assert_eq!(decode_skill_ids(&raw), Some(vec![3905, 102640]));
+        let raw = encode_skill_ids(&[3905, 0, 102640]);
+        assert_eq!(decode_skill_ids(&raw), Some(vec![(3905, 0), (102640, 0)]));
+    }
+
+    /// Issues #169/#170: `remodel_level` (tag 3, BPSR-ZDPS's `Tier`) must
+    /// survive `decode_skill_ids` alongside `skill_id` instead of being
+    /// discarded — this is the finding the two issues were blocked on (see
+    /// `pb::SkillLevelInfo`'s doc comment for the wire-tag correspondence).
+    #[test]
+    fn decode_skill_ids_keeps_nonzero_remodel_level_as_tier() {
+        let raw = encode_skill_list(&[(3905, 3), (102640, 5)]);
+        assert_eq!(decode_skill_ids(&raw), Some(vec![(3905, 3), (102640, 5)]));
+    }
+
+    /// Pins `NONZERO_TIER_LOGGED`'s once-per-process gate itself, not just
+    /// `decode_skill_ids`'s returned tuples (which the tests above already
+    /// cover). The gate is a process-global static shared with every other
+    /// test in this binary, so this test resets it immediately before use —
+    /// that makes it the sole observer of the false→true transition instead
+    /// of racing whichever other test (e.g.
+    /// `decode_skill_ids_keeps_nonzero_remodel_level_as_tier`, above) may
+    /// already have tripped it. No production code path ever sets the flag
+    /// back to `false`, so this reset cannot invalidate another test's
+    /// assertions — none of them read the flag.
+    #[test]
+    fn decode_skill_ids_logs_first_nonzero_tier_only_once_per_process() {
+        use std::sync::atomic::Ordering;
+
+        NONZERO_TIER_LOGGED.store(false, Ordering::Relaxed);
+
+        // First sighting of a nonzero remodel_level: the gate's
+        // compare_exchange(false, true) succeeds, flipping it.
+        let raw = encode_skill_list(&[(3905, 3)]);
+        assert_eq!(decode_skill_ids(&raw), Some(vec![(3905, 3)]));
+        assert!(
+            NONZERO_TIER_LOGGED.load(Ordering::Relaxed),
+            "first nonzero remodel_level must flip the gate to logged"
+        );
+
+        // Second sighting: the gate must stay tripped and take the
+        // already-logged branch rather than resetting — a refactor that
+        // reset the flag, or moved the check so it re-evaluates from
+        // scratch per call, would leave this false again.
+        let raw = encode_skill_list(&[(102640, 5)]);
+        assert_eq!(decode_skill_ids(&raw), Some(vec![(102640, 5)]));
+        assert!(
+            NONZERO_TIER_LOGGED.load(Ordering::Relaxed),
+            "gate must remain tripped after a second nonzero remodel_level"
+        );
     }
 
     #[test]
     fn skill_level_id_list_attr_sets_skill_ids_on_player_info() {
         let attrs = vec![pb::Attr {
             id: attr_id::SKILL_LEVEL_ID_LIST,
-            raw_data: encode_skill_list(&[3905, 102640]),
+            raw_data: encode_skill_list(&[(3905, 0), (102640, 4)]),
         }];
         assert_eq!(
             player_info_from_attrs(1, &attrs, None).skill_ids,
-            vec![3905, 102640]
+            vec![(3905, 0), (102640, 4)]
         );
     }
 
@@ -660,7 +756,7 @@ mod tests {
         }];
         assert_eq!(
             player_info_from_attrs(1, &attrs, None).skill_ids,
-            Vec::<i32>::new()
+            Vec::<(i32, i32)>::new()
         );
     }
 

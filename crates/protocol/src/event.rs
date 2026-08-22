@@ -107,14 +107,17 @@ pub struct PlayerInfo {
     /// Season strength, sourced from `attr_id::SEASON_STRENGTH`. `None`
     /// rather than `Some(0)` when absent (issue #15).
     pub season_strength: Option<u32>,
-    /// Equipped Imagine skill ids (issue #33), sourced from
-    /// `attr_id::SKILL_LEVEL_ID_LIST` (`0x74`), in wire order. **Empty ==
-    /// absent** — matching `FIGHT_POINT`'s zero-is-absent rule — whether
-    /// because the attr wasn't present in this packet or because it decoded
-    /// to no ids. This crate stops at raw ids: it never learns what an
+    /// Equipped Imagine skills (issue #33) as `(skill_id, remodel_level)`
+    /// pairs, sourced from `attr_id::SKILL_LEVEL_ID_LIST` (`0x74`), in wire
+    /// order. **Empty == absent** — matching `FIGHT_POINT`'s zero-is-absent
+    /// rule — whether because the attr wasn't present in this packet or
+    /// because it decoded to no ids. `remodel_level` is the tier field
+    /// (issues #169/#170; BPSR-ZDPS calls it `Tier`) — see
+    /// `attrs::decode_skill_ids`'s doc comment for the wire correspondence.
+    /// This crate stops at raw ids and tiers: it never learns what an
     /// Imagine *is* (name/icon classification happens above this crate, in
     /// `crates/app`).
-    pub skill_ids: Vec<i32>,
+    pub skill_ids: Vec<(i32, i32)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

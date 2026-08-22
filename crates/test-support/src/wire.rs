@@ -220,15 +220,26 @@ pub fn varint_attr(id: i32, value: u64) -> pb::Attr {
 }
 
 /// Builds an `Attr` carrying `attr_id::SKILL_LEVEL_ID_LIST` (issue #33): a
-/// prost-encoded `SkillLevelIdList` wrapping one `SkillLevelInfo` per id.
+/// prost-encoded `SkillLevelIdList` wrapping one `SkillLevelInfo` per id,
+/// each with `remodel_level` (tier, issues #169/#170) left at 0. Use
+/// [`skill_list_attr_with_tiers`] when a test needs a nonzero tier.
 pub fn skill_list_attr(ids: &[i32]) -> pb::Attr {
+    let pairs: Vec<(i32, i32)> = ids.iter().map(|&id| (id, 0)).collect();
+    skill_list_attr_with_tiers(&pairs)
+}
+
+/// Builds an `Attr` carrying `attr_id::SKILL_LEVEL_ID_LIST` (issue #33): a
+/// prost-encoded `SkillLevelIdList` wrapping one `SkillLevelInfo` per
+/// `(skill_id, remodel_level)` pair — `remodel_level` is the tier field
+/// issues #169/#170 thread through (BPSR-ZDPS's `Tier`).
+pub fn skill_list_attr_with_tiers(pairs: &[(i32, i32)]) -> pb::Attr {
     let msg = pb::SkillLevelIdList {
-        skills: ids
+        skills: pairs
             .iter()
-            .map(|&skill_id| pb::SkillLevelInfo {
+            .map(|&(skill_id, remodel_level)| pb::SkillLevelInfo {
                 skill_id,
                 current_level: 1,
-                remodel_level: 0,
+                remodel_level,
             })
             .collect(),
     };

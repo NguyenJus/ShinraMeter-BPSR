@@ -445,7 +445,7 @@ fn drive(records: &[DumpRecord]) -> (Vec<meter::Snapshot>, meter::Snapshot) {
         let mut evs = Vec::new();
         decode_notify(&n, r.ts_ms, &mut evs, None);
         for ev in evs {
-            m.apply(&proto::map::map_event(ev, r.ts_ms, None));
+            m.apply(&proto::map::map_event(ev, r.ts_ms, None, None));
         }
         clock = clock.max(r.ts_ms);
         let st = m.fight_state(clock);
