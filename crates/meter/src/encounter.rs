@@ -708,11 +708,9 @@ impl Meter {
                     // `Ended` and recorded either, and clearing `players`
                     // here would drop it — death counts included — before
                     // anything ever sees it.
-                    if tables::is_dungeon_scene(*level_map_id)
-                        && !cut_short
-                        && !self.wipe_hold
-                        && self.scene_id.is_some()
-                    {
+                    let entering_dungeon =
+                        tables::is_dungeon_scene(*level_map_id) && self.scene_id.is_some();
+                    if entering_dungeon && !cut_short && !self.wipe_hold {
                         self.reset(ResetReason::SceneChanged, self.last_event_ms);
                         // PR #198 review, finding 1: `reset` is shared with
                         // every in-instance reason (manual, `NewFight`,
@@ -730,15 +728,38 @@ impl Meter {
                         // add, naming the wrong boss in the header, on the
                         // HP bar and in recorded history.
                         //
-                        // Cleared *after* the reset, not before, so
-                        // `reset_log` still reports the boss HP of the pull
-                        // being cleared (PR #163 review, finding 3, for the
-                        // same reason the `ServerChanged` arm latches before
-                        // it clears). `boss_uid` needs no separate clearing:
-                        // `reset` ends in `recompute_boss`, which finds no
-                        // enemy damaged this fight and so leaves it `None`.
-                        self.enemies.clear();
                         reason = Some(ResetReason::SceneChanged);
+                    }
+
+                    // Cleared *after* the reset, not before, so `reset_log`
+                    // still reports the boss HP of the pull being cleared
+                    // (PR #163 review, finding 3, for the same reason the
+                    // `ServerChanged` arm latches before it clears) — and
+                    // *outside* it (PR #205 review, finding 1), because the
+                    // withheld cases above need the drop just as badly as
+                    // the reset case does. A deferred reset would otherwise
+                    // leave the departed instance's boss sitting in the map
+                    // flagged `took_damage` and alive, and that flag is the
+                    // whole candidate set `recompute_boss` ranks over: the
+                    // new dungeon's very first `EnemyHp` packet would hand
+                    // `boss_uid` to the boss of the dungeon just left, and
+                    // issue #125's latch would then record it as *this*
+                    // scene's final boss for the rest of the session.
+                    //
+                    // Safe for a frozen display, wipe hold included: what
+                    // captions a held fight is `fight_identity` (issue
+                    // #152), pinned while the fight was live, not the enemy
+                    // map — and the hold's own re-engagement test wants the
+                    // new instance's entities anyway, since the old
+                    // instance's uids will never be seen again.
+                    //
+                    // `boss_uid` spelled out here, where the pre-#205 code
+                    // could leave it to `reset`: the withheld paths run no
+                    // `reset`, and so no `recompute_boss` to clear it.
+                    // Mirrors the `ServerChanged` arm below.
+                    if entering_dungeon {
+                        self.enemies.clear();
+                        self.boss_uid = None;
                     }
 
                     // issue #154 / PR #163 review, finding 1: a wipe hold
@@ -746,10 +767,24 @@ impl Meter {
                     // scene being left. Carrying it out of the instance
                     // would leave the meter withholding every hit that is
                     // not on a recognized boss — out in the world, where
-                    // there may never be one again. Already dropped above
-                    // when `reset` ran; set unconditionally here too since
-                    // that only happens for a dungeon destination.
-                    self.wipe_hold = false;
+                    // there may never be one again.
+                    //
+                    // PR #205 review, finding 2: dropping it
+                    // *unconditionally* undid the guard above in the very
+                    // same call. Where the destination is another dungeon,
+                    // the hold is precisely what withheld the reset, so
+                    // clearing it here handed that deferred reset to the
+                    // next ordinary trash hit — the run-back AoE issue #154
+                    // exists to ignore — instead of to the boss
+                    // re-engagement it requires. The invariant that
+                    // actually holds: the hold survives a
+                    // dungeon-to-dungeon transition and is dropped only on
+                    // the way out to a non-dungeon destination. A dungeon
+                    // destination whose reset *did* run has already had it
+                    // cleared by `reset` itself.
+                    if !tables::is_dungeon_scene(*level_map_id) {
+                        self.wipe_hold = false;
+                    }
                 }
                 self.scene_id = Some(*level_map_id);
                 reason
@@ -4628,7 +4663,14 @@ mod tests {
         const BOSS: u32 = 103_108;
         /// "Golden Nappo": named but `MonsterType == 0`, i.e. a trash add.
         const TRASH: u32 = 10_900;
+        /// A *second* dungeon instance, for the post-wipe bounce into a
+        /// different scene (issue #202).
+        const NEXT_SCENE: u32 = 31_101;
+        /// The second dungeon's own recognized boss — a different template
+        /// id from `BOSS`, so a hijacked header is visible in an assert.
+        const NEXT_BOSS: u32 = 103;
         const BOSS_UID: i64 = 10;
+        const NEXT_BOSS_UID: i64 = 20;
         const ADD_UID: i64 = 11;
         /// An ordinary mob out in the world.
         const MOB_UID: i64 = 12;
@@ -4860,7 +4902,7 @@ mod tests {
             // clearing `players` (and its death counts) out from under it.
             let mut m = wiped();
             let reason = m.apply(&ProtocolEvent::Scene {
-                level_map_id: 31_101, // a different dungeon
+                level_map_id: NEXT_SCENE,
             });
             assert_eq!(
                 reason, None,
@@ -4881,6 +4923,86 @@ mod tests {
                 "player totals must survive the post-wipe scene bounce too"
             );
             assert_eq!(snap.rows.len(), 2);
+        }
+
+        #[test]
+        fn the_next_dungeon_s_first_hp_sync_cannot_hijack_the_held_boss() {
+            // PR #205 review, finding 1: the reset the test above withholds
+            // used to take the `enemies.clear()` down with it, leaving the
+            // departed instance's boss in the map — damaged, alive, and the
+            // only candidate `rank_boss(|e| e.took_damage)` has. The new
+            // dungeon's first `EnemyHp` packet then named *it* as the boss
+            // of the scene the party had just walked into.
+            let mut m = wiped();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: NEXT_SCENE,
+            });
+
+            // Nobody has attacked anything here yet; this is just the next
+            // dungeon's boss syncing into AOI range.
+            m.apply(&enemy_hp(NEXT_BOSS_UID, 800_000, NEXT_BOSS, 30_000));
+
+            assert_ne!(
+                m.boss_uid,
+                Some(BOSS_UID),
+                "the last dungeon's boss must not own the target in this one"
+            );
+            assert_eq!(
+                m.boss_uid, None,
+                "and nothing here has been engaged yet either"
+            );
+            assert_eq!(
+                m.scene_bosses.get(&NEXT_SCENE),
+                None,
+                "issue #125 must not learn the old dungeon's boss as this scene's final boss"
+            );
+            assert_eq!(
+                m.scene_bosses.get(&RAID_SCENE),
+                Some(&BOSS),
+                "...while the scene it really was fought in keeps its answer"
+            );
+
+            // The frozen wipe display is untouched by all of that: it is
+            // captioned by `fight_identity`, not by the live enemy map.
+            let snap = m.snapshot(30_500);
+            assert_eq!(snap.encounter.boss_monster_id, Some(BOSS));
+            assert_eq!(snap.encounter.scene_id, Some(RAID_SCENE));
+            assert_eq!(snap.total_damage, 10_000);
+            assert_eq!(m.fight_state(30_500), FightState::Ended);
+        }
+
+        #[test]
+        fn the_wipe_hold_survives_the_dungeon_transition_it_deferred() {
+            // PR #205 review, finding 2: `wipe_hold` was dropped
+            // unconditionally on any scene change, including the one whose
+            // reset it had just withheld — so the very next trash hit
+            // satisfied the `NewFight` gate and wiped the attempt the guard
+            // had spent the whole call protecting.
+            let mut m = wiped();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: NEXT_SCENE,
+            });
+
+            // Running in, an AoE clips an add — the exact event issue #154
+            // exists to ignore.
+            m.apply(&enemy_hp(ADD_UID, 50_000, TRASH, 30_000));
+            let r = m.apply(&hit(1, ADD_UID, 900, 30_500));
+            assert_eq!(r, None, "trash must not clear a held wipe, here either");
+            assert_eq!(m.fight_state(31_000), FightState::Ended);
+            let snap = m.snapshot(31_000);
+            assert_eq!(snap.total_damage, 10_000);
+            assert_eq!(snap.rows.len(), 2);
+            assert_eq!(snap.encounter.boss_monster_id, Some(BOSS));
+
+            // Re-engaging a recognized boss is still what lifts it — and the
+            // deferred clear lands there, on the new instance's own pull.
+            m.apply(&enemy_hp(NEXT_BOSS_UID, 800_000, NEXT_BOSS, 31_500));
+            let r = m.apply(&hit(1, NEXT_BOSS_UID, 400, 32_000));
+            assert_eq!(r, Some(ResetReason::NewFight));
+            let snap = m.snapshot(32_500);
+            assert_eq!(snap.total_damage, 400, "the next pull starts clean");
+            assert_eq!(snap.encounter.boss_monster_id, Some(NEXT_BOSS));
+            assert_eq!(m.fight_state(32_500), FightState::Active);
         }
 
         #[test]
