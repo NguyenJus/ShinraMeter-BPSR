@@ -64,6 +64,12 @@ const FONT_SIZE_SUBTITLE: f32 = 10.0;
 /// The death counter inside its pill — `DeathsDT` is `MetricTextBlockStyle`
 /// like every other column, so it is the row metric, not a smaller size.
 const FONT_SIZE_COUNTER: f32 = FONT_SIZE_ROW;
+/// The AbilityScore/SeasonStrength suffix trailing the name (issue #168).
+/// Issue #188: deliberately smaller than `FONT_SIZE_ROW` so the suffix
+/// reads as secondary metadata rather than an equal continuation of the
+/// name — position is unaffected, since it's still anchored at
+/// `name_rect.right_center()`, only the font size argument changes.
+const FONT_SIZE_ROW_SUFFIX: f32 = 11.0;
 
 /// Horizontal offset (points) a bold-intended text is repainted at, on top
 /// of the first paint, to fake a heavier weight. Only used when no real bold
@@ -4353,7 +4359,7 @@ fn draw_row(
             name_rect.right_center(),
             egui::Align2::LEFT_CENTER,
             &format!(" {suffix}"),
-            regular(FONT_SIZE_ROW),
+            regular(FONT_SIZE_ROW_SUFFIX),
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, NAME_SUFFIX_ALPHA),
             false,
         );
@@ -4667,16 +4673,21 @@ fn share_bar_paints(rect: egui::Rect, bar_frac: f32, class: Option<Class>) -> Sh
     }
 }
 
-/// Square side of the per-row class icon (issue #9). Matches the source's
-/// `Path 18x18`.
-const ICON_SIZE: f32 = 18.0;
+/// Square side of the per-row class icon (issue #9). The source's `Path
+/// 18x18` was the original target; issue #187 bumps this a couple of
+/// points past that on purpose, since the icon read too small in practice
+/// — `ICON_MARGIN` is left unchanged, so the gutter math below no longer
+/// centers this exactly in a 25px column, it just adds up.
+const ICON_SIZE: f32 = 20.0;
 
 /// Gap on both sides of the icon: between the row's left edge and the icon,
-/// and between the icon and the Imagine gutter that follows it. `3.5` so
-/// the class-icon portion of `ICON_GUTTER_WIDTH` lands exactly on the
-/// source's 18px glyph centered in a fixed 25px `SharedSizeGroup="p0"`
-/// column — `25.0` is what `ICON_GUTTER_WIDTH` reverts to once the
-/// `IMAGINE_GUTTER_WIDTH` addend below is deleted (D4's takedown).
+/// and between the icon and the Imagine gutter that follows it. `3.5` was
+/// originally chosen so the class-icon portion of `ICON_GUTTER_WIDTH`
+/// landed exactly on the source's 18px glyph centered in a fixed 25px
+/// `SharedSizeGroup="p0"` column; issue #187 grew `ICON_SIZE` past 18
+/// without touching this margin, so that exact 25px alignment no longer
+/// holds — `25.0` was what `ICON_GUTTER_WIDTH` would have reverted to had
+/// `IMAGINE_GUTTER_WIDTH` been deleted (D4's takedown) before issue #187.
 const ICON_MARGIN: f32 = 3.5;
 
 /// Class icon tint (source `Fill="#ddd"`).
@@ -4686,8 +4697,10 @@ const CLASS_ICON_TINT: egui::Color32 = egui::Color32::from_rgb(0xDD, 0xDD, 0xDD)
 // `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
 //
 /// Square side of each Imagine slot (issue #33) — subordinate to the
-/// 18x18 class icon.
-const IMAGINE_SIZE: f32 = 14.0;
+/// 20x20 class icon. Issue #187 bumped both up together (14 -> 16 here,
+/// 18 -> 20 for `ICON_SIZE`) so the slot's ~0.8x-of-the-icon proportion —
+/// smaller, secondary — is preserved rather than just growing one.
+const IMAGINE_SIZE: f32 = 16.0;
 
 // IMAGINE-TAKEDOWN: one of five sites — see
 // `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
@@ -4736,16 +4749,19 @@ const IMAGINE_SLOT_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x55, 0x55, 0x
 /// yet" until data proves otherwise, never a stuck-wrong ring.
 const IMAGINE_MAX_TIER: i32 = 5;
 
-/// Stroke color of the gold/yellow ring `draw_row` paints around a
-/// filled Imagine slot at `IMAGINE_MAX_TIER` (issue #170). Exact value is
-/// implementation's call per the issue — a warm gold distinct from
-/// `CLASS_ICON_TINT`'s neutral light gray so it reads as a deliberate
-/// highlight, not a tint variation.
-const IMAGINE_MAX_TIER_RING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xFF, 0xD7, 0x00);
+/// Stroke color of the gold/amber ring `draw_row` paints around a
+/// filled Imagine slot at `IMAGINE_MAX_TIER` (issue #170). Issue #180:
+/// shifted off the original `#FFD700` ("gold" in name only — it rendered
+/// as flat yellow) to `#D4AF37`, a warmer amber/gold that sits in the
+/// `#D4AF37`-`#C9A227` range and still reads distinct from
+/// `CLASS_ICON_TINT`'s neutral light gray as a deliberate highlight, not a
+/// tint variation.
+const IMAGINE_MAX_TIER_RING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xD4, 0xAF, 0x37);
 
-/// Width of the gold max-tier ring's stroke (issue #170). Thin enough not
-/// to visually enlarge the 14pt `IMAGINE_SIZE` slot it circles.
-const IMAGINE_MAX_TIER_RING_WIDTH: f32 = 1.5;
+/// Width of the gold max-tier ring's stroke (issue #170). Issue #180:
+/// thinned from `1.5` to `1.0` so the ring reads as a thin accent rather
+/// than dominating the 16pt `IMAGINE_SIZE` slot it circles.
+const IMAGINE_MAX_TIER_RING_WIDTH: f32 = 1.0;
 
 /// Hover-tooltip text for an equipped Imagine slot (issue #169): the plain
 /// `name` when `tier` is absent or the wire-default `0` (proto3's
@@ -10481,8 +10497,11 @@ mod tests {
         // `419.0`. Issue #118's 2-/1-decimal bands then widened
         // `fmt_short`'s true worst case past `Dps`'s old 48.0-wide budget
         // (see that column's comment in `settings.rs`), growing it to
-        // 56.0 and landing here at `427.0`.
-        assert_eq!(default_inner_width(), 427.0);
+        // 56.0 and landing here at `427.0`. Issue #187 then bumped
+        // `ICON_SIZE` (18 -> 20) and `IMAGINE_SIZE` (14 -> 16), widening
+        // `ICON_GUTTER_WIDTH` by `6.0` (2 for the icon, 2 * 2 for the two
+        // Imagine slots) and landing here at `433.0`.
+        assert_eq!(default_inner_width(), 433.0);
     }
 
     #[test]
