@@ -40,6 +40,14 @@ bpsr-protocol = { path = "crates/protocol" }
 bpsr-meter = { path = "crates/meter" }
 bpsr-capture = { path = "crates/capture" }
 bpsr-test-support = { path = "crates/test-support" }
+# Issue #39: durable encounter history storage. `bundled` statically links the
+# SQLite C amalgamation into the binary, so the shipped `.exe` has no external
+# DLL to find at runtime.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Issue #39: the encounter-history list shows each past fight's *local* date
+# and time; std has no timezone database, and `clock` is the one feature that
+# provides it. `default-features = false` keeps `oldtime`/`wasmbind` out.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # Issue #89: the overlay paints flat gray (#454548) at startup because DWM
 # allocates an opaque, white-initialized GDI redirection surface for the window

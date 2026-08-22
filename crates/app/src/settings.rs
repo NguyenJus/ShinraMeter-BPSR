@@ -323,6 +323,33 @@ pub struct Settings {
     /// always-on-top behavior rather than preserving it.
     #[serde(default = "default_always_on_top")]
     pub always_on_top: bool,
+    /// Whether finished encounters are persisted to `history.sqlite` at all
+    /// (issue #39). `#[serde(default = "default_history_enabled")]` rather
+    /// than plain `#[serde(default)]`: `bool::default()` is `false`, which
+    /// would silently turn history off for every existing settings.json the
+    /// instant this field was added — the same trap `default_always_on_top`
+    /// exists to avoid.
+    #[serde(default = "default_history_enabled")]
+    pub history_enabled: bool,
+    /// The `RetentionPolicy::max_encounters` the history thread is spawned
+    /// with (issue #39). Named-default rather than `#[serde(default)]` for
+    /// the same reason as `history_enabled`: `u32::default()` is `0`, which
+    /// `RetentionPolicy` reads as "prune nothing by count" — the opposite of
+    /// a sane default for a settings.json that predates this field.
+    #[serde(default = "default_history_max_encounters")]
+    pub history_max_encounters: u32,
+    /// The `RetentionPolicy::max_age_days` the history thread is spawned
+    /// with (issue #39). Same named-default reasoning as
+    /// `history_max_encounters`: `0` would mean "never age out by day count"
+    /// rather than the intended 90-day default.
+    #[serde(default = "default_history_max_age_days")]
+    pub history_max_age_days: u32,
+    /// The `RetentionPolicy::min_duration_ms` the history thread is spawned
+    /// with (issue #39). Same named-default reasoning as the other three
+    /// history fields: `0` would record every fight, however brief, rather
+    /// than the intended 5-second floor.
+    #[serde(default = "default_history_min_duration_ms")]
+    pub history_min_duration_ms: u64,
 }
 
 /// The `opacity` default for a settings.json predating issue #166: fully
@@ -335,6 +362,30 @@ fn default_opacity() -> f32 {
 /// field's doc comment for why this can't just be `#[serde(default)]`.
 fn default_always_on_top() -> bool {
     true
+}
+
+/// `Settings::history_enabled`'s serde default (issue #39) — see that
+/// field's doc comment for why this can't just be `#[serde(default)]`.
+fn default_history_enabled() -> bool {
+    true
+}
+
+/// `Settings::history_max_encounters`'s serde default (issue #39), matching
+/// `history::RetentionPolicy::default`'s `max_encounters`.
+fn default_history_max_encounters() -> u32 {
+    500
+}
+
+/// `Settings::history_max_age_days`'s serde default (issue #39), matching
+/// `history::RetentionPolicy::default`'s `max_age_days`.
+fn default_history_max_age_days() -> u32 {
+    90
+}
+
+/// `Settings::history_min_duration_ms`'s serde default (issue #39), matching
+/// `history::RetentionPolicy::default`'s `min_duration_ms`.
+fn default_history_min_duration_ms() -> u64 {
+    5_000
 }
 
 impl Default for Settings {
@@ -357,6 +408,10 @@ impl Default for Settings {
             opacity: default_opacity(),
             click_through: false,
             always_on_top: true,
+            history_enabled: default_history_enabled(),
+            history_max_encounters: default_history_max_encounters(),
+            history_max_age_days: default_history_max_age_days(),
+            history_min_duration_ms: default_history_min_duration_ms(),
         }
     }
 }
@@ -383,6 +438,18 @@ impl Settings {
     /// Ceiling of the `opacity` range: fully opaque, the pre-issue-166
     /// fixed look.
     pub const OPACITY_MAX: f32 = 1.0;
+
+    /// Ceiling clamp for `history_max_encounters` (issue #39): a hand-edited
+    /// or corrupted settings.json can't turn "keep history" into "keep an
+    /// unbounded number of encounters forever".
+    pub const HISTORY_MAX_ENCOUNTERS_CAP: u32 = 10_000;
+    /// Ceiling clamp for `history_max_age_days`, same reasoning as
+    /// `HISTORY_MAX_ENCOUNTERS_CAP` — ten years, comfortably past any
+    /// sensible retention window.
+    pub const HISTORY_MAX_AGE_DAYS_CAP: u32 = 3_650;
+    /// Ceiling clamp for `history_min_duration_ms`, same reasoning again:
+    /// ten minutes is already an absurd floor for "worth recording".
+    pub const HISTORY_MIN_DURATION_CAP_MS: u64 = 600_000;
 
     /// Whether `col` is currently enabled.
     pub fn is_visible(&self, col: ColumnKind) -> bool {
@@ -533,7 +600,31 @@ impl Settings {
         // the only place a loaded value gets clamped before it ever
         // reaches rendering.
         self.opacity = Self::clamp_opacity(self.opacity);
+        // Issue #39: same "repair on load, not just on the next edit" logic
+        // as `opacity` above — these three never go through a setter that
+        // could clamp them, since the spec's DECISION D9 keeps them
+        // settings.json-only with no dropdown controls.
+        self.history_max_encounters = self
+            .history_max_encounters
+            .min(Self::HISTORY_MAX_ENCOUNTERS_CAP);
+        self.history_max_age_days = self
+            .history_max_age_days
+            .min(Self::HISTORY_MAX_AGE_DAYS_CAP);
+        self.history_min_duration_ms = self
+            .history_min_duration_ms
+            .min(Self::HISTORY_MIN_DURATION_CAP_MS);
         self
+    }
+
+    /// The retention rules the history thread is spawned with (issue #39).
+    /// Read once at startup — see the spec's DECISION D9 for why these are
+    /// settings.json-only, with no dropdown controls.
+    pub fn retention_policy(&self) -> crate::history::RetentionPolicy {
+        crate::history::RetentionPolicy {
+            max_encounters: self.history_max_encounters,
+            max_age_days: self.history_max_age_days,
+            min_duration_ms: self.history_min_duration_ms,
+        }
     }
 }
 
@@ -1628,5 +1719,74 @@ mod tests {
         assert!(!loaded.click_through);
         assert!(loaded.always_on_top);
         let _ = fs::remove_file(&path);
+    }
+
+    // -- history (issue #39) --------------------------------------------
+
+    /// A settings.json predating issue #39 (no history keys at all) must
+    /// still deserialize, with every history field falling back to its
+    /// documented default — the same back-compat guarantee
+    /// `always_on_top`/`click_through` make.
+    #[test]
+    fn settings_json_without_the_history_fields_still_loads() {
+        let path = temp_settings_path("legacy-no-history");
+        fs::write(
+            &path,
+            br#"{"visible_columns":["Dps","CritPct","LuckyPct"]}"#,
+        )
+        .expect("write legacy fixture");
+
+        let loaded = load_from(&path);
+
+        assert!(loaded.history_enabled);
+        assert_eq!(loaded.history_max_encounters, 500);
+        assert_eq!(loaded.history_max_age_days, 90);
+        assert_eq!(loaded.history_min_duration_ms, 5_000);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_absurd_history_cap_is_clamped_on_load() {
+        let settings = Settings {
+            history_max_encounters: 1_000_000,
+            history_max_age_days: 100_000,
+            history_min_duration_ms: 10_000_000,
+            ..Settings::default()
+        }
+        .sanitized();
+
+        assert_eq!(
+            (
+                settings.history_max_encounters,
+                settings.history_max_age_days,
+                settings.history_min_duration_ms
+            ),
+            (
+                Settings::HISTORY_MAX_ENCOUNTERS_CAP,
+                Settings::HISTORY_MAX_AGE_DAYS_CAP,
+                Settings::HISTORY_MIN_DURATION_CAP_MS
+            )
+        );
+    }
+
+    #[test]
+    fn retention_policy_mirrors_the_settings_fields() {
+        let settings = Settings {
+            history_max_encounters: 42,
+            history_max_age_days: 7,
+            history_min_duration_ms: 1_234,
+            ..Settings::default()
+        };
+
+        let policy = settings.retention_policy();
+
+        assert_eq!(
+            (
+                policy.max_encounters,
+                policy.max_age_days,
+                policy.min_duration_ms
+            ),
+            (42, 7, 1_234)
+        );
     }
 }

@@ -20,10 +20,13 @@ is genuinely needed to diagnose the bug, trim it down to the minimal relevant
 lines and redact any names that aren't your own. Never attach the log file or
 dump file itself (`ShinraMeter-BPSR.log`, `inspect/dump-<pid>.jsonl`).
 
-The same goes for `%APPDATA%\ShinraMeter-BPSR\names.json`. The meter keeps a
-local cache there of every character name it has seen, so it can label players
-whose name packet it missed — it is written every session, not just when
-diagnostics are on. Don't attach it to an issue.
+The same goes for `%APPDATA%\ShinraMeter-BPSR\names.json` and
+`%APPDATA%\ShinraMeter-BPSR\history.sqlite`. The meter keeps a local cache of
+every character name it has seen in `names.json`, so it can label players
+whose name packet it missed; `history.sqlite` saves each finished encounter —
+including every party member's name, and where and when you fought. Both are
+written every session, not just when diagnostics are on. Don't attach either
+to an issue.
 
 ## Requesting a feature
 

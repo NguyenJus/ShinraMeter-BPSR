@@ -561,6 +561,20 @@ impl Meter {
         self.fight_state(now_ms) == FightState::Ended
     }
 
+    /// When the currently-held fight ended, in the event clock's milliseconds —
+    /// `None` while a fight is running or none has happened since the last reset
+    /// (issue #39). Only meaningful once `fight_state`/`tick` report
+    /// [`FightState::Ended`], which is also what latches the value.
+    ///
+    /// The event clock *is* wall-clock Unix milliseconds in production
+    /// (`bpsr_app::pipeline::now_ms` stamps every event), and scripted values in
+    /// the replay tests — which is exactly what makes the history goldens
+    /// deterministic. Callers persisting this as a timestamp are relying on that
+    /// and on nothing else.
+    pub fn fight_end_ms(&self) -> Option<u64> {
+        self.fight_end_ms
+    }
+
     /// Advances wall-clock-driven fight state and returns the resulting
     /// state. Call this once per UI tick before `snapshot`; it latches an
     /// idle-detected end so the held snapshot can never drift afterwards
@@ -3527,6 +3541,21 @@ mod tests {
         fn no_fight_at_all_stays_idle() {
             let m = Meter::new();
             assert_eq!(m.fight_state(600_000), FightState::Idle);
+        }
+
+        #[test]
+        fn fight_end_ms_is_none_until_the_fight_ends() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 100, 1_000));
+            assert_eq!(m.fight_end_ms(), None);
+        }
+
+        #[test]
+        fn fight_end_ms_reports_the_latched_end() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 100, 1_000));
+            m.tick(1_000 + idle());
+            assert_eq!(m.fight_end_ms(), Some(1_000));
         }
 
         #[test]
