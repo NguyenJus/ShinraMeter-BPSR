@@ -4,6 +4,60 @@ All notable changes to ShinraMeter-BPSR are documented here. This project is
 a fan-made, unofficial tool for Blue Protocol: Star Resonance and is not
 affiliated with the game's publisher.
 
+## v0.2.3
+
+### Added
+
+- Every row in the skill breakdown window now leads with the skill's own
+  icon. A skill with no icon of its own gets a plain disc in its place, so
+  the column always lines up.
+- The header's button cluster gains a History button, next to Share and
+  Reset. It replaces the "History" item that used to live in the settings
+  dropdown, and stays greyed out until there is something to browse.
+
+### Changed
+
+- The skill breakdown window can be resized, and it keeps whatever size it
+  was left at for as long as it stays open. It also no longer forces itself
+  above every other window just because it was opened, and its header shows
+  a larger class icon.
+- Right-clicking a row whose skill breakdown is already open now raises that
+  window and brings it to the front, instead of appearing to do nothing.
+- Class and Imagine icons in each row are larger, the ring around a max-tier
+  Imagine is a thinner amber line rather than a thick yellow one, and the
+  bracketed Ability Score / Season Strength suffix after a player's name is
+  drawn smaller so it reads as secondary to the name.
+- The opacity slider covers the full range and both ends mean what they say:
+  0% is genuinely transparent and 100% is genuinely solid. It used to stop
+  at a 20% floor, and even at its top setting the panel was never fully
+  opaque. Row text, header icons, and pill glyphs stay fully visible at
+  every setting, so the overlay can always be seen and dragged.
+- The pin and click-through toggles moved out of the button cluster and onto
+  the title row, in their own pill beside the dropdown chevron.
+
+### Fixed
+
+- The Share button produced nothing on Windows: the copied image was
+  effectively invisible when pasted, and any failure was silent. The
+  screenshot now pastes as a solid image, and a copy that fails says so.
+- Click-through did not actually pass clicks to the game underneath. Input
+  now reaches the game, while the click-through button itself stays
+  clickable so the mode can be switched back off.
+- Pinning the overlay did not stop it being dragged. A pinned overlay no
+  longer moves, the cursor says so on hover, and pinning mid-drag stops the
+  move already in progress. Resizing a pinned overlay is still allowed.
+- A failed screenshot copy showed an error that stayed on the header for the
+  rest of the session. It now clears itself after a moment.
+- The History button, when there is nothing to browse, is now properly
+  reported as disabled to screen readers instead of merely looking greyed
+  out.
+- Entering a different dungeon left the previous instance's players on
+  screen alongside the new party's. The roster is cleared on the way in, and
+  so is leftover enemy state, so a new instance can no longer inherit the
+  previous dungeon's still-living boss as its own.
+- A fight cut short by moving to a different dungeon is now recorded with
+  its own reason instead of being logged as a server change.
+
 ## v0.2.2
 
 ### Added
