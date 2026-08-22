@@ -4924,16 +4924,16 @@ mod tests {
                 m.boss_uid, None,
                 "and nothing here has been engaged yet either"
             );
-            assert_eq!(
-                m.scene_bosses.get(&NEXT_SCENE),
-                None,
-                "issue #125 must not learn the old dungeon's boss as this scene's final boss"
-            );
-            assert_eq!(
-                m.scene_bosses.get(&RAID_SCENE),
-                Some(&BOSS),
-                "...while the scene it really was fought in keeps its answer"
-            );
+
+            // PR #209 removed the runtime scene->boss *learning* system
+            // (`Meter::scene_bosses` and friends) this test used to guard
+            // here: a stale `boss_uid` had no way to poison a *learned*
+            // per-scene answer, because that answer no longer exists.
+            // `EncounterInfo::scene_boss_name` (`Meter::snapshot`) is now a
+            // pure lookup into the static, curated
+            // `tables::SCENE_FINAL_BOSSES` keyed only on `scene_id` — it
+            // cannot observe `boss_uid` or the live enemy map at all, so
+            // there is nothing left for a cross-dungeon hijack to corrupt.
 
             // The frozen wipe display is untouched by all of that: it is
             // captioned by `fight_identity`, not by the live enemy map.
