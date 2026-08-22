@@ -669,7 +669,7 @@ impl eframe::App for OverlayApp {
                 // false])`.
                 let rows_top = ui.cursor().top();
                 let rows_area_height = ui.available_height();
-                draw_rows(ui, &self.snapshot, &self.settings.ordered_columns(), icons);
+                draw_rows(ui, &self.snapshot, &self.settings, icons);
                 if screenshot_requested {
                     self.pending_screenshot_bound = Some(rows_content_bottom_y(
                         rows_top,
@@ -3081,13 +3081,18 @@ fn row_content_width(viewport_width: f32, stat_columns_total: f32) -> f32 {
 fn draw_rows(
     ui: &mut egui::Ui,
     snapshot: &Snapshot,
-    columns: &[ColumnKind],
+    settings: &Settings,
     icons: &Icons,
 ) -> egui::Vec2 {
-    // The enabled-column set (and therefore the column widths) is identical
-    // for every row in a frame, so it's computed once here rather than once
-    // per row inside `draw_row`.
-    let stat_columns = stat_columns_for(columns);
+    // `Settings::stat_columns`, not `ordered_columns` (issue #168):
+    // `AbilityScore`/`SeasonStrength`, even when enabled, must not reserve
+    // stat-column width or an anchor here — they render inline with the
+    // name instead (`draw_row`'s `name_suffix` call). The enabled-column
+    // set (and therefore the column widths) is identical for every row in
+    // a frame, so it's computed once here rather than once per row inside
+    // `draw_row`.
+    let columns = settings.stat_columns();
+    let stat_columns = stat_columns_for(&columns);
     let stat_columns_total: f32 = stat_columns.iter().map(|c| c.width).sum();
     let content_width = row_content_width(ui.available_width(), stat_columns_total);
 
@@ -3131,9 +3136,10 @@ fn draw_rows(
                 COLUMN_RIGHT_MARGIN,
             );
             let layout = RowLayout {
-                kinds: columns,
+                kinds: &columns,
                 columns: &stat_columns,
                 anchors: &anchors,
+                settings,
             };
 
             // Issue #73: each row's damage-share bar is now scaled to the
@@ -3297,13 +3303,22 @@ pub fn column_anchors(
 /// text for the column is designed, and tested
 /// (`widest_formatted_text_fits_its_column_width_budget`), to fit.
 ///
-/// This is what keeps an out-of-range value (e.g. a packet-decoded
-/// `ability_score`/`season_strength` past the in-game ceiling `StatColumn`'s
-/// `width` budget assumes — see `ColumnKind::spec`) from painting
-/// arbitrarily far left across the row: `draw_row` clips every column's text
-/// draw to this rect rather than trusting the formatted string to fit
-/// `width`, so an overlong string loses its leading glyphs after one
-/// column's worth instead of running over its neighbors.
+/// This is what keeps an out-of-range value (e.g. a packet-decoded stat
+/// past the in-game ceiling `StatColumn`'s `width` budget assumes — see
+/// `ColumnKind::spec`) from painting arbitrarily far left across the row:
+/// `draw_row` clips every stat column's text draw to this rect rather than
+/// trusting the formatted string to fit `width`, so an overlong string
+/// loses its leading glyphs after one column's worth instead of running
+/// over its neighbors.
+///
+/// Its reach is exactly the columns that occupy a stat slot — the ones
+/// `Settings::stat_columns` hands `draw_rows`. `AbilityScore`/
+/// `SeasonStrength` are no longer among them while enabled (issue #168):
+/// they leave the grid entirely and reach the screen only through
+/// `draw_row`'s inline name suffix (`name_suffix`), which is deliberately
+/// unclipped and uncapped, so an over-ceiling value there widens the suffix
+/// and bleeds *under* the stat columns instead of losing glyphs. The
+/// z-order reasoning that makes that safe lives at that paint site.
 ///
 /// The slot is the *nominal* `width`, deliberately not the gap between this
 /// column's anchor and the previous one. The two are identical whenever the
@@ -3338,6 +3353,14 @@ struct RowLayout<'a> {
     kinds: &'a [ColumnKind],
     columns: &'a [StatColumn],
     anchors: &'a [f32],
+    /// Issue #168: `draw_row` needs the live `Settings` (not just `kinds`,
+    /// which now excludes `AbilityScore`/`SeasonStrength` — see
+    /// `Settings::stat_columns`) to compose the name-suffix text via
+    /// `name_suffix`. Bundled into `RowLayout` alongside the three fields
+    /// above for the same reason they are: keeps `draw_row`'s own argument
+    /// count under clippy's limit rather than adding a fourth loose
+    /// parameter.
+    settings: &'a Settings,
 }
 
 fn draw_row(
@@ -3439,7 +3462,7 @@ fn draw_row(
     // comes from color, and the name is already the brightest thing left of
     // the stat columns at plain white.
     let name = row_name(row);
-    paint_text(
+    let name_rect = paint_text(
         ui.painter(),
         rect.left_center() + egui::vec2(name_offset, 0.0),
         egui::Align2::LEFT_CENTER,
@@ -3448,6 +3471,38 @@ fn draw_row(
         egui::Color32::WHITE,
         false,
     );
+    // Issue #168: `AbilityScore`/`SeasonStrength`, when enabled, paint as a
+    // bracketed suffix immediately after the name rather than as their own
+    // stat columns — `layout.kinds` already excludes both
+    // (`Settings::stat_columns`), so this is the one place their value
+    // reaches the screen. Painted from `name_rect.right_center()` (the
+    // real painted extent `paint_text` just handed back, not a fixed
+    // offset), so the suffix always starts flush against the name however
+    // wide it rendered. Dimmed relative to the name's own opaque white
+    // (`NAME_SUFFIX_ALPHA`) so it reads as secondary metadata trailing the
+    // name, not as part of the name itself.
+    //
+    // Deliberately unclipped and never truncated/elided (issue #168
+    // follow-up decision), same as the plain name text above it: a long
+    // name plus both scores is allowed to visually run into the stat
+    // columns rather than lose characters. That is safe specifically
+    // because this paint happens *before* the stat-column loop below —
+    // egui paints shapes in call order, so the columns' own paints land
+    // on top of whatever the suffix already put down, and the row always
+    // reads correctly at the columns' fixed anchors no matter how far the
+    // suffix bleeds under them. Do not add a clip rect or a length cap
+    // here — that would be undoing this decision, not fixing an oversight.
+    if let Some(suffix) = name_suffix(row, layout.settings) {
+        paint_text(
+            ui.painter(),
+            name_rect.right_center(),
+            egui::Align2::LEFT_CENTER,
+            &format!(" {suffix}"),
+            regular(FONT_SIZE_ROW),
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, NAME_SUFFIX_ALPHA),
+            false,
+        );
+    }
 
     // Each stat gets its own fixed-width column (issue #8) so a
     // digit-count change (e.g. `9.9K` -> `10.1K`) shifts only that
@@ -3860,6 +3915,58 @@ fn row_name(row: &PlayerRow) -> String {
     }
 }
 
+/// Composes the bracketed suffix `draw_row` paints immediately after the
+/// player name when `AbilityScore` and/or `SeasonStrength` are enabled
+/// (issue #168) — the two columns `Settings::stat_columns` excludes from
+/// the ordinary stat-column layout because they read better folded into
+/// the name slot than laid out as their own leading columns (the same
+/// reasoning `ColumnKind::ALL`'s doc comment already gives for why they
+/// lead the canonical column order, and `ColumnKind::renders_inline_with_
+/// name`'s doc comment restates for this issue specifically).
+///
+/// Format, decided by the issue rather than left to this function: a
+/// single bracketed group, Ability Score first then Season Strength,
+/// joined by `" / "` when both are present (`"[12345 / 678]"`), or just
+/// the one enabled value's own brackets when only one is on
+/// (`"[12345]"`). Each value comes from that column's own `StatColumn::
+/// text` (`ColumnKind::spec`), so the None-is-blank behavior already
+/// documented there carries over unchanged: a `None` reading (no
+/// FIGHT_POINT packet seen yet for this player) produces an empty string
+/// from `text`, which this function treats as "omit this slot" rather
+/// than painting an empty bracket entry. `None` is returned — no
+/// brackets, no leading space — when neither column is enabled, or both
+/// are enabled but both values are still `None`; `draw_row` paints
+/// nothing extra after the name in either case.
+///
+/// This function never truncates, elides, or otherwise clamps the
+/// returned string to any width budget, and never will — that is an
+/// explicit issue #168 follow-up decision, not an oversight: a long name
+/// plus both scores is allowed to run into (and, since `draw_row` paints
+/// it before the stat-column loop, visually underneath) the stat columns
+/// rather than lose characters. `draw_row`'s own comment at the paint
+/// site has the z-order reasoning; this function's job stays just the
+/// string, in full, every time.
+fn name_suffix(row: &PlayerRow, settings: &Settings) -> Option<String> {
+    let mut parts = Vec::new();
+    if settings.is_visible(ColumnKind::AbilityScore) {
+        let text = (ColumnKind::AbilityScore.spec().text)(row);
+        if !text.is_empty() {
+            parts.push(text);
+        }
+    }
+    if settings.is_visible(ColumnKind::SeasonStrength) {
+        let text = (ColumnKind::SeasonStrength.spec().text)(row);
+        if !text.is_empty() {
+            parts.push(text);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("[{}]", parts.join(" / ")))
+    }
+}
+
 /// Compact damage/DPS abbreviation (issue #118): `999`, `1.23K`, `12.34K`,
 /// `123.4K`, `1.23M`, `1000K`. Below 1000 raw the value is left as a plain
 /// integer — no suffix, no decimals. At or above 1000 it is scaled by
@@ -4000,6 +4107,14 @@ const ITEM_SPACING_Y: f32 = 2.0;
 /// name" budget.
 const NAME_LEFT_PAD: f32 = 2.0;
 
+/// Alpha `draw_row` paints the `AbilityScore`/`SeasonStrength` name-suffix
+/// text at (issue #168) — a dimmed variant of the name's own opaque white,
+/// so the bracketed score reads as secondary metadata trailing the name
+/// rather than as part of the name itself. `0x99` (~60%) is dim enough to
+/// read as de-emphasized against the name's full white while staying
+/// comfortably legible against the row background.
+const NAME_SUFFIX_ALPHA: u8 = 0x99;
+
 /// Budgeted width for the name itself. `draw_row` paints names unclipped,
 /// regular weight and proportional at `FONT_SIZE_ROW` (issues #56, #62) —
 /// truncation/ellipsis is explicitly out of scope for issue #26 — so this is
@@ -4088,7 +4203,7 @@ const HEADER_ROW_EXTRA_WIDTH: f32 = 20.0;
 /// Issue #33's `IMAGINE_GUTTER_WIDTH` addend widens this the same way: the
 /// name budget stays `150.0` rather than being squeezed to make room.
 fn default_inner_width() -> f32 {
-    let columns_width: f32 = stat_columns_for(&Settings::default().ordered_columns())
+    let columns_width: f32 = stat_columns_for(&Settings::default().stat_columns())
         .iter()
         .map(|c| c.width)
         .sum();
@@ -6972,6 +7087,86 @@ mod tests {
         assert_eq!((column.text)(&row), "12345678");
     }
 
+    // -- name_suffix (issue #168): AbilityScore/SeasonStrength inline with
+    // the name instead of their own stat column ---------------------------
+
+    fn sample_score_row(ability_score: Option<u32>, season_strength: Option<u32>) -> PlayerRow {
+        PlayerRow {
+            season_strength,
+            ..sample_row(ability_score)
+        }
+    }
+
+    #[test]
+    fn name_suffix_is_none_when_neither_column_is_enabled() {
+        let row = sample_score_row(Some(12345), Some(678));
+        assert_eq!(name_suffix(&row, &Settings::default()), None);
+    }
+
+    #[test]
+    fn name_suffix_shows_ability_score_alone() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::AbilityScore);
+        let row = sample_score_row(Some(12345), Some(678));
+        assert_eq!(name_suffix(&row, &settings), Some("[12345]".to_string()));
+    }
+
+    #[test]
+    fn name_suffix_shows_season_strength_alone() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::SeasonStrength);
+        let row = sample_score_row(Some(12345), Some(678));
+        assert_eq!(name_suffix(&row, &settings), Some("[678]".to_string()));
+    }
+
+    #[test]
+    fn name_suffix_shows_both_ability_score_then_season_strength() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::AbilityScore);
+        settings.toggle(ColumnKind::SeasonStrength);
+        let row = sample_score_row(Some(12345), Some(678));
+        assert_eq!(
+            name_suffix(&row, &settings),
+            Some("[12345 / 678]".to_string())
+        );
+    }
+
+    #[test]
+    fn name_suffix_omits_a_none_value_slot_when_both_enabled() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::AbilityScore);
+        settings.toggle(ColumnKind::SeasonStrength);
+        let row = sample_score_row(None, Some(678));
+        assert_eq!(name_suffix(&row, &settings), Some("[678]".to_string()));
+    }
+
+    #[test]
+    fn name_suffix_is_none_when_both_enabled_but_both_values_are_none() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::AbilityScore);
+        settings.toggle(ColumnKind::SeasonStrength);
+        let row = sample_score_row(None, None);
+        assert_eq!(name_suffix(&row, &settings), None);
+    }
+
+    /// Issue #168 follow-up: the suffix is allowed to visually overlap the
+    /// stat columns rather than being truncated/elided, so `name_suffix`
+    /// itself must never clamp its output to any width or length budget —
+    /// widest-plausible-value in (ability score's real in-game ceiling is
+    /// 5 digits, season strength's is 4, per `ColumnKind::spec`'s doc
+    /// comments) must come back out whole, not cut down to fit anything.
+    #[test]
+    fn name_suffix_is_never_truncated_for_the_widest_plausible_values() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::AbilityScore);
+        settings.toggle(ColumnKind::SeasonStrength);
+        let row = sample_score_row(Some(99_999), Some(9_999));
+        assert_eq!(
+            name_suffix(&row, &settings),
+            Some("[99999 / 9999]".to_string())
+        );
+    }
+
     fn window() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(340.0, 220.0))
     }
@@ -8144,7 +8339,7 @@ mod tests {
 
     #[test]
     fn default_inner_width_matches_icon_gutter_plus_name_budget_plus_columns() {
-        let columns_width: f32 = stat_columns_for(&Settings::default().ordered_columns())
+        let columns_width: f32 = stat_columns_for(&Settings::default().stat_columns())
             .iter()
             .map(|c| c.width)
             .sum();
@@ -8169,7 +8364,7 @@ mod tests {
 
     #[test]
     fn default_inner_width_exceeds_the_default_stat_columns_width() {
-        let columns_width: f32 = stat_columns_for(&Settings::default().ordered_columns())
+        let columns_width: f32 = stat_columns_for(&Settings::default().stat_columns())
             .iter()
             .map(|c| c.width)
             .sum();
@@ -8246,7 +8441,13 @@ mod tests {
     /// rects, because `draw_row` paints the share bar and hover highlight
     /// as gradient meshes (`Shape::Mesh`), never a flat `Shape::Rect`.
     struct RowFrame {
-        texts: Vec<(String, egui::Rect)>,
+        /// In paint order, so a test can compare two texts' indices to pin
+        /// z-order (egui paints shapes in call order) — that is how the
+        /// inline name suffix is proven to paint *before* the stat-column
+        /// loop. The `Color32` is the galley's own text color, which is
+        /// what makes the suffix's dimming (`NAME_SUFFIX_ALPHA`) checkable
+        /// from the painted output rather than from the call site.
+        texts: Vec<(String, egui::Rect, egui::Color32)>,
         meshes: Vec<egui::Rect>,
     }
 
@@ -8256,9 +8457,20 @@ mod tests {
         fn text_box(&self, value: &str) -> egui::Rect {
             self.texts
                 .iter()
-                .filter(|(painted, _)| painted == value)
-                .map(|(_, rect)| *rect)
+                .filter(|(painted, ..)| painted == value)
+                .map(|(_, rect, _)| *rect)
                 .reduce(egui::Rect::union)
+                .unwrap_or_else(|| panic!("draw_rows never painted {value:?}: {:?}", self.texts))
+        }
+
+        /// The index in paint order of the first text shape painted for
+        /// `value`, plus the color it was painted in.
+        fn text_paint(&self, value: &str) -> (usize, egui::Color32) {
+            self.texts
+                .iter()
+                .enumerate()
+                .find(|(_, (painted, ..))| painted == value)
+                .map(|(i, (_, _, color))| (i, *color))
                 .unwrap_or_else(|| panic!("draw_rows never painted {value:?}: {:?}", self.texts))
         }
 
@@ -8288,6 +8500,16 @@ mod tests {
             egui::Shape::Text(text) => frame.texts.push((
                 text.galley.text().to_string(),
                 egui::Rect::from_min_size(text.pos, text.galley.size()).intersect(clip),
+                text.override_text_color
+                    .or_else(|| {
+                        text.galley
+                            .job
+                            .sections
+                            .first()
+                            .map(|section| section.format.color)
+                    })
+                    .filter(|color| *color != egui::Color32::PLACEHOLDER)
+                    .unwrap_or(text.fallback_color),
             )),
             egui::Shape::Mesh(mesh) => frame.meshes.push(mesh.calc_bounds().intersect(clip)),
             egui::Shape::Vec(shapes) => {
@@ -8308,6 +8530,19 @@ mod tests {
     /// `collect_row_boxes` intersects every shape with the clip rect it was
     /// actually painted under — exactly like `collect_painted_boxes` does.
     fn rows_painted_boxes(snapshot: &Snapshot, width: f32, height: f32) -> RowFrame {
+        rows_painted_boxes_with(snapshot, &Settings::default(), width, height)
+    }
+
+    /// `rows_painted_boxes` with the settings under test spelled out —
+    /// needed by anything that has to render a non-default column set
+    /// (issue #168's inline `AbilityScore`/`SeasonStrength`, which
+    /// `Settings::default` does not enable).
+    fn rows_painted_boxes_with(
+        snapshot: &Snapshot,
+        settings: &Settings,
+        width: f32,
+        height: f32,
+    ) -> RowFrame {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
@@ -8324,7 +8559,7 @@ mod tests {
             meshes: Vec::new(),
         };
         let output = ctx.run_ui(input, |ui| {
-            draw_rows(ui, snapshot, &Settings::default().ordered_columns(), &icons);
+            draw_rows(ui, snapshot, settings, &icons);
         });
         for clipped in &output.shapes {
             collect_row_boxes(&clipped.shape, clipped.clip_rect, &mut frame);
@@ -8350,7 +8585,7 @@ mod tests {
         };
         let mut content_size = egui::Vec2::ZERO;
         let output = ctx.run_ui(input, |ui| {
-            content_size = draw_rows(ui, snapshot, &Settings::default().ordered_columns(), &icons);
+            content_size = draw_rows(ui, snapshot, &Settings::default(), &icons);
         });
         output.drop_without_applying_deltas();
         content_size
@@ -8443,6 +8678,86 @@ mod tests {
                 row_rect.center().y
             );
         }
+    }
+
+    /// Issue #168's render-level contract, driven through `draw_rows`
+    /// rather than through `name_suffix` alone (which the pure-string
+    /// tests above already cover): with `AbilityScore`/`SeasonStrength`
+    /// enabled, the bracketed suffix must actually reach the screen, sit
+    /// flush against the painted name, be dimmed relative to it, and be
+    /// painted *before* the stat-column loop so the columns win z-order.
+    /// That last point is the whole reason the suffix is allowed to be
+    /// unclipped and uncapped, so it is pinned here from paint order, not
+    /// assumed from the call site.
+    #[test]
+    fn the_inline_score_suffix_paints_flush_dimmed_and_beneath_the_stat_columns() {
+        let mut settings = Settings::default();
+        settings.toggle(ColumnKind::AbilityScore);
+        settings.toggle(ColumnKind::SeasonStrength);
+        let row = PlayerRow {
+            name: "Zoe".to_string(),
+            damage: 1_000,
+            dps: 1_234.0,
+            ..sample_score_row(Some(12_345), Some(678))
+        };
+        let snapshot = Snapshot {
+            duration_ms: 90_000,
+            total_damage: row.damage,
+            total_dps: row.dps,
+            rows: vec![row.clone()],
+            encounter: EncounterInfo::default(),
+        };
+
+        let frame = rows_painted_boxes_with(
+            &snapshot,
+            &settings,
+            default_inner_width(),
+            default_inner_height(),
+        );
+
+        // Painted whole, exactly as `name_suffix` composed it, with the
+        // single separating space `draw_row` prepends — no elision.
+        let suffix_text = format!(" {}", name_suffix(&row, &settings).expect("a suffix"));
+        assert_eq!(suffix_text, " [12345 / 678]");
+        let name_box = frame.text_box(&row.name);
+        let suffix_box = frame.text_box(&suffix_text);
+        assert!(
+            (suffix_box.left() - name_box.right()).abs() < 0.5,
+            "suffix {suffix_box:?} must start where the name {name_box:?} ends"
+        );
+        assert!(
+            (suffix_box.center().y - name_box.center().y).abs() < 0.5,
+            "suffix {suffix_box:?} must share the name's baseline row {name_box:?}"
+        );
+
+        // Dimmed: the same white as the name, at `NAME_SUFFIX_ALPHA`.
+        let (suffix_index, suffix_color) = frame.text_paint(&suffix_text);
+        let (name_index, name_color) = frame.text_paint(&row.name);
+        assert_eq!(
+            suffix_color,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, NAME_SUFFIX_ALPHA)
+        );
+        assert!(
+            suffix_color.a() < name_color.a(),
+            "suffix {suffix_color:?} must be dimmer than the name {name_color:?}"
+        );
+
+        // Paint order: name, then suffix, then every stat column — so the
+        // columns land on top of whatever the suffix bled under them.
+        let stat_text = (ColumnKind::Dps.spec().text)(&row);
+        let (stat_index, _) = frame.text_paint(&stat_text);
+        assert!(
+            name_index < suffix_index && suffix_index < stat_index,
+            "expected name ({name_index}) then suffix ({suffix_index}) then stat column {stat_text:?} ({stat_index})"
+        );
+
+        // And the inline pair really did leave the grid: neither value is
+        // painted a second time as its own column.
+        assert!(
+            !frame.texts.iter().any(|(painted, ..)| painted == "12345"),
+            "ability score must not also paint as a stat column: {:?}",
+            frame.texts
+        );
     }
 
     // -- window position tracking (issue #27) -----------------------------
