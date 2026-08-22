@@ -586,8 +586,19 @@ impl eframe::App for OverlayApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
-                    .fill(PANEL_FILL)
-                    .stroke(egui::Stroke::new(PANEL_BORDER_WIDTH, PANEL_BORDER_COLOR))
+                    // Issue #166: the opacity slider (in the header's
+                    // Columns/settings dropdown, `draw_header_menu`) scales
+                    // the background fill and border chrome only — row
+                    // text, icons, and stat-pill colors are untouched.
+                    // `Color32::gamma_multiply` does the premultiplied-alpha
+                    // scaling correctly (see its doc comment on `Color32`
+                    // storing channels premultiplied), so there is no need
+                    // for a hand-rolled equivalent here.
+                    .fill(PANEL_FILL.gamma_multiply(self.settings.opacity))
+                    .stroke(egui::Stroke::new(
+                        PANEL_BORDER_WIDTH,
+                        PANEL_BORDER_COLOR.gamma_multiply(self.settings.opacity),
+                    ))
                     .corner_radius(egui::CornerRadius::same(PANEL_CORNER_RADIUS)),
             )
             .show(ui, |ui| {
@@ -2577,6 +2588,36 @@ fn draw_header_menu(
 
     ui.separator();
 
+    // Issue #166: its own labelled section (not nested inside the Columns
+    // disclosure above) since it toggles a single overlay-wide value rather
+    // than a per-column list — a `CollapsingHeader` would just be an extra
+    // click for something that's already only one control. Placed in the
+    // header's settings dropdown, alongside Columns, rather than the
+    // header's toggle-cluster pill (a separate, unrelated header surface —
+    // see `toggle_cluster` — that a different issue is changing in
+    // parallel).
+    ui.label("Opacity");
+    let mut opacity = settings.opacity;
+    let opacity_response = ui.add(
+        egui::Slider::new(&mut opacity, Settings::OPACITY_MIN..=Settings::OPACITY_MAX)
+            .show_value(false),
+    );
+    if opacity_response.changed() {
+        // Applied immediately (same frame): `draw_header_menu` mutates the
+        // caller's `&mut Settings` in place, and `OverlayApp::ui` reads
+        // `self.settings.opacity` fresh when it builds the panel `Frame`
+        // right after `draw_header` returns — no extra repaint request
+        // needed, unlike an async round trip such as the Share screenshot's.
+        settings.set_opacity(opacity);
+        // Same persistence path as the Columns checkboxes just above:
+        // blocking file IO stays off this render thread, and a dropped
+        // writer thread just leaves the in-memory value correct for the
+        // rest of this session.
+        let _ = tx_settings.send(settings.clone());
+    }
+
+    ui.separator();
+
     // Issue #131: the escape hatch for a stale learned boss name (e.g. after
     // a game patch changes a dungeon's final boss) — see
     // `scene_bosses_cache`'s doc comment for why nothing invalidates the
@@ -4146,6 +4187,7 @@ const PANEL_BORDER_COLOR: egui::Color32 =
 const PANEL_BORDER_WIDTH: f32 = 1.0;
 /// `TopmostBorderStyle`'s `CornerRadius="8"`.
 const PANEL_CORNER_RADIUS: u8 = 8;
+
 /// Height of `draw_header`'s stat-pill / window-control row — the source's
 /// `Height="22"` stat pills. Named because `apply_theme` installs it as
 /// `interact_size.y` *and* `default_inner_height` budgets for it; reading
@@ -8039,6 +8081,7 @@ mod tests {
             visible_columns: ColumnKind::ALL.to_vec(),
             window_position: None,
             window_size: None,
+            opacity: 1.0,
         };
         settings.toggle(ColumnKind::Dps);
         let cols = settings.ordered_columns();
@@ -8762,6 +8805,28 @@ mod tests {
         )
     }
 
+    /// Same idea as `accessible_rect_for_label`, but for a widget like the
+    /// opacity `Slider` that carries no label of its own
+    /// (`.show_value(false)` and no `.text(...)` call, so
+    /// `WidgetInfo::slider` leaves `label` empty) — it can only be found by
+    /// its AccessKit `role`, which egui sets from `WidgetType::Slider` for
+    /// every `Slider` regardless of whether it has a label
+    /// (`Response::fill_accesskit_node_from_widget_info`).
+    fn accessible_rect_for_role(
+        update: &egui::accesskit::TreeUpdate,
+        role: egui::accesskit::Role,
+    ) -> egui::Rect {
+        let bounds = update
+            .nodes
+            .iter()
+            .find_map(|(_, node)| (node.role() == role).then(|| node.bounds()).flatten())
+            .unwrap_or_else(|| panic!("no accessible node with role {role:?} painted"));
+        egui::Rect::from_min_max(
+            egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+            egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+        )
+    }
+
     /// A single left-click (move, press, release, all in one frame) at
     /// `pos` — enough for `Response::clicked()` to fire on whatever gets
     /// allocated at `pos` during the very frame this `RawInput` drives,
@@ -8785,6 +8850,47 @@ mod tests {
                     modifiers,
                 },
             ],
+            ..Default::default()
+        }
+    }
+
+    /// A press-and-hold at `pos` (move, press — no release) for a single
+    /// frame. Unlike `click_at`, this deliberately does *not* also release
+    /// in the same frame: egui's drag bookkeeping
+    /// (`crate::interaction::update_interactions`) sets a widget's
+    /// `potential_drag_id` on `Pressed` and then clears it right back to
+    /// `None` on a same-frame `Released` — a widget sensitive only to
+    /// `Sense::drag()` (like `Slider`, which has no `Sense::click()`) never
+    /// actually registers as dragged if `click_at`'s press-then-release
+    /// both land in one `RawInput`, so its value never updates. A real drag
+    /// presses on one frame and releases several frames later; this
+    /// reproduces the press half of that so the drag is live for the
+    /// `run_ui` call it's passed to.
+    fn press_at(pos: egui::Pos2) -> egui::RawInput {
+        egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// The release half of the gesture `press_at` starts — a separate frame,
+    /// same reasoning as `press_at`'s doc comment.
+    fn release_at(pos: egui::Pos2) -> egui::RawInput {
+        egui::RawInput {
+            events: vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
             ..Default::default()
         }
     }
@@ -8858,6 +8964,109 @@ mod tests {
         assert!(
             close_commands.contains(&egui::ViewportCommand::Close),
             "Close must also ask the viewport to close: {close_commands:?}"
+        );
+    }
+
+    /// Drives a real drag on the opacity slider (issue #166) through
+    /// `Response::changed()` the same way `draw_header_menu_dispatches_
+    /// close_to_the_right_command` drives a real click on Close — nothing
+    /// before this test exercised `opacity_response.changed()` itself
+    /// (~line 2602), only the pure color math it feeds into.
+    #[test]
+    fn draw_header_menu_slider_drag_updates_settings_and_sends_on_tx_settings() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.opacity,
+            Settings::OPACITY_MAX,
+            "the default must start at full opacity for this test to prove a drag actually moved it"
+        );
+
+        // Frame 1: lay the menu out with no input, and read back where
+        // AccessKit says the opacity slider actually painted — its rect
+        // isn't knowable ahead of a real `draw_header_menu` run.
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+            );
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let slider_rect = accessible_rect_for_role(&update, egui::accesskit::Role::Slider);
+        layout.drop_without_applying_deltas();
+
+        // Frame 2: press (not click — see `press_at`'s doc comment) the far
+        // left edge of the slider's rail — egui's `Slider::slider_ui`
+        // clamps a position outside the rail to its nearest end
+        // (`remap_clamp`), so this reliably lands on `Settings::OPACITY_MIN`
+        // regardless of the handle's start position, the same way the
+        // pre-existing `panic!`-on-miss `click_at` calls elsewhere in this
+        // file target a known, stable point rather than a computed one.
+        let drag_pos = egui::pos2(slider_rect.left(), slider_rect.center().y);
+        let output = ctx.run_ui(press_at(drag_pos), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+            );
+        });
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            settings.opacity,
+            Settings::OPACITY_MIN,
+            "dragging the slider to its left edge must lower settings.opacity to the floor"
+        );
+        let sent = rx_settings
+            .try_recv()
+            .expect("a changed slider must send the new settings on tx_settings");
+        assert_eq!(sent.opacity, Settings::OPACITY_MIN);
+        assert!(
+            rx_settings.try_recv().is_err(),
+            "one slider drag must not send more than once"
+        );
+
+        // Frame 3: release, finishing the gesture `press_at` started. The
+        // pointer hasn't moved since frame 2, so the value doesn't change
+        // again here — this only proves letting go of the slider doesn't
+        // send a spurious second `tx_settings` update.
+        let output = ctx.run_ui(release_at(drag_pos), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+            );
+        });
+        output.drop_without_applying_deltas();
+        assert_eq!(settings.opacity, Settings::OPACITY_MIN);
+        assert!(
+            rx_settings.try_recv().is_err(),
+            "releasing the slider without moving it must not send again"
         );
     }
 
