@@ -554,6 +554,7 @@ mod tests {
         GlyphIcon::MouseOff,
         GlyphIcon::Pin,
         GlyphIcon::Share,
+        GlyphIcon::History,
     ];
 
     #[test]
