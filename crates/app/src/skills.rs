@@ -9,11 +9,18 @@
 use crate::ui::{fmt_pct0, fmt_short};
 use bpsr_meter::SkillRow;
 
-/// One column of the Dps tab (issue #16, D5), in on-screen order. The
-/// reference's leading skill-icon column is omitted — this repo has no
-/// skill-icon assets, and sourcing them is the unsolved issue #9 problem.
+/// One column of the Dps tab (issue #16, D5), in on-screen order.
+///
+/// `Icon` is the reference's leading skill-icon column (issue #192). It was
+/// omitted originally because this repo had no skill-icon assets; it now
+/// vendors them under `crates/app/assets/skills/`, keyed by
+/// `bpsr_meter::tables::skill_icon`. It is the one column here that paints
+/// no text and is not sortable (`sortable`) — the reference's expander
+/// chevron that sits left of it stays omitted, since this window has no
+/// expand/collapse tier to drive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillColumn {
+    Icon,
     Name,
     Damage,
     DmgPct,
@@ -31,6 +38,9 @@ impl SkillColumn {
     /// Column header text, matching the reference's labels verbatim (D5).
     pub fn label(self) -> &'static str {
         match self {
+            // The icon column is unlabelled in the reference, and there is
+            // nothing to abbreviate a picture to in 32pt anyway.
+            SkillColumn::Icon => "",
             SkillColumn::Name => "Skill name",
             SkillColumn::Damage => "Damage",
             SkillColumn::DmgPct => "% Dmg",
@@ -53,6 +63,9 @@ impl SkillColumn {
     /// bounded by `fmt_short`.
     pub fn width(self) -> f32 {
         match self {
+            // The 24pt icon (`SKILL_ICON_SIZE` in `ui.rs`) plus the 8pt gap
+            // that separates it from the skill name.
+            SkillColumn::Icon => 32.0,
             SkillColumn::Name => 160.0,
             // `fmt_short` bounds every damage/count figure to ~7 chars,
             // same budget `ColumnKind::Damage`/`Hits` use in settings.rs.
@@ -78,6 +91,9 @@ impl SkillColumn {
     /// only 2-decimal column (D5).
     pub fn text(self, row: &SkillRow) -> String {
         match self {
+            // Painted as a texture, not text — see `SkillColumn`'s doc
+            // comment and the row-paint loop in `ui.rs`.
+            SkillColumn::Icon => String::new(),
             SkillColumn::Name => skill_display_name(row.skill_id),
             SkillColumn::Damage => fmt_short(row.damage),
             SkillColumn::DmgPct => fmt_pct0(row.share_pct),
@@ -92,14 +108,24 @@ impl SkillColumn {
         }
     }
 
+    /// Whether clicking this column's header sorts by it. Every column but
+    /// `Icon` does; ordering rows by which picture they carry is
+    /// meaningless, and the reference's icon column is not clickable
+    /// either. `ui.rs`'s header loop skips the toggle for an unsortable
+    /// column, and `sort_rows` returns early on one, so no code path can
+    /// reach `numeric_key`'s `unreachable!` for it.
+    pub fn sortable(self) -> bool {
+        !matches!(self, SkillColumn::Icon)
+    }
+
     /// This column's numeric sort key, as `f64` so every column but `Name`
     /// (which sorts lexically on its display name, not here) shares one
     /// comparison path in `sort_rows`. Every source field already fits an
     /// `f64` without meaningful precision loss at realistic damage scales.
     fn numeric_key(self, row: &SkillRow) -> f64 {
         match self {
-            SkillColumn::Name => {
-                unreachable!("Name sorts lexically via skill_display_name, not numeric_key")
+            SkillColumn::Icon | SkillColumn::Name => {
+                unreachable!("{self:?} does not sort numerically; see `sortable`")
             }
             SkillColumn::Damage => row.damage as f64,
             SkillColumn::DmgPct => row.share_pct as f64,
@@ -126,6 +152,19 @@ pub fn skill_display_name(skill_id: i32) -> String {
         .and_then(bpsr_meter::tables::skill_name)
         .map(str::to_owned)
         .unwrap_or_else(|| format!("Skill #{skill_id}"))
+}
+
+/// Resolves a raw skill id to its vendored icon basename (issue #192), via
+/// the generated `skill_icon` table. `None` — an id the table names no icon
+/// for, or a negative id, both falling through the same `try_from` — is the
+/// normal "no icon" answer, and the caller paints the blank placeholder.
+/// Note that `Some` is not a promise the icon is *shipped*: the table names
+/// every icon BPSR-ZDPS references, and `SkillIcons::get` returns `None` for
+/// any whose PNG is not committed under `crates/app/assets/skills/`.
+pub fn skill_icon_basename(skill_id: i32) -> Option<&'static str> {
+    u32::try_from(skill_id)
+        .ok()
+        .and_then(bpsr_meter::tables::skill_icon)
 }
 
 /// Sort state for one open breakdown window. Per-window, not global (D9) —
@@ -182,8 +221,16 @@ impl SkillSort {
 /// incoming relative order — the meter's damage-descending order is a
 /// reasonable tiebreaker for every other column). `Name` sorts on the
 /// resolved display name (what the user actually reads); every other
-/// column sorts on its own numeric field via `SkillColumn::numeric_key`.
+/// sortable column sorts on its own numeric field via
+/// `SkillColumn::numeric_key`. `Icon` is not sortable and is a no-op here.
 pub fn sort_rows(rows: &mut [SkillRow], sort: SkillSort) {
+    // An unsortable column (`Icon`) leaves the incoming meter order alone.
+    // `ui.rs` never toggles the sort onto one, so this is belt-and-braces
+    // against a future caller constructing such a `SkillSort` by hand — but
+    // it is what keeps `numeric_key`'s `unreachable!` genuinely unreachable.
+    if !sort.column.sortable() {
+        return;
+    }
     if sort.column == SkillColumn::Name {
         rows.sort_by(|a, b| {
             let ord = skill_display_name(a.skill_id).cmp(&skill_display_name(b.skill_id));
@@ -287,6 +334,53 @@ mod tests {
         let sort = SkillSort::default();
         assert_eq!(sort.header_label(SkillColumn::Damage), "Damage \u{2193}");
         assert_eq!(sort.header_label(SkillColumn::Hits), "Hits");
+    }
+
+    #[test]
+    fn the_icon_column_is_the_only_unsortable_one() {
+        assert!(!SkillColumn::Icon.sortable());
+        for column in [
+            SkillColumn::Name,
+            SkillColumn::Damage,
+            SkillColumn::DmgPct,
+            SkillColumn::CritPct,
+            SkillColumn::MaxCrit,
+            SkillColumn::AvgCrit,
+            SkillColumn::AvgWhite,
+            SkillColumn::Avg,
+            SkillColumn::Hits,
+            SkillColumn::Crits,
+            SkillColumn::HitPerMin,
+        ] {
+            assert!(column.sortable(), "{column:?} should be sortable");
+        }
+    }
+
+    #[test]
+    fn sorting_by_the_icon_column_is_a_no_op_rather_than_a_panic() {
+        let mut rows = vec![skill_row(1, 100), skill_row(2, 300)];
+        sort_rows(
+            &mut rows,
+            SkillSort {
+                column: SkillColumn::Icon,
+                descending: true,
+            },
+        );
+        let ids: Vec<i32> = rows.iter().map(|r| r.skill_id).collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn an_unmapped_skill_id_has_no_icon_basename() {
+        assert_eq!(skill_icon_basename(2_000_000_000), None);
+        assert_eq!(skill_icon_basename(-1), None);
+    }
+
+    #[test]
+    fn a_known_skill_id_resolves_to_its_vendored_icon_basename() {
+        // 1201 ("Raincall Surge - Stage 1") is the first entry in
+        // `crates/meter/data/SkillOverridesIcons.json`.
+        assert_eq!(skill_icon_basename(1201), Some("weapon_mz-01_skill_atk"));
     }
 
     #[test]

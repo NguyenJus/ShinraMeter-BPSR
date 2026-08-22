@@ -32,3 +32,7 @@ docs/reference/
 ShinraMeter-BPSR-inspect-dump-*.jsonl
 inspect-dumps/
 *.inspect-dump.jsonl
+
+# Byte-compiled Python, created when `scripts/prep-skill-icons.py` imports
+# `scripts/prep-imagine-icons.py` to reuse its transforms.
+__pycache__/

@@ -9,6 +9,8 @@ name: Generated tables
 # the PNGs under `crates/app/assets/imagines/` — so the offline job checks it
 # too. It has no upstream half: its inputs are all committed here, and the only
 # rot it can suffer is a hand-edit or a re-curation without a regeneration.
+# Issue #192 added a third, `crates/app/src/skill_icons.rs`, from the PNGs
+# under `crates/app/assets/skills/`, on exactly the same footing.
 #
 # A CI job was chosen over a release-checklist note because the first job is the
 # only thing that can catch a hand-edit of a generated file, and a checklist
@@ -42,6 +44,7 @@ jobs:
       - uses: actions/checkout@v7
       - run: python3 scripts/gen-name-tables.py --check
       - run: python3 scripts/gen-imagine-table.py --check
+      - run: python3 scripts/gen-skill-icons.py --check
 
   # Networked, and deliberately *not* on pull requests: have the vendored
   # copies drifted from their upstream sources? A red run here is the nag that

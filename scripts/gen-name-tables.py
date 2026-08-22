@@ -42,6 +42,7 @@ import functools
 import io
 import json
 import pathlib
+import re
 import sys
 import unicodedata
 import urllib.request
@@ -76,12 +77,30 @@ FILTERED_SOURCES = {
     "SceneTableNames.json": f"{_ZDPS}/SceneTable.json",
     "DungeonsTableNames.json": f"{_ZDPS}/DungeonsTable.json",
     # Issue #16: BPSR-ZDPS's curated player-facing skill names — 1487
-    # hand-tuned entries, `{id: {Name, Icon}}` (Icon dropped; skill icons are
-    # issue #9's unsolved problem). Unlike the monster/scene tables above,
-    # *this* is the hand-checked layer for skills, not `SkillName.json` — see
-    # the merge order in `render()`. `filter_id_names` already handles this
-    # shape unchanged.
+    # hand-tuned entries, `{id: {Name, Icon}}`. Unlike the monster/scene tables
+    # above, *this* is the hand-checked layer for skills, not `SkillName.json`
+    # — see the merge order in `render()`. `filter_id_names` already handles
+    # this shape unchanged; the `Icon` half of each row is projected out
+    # separately by `ICON_SOURCES` below.
     "SkillOverridesNames.json": f"{_ZDPS}/SkillOverrides.en.json",
+}
+
+# Issue #192: the same `SkillOverrides.en.json` rows also carry `Icon`, an
+# asset path into the game client's UI atlas
+# (`ui/atlas/skill_weapon_mz/weapon_mz-01_kx06`). This used to be dropped on
+# the floor because there were no skill-icon assets to key against it; the
+# skill breakdown window now paints one per row, so the id -> icon *basename*
+# half is vendored here, projected from the same URL `SkillOverridesNames.json`
+# uses (`_fetch` is `lru_cache`d, so a `--refresh` still downloads it once).
+#
+# Only the basename is kept: the atlas directories are a client-side layout
+# this project does not mirror, and `crates/app/assets/skills/` is flat. The
+# PNGs themselves are vendored by `scripts/prep-skill-icons.py` and compiled in
+# via `scripts/gen-skill-icons.py`; an id whose basename has no committed PNG
+# degrades to a blank placeholder at draw time, so this table is deliberately
+# allowed to name icons that are not shipped.
+ICON_SOURCES = {
+    "SkillOverridesIcons.json": f"{_ZDPS}/SkillOverrides.en.json",
 }
 
 # Issue #112: the same `MonsterTable.json` also carries `MonsterType`, an enum
@@ -359,6 +378,39 @@ def filter_id_names(raw: dict) -> dict[str, str]:
     return dict(sorted(out.items(), key=lambda kv: int(kv[0])))
 
 
+# An icon basename we are willing to treat as an asset name: what a file under
+# `crates/app/assets/skills/` can actually be called. Upstream's `Icon` field is
+# not uniformly an asset path — at least one row carries free prose ("From
+# Shield Combo talent") — and a value with spaces in it can never name a
+# committed PNG, so it is dropped here rather than vendored as a permanently
+# unresolvable key.
+_ICON_BASENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def filter_id_icons(raw: dict) -> dict[str, str]:
+    """Project BPSR-ZDPS's `SkillOverrides.en.json` down to `{id: icon basename}`.
+
+    The inverse projection of `filter_id_names` over the same rows (issue
+    #192). Upstream `Icon` is a client atlas path
+    (`ui/atlas/skill_weapon_mz/weapon_mz-01_kx06`); only the last path segment
+    is kept, since that is what the vendored PNGs are named. Rows whose `Icon`
+    is missing, non-string, blank, or not a plausible asset basename are
+    dropped, so an iconless id keeps falling through to the draw-time blank
+    placeholder rather than being vendored as an empty string.
+    """
+    out = {}
+    for key, row in raw.items():
+        if not isinstance(row, dict):
+            continue
+        icon = row.get("Icon")
+        if not isinstance(icon, str):
+            continue
+        basename = icon.strip().rsplit("/", 1)[-1]
+        if _ICON_BASENAME_RE.match(basename):
+            out[str(int(key))] = basename
+    return dict(sorted(out.items(), key=lambda kv: int(kv[0])))
+
+
 def filter_boss_ids(raw: dict) -> list[int]:
     """Project a full `MonsterTable.json` down to ids with `MonsterType == 2`
     (`Zproto.EMonsterType.Boss`) — see `BOSS_ID_SOURCES` for why this field,
@@ -440,6 +492,25 @@ def _self_test() -> None:
         "a non-blank name carrying leading/trailing padding must be stored stripped"
     )
 
+    icons = filter_id_icons(
+        {
+            "20": {"Icon": "ui/atlas/skill_weapon_mz/weapon_mz-01_kx06"},
+            "10": {"Icon": "flat_basename"},
+            "11": {"Icon": "  ui/atlas/x/padded  "},
+            "12": {"Icon": "From Shield Combo talent"},
+            "13": {"Icon": ""},
+            "14": {"Icon": None},
+            "15": {"NoIcon": 1},
+            "16": "not a row",
+        }
+    )
+    assert icons == {
+        "10": "flat_basename",
+        "11": "padded",
+        "20": "weapon_mz-01_kx06",
+    }, icons
+    assert list(icons) == ["10", "11", "20"], "icon output must be id-sorted"
+
     boss_ids = filter_boss_ids(
         {
             "20": {"MonsterType": 2},
@@ -512,6 +583,17 @@ def emit(out: io.StringIO, doc: str, fn: str, table: dict) -> None:
         out.write('        %d => "%s",\n' % (key, esc(table[key])))
     out.write("        _ => return None,\n    })\n}\n")
 
+
+SKILL_ICON_DOC = """/// Icon basename for a skill id (issue #192), if BPSR-ZDPS\'s curated
+/// `SkillOverrides.en.json` names one for it. The basename keys
+/// `crates/app/assets/skills/<basename>.png`, but this table is deliberately
+/// wider than that directory: it names every icon upstream references, and
+/// `crates/app/src/skill_icons.rs` only compiles in the ones actually
+/// committed here. A basename with no committed PNG resolves to `None` at the
+/// texture lookup and the row paints a blank placeholder — never a panic.
+///
+/// Generated from `crates/meter/data/SkillOverridesIcons.json`, the `Icon`
+/// half of the same rows `skill_name`\'s curated layer comes from."""
 
 BOSS_IDS_DOC = """/// Boss-monster template ids (issue #42): the top-bar encounter name should
 /// only ever appear for a genuine boss fight. `Meter::recompute_boss`
@@ -661,6 +743,9 @@ def _render_source(name: str, url: str) -> bytes:
     if name in FILTERED_SOURCES:
         filtered = filter_id_names(json.loads(body.decode("utf-8-sig")))
         return (json.dumps(filtered, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if name in ICON_SOURCES:
+        icons = filter_id_icons(json.loads(body.decode("utf-8-sig")))
+        return (json.dumps(icons, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     if name in BOSS_ID_SOURCES:
         ids = filter_boss_ids(json.loads(body.decode("utf-8-sig")))
         return (json.dumps(ids, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
@@ -685,6 +770,7 @@ def refresh(check: bool) -> bool:
     for name, url in {
         **VERBATIM_SOURCES,
         **FILTERED_SOURCES,
+        **ICON_SOURCES,
         **BOSS_ID_SOURCES,
         **DUNGEON_SCENE_ID_SOURCES,
     }.items():
@@ -741,6 +827,10 @@ def render() -> str:
         _keyed(load("SkillName.json")),
         _keyed(load("SkillOverridesNames.json")),
     )
+    # Issue #192: the icon half of the same curated rows. Not merged with
+    # anything — `SkillName.json` carries no icon reference, so BPSR-ZDPS's
+    # overrides are the only layer there is.
+    skill_icons = _keyed(load("SkillOverridesIcons.json"))
 
     out = io.StringIO()
     out.write(HEADER)
@@ -762,6 +852,7 @@ def render() -> str:
         "skill_name",
         skills,
     )
+    emit(out, SKILL_ICON_DOC, "skill_icon", skill_icons)
     emit_boss_ids(out, boss_ids)
     emit_dungeon_scene_ids(out, dungeon_scene_ids)
     out.write(FOOTER)

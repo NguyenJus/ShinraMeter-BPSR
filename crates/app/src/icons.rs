@@ -30,6 +30,7 @@
 //! see its doc comment.
 
 use crate::imagines;
+use crate::skill_icons;
 use bpsr_meter::Class;
 use eframe::egui;
 
@@ -402,6 +403,41 @@ impl ImagineIcons {
     }
 }
 
+/// Textures for the per-skill row icons in the breakdown window (issue
+/// #192), uploaded once via `SkillIcons::load`. Same lazy-load,
+/// load-once-per-process pattern as every other set in this module — see
+/// `ClassIcons`'s doc comment — and keyed the same way `ImagineIcons` is,
+/// by the icon *basename*, for the same reason: a skill id maps to one of
+/// the vendored basenames via `bpsr_meter::tables::skill_icon`, and that
+/// key set is open-ended game data rather than fixed UI chrome.
+pub struct SkillIcons(IconSet<&'static str>);
+
+impl SkillIcons {
+    /// Decodes and uploads a texture for every
+    /// `skill_icons::SKILL_ICON_BYTES` entry. Same load-once pattern as
+    /// `ImagineIcons::load` — see `ClassIcons`'s doc comment.
+    pub fn load(ctx: &egui::Context) -> Self {
+        Self(IconSet::load(
+            ctx,
+            skill_icons::SKILL_ICON_BYTES,
+            |icon| format!("skill-icon-{icon}"),
+            |icon| format!("skill icon {icon}"),
+        ))
+    }
+
+    /// The texture for the icon basename `icon`, or `None` if none is
+    /// loaded for it. Unlike `ImagineIcons::get`, `None` here is *expected*
+    /// in normal operation, not just a decode failure:
+    /// `bpsr_meter::tables::skill_icon` names every icon BPSR-ZDPS
+    /// references, while `SKILL_ICON_BYTES` carries only the subset whose
+    /// art is committed under `assets/skills/`, and a skill id the table
+    /// does not know yields no basename at all. Every one of those cases
+    /// lands on the caller's blank-placeholder branch — never a panic.
+    pub fn get(&self, icon: &'static str) -> Option<&egui::TextureHandle> {
+        self.0.get(icon)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,6 +625,47 @@ mod tests {
                 assert_ne!(a, b, "icon basename {a:?} appears more than once");
             }
         }
+    }
+
+    // -- skill icons (issue #192) -----------------------------------------
+
+    #[test]
+    fn every_embedded_skill_icon_decodes() {
+        for &(basename, bytes) in skill_icons::SKILL_ICON_BYTES {
+            assert!(
+                decode(&format!("skill icon {basename}"), bytes).is_some(),
+                "{basename} failed to decode"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_icon_basenames_are_unique() {
+        for (i, &a) in skill_icons::SKILL_ICON_FILES.iter().enumerate() {
+            for &b in &skill_icons::SKILL_ICON_FILES[i + 1..] {
+                assert_ne!(a, b, "icon basename {a:?} appears more than once");
+            }
+        }
+    }
+
+    #[test]
+    fn skill_icons_get_is_defined_for_every_icon_file() {
+        let ctx = egui::Context::default();
+        let icons = SkillIcons::load(&ctx);
+        for &basename in skill_icons::SKILL_ICON_FILES {
+            assert!(
+                icons.get(basename).is_some(),
+                "{basename} has no loaded texture"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unvendored_skill_icon_basename_has_no_texture() {
+        // The vendored table may name icons whose art is not committed here;
+        // that must degrade to `None`, not a panic.
+        let ctx = egui::Context::default();
+        assert!(SkillIcons::load(&ctx).get("not-a-vendored-icon").is_none());
     }
 
     #[test]
