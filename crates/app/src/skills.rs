@@ -39,7 +39,7 @@ impl SkillColumn {
     pub fn label(self) -> &'static str {
         match self {
             // The icon column is unlabelled in the reference, and there is
-            // nothing to abbreviate a picture to in 32pt anyway.
+            // nothing to abbreviate a picture to in 48pt anyway.
             SkillColumn::Icon => "",
             SkillColumn::Name => "Skill name",
             SkillColumn::Damage => "Damage",
@@ -63,9 +63,11 @@ impl SkillColumn {
     /// bounded by `fmt_short`.
     pub fn width(self) -> f32 {
         match self {
-            // The 24pt icon (`SKILL_ICON_SIZE` in `ui.rs`) plus the 8pt gap
-            // that separates it from the skill name.
-            SkillColumn::Icon => 32.0,
+            // The 38pt icon (`SKILL_ICON_SIZE` in `ui.rs`) plus the 10pt
+            // gap that separates it from the skill name — issue #200
+            // measured the reference's row icon at 38px across, clearing
+            // the name text (which starts at x=78) by ~9px.
+            SkillColumn::Icon => 48.0,
             SkillColumn::Name => 160.0,
             // `fmt_short` bounds every damage/count figure to ~7 chars,
             // same budget `ColumnKind::Damage`/`Hits` use in settings.rs.

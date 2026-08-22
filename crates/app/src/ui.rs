@@ -5729,41 +5729,62 @@ const SKILL_CLOSE_RGB: egui::Color32 = egui::Color32::from_rgb(0xff, 0x55, 0x55)
 const SKILL_ROW_HOVER_FILL: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(0xff, 0xff, 0xff, 0x10);
 
-const SKILL_HEADER_HEIGHT: f32 = 56.0;
-const SKILL_TAB_HEIGHT: f32 = 32.0;
-const SKILL_COLUMN_HEADER_HEIGHT: f32 = 28.0;
-/// The reference's 40px row-height minimum (D5/D14) — taller than the main
-/// row list's `ROW_HEIGHT` (30.0), so this is its own constant rather than
-/// reusing that one.
-const SKILL_ROW_HEIGHT: f32 = 40.0;
-/// The per-skill row icon (issue #192), sized against the 40pt row the way
-/// `SKILL_HEADER_ICON_SIZE` is sized against the 56pt header: big enough to
-/// read, with room left for the row's vertical breathing space. The vendored
-/// PNGs are 48px (`scripts/prep-skill-icons.py`), so this is a 2x source at
-/// 100% display scaling.
-const SKILL_ICON_SIZE: f32 = 24.0;
+/// Column-header band fill (issue #200). The reference paints three
+/// distinct levels, not two: measured at x=860, where the game background
+/// behind the window runs continuously across both band edges, the header
+/// and tab strip sit at (29,28,33), the row list at (45,44,49) and the
+/// column-header band at (51,50,55). Backing the known
+/// `SKILL_PANEL_FILL`/`SKILL_CHROME_FILL` pair out of that composite gives
+/// the window's alpha as ~0.90, which puts this band a further ~0x09 above
+/// `SKILL_PANEL_FILL`. Kept on the same opaque baseline as the other two so
+/// `settings.opacity` still reads identically across all of them.
+const SKILL_COLUMN_HEADER_FILL: egui::Color32 = egui::Color32::from_rgb(0x2a, 0x2a, 0x30);
+
+/// Band heights, all measured off `docs/reference/shinra-skills-ex.webp`
+/// (issue #200). That capture is 1:1 with WPF DIPs — its header pill is
+/// exactly 34px tall against `Skills.xaml`'s `CornerRadius="17"`, which
+/// pins the scale — so the pixel figures port straight to egui points.
+/// Header: content top y=2 to y=70. Tab strip: y=71..92. Column header:
+/// y=93..132. Rows: a 44px pitch from y=133 (ten row text centers, 156
+/// through 553, evenly spaced 44.1px apart).
+const SKILL_HEADER_HEIGHT: f32 = 70.0;
+const SKILL_TAB_HEIGHT: f32 = 22.0;
+const SKILL_COLUMN_HEADER_HEIGHT: f32 = 40.0;
+/// The reference's measured 44px row pitch (issue #200) — taller than the
+/// main row list's `ROW_HEIGHT` (30.0), so this is its own constant rather
+/// than reusing that one. D5/D14 read `Skills.xaml`'s `MinHeight` of 40 as
+/// the row height; the rendered capture shows 44 once the row's own padding
+/// is included, and the pitch is what the eye actually reads.
+const SKILL_ROW_HEIGHT: f32 = 44.0;
+/// The per-skill row icon (issue #192), measured off the reference (issue
+/// #200): row 1's disc spans x 32..69 and y 136..173, i.e. 38px across in a
+/// 44px row — the icon dominates its row rather than sitting as a small
+/// bullet beside the name, which 24.0 made it. The vendored PNGs are 48px
+/// (`scripts/prep-skill-icons.py`), so this is still a downscale at 100%
+/// display scaling.
+const SKILL_ICON_SIZE: f32 = 38.0;
 /// Fill for a row whose skill has no icon to paint. Deliberately the same
 /// flat disc the Imagine slots degrade to, so an empty slot reads as a
 /// deliberate blank rather than a rendering failure.
 const SKILL_ICON_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x3B);
-/// Issue #190: the reference's `Skills.xaml:151-154` draws the class icon
-/// at 50x50, but that number comes from an `Height="Auto"` header row where
-/// the icon *is* the tallest child and therefore sets the row's height —
-/// there's no independent header height to match. Ours works the other way
-/// around (`SKILL_HEADER_HEIGHT` is a fixed 56.0), so porting 50 verbatim
-/// would exceed the header's padded content area (`SKILL_HEADER_HEIGHT -
-/// 2 * SKILL_HEADER_PAD_Y` = 40) and break the `SKILL_HEADER_PAD_Y`
-/// padding it's centered within. Sized instead to exactly fill that content
-/// area — the same 40 the Deaths pill is already sized to (`deaths_pill_size`
-/// below) — reproducing the reference's "icon fills the row" relationship
-/// within our fixed-height header, up from the old 32.0 which left a
-/// visually undersized 12px of slack above and below the icon.
-const SKILL_HEADER_ICON_SIZE: f32 = 40.0;
+/// `Skills.xaml:151-154` draws the class icon at 50x50. Issue #190 could
+/// only fit 40 of that, because `SKILL_HEADER_HEIGHT` was a made-up 56 and
+/// 50 would have overflowed its padded content area. Issue #200 measured
+/// the reference's header band at 70px instead, so the source's 50 now
+/// lands verbatim *and* keeps the "icon exactly fills the padded row"
+/// relationship #190 was reaching for
+/// (`SKILL_HEADER_HEIGHT - 2 * SKILL_HEADER_PAD_Y` = 50).
+const SKILL_HEADER_ICON_SIZE: f32 = 50.0;
 const SKILL_HEADER_PAD_X: f32 = 12.0;
-const SKILL_HEADER_PAD_Y: f32 = 8.0;
+const SKILL_HEADER_PAD_Y: f32 = 10.0;
 const SKILL_CLOSE_SIZE: f32 = 20.0;
 /// The reference's `CornerRadius="17"` header pill.
 const SKILL_PILL_CORNER_RADIUS: u8 = 17;
+/// Header pill height, measured at 34px in the reference (issue #200) —
+/// exactly `2 * SKILL_PILL_CORNER_RADIUS`, i.e. a true stadium. It used to
+/// be derived from the header band instead, which made it 40 tall against a
+/// 17 radius: a rounded rectangle with flat sides, not the reference's pill.
+const SKILL_PILL_HEIGHT: f32 = 34.0;
 /// The reference's 24pt player name — the one size in this window with no
 /// equivalent in the main row scale (`FONT_SIZE_ROW` tops out at 13.0).
 const FONT_SIZE_SKILL_HEADER_NAME: f32 = 24.0;
@@ -5799,7 +5820,12 @@ const SKILL_COLUMN_ORDER: [skills::SkillColumn; 12] = [
 // column budget, and at 720 the sum of `SkillColumn::width`s would exceed
 // the content width, making `column_anchors_from_widths` shrink every
 // column to fit rather than laying them out at their stated widths.
-const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 520.0);
+// Issue #200 raised the height 520 -> 572: the reference-measured band
+// heights (70/22/40 of chrome, 44 per row) make 520 open on only 8.8 rows,
+// breaking the "roughly ten rows" promise above. 572 is also the reference
+// capture's own content height (928x574 minus its 2px border), where ten
+// 44px rows fill y=133..573 exactly.
+const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 572.0);
 /// Floor on the skill breakdown viewport's inner size (issue #181) so a
 /// resize can't shrink it into uselessness — tall enough for the header, tab
 /// strip and column-header row plus a couple of rows before the list
@@ -5931,6 +5957,35 @@ fn skill_windows_to_draw<'a>(
 /// column grid reuses `column_anchors_from_widths`' right-aligned-anchor
 /// scheme, the same maths `column_anchors` uses for the main row list —
 /// the anchor maths is not re-derived here.
+/// The filled box behind the selected tab (issue #200). The reference's tab
+/// strip has no band fill of its own: only the selected tab carries
+/// `SKILL_PANEL_FILL`, in a box flush with the window's left edge that hugs
+/// the label with one `SKILL_HEADER_PAD_X` of padding on each side — the
+/// measured `Dps` box runs x 2..51 against a label starting at x≈17.
+fn skill_selected_tab_rect(tabs_rect: egui::Rect, text_width: f32) -> egui::Rect {
+    egui::Rect::from_min_size(
+        tabs_rect.min,
+        egui::vec2(text_width + 2.0 * SKILL_HEADER_PAD_X, tabs_rect.height()),
+    )
+}
+
+/// The column-header band's rect (issue #200): flush with the window's
+/// left/right edges, directly beneath the tab strip, `SKILL_COLUMN_HEADER_
+/// HEIGHT` tall. Painted with `SKILL_COLUMN_HEADER_FILL`.
+fn skill_column_header_rect(rect: egui::Rect, tabs_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(rect.left(), tabs_rect.bottom()),
+        egui::vec2(rect.width(), SKILL_COLUMN_HEADER_HEIGHT),
+    )
+}
+
+/// The scrollable row-list band's rect (issue #200): everything below the
+/// column header down to the window's bottom edge. Painted with
+/// `SKILL_PANEL_FILL`, not the window's `SKILL_CHROME_FILL`.
+fn skill_rows_rect(rect: egui::Rect, col_header_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(egui::pos2(rect.left(), col_header_rect.bottom()), rect.max)
+}
+
 fn draw_skill_window(
     ui: &mut egui::Ui,
     row: &PlayerRow,
@@ -6006,11 +6061,7 @@ fn draw_skill_window(
         stroke: None,
     };
     let deaths_text_size = pill_text_size(&painter, &deaths_pill);
-    let deaths_pill_size = pill_size(
-        deaths_text_size,
-        deaths_pill.icon_side,
-        SKILL_HEADER_HEIGHT - 2.0 * SKILL_HEADER_PAD_Y,
-    );
+    let deaths_pill_size = pill_size(deaths_text_size, deaths_pill.icon_side, SKILL_PILL_HEIGHT);
     let deaths_pill_rect = egui::Rect::from_min_size(
         egui::pos2(
             header_rect.right()
@@ -6057,21 +6108,38 @@ fn draw_skill_window(
         egui::pos2(rect.left(), header_rect.bottom()),
         egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
     );
-    painter.rect_filled(tabs_rect, 0.0, SKILL_PANEL_FILL.gamma_multiply(opacity));
+    // Issue #200: the strip itself is *not* a filled band. At y=80 in the
+    // reference the pixels under the unselected tabs (x=700) match the
+    // header band exactly, while only the selected `Dps` tab (x 2..51)
+    // carries the lighter `#212127` box. Filling the whole strip made the
+    // window read as a two-tone sandwich instead of a tab row.
+    let tab_label = "Dps";
+    let tab_font = bold(FONT_SIZE_ROW);
+    let tab_text_width = painter
+        .layout_no_wrap(tab_label.to_owned(), tab_font.clone(), egui::Color32::WHITE)
+        .size()
+        .x;
+    painter.rect_filled(
+        skill_selected_tab_rect(tabs_rect, tab_text_width),
+        0.0,
+        SKILL_PANEL_FILL.gamma_multiply(opacity),
+    );
     paint_text(
         &painter,
         tabs_rect.left_center() + egui::vec2(SKILL_HEADER_PAD_X, 0.0),
         egui::Align2::LEFT_CENTER,
-        "Dps",
-        bold(FONT_SIZE_ROW),
+        tab_label,
+        tab_font,
         egui::Color32::WHITE,
         true,
     );
 
     // -- column header row: click (either button, D9) toggles sort -------
-    let col_header_rect = egui::Rect::from_min_size(
-        egui::pos2(rect.left(), tabs_rect.bottom()),
-        egui::vec2(rect.width(), SKILL_COLUMN_HEADER_HEIGHT),
+    let col_header_rect = skill_column_header_rect(rect, tabs_rect);
+    painter.rect_filled(
+        col_header_rect,
+        0.0,
+        SKILL_COLUMN_HEADER_FILL.gamma_multiply(opacity),
     );
     let widths: Vec<f32> = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).collect();
     let anchors = column_anchors_from_widths(
@@ -6115,8 +6183,12 @@ fn draw_skill_window(
     // BPSR's skill ids are flat — there is no "short name" to group
     // sub-skills under, so unlike the reference's expander rows this is
     // deliberately one row per skill id with no expand/collapse tier.
-    let rows_rect =
-        egui::Rect::from_min_max(egui::pos2(rect.left(), col_header_rect.bottom()), rect.max);
+    let rows_rect = skill_rows_rect(rect, col_header_rect);
+    // Issue #200: the row list sits on the panel fill, not the window's
+    // chrome fill. Measured at x=860 the reference's rows band is exactly
+    // `SKILL_PANEL_FILL - SKILL_CHROME_FILL` (16 per channel) brighter than
+    // the header above it.
+    painter.rect_filled(rows_rect, 0.0, SKILL_PANEL_FILL.gamma_multiply(opacity));
     let mut skill_rows = row.skills.clone();
     skills::sort_rows(&mut skill_rows, *sort);
 
@@ -11127,11 +11199,158 @@ mod tests {
     /// perceived transparency, however different the colors underneath.
     #[test]
     fn skill_window_fills_share_the_panel_opacity_baseline() {
-        for (name, fill) in [("chrome", SKILL_CHROME_FILL), ("panel", SKILL_PANEL_FILL)] {
+        for (name, fill) in [
+            ("chrome", SKILL_CHROME_FILL),
+            ("panel", SKILL_PANEL_FILL),
+            ("column header", SKILL_COLUMN_HEADER_FILL),
+        ] {
             assert_eq!(fill.a(), PANEL_FILL.a(), "{name}");
             let half = fill.gamma_multiply(0.5).a();
             assert_eq!(half, PANEL_FILL.gamma_multiply(0.5).a(), "{name} at 50%");
         }
+    }
+
+    // -- reference-measured geometry (issue #200) ---------------------------
+    //
+    // Every number below is a pixel measurement taken off
+    // `docs/reference/shinra-skills-ex.webp` (928x574). That capture is 1:1
+    // with WPF DIPs: its header pill measures exactly 34px tall against
+    // `Skills.xaml`'s `CornerRadius="17"`, which pins the scale, so these
+    // pixel figures port straight across to egui points.
+
+    /// The reference's class icon is `Skills.xaml`'s 50x50, and its header
+    /// band measures 70px (content starts at y=2; the selected tab's box
+    /// starts at y=71), so the icon fills the padded content area exactly.
+    /// Issue #190 settled for 40 only because the header was a too-short 56.
+    #[test]
+    fn skill_header_icon_exactly_fills_the_padded_header() {
+        assert_eq!(SKILL_HEADER_ICON_SIZE, 50.0);
+        assert_eq!(
+            SKILL_HEADER_HEIGHT - 2.0 * SKILL_HEADER_PAD_Y,
+            SKILL_HEADER_ICON_SIZE
+        );
+    }
+
+    /// The header pill measures 34px tall in the reference — exactly twice
+    /// `Skills.xaml`'s `CornerRadius="17"`, i.e. a true stadium. Deriving
+    /// the height from the header band instead made it 40 tall against a 17
+    /// radius, which is visibly not one.
+    #[test]
+    fn skill_header_pill_is_a_stadium() {
+        assert_eq!(SKILL_PILL_HEIGHT, 2.0 * f32::from(SKILL_PILL_CORNER_RADIUS));
+    }
+
+    /// Band heights measured off the reference: header 2..70, tab strip
+    /// 71..92, column header 93..132, then a 44px row pitch (ten row text
+    /// centers, 156 through 553). The stack still has to leave two rows
+    /// visible at the minimum window size.
+    #[test]
+    fn reference_band_heights_leave_two_rows_at_the_minimum_size() {
+        assert_eq!(SKILL_HEADER_HEIGHT, 70.0);
+        assert_eq!(SKILL_TAB_HEIGHT, 22.0);
+        assert_eq!(SKILL_COLUMN_HEADER_HEIGHT, 40.0);
+        assert_eq!(SKILL_ROW_HEIGHT, 44.0);
+        let chrome = SKILL_HEADER_HEIGHT + SKILL_TAB_HEIGHT + SKILL_COLUMN_HEADER_HEIGHT;
+        assert!(
+            chrome + 2.0 * SKILL_ROW_HEIGHT <= SKILL_WINDOW_MIN_SIZE.y,
+            "{chrome} of chrome leaves no room for two rows"
+        );
+        // `SKILL_WINDOW_SIZE`'s documented promise: a newly opened window
+        // shows ten rows before the list scrolls, exactly as the reference
+        // capture does (rows y=133..573, ten 44px rows).
+        let rows = (SKILL_WINDOW_SIZE.y - chrome) / SKILL_ROW_HEIGHT;
+        assert!(rows >= 10.0, "initial window opens on only {rows} rows");
+    }
+
+    /// The reference's row icons are 38px across (row 1's disc spans x
+    /// 32..69, y 136..173) inside a 44px row, and clear the skill name by
+    /// ~9px (name text starts at x=78).
+    #[test]
+    fn skill_row_icon_matches_the_reference_and_clears_the_name() {
+        assert_eq!(SKILL_ICON_SIZE, 38.0);
+        const { assert!(SKILL_ICON_SIZE < SKILL_ROW_HEIGHT) };
+        let gap = skills::SkillColumn::Icon.width() - SKILL_ICON_SIZE;
+        assert!(
+            (8.0..=12.0).contains(&gap),
+            "icon column must keep a reference-sized gap before the name, got {gap}"
+        );
+    }
+
+    /// Widening the icon column must not push the column set past the
+    /// initial window's content width — `column_anchors_from_widths` would
+    /// silently shrink every column to fit (the trap issue #192 hit).
+    #[test]
+    fn skill_columns_fit_the_initial_window_at_their_stated_widths() {
+        let total: f32 = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).sum();
+        assert!(
+            total <= SKILL_WINDOW_SIZE.x - 2.0 * SKILL_HEADER_PAD_X,
+            "columns total {total}"
+        );
+    }
+
+    /// Measured off the reference at x=860, where the game background
+    /// behind the window is continuous across all three band edges:
+    /// header/tabs (29,28,33), rows (45,44,49), column header (51,50,55).
+    /// Three distinct levels, brightest at the column header — the rows are
+    /// *not* on the window's chrome fill.
+    #[test]
+    fn skill_bands_step_up_from_chrome_to_the_column_header() {
+        assert!(SKILL_PANEL_FILL.r() > SKILL_CHROME_FILL.r());
+        assert!(SKILL_COLUMN_HEADER_FILL.r() > SKILL_PANEL_FILL.r());
+    }
+
+    /// In the reference the tab strip's background *is* the window fill:
+    /// at y=80 the pixels under the unselected tabs (x=700) match the
+    /// header band exactly, while only the selected `Dps` tab (x 2..51)
+    /// carries the lighter `#212127` box.
+    #[test]
+    fn selected_tab_fill_hugs_its_label_instead_of_the_whole_strip() {
+        let tabs =
+            egui::Rect::from_min_size(egui::pos2(10.0, 60.0), egui::vec2(760.0, SKILL_TAB_HEIGHT));
+        let fill = skill_selected_tab_rect(tabs, 26.0);
+        assert_eq!(fill.left(), tabs.left());
+        assert_eq!(fill.top(), tabs.top());
+        assert_eq!(fill.height(), tabs.height());
+        assert_eq!(fill.width(), 26.0 + 2.0 * SKILL_HEADER_PAD_X);
+        assert!(
+            fill.right() < tabs.right(),
+            "the rest of the strip must stay window fill"
+        );
+    }
+
+    /// Pins the column-header band's rect (issue #200): flush with the
+    /// window edges, directly beneath the tab strip, `SKILL_COLUMN_HEADER_
+    /// HEIGHT` tall — this is the rect `SKILL_COLUMN_HEADER_FILL` paints.
+    #[test]
+    fn column_header_rect_sits_flush_beneath_the_tab_strip() {
+        let rect = egui::Rect::from_min_size(egui::pos2(5.0, 5.0), egui::vec2(800.0, 600.0));
+        let tabs_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), 75.0),
+            egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
+        );
+        let col_header_rect = skill_column_header_rect(rect, tabs_rect);
+        assert_eq!(col_header_rect.left(), rect.left());
+        assert_eq!(col_header_rect.right(), rect.right());
+        assert_eq!(col_header_rect.top(), tabs_rect.bottom());
+        assert_eq!(col_header_rect.height(), SKILL_COLUMN_HEADER_HEIGHT);
+    }
+
+    /// Pins the scrollable row-list band's rect (issue #200): everything
+    /// below the column header down to the window's bottom edge — this is
+    /// the rect `SKILL_PANEL_FILL` paints, distinct from the chrome fill
+    /// above it.
+    #[test]
+    fn rows_rect_fills_everything_below_the_column_header() {
+        let rect = egui::Rect::from_min_size(egui::pos2(5.0, 5.0), egui::vec2(800.0, 600.0));
+        let col_header_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), 132.0),
+            egui::vec2(rect.width(), SKILL_COLUMN_HEADER_HEIGHT),
+        );
+        let rows_rect = skill_rows_rect(rect, col_header_rect);
+        assert_eq!(rows_rect.left(), rect.left());
+        assert_eq!(rows_rect.right(), rect.right());
+        assert_eq!(rows_rect.top(), col_header_rect.bottom());
+        assert_eq!(rows_rect.bottom(), rect.bottom());
     }
 
     /// The panel is deliberately *not* the source's slate `#232830` — that
