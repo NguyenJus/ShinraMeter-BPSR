@@ -11991,15 +11991,25 @@ mod tests {
     #[test]
     fn the_list_limit_follows_the_configured_retention_cap() {
         let mut app = history_test_app();
-        app.settings.history_max_encounters = Settings::HISTORY_MAX_ENCOUNTERS_CAP;
+
+        // Below the ceiling: the configured value is returned as-is.
+        app.settings.history_max_encounters = 50;
+        assert_eq!(app.history_list_limit(), 50);
+
+        // Above the ceiling: clamped down to the ceiling.
+        app.settings.history_max_encounters = Settings::HISTORY_MAX_ENCOUNTERS_CAP + 1;
         assert_eq!(
             app.history_list_limit(),
             Settings::HISTORY_MAX_ENCOUNTERS_CAP
         );
-        // `0` is "prune nothing by count", which no `LIMIT` expresses.
+
+        // `0` is "prune nothing by count", which no `LIMIT` expresses —
+        // falls back to the ceiling.
         app.settings.history_max_encounters = 0;
-        assert_eq!(app.history_list_limit(), HISTORY_LIST_CEILING);
-        assert!(HISTORY_LIST_CEILING >= Settings::HISTORY_MAX_ENCOUNTERS_CAP);
+        assert_eq!(
+            app.history_list_limit(),
+            Settings::HISTORY_MAX_ENCOUNTERS_CAP
+        );
     }
 
     #[test]
