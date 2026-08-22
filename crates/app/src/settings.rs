@@ -248,10 +248,10 @@ pub struct Settings {
     pub window_size: Option<[f32; 2]>,
     /// Overlay-wide panel opacity (issue #166): a single multiplier applied
     /// to the alpha channel of the panel's background fill and chrome (its
-    /// border stroke) — see `ui::scaled_alpha`, `ui::PANEL_FILL`,
-    /// `ui::PANEL_BORDER_COLOR`. Deliberately *not* applied to row/text
-    /// alpha, so dragging this down dims the backdrop rather than the stats
-    /// drawn on top of it.
+    /// border stroke) — see `egui::Color32::gamma_multiply`, called at
+    /// `ui::PANEL_FILL`/`ui::PANEL_BORDER_COLOR`'s `CentralPanel` `Frame`
+    /// call site. Deliberately *not* applied to row/text alpha, so dragging
+    /// this down dims the backdrop rather than the stats drawn on top of it.
     ///
     /// Clamped to `OPACITY_MIN..=OPACITY_MAX` (0.2..=1.0) both on every
     /// `set_opacity` call and on load (`sanitized`), so neither a slider
