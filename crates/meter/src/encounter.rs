@@ -63,6 +63,40 @@ const MAX_PRELOADED_PLAYERS: u32 = 64;
 /// a `FightConfig` tunable — a zero there would silently revert issue #157.
 const BOSS_ENGAGEMENT_WINDOW_MS: u64 = 60_000;
 
+/// How long a party wipe's attempt is held for review before the *next*
+/// player damage of any kind is allowed to start a fresh fight (issue #204).
+///
+/// Issue #154 froze a wipe and made only one thing lift the freeze: a player
+/// damaging a target whose cached `monster_id` resolves through
+/// `tables::is_boss_monster` (see `withholds_after_wipe`). That is the right
+/// test for the run-back — an AoE clipping an add on the way back in is not
+/// the next pull — but as the *only* test it has no floor. Nothing
+/// guarantees the re-pull ever presents a recognizable boss: the respawn can
+/// come up under a fresh uid whose `EnemyHp` never arrives, the party can
+/// give up and pull something else, or the boss's id can simply be missing
+/// from the generated table. In every one of those the hold never lifts, and
+/// because `apply_damage` returns early for the whole duration of a hold,
+/// every hit, death and point of damage after it is silently dropped — the
+/// meter shows the wiped attempt's frozen elapsed timer until the player
+/// zones, reconnects or resets by hand. That is issue #204 as reported.
+///
+/// So the recognized-boss test keeps deciding, but only for as long as the
+/// attempt is plausibly still *being reviewed*. Past this bound, the hold has
+/// outlived its purpose and the ordinary issue #78 rule takes back over:
+/// the next real player hit starts the next fight, whatever it lands on.
+/// Anchored on `fight_end_ms` — the wipe itself — rather than on the last
+/// event, so nothing that happens during the hold can push the release out
+/// (issue #155's boss swinging at the corpses least of all).
+///
+/// 60s, sized like [`BOSS_ENGAGEMENT_WINDOW_MS`] and
+/// `FightConfig::phase_resume_window_ms`: longer than any corpse run plus the
+/// trash on the way back — which is what issue #154's guarantee costs — and
+/// far shorter than a user's patience with a meter that has stopped
+/// responding. Not a `FightConfig` tunable for the same reason
+/// `BOSS_ENGAGEMENT_WINDOW_MS` is not: a zero would silently reinstate the
+/// wedge this exists to bound.
+const WIPE_HOLD_RELEASE_MS: u64 = 60_000;
+
 /// Whether an enemy last damaged at `last_damaged_ms` was still being
 /// fought when the enemy now holding the target was hit at `engaged_at`,
 /// per [`BOSS_ENGAGEMENT_WINDOW_MS`].
@@ -236,7 +270,10 @@ pub struct Meter {
     /// truly re-engaged — the boss's bar refilling, its swings at the
     /// corpses, an AoE tick clipping an add on the run-back. Only a player
     /// damaging a recognized boss again lifts it, through the ordinary
-    /// `NewFight` path (see `withholds_after_wipe`).
+    /// `NewFight` path (see `withholds_after_wipe`) — or, once the attempt
+    /// has been held for [`WIPE_HOLD_RELEASE_MS`], any player damage at all,
+    /// so a re-pull the meter cannot recognize can never wedge the hold open
+    /// forever (issue #204).
     ///
     /// Cleared by `reset` — so by that same `NewFight` — and by a server
     /// change, which invalidates the entity state the re-engagement test
@@ -1142,11 +1179,34 @@ impl Meter {
     /// hold exists to prevent. A target whose `monster_id` has not arrived
     /// yet is undecidable, so it withholds too — packet order is not
     /// guaranteed and the next hit decides once the `EnemyHp` lands.
+    ///
+    /// ...for [`WIPE_HOLD_RELEASE_MS`] after the wipe, and no longer (issue
+    /// #204). "The next hit decides" assumes a next hit that *can* decide,
+    /// and nothing on the wire guarantees one — leaving the hold, and with
+    /// it every event `apply_damage` drops while a fight is held, wedged
+    /// until the player zones or resets by hand. Past that bound the attempt
+    /// is no longer being reviewed, so the recognized-boss test stops
+    /// deciding and the ordinary issue #78 rule takes it: any real player
+    /// damage is the next fight.
     fn withholds_after_wipe(&self, d: &DamageEvent) -> bool {
         self.wipe_hold
+            && !self.wipe_hold_released(d.timestamp_ms)
             && !self
                 .target_monster_id(d)
                 .is_some_and(tables::is_boss_monster)
+    }
+
+    /// Whether the wipe hold has been held past [`WIPE_HOLD_RELEASE_MS`] as
+    /// of `now_ms` and so no longer withholds anything (issue #204).
+    ///
+    /// `fight_end_ms` is the wipe: `withholds_after_wipe` is only ever
+    /// consulted from the `NewFight` gate, which already requires a held
+    /// fight, and `wipe_hold` is only ever set alongside that latch. A
+    /// missing latch therefore cannot happen, and reading it as "not yet
+    /// released" if it somehow did is the conservative answer.
+    fn wipe_hold_released(&self, now_ms: u64) -> bool {
+        self.fight_end_ms
+            .is_some_and(|end_ms| now_ms.saturating_sub(end_ms) >= WIPE_HOLD_RELEASE_MS)
     }
 
     /// Whether `d` is the next phase of the fight currently being held, and
@@ -4776,7 +4836,70 @@ mod tests {
             assert_eq!(r, Some(ResetReason::NewFight));
             let snap = m.snapshot(31_000);
             assert_eq!(snap.total_damage, 400, "the next pull starts clean");
+            assert_eq!(
+                snap.duration_ms, 1_000,
+                "issue #204: the elapsed timer restarts at the re-pull, it does \
+                 not carry the wiped attempt's 5s forward"
+            );
             assert_eq!(m.fight_state(31_000), FightState::Active);
+        }
+
+        // -- issue #204: the hold must be releasable, not wedgeable --
+
+        #[test]
+        fn a_re_pull_that_never_resolves_as_a_boss_still_releases_the_hold() {
+            let mut m = wiped();
+            // The party runs back and opens up again, but nothing they hit
+            // ever resolves as a recognized boss: the respawn came up under
+            // a fresh uid whose `EnemyHp` never landed, so its `monster_id`
+            // is unknown and `withholds_after_wipe` has nothing to say yes
+            // to. Before issue #204 that wedged the hold permanently — every
+            // hit after it dropped on the floor and the elapsed timer showed
+            // the wiped attempt forever.
+            let repull_ms = 6_000 + WIPE_HOLD_RELEASE_MS;
+            let r = m.apply(&hit(1, 4_242, 700, repull_ms));
+            assert_eq!(r, Some(ResetReason::NewFight));
+            let snap = m.snapshot(repull_ms + 2_000);
+            assert_eq!(snap.total_damage, 700, "the re-pull records normally");
+            assert_eq!(
+                snap.duration_ms, 2_000,
+                "the elapsed timer restarts at the re-pull"
+            );
+            assert_eq!(m.fight_state(repull_ms + 2_000), FightState::Active);
+        }
+
+        #[test]
+        fn trash_damage_inside_the_release_window_still_holds_the_wipe_stats() {
+            // Issue #154's guarantee, unchanged: for as long as the attempt
+            // is genuinely being held for review, an AoE clipping an add on
+            // the run-back is not the next pull.
+            let mut m = wiped();
+            m.apply(&enemy_hp(ADD_UID, 50_000, TRASH, 10_000));
+            let last_held_ms = 6_000 + WIPE_HOLD_RELEASE_MS - 1;
+            for ts in (20_000..last_held_ms).step_by(5_000) {
+                assert_eq!(m.apply(&hit(1, ADD_UID, 900, ts)), None);
+            }
+            assert_eq!(m.apply(&hit(1, ADD_UID, 900, last_held_ms)), None);
+            let snap = m.snapshot(last_held_ms);
+            assert_eq!(snap.total_damage, 10_000, "still the wiped attempt");
+            assert_eq!(snap.duration_ms, 5_000, "still the wiped attempt's clock");
+            assert_eq!(m.fight_state(last_held_ms), FightState::Ended);
+        }
+
+        #[test]
+        fn the_release_window_alone_never_clears_the_wipe_stats() {
+            // Time passing is not a re-pull: the release is armed by the
+            // clock but only ever fired by *player* damage, so a boss
+            // swinging at the corpses long past the window leaves the
+            // attempt exactly where it froze.
+            let mut m = wiped();
+            for ts in (7_000..=6_000 + WIPE_HOLD_RELEASE_MS + 30_000).step_by(1_000) {
+                m.apply(&monster_swing(1, ts));
+            }
+            let now = 6_000 + WIPE_HOLD_RELEASE_MS + 31_000;
+            assert_eq!(m.fight_state(now), FightState::Ended);
+            assert_eq!(m.snapshot(now).duration_ms, 5_000);
+            assert_eq!(m.snapshot(now).total_damage, 10_000);
         }
 
         // -- PR #163 review, finding 1: the hold needs a boss to lift it --

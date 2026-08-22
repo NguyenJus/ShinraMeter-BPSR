@@ -3722,6 +3722,25 @@ fn draw_header_menu(
 
     ui.separator();
 
+    // Issue #203: a UI-settings reset (window size + opacity), distinct
+    // from the tray's own OS-level `TrayCommand::ResetWindow` (which
+    // recenters/resizes back to the full 20-row raid default and never
+    // touches opacity). This resizes to a 5-row sample instead, using the
+    // same column set `default_inner_width` already sizes for, and puts
+    // opacity back to `Settings::default_opacity()` through the same
+    // `set_opacity` + `tx_settings` path the slider above uses.
+    if ui.button("Reset to defaults").clicked() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            default_inner_width(),
+            reset_to_defaults_inner_height(),
+        )));
+        settings.set_opacity(Settings::default_opacity());
+        let _ = tx_settings.send(settings.clone());
+        ui.close();
+    }
+
+    ui.separator();
+
     // Issue #171: manual-only, per the issue — there is no automatic or
     // background check anywhere in this crate, only this button. The
     // request itself never touches this thread: clicking spawns a
@@ -5485,7 +5504,36 @@ const MIN_COLUMN_SCALE: f32 = 0.6;
 /// this window's "no scrolling needed" promise and the wash's reach can
 /// never drift back out of sync with each other.
 fn default_inner_height() -> f32 {
-    let rows = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
+    inner_height_for_rows(DEFAULT_VISIBLE_ROWS)
+}
+
+/// Number of player rows the header dropdown's "Reset to defaults" item
+/// (issue #203) resizes the window to fit — a small sample of the roster,
+/// deliberately much shorter than `DEFAULT_VISIBLE_ROWS`' full 20-player
+/// raid the tray's own `TrayCommand::ResetWindow` targets. That tray reset
+/// is a different, OS-level "back to launch size" action and is untouched
+/// by this one.
+const RESET_TO_DEFAULTS_VISIBLE_ROWS: usize = 5;
+
+/// Window height the header dropdown's "Reset to defaults" item resizes to
+/// (issue #203): the same header-band/separator/gap math as
+/// `default_inner_height`, just sized for `RESET_TO_DEFAULTS_VISIBLE_ROWS`
+/// rows instead of the launch default's full `DEFAULT_VISIBLE_ROWS` raid.
+/// Width is unaffected — `default_inner_width` already sizes for exactly
+/// the `Settings::default()` column set this reset also restores, with no
+/// dependence on row count — so only height needs its own helper here.
+fn reset_to_defaults_inner_height() -> f32 {
+    inner_height_for_rows(RESET_TO_DEFAULTS_VISIBLE_ROWS)
+}
+
+/// Shared formula behind both `default_inner_height` and
+/// `reset_to_defaults_inner_height` (issue #203 review finding): the header
+/// band + separator + gap above the roster, plus `rows` player rows below
+/// it. Pulling this out means the two callers can never drift from each
+/// other by editing the top-level math in one and not the other — only the
+/// row count differs between them, and that lives in their own constants.
+fn inner_height_for_rows(rows: usize) -> f32 {
+    let rows = rows as f32 * ROW_HEIGHT;
     first_player_row_top_offset(header_band_height(BUTTON_ROW_HEIGHT)) + rows
 }
 
@@ -11598,6 +11646,48 @@ mod tests {
         assert!(default_inner_height() >= 90.0);
     }
 
+    // -- header menu "Reset to defaults" sizing (issue #203) ---------------
+
+    #[test]
+    fn reset_to_defaults_inner_height_fits_five_rows_without_scrolling() {
+        // Same shape as `default_inner_height_fits_twenty_rows_without_
+        // scrolling`, but for the smaller 5-row sample the header menu's
+        // "Reset to defaults" item resizes to rather than a full raid.
+        let rows_only = RESET_TO_DEFAULTS_VISIBLE_ROWS as f32 * ROW_HEIGHT;
+        let chrome = header_band_height(BUTTON_ROW_HEIGHT) + SEPARATOR_HEIGHT + ITEM_SPACING_Y;
+        assert!(
+            reset_to_defaults_inner_height() - chrome >= rows_only,
+            "reset height {} leaves only {}pt under the {chrome}pt of header \
+             chrome — short of the {rows_only}pt the {RESET_TO_DEFAULTS_VISIBLE_ROWS} rows need",
+            reset_to_defaults_inner_height(),
+            reset_to_defaults_inner_height() - chrome
+        );
+    }
+
+    #[test]
+    fn reset_to_defaults_inner_height_matches_header_plus_separator_plus_five_rows_plus_gap() {
+        let rows = RESET_TO_DEFAULTS_VISIBLE_ROWS as f32 * ROW_HEIGHT;
+        let expected =
+            header_band_height(BUTTON_ROW_HEIGHT) + SEPARATOR_HEIGHT + rows + ITEM_SPACING_Y;
+        assert_eq!(reset_to_defaults_inner_height(), expected);
+    }
+
+    #[test]
+    fn reset_to_defaults_inner_height_is_shorter_than_the_twenty_row_default_by_exactly_the_row_delta()
+     {
+        // Both heights derive from the same `inner_height_for_rows` formula
+        // now, so the *only* thing that can differ between them is the row
+        // count. Asserting the exact gap (not just `<`) is what actually
+        // catches drift: if a future edit changes the top-level formula for
+        // one caller but not the other, this fails even though both heights
+        // still individually "fit their rows".
+        let row_delta = (DEFAULT_VISIBLE_ROWS - RESET_TO_DEFAULTS_VISIBLE_ROWS) as f32;
+        assert_eq!(
+            default_inner_height() - reset_to_defaults_inner_height(),
+            row_delta * ROW_HEIGHT
+        );
+    }
+
     // -- draw_rows scrolling (issue #84) and the row-pitch/centering
     // regression harness (issue #83) ---------------------------------------
 
@@ -12898,6 +12988,91 @@ mod tests {
         assert!(
             rx_settings.try_recv().is_err(),
             "releasing the slider without moving it must not send again"
+        );
+    }
+
+    /// Issue #203: the header dropdown's "Reset to defaults" item must
+    /// resize the window to fit `RESET_TO_DEFAULTS_VISIBLE_ROWS` rows (not
+    /// the tray's own 20-row `TrayCommand::ResetWindow`) and reset opacity
+    /// to `Settings::default_opacity()`, sending the updated settings on
+    /// `tx_settings` the same way the opacity slider above already does.
+    #[test]
+    fn draw_header_menu_reset_to_defaults_resizes_and_resets_opacity() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        // Start away from both defaults so the click can prove it actually
+        // changed something rather than coincidentally matching already.
+        settings.set_opacity(0.4);
+        assert_ne!(settings.opacity, Settings::default_opacity());
+
+        // Frame 1: lay the menu out with no input, and read back where
+        // AccessKit says "Reset to defaults" actually painted — its rect
+        // isn't knowable ahead of a real `draw_header_menu` run.
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut UpdateCheckState::default(),
+            );
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let reset_pos = accessible_rect_for_label(&update, "Reset to defaults").center();
+        layout.drop_without_applying_deltas();
+
+        // Frame 2: click "Reset to defaults".
+        let output = ctx.run_ui(click_at(reset_pos), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut UpdateCheckState::default(),
+            );
+        });
+        let viewport_commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            settings.opacity,
+            Settings::default_opacity(),
+            "Reset to defaults must restore full opacity"
+        );
+        let sent = rx_settings
+            .try_recv()
+            .expect("Reset to defaults must send the updated settings on tx_settings");
+        assert_eq!(sent.opacity, Settings::default_opacity());
+        assert!(
+            rx_settings.try_recv().is_err(),
+            "one click must not send more than once"
+        );
+        let expected_size = egui::vec2(default_inner_width(), reset_to_defaults_inner_height());
+        assert!(
+            viewport_commands.contains(&egui::ViewportCommand::InnerSize(expected_size)),
+            "Reset to defaults must resize to fit {RESET_TO_DEFAULTS_VISIBLE_ROWS} rows: \
+             {viewport_commands:?}"
         );
     }
 
