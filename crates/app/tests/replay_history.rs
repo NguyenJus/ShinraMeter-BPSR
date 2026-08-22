@@ -57,7 +57,7 @@ fn load_one(history: &HistoryHandle, id: i64) -> EncounterRecord {
     let (reply_tx, reply_rx) = crossbeam_channel::unbounded();
     history.load(id, &reply_tx);
     match reply_rx.recv().unwrap() {
-        HistoryEvent::Loaded(record) => *record,
+        HistoryEvent::Loaded { record, .. } => *record,
         other => panic!("expected Loaded, got {other:?}"),
     }
 }

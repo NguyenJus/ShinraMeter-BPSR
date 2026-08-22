@@ -261,6 +261,20 @@ pub fn format_duration(duration_ms: u64) -> String {
     }
 }
 
+/// A fresh temp-file database path per test, so parallel test threads never
+/// collide on the same on-disk database. Shared by every history test in
+/// this crate — `writer.rs`'s and `pipeline.rs`'s alike.
+#[cfg(test)]
+pub(crate) fn temp_history_path(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "ShinraMeter-BPSR-test-history-{tag}-{}-{n}.sqlite",
+        std::process::id()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

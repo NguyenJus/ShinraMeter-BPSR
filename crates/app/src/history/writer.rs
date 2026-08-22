@@ -44,7 +44,13 @@ pub enum HistoryRequest {
 #[derive(Debug, Clone)]
 pub enum HistoryEvent {
     Listed(Vec<EncounterSummary>),
-    Loaded(Box<EncounterRecord>),
+    /// One encounter's full detail, tagged with the id it was requested
+    /// with: the record itself carries no row id, and a caller with more
+    /// than one `Load` in flight has to be able to tell the replies apart.
+    Loaded {
+        id: i64,
+        record: Box<EncounterRecord>,
+    },
     /// The requested encounter is gone (deleted, or pruned since the list was
     /// taken) — the UI drops back to the list rather than showing nothing.
     Missing(i64),
@@ -157,7 +163,10 @@ fn run(mut store: SqliteHistory, rx: Receiver<HistoryRequest>) {
             },
             HistoryRequest::Load { id, reply } => match store.load(id) {
                 Ok(Some(record)) => {
-                    let _ = reply.send(HistoryEvent::Loaded(Box::new(record)));
+                    let _ = reply.send(HistoryEvent::Loaded {
+                        id,
+                        record: Box::new(record),
+                    });
                 }
                 Ok(None) => {
                     let _ = reply.send(HistoryEvent::Missing(id));
@@ -191,25 +200,11 @@ fn run(mut store: SqliteHistory, rx: Receiver<HistoryRequest>) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
-
     use crossbeam_channel::unbounded;
 
     use super::*;
-    use crate::history::record_from_snapshot;
+    use crate::history::{record_from_snapshot, temp_history_path};
     use bpsr_meter::{EncounterInfo, PlayerRow, Snapshot};
-
-    /// A fresh temp-file path per test, so parallel test threads never
-    /// collide on the same on-disk database (mirrors `sqlite.rs`'s own test
-    /// helper).
-    fn temp_history_path(tag: &str) -> PathBuf {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "ShinraMeter-BPSR-test-history-{tag}-{}-{n}.sqlite",
-            std::process::id()
-        ))
-    }
 
     fn sample_record(title: &str) -> EncounterRecord {
         let snapshot = Snapshot {
@@ -284,7 +279,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         match event {
-            HistoryEvent::Loaded(record) => assert_eq!(record.players[0].name, "Alice"),
+            HistoryEvent::Loaded {
+                id: replied_id,
+                record,
+            } => {
+                assert_eq!(replied_id, id);
+                assert_eq!(record.players[0].name, "Alice");
+            }
             other => panic!("expected Loaded, got {other:?}"),
         }
     }

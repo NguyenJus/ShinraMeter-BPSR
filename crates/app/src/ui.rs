@@ -5062,10 +5062,10 @@ struct HistoryUi {
     /// on every other history-bar/list interaction, so leaving and
     /// returning to the list never leaves it primed.
     confirm_clear: bool,
-    /// The id of the in-flight `Load` request, if any. `HistoryEvent::
-    /// Loaded`'s `EncounterRecord` doesn't carry its own row id — only
-    /// `EncounterSummary` does — so this is what lets that reply be paired
-    /// back up with the id that was actually requested.
+    /// The id of the newest in-flight `Load` request, if any. Rows stay
+    /// clickable while one is in flight, so a `Loaded`/`Missing` reply
+    /// carrying any other id belongs to a click the user has already
+    /// superseded, and is dropped.
     pending_load_id: Option<i64>,
 }
 
@@ -5093,10 +5093,11 @@ struct HistoryHeader<'a> {
     subtitle: Option<&'a str>,
 }
 
-/// How many encounters the list requests. Comfortably above the default
-/// retention cap (`Settings::history_max_encounters` = 500) so the list is
-/// never silently truncated below what retention already keeps.
-const HISTORY_LIST_LIMIT: u32 = 1_000;
+/// The ceiling on how many encounters the list requests, used when
+/// `Settings::history_max_encounters` is `0` — "prune nothing by count",
+/// which has no matching `LIMIT`. Equal to the settings cap, so the list can
+/// never hide a row retention has kept.
+const HISTORY_LIST_CEILING: u32 = Settings::HISTORY_MAX_ENCOUNTERS_CAP;
 
 /// Width of the trailing delete button painted into each history row.
 const HISTORY_DELETE_WIDTH: f32 = 18.0;
@@ -5131,6 +5132,7 @@ impl OverlayApp {
     /// issues a fresh `list` request on the way in, so a reply that arrives
     /// after the view has already closed is safe to simply discard.
     fn poll_history(&mut self) {
+        let list_limit = self.history_list_limit();
         for event in self.rx_history.try_iter() {
             let OverlayView::History(state) = &mut self.view else {
                 continue;
@@ -5141,22 +5143,31 @@ impl OverlayApp {
                     state.error = None;
                     state.pending = false;
                 }
-                history::writer::HistoryEvent::Loaded(record) => {
-                    if let Some(id) = state.pending_load_id.take() {
-                        state.open = Some(OpenEncounter {
-                            id,
-                            title: record.title.clone(),
-                            subtitle: record.subtitle.clone(),
-                            ended_at_ms: record.ended_at_ms,
-                            snapshot: record.to_snapshot(),
-                        });
-                        state.error = None;
+                history::writer::HistoryEvent::Loaded { id, record } => {
+                    // A reply for anything but the newest click is stale:
+                    // the rows stay clickable while a load is in flight, so
+                    // the user may already have asked for a different fight.
+                    if state.pending_load_id != Some(id) {
+                        continue;
                     }
+                    state.pending_load_id = None;
+                    state.open = Some(OpenEncounter {
+                        id,
+                        title: record.title.clone(),
+                        subtitle: record.subtitle.clone(),
+                        ended_at_ms: record.ended_at_ms,
+                        snapshot: record.to_snapshot(),
+                    });
+                    state.error = None;
                     state.pending = false;
                 }
-                history::writer::HistoryEvent::Missing(_) => {
+                history::writer::HistoryEvent::Missing(id) => {
                     // Deleted, or pruned since the list was taken — drop
                     // back to the list rather than showing a stale fight.
+                    // Same staleness check as `Loaded`.
+                    if state.pending_load_id != Some(id) {
+                        continue;
+                    }
                     state.pending_load_id = None;
                     state.open = None;
                     state.pending = false;
@@ -5166,7 +5177,7 @@ impl OverlayApp {
                     // reflects the new state.
                     state.confirm_clear = false;
                     if let Some(handle) = &self.history {
-                        handle.list(HISTORY_LIST_LIMIT, &self.tx_history);
+                        handle.list(list_limit, &self.tx_history);
                         state.pending = true;
                     }
                 }
@@ -5179,15 +5190,26 @@ impl OverlayApp {
         }
     }
 
+    /// How many encounters the list asks for: exactly what retention keeps,
+    /// so an encounter that is on disk is always one the user can see and
+    /// delete (issue #39).
+    fn history_list_limit(&self) -> u32 {
+        match self.settings.history_max_encounters {
+            0 => HISTORY_LIST_CEILING,
+            limit => limit.min(HISTORY_LIST_CEILING),
+        }
+    }
+
     /// Switches to the history view and asks for the list (issue #39).
     fn open_history(&mut self) {
         let pending = self.history.is_some();
+        let list_limit = self.history_list_limit();
         self.view = OverlayView::History(Box::new(HistoryUi {
             pending,
             ..HistoryUi::default()
         }));
         if let Some(handle) = &self.history {
-            handle.list(HISTORY_LIST_LIMIT, &self.tx_history);
+            handle.list(list_limit, &self.tx_history);
         }
     }
 }
@@ -11945,19 +11967,8 @@ mod tests {
         assert_eq!(state.encounters.len(), 1);
     }
 
-    #[test]
-    fn a_loaded_reply_opens_that_encounter() {
-        let mut app = history_test_app();
-        app.open_history();
-        let OverlayView::History(state) = &mut app.view else {
-            panic!("expected the History view");
-        };
-        // `HistoryEvent::Loaded`'s `EncounterRecord` doesn't carry its own
-        // row id (see `HistoryUi::pending_load_id`'s doc comment) — this is
-        // what a real `HistoryRowAction::Open(7)` click would have set.
-        state.pending_load_id = Some(7);
-
-        let record = history::EncounterRecord {
+    fn history_test_record(title: &str) -> history::EncounterRecord {
+        history::EncounterRecord {
             ended_at_ms: 2_000,
             duration_ms: 5_000,
             total_damage: 1_000,
@@ -11967,13 +11978,45 @@ mod tests {
             is_boss: false,
             scene_id: None,
             scene_name: None,
-            title: "Loaded Fight".to_string(),
+            title: title.to_string(),
             subtitle: None,
             meter_version: "0.0.0".to_string(),
             players: Vec::new(),
+        }
+    }
+
+    /// The list has to ask for everything retention keeps, or encounters
+    /// past the limit are stranded on disk: visible to no one, deletable
+    /// only by "Clear all".
+    #[test]
+    fn the_list_limit_follows_the_configured_retention_cap() {
+        let mut app = history_test_app();
+        app.settings.history_max_encounters = Settings::HISTORY_MAX_ENCOUNTERS_CAP;
+        assert_eq!(
+            app.history_list_limit(),
+            Settings::HISTORY_MAX_ENCOUNTERS_CAP
+        );
+        // `0` is "prune nothing by count", which no `LIMIT` expresses.
+        app.settings.history_max_encounters = 0;
+        assert_eq!(app.history_list_limit(), HISTORY_LIST_CEILING);
+        assert!(HISTORY_LIST_CEILING >= Settings::HISTORY_MAX_ENCOUNTERS_CAP);
+    }
+
+    #[test]
+    fn a_loaded_reply_opens_that_encounter() {
+        let mut app = history_test_app();
+        app.open_history();
+        let OverlayView::History(state) = &mut app.view else {
+            panic!("expected the History view");
         };
+        // What a real `HistoryRowAction::Open(7)` click would have set.
+        state.pending_load_id = Some(7);
+
         app.tx_history
-            .send(history::writer::HistoryEvent::Loaded(Box::new(record)))
+            .send(history::writer::HistoryEvent::Loaded {
+                id: 7,
+                record: Box::new(history_test_record("Loaded Fight")),
+            })
             .unwrap();
         app.poll_history();
 
@@ -11983,6 +12026,70 @@ mod tests {
         assert_eq!(state.open.as_ref().map(|open| open.id), Some(7));
     }
 
+    /// Rows stay clickable while a load is in flight, so clicking row 1 and
+    /// then row 2 leaves two `Load` requests outstanding: row 1's reply must
+    /// not open its record under row 2's id, and must not consume the
+    /// pending id row 2's own reply is still waiting on.
+    #[test]
+    fn a_stale_loaded_reply_is_dropped() {
+        let mut app = history_test_app();
+        app.open_history();
+        let OverlayView::History(state) = &mut app.view else {
+            panic!("expected the History view");
+        };
+        state.pending_load_id = Some(2);
+
+        app.tx_history
+            .send(history::writer::HistoryEvent::Loaded {
+                id: 1,
+                record: Box::new(history_test_record("First Click")),
+            })
+            .unwrap();
+        app.poll_history();
+
+        let OverlayView::History(state) = &app.view else {
+            panic!("expected the History view");
+        };
+        assert!(state.open.is_none());
+
+        app.tx_history
+            .send(history::writer::HistoryEvent::Loaded {
+                id: 2,
+                record: Box::new(history_test_record("Second Click")),
+            })
+            .unwrap();
+        app.poll_history();
+
+        let OverlayView::History(state) = &app.view else {
+            panic!("expected the History view");
+        };
+        let open = state.open.as_ref().expect("the newest load should open");
+        assert_eq!((open.id, open.title.as_str()), (2, "Second Click"));
+    }
+
+    /// The same staleness rule as `a_stale_loaded_reply_is_dropped`, for the
+    /// `Missing` reply: an earlier click's "it's gone" must not close the
+    /// encounter a later click is about to open.
+    #[test]
+    fn a_stale_missing_reply_is_dropped() {
+        let mut app = history_test_app();
+        app.open_history();
+        let OverlayView::History(state) = &mut app.view else {
+            panic!("expected the History view");
+        };
+        state.pending_load_id = Some(2);
+
+        app.tx_history
+            .send(history::writer::HistoryEvent::Missing(1))
+            .unwrap();
+        app.poll_history();
+
+        let OverlayView::History(state) = &app.view else {
+            panic!("expected the History view");
+        };
+        assert_eq!(state.pending_load_id, Some(2));
+    }
+
     #[test]
     fn a_missing_reply_drops_back_to_the_list() {
         let mut app = history_test_app();
@@ -11990,6 +12097,7 @@ mod tests {
         let OverlayView::History(state) = &mut app.view else {
             panic!("expected the History view");
         };
+        state.pending_load_id = Some(9);
         state.open = Some(OpenEncounter {
             id: 9,
             title: "Stale Fight".to_string(),

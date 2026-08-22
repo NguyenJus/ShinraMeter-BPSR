@@ -1306,21 +1306,9 @@ mod tests {
     /// Issue #39: `record_fight_end`'s `Active -> Ended` edge trigger and its
     /// write-exactly-once latch.
     mod history_recording {
-        use std::sync::atomic::{AtomicU32, Ordering};
-
         use super::*;
+        use crate::history::temp_history_path;
         use crate::history::writer::HistoryEvent;
-
-        /// A fresh temp-file history path per test, so parallel test threads
-        /// never collide on the same on-disk database.
-        fn temp_history_path(tag: &str) -> PathBuf {
-            static COUNTER: AtomicU32 = AtomicU32::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            std::env::temp_dir().join(format!(
-                "ShinraMeter-BPSR-test-pipeline-history-{tag}-{}-{n}.sqlite",
-                std::process::id()
-            ))
-        }
 
         /// Drives one damage hit, then ticks past the idle timeout so the
         /// fight latches `FightState::Ended` — the edge `record_fight_end`
@@ -1357,7 +1345,7 @@ mod tests {
 
         #[test]
         fn an_ended_fight_is_recorded_once() {
-            let path = temp_history_path("record-once");
+            let path = temp_history_path("pipeline-record-once");
             let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
             let mut pipeline = Pipeline::new().with_history(handle.clone());
 
@@ -1377,7 +1365,7 @@ mod tests {
 
         #[test]
         fn a_new_fight_clears_the_recorded_latch() {
-            let path = temp_history_path("clear-latch");
+            let path = temp_history_path("pipeline-clear-latch");
             let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
             let mut pipeline = Pipeline::new().with_history(handle.clone());
 
@@ -1397,7 +1385,7 @@ mod tests {
 
         #[test]
         fn an_idle_pipeline_records_nothing() {
-            let path = temp_history_path("idle-none");
+            let path = temp_history_path("pipeline-idle-none");
             let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
             let mut pipeline = Pipeline::new().with_history(handle.clone());
 
