@@ -1100,13 +1100,13 @@ impl eframe::App for OverlayApp {
                 .expect("uid came from skill_windows.keys()");
             let builder = egui::ViewportBuilder::default()
                 .with_title(format!("{} — skills", row.name))
-                .with_always_on_top()
                 .with_decorations(false)
                 .with_transparent(true)
-                .with_resizable(false)
+                .with_resizable(true)
                 .with_taskbar(false)
                 .with_active(false)
                 .with_inner_size(SKILL_WINDOW_SIZE)
+                .with_min_inner_size(SKILL_WINDOW_MIN_SIZE)
                 .with_position(state.pos);
             // None of `platform::disable_aero_snap`/`install_snap_blocker`/
             // `set_click_through`/`clamp_window_to_visible_area` applies to
@@ -5365,16 +5365,25 @@ const SKILL_COLUMN_ORDER: [skills::SkillColumn; 12] = [
     skills::SkillColumn::HitPerMin,
 ];
 
-/// Fixed inner size for a skill breakdown window (D2: `with_resizable
-/// (false)`) — wide enough for every `SkillColumn` at its full width plus
-/// header padding (widths sum to `680`; `720` leaves room for the padding
-/// and the scrollbar), tall enough for the header, tab strip and
-/// column-header row plus roughly ten rows before the list scrolls.
+/// Initial inner size for a skill breakdown window (issue #181: the viewport
+/// is resizable, so this is only the size it opens at) — wide enough for
+/// every `SkillColumn` at its full width plus header padding, tall enough
+/// for the header, tab strip and column-header row plus roughly ten rows
+/// before the list scrolls. `draw_skill_window` lays everything out from the
+/// live viewport rect (`ui.max_rect()`), not this constant, so the content
+/// adapts on every resize; `column_anchors_from_widths` scales column widths
+/// down when the window is narrower than their sum.
 // Issue #192 widened this from 720: the leading icon column adds 32pt of
 // column budget, and at 720 the sum of `SkillColumn::width`s would exceed
 // the content width, making `column_anchors_from_widths` shrink every
 // column to fit rather than laying them out at their stated widths.
 const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 520.0);
+/// Floor on the skill breakdown viewport's inner size (issue #181) so a
+/// resize can't shrink it into uselessness — tall enough for the header, tab
+/// strip and column-header row plus a couple of rows before the list
+/// scrolls, wide enough to keep the columns legible once
+/// `column_anchors_from_widths` scales them down.
+const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(360.0, 220.0);
 
 /// One open breakdown window's own state (issue #16, D9): its sort column/
 /// direction, and the screen position it was placed at when opened. `pos`
