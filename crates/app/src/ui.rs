@@ -1177,6 +1177,64 @@ const TOGGLE_PAD_X: f32 = 4.0;
 /// (issue #167 rehash) isn't razor-thin right at the glyph's edges.
 const CLICK_THROUGH_HIT_PAD: f32 = 2.0;
 
+/// Horizontal offset, in points, from the toggle cluster's left edge to the
+/// left edge of the click-through button's glyph box — the same running
+/// cursor `toggle_cluster` walks across the Share and Reset slots, spelled
+/// once so the hit box can be computed before the cluster is laid out (see
+/// `click_through_button_slot`).
+const CLICK_THROUGH_SLOT_OFFSET_X: f32 =
+    TOGGLE_PAD_X + TOGGLE_MOUSE_SIDE + TOGGLE_GAP + TOGGLE_CLOUD_SIDE + TOGGLE_GAP;
+
+/// The click-through button's glyph box, in points, derived from the whole
+/// toggle cluster's allocated rect. Pure so `toggle_cluster` can publish the
+/// button's `WM_NCHITTEST` hit box (issue #167 rehash) before it starts
+/// painting — and so the geometry is unit-testable on every platform, unlike
+/// the `cfg(windows)` publish itself.
+fn click_through_button_slot(cluster: egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        egui::pos2(
+            cluster.left() + CLICK_THROUGH_SLOT_OFFSET_X + TOGGLE_CLICK_THROUGH_SIDE / 2.0,
+            cluster.center().y,
+        ),
+        egui::Vec2::splat(TOGGLE_CLICK_THROUGH_SIDE),
+    )
+}
+
+/// Converts the click-through button's egui rect (points, already
+/// client-area-relative — matching what `ScreenToClient` produces) into the
+/// physical-pixel `left, top, right, bottom` bounds `platform::
+/// set_click_through_button_rect` publishes for `WM_NCHITTEST`. Padded by
+/// `CLICK_THROUGH_HIT_PAD` points first so the carve-out isn't razor-thin at
+/// the glyph's edges.
+///
+/// A non-finite or non-positive `pixels_per_point` is treated as `1.0`, the
+/// same guard (and for the same reason) as `platform::cursor_points`:
+/// multiplying by `0.0`/NaN would round every bound to `0`, and a
+/// zero-area rect can never `contains` anything — so `click_through_hit_test`
+/// would resolve `Transparent` for *every* point, including the button that
+/// turns click-through back off. Identity scaling leaves the button a few
+/// pixels off; a degenerate rect strands the user.
+///
+/// Pure so the points-to-pixels transform is unit-testable off-Windows; the
+/// `cfg`-gated publish call is the only Windows-only part.
+fn click_through_hit_box_px(
+    button_rect: egui::Rect,
+    pixels_per_point: f32,
+) -> (i32, i32, i32, i32) {
+    let scale = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    let padded = button_rect.expand(CLICK_THROUGH_HIT_PAD);
+    (
+        (padded.left() * scale).round() as i32,
+        (padded.top() * scale).round() as i32,
+        (padded.right() * scale).round() as i32,
+        (padded.bottom() * scale).round() as i32,
+    )
+}
+
 /// One toggle-cluster button's hit box, hover highlight and accessible
 /// label. The painted glyph itself is the caller's job — Share and Reset
 /// draw from two different icon sets (`GlyphIcon` and `ToolbarIcon`) — so
@@ -1288,6 +1346,21 @@ fn toggle_cluster(
         + TOGGLE_ALWAYS_ON_TOP_SIDE;
     let (rect, _response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
 
+    // Invariant: the published hit box always describes *this* frame's
+    // layout, even on a frame egui culls the cluster — publishing before the
+    // visibility early return below is what guarantees it, because a culled
+    // frame that returned early would leave `WM_NCHITTEST` consulting a rect
+    // from a previous layout and a click at the button's real position would
+    // resolve `Transparent`, stranding the user under click-through. Clearing
+    // the rect on the culled path was the alternative; publishing wins
+    // because it keeps the button reachable rather than merely un-stale.
+    // See `click_through_hit_box_px` for the points-to-pixels conversion and
+    // `platform::CLICK_THROUGH_BUTTON_LEFT` for why it's unconditional.
+    let click_through_rect = click_through_button_slot(rect);
+    let (hit_left, hit_top, hit_right, hit_bottom) =
+        click_through_hit_box_px(click_through_rect, ui.ctx().pixels_per_point());
+    crate::platform::set_click_through_button_rect(hit_left, hit_top, hit_right, hit_bottom);
+
     if !ui.is_rect_visible(rect) {
         return false;
     }
@@ -1333,7 +1406,6 @@ fn toggle_cluster(
         ui.painter()
             .image(reset.id(), reset_rect, UV_FULL, TOGGLE_ACTIVE_COLOR);
     }
-    x += TOGGLE_CLOUD_SIDE + TOGGLE_GAP;
 
     // Click-through (issue #167; mechanism replaced — issue #167 rehash):
     // OS-level mouse passthrough for the whole overlay *except this very
@@ -1349,30 +1421,11 @@ fn toggle_cluster(
     // `OverlayApp`'s first frame. The tray menu's "Turn off click-through"
     // entry is a belt-and-braces fallback, not the primary way back — this
     // button is.
-    let click_through_rect = egui::Rect::from_center_size(
-        egui::pos2(x + TOGGLE_CLICK_THROUGH_SIDE / 2.0, y),
-        egui::Vec2::splat(TOGGLE_CLICK_THROUGH_SIDE),
-    );
-
-    // Published every frame, click or not, and regardless of whether
-    // click-through is currently on: `platform::window_proc`'s
-    // `WM_NCHITTEST` branch only *consults* this while click-through is
-    // on, but the button's position can change between frames (a resize,
-    // a DPI change) even while it's off, and publishing unconditionally
-    // means that branch never reads a rect stale enough to belong to a
-    // previous layout. Padded by `CLICK_THROUGH_HIT_PAD` points so the
-    // carve-out isn't razor-thin at its edges, then converted from egui
-    // points (already client-area-relative, matching what `ScreenToClient`
-    // produces) to the physical pixels `WM_NCHITTEST` actually hit-tests
-    // in.
-    let padded_click_through_rect = click_through_rect.expand(CLICK_THROUGH_HIT_PAD);
-    let scale = ui.ctx().pixels_per_point();
-    crate::platform::set_click_through_button_rect(
-        (padded_click_through_rect.left() * scale).round() as i32,
-        (padded_click_through_rect.top() * scale).round() as i32,
-        (padded_click_through_rect.right() * scale).round() as i32,
-        (padded_click_through_rect.bottom() * scale).round() as i32,
-    );
+    // `click_through_rect` is `click_through_button_slot(rect)`, already
+    // computed and published up top (the hit box has to exist before the
+    // visibility check, so the slot can't wait for the running `x` cursor to
+    // reach it). The cursor picks back up off that slot's right edge below,
+    // so the two can never drift apart.
 
     let click_through_label = if settings.click_through {
         "Click-through: on"
@@ -1392,7 +1445,7 @@ fn toggle_cluster(
             toggle_state_tint(settings.click_through),
         );
     }
-    x += TOGGLE_CLICK_THROUGH_SIDE + TOGGLE_GAP;
+    x = click_through_rect.right() + TOGGLE_GAP;
 
     // Always-on-top (issue #167): whether the overlay stays pinned above
     // other windows, via `ViewportCommand::WindowLevel` — the runtime
@@ -10708,5 +10761,74 @@ mod tests {
         // the tip when pointing down.
         assert!(points[1].y > points[0].y);
         assert!(points[1].y > points[2].y);
+    }
+
+    // -- click-through hit box (issue #167 rehash) --------------------------
+
+    /// The cluster rect the header allocates for `toggle_cluster`, at a
+    /// round origin so the expected bounds below are readable.
+    fn toggle_cluster_rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(100.0, 10.0), egui::vec2(80.0, 20.0))
+    }
+
+    #[test]
+    fn the_click_through_slot_sits_after_share_and_reset() {
+        let cluster = toggle_cluster_rect();
+        let slot = click_through_button_slot(cluster);
+        // Same running cursor `toggle_cluster` walks: pad, Share, gap,
+        // Reset, gap — then the glyph box itself.
+        assert_eq!(slot.left(), cluster.left() + CLICK_THROUGH_SLOT_OFFSET_X);
+        assert_eq!(slot.width(), TOGGLE_CLICK_THROUGH_SIDE);
+        assert_eq!(slot.height(), TOGGLE_CLICK_THROUGH_SIDE);
+        assert_eq!(slot.center().y, cluster.center().y);
+    }
+
+    #[test]
+    fn the_hit_box_pads_the_glyph_at_scale_one() {
+        let button = egui::Rect::from_min_max(egui::pos2(20.0, 30.0), egui::pos2(34.0, 44.0));
+        assert_eq!(
+            click_through_hit_box_px(button, 1.0),
+            (
+                (20.0 - CLICK_THROUGH_HIT_PAD) as i32,
+                (30.0 - CLICK_THROUGH_HIT_PAD) as i32,
+                (34.0 + CLICK_THROUGH_HIT_PAD) as i32,
+                (44.0 + CLICK_THROUGH_HIT_PAD) as i32,
+            )
+        );
+    }
+
+    #[test]
+    fn the_hit_box_scales_to_physical_pixels() {
+        let button = egui::Rect::from_min_max(egui::pos2(20.0, 30.0), egui::pos2(34.0, 44.0));
+        // 2x DPI: every padded bound doubles.
+        assert_eq!(click_through_hit_box_px(button, 2.0), (36, 56, 72, 92));
+        // A fractional scale rounds rather than truncating.
+        assert_eq!(click_through_hit_box_px(button, 1.5), (27, 42, 54, 69));
+    }
+
+    /// A bad `pixels_per_point` must never collapse the hit box: every bound
+    /// would round to `0`, and `platform::Rect::contains` can't be true for a
+    /// zero-area rect, so `WM_NCHITTEST` would answer `Transparent` for every
+    /// point — including the button that turns click-through back off.
+    #[test]
+    fn a_degenerate_scale_falls_back_to_identity() {
+        let button = egui::Rect::from_min_max(egui::pos2(20.0, 30.0), egui::pos2(34.0, 44.0));
+        let identity = click_through_hit_box_px(button, 1.0);
+        for bad in [0.0, -1.0, -0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let (left, top, right, bottom) = click_through_hit_box_px(button, bad);
+            assert_eq!(
+                (left, top, right, bottom),
+                identity,
+                "pixels_per_point {bad} should fall back to 1.0"
+            );
+            assert!(
+                right > left,
+                "hit box must have area (pixels_per_point {bad})"
+            );
+            assert!(
+                bottom > top,
+                "hit box must have area (pixels_per_point {bad})"
+            );
+        }
     }
 }
