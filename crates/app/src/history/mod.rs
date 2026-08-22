@@ -16,6 +16,7 @@
 //! callers.
 
 pub mod sqlite;
+pub mod writer;
 
 use std::path::PathBuf;
 

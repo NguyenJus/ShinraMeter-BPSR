@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bpsr_app::{fonts, inspect, logging, paths, pipeline, platform, settings, ui};
+use bpsr_app::{fonts, history, inspect, logging, paths, pipeline, platform, settings, ui};
 use bpsr_protocol::ProtocolEvent;
 use crossbeam_channel::bounded;
 use ui::{OverlayApp, StatusLine, UiCommand};
@@ -49,6 +49,24 @@ fn scene_bosses_path() -> PathBuf {
         &["ShinraMeter-BPSR", "scene-bosses.json"],
         "ShinraMeter-BPSR-scene-bosses.json",
         "APPDATA is not set; falling back to a working-directory file for the scene-bosses cache",
+    );
+    if let Some(warning) = warning {
+        log::warn!("{warning}");
+    }
+    path
+}
+
+/// Where the encounter-history database (issue #39) lives:
+/// `%APPDATA%\ShinraMeter-BPSR\history.sqlite`. `SHINRA_HISTORY_DB` overrides
+/// it outright — the only one of these three files with an override, because
+/// it is the only one a developer routinely wants pointed at a scratch copy.
+fn history_db_path() -> PathBuf {
+    let (path, warning) = paths::resolve(
+        std::env::var("SHINRA_HISTORY_DB").ok().as_deref(),
+        std::env::var("APPDATA").ok().as_deref(),
+        &["ShinraMeter-BPSR", "history.sqlite"],
+        "ShinraMeter-BPSR-history.sqlite",
+        "APPDATA is not set; falling back to a working-directory file for the encounter history",
     );
     if let Some(warning) = warning {
         log::warn!("{warning}");
@@ -258,19 +276,35 @@ fn main() -> eframe::Result {
         }
     };
 
+    // Loaded once, here, rather than inside `OverlayApp::new`: issue #27
+    // needs this same value before `OverlayApp` exists, to seed
+    // `ui::viewport`'s starting position, so the single load is hoisted up
+    // to cover both uses instead of loading twice — and the history thread
+    // needs the retention policy before the pipeline is spawned (issue #39).
+    let settings = settings::load();
+
+    // Issue #39: `None` when history is switched off in settings.json, or when
+    // the database cannot be opened (already logged by `HistoryHandle::spawn`) —
+    // in either case the overlay runs exactly as before, minus history.
+    let history = settings
+        .history_enabled
+        .then(|| {
+            history::writer::HistoryHandle::spawn(history_db_path(), settings.retention_policy())
+        })
+        .flatten();
+    let (history_handle, history_thread) = match history {
+        Some((handle, thread)) => (Some(handle), Some(thread)),
+        None => (None, None),
+    };
+
     let (rx_snapshot, pipeline_thread) = pipeline::spawn(
         rx_events,
         rx_command,
         names_cache_path(),
         scene_bosses_path(),
+        history_handle.clone(),
     );
     let (tx_settings, settings_thread) = settings::spawn_writer();
-
-    // Loaded once, here, rather than inside `OverlayApp::new`: issue #27
-    // needs this same value before `OverlayApp` exists, to seed
-    // `ui::viewport`'s starting position, so the single load is hoisted up
-    // to cover both uses instead of loading twice.
-    let settings = settings::load();
 
     // Kept alongside the clone handed to `OverlayApp` so shutdown can signal
     // the pipeline explicitly below, rather than depending on `run_native`
@@ -346,6 +380,17 @@ fn main() -> eframe::Result {
     }
     let _ = tx_command_shutdown.try_send(UiCommand::Quit);
     let _ = pipeline_thread.join();
+    // Issue #39: both `HistoryHandle` clones are gone by now (the pipeline
+    // thread's with the pipeline, joined just above; this one dropped right
+    // here — `OverlayApp` never held one, since WP3 wires that up), so the
+    // history thread's channel is closed and it exits after draining.
+    // Joining here is what guarantees the session's last encounter actually
+    // reached disk — the same explicit-shutdown discipline
+    // `CacheWriter::shutdown` follows.
+    drop(history_handle);
+    if let Some(thread) = history_thread {
+        let _ = thread.join();
+    }
     // `OverlayApp` (and its `tx_settings`) is dropped by the time
     // `run_native` returns, which closes the settings-writer's channel and
     // lets its thread exit; joining here just makes sure the last-sent

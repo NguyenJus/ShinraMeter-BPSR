@@ -2345,7 +2345,10 @@ const UV_FULL: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui:
 /// describes *that* fight rather than live state (issue #152), so nothing
 /// in this precedence has to know about zoning: the header keeps naming the
 /// boss whose frozen numbers are on the rows below it.
-fn encounter_title(e: &EncounterInfo) -> String {
+///
+/// Also called by `pipeline::record_fight_end` so a saved encounter stores
+/// the *same* label the live header showed (issue #39, spec DECISION D2).
+pub(crate) fn encounter_title(e: &EncounterInfo) -> String {
     if e.is_boss {
         // `is_boss` is only ever true alongside a `Some` `boss_monster_id`
         // (see `Meter::snapshot`), so the `None` arm here is unreachable in
@@ -2373,7 +2376,10 @@ fn encounter_title(e: &EncounterInfo) -> String {
 /// its raw scene id, else `None` — `draw_header` paints the subtitle row
 /// blank in that case. The row's space is reserved either way (issue #91,
 /// `header_text_band_height`); only its ink is conditional.
-fn encounter_subtitle(e: &EncounterInfo) -> Option<String> {
+///
+/// Also called by `pipeline::record_fight_end` so a saved encounter stores
+/// the *same* label the live header showed (issue #39, spec DECISION D2).
+pub(crate) fn encounter_subtitle(e: &EncounterInfo) -> Option<String> {
     match (e.scene_name, e.scene_id) {
         (Some(name), _) => Some(name.to_string()),
         (None, Some(id)) => Some(format!("Scene #{id}")),

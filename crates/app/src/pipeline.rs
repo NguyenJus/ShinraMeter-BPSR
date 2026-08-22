@@ -18,9 +18,10 @@ use bpsr_meter as meter;
 use bpsr_protocol as proto;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select, tick};
 
+use crate::history::{self, writer::HistoryHandle};
 use crate::imagines;
 use crate::scene_bosses_cache;
-use crate::ui::UiCommand;
+use crate::ui::{UiCommand, encounter_subtitle, encounter_title};
 
 /// Snapshot publication rate (~10 Hz), matching the overlay's repaint cadence.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
@@ -290,6 +291,16 @@ pub struct Pipeline {
     /// `cache_writer`, and it owns the deletes behind "Forget learned
     /// bosses" as well as the saves — see `CacheWriter`.
     scene_bosses_writer: Option<CacheWriter<SceneBosses>>,
+    /// The history thread's handle (issue #39), or `None` in tests and
+    /// `Pipeline::new()` — no handle means no history writes at all, the
+    /// same "`None` means no disk IO" contract `cache_writer` follows.
+    history: Option<HistoryHandle>,
+    /// Issue #39's write-exactly-once latch: `true` once the current
+    /// `FightState::Ended` has been recorded, cleared the moment the state
+    /// leaves `Ended`. Mirrors `Meter::latch_fight_end`'s idempotency shape
+    /// (`crates/meter/src/encounter.rs`) — a nine-second post-fight freeze
+    /// produces ~90 consecutive `Ended` ticks and must produce one row.
+    fight_end_recorded: bool,
 }
 
 impl Pipeline {
@@ -298,6 +309,8 @@ impl Pipeline {
             meter: meter::Meter::new(),
             cache_writer: None,
             scene_bosses_writer: None,
+            history: None,
+            fight_end_recorded: false,
         }
     }
 
@@ -312,6 +325,8 @@ impl Pipeline {
             meter: meter::Meter::with_names_cache(cached),
             cache_writer: Some(CacheWriter::spawn(path)),
             scene_bosses_writer: None,
+            history: None,
+            fight_end_recorded: false,
         }
     }
 
@@ -326,6 +341,14 @@ impl Pipeline {
     /// reason.
     pub fn with_scene_bosses_path(self, path: PathBuf) -> Self {
         self.with_scene_bosses_writer(path, None)
+    }
+
+    /// Attaches the history thread's handle (issue #39). Takes `self` by
+    /// value so it chains after the two cache constructors, exactly like
+    /// `with_scene_bosses_path`.
+    pub fn with_history(mut self, history: HistoryHandle) -> Self {
+        self.history = Some(history);
+        self
     }
 
     /// Test seam: `with_scene_bosses_path` with the writer thread parked on
@@ -422,6 +445,39 @@ impl Pipeline {
         self.meter.tick(now_ms)
     }
 
+    /// Records the encounter that just ended, exactly once (issue #39).
+    ///
+    /// Called from `publish` immediately after `tick`/`snapshot`, on the
+    /// `Active -> Ended` edge — deliberately *not* from `Meter::reset`, which
+    /// has already cleared `players` by the time any caller learns a fight is
+    /// over.
+    ///
+    /// Cheap on this thread: it clones the snapshot's rows into owned DTOs and
+    /// enqueues them on an unbounded channel, then returns. Every failure past
+    /// that point is the history thread's to log and swallow.
+    pub fn record_fight_end(&mut self, state: meter::FightState, snapshot: &meter::Snapshot) {
+        if state != meter::FightState::Ended {
+            self.fight_end_recorded = false;
+            return;
+        }
+        if self.fight_end_recorded {
+            return;
+        }
+        self.fight_end_recorded = true;
+        let Some(history) = &self.history else {
+            return;
+        };
+        let Some(ended_at_ms) = self.meter.fight_end_ms() else {
+            return;
+        };
+        let title = encounter_title(&snapshot.encounter);
+        let subtitle = encounter_subtitle(&snapshot.encounter);
+        if let Some(record) = history::record_from_snapshot(snapshot, ended_at_ms, title, subtitle)
+        {
+            history.record(record);
+        }
+    }
+
     /// Stops the background cache-writer thread, blocking until it has
     /// written any pending snapshot to disk. Must be called before process
     /// exit (see `run`'s shutdown path) so the final save is never lost; a
@@ -462,6 +518,7 @@ pub fn spawn(
     commands: Receiver<UiCommand>,
     names_cache_path: PathBuf,
     scene_bosses_path: PathBuf,
+    history: Option<HistoryHandle>,
 ) -> (Receiver<meter::Snapshot>, JoinHandle<()>) {
     let (tx_snapshot, rx_snapshot) = bounded::<meter::Snapshot>(1);
     let stale = rx_snapshot.clone();
@@ -476,6 +533,7 @@ pub fn spawn(
                 stale,
                 names_cache_path,
                 scene_bosses_path,
+                history,
             )
         })
         .expect("failed to spawn the pipeline thread");
@@ -490,9 +548,13 @@ fn run(
     stale: Receiver<meter::Snapshot>,
     names_cache_path: PathBuf,
     scene_bosses_path: PathBuf,
+    history: Option<HistoryHandle>,
 ) {
     let mut pipeline =
         Pipeline::with_names_cache_path(names_cache_path).with_scene_bosses_path(scene_bosses_path);
+    if let Some(history) = history {
+        pipeline = pipeline.with_history(history);
+    }
     // Replaced by `never()` once capture disconnects, so a dead channel does
     // not spin the select loop.
     let mut events = events;
@@ -539,8 +601,9 @@ fn publish(
     // One `now` for the whole tick: the fight-state advance and the snapshot
     // it feeds must agree on what time it is.
     let now = now_ms();
-    pipeline.tick(now);
+    let state = pipeline.tick(now);
     let snap = pipeline.snapshot(now);
+    pipeline.record_fight_end(state, &snap);
     if tx_snapshot.try_send(snap).is_err() {
         let _ = stale.try_recv();
         let _ = tx_snapshot.try_send(pipeline.snapshot(now));
@@ -1237,6 +1300,125 @@ mod tests {
                 imagine_slots(&[(3905, 0)]),
                 ([Some(3905), None], [Some(0), None])
             );
+        }
+    }
+
+    /// Issue #39: `record_fight_end`'s `Active -> Ended` edge trigger and its
+    /// write-exactly-once latch.
+    mod history_recording {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use super::*;
+        use crate::history::writer::HistoryEvent;
+
+        /// A fresh temp-file history path per test, so parallel test threads
+        /// never collide on the same on-disk database.
+        fn temp_history_path(tag: &str) -> PathBuf {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!(
+                "ShinraMeter-BPSR-test-pipeline-history-{tag}-{}-{n}.sqlite",
+                std::process::id()
+            ))
+        }
+
+        /// Drives one damage hit, then ticks past the idle timeout so the
+        /// fight latches `FightState::Ended` — the edge `record_fight_end`
+        /// is looking for.
+        fn ended_snapshot(pipeline: &mut Pipeline) -> (meter::FightState, meter::Snapshot) {
+            pipeline.step(proto::ProtocolEvent::Damage(damage(1, 100, 1_000)), 1_000);
+            let idle = meter::FightConfig::default().idle_timeout_ms;
+            let state = pipeline.tick(1_000 + idle);
+            let snap = pipeline.snapshot(1_000 + idle);
+            (state, snap)
+        }
+
+        /// A `RetentionPolicy` with no duration floor: `ended_snapshot`'s
+        /// scripted single-hit fight is only a handful of milliseconds long,
+        /// which the default policy's 5s floor would otherwise reject at
+        /// `HistoryStore::insert` — a `RetentionPolicy` concern this test
+        /// suite isn't exercising.
+        fn no_floor_policy() -> history::RetentionPolicy {
+            history::RetentionPolicy {
+                min_duration_ms: 0,
+                ..history::RetentionPolicy::default()
+            }
+        }
+
+        /// Lists the history back and returns how many rows it holds.
+        fn row_count(handle: &HistoryHandle) -> usize {
+            let (reply_tx, reply_rx) = crossbeam_channel::unbounded();
+            handle.list(10, &reply_tx);
+            match reply_rx.recv().unwrap() {
+                HistoryEvent::Listed(rows) => rows.len(),
+                other => panic!("expected Listed, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn an_ended_fight_is_recorded_once() {
+            let path = temp_history_path("record-once");
+            let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+            let mut pipeline = Pipeline::new().with_history(handle.clone());
+
+            let (state, snap) = ended_snapshot(&mut pipeline);
+            pipeline.record_fight_end(state, &snap);
+            pipeline.record_fight_end(state, &snap);
+            pipeline.record_fight_end(state, &snap);
+
+            let count = row_count(&handle);
+            drop(handle);
+            drop(pipeline);
+            let _ = thread.join();
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(count, 1);
+        }
+
+        #[test]
+        fn a_new_fight_clears_the_recorded_latch() {
+            let path = temp_history_path("clear-latch");
+            let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+            let mut pipeline = Pipeline::new().with_history(handle.clone());
+
+            let (state, snap) = ended_snapshot(&mut pipeline);
+            pipeline.record_fight_end(state, &snap);
+            pipeline.record_fight_end(meter::FightState::Active, &snap);
+            pipeline.record_fight_end(state, &snap);
+
+            let count = row_count(&handle);
+            drop(handle);
+            drop(pipeline);
+            let _ = thread.join();
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(count, 2);
+        }
+
+        #[test]
+        fn an_idle_pipeline_records_nothing() {
+            let path = temp_history_path("idle-none");
+            let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+            let mut pipeline = Pipeline::new().with_history(handle.clone());
+
+            let snap = pipeline.snapshot(0);
+            pipeline.record_fight_end(meter::FightState::Idle, &snap);
+            pipeline.record_fight_end(meter::FightState::Active, &snap);
+
+            let count = row_count(&handle);
+            drop(handle);
+            drop(pipeline);
+            let _ = thread.join();
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(count, 0);
+        }
+
+        #[test]
+        fn a_pipeline_without_history_never_panics() {
+            let mut pipeline = Pipeline::new();
+            let snap = pipeline.snapshot(0);
+            pipeline.record_fight_end(meter::FightState::Ended, &snap);
         }
     }
 }
