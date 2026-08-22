@@ -131,6 +131,20 @@ DUNGEON_SCENE_ID_SOURCES = {
     "DungeonSceneIds.json": f"{_ZDPS}/DungeonsTable.json",
 }
 
+# Issue #201: the curated dungeon scene -> final-boss table. Deliberately *not*
+# in any of the source dicts above — it is hand-maintained here, never
+# downloaded, so `--refresh` must leave it alone. Issue #125's investigation
+# established that nothing upstream maps a dungeon to its boss (every
+# `BPSR-ZDPS/Data/*.json` table and both community repos were checked), which
+# is why issue #131 learned it at runtime instead. Issue #201 retired that
+# machinery — there are few enough dungeons to simply write them down — so this
+# file is now the only source, and it is filled in by hand from real runs.
+#
+# `filter_scene_final_bosses` validates every row against the generated name
+# tables, so a typo or a game patch that re-ids a boss fails the `generated` CI
+# job instead of silently shipping a wrong header caption.
+SCENE_FINAL_BOSSES_FILE = "SceneFinalBosses.json"
+
 # Manual overrides (issue #112): ids the old hand-curated `MonsterNameBoss.json`
 # list carried as bosses that `MonsterTable.json`'s `MonsterType` does not mark
 # as `Boss` (2). Checked individually — see the per-id comment — and unioned on
@@ -307,6 +321,50 @@ mod tests {
     }
 
     #[test]
+    fn scene_final_boss_names_a_curated_single_boss_dungeon() {
+        // Issue #201: scene 1154 ("Unstable - Towering Ruin") -> monster 1152
+        // ("Kartgriff"), from `crates/meter/data/SceneFinalBosses.json`.
+        assert_eq!(scene_final_boss(1154), Some(1152));
+    }
+
+    #[test]
+    fn scene_final_boss_is_none_for_an_uncurated_dungeon_scene() {
+        // Most dungeons are not curated, and that is fine — the header simply
+        // has no caption for them until a boss is engaged.
+        assert!(is_dungeon_scene(1001));
+        assert_eq!(scene_final_boss(1001), None);
+    }
+
+    #[test]
+    fn scene_final_boss_is_none_for_a_non_dungeon_scene() {
+        assert_eq!(scene_final_boss(8), None);
+    }
+
+    #[test]
+    fn every_curated_scene_final_boss_resolves_in_the_generated_tables() {
+        // The Rust-side half of `filter_scene_final_bosses`' validation: a
+        // curated entry must name a real dungeon scene and a real, *named*
+        // boss monster, since an unnamed one would caption nothing at all.
+        for &(scene, boss) in SCENE_FINAL_BOSSES {
+            assert!(is_dungeon_scene(scene), "scene {scene} is not a dungeon");
+            assert!(is_boss_monster(boss), "monster {boss} is not a boss");
+            assert!(scene_name(scene).is_some(), "scene {scene} is unnamed");
+            assert!(monster_name(boss).is_some(), "monster {boss} is unnamed");
+        }
+    }
+
+    #[test]
+    fn curated_scene_final_bosses_are_sorted_and_unique() {
+        // `scene_final_boss` binary-searches, so unsorted or duplicated scene
+        // ids would silently stop resolving.
+        let scenes: Vec<u32> = SCENE_FINAL_BOSSES.iter().map(|&(scene, _)| scene).collect();
+        let mut sorted = scenes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(scenes, sorted);
+    }
+
+    #[test]
     fn unknown_skill_ids_are_none() {
         assert_eq!(skill_name(0), None);
     }
@@ -435,6 +493,52 @@ def filter_dungeon_scene_ids(raw: dict) -> list[int]:
             if scene_id:
                 out.append(int(scene_id))
     return sorted(set(out))
+
+
+def filter_scene_final_bosses(
+    raw: dict,
+    scenes: dict[int, str],
+    monsters: dict[int, str],
+    boss_ids: set[int],
+    dungeon_scene_ids: set[int],
+) -> list[tuple[int, int]]:
+    """Validate and flatten `SceneFinalBosses.json` into sorted `(scene, boss)`
+    pairs (issue #201).
+
+    Every row is checked against the tables generated alongside it: the scene
+    has to be a real dungeon scene, the boss a real boss monster, and both
+    `scene`/`boss` name fields have to still match what `scene_name` /
+    `monster_name` resolve to. All problems are collected and reported at once
+    rather than failing on the first, so a refresh that moved several ids
+    reads as one list of edits to make. Keys starting with `_` are prose
+    (`_README`) and are skipped.
+    """
+    problems: list[str] = []
+    pairs: list[tuple[int, int]] = []
+    for key, row in raw.items():
+        if key.startswith("_"):
+            continue
+        scene = int(key)
+        boss = int(row["boss_id"])
+        if scene not in dungeon_scene_ids:
+            problems.append(f"scene {scene} is not in DungeonSceneIds.json")
+        if boss not in boss_ids:
+            problems.append(f"monster {boss} (scene {scene}) is not a boss monster")
+        for field, table, want_id in (("scene", scenes, scene), ("boss", monsters, boss)):
+            got = table.get(want_id)
+            if got != row[field]:
+                problems.append(
+                    f"scene {scene}: {field!r} is {row[field]!r} but the generated "
+                    f"table says {got!r} for id {want_id}"
+                )
+        pairs.append((scene, boss))
+
+    if problems:
+        listing = "\n  ".join(problems)
+        sys.exit(f"{SCENE_FINAL_BOSSES_FILE} is out of date:\n  {listing}")
+
+    pairs.sort()
+    return pairs
 
 
 def merge_names(*layers: dict[int, str]) -> dict[int, str]:
@@ -691,13 +795,12 @@ DUNGEON_SCENE_IDS_DOC = """/// Dungeon scene ids (issue #125): every scene id `D
 /// as a dungeon instance's `SceneID` — 572 distinct ids (min 1001, max
 /// 171001). No upstream table maps a scene/dungeon to its final boss (issue
 /// #125's investigation checked every `BPSR-ZDPS/Data/*.json` table and both
-/// community data repos), so `Meter::recompute_boss`
-/// (`crates/meter/src/encounter.rs`) instead *learns* a dungeon's final boss
-/// by observation — the last genuine boss engaged in a scene — and remembers
-/// it per scene for the rest of the session. This table is what gates that
-/// latch to actual dungeons: without it, killing a world boss in an
-/// open-world zone would pin its name to the banner for every later visit to
-/// that town or field.
+/// community data repos), which is why [`SCENE_FINAL_BOSSES`] is curated by
+/// hand instead (issue #201). This table is the wider "is this an instance at
+/// all" answer, used by `Meter::apply`'s scene-change handling
+/// (`crates/meter/src/encounter.rs`) and by issue #151's in-dungeon fight
+/// hold, neither of which should treat an open-world town or field as a
+/// dungeon.
 ///
 /// Generated from `crates/meter/data/DungeonSceneIds.json`, itself filtered
 /// from BPSR-ZDPS's `DungeonsTable.json` — the same URL vendored as
@@ -719,11 +822,64 @@ def emit_dungeon_scene_ids(out: io.StringIO, ids: list[int]) -> None:
         _DUNGEON_SCENE_IDS_LINE_WIDTH,
         _DUNGEON_SCENE_IDS_INDENT,
         "\n/// Whether `id` is a known dungeon scene id (issue #125) — i.e. whether\n"
-        "/// the final-boss latch in `Meter::recompute_boss` may record a\n"
-        "/// remembered boss for it.\n"
+        "/// the party is inside a dungeon instance rather than an open-world\n"
+        "/// town or field.\n"
         "pub fn is_dungeon_scene(id: u32) -> bool {\n"
         "    DUNGEON_SCENE_IDS.binary_search(&id).is_ok()\n"
         "}\n",
+    )
+
+
+SCENE_FINAL_BOSSES_DOC = """/// Curated dungeon scene -> final-boss monster id (issue #201).
+///
+/// Hand-maintained in `crates/meter/data/SceneFinalBosses.json` — nothing
+/// upstream carries this mapping (issue #125's investigation checked every
+/// `BPSR-ZDPS/Data/*.json` table and both community data repos), and issue
+/// #201 replaced issue #131's runtime learning of it with a written-down
+/// table: there are few enough dungeons in the game that learning one boss per
+/// scene at runtime — and shipping an "I don't trust the cache" reset button
+/// to go with it — cost more than curating them.
+///
+/// **Single-boss dungeons only.** This is what `Meter::snapshot` puts in
+/// `EncounterInfo::scene_boss_name`, i.e. the header caption *before* — or
+/// without — a boss hit. The moment a recognized boss is actually engaged the
+/// live lock in `Meter::recompute_boss` takes over and `encounter_title`
+/// (`crates/app/src/ui.rs`) prefers it, so a multi-boss dungeon has nothing to
+/// gain here and everything to get wrong. Raid scenes
+/// (`phase::is_boss_select_scene`) are suppressed outright and must never
+/// appear.
+///
+/// A dungeon absent from this table simply has no pre-pull caption; that is
+/// the expected state for most of the 572 ids `is_dungeon_scene` knows.
+///
+/// Sorted by scene id; `scene_final_boss` binary-searches it."""
+
+# Mirrors `_BOSS_IDS_LINE_WIDTH`/`_BOSS_IDS_INDENT` above — see their comment.
+_SCENE_FINAL_BOSSES_INDENT = "    "
+
+
+def emit_scene_final_bosses(
+    out: io.StringIO, pairs: list[tuple[int, int]], scenes: dict[int, str], monsters: dict[int, str]
+) -> None:
+    """One pair per line, each annotated with the names — the table is small
+    and hand-curated, so a reviewer reading `tables.rs` should not have to go
+    look two ids up to see what an entry claims."""
+    out.write(f"\n{SCENE_FINAL_BOSSES_DOC}\n#[rustfmt::skip]\n")
+    out.write("pub(crate) const SCENE_FINAL_BOSSES: &[(u32, u32)] = &[\n")
+    for scene, boss in pairs:
+        indent = _SCENE_FINAL_BOSSES_INDENT
+        out.write(f"{indent}({scene}, {boss}), // {scenes[scene]} -> {monsters[boss]}\n")
+    out.write("];\n")
+    out.write(
+        "\n/// The curated final boss of dungeon scene `id` (issue #201), if it is a\n"
+        "/// single-boss dungeon someone has written down. See\n"
+        "/// [`SCENE_FINAL_BOSSES`].\n"
+        "pub fn scene_final_boss(id: u32) -> Option<u32> {\n"
+        "    SCENE_FINAL_BOSSES\n"
+        "        .binary_search_by_key(&id, |&(scene, _)| scene)\n"
+        "        .ok()\n"
+        "        .map(|i| SCENE_FINAL_BOSSES[i].1)\n"
+        "}\n"
     )
 
 
@@ -818,6 +974,13 @@ def render() -> str:
         {int(x) for x in load("MonsterTableBossIds.json")} | set(BOSS_ID_MANUAL_OVERRIDES)
     )
     dungeon_scene_ids = sorted({int(x) for x in load("DungeonSceneIds.json")})
+    scene_final_bosses = filter_scene_final_bosses(
+        load(SCENE_FINAL_BOSSES_FILE),
+        scenes,
+        monsters,
+        set(boss_ids),
+        set(dungeon_scene_ids),
+    )
     # Issue #16: inverted precedence vs. monsters/scenes above — here the
     # bulk community dump (`SkillName.json`) is the backfill layer and
     # BPSR-ZDPS's curated `SkillOverridesNames.json` is the hand-checked
@@ -855,10 +1018,12 @@ def render() -> str:
     emit(out, SKILL_ICON_DOC, "skill_icon", skill_icons)
     emit_boss_ids(out, boss_ids)
     emit_dungeon_scene_ids(out, dungeon_scene_ids)
+    emit_scene_final_bosses(out, scene_final_bosses, scenes, monsters)
     out.write(FOOTER)
     print(
         f"{len(monsters)} monsters, {len(scenes)} scenes, {len(skills)} skills, "
-        f"{len(boss_ids)} boss ids, {len(dungeon_scene_ids)} dungeon scene ids",
+        f"{len(boss_ids)} boss ids, {len(dungeon_scene_ids)} dungeon scene ids, "
+        f"{len(scene_final_bosses)} curated scene final bosses",
         file=sys.stderr,
     )
     return out.getvalue()

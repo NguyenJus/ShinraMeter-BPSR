@@ -12,7 +12,6 @@ pub mod logging;
 pub mod paths;
 pub mod pipeline;
 pub mod platform;
-pub mod scene_bosses_cache;
 pub mod settings;
 pub mod skill_icons;
 pub mod skills;

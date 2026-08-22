@@ -9,6 +9,6 @@ encounter.boss_name=-
 encounter.is_boss=false
 encounter.scene_id=1101
 encounter.scene_name=Towering Ruin
-encounter.scene_boss_name=Rathalos
+encounter.scene_boss_name=-
 resets=BossHpRollback@5000
 rows=0

@@ -182,33 +182,6 @@ pub struct Meter {
     /// boss-HP rollback both stay in the same dungeon); cleared only on
     /// `ServerChanged`, in `apply` directly rather than in `reset` itself.
     scene_id: Option<u32>,
-    /// Learned final boss per dungeon scene (issue #125): maps a dungeon
-    /// scene id (`tables::is_dungeon_scene`) to the monster id of the last
-    /// genuine boss (`tables::is_boss_monster`) engaged there. No upstream
-    /// data table maps a scene to its final boss, so this is *learned* by
-    /// observation instead — the last real boss fought in a dungeon is
-    /// assumed to be its final boss, which converges correctly because a
-    /// dungeon's own boss order runs earlier bosses before its last one.
-    ///
-    /// A raid breaks that premise — the party *selects* which of several
-    /// bosses to pull, so "the last one engaged" is merely the one that
-    /// party picked — but the break is not observable from here: a raid's
-    /// selections and a dungeon's boss order both arrive as distinct bosses
-    /// engaged one after another in one scene. Issue #150 answers it with
-    /// the curated `phase::is_boss_select_scene` table, which makes
-    /// `snapshot` suppress this map's answer for those scenes. This map
-    /// keeps overwriting, so an ordinary dungeon still converges on its
-    /// final boss and a boss whose monster id a game patch changes heals
-    /// itself on the next run rather than needing a manual forget.
-    /// Deliberately session-lifetime, **not** cleared by `reset`: an
-    /// encounter reset (or a boss-HP rollback) happens mid-dungeon, and the
-    /// whole point is for the remembered name to survive into the *next*
-    /// pull and the *next* run of the same dungeon, not just the current
-    /// one. Cross-session persistence (issue #131) lives entirely in the app
-    /// crate — this crate stays free of disk I/O and only exposes seed/export
-    /// accessors (`with_scene_bosses`, `set_scene_bosses`,
-    /// `scene_bosses_for_save`) for the app crate to drive.
-    scene_bosses: HashMap<u32, u32>,
     /// When the current fight ended, if it has (issue #78). `Some(t)` puts
     /// the meter in [`FightState::Ended`]: the snapshot is rendered as of
     /// `t` rather than the caller's `now_ms`, so rows, totals and the
@@ -301,7 +274,6 @@ impl Meter {
             last_reset_ms: None,
             boss_uid: None,
             scene_id: None,
-            scene_bosses: HashMap::new(),
             fight_end_ms: None,
             fight_end_boss_id: None,
             wipe_hold: false,
@@ -360,38 +332,6 @@ impl Meter {
         }
         m.names_seq = total;
         m
-    }
-
-    /// Seeds the learned scene -> final-boss map from a previously-persisted
-    /// value (issue #131), so a dungeon whose final boss was learned in an
-    /// earlier session already names it on entry this session, rather than
-    /// only after the first observed engagement falls back to naming it
-    /// mid-fight. Live observation (`recompute_boss`) always takes
-    /// precedence going forward: it overwrites a seeded entry the next time
-    /// that scene's real boss is engaged, the same way it converges on the
-    /// last boss engaged within one session (see `scene_bosses`' doc
-    /// comment).
-    pub fn with_scene_bosses(scene_bosses: HashMap<u32, u32>) -> Self {
-        Self {
-            scene_bosses,
-            ..Self::new()
-        }
-    }
-
-    /// Overwrites the learned scene -> final-boss map in place, for callers
-    /// (namely `Pipeline`, issue #131) that need to seed it on a `Meter`
-    /// already constructed for another reason (e.g. via `with_names_cache`)
-    /// rather than at construction time.
-    pub fn set_scene_bosses(&mut self, scene_bosses: HashMap<u32, u32>) {
-        self.scene_bosses = scene_bosses;
-    }
-
-    /// Exports the learned scene -> final-boss map for persistence (issue
-    /// #131), mirroring `names_for_save`. Unlike `names_for_save` this
-    /// carries no eviction cap or recency order to preserve — the caller
-    /// (`scene_bosses_cache` in the app crate) just needs the full map.
-    pub fn scene_bosses_for_save(&self) -> HashMap<u32, u32> {
-        self.scene_bosses.clone()
     }
 
     /// Reads a cached name/class/ability_score, bumping its recency for
@@ -687,7 +627,7 @@ impl Meter {
                     // `ServerChanged`), but it can just as well mean this
                     // very `Scene` packet is the *late* confirmation of the
                     // instance the currently-held fight was already fought
-                    // in (`a_scene_learned_after_the_boss_was_still_captions_the_held_fight`,
+                    // in (`a_scene_that_arrives_after_the_boss_still_captions_the_held_fight`,
                     // issue #152: `EnterScene` can land after the pull
                     // already started). The meter has no way to tell those
                     // two apart from here, and wrongly clearing the second
@@ -1564,44 +1504,6 @@ impl Meter {
         };
 
         let monster_id = self.boss_monster_id();
-        // Whether the selected boss is one *this encounter* engaged. Only
-        // the issue #157 fallback above can select an enemy that has taken
-        // no damage since the last reset (it deliberately reaches for one
-        // the party fought before it — see `EnemyState::last_damaged_ms`),
-        // and issue #125's learned scene -> final-boss map means "the last
-        // boss *engaged* in this dungeon" — a boss merely standing in AOI
-        // range must not latch itself as one.
-        let engaged = self
-            .boss_uid
-            .and_then(|uid| self.enemies.get(&uid))
-            .is_some_and(|e| e.took_damage);
-
-        // issue #125: learn this dungeon's final boss by observation. No
-        // upstream table maps a scene to its final boss, so the last genuine
-        // boss (`is_boss_monster`) engaged in an actual dungeon scene
-        // (`is_dungeon_scene`) is assumed to be it — see `scene_bosses`' doc
-        // comment. Overwriting is correct and intended: a dungeon fought
-        // through multiple bosses converges on the last one engaged, which
-        // is the final boss, and a monster id a game patch changed replaces
-        // the stale one on the next run. A raid's selections land here too,
-        // but issue #150's curated `phase::is_boss_select_scene` table keeps
-        // `snapshot` from ever showing this map's answer for those scenes,
-        // so there is nothing to guess wrong. The `is_dungeon_scene` guard
-        // keeps a world boss fought in an open-world zone from pinning its
-        // name to every later visit to that town or field.
-        if let (Some(id), Some(scene)) = (monster_id, self.scene_id)
-            && engaged
-            && tables::is_boss_monster(id)
-            && tables::is_dungeon_scene(scene)
-        {
-            let previous = self.scene_bosses.get(&scene).copied();
-            if previous != Some(id) {
-                self.scene_bosses.insert(scene, id);
-                if let Some(msg) = scene_boss_latch_log(previous, id, scene) {
-                    log::info!("{msg}");
-                }
-            }
-        }
 
         // issue #152: remember which fight this is while it is still live,
         // so the header can keep naming it once the fight ends and zoning
@@ -1674,12 +1576,6 @@ impl Meter {
     /// `PlayerStats` entry per uid, taking `deaths`/`last_death_ms` with it,
     /// so no separate clearing step is needed here.
     ///
-    /// Deliberately does **not** clear `scene_bosses` (issue #125): that map
-    /// is session-lifetime by design, so the dungeon's final boss stays
-    /// remembered across every reset a pull inside that dungeon can trigger
-    /// (manual, boss-HP rollback) and across every later pull and later run
-    /// of the same dungeon this session — clearing it here would defeat the
-    /// entire point of latching it.
     pub fn reset(&mut self, reason: ResetReason, now_ms: u64) {
         // `reset` is itself already an event, never a per-snapshot poll, so
         // this is naturally sparse (issue #69) — no transition-only guard
@@ -1828,29 +1724,31 @@ impl Meter {
         // populated for every pull since it's real data, not a display
         // choice.
         let is_boss = boss_monster_id.is_some_and(tables::is_boss_monster);
-        // issue #125: the dungeon's remembered final boss, if `scene_id` is
-        // known and a boss has been latched for it — see `scene_bosses`' doc
-        // comment. Independent of `boss_monster_id`/`is_boss` above, which
-        // stay the raw facts about the currently-selected target. Issue
-        // #131 inverted which one `encounter_title` (`crates/app/src/ui.rs`)
-        // prefers: a genuinely recognized live boss (`is_boss`) now wins
-        // over this field, which is the fallback for "nothing engaged yet"
-        // and for a non-boss `boss_uid` target — see that function's doc
-        // comment for the full precedence and why.
+        // issue #125, rewritten by issue #201: the dungeon's final boss, if
+        // `scene_id` is a single-boss dungeon someone has written down in
+        // `tables::SCENE_FINAL_BOSSES`. This used to be *learned* at runtime
+        // and cached to disk; there are few enough dungeons in the game that
+        // a curated table is both simpler and never wrong about a scene it
+        // covers. Independent of `boss_monster_id`/`is_boss` above, which
+        // stay the raw facts about the currently-selected target: a
+        // genuinely recognized live boss (`is_boss`) wins over this field in
+        // `encounter_title` (`crates/app/src/ui.rs`), which is the caption
+        // for "nothing engaged yet" and for a non-boss `boss_uid` target —
+        // see that function's doc comment for the full precedence and why.
         //
-        // issue #150: a scene that lets the party pick which boss to pull
-        // has no single remembered answer to fall back on, so it names none
-        // and `encounter_title` shows "Select a boss" instead. Which scenes
-        // those are is curated (`phase::is_boss_select_scene`), never
-        // inferred from what has been observed in the scene: a raid's
-        // selections are indistinguishable here from an ordinary dungeon's
-        // boss order, so inferring it would silence the remembered name for
-        // every dungeon that has more than one boss in it.
+        // issue #150: a scene that lets the party pick which boss to pull has
+        // no single right answer to fall back on, so it names none and
+        // `encounter_title` shows "Select a boss" instead. Curated entries
+        // are single-boss dungeons only (`phase`'s
+        // `no_curated_scene_final_boss_is_a_boss_select_scene` guards that),
+        // so this filter is belt-and-braces rather than load-bearing — but it
+        // keeps the two curated tables from ever contradicting each other
+        // silently.
         let multi_boss_scene = scene_id.is_some_and(phase::is_boss_select_scene);
         let scene_boss_name = scene_id
             .filter(|_| !multi_boss_scene)
-            .and_then(|scene| self.scene_bosses.get(&scene))
-            .and_then(|&id| tables::monster_name(id));
+            .and_then(tables::scene_final_boss)
+            .and_then(tables::monster_name);
         let encounter = EncounterInfo {
             boss_monster_id,
             boss_name: if is_boss {
@@ -2061,31 +1959,6 @@ fn reset_log(
     format!(
         "encounter: reset reason={reason:?} boss_hp_pct={hp} party_down={party_down}/{party_known}"
     )
-}
-
-/// Builds the "dungeon final boss learned/changed" diagnostic line (issue
-/// #125), or `None` when `new_monster_id` matches `previous` — `recompute_boss`
-/// only calls this (and only re-inserts into `scene_bosses`) when the winner
-/// differs from what's already latched, but this guard is kept as a second
-/// line of defense against relogging an unchanged boss. Pure, like
-/// [`scene_transition_log`]/[`boss_transition_log`], for the same
-/// testability reason.
-fn scene_boss_latch_log(
-    previous: Option<u32>,
-    new_monster_id: u32,
-    scene_id: u32,
-) -> Option<String> {
-    if previous == Some(new_monster_id) {
-        return None;
-    }
-    Some(match tables::monster_name(new_monster_id) {
-        Some(name) => format!(
-            "encounter: scene={scene_id} final boss latched monster_id={new_monster_id} name={name}"
-        ),
-        None => format!(
-            "encounter: scene={scene_id} final boss latched monster_id={new_monster_id} name=<unresolved>"
-        ),
-    })
 }
 
 impl Default for Meter {
@@ -3230,12 +3103,23 @@ mod tests {
         }
     }
 
-    /// Issue #131: the meter-side half of cross-session scene -> final-boss
-    /// persistence. `scene_bosses_cache` (app crate) owns the disk I/O; this
-    /// only covers the seed-in/export-out contract these tests exercise
-    /// directly against `Meter`, mirroring `mod names_cache` above.
-    mod scene_bosses {
+    /// Issue #201: the curated scene -> final-boss table
+    /// (`tables::scene_final_boss`, generated from
+    /// `crates/meter/data/SceneFinalBosses.json`) replaced issue #131's
+    /// runtime learning. It covers only dungeons with a *single* boss, and it
+    /// only supplies the caption before — or without — a boss hit: the
+    /// hit-based lock in `recompute_boss` is untouched and still outranks it
+    /// in `encounter_title`.
+    mod scene_final_boss {
         use super::*;
+
+        /// A curated entry: scene 1154 ("Unstable - Towering Ruin") ->
+        /// monster 1152 ("Kartgriff").
+        const CURATED_SCENE: u32 = 1154;
+        const CURATED_BOSS: &str = "Kartgriff";
+        /// 1001 ("Tina's Mindrealm") *is* a dungeon scene, but the curated
+        /// table does not cover it — the "known dungeon, unknown boss" case.
+        const UNCURATED_SCENE: u32 = 1001;
 
         fn boss_hit(uid: i64, ts: u64) -> ProtocolEvent {
             ProtocolEvent::Damage(DamageEvent {
@@ -3260,114 +3144,86 @@ mod tests {
         }
 
         #[test]
-        fn seeded_scene_boss_resolves_before_any_hit_lands_this_session() {
-            // 1001 ("Tina's Mindrealm") is a dungeon scene; 103 ("Rathalos")
-            // is a genuine boss — seeding mirrors what a real run of this
-            // dungeon would have latched last session.
-            let mut m = Meter::with_scene_bosses(HashMap::from([(1001, 103)]));
-            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
-
-            let snap = m.snapshot(1000);
-            assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
-        }
-
-        #[test]
-        fn set_scene_bosses_seeds_a_meter_already_constructed_another_way() {
-            let cache = vec![(5, (Some("Cached".to_string()), None))];
-            let mut m = Meter::with_names_cache(cache);
-            m.set_scene_bosses(HashMap::from([(1001, 103)]));
-            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
-
-            let snap = m.snapshot(1000);
-            assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
-        }
-
-        #[test]
-        fn scene_bosses_for_save_returns_what_was_learned() {
+        fn a_curated_dungeon_names_its_final_boss_before_any_hit_lands() {
             let mut m = Meter::new();
-            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: CURATED_SCENE,
+            });
+
+            let snap = m.snapshot(1_000);
+            assert_eq!(snap.encounter.scene_boss_name, Some(CURATED_BOSS));
+            assert!(!snap.encounter.is_boss, "nothing has been engaged yet");
+        }
+
+        #[test]
+        fn an_uncurated_dungeon_names_no_boss_before_any_hit_lands() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: UNCURATED_SCENE,
+            });
+
+            assert_eq!(m.snapshot(1_000).encounter.scene_boss_name, None);
+        }
+
+        #[test]
+        fn engaging_a_boss_in_an_uncurated_dungeon_teaches_the_table_nothing() {
+            // The whole point of issue #201: no runtime learning survives, so
+            // a boss fought here leaves no remembered caption behind once the
+            // encounter is reset back to "nothing engaged".
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: UNCURATED_SCENE,
+            });
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 103, 0));
+            m.reset(ResetReason::Manual, 1_000);
+
+            assert_eq!(m.snapshot(2_000).encounter.scene_boss_name, None);
+        }
+
+        #[test]
+        fn a_curated_entry_survives_a_reset() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: CURATED_SCENE,
+            });
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 103, 0));
+            m.reset(ResetReason::Manual, 1_000);
+
+            assert_eq!(
+                m.snapshot(2_000).encounter.scene_boss_name,
+                Some(CURATED_BOSS)
+            );
+        }
+
+        #[test]
+        fn the_live_boss_lock_is_unaffected_by_the_curated_entry() {
+            // Maintainer guidance for issue #201: the existing hit-based lock
+            // stays exactly as it was. A recognized boss actually engaged in a
+            // curated scene still populates `boss_name`/`is_boss`, which is
+            // what `encounter_title` prefers over `scene_boss_name`.
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: CURATED_SCENE,
+            });
             m.apply(&boss_hit(10, 0));
             m.apply(&hp(10, 103, 0));
 
-            assert_eq!(m.scene_bosses_for_save(), HashMap::from([(1001, 103)]));
+            let snap = m.snapshot(1_000);
+            assert!(snap.encounter.is_boss);
+            assert_eq!(snap.encounter.boss_name, Some("Rathalos"));
+            assert_eq!(snap.encounter.scene_boss_name, Some(CURATED_BOSS));
         }
 
         #[test]
-        fn scene_bosses_for_save_is_empty_when_nothing_has_been_learned() {
-            let m = Meter::new();
-            assert_eq!(m.scene_bosses_for_save(), HashMap::new());
-        }
+        fn an_open_world_scene_names_no_boss() {
+            // Scene 8 ("Asterleeds") is not a dungeon at all, so it can never
+            // carry a curated entry.
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 8 });
 
-        #[test]
-        fn a_reset_does_not_lose_a_seeded_scene_boss() {
-            let mut m = Meter::with_scene_bosses(HashMap::from([(1001, 103)]));
-            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
-            m.reset(ResetReason::Manual, 1000);
-
-            let snap = m.snapshot(2000);
-            assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
-            assert_eq!(m.scene_bosses_for_save(), HashMap::from([(1001, 103)]));
-        }
-
-        #[test]
-        fn live_observation_is_recorded_after_a_seeded_entry() {
-            // A different pull can engage a boss the seeded run never did.
-            // The freshly observed one replaces the seeded id, which is the
-            // within-session recency semantics `recompute_boss` documents,
-            // applied across sessions too.
-            let mut m = Meter::with_scene_bosses(HashMap::from([(1001, 103)]));
-            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
-            m.apply(&boss_hit(11, 0));
-            m.apply(&hp(11, 103_108, 0));
-
-            assert_eq!(m.scene_bosses_for_save(), HashMap::from([(1001, 103_108)]));
-        }
-
-        #[test]
-        fn a_seeded_entry_a_live_pull_disagrees_with_is_replaced_not_second_guessed() {
-            // PR #164 review, finding 1: the seeded id and the observed one
-            // disagreeing is *not* evidence that this scene offers a choice
-            // of bosses — it is an ordinary dungeon whose boss order this
-            // session walked further, or a boss whose monster id moved in a
-            // game patch (the cached 103 is then simply stale). Either way
-            // the header names the boss actually engaged, and the stale id
-            // is gone from the next save, so the map heals itself without a
-            // manual "forget". Judging this scene by observation instead
-            // would caption every later visit "Select a boss" forever.
-            let mut m = Meter::with_scene_bosses(HashMap::from([(1001, 103)]));
-            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
-            m.apply(&boss_hit(11, 0));
-            m.apply(&hp(11, 103_108, 0));
-            // Back at "nothing engaged", which is where the remembered name
-            // is the header's answer.
-            m.reset(ResetReason::Manual, 1000);
-
-            let snap = m.snapshot(2000);
-            assert!(!snap.encounter.multi_boss_scene);
-            assert_eq!(
-                snap.encounter.scene_boss_name,
-                Some("Paradox-Calamity Remnant - Origin")
-            );
-            assert_eq!(m.scene_bosses_for_save(), HashMap::from([(1001, 103_108)]));
-        }
-
-        #[test]
-        fn a_seeded_entry_for_a_curated_raid_scene_is_still_never_shown() {
-            // The same shape in a scene that genuinely offers a choice:
-            // 13023 ("Purge! Field of Forgotten Illusions") is curated, so
-            // neither the seeded id nor the one this session engaged may be
-            // offered as the header's answer once nothing is engaged.
-            let mut m = Meter::with_scene_bosses(HashMap::from([(13_023, 103_108)]));
-            m.apply(&ProtocolEvent::Scene {
-                level_map_id: 13_023,
-            });
-            m.apply(&boss_hit(11, 0));
-            m.apply(&hp(11, 103_309, 0));
-            m.reset(ResetReason::Manual, 1000);
-
-            let snap = m.snapshot(2000);
-            assert!(snap.encounter.multi_boss_scene);
-            assert_eq!(snap.encounter.scene_boss_name, None);
+            assert_eq!(m.snapshot(1_000).encounter.scene_boss_name, None);
         }
 
         // -- curated multi-boss scenes (issue #150) -------------------------
@@ -3375,11 +3231,11 @@ mod tests {
         #[test]
         fn a_curated_multi_boss_raid_scene_never_guesses_a_boss_before_one_is_engaged() {
             // Scene 13023 ("Purge! Field of Forgotten Illusions") is a raid:
-            // the party selects one of three bosses, so a remembered one is
-            // a guess that is wrong two times out of three. Engaging one
-            // still names it; standing there having selected nothing — on
-            // entry, or after a win or a wipe, both of which put the player
-            // back at the selection without leaving the scene — must not.
+            // the party selects one of three bosses, so no single caption is
+            // right before one is engaged. Engaging one still names it;
+            // standing there having selected nothing — on entry, or after a
+            // win or a wipe, both of which put the player back at the
+            // selection without leaving the scene — must not.
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Scene {
                 level_map_id: 13_023,
@@ -3405,19 +3261,13 @@ mod tests {
         }
 
         #[test]
-        fn an_ordinary_dungeon_scene_is_not_treated_as_offering_a_boss_choice() {
-            // The regression guard for the change above: 1001 ("Tina's
-            // Mindrealm") has one final boss, so nothing about issue #150
-            // may disturb what it shows.
+        fn a_curated_single_boss_dungeon_is_not_treated_as_offering_a_boss_choice() {
             let mut m = Meter::new();
-            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
-            m.apply(&boss_hit(10, 0));
-            m.apply(&hp(10, 103, 0));
-            m.reset(ResetReason::Manual, 1000);
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: CURATED_SCENE,
+            });
 
-            let snap = m.snapshot(2000);
-            assert!(!snap.encounter.multi_boss_scene);
-            assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
+            assert!(!m.snapshot(1_000).encounter.multi_boss_scene);
         }
     }
 
@@ -5154,11 +5004,8 @@ mod tests {
             assert_eq!(m.snapshot(11_100).encounter.boss_monster_id, Some(FINAL));
             assert_eq!(m.snapshot(11_100).total_damage, 600);
 
-            // issue #125: the dungeon's learned final boss converges on the
-            // last phase engaged, which is the fight's real final phase.
-            // issue #150: this scene is not a curated raid scene, so it is
-            // still a single-boss dungeon that names what it learned.
-            assert_eq!(m.scene_bosses.get(&DUNGEON_SCENE), Some(&FINAL));
+            // issue #150: this scene is not a curated raid scene, so nothing
+            // asks the player to select a boss here.
             assert!(!m.snapshot(11_100).encounter.multi_boss_scene);
         }
 
@@ -5714,111 +5561,9 @@ mod tests {
             assert_eq!(snap.encounter.scene_name, None);
         }
 
-        // -- dungeon final-boss latch (issue #125) --------------------------
-
-        #[test]
-        fn scene_boss_name_latches_for_a_genuine_boss_in_a_dungeon_scene() {
-            // 1001 ("Tina's Mindrealm") is a dungeon scene; 103 ("Rathalos")
-            // is a genuine boss (`is_boss_monster`).
-            let mut m = Meter::new();
-            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
-            m.apply(&boss_hit(10, 0));
-            m.apply(&hp(10, 100, 100, Some(103), 0));
-            let snap = m.snapshot(1000);
-            assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
-        }
-
-        #[test]
-        fn scene_boss_name_does_not_latch_for_a_non_boss_mid_dungeon_mech() {
-            // The exact issue #125 case: template 1342 ("Boss - Battle Mech
-            // 03") is not a genuine boss (`MonsterType != 2`), so it must
-            // never latch as the dungeon's final boss even though it's the
-            // selected `boss_uid` target.
-            let mut m = Meter::new();
-            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
-            m.apply(&boss_hit(10, 0));
-            m.apply(&hp(10, 100, 100, Some(1342), 0));
-            let snap = m.snapshot(1000);
-            assert_eq!(snap.encounter.scene_boss_name, None);
-        }
-
-        #[test]
-        fn scene_boss_name_does_not_latch_in_a_non_dungeon_scene() {
-            // 8 ("Asterleeds") is an open-world zone, not a dungeon scene:
-            // a world boss fought there must not pin its name to the header
-            // for every later visit to that zone.
-            let mut m = Meter::new();
-            m.apply(&ProtocolEvent::Scene { level_map_id: 8 });
-            m.apply(&boss_hit(10, 0));
-            m.apply(&hp(10, 100, 100, Some(103), 0));
-            let snap = m.snapshot(1000);
-            assert_eq!(snap.encounter.scene_boss_name, None);
-        }
-
-        #[test]
-        fn scene_boss_name_survives_an_encounter_reset() {
-            let mut m = Meter::new();
-            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
-            m.apply(&boss_hit(10, 0));
-            m.apply(&hp(10, 100, 100, Some(103), 0));
-            m.reset(ResetReason::Manual, 1000);
-            let snap = m.snapshot(2000);
-            assert_eq!(snap.encounter.scene_boss_name, Some("Rathalos"));
-        }
-
-        #[test]
-        fn a_dungeon_fought_through_two_unrelated_bosses_converges_on_the_last() {
-            // PR #164 review, finding 1: two *unrelated* bosses (103
-            // "Rathalos" and 103_108, a boss of a different fight entirely)
-            // seen in one dungeon scene is an ordinary dungeon's boss order,
-            // not proof that the scene offers a selection — the two are
-            // indistinguishable from here, which is why issue #150 curates
-            // the raid scenes (`phase::is_boss_select_scene`) instead of
-            // inferring them. So this scene keeps converging on the last
-            // boss engaged, the pre-#150 rule that is right for it.
-            let mut m = Meter::new();
-            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
-            m.apply(&boss_hit(10, 0));
-            m.apply(&hp(10, 100, 100, Some(103), 0));
-            assert_eq!(m.snapshot(1000).encounter.scene_boss_name, Some("Rathalos"));
-            assert!(!m.snapshot(1000).encounter.multi_boss_scene);
-
-            m.reset(ResetReason::Manual, 1000);
-            m.apply(&boss_hit(11, 1000));
-            m.apply(&hp(11, 100, 100, Some(103_108), 1000));
-            m.reset(ResetReason::Manual, 2000);
-            let snap = m.snapshot(3000);
-            assert!(!snap.encounter.multi_boss_scene);
-            assert_eq!(
-                snap.encounter.scene_boss_name,
-                Some("Paradox-Calamity Remnant - Origin")
-            );
-        }
-
-        #[test]
-        fn two_parts_of_one_fight_converge_on_the_part_engaged_last() {
-            // 103_110 and 103_111 are the Dragonbane Golem's two separately
-            // targetable cannons — one curated fight
-            // (`phase::BOSS_PHASE_GROUPS`), reached in a fixed order. The
-            // convergence above therefore has to land on the part engaged
-            // last here too, not on whichever one the dungeon opened with.
-            let mut m = Meter::new();
-            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
-            m.apply(&boss_hit(10, 0));
-            m.apply(&hp(10, 100, 100, Some(103_110), 0));
-
-            m.reset(ResetReason::Manual, 1000);
-            m.apply(&boss_hit(11, 1000));
-            m.apply(&hp(11, 100, 100, Some(103_111), 1000));
-
-            m.reset(ResetReason::Manual, 2000);
-            let snap = m.snapshot(3000);
-            assert!(!snap.encounter.multi_boss_scene);
-            assert_eq!(
-                snap.encounter.scene_boss_name,
-                Some("Dragonbane Golem - Left Cannon")
-            );
-        }
+        // Issue #201: the curated `tables::SCENE_FINAL_BOSSES` path that
+        // replaced issue #125's runtime latch is covered by `mod
+        // scene_final_boss` above.
     }
 
     /// issue #69: `scene_transition_log`/`boss_transition_log` are the pure
@@ -5980,24 +5725,6 @@ mod tests {
             // Boss target cleared.
             let msg = boss_transition_log(Some(10), None, None).unwrap();
             assert!(msg.contains("cleared"));
-        }
-
-        #[test]
-        fn scene_boss_latch_log_fires_only_when_the_monster_id_changes() {
-            assert!(scene_boss_latch_log(None, 103, 1001).is_some());
-            assert!(scene_boss_latch_log(Some(103), 103, 1001).is_none());
-            assert!(scene_boss_latch_log(Some(103), 103_108, 1001).is_some());
-        }
-
-        #[test]
-        fn scene_boss_latch_log_reports_the_scene_and_resolved_name() {
-            let msg = scene_boss_latch_log(None, 103, 1001).unwrap();
-            assert!(msg.contains("scene=1001"));
-            assert!(msg.contains("monster_id=103"));
-            assert!(msg.contains("name=Rathalos"));
-
-            let msg = scene_boss_latch_log(None, 999_999, 1001).unwrap();
-            assert!(msg.contains("<unresolved>"));
         }
 
         #[test]
@@ -6173,7 +5900,7 @@ mod tests {
         }
 
         #[test]
-        fn a_scene_learned_after_the_boss_was_still_captions_the_held_fight() {
+        fn a_scene_that_arrives_after_the_boss_still_captions_the_held_fight() {
             // `EnterScene` can land after the pull has already started (it
             // does in `replay_dump`'s real capture), and only damage/HP
             // events refresh the captured identity — so a held fight whose
