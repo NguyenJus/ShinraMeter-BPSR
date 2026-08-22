@@ -55,6 +55,13 @@
 //! APIs have no egui/eframe equivalent) and reuses this module's `Rect`,
 //! monitor enumeration and `app_driven_reposition` directly. See its doc
 //! comment for the message flow and the lifetime rules for the icon.
+//!
+//! Issue #171: `http_get` is a fourth, unrelated addition living here for
+//! the same reason as the rest — egui/eframe expose no HTTP client, so the
+//! header dropdown's manual "Check for updates" reaches for WinHTTP
+//! directly. See its doc comment for why WinHTTP over a new crate, and
+//! `update_check`'s module doc comment for the pure request/decision logic
+//! this feeds.
 
 /// Bit for `WS_MAXIMIZEBOX` in a Win32 window style (`GWL_STYLE`) bitmask.
 /// Kept as a plain literal — rather than referencing
@@ -2504,6 +2511,196 @@ pub fn write_clipboard_image(image: &egui::ColorImage) {
 #[cfg(not(windows))]
 pub fn write_clipboard_image(_image: &egui::ColorImage) {
     log::warn!("clipboard image write is not supported on this platform");
+}
+
+/// Issue #171: the manual "Check for updates" header-menu item needs an
+/// HTTPS GET to GitHub's releases API, and — same reasoning as every other
+/// function in this module — egui/eframe expose no HTTP client at all, so
+/// this reaches straight for the OS's own one rather than pulling in a new
+/// HTTP/TLS crate. WinHTTP (not WinINet, which is documented as unsuitable
+/// for services/background callers) is the same client Windows' own
+/// Update/Store stack uses, needs no extra system DLL beyond `winhttp.dll`
+/// (present on every supported Windows version), and, via `WinHttpOpen`'s
+/// `pszAgentW`, is the one place a `User-Agent` header can be set before
+/// the connection even exists — GitHub's API rejects any request that
+/// arrives without one.
+///
+/// `host` and `path` are supplied separately (rather than one URL string)
+/// because that is exactly the shape `WinHttpConnect`/`WinHttpOpenRequest`
+/// want; always HTTPS (`WINHTTP_FLAG_SECURE`), on port 443
+/// (`INTERNET_DEFAULT_HTTPS_PORT`) — this function has no plain-HTTP path,
+/// on purpose, since its one caller only ever talks to `api.github.com`.
+///
+/// Synchronous and blocking by design: `update_check::check_for_update`
+/// (the sole caller) is itself only ever run from a spawned
+/// `std::thread`, never the UI thread, so there is nothing here for a
+/// blocking call to stall — see that function's doc comment.
+#[cfg(windows)]
+pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, String> {
+    use windows::Win32::Foundation::GetLastError;
+    use windows::Win32::Networking::WinHttp::{
+        INTERNET_DEFAULT_HTTPS_PORT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+        WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect,
+        WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable, WinHttpQueryHeaders,
+        WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
+    };
+    use windows::core::PCWSTR;
+
+    /// Closes a WinHTTP handle (session, connection or request — the same
+    /// `WinHttpCloseHandle` closes all three) when dropped, so every early
+    /// `return Err(...)` below still releases whatever handles were opened
+    /// before it, instead of a leak per error path.
+    struct WinHttpHandle(*mut core::ffi::c_void);
+
+    impl Drop for WinHttpHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was returned by a prior WinHTTP `*Open*`
+                // call and is only ever closed once, here, at end of scope.
+                let _ = unsafe { WinHttpCloseHandle(self.0) };
+            }
+        }
+    }
+
+    /// UTF-16, NUL-terminated — every WinHTTP string parameter below wants
+    /// exactly this shape.
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    // SAFETY (this whole function): every WinHTTP call below is handed
+    // either a `PCWSTR` built from a `wide()` buffer that outlives the
+    // call, or a handle owned by a `WinHttpHandle` still in scope — never a
+    // dangling or foreign pointer. None of these calls touch the window or
+    // its `HWND`, so nothing here interacts with `OVERLAY_HWND` or the
+    // reposition-exemption machinery elsewhere in this module.
+    let agent = wide(user_agent);
+    let session = unsafe {
+        WinHttpOpen(
+            PCWSTR(agent.as_ptr()),
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            0,
+        )
+    };
+    if session.is_null() {
+        return Err(format!(
+            "WinHttpOpen failed (GetLastError={})",
+            unsafe { GetLastError() }.0
+        ));
+    }
+    let session = WinHttpHandle(session);
+
+    // Every WinHTTP timeout has to be set explicitly: the defaults leave
+    // name resolution on 0, which WinHTTP documents as "infinite", so a
+    // stalled resolver, a captive portal or a firewall that drops rather
+    // than refuses would block this thread — and, with it, the header
+    // dropdown's "Checking…" state — forever. This is a user-triggered
+    // check against a single small JSON endpoint, so a few seconds each is
+    // plenty: 5s to resolve, 5s to connect, 10s to send and 10s to receive.
+    // Set on the session handle, before `WinHttpConnect`, so every handle
+    // derived from it inherits them.
+    unsafe { WinHttpSetTimeouts(session.0, 5_000, 5_000, 10_000, 10_000) }
+        .map_err(|err| format!("WinHttpSetTimeouts failed: {err}"))?;
+
+    let host_w = wide(host);
+    let connect = unsafe {
+        WinHttpConnect(
+            session.0,
+            PCWSTR(host_w.as_ptr()),
+            INTERNET_DEFAULT_HTTPS_PORT,
+            0,
+        )
+    };
+    if connect.is_null() {
+        return Err(format!(
+            "WinHttpConnect failed (GetLastError={})",
+            unsafe { GetLastError() }.0
+        ));
+    }
+    let connect = WinHttpHandle(connect);
+
+    let verb = wide("GET");
+    let object = wide(path);
+    let request = unsafe {
+        WinHttpOpenRequest(
+            connect.0,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(object.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            std::ptr::null(),
+            WINHTTP_FLAG_SECURE,
+        )
+    };
+    if request.is_null() {
+        return Err(format!(
+            "WinHttpOpenRequest failed (GetLastError={})",
+            unsafe { GetLastError() }.0
+        ));
+    }
+    let request = WinHttpHandle(request);
+
+    unsafe { WinHttpSendRequest(request.0, None, None, 0, 0, 0) }
+        .map_err(|err| format!("WinHttpSendRequest failed: {err}"))?;
+    unsafe { WinHttpReceiveResponse(request.0, std::ptr::null_mut()) }
+        .map_err(|err| format!("WinHttpReceiveResponse failed: {err}"))?;
+
+    let mut status: u32 = 0;
+    let mut status_len = std::mem::size_of::<u32>() as u32;
+    unsafe {
+        WinHttpQueryHeaders(
+            request.0,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            PCWSTR::null(),
+            Some(&mut status as *mut u32 as *mut core::ffi::c_void),
+            &mut status_len,
+            std::ptr::null_mut(),
+        )
+    }
+    .map_err(|err| format!("WinHttpQueryHeaders failed: {err}"))?;
+    if status != 200 {
+        return Err(format!("GitHub releases API returned HTTP {status}"));
+    }
+
+    // Drained in a loop, per WinHTTP's own documented pattern:
+    // `WinHttpQueryDataAvailable` reports how much of the *next* chunk is
+    // ready (never the whole body at once), and a `0` is WinHTTP's own
+    // end-of-response signal.
+    let mut body = Vec::new();
+    loop {
+        let mut available: u32 = 0;
+        unsafe { WinHttpQueryDataAvailable(request.0, &mut available) }
+            .map_err(|err| format!("WinHttpQueryDataAvailable failed: {err}"))?;
+        if available == 0 {
+            break;
+        }
+        let mut chunk = vec![0u8; available as usize];
+        let mut read: u32 = 0;
+        unsafe {
+            WinHttpReadData(
+                request.0,
+                chunk.as_mut_ptr() as *mut core::ffi::c_void,
+                available,
+                &mut read,
+            )
+        }
+        .map_err(|err| format!("WinHttpReadData failed: {err}"))?;
+        chunk.truncate(read as usize);
+        body.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(body).map_err(|err| format!("response was not valid UTF-8: {err}"))
+}
+
+/// Non-Windows stub — see `http_get`'s doc comment. Dev/CI hosts for this
+/// crate are Linux, so `update_check`'s tests exercise only the pure
+/// parsing/comparison logic and never call this at all; a real "is an
+/// update available" answer needs a real Windows build.
+#[cfg(not(windows))]
+pub fn http_get(_host: &str, _path: &str, _user_agent: &str) -> Result<String, String> {
+    Err("update checks are only supported on Windows builds".to_string())
 }
 
 #[cfg(test)]

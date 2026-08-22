@@ -3,18 +3,25 @@
 //! `OverlayApp` is pure "snapshot in, commands out": it renders a
 //! `bpsr_meter::Snapshot` handed to it over a channel and emits `UiCommand`s
 //! for the app layer to act on. No threads or channels are created in this
-//! module beyond the `crossbeam_channel` endpoints eframe's caller hands in.
+//! module beyond the `crossbeam_channel` endpoints eframe's caller hands in
+//! — with one deliberate exception: issue #171's "Check for updates"
+//! header-menu item (`draw_header_menu`, `UpdateCheckState`) spawns its own
+//! one-shot `std::thread` and owns its own `crossbeam_channel` pair, the
+//! same way `settings::spawn_writer` and `pipeline::spawn` do at the app
+//! layer, because the app layer has no channel of its own suited to a
+//! single manual, UI-triggered request/reply.
 
 use std::time::Duration;
 
 use bpsr_meter::{Class, EncounterInfo, PlayerRow, Role, Snapshot};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui;
 
 use crate::fonts;
 use crate::icons::{ClassIcons, GlyphIcon, GlyphIcons, ImagineIcons, ToolbarIcon, ToolbarIcons};
 use crate::imagines;
 use crate::settings::{ColumnKind, Settings};
+use crate::update_check::{self, CheckOutcome};
 
 // -- typography scale (issue #56, issue #62) ----------------------------
 //
@@ -214,6 +221,16 @@ pub struct OverlayApp {
     /// stays `true` with no landed reply — see `screenshot_capture_timed_
     /// out`'s doc comment.
     screenshot_capturing: bool,
+    /// Issue #171: state of a manual "Check for updates" request from the
+    /// header dropdown — `Idle` until clicked, `Checking` while
+    /// `update_check::check_for_update` runs on its spawned thread, then
+    /// `Done` once its result lands over the channel. Lives here (not
+    /// local to `draw_header_menu`) so the in-flight state and the last
+    /// result both survive the dropdown popup closing and reopening
+    /// mid-check, and so `poll_update_check` can drain the channel once
+    /// per frame regardless of whether the dropdown happens to be open
+    /// that frame. See `UpdateCheckState`'s own doc comment.
+    update_check: UpdateCheckState,
     /// Issue #156: consecutive frames `screenshot_capturing` has been
     /// held `true` with neither a new request nor a landed reply this
     /// frame — reset to `0` by `advance_screenshot_capture_wait` the
@@ -519,6 +536,7 @@ impl OverlayApp {
             last_dpi_probe: None,
             pending_screenshot_bound: None,
             screenshot_capturing: false,
+            update_check: UpdateCheckState::Idle,
             screenshot_capture_frames_waited: 0,
             demo_mode,
             startup_toggles_applied: false,
@@ -543,6 +561,38 @@ impl OverlayApp {
             }
         }
     }
+
+    /// Issue #171: picks up the manual update-check thread's result, if one
+    /// is in flight and has landed — the counterpart to `drain_snapshots`,
+    /// called once per frame from `ui()` so a reply that arrives while the
+    /// header dropdown happens to be closed is still there the moment it's
+    /// reopened, rather than dropped or leaving the dropdown stuck showing
+    /// "Checking…" forever.
+    fn poll_update_check(&mut self) {
+        let landed = match &self.update_check {
+            UpdateCheckState::Checking { rx } => match rx.try_recv() {
+                Ok(outcome) => Some(outcome),
+                // Still in flight — keep rendering "Checking…".
+                Err(TryRecvError::Empty) => None,
+                // The sender is gone without ever having sent: the
+                // update-check thread died (a panic in the unsafe WinHTTP
+                // FFI, say) instead of reporting. Collapsing this into
+                // `Empty` — which `try_recv().ok()` used to do — left the
+                // state `Checking` forever, and with it the "Check for
+                // updates" button disabled, so the user could never retry
+                // short of restarting the app. Resolve it as a failure
+                // instead, which the dropdown renders and which leaves the
+                // button clickable again.
+                Err(TryRecvError::Disconnected) => Some(Err(
+                    "the update-check thread stopped without reporting a result".to_string(),
+                )),
+            },
+            _ => None,
+        };
+        if let Some(outcome) = landed {
+            self.update_check = UpdateCheckState::Done(outcome);
+        }
+    }
 }
 
 impl eframe::App for OverlayApp {
@@ -552,6 +602,7 @@ impl eframe::App for OverlayApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_snapshots();
+        self.poll_update_check();
 
         let ctx = ui.ctx().clone();
         apply_theme(&ctx);
@@ -703,6 +754,7 @@ impl eframe::App for OverlayApp {
                     icons,
                     &mut self.window_gesture,
                     capturing,
+                    &mut self.update_check,
                 );
                 // Issue #156: whether this frame's wait for the reply has
                 // gone on long enough that it's never coming — computed
@@ -914,6 +966,10 @@ fn draw_header(
     // actually gets captured. See `screenshot_capture_guard`'s doc comment
     // for why this can't just be "the frame the click happened on".
     capturing: bool,
+    // Issue #171: the manual "Check for updates" header-menu item's
+    // in-flight/last-result state — threaded through to `draw_header_menu`,
+    // the only place that reads or mutates it.
+    update_check: &mut UpdateCheckState,
 ) -> bool {
     let title = encounter_title(&snapshot.encounter);
     let subtitle = encounter_subtitle(&snapshot.encounter);
@@ -1046,6 +1102,7 @@ fn draw_header(
                     tx_settings: settings.tx_settings,
                 },
                 icons,
+                update_check,
             );
         });
     draw_subtitle_line(ui, subtitle.as_deref().unwrap_or(""));
@@ -2795,8 +2852,10 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
 ///
 /// Order matches the spec: a Columns disclosure section (issue #13's stat
 /// column toggles, unchanged in behavior — just relocated), a separator,
-/// Forget learned bosses (issue #131), a separator, Minimize to tray, a
-/// separator, then Close. Reset used to be the first item here but moved
+/// the Opacity slider (issue #166), a separator, Forget learned bosses
+/// (issue #131), a separator, Minimize to tray, a separator, Check for
+/// updates and its result line (issue #171), a separator, then Close.
+/// Reset used to be the first item here but moved
 /// into the header's toggle cluster (issue #82; see `toggle_cluster`),
 /// leaving this menu with no reset trigger of its own.
 /// Collapse/Expand (issue #54's collapse-to-header) used to be the item
@@ -2837,6 +2896,9 @@ fn draw_header_menu(
     tx_command: &Sender<UiCommand>,
     settings: SettingsHandle<'_>,
     icons: &Icons,
+    // Issue #171: the manual "Check for updates" item's in-flight/last-
+    // result state — see `UpdateCheckState`'s doc comment.
+    update_check: &mut UpdateCheckState,
 ) {
     let SettingsHandle {
         settings,
@@ -2964,6 +3026,53 @@ fn draw_header_menu(
 
     ui.separator();
 
+    // Issue #171: manual-only, per the issue — there is no automatic or
+    // background check anywhere in this crate, only this button. The
+    // request itself never touches this thread: clicking spawns a
+    // dedicated `std::thread` that calls `update_check::check_for_update`
+    // and reports back over a fresh `crossbeam_channel`, the same
+    // one-shot-thread shape `settings::spawn_writer` uses for its own
+    // (longer-lived) writer thread — see `UpdateCheckState`'s doc comment
+    // for why the state lives on `OverlayApp` rather than here.
+    //
+    // The button stays enabled (and re-clickable) once a check is done,
+    // both to let the user retry after a transient network error and to
+    // let them re-check right before actually upgrading; it is only
+    // disabled while one is already in flight, so a click can't pile up a
+    // second thread racing the first to the same channel.
+    let checking = matches!(update_check, UpdateCheckState::Checking { .. });
+    let clicked_check_for_updates = ui
+        .add_enabled(!checking, egui::Button::new("Check for updates"))
+        .clicked();
+    if clicked_check_for_updates {
+        *update_check = start_update_check();
+    }
+    match update_check {
+        UpdateCheckState::Idle => {}
+        UpdateCheckState::Checking { .. } => {
+            ui.label("Checking…");
+        }
+        UpdateCheckState::Done(Ok(CheckOutcome::UpToDate)) => {
+            ui.label(format!("Up to date (v{})", env!("CARGO_PKG_VERSION")));
+        }
+        UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable { tag, url })) => {
+            ui.horizontal(|ui| {
+                ui.label(format!("Update available: {tag}"));
+                // Issue #171 scopes auto-download/apply out — this link to
+                // the release's own GitHub page is the whole "get it"
+                // affordance. `egui::OpenUrl` (what `hyperlink_to` sends
+                // through `ctx.output_mut`) is what eframe's native
+                // backend turns into an actual browser launch.
+                ui.hyperlink_to("Download", url.as_str());
+            });
+        }
+        UpdateCheckState::Done(Err(err)) => {
+            ui.label(format!("Update check failed: {err}"));
+        }
+    }
+
+    ui.separator();
+
     if ui
         .add(menu_item_button(
             icons.toolbar.get(ToolbarIcon::Close),
@@ -2975,6 +3084,56 @@ fn draw_header_menu(
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         ui.close();
     }
+}
+
+/// State of a manual "Check for updates" request from the header dropdown
+/// (issue #171). Lives on `OverlayApp` (`update_check` field), not local to
+/// `draw_header_menu`, for two reasons: the popup itself is only painted
+/// while open (`egui::Popup::menu`'s `show` closure runs once per frame
+/// *it* is open, not every app frame), so any state stored purely in its
+/// closure's locals would be reset to nothing the next time it opens; and
+/// `OverlayApp::poll_update_check` needs to drain the `Checking` channel
+/// once per app frame regardless of whether the dropdown happens to be
+/// open that frame, so a result that lands while it's closed is still
+/// there — not dropped — the moment it's reopened.
+#[derive(Debug, Default)]
+enum UpdateCheckState {
+    /// No request has been made yet this session, or this is a fresh
+    /// `OverlayApp`.
+    #[default]
+    Idle,
+    /// A request is in flight on a spawned thread; `rx` is that thread's
+    /// reply channel, drained by `OverlayApp::poll_update_check`.
+    Checking {
+        rx: Receiver<Result<CheckOutcome, String>>,
+    },
+    /// The most recent request has resolved, successfully or not.
+    Done(Result<CheckOutcome, String>),
+}
+
+/// Starts a manual update check (issue #171): spawns a one-shot
+/// `std::thread` that calls `update_check::check_for_update` — the pure
+/// decision logic plus, on Windows, the actual `platform::http_get` network
+/// call — and sends its `Result` back over a fresh, unbounded
+/// `crossbeam_channel`. Returns the `Checking` state `draw_header_menu`'s
+/// click handler stores on `OverlayApp` so `poll_update_check` knows to
+/// start draining it.
+///
+/// Never called from, and never blocks, the UI thread: the click handler
+/// only starts the thread and returns immediately, the same shape
+/// `settings::spawn_writer`'s doc comment describes for its own writer
+/// thread (a persistent one, unlike this one-shot version, since a
+/// settings write can happen many times a session and an update check is
+/// only ever one click at a time).
+fn start_update_check() -> UpdateCheckState {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    std::thread::Builder::new()
+        .name("update-check".to_string())
+        .spawn(move || {
+            let _ = tx.send(update_check::check_for_update(env!("CARGO_PKG_VERSION")));
+        })
+        .expect("failed to spawn the update-check thread");
+    UpdateCheckState::Checking { rx }
 }
 
 /// Smallest inner size the overlay may be resized to, in points. Shared by
@@ -5223,6 +5382,7 @@ mod tests {
                 &icons,
                 &mut WindowGesture::default(),
                 false,
+                &mut UpdateCheckState::default(),
             );
         });
         let mut texts = Vec::new();
@@ -5376,6 +5536,7 @@ mod tests {
                 &icons,
                 &mut WindowGesture::default(),
                 false,
+                &mut UpdateCheckState::default(),
             );
         });
         for clipped in &output.shapes {
@@ -5625,6 +5786,7 @@ mod tests {
                 &icons,
                 &mut WindowGesture::default(),
                 false,
+                &mut UpdateCheckState::default(),
             );
         });
         let update = output
@@ -5704,6 +5866,7 @@ mod tests {
                 &icons,
                 &mut WindowGesture::default(),
                 false,
+                &mut UpdateCheckState::default(),
             );
             interact_size_y = ui.spacing().interact_size.y;
             rendered_height = ui.min_rect().height();
@@ -9902,6 +10065,284 @@ mod tests {
         }
     }
 
+    // -- issue #171: "Check for updates" --------------------------------
+
+    /// `start_update_check` is what the header dropdown's click handler
+    /// calls; the thread it spawns talks to the network (or, off-Windows,
+    /// immediately reports `platform::http_get`'s stub error) — see
+    /// `update_check`'s own tests for everything decidable without one.
+    /// All this checks is the state transition the click handler relies
+    /// on: a fresh request always starts out `Checking`, never landing in
+    /// `Idle` or `Done` before its thread has even run.
+    #[test]
+    fn start_update_check_begins_in_the_checking_state() {
+        assert!(matches!(
+            start_update_check(),
+            UpdateCheckState::Checking { .. }
+        ));
+    }
+
+    /// `OverlayApp::poll_update_check` is `drain_snapshots`'s counterpart
+    /// for the update-check channel (see `UpdateCheckState`'s doc comment
+    /// for why it has to be a once-per-frame poll rather than something
+    /// read only while the dropdown happens to be open). This drives it
+    /// directly, standing in for the update-check thread with a plain
+    /// `send` on the same channel `start_update_check` would have handed
+    /// out.
+    #[test]
+    fn poll_update_check_picks_up_a_landed_result() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(rx_snapshot, tx_command, tx_settings, Settings::default());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.update_check = UpdateCheckState::Checking { rx };
+        tx.send(Ok(CheckOutcome::UpToDate)).unwrap();
+
+        app.poll_update_check();
+
+        assert!(matches!(
+            app.update_check,
+            UpdateCheckState::Done(Ok(CheckOutcome::UpToDate))
+        ));
+    }
+
+    /// Counterpart to the test above: with nothing sent on the channel yet,
+    /// a poll must leave the state exactly as `Checking` — not, say, some
+    /// default/empty `Done` — so a still-in-flight request keeps rendering
+    /// "Checking…" instead of silently resolving to nothing.
+    #[test]
+    fn poll_update_check_leaves_an_in_flight_request_checking() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(rx_snapshot, tx_command, tx_settings, Settings::default());
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        app.update_check = UpdateCheckState::Checking { rx };
+
+        app.poll_update_check();
+
+        assert!(matches!(
+            app.update_check,
+            UpdateCheckState::Checking { .. }
+        ));
+    }
+
+    /// The failure mode the two tests above can't reach: the update-check
+    /// thread dies without ever sending (a panic inside the unsafe WinHTTP
+    /// FFI, say), so its sender drops and the channel disconnects. That has
+    /// to resolve to a `Done(Err(..))` rather than read as "still empty" —
+    /// otherwise the state stays `Checking` forever and, because
+    /// `draw_header_menu` disables the button while checking (see
+    /// `draw_header_menu_disables_check_for_updates_while_one_is_in_flight`),
+    /// the user can never retry without restarting the app.
+    #[test]
+    fn poll_update_check_resolves_a_disconnected_channel_to_an_error() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(rx_snapshot, tx_command, tx_settings, Settings::default());
+        let (tx, rx) = crossbeam_channel::unbounded::<Result<CheckOutcome, String>>();
+        app.update_check = UpdateCheckState::Checking { rx };
+        drop(tx);
+
+        app.poll_update_check();
+
+        assert!(
+            matches!(app.update_check, UpdateCheckState::Done(Err(_))),
+            "a dropped sender must resolve out of Checking, got {:?}",
+            app.update_check
+        );
+    }
+
+    /// Two checks at once would race two threads to the same channel, so
+    /// the button is disabled while one is in flight — and, since that's
+    /// the only thing standing between the user and a pile-up, it's worth
+    /// asserting rather than assuming. Read back off AccessKit (which is
+    /// where `Response::fill_accesskit_node_common` records `!enabled` as
+    /// `set_disabled`) rather than off the painted shapes, since a disabled
+    /// button paints the same string a live one does.
+    #[test]
+    fn draw_header_menu_disables_check_for_updates_while_one_is_in_flight() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let (_tx, rx) = crossbeam_channel::unbounded();
+
+        let mut disabled_while = |update_check: &mut UpdateCheckState| {
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                draw_header_menu(
+                    ui,
+                    &ctx,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    update_check,
+                );
+            });
+            let update = output
+                .platform_output
+                .accesskit_update
+                .clone()
+                .expect("accesskit was enabled for this frame");
+            let disabled = update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label().is_some_and(|s| s == "Check for updates"))
+                .map(|(_, node)| node.is_disabled());
+            output.drop_without_applying_deltas();
+            disabled
+        };
+
+        assert_eq!(
+            disabled_while(&mut UpdateCheckState::Checking { rx }),
+            Some(true),
+            "the button must be disabled while a check is in flight"
+        );
+        assert_eq!(
+            disabled_while(&mut UpdateCheckState::Done(Err("boom".to_string()))),
+            Some(false),
+            "a resolved check must leave the button clickable again, so the user can retry"
+        );
+    }
+
+    /// The error branch of the same render the two `Done(Ok(..))` tests
+    /// below cover: whatever `check_for_update` (or `poll_update_check`'s
+    /// disconnected-channel path) reports has to reach the dropdown as
+    /// text, since it's the only signal the user gets that the check
+    /// failed rather than silently did nothing.
+    #[test]
+    fn draw_header_menu_shows_the_reason_a_check_failed() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let mut update_check = UpdateCheckState::Done(Err("no network".to_string()));
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut update_check,
+            );
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text_shapes(&clipped.shape, &mut texts);
+        }
+        output.drop_without_applying_deltas();
+
+        let expected = "Update check failed: no network".to_string();
+        assert!(
+            texts.contains(&expected),
+            "expected {expected:?} among the painted text, got {texts:?}"
+        );
+    }
+
+    /// Renders `draw_header_menu` directly (not through the popup — same
+    /// reasoning as `draw_header_menu_dispatches_close_to_the_right_command`)
+    /// with the state already `Done(Ok(UpToDate))`, and reads back every
+    /// string it painted the same way `header_rendered_texts` does for
+    /// `draw_header`, since none of this menu's items go through accesskit
+    /// alone — `ui.label`/`ui.button` both paint a `Shape::Text` regardless.
+    #[test]
+    fn draw_header_menu_shows_up_to_date_with_the_running_version() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let mut update_check = UpdateCheckState::Done(Ok(CheckOutcome::UpToDate));
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut update_check,
+            );
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text_shapes(&clipped.shape, &mut texts);
+        }
+        output.drop_without_applying_deltas();
+
+        let expected = format!("Up to date (v{})", env!("CARGO_PKG_VERSION"));
+        assert!(
+            texts.contains(&expected),
+            "expected {expected:?} among the painted text, got {texts:?}"
+        );
+    }
+
+    /// Same shape as the test above, but for the update-available branch:
+    /// both the tag and the "Download" hyperlink's own label must be
+    /// painted — the actual `href` isn't a painted string at all (it's a
+    /// `ViewportCommand::OpenUrl` queued on click, not text), so this only
+    /// covers what a render test can see.
+    #[test]
+    fn draw_header_menu_shows_update_available_with_the_tag_and_a_download_link() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let mut update_check = UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable {
+            tag: "v0.3.0".to_string(),
+            url: "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/tag/v0.3.0".to_string(),
+        }));
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut update_check,
+            );
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text_shapes(&clipped.shape, &mut texts);
+        }
+        output.drop_without_applying_deltas();
+
+        assert!(
+            texts.contains(&"Update available: v0.3.0".to_string()),
+            "expected the update-available line among the painted text, got {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Download".to_string()),
+            "expected the Download hyperlink's label among the painted text, got {texts:?}"
+        );
+    }
+
     /// Reset moved out of this menu into the toggle cluster (issue #82;
     /// see `clicking_reset_sends_the_reset_command`), leaving Close as the
     /// only command this menu itself still dispatches. This drives a real
@@ -9930,6 +10371,7 @@ mod tests {
                     tx_settings: &tx_settings,
                 },
                 &icons,
+                &mut UpdateCheckState::default(),
             );
         });
         let update = layout
@@ -9951,6 +10393,7 @@ mod tests {
                     tx_settings: &tx_settings,
                 },
                 &icons,
+                &mut UpdateCheckState::default(),
             );
         });
         let close_commands = output
@@ -10007,6 +10450,7 @@ mod tests {
                     tx_settings: &tx_settings,
                 },
                 &icons,
+                &mut UpdateCheckState::default(),
             );
         });
         let update = layout
@@ -10035,6 +10479,7 @@ mod tests {
                     tx_settings: &tx_settings,
                 },
                 &icons,
+                &mut UpdateCheckState::default(),
             );
         });
         output.drop_without_applying_deltas();
@@ -10067,6 +10512,7 @@ mod tests {
                     tx_settings: &tx_settings,
                 },
                 &icons,
+                &mut UpdateCheckState::default(),
             );
         });
         output.drop_without_applying_deltas();
@@ -10117,6 +10563,7 @@ mod tests {
         let mut settings = Settings::default();
         let snapshot = header_test_snapshot(0);
         let mut gesture = WindowGesture::default();
+        let mut update_check = UpdateCheckState::default();
 
         // Runs one frame of the real `draw_header` (chevron, popup wiring,
         // and all) and hands back this frame's accessibility tree, the same
@@ -10147,6 +10594,7 @@ mod tests {
                     &icons,
                     &mut gesture,
                     false,
+                    &mut update_check,
                 );
             });
             let update = output

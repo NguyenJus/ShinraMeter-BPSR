@@ -14,3 +14,4 @@ pub mod platform;
 pub mod scene_bosses_cache;
 pub mod settings;
 pub mod ui;
+pub mod update_check;

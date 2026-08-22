@@ -56,6 +56,10 @@ windows = { workspace = true, features = [
     # `GetModuleHandleW`, to look up the executable's own icon resource for
     # the tray entry (issue #53).
     "Win32_System_LibraryLoader",
+    # `WinHttpOpen`/`WinHttpConnect`/`WinHttpSendRequest`/etc. for the
+    # header dropdown's manual "Check for updates" GET against GitHub's
+    # releases API (`src/platform.rs::http_get`, issue #171).
+    "Win32_Networking_WinHttp",
 ] }
 
 [build-dependencies]
