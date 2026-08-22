@@ -5936,6 +5936,23 @@ fn skill_selected_tab_rect(tabs_rect: egui::Rect, text_width: f32) -> egui::Rect
     )
 }
 
+/// The column-header band's rect (issue #200): flush with the window's
+/// left/right edges, directly beneath the tab strip, `SKILL_COLUMN_HEADER_
+/// HEIGHT` tall. Painted with `SKILL_COLUMN_HEADER_FILL`.
+fn skill_column_header_rect(rect: egui::Rect, tabs_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(rect.left(), tabs_rect.bottom()),
+        egui::vec2(rect.width(), SKILL_COLUMN_HEADER_HEIGHT),
+    )
+}
+
+/// The scrollable row-list band's rect (issue #200): everything below the
+/// column header down to the window's bottom edge. Painted with
+/// `SKILL_PANEL_FILL`, not the window's `SKILL_CHROME_FILL`.
+fn skill_rows_rect(rect: egui::Rect, col_header_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(egui::pos2(rect.left(), col_header_rect.bottom()), rect.max)
+}
+
 fn draw_skill_window(
     ui: &mut egui::Ui,
     row: &PlayerRow,
@@ -6085,10 +6102,7 @@ fn draw_skill_window(
     );
 
     // -- column header row: click (either button, D9) toggles sort -------
-    let col_header_rect = egui::Rect::from_min_size(
-        egui::pos2(rect.left(), tabs_rect.bottom()),
-        egui::vec2(rect.width(), SKILL_COLUMN_HEADER_HEIGHT),
-    );
+    let col_header_rect = skill_column_header_rect(rect, tabs_rect);
     painter.rect_filled(
         col_header_rect,
         0.0,
@@ -6136,8 +6150,7 @@ fn draw_skill_window(
     // BPSR's skill ids are flat — there is no "short name" to group
     // sub-skills under, so unlike the reference's expander rows this is
     // deliberately one row per skill id with no expand/collapse tier.
-    let rows_rect =
-        egui::Rect::from_min_max(egui::pos2(rect.left(), col_header_rect.bottom()), rect.max);
+    let rows_rect = skill_rows_rect(rect, col_header_rect);
     // Issue #200: the row list sits on the panel fill, not the window's
     // chrome fill. Measured at x=860 the reference's rows band is exactly
     // `SKILL_PANEL_FILL - SKILL_CHROME_FILL` (16 per channel) brighter than
@@ -11222,7 +11235,7 @@ mod tests {
     #[test]
     fn skill_row_icon_matches_the_reference_and_clears_the_name() {
         assert_eq!(SKILL_ICON_SIZE, 38.0);
-        assert!(SKILL_ICON_SIZE < SKILL_ROW_HEIGHT);
+        const { assert!(SKILL_ICON_SIZE < SKILL_ROW_HEIGHT) };
         let gap = skills::SkillColumn::Icon.width() - SKILL_ICON_SIZE;
         assert!(
             (8.0..=12.0).contains(&gap),
@@ -11270,6 +11283,41 @@ mod tests {
             fill.right() < tabs.right(),
             "the rest of the strip must stay window fill"
         );
+    }
+
+    /// Pins the column-header band's rect (issue #200): flush with the
+    /// window edges, directly beneath the tab strip, `SKILL_COLUMN_HEADER_
+    /// HEIGHT` tall — this is the rect `SKILL_COLUMN_HEADER_FILL` paints.
+    #[test]
+    fn column_header_rect_sits_flush_beneath_the_tab_strip() {
+        let rect = egui::Rect::from_min_size(egui::pos2(5.0, 5.0), egui::vec2(800.0, 600.0));
+        let tabs_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), 75.0),
+            egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
+        );
+        let col_header_rect = skill_column_header_rect(rect, tabs_rect);
+        assert_eq!(col_header_rect.left(), rect.left());
+        assert_eq!(col_header_rect.right(), rect.right());
+        assert_eq!(col_header_rect.top(), tabs_rect.bottom());
+        assert_eq!(col_header_rect.height(), SKILL_COLUMN_HEADER_HEIGHT);
+    }
+
+    /// Pins the scrollable row-list band's rect (issue #200): everything
+    /// below the column header down to the window's bottom edge — this is
+    /// the rect `SKILL_PANEL_FILL` paints, distinct from the chrome fill
+    /// above it.
+    #[test]
+    fn rows_rect_fills_everything_below_the_column_header() {
+        let rect = egui::Rect::from_min_size(egui::pos2(5.0, 5.0), egui::vec2(800.0, 600.0));
+        let col_header_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), 132.0),
+            egui::vec2(rect.width(), SKILL_COLUMN_HEADER_HEIGHT),
+        );
+        let rows_rect = skill_rows_rect(rect, col_header_rect);
+        assert_eq!(rows_rect.left(), rect.left());
+        assert_eq!(rows_rect.right(), rect.right());
+        assert_eq!(rows_rect.top(), col_header_rect.bottom());
+        assert_eq!(rows_rect.bottom(), rect.bottom());
     }
 
     /// The panel is deliberately *not* the source's slate `#232830` — that

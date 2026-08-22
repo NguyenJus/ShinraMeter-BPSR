@@ -39,7 +39,7 @@ impl SkillColumn {
     pub fn label(self) -> &'static str {
         match self {
             // The icon column is unlabelled in the reference, and there is
-            // nothing to abbreviate a picture to in 32pt anyway.
+            // nothing to abbreviate a picture to in 48pt anyway.
             SkillColumn::Icon => "",
             SkillColumn::Name => "Skill name",
             SkillColumn::Damage => "Damage",
