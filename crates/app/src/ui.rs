@@ -21,7 +21,9 @@ use eframe::egui;
 
 use crate::fonts;
 use crate::history;
-use crate::icons::{ClassIcons, GlyphIcon, GlyphIcons, ImagineIcons, ToolbarIcon, ToolbarIcons};
+use crate::icons::{
+    ClassIcons, GlyphIcon, GlyphIcons, ImagineIcons, SkillIcons, ToolbarIcon, ToolbarIcons,
+};
 use crate::imagines;
 use crate::settings::{ColumnKind, Settings};
 use crate::skills;
@@ -298,6 +300,8 @@ struct Icons {
     // IMAGINE-TAKEDOWN: one of five sites — see
     // `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
     imagines: ImagineIcons,
+    /// Per-skill row icons for the breakdown window (issue #192).
+    skills: SkillIcons,
 }
 
 impl Icons {
@@ -311,6 +315,7 @@ impl Icons {
             toolbar: ToolbarIcons::load(ctx),
             glyphs: GlyphIcons::load(ctx),
             imagines: ImagineIcons::load(ctx),
+            skills: SkillIcons::load(ctx),
         }
     }
 }
@@ -5275,6 +5280,16 @@ const SKILL_COLUMN_HEADER_HEIGHT: f32 = 28.0;
 /// row list's `ROW_HEIGHT` (30.0), so this is its own constant rather than
 /// reusing that one.
 const SKILL_ROW_HEIGHT: f32 = 40.0;
+/// The per-skill row icon (issue #192), sized against the 40pt row the way
+/// `SKILL_HEADER_ICON_SIZE` is sized against the 56pt header: big enough to
+/// read, with room left for the row's vertical breathing space. The vendored
+/// PNGs are 48px (`scripts/prep-skill-icons.py`), so this is a 2x source at
+/// 100% display scaling.
+const SKILL_ICON_SIZE: f32 = 24.0;
+/// Fill for a row whose skill has no icon to paint. Deliberately the same
+/// flat disc the Imagine slots degrade to, so an empty slot reads as a
+/// deliberate blank rather than a rendering failure.
+const SKILL_ICON_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x3B);
 const SKILL_HEADER_ICON_SIZE: f32 = 32.0;
 const SKILL_HEADER_PAD_X: f32 = 12.0;
 const SKILL_HEADER_PAD_Y: f32 = 8.0;
@@ -5288,7 +5303,8 @@ const FONT_SIZE_SKILL_HEADER_NAME: f32 = 24.0;
 /// D5's column order, as a fixed array so the header row and every data
 /// row iterate it identically — a column can never appear in one but not
 /// the other.
-const SKILL_COLUMN_ORDER: [skills::SkillColumn; 11] = [
+const SKILL_COLUMN_ORDER: [skills::SkillColumn; 12] = [
+    skills::SkillColumn::Icon,
     skills::SkillColumn::Name,
     skills::SkillColumn::Damage,
     skills::SkillColumn::DmgPct,
@@ -5307,7 +5323,11 @@ const SKILL_COLUMN_ORDER: [skills::SkillColumn; 11] = [
 /// header padding (widths sum to `680`; `720` leaves room for the padding
 /// and the scrollbar), tall enough for the header, tab strip and
 /// column-header row plus roughly ten rows before the list scrolls.
-const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(720.0, 520.0);
+// Issue #192 widened this from 720: the leading icon column adds 32pt of
+// column budget, and at 720 the sum of `SkillColumn::width`s would exceed
+// the content width, making `column_anchors_from_widths` shrink every
+// column to fit rather than laying them out at their stated widths.
+const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 520.0);
 
 /// One open breakdown window's own state (issue #16, D9): its sort column/
 /// direction, and the screen position it was placed at when opened. `pos`
@@ -5529,7 +5549,7 @@ fn draw_skill_window(
             ui.id().with(("skill_col_header", row.uid, i)),
             egui::Sense::click(),
         );
-        if response.clicked() || response.secondary_clicked() {
+        if kind.sortable() && (response.clicked() || response.secondary_clicked()) {
             sort.toggle(*kind);
         }
         let label = sort.header_label(*kind);
@@ -5579,6 +5599,38 @@ fn draw_skill_window(
                         egui::pos2(anchor_x, skill_rect.bottom()),
                     );
                     let cell_painter = ui.painter().with_clip_rect(clip);
+                    // Issue #192: the leading icon column paints a texture,
+                    // not text. Left-aligned inside its cell so the icons
+                    // line up with each other and sit a fixed gap from the
+                    // skill name, exactly as in the reference. A skill the
+                    // name tables know no icon for, an icon whose PNG is not
+                    // vendored here, and one that failed to decode all land
+                    // on the same blank-disc branch — one degrade path,
+                    // never a panic, the same shape `ImagineIcons`' empty
+                    // slot uses.
+                    if *kind == skills::SkillColumn::Icon {
+                        let center =
+                            egui::pos2(clip.left() + SKILL_ICON_SIZE / 2.0, clip.center().y);
+                        match skills::skill_icon_basename(skill.skill_id)
+                            .and_then(|basename| icons.skills.get(basename))
+                        {
+                            Some(texture) => cell_painter.image(
+                                texture.id(),
+                                egui::Rect::from_center_size(
+                                    center,
+                                    egui::Vec2::splat(SKILL_ICON_SIZE),
+                                ),
+                                UV_FULL,
+                                CLASS_ICON_TINT,
+                            ),
+                            None => cell_painter.circle_filled(
+                                center,
+                                SKILL_ICON_SIZE / 2.0,
+                                SKILL_ICON_EMPTY,
+                            ),
+                        };
+                        continue;
+                    }
                     let (align, pos) = if *kind == skills::SkillColumn::Name {
                         (egui::Align2::LEFT_CENTER, clip.left_center())
                     } else {

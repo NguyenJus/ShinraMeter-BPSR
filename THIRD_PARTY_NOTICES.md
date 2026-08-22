@@ -96,6 +96,43 @@ WinDivert's LGPL-3.0 option is compatible.
   re-releasing — the icons are compiled in, so a directory deletion in an
   extracted copy is not enough on its own.
 
+## BPSR-ZDPS skill icons
+
+- Files: `crates/app/assets/skills/*.png` — 179 of the 180 icon basenames
+  referenced by `crates/meter/data/SkillOverridesIcons.json`. The one
+  remaining reference is not an asset name at all (upstream stores the prose
+  "From Shield Combo talent" in that row's `Icon` field) and no image exists
+  for it. Only the icons the meter can actually draw are shipped, the same
+  footprint discipline the Imagine icons above follow — the 348 + 86 upstream
+  images are not bulk-redistributed.
+- Upstream: <https://github.com/Blue-Protocol-Source/BPSR-ZDPS>
+  (`Data/Images/Skills/` and `Data/Images/Skills_Imagines/`; the `Icon` field
+  does not say which of the two an icon lives in, so both are searched)
+- Basis: same as the class and Imagine icons above — game-client-derived
+  assets, obtained via BPSR-ZDPS, redistributed on the inferred basis that the
+  game's developers have publicly endorsed open-source meters and have not
+  objected to other meters shipping the same data. No permission was requested
+  or granted directly, by either the game's developers or BPSR-ZDPS.
+- Modified: downscaled to 48x48 with Lanczos resampling, then alpha-masked to
+  a circle, by `scripts/prep-skill-icons.py` — which reuses
+  `scripts/prep-imagine-icons.py`'s transforms rather than restating them.
+  Resampled with stated provenance, not verbatim, the same register the
+  Imagine-icon note above uses.
+- Shipped compiled into the executable via `include_bytes!` (issue #123's
+  reasoning). The file names and bytes are generated into `SKILL_ICON_FILES`
+  and `SKILL_ICON_BYTES` in `crates/app/src/skill_icons.rs` by
+  `scripts/gen-skill-icons.py`.
+- The id -> icon table these are keyed against,
+  `crates/meter/data/SkillOverridesIcons.json` and the `skill_icon` function it
+  generates in `crates/meter/src/tables.rs`, is covered by the BPSR-ZDPS game
+  table section below, under that section's MIT grant.
+- Takedown: these assets will be removed promptly on request from the rights
+  holder. To request removal, open a GitHub issue on this repository. For an
+  already-distributed release, the takedown is deleting
+  `crates/app/assets/skills/` from the source tree, rebuilding, and
+  re-releasing — the icons are compiled in, so a directory deletion in an
+  extracted copy is not enough on its own.
+
 ## ShinraMeter toolbar icons
 
 - Files: `crates/app/assets/icons/*.png`
@@ -216,12 +253,15 @@ WinDivert's LGPL-3.0 option is compatible.
   here is only the `{id: name}` projection of each (about 97 KB, 19 KB and
   17 KB), produced by `filter_id_names` in `scripts/gen-name-tables.py`;
   nothing else from those rows is copied into this repository. `SkillOverrides.en.json`
-  is filtered the same way: upstream it is ~152 KB of `{id: {Name, Icon}}`
-  objects, and only the `{id: Name}` projection (~56 KB) is vendored as
-  `SkillOverridesNames.json` — the `Icon` field is dropped, since skill icons
-  are issue #9's unsolved problem and are out of scope here. Re-run
-  `scripts/gen-name-tables.py --refresh` to reproduce the filtering from
-  upstream.
+  is filtered the same way, into two files: the `{id: Name}` projection
+  (~56 KB) is vendored as `SkillOverridesNames.json`, and — since issue #192
+  — the `{id: Icon}` projection (~11 KB, 327 of the 1487 rows carry a usable
+  icon reference) as `SkillOverridesIcons.json`, produced by `filter_id_icons`
+  in the same script. Only the last path segment of each `Icon` value is kept:
+  upstream they are client atlas paths
+  (`ui/atlas/skill_weapon_mz/weapon_mz-01_kx06`) and this project's asset
+  directory is flat. Re-run `scripts/gen-name-tables.py --refresh` to
+  reproduce the filtering from upstream.
 - Added by issue #36 to backfill the ids the community tables do not cover:
   they take `monster_name` from 216 to 3,094 ids and `scene_name` from 340 to
   605, so far fewer encounters fall back to a raw `Monster #40010` /
