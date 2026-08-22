@@ -270,7 +270,8 @@ pub struct OverlayApp {
     startup_toggles_applied: bool,
     /// Per-player skill breakdown windows currently open (issue #16), keyed
     /// by player uid; the value is that window's own sort state plus the
-    /// screen position it was placed at when opened (`SkillWindowState`).
+    /// screen position it was placed at and the size it is shown at
+    /// (`SkillWindowState`).
     /// Lives on the app rather than in egui memory for the same reason
     /// `window_gesture` does: `ctx.show_viewport_immediate` runs each
     /// child's UI on this same frame and thread, which is precisely what
@@ -1075,10 +1076,22 @@ impl eframe::App for OverlayApp {
                     egui::Pos2::ZERO,
                     egui::Vec2::ZERO,
                 ));
-            open_skill_window(&mut self.skill_windows, uid, || SkillWindowState {
-                sort: skills::SkillSort::default(),
-                pos: skills::place_window(main_outer, monitor, SKILL_WINDOW_SIZE),
-            });
+            let already_open =
+                open_skill_window(&mut self.skill_windows, uid, || SkillWindowState {
+                    sort: skills::SkillSort::default(),
+                    pos: skills::place_window(main_outer, monitor, SKILL_WINDOW_SIZE),
+                    size: SKILL_WINDOW_SIZE,
+                });
+            // Issue #189: the window is no longer always-on-top, so an
+            // already-open one can be sitting behind a fullscreen game with
+            // no taskbar entry to click. Re-right-clicking the row is the
+            // only path back to it, and that path only exists if the
+            // gesture raises the viewport — the map is deliberately left
+            // untouched (see `open_skill_window`), so this command is the
+            // entire visible effect of a second right-click.
+            if already_open {
+                ctx.send_viewport_cmd_to(skill_viewport_id(uid), egui::ViewportCommand::Focus);
+            }
         }
 
         // Issue #16 (D2): one immediate child viewport per open breakdown
@@ -1105,7 +1118,7 @@ impl eframe::App for OverlayApp {
                 .with_resizable(true)
                 .with_taskbar(false)
                 .with_active(false)
-                .with_inner_size(SKILL_WINDOW_SIZE)
+                .with_inner_size(state.size)
                 .with_min_inner_size(SKILL_WINDOW_MIN_SIZE)
                 .with_position(state.pos);
             // None of `platform::disable_aero_snap`/`install_snap_blocker`/
@@ -1114,18 +1127,23 @@ impl eframe::App for OverlayApp {
             // window's HWND, once, from `CreationContext`, and never looks
             // a window up by title or class, so it cannot see this window
             // at all. This is deliberately not click-through (D2).
-            let close_requested = ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of(("skills", uid)),
-                builder,
-                |ui, _class| {
+            let close_requested =
+                ctx.show_viewport_immediate(skill_viewport_id(uid), builder, |ui, _class| {
                     let x_clicked = draw_skill_window(ui, row, &mut state.sort, icons, opacity);
+                    // Issue #181: read from inside the child callback, for
+                    // the same reason the close-request check below is —
+                    // this is where `ctx.input` reflects the *child*
+                    // viewport rather than the root window.
+                    track_skill_window_size(
+                        &mut state.size,
+                        ui.ctx().input(|i| i.viewport().inner_rect),
+                    );
                     // Belt-and-braces (D2): an OS-level close (Alt+F4, task
                     // manager, …) must drop this uid exactly like the
                     // in-window `X` does, so the window can never be
                     // orphaned open with no way left to close it.
                     x_clicked || ui.ctx().input(|i| i.viewport().close_requested())
-                },
-            );
+                });
             if close_requested {
                 closed_skill_windows.push(uid);
             }
@@ -5378,7 +5396,8 @@ const SKILL_COLUMN_ORDER: [skills::SkillColumn; 12] = [
 ];
 
 /// Initial inner size for a skill breakdown window (issue #181: the viewport
-/// is resizable, so this is only the size it opens at) — wide enough for
+/// is resizable, so this is only the size a newly opened one starts at —
+/// `SkillWindowState::size` takes over from there) — wide enough for
 /// every `SkillColumn` at its full width plus header padding, tall enough
 /// for the header, tab strip and column-header row plus roughly ten rows
 /// before the list scrolls. `draw_skill_window` lays everything out from the
@@ -5398,14 +5417,19 @@ const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 520.0);
 const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(360.0, 220.0);
 
 /// One open breakdown window's own state (issue #16, D9): its sort column/
-/// direction, and the screen position it was placed at when opened. `pos`
-/// is computed once, at open time (`skills::place_window`), and never
-/// recomputed on a later frame — recomputing it every frame would fight a
-/// user actively dragging the window, snapping it back to its dock point
-/// on the very next repaint.
+/// direction, the screen position it was placed at when opened, and the
+/// inner size it is currently shown at. `pos` is computed once, at open
+/// time (`skills::place_window`), and never recomputed on a later frame —
+/// recomputing it every frame would fight a user actively dragging the
+/// window, snapping it back to its dock point on the very next repaint.
+/// `size` works the other way around: it starts at `SKILL_WINDOW_SIZE` and
+/// then follows the live viewport (`track_skill_window_size`), so a
+/// viewport that is torn down and rebuilt reopens at the size the user
+/// resized it to instead of snapping back to the constant (issue #181).
 struct SkillWindowState {
     sort: skills::SkillSort,
     pos: egui::Pos2,
+    size: egui::Vec2,
 }
 
 /// Applies one frame's right-click gesture to the open-window set (D1): a
@@ -5414,12 +5438,30 @@ struct SkillWindowState {
 /// toggle it closed, and `BTreeMap::entry().or_insert_with` is exactly
 /// that (`state` never runs for an already-open uid, so its placement is
 /// never recomputed either).
+///
+/// Returns whether the uid was *already* open, which is the caller's cue to
+/// raise and focus that viewport (issue #189). Leaving the map untouched is
+/// the whole behaviour for an already-open uid, so without that command the
+/// gesture would be a silent no-op — and since the window is no longer
+/// always-on-top and has no taskbar entry (`with_taskbar(false)`), a
+/// fullscreen game covering it would leave the user with no way back to it,
+/// not even to its close glyph.
 fn open_skill_window(
     windows: &mut std::collections::BTreeMap<i64, SkillWindowState>,
     uid: i64,
     state: impl FnOnce() -> SkillWindowState,
-) {
+) -> bool {
+    let already_open = windows.contains_key(&uid);
     windows.entry(uid).or_insert_with(state);
+    already_open
+}
+
+/// The child viewport id one breakdown window is shown under. A function
+/// rather than an inline `from_hash_of` at each site so the open gesture's
+/// focus command and the draw loop's viewport can never drift apart onto
+/// two different ids for the same uid.
+fn skill_viewport_id(uid: i64) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(("skills", uid))
 }
 
 /// The only two paths that may drop a uid from the open-window set (D2):
@@ -5428,6 +5470,42 @@ fn open_skill_window(
 fn close_skill_window(windows: &mut std::collections::BTreeMap<i64, SkillWindowState>, uid: i64) {
     windows.remove(&uid);
 }
+
+/// Follows one breakdown window's live inner size (issue #181) so its
+/// `ViewportBuilder` reopens it at the size the user left it at rather than
+/// at `SKILL_WINDOW_SIZE`. Mirrors `track_window_size`'s job for the root
+/// window, `is_plausible_size` guard included; the difference is where the
+/// size lands. This one stays in `SkillWindowState` rather than `Settings`
+/// because, like `sort` and `pos`, it is per-window state that dies with
+/// the window (`close_skill_window`). The child viewport reports its inner
+/// rect on every frame, so the update is gated on an actual resize the same
+/// way `Settings::with_window_size_if_changed` gates its send: the size is
+/// fed straight back into the next frame's builder, and forwarding
+/// sub-pixel DPI jitter there would have egui resizing the window at itself
+/// on every repaint.
+fn track_skill_window_size(size: &mut egui::Vec2, inner_rect: Option<egui::Rect>) {
+    let Some(rect) = inner_rect else {
+        return;
+    };
+    let reported = rect.size();
+    if !is_plausible_size(reported) {
+        return;
+    }
+    if (size.x - reported.x).abs() < SKILL_WINDOW_SIZE_EPSILON
+        && (size.y - reported.y).abs() < SKILL_WINDOW_SIZE_EPSILON
+    {
+        return;
+    }
+    *size = reported;
+}
+
+/// How far the breakdown viewport has to have resized before
+/// `track_skill_window_size` believes it — the same fractional-DPI jitter
+/// floor, and the same one-logical-pixel value, `settings.rs`'
+/// `SIZE_EPSILON` uses for the root window. Its own constant here because
+/// that one is private to `settings.rs` and gates a disk write, while this
+/// one gates a viewport command.
+const SKILL_WINDOW_SIZE_EPSILON: f32 = 1.0;
 
 /// The `(row, uid)` pairs this frame's viewport-draw loop should actually
 /// paint: every open uid that still has a row in the current snapshot. A
@@ -5455,8 +5533,10 @@ fn skill_windows_to_draw<'a>(
 /// window orphaned (D2).
 ///
 /// Painted with explicit rects via `ui.painter()`, mirroring `draw_row`'s
-/// style, rather than egui's widget-flow layout: the window is fixed-size
-/// and non-resizable, so every position is a known constant, and the
+/// style, rather than egui's widget-flow layout: every position is derived
+/// live from the viewport's own rect (`ui.max_rect()`) on each frame, so
+/// the layout follows the window as the user resizes it (issue #181,
+/// `SKILL_WINDOW_SIZE` being only the size it opens at), and the
 /// column grid reuses `column_anchors_from_widths`' right-aligned-anchor
 /// scheme, the same maths `column_anchors` uses for the main row list —
 /// the anchor maths is not re-derived here.
@@ -12842,6 +12922,7 @@ mod tests {
         SkillWindowState {
             sort: skills::SkillSort::default(),
             pos,
+            size: SKILL_WINDOW_SIZE,
         }
     }
 
@@ -12858,6 +12939,71 @@ mod tests {
         });
         assert!(windows.contains_key(&1));
         assert_eq!(windows[&1].pos, egui::pos2(1.0, 1.0));
+    }
+
+    /// The map is deliberately untouched for an already-open uid, so the
+    /// return value is the only thing that can tell the caller to raise and
+    /// focus the buried viewport (issue #189).
+    #[test]
+    fn a_second_right_click_reports_the_uid_as_already_open() {
+        let mut windows = std::collections::BTreeMap::new();
+
+        let first = open_skill_window(&mut windows, 1, || skill_window_state(egui::pos2(1.0, 1.0)));
+        let second =
+            open_skill_window(&mut windows, 1, || skill_window_state(egui::pos2(1.0, 1.0)));
+
+        assert!(!first, "the first right-click is what opens the window");
+        assert!(second, "the second must ask the caller to focus it");
+    }
+
+    fn skill_inner_rect_of(size: egui::Vec2) -> Option<egui::Rect> {
+        Some(egui::Rect::from_min_size(egui::pos2(1.0, 1.0), size))
+    }
+
+    /// The round trip issue #181 is about: a size the user resized to is
+    /// tracked off the live viewport, and is still what the next
+    /// `ViewportBuilder` reads after the window has been reopened — the
+    /// resize is no longer discarded in favour of `SKILL_WINDOW_SIZE`.
+    #[test]
+    fn a_resized_breakdown_reopens_at_the_size_it_was_left_at() {
+        let mut windows = std::collections::BTreeMap::new();
+        open_skill_window(&mut windows, 1, || skill_window_state(egui::pos2(1.0, 1.0)));
+        let resized = egui::vec2(900.0, 640.0);
+
+        track_skill_window_size(
+            &mut windows.get_mut(&1).unwrap().size,
+            skill_inner_rect_of(resized),
+        );
+        // A later right-click on the same row must not undo it: `state`
+        // never runs for an already-open uid.
+        open_skill_window(&mut windows, 1, || skill_window_state(egui::pos2(1.0, 1.0)));
+
+        assert_eq!(windows[&1].size, resized);
+    }
+
+    /// Fractional-DPI jitter is not a resize — it would otherwise be fed
+    /// back into the builder and resize the window at itself every repaint.
+    #[test]
+    fn track_skill_window_size_ignores_sub_pixel_jitter() {
+        let mut size = SKILL_WINDOW_SIZE;
+
+        track_skill_window_size(
+            &mut size,
+            skill_inner_rect_of(SKILL_WINDOW_SIZE + egui::vec2(0.25, 0.25)),
+        );
+
+        assert_eq!(size, SKILL_WINDOW_SIZE);
+    }
+
+    /// Same plausibility floor `track_window_size` applies to the root
+    /// window: a zeroed size must never become the size it reopens at.
+    #[test]
+    fn track_skill_window_size_ignores_an_absurd_zeroed_size() {
+        let mut size = SKILL_WINDOW_SIZE;
+
+        track_skill_window_size(&mut size, skill_inner_rect_of(egui::Vec2::ZERO));
+
+        assert_eq!(size, SKILL_WINDOW_SIZE);
     }
 
     #[test]
