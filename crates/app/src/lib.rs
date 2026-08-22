@@ -14,5 +14,6 @@ pub mod pipeline;
 pub mod platform;
 pub mod scene_bosses_cache;
 pub mod settings;
+pub mod skills;
 pub mod ui;
 pub mod update_check;

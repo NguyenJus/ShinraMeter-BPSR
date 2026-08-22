@@ -115,6 +115,9 @@ impl PlayerRecord {
             lucky_pct: self.lucky_pct,
             hits: self.hits,
             deaths: self.deaths,
+            // Not persisted (issue #39's schema stores per-player totals
+            // only), so a rebuilt historical row has no breakdown.
+            skills: Vec::new(),
         }
     }
 }
@@ -295,6 +298,7 @@ mod tests {
             lucky_pct: 5.0,
             hits: 20,
             deaths: 1,
+            skills: Vec::new(),
         }
     }
 

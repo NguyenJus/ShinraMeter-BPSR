@@ -1575,6 +1575,7 @@ mod tests {
             season_strength: None,
             imagines: [None, None],
             imagine_tiers: [None, None],
+            skills: Vec::new(),
         };
         assert_eq!((ColumnKind::Deaths.spec().text)(&row), "12");
     }

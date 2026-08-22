@@ -13,7 +13,9 @@
 
 use std::time::Duration;
 
-use bpsr_meter::{Class, EncounterInfo, PlayerRow, Role, Snapshot};
+use bpsr_meter::{
+    Class, EncounterInfo, PlayerRow, Role, SkillRow, SkillStats, Snapshot, skill_row_from_stats,
+};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui;
 
@@ -22,6 +24,7 @@ use crate::history;
 use crate::icons::{ClassIcons, GlyphIcon, GlyphIcons, ImagineIcons, ToolbarIcon, ToolbarIcons};
 use crate::imagines;
 use crate::settings::{ColumnKind, Settings};
+use crate::skills;
 use crate::update_check::{self, CheckOutcome};
 
 // -- typography scale (issue #56, issue #62) ----------------------------
@@ -257,6 +260,16 @@ pub struct OverlayApp {
     /// through `toggle_cluster`'s own click handling and the tray menu's
     /// "Turn off click-through" escape hatch, not this flag.
     startup_toggles_applied: bool,
+    /// Per-player skill breakdown windows currently open (issue #16), keyed
+    /// by player uid; the value is that window's own sort state plus the
+    /// screen position it was placed at when opened (`SkillWindowState`).
+    /// Lives on the app rather than in egui memory for the same reason
+    /// `window_gesture` does: `ctx.show_viewport_immediate` runs each
+    /// child's UI on this same frame and thread, which is precisely what
+    /// lets this be an owned field instead of an `Arc<Mutex<..>>`. A
+    /// `BTreeMap` so several open windows keep a stable draw order across
+    /// frames.
+    skill_windows: std::collections::BTreeMap<i64, SkillWindowState>,
     /// Issue #39: the history thread's handle, or `None` when history is
     /// disabled or its database could not be opened — every history control is
     /// then simply absent, and nothing else changes.
@@ -323,9 +336,21 @@ fn demo_enabled_from(var: Option<&str>) -> bool {
     var.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
 }
 
+/// `(skill_id, damage, hits, crit_hits, crit_damage, max_crit)` for one
+/// skill in a `DemoRow`'s breakdown (issue #16). This is deliberately more
+/// than `bpsr_meter::SkillStats` carries at rest (it has no `crit_damage`
+/// field — only a running `max_crit`) because a `SkillRow`'s `avg_crit` and
+/// `avg_white` are *means*, and a literal fixture has no per-hit event
+/// stream to mean over; carrying `crit_damage` explicitly is the minimum
+/// needed for [`demo_skill_rows`] to hand every field off to
+/// `bpsr_meter::skill_row_from_stats` — the same formulas the real
+/// aggregator uses, rather than inventing a second, looser set of
+/// demo-only ones.
+type DemoSkill = (i32, i64, u64, u64, i64, i64);
+
 /// `(name, class, damage, crit_pct, lucky_pct, hits, deaths, imagines,
-/// imagine_tiers)` for one `DEMO_ROWS` entry. Named so the array below
-/// reads as one type, not clippy's `type_complexity` bait.
+/// imagine_tiers, skills)` for one `DEMO_ROWS` entry. Named so the array
+/// below reads as one type, not clippy's `type_complexity` bait.
 type DemoRow = (
     &'static str,
     Class,
@@ -336,6 +361,7 @@ type DemoRow = (
     u32,
     [Option<i32>; 2],
     [Option<i32>; 2],
+    &'static [DemoSkill],
 );
 
 /// `(name, class, damage, crit_pct, lucky_pct, hits, deaths, imagines,
@@ -375,6 +401,25 @@ type DemoRow = (
 /// paired with `imagines`. `Glorbaxian`'s first slot is deliberately pinned
 /// at `IMAGINE_MAX_TIER` so the demo capture actually shows the gold ring
 /// doing real work, not just the tooltip text.
+///
+/// `skills` (issue #16) is each row's per-skill breakdown, folded into the
+/// same tuple entry for the same reason `imagines` is: a row and its skills
+/// can't drift apart structurally, and there is no second by-index array
+/// whose length could silently disagree with `DEMO_ROWS`. Each skill's
+/// `damage`/`hits` are hand-picked to sum *exactly* to the row's own
+/// `damage`/`hits` — an inconsistent breakdown would contradict the row it
+/// opens from, which is exactly the class of header/row disagreement bug
+/// issue #148 already burned this file on once (see the `demo_snapshot` doc
+/// comment below). Skill ids are real ids from the vendored
+/// `SkillOverridesNames.json` curated table, picked so `tables::skill_name`
+/// resolves every one of them to a real name instead of the `Skill #<id>`
+/// fallback — a demo capture with placeholder names would be worthless for
+/// eyeballing the breakdown window. Each row gets 4-5 skills in a
+/// descending damage/hit split (a "signature" skill carrying roughly a
+/// third to two-fifths of the row, tapering off), with per-skill crit hits
+/// apportioned from the row's own `crit_pct` and crit damage weighted
+/// above the row's white-hit average, so `Max crit >= Avg crit` holds the
+/// way a real combat log's would.
 const DEMO_ROWS: [DemoRow; 5] = [
     (
         "Blorp",
@@ -386,6 +431,13 @@ const DEMO_ROWS: [DemoRow; 5] = [
         0,
         [Some(3901), Some(3902)],
         [Some(3), Some(1)],
+        &[
+            (1605, 21_014_000, 45, 30, 15_760_500, 683_955), // Blazing Ascension
+            (1607, 13_272_000, 36, 24, 9_954_000, 540_175),  // Blazing Assault
+            (1613, 8_848_000, 30, 20, 6_636_000, 432_340),   // Wildfire Dance
+            (1617, 7_189_000, 22, 14, 5_205_828, 484_398),   // Endless Hellfire
+            (1623, 4_977_000, 17, 11, 3_649_800, 432_340),   // Great Crimson Lotus
+        ],
     ),
     (
         "Glorbaxian",
@@ -397,6 +449,13 @@ const DEMO_ROWS: [DemoRow; 5] = [
         1,
         [Some(3903), Some(3904)],
         [Some(IMAGINE_MAX_TIER), Some(2)],
+        &[
+            (1239, 20_938_000, 54, 28, 12_932_294, 601_428), // Meteor Storm
+            (1241, 13_224_000, 43, 22, 8_081_333, 478_533),  // Frostbeam
+            (1244, 8_816_000, 36, 18, 5_289_600, 383_027),   // Blizzard
+            (1258, 7_163_000, 27, 14, 4_424_206, 411_819),   // Icy Bolt
+            (1259, 4_959_000, 20, 10, 2_975_400, 387_802),   // Frost Comet
+        ],
     ),
     (
         "Zog",
@@ -408,6 +467,13 @@ const DEMO_ROWS: [DemoRow; 5] = [
         0,
         [Some(3905), Some(3906)],
         [Some(0), Some(4)],
+        &[
+            (1714, 18_962_000, 63, 23, 8_781_060, 497_321), // Iaido Slash
+            (1715, 11_976_000, 50, 19, 5_736_403, 393_491), // Moonstrike
+            (1727, 7_984_000, 42, 15, 3_629_091, 315_521),  // Piercing Slash
+            (1728, 6_487_000, 32, 12, 3_072_789, 333_885),  // Ultimate Slash
+            (1736, 4_491_000, 23, 8, 1_996_000, 325_350),   // Phantom Slash
+        ],
     ),
     (
         "Thudd",
@@ -419,6 +485,13 @@ const DEMO_ROWS: [DemoRow; 5] = [
         0,
         [Some(3907), Some(3908)],
         [Some(1), Some(1)],
+        &[
+            (1401, 6_764_000, 162, 35, 1_978_329, 74_481), // Windborne Grace - Sweep
+            (1406, 4_272_000, 130, 28, 1_246_000, 58_850), // Windborne Grace
+            (1411, 2_848_000, 108, 23, 822_226, 47_474),   // Swift Blade
+            (1423, 2_314_000, 81, 17, 659_296, 51_417),    // Aegis Gale
+            (1932, 1_602_000, 59, 12, 443_631, 49_060),    // Shield Combo
+        ],
     ),
     (
         "Fizz",
@@ -430,8 +503,41 @@ const DEMO_ROWS: [DemoRow; 5] = [
         0,
         [Some(3909), None],
         [Some(2), None],
+        &[
+            (1550, 4_326_000, 32, 3, 581_104, 252_812), // Feral Seed - Seed Meteor
+            (1551, 2_781_000, 25, 2, 320_885, 209_575), // Regen Bud: Wild Seed
+            (1556, 1_854_000, 18, 1, 150_324, 196_421), // Bloomheal
+            (1560, 1_339_000, 15, 1, 129_581, 169_455), // Regen Pulse
+        ],
     ),
 ];
+
+/// Derives one demo row's `SkillRow`s from its `DemoSkill` fixture list
+/// (issue #16) via `bpsr_meter::skill_row_from_stats` — the same formulas
+/// the real aggregator uses, kept in sync by construction instead of a
+/// second copy of the arithmetic living here. Sorted damage-descending
+/// like the real snapshot, so the breakdown window's default sort (D9) is
+/// a no-op on first paint here too.
+fn demo_skill_rows(skills: &[DemoSkill], player_damage: i64, duration_ms: u64) -> Vec<SkillRow> {
+    let mut rows: Vec<SkillRow> = skills
+        .iter()
+        .map(
+            |&(skill_id, damage, hits, crit_hits, crit_damage, max_crit)| {
+                let stats = SkillStats {
+                    total_damage: damage,
+                    hits,
+                    crit_hits,
+                    crit_damage,
+                    max_crit,
+                    ..Default::default()
+                };
+                skill_row_from_stats(skill_id, &stats, player_damage, duration_ms)
+            },
+        )
+        .collect();
+    rows.sort_by_key(|s| std::cmp::Reverse(s.damage));
+    rows
+}
 
 /// The synthetic snapshot `demo_enabled` seeds the overlay with. The header's
 /// `total_damage`/`total_dps` are derived from `DEMO_ROWS` rather than a
@@ -461,6 +567,7 @@ fn demo_snapshot() -> Snapshot {
                     deaths,
                     imagine_ids,
                     imagine_tiers,
+                    demo_skills,
                 ),
             )| {
                 PlayerRow {
@@ -478,6 +585,7 @@ fn demo_snapshot() -> Snapshot {
                     lucky_pct,
                     hits,
                     deaths,
+                    skills: demo_skill_rows(demo_skills, damage, duration_ms),
                 }
             },
         )
@@ -559,6 +667,7 @@ impl OverlayApp {
             screenshot_capture_frames_waited: 0,
             demo_mode,
             startup_toggles_applied: false,
+            skill_windows: std::collections::BTreeMap::new(),
             history,
             rx_history,
             tx_history,
@@ -740,6 +849,11 @@ impl eframe::App for OverlayApp {
         // the icon textures (issues #9, #41); every later frame reuses them.
         let icons = self.icons.get_or_insert_with(|| Icons::load(&ctx));
 
+        // Issue #16 (D1): set by `draw_rows` (via `draw_row`) when a row is
+        // right-clicked this frame; consumed below, after this frame's root
+        // window rect is known, to open (or re-show) that player's
+        // breakdown window.
+        let mut opened_skill_uid: Option<i64> = None;
         // Issue #39: the open historical fight's header text and its
         // rebuilt `Snapshot`, cloned once per frame *before* the panel body
         // — the two short strings and the ~10-row snapshot are cheap next
@@ -880,7 +994,13 @@ impl eframe::App for OverlayApp {
                 let mut back_to_live = false;
                 match &mut self.view {
                     OverlayView::Live => {
-                        draw_rows(ui, &self.snapshot, &self.settings, icons);
+                        draw_rows(
+                            ui,
+                            &self.snapshot,
+                            &self.settings,
+                            icons,
+                            &mut opened_skill_uid,
+                        );
                     }
                     OverlayView::History(state) => {
                         draw_history(
@@ -924,6 +1044,80 @@ impl eframe::App for OverlayApp {
         });
         track_window_position(outer_rect, minimized, &mut self.settings, &self.tx_settings);
         track_window_size(inner_rect, minimized, &mut self.settings, &self.tx_settings);
+
+        // Issue #16 (D1/D3): a right-click on a row this frame opens (or
+        // re-shows — never re-closes, see `open_skill_window`) that
+        // player's breakdown window. Placement is computed once here, from
+        // this frame's already-read root window rect, rather than inside
+        // the draw loop below — recomputing `skills::place_window` every
+        // frame would fight a user actively dragging the breakdown window,
+        // snapping it back to its dock point on the very next repaint.
+        if let Some(uid) = opened_skill_uid {
+            let monitor = ctx.input(|i| i.viewport().monitor_size);
+            let main_outer = outer_rect
+                .or(inner_rect)
+                .unwrap_or(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::ZERO,
+                ));
+            open_skill_window(&mut self.skill_windows, uid, || SkillWindowState {
+                sort: skills::SkillSort::default(),
+                pos: skills::place_window(main_outer, monitor, SKILL_WINDOW_SIZE),
+            });
+        }
+
+        // Issue #16 (D2): one immediate child viewport per open breakdown
+        // window. `show_viewport_immediate` runs the child's UI on this
+        // same frame/thread — exactly what lets `skill_windows`' state
+        // live as a plain field instead of behind an `Arc<Mutex<..>>` —
+        // and the app already repaints at ~10Hz (`request_repaint_after`
+        // below), so the extra viewport per open player costs nothing.
+        // Re-borrowed here rather than reusing the binding above: that one's
+        // borrow of `self.icons` has to end before `open_history` can take
+        // `&mut self`, so the child-viewport loop below takes a fresh one.
+        let icons = self.icons.as_ref().expect("loaded on the first frame");
+        let opacity = self.settings.opacity;
+        let mut closed_skill_windows: Vec<i64> = Vec::new();
+        for (row, uid) in skill_windows_to_draw(&self.skill_windows, &self.snapshot.rows) {
+            let state = self
+                .skill_windows
+                .get_mut(&uid)
+                .expect("uid came from skill_windows.keys()");
+            let builder = egui::ViewportBuilder::default()
+                .with_title(format!("{} — skills", row.name))
+                .with_always_on_top()
+                .with_decorations(false)
+                .with_transparent(true)
+                .with_resizable(false)
+                .with_taskbar(false)
+                .with_active(false)
+                .with_inner_size(SKILL_WINDOW_SIZE)
+                .with_position(state.pos);
+            // None of `platform::disable_aero_snap`/`install_snap_blocker`/
+            // `set_click_through`/`clamp_window_to_visible_area` applies to
+            // this child viewport — `platform.rs` caches only the *root*
+            // window's HWND, once, from `CreationContext`, and never looks
+            // a window up by title or class, so it cannot see this window
+            // at all. This is deliberately not click-through (D2).
+            let close_requested = ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of(("skills", uid)),
+                builder,
+                |ui, _class| {
+                    let x_clicked = draw_skill_window(ui, row, &mut state.sort, icons, opacity);
+                    // Belt-and-braces (D2): an OS-level close (Alt+F4, task
+                    // manager, …) must drop this uid exactly like the
+                    // in-window `X` does, so the window can never be
+                    // orphaned open with no way left to close it.
+                    x_clicked || ui.ctx().input(|i| i.viewport().close_requested())
+                },
+            );
+            if close_requested {
+                closed_skill_windows.push(uid);
+            }
+        }
+        for uid in closed_skill_windows {
+            close_skill_window(&mut self.skill_windows, uid);
+        }
 
         // ~10 Hz.
         ctx.request_repaint_after(Duration::from_millis(100));
@@ -3707,6 +3901,12 @@ fn draw_rows(
     snapshot: &Snapshot,
     settings: &Settings,
     icons: &Icons,
+    // Issue #16 (D1): set to `Some(uid)` when `draw_row` reports a
+    // right-click this frame. A plain out-parameter rather than a return
+    // value, since `draw_rows`' own return (the `ScrollArea` content size)
+    // is already spoken for and belongs to a different caller (the
+    // screenshot-crop bound).
+    opened: &mut Option<i64>,
 ) -> egui::Vec2 {
     // `Settings::stat_columns`, not `ordered_columns` (issue #168):
     // `AbilityScore`/`SeasonStrength`, even when enabled, must not reserve
@@ -3776,7 +3976,9 @@ fn draw_rows(
             let top_damage = snapshot.rows.first().map(|r| r.damage).unwrap_or(0);
 
             for row in &snapshot.rows {
-                draw_row(ui, row, &layout, icons, top_damage, content_width);
+                if let Some(uid) = draw_row(ui, row, &layout, icons, top_damage, content_width) {
+                    *opened = Some(uid);
+                }
             }
         });
     output.content_size
@@ -3903,7 +4105,21 @@ pub fn column_anchors(
     columns: &[StatColumn],
     margin: f32,
 ) -> Vec<f32> {
-    let total_width: f32 = columns.iter().map(|c| c.width).sum();
+    let widths: Vec<f32> = columns.iter().map(|c| c.width).collect();
+    column_anchors_from_widths(rect_left, rect_right, &widths, margin)
+}
+
+/// Same anchor placement as [`column_anchors`], over bare widths rather
+/// than full `StatColumn`s — for a caller (`draw_skill_window`) that has a
+/// fixed width per column but no per-row `text`/`color` to paint through a
+/// `StatColumn`.
+pub fn column_anchors_from_widths(
+    rect_left: f32,
+    rect_right: f32,
+    widths: &[f32],
+    margin: f32,
+) -> Vec<f32> {
+    let total_width: f32 = widths.iter().sum();
     let available = (rect_right - rect_left - margin).max(0.0);
     let scale = if total_width > available && total_width > 0.0 {
         available / total_width
@@ -3911,11 +4127,11 @@ pub fn column_anchors(
         1.0
     };
 
-    let mut anchors = Vec::with_capacity(columns.len());
+    let mut anchors = Vec::with_capacity(widths.len());
     let mut x = rect_right - margin;
-    for col in columns.iter().rev() {
+    for &width in widths.iter().rev() {
         anchors.push(x);
-        x -= col.width * scale;
+        x -= width * scale;
     }
     anchors.reverse();
     anchors
@@ -3999,9 +4215,15 @@ fn draw_row(
     // can report an unbounded width, which is not what a row should paint
     // itself at.
     row_width: f32,
-) {
+    // Issue #16: `Some(row.uid)` when this row was right-clicked this
+    // frame, so `draw_rows` can open (or re-show) its breakdown window.
+    // `Sense::click()` (widened from `Sense::hover()`) still reports
+    // `hovered()` exactly as before, so the hover gradient below is
+    // unaffected; left-click stays free for the window drag, which lives
+    // on the header band and resize strips, never on a row.
+) -> Option<i64> {
     let desired_size = egui::vec2(row_width, ROW_HEIGHT);
-    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
 
     // Background bar scaled by this row's damage relative to the *top row's*
     // damage, not this row's share of total encounter damage (issue #73) —
@@ -4195,6 +4417,12 @@ fn draw_row(
             );
         }
     }
+
+    // Issue #16 (D1): right-click opens/re-shows this player's skill
+    // breakdown; left-click is deliberately not sensed here at all — it
+    // stays free for the window drag (`WindowGesture`'s header band and
+    // resize strips are the only primary-button drag surfaces).
+    response.secondary_clicked().then_some(row.uid)
 }
 
 /// Paints one counter pill (issue #49) so that its **right edge lands on
@@ -5019,6 +5247,359 @@ pub fn apply_theme(ctx: &egui::Context) {
     });
 }
 
+// -- per-player skill breakdown window (issue #16) -----------------------
+//
+// A second, per-player child viewport (D2), painted with the reference's
+// own chrome (D14) rather than the main overlay's `PANEL_FILL`/
+// `PANEL_BORDER_COLOR` — `Skills.xaml`'s `#111117`/`#212127` is a
+// deliberately distinct window from `TopmostBorderStyle`'s panel, not a
+// variant of it.
+
+/// Window/bar fill — the reference's `#111117`.
+const SKILL_CHROME_FILL: egui::Color32 = egui::Color32::from_rgb(0x11, 0x11, 0x17);
+/// Panel/tab background, and the Deaths pill's fill — the reference's
+/// `#212127`.
+const SKILL_PANEL_FILL: egui::Color32 = egui::Color32::from_rgb(0x21, 0x21, 0x27);
+/// Dps column-header text — the reference's `#ef5350`.
+const SKILL_HEADER_RGB: egui::Color32 = egui::Color32::from_rgb(0xef, 0x53, 0x50);
+/// Close glyph — the reference's `LightRed #ff5555`.
+const SKILL_CLOSE_RGB: egui::Color32 = egui::Color32::from_rgb(0xff, 0x55, 0x55);
+/// Translucent-white row hover — the reference's `#10FFFFFF`.
+const SKILL_ROW_HOVER_FILL: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0xff, 0xff, 0xff, 0x10);
+
+const SKILL_HEADER_HEIGHT: f32 = 56.0;
+const SKILL_TAB_HEIGHT: f32 = 32.0;
+const SKILL_COLUMN_HEADER_HEIGHT: f32 = 28.0;
+/// The reference's 40px row-height minimum (D5/D14) — taller than the main
+/// row list's `ROW_HEIGHT` (30.0), so this is its own constant rather than
+/// reusing that one.
+const SKILL_ROW_HEIGHT: f32 = 40.0;
+const SKILL_HEADER_ICON_SIZE: f32 = 32.0;
+const SKILL_HEADER_PAD_X: f32 = 12.0;
+const SKILL_HEADER_PAD_Y: f32 = 8.0;
+const SKILL_CLOSE_SIZE: f32 = 20.0;
+/// The reference's `CornerRadius="17"` header pill.
+const SKILL_PILL_CORNER_RADIUS: u8 = 17;
+/// The reference's 24pt player name — the one size in this window with no
+/// equivalent in the main row scale (`FONT_SIZE_ROW` tops out at 13.0).
+const FONT_SIZE_SKILL_HEADER_NAME: f32 = 24.0;
+
+/// D5's column order, as a fixed array so the header row and every data
+/// row iterate it identically — a column can never appear in one but not
+/// the other.
+const SKILL_COLUMN_ORDER: [skills::SkillColumn; 11] = [
+    skills::SkillColumn::Name,
+    skills::SkillColumn::Damage,
+    skills::SkillColumn::DmgPct,
+    skills::SkillColumn::CritPct,
+    skills::SkillColumn::MaxCrit,
+    skills::SkillColumn::AvgCrit,
+    skills::SkillColumn::AvgWhite,
+    skills::SkillColumn::Avg,
+    skills::SkillColumn::Hits,
+    skills::SkillColumn::Crits,
+    skills::SkillColumn::HitPerMin,
+];
+
+/// Fixed inner size for a skill breakdown window (D2: `with_resizable
+/// (false)`) — wide enough for every `SkillColumn` at its full width plus
+/// header padding (widths sum to `680`; `720` leaves room for the padding
+/// and the scrollbar), tall enough for the header, tab strip and
+/// column-header row plus roughly ten rows before the list scrolls.
+const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(720.0, 520.0);
+
+/// One open breakdown window's own state (issue #16, D9): its sort column/
+/// direction, and the screen position it was placed at when opened. `pos`
+/// is computed once, at open time (`skills::place_window`), and never
+/// recomputed on a later frame — recomputing it every frame would fight a
+/// user actively dragging the window, snapping it back to its dock point
+/// on the very next repaint.
+struct SkillWindowState {
+    sort: skills::SkillSort,
+    pos: egui::Pos2,
+}
+
+/// Applies one frame's right-click gesture to the open-window set (D1): a
+/// uid not yet open is inserted via `state`; a uid already open is left
+/// untouched entirely — re-right-clicking an open row must re-show it, not
+/// toggle it closed, and `BTreeMap::entry().or_insert_with` is exactly
+/// that (`state` never runs for an already-open uid, so its placement is
+/// never recomputed either).
+fn open_skill_window(
+    windows: &mut std::collections::BTreeMap<i64, SkillWindowState>,
+    uid: i64,
+    state: impl FnOnce() -> SkillWindowState,
+) {
+    windows.entry(uid).or_insert_with(state);
+}
+
+/// The only two paths that may drop a uid from the open-window set (D2):
+/// the in-window `X` and an OS-level close request. Never called for a uid
+/// merely missing from the current snapshot — see `skill_windows_to_draw`.
+fn close_skill_window(windows: &mut std::collections::BTreeMap<i64, SkillWindowState>, uid: i64) {
+    windows.remove(&uid);
+}
+
+/// The `(row, uid)` pairs this frame's viewport-draw loop should actually
+/// paint: every open uid that still has a row in the current snapshot. A
+/// uid with no matching row (a player who dropped off the live encounter,
+/// or a stale uid after a reset) is silently excluded from *this frame's*
+/// draw pass but left in `windows` — the player can rejoin mid-encounter,
+/// and closing on their behalf here would orphan the window state the
+/// moment they reappeared. Only `close_skill_window` may remove an entry.
+fn skill_windows_to_draw<'a>(
+    windows: &std::collections::BTreeMap<i64, SkillWindowState>,
+    rows: &'a [PlayerRow],
+) -> Vec<(&'a PlayerRow, i64)> {
+    windows
+        .keys()
+        .filter_map(|&uid| rows.iter().find(|r| r.uid == uid).map(|row| (row, uid)))
+        .collect()
+}
+
+/// Paints one player's skill-breakdown window (issue #16, D5/D9-D12/D14)
+/// into its child viewport's root `Ui`. Returns whether the in-window `X`
+/// glyph was clicked this frame; the OS close-request check is the call
+/// site's job (it reads `ui.ctx().input(|i| i.viewport().close_requested
+/// ())` from inside the child callback, which is what reflects the
+/// *child's* own close request), so neither close path can leave the
+/// window orphaned (D2).
+///
+/// Painted with explicit rects via `ui.painter()`, mirroring `draw_row`'s
+/// style, rather than egui's widget-flow layout: the window is fixed-size
+/// and non-resizable, so every position is a known constant, and the
+/// column grid reuses `column_anchors_from_widths`' right-aligned-anchor
+/// scheme, the same maths `column_anchors` uses for the main row list —
+/// the anchor maths is not re-derived here.
+fn draw_skill_window(
+    ui: &mut egui::Ui,
+    row: &PlayerRow,
+    sort: &mut skills::SkillSort,
+    icons: &Icons,
+    opacity: f32,
+) -> bool {
+    let rect = ui.max_rect();
+    let painter = ui.painter().clone();
+    painter.rect_filled(rect, 0.0, SKILL_CHROME_FILL.gamma_multiply(opacity));
+
+    // Drag anywhere on the background moves the window (the child viewport
+    // has no OS titlebar, D2's `with_decorations(false)`) — registered
+    // first so the more specific interacts below (column headers, close
+    // glyph) win the pixels they overlap with it; egui gives interaction
+    // priority to whatever was registered later, the same "registered
+    // later wins" idiom `OverlayApp::ui`'s `draw_resize_handles`-before-
+    // `draw_header` ordering relies on. Not routed through `WindowGesture`,
+    // which owns a root-window-only reposition exemption guard (issue #11)
+    // with no analogue for a child viewport.
+    let drag = ui.interact(
+        rect,
+        ui.id().with(("skill_drag", row.uid)),
+        egui::Sense::drag(),
+    );
+    if drag.drag_started_by(egui::PointerButton::Primary) {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+
+    // -- header: class icon, player name, one Deaths pill (D10) ----------
+    let header_rect =
+        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), SKILL_HEADER_HEIGHT));
+    let icon_rect = egui::Rect::from_center_size(
+        header_rect.left_center()
+            + egui::vec2(SKILL_HEADER_PAD_X + SKILL_HEADER_ICON_SIZE / 2.0, 0.0),
+        egui::Vec2::splat(SKILL_HEADER_ICON_SIZE),
+    );
+    if let Some(texture) = row.class.and_then(|class| icons.classes.get(class)) {
+        painter.image(texture.id(), icon_rect, UV_FULL, CLASS_ICON_TINT);
+    }
+    paint_text(
+        &painter,
+        egui::pos2(
+            icon_rect.right() + SKILL_HEADER_PAD_X,
+            header_rect.center().y,
+        ),
+        egui::Align2::LEFT_CENTER,
+        &row.name,
+        regular(FONT_SIZE_SKILL_HEADER_NAME),
+        egui::Color32::WHITE,
+        false,
+    );
+
+    // D10: only the Deaths pill. The reference's other three header pills
+    // (death time, aggro count, aggro time) need revive-timing and threat/
+    // aggro data this decoder never captures — rendering them would be
+    // inventing numbers rather than reporting them. Follow-up candidate,
+    // noted in the PR body.
+    let deaths_text = row.deaths.to_string();
+    let deaths_pill = StatPill {
+        value: &deaths_text,
+        icon: icons.glyphs.get(GlyphIcon::Skull).map(|t| t.id()),
+        icon_side: COUNTER_GLYPH_SIDE,
+        size: FONT_SIZE_PILL_VALUE,
+        value_color: egui::Color32::WHITE,
+        icon_color: COUNTER_ICON_COLOR,
+        icon_first: true,
+        corner_radius: egui::CornerRadius::same(SKILL_PILL_CORNER_RADIUS),
+        fill: SKILL_PANEL_FILL,
+        stroke: None,
+    };
+    let deaths_text_size = pill_text_size(&painter, &deaths_pill);
+    let deaths_pill_size = pill_size(
+        deaths_text_size,
+        deaths_pill.icon_side,
+        SKILL_HEADER_HEIGHT - 2.0 * SKILL_HEADER_PAD_Y,
+    );
+    let deaths_pill_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            header_rect.right()
+                - SKILL_HEADER_PAD_X
+                - SKILL_CLOSE_SIZE
+                - SKILL_HEADER_PAD_X
+                - deaths_pill_size.x,
+            header_rect.center().y - deaths_pill_size.y / 2.0,
+        ),
+        deaths_pill_size,
+    );
+    paint_stat_pill(&painter, deaths_pill_rect, deaths_text_size, &deaths_pill);
+
+    // -- close glyph (D2): the only in-window way to close ---------------
+    let close_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.right() - SKILL_HEADER_PAD_X - SKILL_CLOSE_SIZE,
+            rect.top() + SKILL_HEADER_PAD_Y,
+        ),
+        egui::Vec2::splat(SKILL_CLOSE_SIZE),
+    );
+    paint_text(
+        &painter,
+        close_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "\u{2715}",
+        bold(FONT_SIZE_ROW),
+        SKILL_CLOSE_RGB,
+        true,
+    );
+    let close_clicked = ui
+        .interact(
+            close_rect,
+            ui.id().with(("skill_close", row.uid)),
+            egui::Sense::click(),
+        )
+        .clicked();
+
+    // -- tab strip: `Dps` only, styled selected (D11) ---------------------
+    // The reference's other six tabs (Heal, Mana, Buff, Counter,
+    // SkillDealt, SkillReceived) are explicitly out of scope per the issue
+    // — drawing six dead tabs would be clutter, not fidelity.
+    let tabs_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), header_rect.bottom()),
+        egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
+    );
+    painter.rect_filled(tabs_rect, 0.0, SKILL_PANEL_FILL.gamma_multiply(opacity));
+    paint_text(
+        &painter,
+        tabs_rect.left_center() + egui::vec2(SKILL_HEADER_PAD_X, 0.0),
+        egui::Align2::LEFT_CENTER,
+        "Dps",
+        bold(FONT_SIZE_ROW),
+        egui::Color32::WHITE,
+        true,
+    );
+
+    // -- column header row: click (either button, D9) toggles sort -------
+    let col_header_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), tabs_rect.bottom()),
+        egui::vec2(rect.width(), SKILL_COLUMN_HEADER_HEIGHT),
+    );
+    let widths: Vec<f32> = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).collect();
+    let anchors = column_anchors_from_widths(
+        col_header_rect.left() + SKILL_HEADER_PAD_X,
+        col_header_rect.right() - SKILL_HEADER_PAD_X,
+        &widths,
+        0.0,
+    );
+    for (i, (&anchor_x, kind)) in anchors.iter().zip(SKILL_COLUMN_ORDER.iter()).enumerate() {
+        let width = kind.width();
+        let cell = egui::Rect::from_min_max(
+            egui::pos2(anchor_x - width, col_header_rect.top()),
+            egui::pos2(anchor_x, col_header_rect.bottom()),
+        );
+        let response = ui.interact(
+            cell,
+            ui.id().with(("skill_col_header", row.uid, i)),
+            egui::Sense::click(),
+        );
+        if response.clicked() || response.secondary_clicked() {
+            sort.toggle(*kind);
+        }
+        let label = sort.header_label(*kind);
+        let (align, pos) = if *kind == skills::SkillColumn::Name {
+            (egui::Align2::LEFT_CENTER, cell.left_center())
+        } else {
+            (egui::Align2::RIGHT_CENTER, cell.right_center())
+        };
+        paint_text(
+            &painter,
+            pos,
+            align,
+            &label,
+            bold(FONT_SIZE_ROW),
+            SKILL_HEADER_RGB,
+            true,
+        );
+    }
+
+    // -- rows: sorted per-window (D9), scrollable, no grouping (D12) -----
+    // BPSR's skill ids are flat — there is no "short name" to group
+    // sub-skills under, so unlike the reference's expander rows this is
+    // deliberately one row per skill id with no expand/collapse tier.
+    let rows_rect =
+        egui::Rect::from_min_max(egui::pos2(rect.left(), col_header_rect.bottom()), rect.max);
+    let mut skill_rows = row.skills.clone();
+    skills::sort_rows(&mut skill_rows, *sort);
+
+    let mut rows_ui = ui.new_child(egui::UiBuilder::new().max_rect(rows_rect));
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(&mut rows_ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for skill in &skill_rows {
+                let (skill_rect, response) = ui.allocate_exact_size(
+                    egui::vec2(rows_rect.width(), SKILL_ROW_HEIGHT),
+                    egui::Sense::hover(),
+                );
+                if response.hovered() {
+                    ui.painter()
+                        .rect_filled(skill_rect, 0.0, SKILL_ROW_HOVER_FILL);
+                }
+                for (&anchor_x, kind) in anchors.iter().zip(SKILL_COLUMN_ORDER.iter()) {
+                    let width = kind.width();
+                    let clip = egui::Rect::from_min_max(
+                        egui::pos2(anchor_x - width, skill_rect.top()),
+                        egui::pos2(anchor_x, skill_rect.bottom()),
+                    );
+                    let cell_painter = ui.painter().with_clip_rect(clip);
+                    let (align, pos) = if *kind == skills::SkillColumn::Name {
+                        (egui::Align2::LEFT_CENTER, clip.left_center())
+                    } else {
+                        (egui::Align2::RIGHT_CENTER, clip.right_center())
+                    };
+                    paint_text(
+                        &cell_painter,
+                        pos,
+                        align,
+                        &kind.text(skill),
+                        regular(FONT_SIZE_ROW),
+                        egui::Color32::WHITE,
+                        false,
+                    );
+                }
+            }
+        });
+
+    close_clicked
+}
+
 // == Encounter history (issue #39) =======================================
 //
 // Everything below is WP3 of the persistent-history feature: the overlay's
@@ -5249,7 +5830,7 @@ fn draw_history(
     ui.separator();
 
     if let Some(open) = &state.open {
-        draw_rows(ui, &open.snapshot, settings, icons);
+        draw_rows(ui, &open.snapshot, settings, icons, &mut None);
         return;
     }
 
@@ -5563,7 +6144,7 @@ mod tests {
     /// would have caught.
     #[test]
     fn every_demo_row_imagine_id_resolves_to_a_known_icon_with_bytes() {
-        for &(name, _, _, _, _, _, _, ids, _) in &DEMO_ROWS {
+        for &(name, _, _, _, _, _, _, ids, _, _) in &DEMO_ROWS {
             for id in ids.into_iter().flatten() {
                 let imagine = imagines::imagine_of_skill_id(id)
                     .unwrap_or_else(|| panic!("{name:?}'s Imagine id {id} is not curated"));
@@ -5672,6 +6253,100 @@ mod tests {
             snapshot.rows.len() - 2,
             "everyone else in the demo party must be on the Damage role"
         );
+    }
+
+    /// Issue #16: the breakdown window is only worth capturing under
+    /// `SHINRA_DEMO=1` if every row actually has something to show — a
+    /// leftover empty `skills: Vec::new()` (the placeholder T1 left for
+    /// this task) would silently produce a blank window.
+    #[test]
+    fn every_demo_row_has_a_skill_breakdown() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            assert!(
+                !row.skills.is_empty(),
+                "row {} must have a non-empty skill breakdown",
+                row.name
+            );
+        }
+    }
+
+    /// A demo skill breakdown whose damage doesn't sum to the row's own
+    /// `damage` would contradict the row it was opened from — precisely the
+    /// class of header/row disagreement issue #148 already burned this file
+    /// on once for the top-level totals.
+    #[test]
+    fn demo_skill_damage_sums_to_the_row_damage() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            let skill_damage_sum: i64 = row.skills.iter().map(|s| s.damage).sum();
+            assert_eq!(
+                skill_damage_sum, row.damage,
+                "row {}'s skill damages must sum to its own damage",
+                row.name
+            );
+        }
+    }
+
+    /// Same consistency requirement as damage, for hit counts.
+    #[test]
+    fn demo_skill_hits_sum_to_the_row_hits() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            let skill_hits_sum: u64 = row.skills.iter().map(|s| s.hits).sum();
+            assert_eq!(
+                skill_hits_sum, row.hits,
+                "row {}'s skill hits must sum to its own hits",
+                row.name
+            );
+        }
+    }
+
+    /// A demo capture with every skill reading `Skill #<id>` would be
+    /// worthless for eyeballing the breakdown window — issue #16 requires
+    /// real ids picked from the vendored, curated skill-name table.
+    #[test]
+    fn every_demo_skill_id_resolves_to_a_real_name() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            for skill in &row.skills {
+                let name = skills::skill_display_name(skill.skill_id);
+                assert!(
+                    !name.starts_with("Skill #"),
+                    "row {}'s skill id {} must resolve to a real name via the generated \
+                     table, got fallback {name:?}",
+                    row.name,
+                    skill.skill_id
+                );
+            }
+        }
+    }
+
+    /// Sanity bound on the per-skill numbers themselves, independent of the
+    /// row totals: a crit can never be counted more than the skill's own
+    /// hits, and the running max crit can never be smaller than the mean
+    /// crit it's a max of.
+    #[test]
+    fn demo_skill_numbers_are_internally_consistent() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            for skill in &row.skills {
+                assert!(
+                    skill.crit_hits <= skill.hits,
+                    "row {}'s skill {} has more crit_hits than hits",
+                    row.name,
+                    skill.skill_id
+                );
+                assert!(
+                    skill.max_crit as f64 >= skill.avg_crit,
+                    "row {}'s skill {} has max_crit {} < avg_crit {}",
+                    row.name,
+                    skill.skill_id,
+                    skill.max_crit,
+                    skill.avg_crit
+                );
+            }
+        }
     }
 
     /// The regression this guards: a future refactor that deletes or
@@ -8490,6 +9165,7 @@ mod tests {
             season_strength: None,
             imagines: [None, None],
             imagine_tiers: [None, None],
+            skills: Vec::new(),
         }
     }
 
@@ -9246,6 +9922,7 @@ mod tests {
             season_strength: Some(9_999),
             imagines: [Some(99_999), Some(99_999)],
             imagine_tiers: [Some(IMAGINE_MAX_TIER), Some(IMAGINE_MAX_TIER)],
+            skills: Vec::new(),
         };
 
         for (kind, column) in ColumnKind::ALL
@@ -10005,7 +10682,7 @@ mod tests {
             meshes: Vec::new(),
         };
         let output = ctx.run_ui(input, |ui| {
-            draw_rows(ui, snapshot, settings, &icons);
+            draw_rows(ui, snapshot, settings, &icons, &mut None);
         });
         for clipped in &output.shapes {
             collect_row_boxes(&clipped.shape, clipped.clip_rect, &mut frame);
@@ -10031,7 +10708,7 @@ mod tests {
         };
         let mut content_size = egui::Vec2::ZERO;
         let output = ctx.run_ui(input, |ui| {
-            content_size = draw_rows(ui, snapshot, &Settings::default(), &icons);
+            content_size = draw_rows(ui, snapshot, &Settings::default(), &icons, &mut None);
         });
         output.drop_without_applying_deltas();
         content_size
@@ -11910,6 +12587,232 @@ mod tests {
         }
     }
 
+    // -- per-player skill breakdown window (issue #16) --------------------
+
+    /// A single click (move, press, release, all in one frame) at `pos`
+    /// with `button` — `click_at`'s shape, generalized to any button, so a
+    /// right-click gesture can be synthesized the same way.
+    fn click_at_with_button(pos: egui::Pos2, button: egui::PointerButton) -> egui::RawInput {
+        let modifiers = egui::Modifiers::NONE;
+        egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed: true,
+                    modifiers,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed: false,
+                    modifiers,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// Two-frame click-on-a-row harness: frame 1 lays `draw_rows` out with
+    /// no input (egui's own click hit-testing is one-frame-lagged — a
+    /// widget must already have existed, from a *prior* frame, for a click
+    /// on it to register on this one — the same reason `draw_header_menu_
+    /// dispatches_close_to_the_right_command` runs a layout frame before
+    /// its click frame), and reads back where row 0's name actually
+    /// painted; frame 2 (the same `Context`, so the widget IDs line up)
+    /// sends a synthesized click there with `button` and returns whatever
+    /// `draw_rows` reported opened this time — the seam `draw_row`'s
+    /// widened `Sense::click()` plus its `secondary_clicked()` gate feed
+    /// (issue #16, D1).
+    fn opened_uid_after_click(snapshot: &Snapshot, button: egui::PointerButton) -> Option<i64> {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+
+        let mut discarded = None;
+        let layout = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_rows(ui, snapshot, &Settings::default(), &icons, &mut discarded);
+            },
+        );
+        let mut frame = RowFrame {
+            texts: Vec::new(),
+            meshes: Vec::new(),
+        };
+        for clipped in &layout.shapes {
+            collect_row_boxes(&clipped.shape, clipped.clip_rect, &mut frame);
+        }
+        let pos = frame.text_box(&snapshot.rows[0].name).center();
+        layout.drop_without_applying_deltas();
+
+        let mut opened: Option<i64> = None;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..click_at_with_button(pos, button)
+            },
+            |ui| {
+                draw_rows(ui, snapshot, &Settings::default(), &icons, &mut opened);
+            },
+        );
+        output.drop_without_applying_deltas();
+        opened
+    }
+
+    #[test]
+    fn a_right_click_on_a_row_opens_that_players_breakdown() {
+        let snapshot = rows_test_snapshot(1);
+        let uid = snapshot.rows[0].uid;
+        let opened = opened_uid_after_click(&snapshot, egui::PointerButton::Secondary);
+        assert_eq!(opened, Some(uid));
+    }
+
+    #[test]
+    fn a_left_click_on_a_row_opens_nothing() {
+        let snapshot = rows_test_snapshot(1);
+        let opened = opened_uid_after_click(&snapshot, egui::PointerButton::Primary);
+        assert_eq!(opened, None);
+    }
+
+    fn skill_window_state(pos: egui::Pos2) -> SkillWindowState {
+        SkillWindowState {
+            sort: skills::SkillSort::default(),
+            pos,
+        }
+    }
+
+    #[test]
+    fn a_second_right_click_does_not_close_an_open_breakdown() {
+        let mut windows = std::collections::BTreeMap::new();
+        open_skill_window(&mut windows, 1, || skill_window_state(egui::pos2(1.0, 1.0)));
+        // A second open, at a different would-be placement, must be a
+        // no-op: the first placement is what stays, and the uid is never
+        // removed — re-right-clicking an open row re-shows it, it never
+        // toggles it closed (D1).
+        open_skill_window(&mut windows, 1, || {
+            skill_window_state(egui::pos2(99.0, 99.0))
+        });
+        assert!(windows.contains_key(&1));
+        assert_eq!(windows[&1].pos, egui::pos2(1.0, 1.0));
+    }
+
+    #[test]
+    fn closing_a_breakdown_drops_its_uid() {
+        let mut windows = std::collections::BTreeMap::new();
+        open_skill_window(&mut windows, 1, || skill_window_state(egui::pos2(1.0, 1.0)));
+        close_skill_window(&mut windows, 1);
+        assert!(!windows.contains_key(&1));
+    }
+
+    #[test]
+    fn a_uid_missing_from_the_snapshot_is_skipped_not_closed() {
+        let mut windows = std::collections::BTreeMap::new();
+        open_skill_window(&mut windows, 1, || skill_window_state(egui::pos2(1.0, 1.0)));
+        open_skill_window(&mut windows, 2, || skill_window_state(egui::pos2(2.0, 2.0)));
+        let rows = vec![PlayerRow {
+            uid: 1,
+            ..sample_row(None)
+        }];
+
+        let to_draw = skill_windows_to_draw(&windows, &rows);
+
+        assert_eq!(to_draw.len(), 1, "only the live uid is drawn this frame");
+        assert_eq!(to_draw[0].1, 1);
+        assert!(
+            windows.contains_key(&2),
+            "a uid missing from the snapshot must stay open, not be closed"
+        );
+    }
+
+    fn sample_skill_row(skill_id: i32) -> SkillRow {
+        SkillRow {
+            skill_id,
+            damage: 1_000,
+            share_pct: 50.0,
+            crit_pct: 10.0,
+            max_crit: 200,
+            avg_crit: 150.0,
+            avg_white: 90.0,
+            avg: 100.0,
+            hits: 10,
+            crit_hits: 1,
+            hits_per_min: 5.0,
+        }
+    }
+
+    /// Two-frame click harness for `draw_skill_window`, the same shape as
+    /// `opened_uid_after_click`: frame 1 lays the window out with no input
+    /// and reads back where `value`'s text actually painted (not knowable
+    /// ahead of a real run); frame 2 (the same `Context`, so the interact
+    /// ids line up) sends a synthesized left click there and returns
+    /// whatever this run reports the `X` glyph did, leaving `sort` mutated
+    /// in place for the caller to inspect.
+    fn click_skill_window_at(row: &PlayerRow, sort: &mut skills::SkillSort, value: &str) -> bool {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_SIZE);
+
+        let layout = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_skill_window(ui, row, sort, &icons, 1.0);
+            },
+        );
+        let mut frame = RowFrame {
+            texts: Vec::new(),
+            meshes: Vec::new(),
+        };
+        for clipped in &layout.shapes {
+            collect_row_boxes(&clipped.shape, clipped.clip_rect, &mut frame);
+        }
+        let pos = frame.text_box(value).center();
+        layout.drop_without_applying_deltas();
+
+        let mut clicked = false;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..click_at_with_button(pos, egui::PointerButton::Primary)
+            },
+            |ui| {
+                clicked = draw_skill_window(ui, row, sort, &icons, 1.0);
+            },
+        );
+        output.drop_without_applying_deltas();
+        clicked
+    }
+
+    #[test]
+    fn clicking_a_column_header_toggles_its_sort() {
+        let row = PlayerRow {
+            skills: vec![sample_skill_row(1550), sample_skill_row(1551)],
+            ..sample_row(None)
+        };
+        let mut sort = skills::SkillSort::default();
+        assert_eq!(sort.column, skills::SkillColumn::Damage);
+
+        // "Skill name" is the `Name` header's plain (unselected) label —
+        // the default sort is `Damage`, so this is never the active-sort
+        // text `header_label` would instead paint.
+        click_skill_window_at(&row, &mut sort, "Skill name");
+
+        assert_eq!(sort.column, skills::SkillColumn::Name);
+        assert!(
+            sort.descending,
+            "a newly-clicked column always starts descending (D9)"
+        );
+    }
+
     // -- Encounter history view (issue #39) ---------------------------------
 
     /// Builds a throwaway `OverlayApp` for the history-view tests below —
@@ -12191,6 +13094,22 @@ mod tests {
                 "Historical Fight".to_string(),
                 Some("Historical Scene".to_string())
             )
+        );
+    }
+
+    #[test]
+    fn clicking_the_close_glyph_closes_the_window() {
+        let row = PlayerRow {
+            skills: vec![sample_skill_row(1550)],
+            ..sample_row(None)
+        };
+        let mut sort = skills::SkillSort::default();
+
+        let closed = click_skill_window_at(&row, &mut sort, "\u{2715}");
+
+        assert!(
+            closed,
+            "clicking the close glyph must report the window closed (D2)"
         );
     }
 
