@@ -299,14 +299,21 @@ pub enum GlyphIcon {
     /// screenshot to the clipboard" since neither ShinraMeter's `SVG.xaml`
     /// nor the existing vendored set has a dedicated share/copy icon.
     Share,
+    /// The toggle cluster's History button (issue #186) — MDI's `history`
+    /// glyph (a clock with a counter-clockwise arrow), the literal fit for
+    /// "browse saved encounters". Vendored for this issue: neither
+    /// ShinraMeter's `SVG.xaml` nor the previously vendored set had any
+    /// clock-with-arrow mark, and the existing `Timer` stopwatch is already
+    /// spoken for by the header's live fight timer two pills away.
+    History,
 }
 
 /// Every `GlyphIcon` an embedded PNG exists for. Provenance is split three
 /// ways — see `THIRD_PARTY_NOTICES.md`'s "ShinraMeter encounter emblem",
 /// "Google Material Symbols", and "Material Design Icons (Pictogrammers)"
 /// sections: `Emblem` is ShinraMeter's own artwork; `Timer`, `Speed`,
-/// `Heart` are Google Material Symbols; `Skull`, `MouseOff`, `Pin`, and
-/// `Share` are Pictogrammers' Material Design Icons.
+/// `Heart` are Google Material Symbols; `Skull`, `MouseOff`, `Pin`,
+/// `Share`, and `History` are Pictogrammers' Material Design Icons.
 const GLYPH_ICON_BYTES: &[(GlyphIcon, &[u8])] = &[
     (
         GlyphIcon::Emblem,
@@ -339,6 +346,10 @@ const GLYPH_ICON_BYTES: &[(GlyphIcon, &[u8])] = &[
     (
         GlyphIcon::Share,
         include_bytes!("../assets/icons/glyphs/share.png"),
+    ),
+    (
+        GlyphIcon::History,
+        include_bytes!("../assets/icons/glyphs/history.png"),
     ),
 ];
 
@@ -543,6 +554,7 @@ mod tests {
         GlyphIcon::MouseOff,
         GlyphIcon::Pin,
         GlyphIcon::Share,
+        GlyphIcon::History,
     ];
 
     #[test]

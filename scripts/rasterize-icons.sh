@@ -24,6 +24,6 @@ render() {
 
 echo "rasterizing glyphs:"
 render emblem 512
-for name in timer speed heart skull mouse_off pin share; do
+for name in timer speed heart skull mouse_off pin share history; do
   render "$name" 64
 done

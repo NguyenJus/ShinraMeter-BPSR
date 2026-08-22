@@ -183,10 +183,11 @@ WinDivert's LGPL-3.0 option is compatible.
 
 ## Material Design Icons (Pictogrammers)
 
-- Files: `crates/app/assets/icons/svg/{skull,mouse_off,pin,share}.svg` and the
-  correspondingly named PNGs under `crates/app/assets/icons/glyphs/`
+- Files: `crates/app/assets/icons/svg/{skull,mouse_off,pin,share,history}.svg`
+  and the correspondingly named PNGs under `crates/app/assets/icons/glyphs/`
 - Upstream: <https://github.com/Templarian/MaterialDesign> — the `skull`,
-  `cursor-default-click-outline` (struck-through), `pin`, and `export` icons
+  `cursor-default-click-outline` (struck-through), `pin`, `export`, and
+  `history` icons
 - Copyright (c) Austin Andrews and the Pictogrammers contributors
 - License: Apache License 2.0, which is compatible with this project's
   GPL-3.0-only licence.
