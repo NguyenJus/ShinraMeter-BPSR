@@ -697,8 +697,20 @@ impl Meter {
                     // resolved immediately; the unknown-origin case still
                     // falls back to `prune_stale_preloads` plus the
                     // ordinary `NewFight` reset, exactly as before #191.
+                    // issue #202: a wipe latches `fight_end_ms` right away
+                    // (see `apply_damage`'s `FightEndCause::Wipe` arm), so
+                    // by the time this packet lands `cut_short` already
+                    // reads false — it only ever catches a fight still
+                    // `Active`. `wipe_hold` is that same unobserved-fight
+                    // case under its own cause, so it has to hold off this
+                    // reset for exactly the reason spelled out above: a
+                    // wiped fight has not had a tick to be observed as
+                    // `Ended` and recorded either, and clearing `players`
+                    // here would drop it — death counts included — before
+                    // anything ever sees it.
                     if tables::is_dungeon_scene(*level_map_id)
                         && !cut_short
+                        && !self.wipe_hold
                         && self.scene_id.is_some()
                     {
                         self.reset(ResetReason::SceneChanged, self.last_event_ms);
@@ -4833,6 +4845,42 @@ mod tests {
             assert_eq!(m.fight_state(3_000), FightState::Active);
             assert_eq!(m.apply(&hit(1, ADD_UID, 1_000, 3_000)), None);
             assert_eq!(m.snapshot(3_500).total_damage, 3_000);
+        }
+
+        #[test]
+        fn a_scene_change_during_the_wipe_hold_defers_its_reset_too() {
+            // Issue #202: the wipe already latched `fight_end_ms` (so
+            // `cut_short` reads false), and a `Scene` packet with a
+            // differing dungeon scene id can land before the next tick gets
+            // a chance to observe the fight as `Ended` — e.g. bounced to a
+            // checkpoint/lobby sub-map right after the party goes down. The
+            // dungeon-transition reset guard must hold off on `wipe_hold`
+            // exactly as it already does on `cut_short` (issue #154's
+            // "don't destroy an unobserved fight" principle), instead of
+            // clearing `players` (and its death counts) out from under it.
+            let mut m = wiped();
+            let reason = m.apply(&ProtocolEvent::Scene {
+                level_map_id: 31_101, // a different dungeon
+            });
+            assert_eq!(
+                reason, None,
+                "an unobserved wipe defers its clear to the next fight's first hit, same as cut_short"
+            );
+
+            assert_eq!(
+                m.players.get(&1).map(|p| p.deaths),
+                Some(1),
+                "death counts must survive the post-wipe scene bounce"
+            );
+            assert_eq!(m.players.get(&2).map(|p| p.deaths), Some(1));
+
+            assert_eq!(m.fight_state(60_000), FightState::Ended);
+            let snap = m.snapshot(60_000);
+            assert_eq!(
+                snap.total_damage, 10_000,
+                "player totals must survive the post-wipe scene bounce too"
+            );
+            assert_eq!(snap.rows.len(), 2);
         }
 
         #[test]
