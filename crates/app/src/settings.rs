@@ -749,6 +749,7 @@ mod tests {
             visible_columns: vec![ColumnKind::Damage, ColumnKind::AbilityScore],
             window_position: None,
             window_size: None,
+            ..Settings::default()
         };
 
         settings.toggle(ColumnKind::Damage);
@@ -811,6 +812,7 @@ mod tests {
             visible_columns: vec![ColumnKind::AbilityScore, ColumnKind::SeasonStrength],
             window_position: None,
             window_size: None,
+            ..Settings::default()
         };
 
         settings.toggle(ColumnKind::SeasonStrength);
@@ -1324,6 +1326,7 @@ mod tests {
             visible_columns: ColumnKind::ALL.to_vec(),
             window_position: None,
             window_size: None,
+            ..Settings::default()
         };
         let stat_columns = settings.stat_columns();
         assert!(!stat_columns.contains(&ColumnKind::AbilityScore));
