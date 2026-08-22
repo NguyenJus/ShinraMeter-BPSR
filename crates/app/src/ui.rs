@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use bpsr_meter::{Class, EncounterInfo, PlayerRow, Role, Snapshot};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui;
 
 use crate::fonts;
@@ -570,7 +570,23 @@ impl OverlayApp {
     /// "Checking…" forever.
     fn poll_update_check(&mut self) {
         let landed = match &self.update_check {
-            UpdateCheckState::Checking { rx } => rx.try_recv().ok(),
+            UpdateCheckState::Checking { rx } => match rx.try_recv() {
+                Ok(outcome) => Some(outcome),
+                // Still in flight — keep rendering "Checking…".
+                Err(TryRecvError::Empty) => None,
+                // The sender is gone without ever having sent: the
+                // update-check thread died (a panic in the unsafe WinHTTP
+                // FFI, say) instead of reporting. Collapsing this into
+                // `Empty` — which `try_recv().ok()` used to do — left the
+                // state `Checking` forever, and with it the "Check for
+                // updates" button disabled, so the user could never retry
+                // short of restarting the app. Resolve it as a failure
+                // instead, which the dropdown renders and which leaves the
+                // button clickable again.
+                Err(TryRecvError::Disconnected) => Some(Err(
+                    "the update-check thread stopped without reporting a result".to_string(),
+                )),
+            },
             _ => None,
         };
         if let Some(outcome) = landed {
@@ -10110,6 +10126,132 @@ mod tests {
             app.update_check,
             UpdateCheckState::Checking { .. }
         ));
+    }
+
+    /// The failure mode the two tests above can't reach: the update-check
+    /// thread dies without ever sending (a panic inside the unsafe WinHTTP
+    /// FFI, say), so its sender drops and the channel disconnects. That has
+    /// to resolve to a `Done(Err(..))` rather than read as "still empty" —
+    /// otherwise the state stays `Checking` forever and, because
+    /// `draw_header_menu` disables the button while checking (see
+    /// `draw_header_menu_disables_check_for_updates_while_one_is_in_flight`),
+    /// the user can never retry without restarting the app.
+    #[test]
+    fn poll_update_check_resolves_a_disconnected_channel_to_an_error() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(rx_snapshot, tx_command, tx_settings, Settings::default());
+        let (tx, rx) = crossbeam_channel::unbounded::<Result<CheckOutcome, String>>();
+        app.update_check = UpdateCheckState::Checking { rx };
+        drop(tx);
+
+        app.poll_update_check();
+
+        assert!(
+            matches!(app.update_check, UpdateCheckState::Done(Err(_))),
+            "a dropped sender must resolve out of Checking, got {:?}",
+            app.update_check
+        );
+    }
+
+    /// Two checks at once would race two threads to the same channel, so
+    /// the button is disabled while one is in flight — and, since that's
+    /// the only thing standing between the user and a pile-up, it's worth
+    /// asserting rather than assuming. Read back off AccessKit (which is
+    /// where `Response::fill_accesskit_node_common` records `!enabled` as
+    /// `set_disabled`) rather than off the painted shapes, since a disabled
+    /// button paints the same string a live one does.
+    #[test]
+    fn draw_header_menu_disables_check_for_updates_while_one_is_in_flight() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let (_tx, rx) = crossbeam_channel::unbounded();
+
+        let mut disabled_while = |update_check: &mut UpdateCheckState| {
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                draw_header_menu(
+                    ui,
+                    &ctx,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    update_check,
+                );
+            });
+            let update = output
+                .platform_output
+                .accesskit_update
+                .clone()
+                .expect("accesskit was enabled for this frame");
+            let disabled = update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label().is_some_and(|s| s == "Check for updates"))
+                .map(|(_, node)| node.is_disabled());
+            output.drop_without_applying_deltas();
+            disabled
+        };
+
+        assert_eq!(
+            disabled_while(&mut UpdateCheckState::Checking { rx }),
+            Some(true),
+            "the button must be disabled while a check is in flight"
+        );
+        assert_eq!(
+            disabled_while(&mut UpdateCheckState::Done(Err("boom".to_string()))),
+            Some(false),
+            "a resolved check must leave the button clickable again, so the user can retry"
+        );
+    }
+
+    /// The error branch of the same render the two `Done(Ok(..))` tests
+    /// below cover: whatever `check_for_update` (or `poll_update_check`'s
+    /// disconnected-channel path) reports has to reach the dropdown as
+    /// text, since it's the only signal the user gets that the check
+    /// failed rather than silently did nothing.
+    #[test]
+    fn draw_header_menu_shows_the_reason_a_check_failed() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let mut update_check = UpdateCheckState::Done(Err("no network".to_string()));
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut update_check,
+            );
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text_shapes(&clipped.shape, &mut texts);
+        }
+        output.drop_without_applying_deltas();
+
+        let expected = "Update check failed: no network".to_string();
+        assert!(
+            texts.contains(&expected),
+            "expected {expected:?} among the painted text, got {texts:?}"
+        );
     }
 
     /// Renders `draw_header_menu` directly (not through the popup — same

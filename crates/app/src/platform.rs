@@ -2542,7 +2542,7 @@ pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, Stri
         INTERNET_DEFAULT_HTTPS_PORT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
         WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect,
         WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable, WinHttpQueryHeaders,
-        WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
+        WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
     };
     use windows::core::PCWSTR;
 
@@ -2591,6 +2591,18 @@ pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, Stri
         ));
     }
     let session = WinHttpHandle(session);
+
+    // Every WinHTTP timeout has to be set explicitly: the defaults leave
+    // name resolution on 0, which WinHTTP documents as "infinite", so a
+    // stalled resolver, a captive portal or a firewall that drops rather
+    // than refuses would block this thread — and, with it, the header
+    // dropdown's "Checking…" state — forever. This is a user-triggered
+    // check against a single small JSON endpoint, so a few seconds each is
+    // plenty: 5s to resolve, 5s to connect, 10s to send and 10s to receive.
+    // Set on the session handle, before `WinHttpConnect`, so every handle
+    // derived from it inherits them.
+    unsafe { WinHttpSetTimeouts(session.0, 5_000, 5_000, 10_000, 10_000) }
+        .map_err(|err| format!("WinHttpSetTimeouts failed: {err}"))?;
 
     let host_w = wide(host);
     let connect = unsafe {
