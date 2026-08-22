@@ -146,11 +146,6 @@ fn paint_bold_text(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiCommand {
     Reset,
-    /// Issue #131: clears the learned scene -> final-boss map, both
-    /// in-process and its on-disk cache. Sent from the header dropdown's
-    /// "Forget learned bosses" item (`draw_header_menu`); handled by
-    /// `pipeline::run` on the pipeline thread, not here — same as `Reset`.
-    ForgetLearnedBosses,
     Quit,
 }
 
@@ -2955,23 +2950,24 @@ const UV_FULL: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui:
 ///    recognized boss (`is_boss`): its resolved name, or `Monster #{id}`
 ///    when it's a recognized boss whose name didn't resolve (the two
 ///    vendored lists aren't guaranteed to agree — see
-///    `EncounterInfo::is_boss`). This now outranks `scene_boss_name` —
+///    `EncounterInfo::is_boss`). This outranks `scene_boss_name` —
 ///    inverted from issue #125's original precedence — because a raid can
 ///    string several *different* final bosses together in one instance
-///    (repo owner, issue #131): `Meter::scene_bosses` only ever remembers
-///    one boss per scene and overwrites, so once a second or third raid
-///    boss is actually engaged, showing the *previous* one instead of the
-///    boss currently being fought would be actively wrong, not just stale.
-///    A single-final-boss dungeon is unaffected: nothing else is ever
-///    `is_boss` there once the run's target is the remembered boss itself.
-/// 2. else `scene_boss_name` — the current dungeon's *remembered final
-///    boss* (`Meter::scene_bosses`), if one has been learned. This is what
-///    covers both "just walked in, nothing engaged yet" (`boss_monster_id`
-///    is still `None`) and the issue #125 case: `recompute_boss` selected a
-///    non-boss mid-dungeon mech or add as `boss_uid` (`is_boss` false), so
-///    branch 1 doesn't apply, but the header still shouldn't go blank or
-///    fall through to "No target" when the dungeon's real boss is already
-///    known.
+///    (repo owner, issue #131), so once a second or third raid boss is
+///    actually engaged, showing anything but the boss currently being
+///    fought would be actively wrong. A single-final-boss dungeon is
+///    unaffected: nothing else is ever `is_boss` there once the run's
+///    target is the curated boss itself.
+/// 2. else `scene_boss_name` — the current dungeon's final boss from the
+///    curated `tables::SCENE_FINAL_BOSSES` (issue #201; learned at runtime
+///    before that, issue #125/#131). This is what covers both "just walked
+///    in, nothing engaged yet" (`boss_monster_id` is still `None`) and the
+///    issue #125 case: `recompute_boss` selected a non-boss mid-dungeon
+///    mech or add as `boss_uid` (`is_boss` false), so branch 1 doesn't
+///    apply, but the header still shouldn't go blank or fall through to
+///    "No target" when the dungeon's real boss is already known. Only
+///    curated single-boss dungeons have an answer here; every other scene
+///    falls through.
 /// 3. else, with nothing engaged at all in a scene that offers a *choice*
 ///    of bosses (`multi_boss_scene`, issue #150): "Select a boss". Every
 ///    raid lets the party pick one of three bosses, and picking again after
@@ -3004,7 +3000,9 @@ const UV_FULL: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui:
 /// raid, `scene_boss_name` naming whichever boss was latched last rather
 /// than the one the party will actually fight — is what issue #150 fixed,
 /// by having `Meter::snapshot` suppress that fallback for such a scene and
-/// set `multi_boss_scene` instead. Branch 3 is the resulting caption.
+/// set `multi_boss_scene` instead (issue #201's curated table is
+/// single-boss dungeons only, so it cannot reintroduce it either). Branch 3
+/// is the resulting caption.
 ///
 /// While a finished fight is being held on screen, every field here
 /// describes *that* fight rather than live state (issue #152), so nothing
@@ -3542,9 +3540,12 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
 ///
 /// Order matches the spec: a Columns disclosure section (issue #13's stat
 /// column toggles, unchanged in behavior — just relocated), a separator,
-/// the Opacity slider (issue #166), a separator, Forget learned bosses
-/// (issue #131), a separator, Minimize to tray, a separator, Check for
-/// updates and its result line (issue #171), a separator, then Close.
+/// the Opacity slider (issue #166), a separator, Minimize to tray, a
+/// separator, Check for updates and its result line (issue #171), a
+/// separator, then Close. "Forget learned bosses" (issue #131) sat between
+/// the Opacity slider and Minimize until issue #201 replaced the runtime
+/// scene -> boss learning it reset with a curated static table
+/// (`bpsr_meter::tables::SCENE_FINAL_BOSSES`), leaving nothing to forget.
 /// Reset used to be the first item here but moved
 /// into the header's toggle cluster (issue #82; see `toggle_cluster`),
 /// leaving this menu with no reset trigger of its own.
@@ -3689,22 +3690,6 @@ fn draw_header_menu(
         // writer thread just leaves the in-memory value correct for the
         // rest of this session.
         let _ = tx_settings.send(settings.clone());
-    }
-
-    ui.separator();
-
-    // Issue #131: the escape hatch for a stale learned boss name (e.g. after
-    // a game patch changes a dungeon's final boss) — see
-    // `scene_bosses_cache`'s doc comment for why nothing invalidates the
-    // cache automatically. Placed here (the header dropdown) rather than
-    // the tray's native Win32 context menu (`platform::install_tray`)
-    // because this menu is already the smaller, cross-platform, plain-egui
-    // surface with a `tx_command` in scope — the tray menu would need new
-    // HMENU/message-id plumbing in `platform.rs` for what is otherwise a
-    // one-line addition here.
-    if ui.button("Forget learned bosses").clicked() {
-        let _ = tx_command.try_send(UiCommand::ForgetLearnedBosses);
-        ui.close();
     }
 
     ui.separator();

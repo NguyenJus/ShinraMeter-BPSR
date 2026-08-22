@@ -37,25 +37,6 @@ fn names_cache_path() -> PathBuf {
     path
 }
 
-/// Where the cross-session scene -> final-boss cache (issue #131) lives:
-/// `%APPDATA%\ShinraMeter-BPSR\scene-bosses.json`. Mirrors
-/// `names_cache_path` exactly — see its doc comment for the fallback
-/// rationale. `bpsr-meter` deliberately knows nothing about this path
-/// either (see `scene_bosses_cache`'s module doc comment).
-fn scene_bosses_path() -> PathBuf {
-    let (path, warning) = paths::resolve(
-        None,
-        std::env::var("APPDATA").ok().as_deref(),
-        &["ShinraMeter-BPSR", "scene-bosses.json"],
-        "ShinraMeter-BPSR-scene-bosses.json",
-        "APPDATA is not set; falling back to a working-directory file for the scene-bosses cache",
-    );
-    if let Some(warning) = warning {
-        log::warn!("{warning}");
-    }
-    path
-}
-
 /// Where the encounter-history database (issue #39) lives:
 /// `%APPDATA%\ShinraMeter-BPSR\history.sqlite`. `SHINRA_HISTORY_DB` overrides
 /// it outright — the only one of these three files with an override, because
@@ -301,7 +282,6 @@ fn main() -> eframe::Result {
         rx_events,
         rx_command,
         names_cache_path(),
-        scene_bosses_path(),
         history_handle.clone(),
     );
     let (tx_settings, settings_thread) = settings::spawn_writer();
