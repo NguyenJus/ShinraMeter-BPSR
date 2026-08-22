@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use bpsr_meter::{Class, EncounterInfo, PlayerRow, Role, Snapshot};
+use bpsr_meter::{Class, EncounterInfo, PlayerRow, Role, SkillRow, Snapshot};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui;
 
@@ -320,9 +320,20 @@ fn demo_enabled_from(var: Option<&str>) -> bool {
     var.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
 }
 
+/// `(skill_id, damage, hits, crit_hits, crit_damage, max_crit)` for one
+/// skill in a `DemoRow`'s breakdown (issue #16). This is deliberately more
+/// than `bpsr_meter::SkillStats` carries at rest (it has no `crit_damage`
+/// field — only a running `max_crit`) because a `SkillRow`'s `avg_crit` and
+/// `avg_white` are *means*, and a literal fixture has no per-hit event
+/// stream to mean over; carrying `crit_damage` explicitly is the minimum
+/// needed for [`demo_skill_rows`] to derive every `SkillRow` field with the
+/// same formulas `bpsr_meter::encounter::skill_rows` uses, rather than
+/// inventing a second, looser set of demo-only ones.
+type DemoSkill = (i32, i64, u64, u64, i64, i64);
+
 /// `(name, class, damage, crit_pct, lucky_pct, hits, deaths, imagines,
-/// imagine_tiers)` for one `DEMO_ROWS` entry. Named so the array below
-/// reads as one type, not clippy's `type_complexity` bait.
+/// imagine_tiers, skills)` for one `DEMO_ROWS` entry. Named so the array
+/// below reads as one type, not clippy's `type_complexity` bait.
 type DemoRow = (
     &'static str,
     Class,
@@ -333,6 +344,7 @@ type DemoRow = (
     u32,
     [Option<i32>; 2],
     [Option<i32>; 2],
+    &'static [DemoSkill],
 );
 
 /// `(name, class, damage, crit_pct, lucky_pct, hits, deaths, imagines,
@@ -372,6 +384,25 @@ type DemoRow = (
 /// paired with `imagines`. `Glorbaxian`'s first slot is deliberately pinned
 /// at `IMAGINE_MAX_TIER` so the demo capture actually shows the gold ring
 /// doing real work, not just the tooltip text.
+///
+/// `skills` (issue #16) is each row's per-skill breakdown, folded into the
+/// same tuple entry for the same reason `imagines` is: a row and its skills
+/// can't drift apart structurally, and there is no second by-index array
+/// whose length could silently disagree with `DEMO_ROWS`. Each skill's
+/// `damage`/`hits` are hand-picked to sum *exactly* to the row's own
+/// `damage`/`hits` — an inconsistent breakdown would contradict the row it
+/// opens from, which is exactly the class of header/row disagreement bug
+/// issue #148 already burned this file on once (see the `demo_snapshot` doc
+/// comment below). Skill ids are real ids from the vendored
+/// `SkillOverridesNames.json` curated table, picked so `tables::skill_name`
+/// resolves every one of them to a real name instead of the `Skill #<id>`
+/// fallback — a demo capture with placeholder names would be worthless for
+/// eyeballing the breakdown window. Each row gets 4-5 skills in a
+/// descending damage/hit split (a "signature" skill carrying roughly a
+/// third to two-fifths of the row, tapering off), with per-skill crit hits
+/// apportioned from the row's own `crit_pct` and crit damage weighted
+/// above the row's white-hit average, so `Max crit >= Avg crit` holds the
+/// way a real combat log's would.
 const DEMO_ROWS: [DemoRow; 5] = [
     (
         "Blorp",
@@ -383,6 +414,13 @@ const DEMO_ROWS: [DemoRow; 5] = [
         0,
         [Some(3901), Some(3902)],
         [Some(3), Some(1)],
+        &[
+            (1605, 21_014_000, 45, 30, 15_760_500, 683_955), // Blazing Ascension
+            (1607, 13_272_000, 36, 24, 9_954_000, 540_175),  // Blazing Assault
+            (1613, 8_848_000, 30, 20, 6_636_000, 432_340),   // Wildfire Dance
+            (1617, 7_189_000, 22, 14, 5_205_828, 484_398),   // Endless Hellfire
+            (1623, 4_977_000, 17, 11, 3_649_800, 432_340),   // Great Crimson Lotus
+        ],
     ),
     (
         "Glorbaxian",
@@ -394,6 +432,13 @@ const DEMO_ROWS: [DemoRow; 5] = [
         1,
         [Some(3903), Some(3904)],
         [Some(IMAGINE_MAX_TIER), Some(2)],
+        &[
+            (1239, 20_938_000, 54, 28, 12_932_294, 601_428), // Meteor Storm
+            (1241, 13_224_000, 43, 22, 8_081_333, 478_533),  // Frostbeam
+            (1244, 8_816_000, 36, 18, 5_289_600, 383_027),   // Blizzard
+            (1258, 7_163_000, 27, 14, 4_424_206, 411_819),   // Icy Bolt
+            (1259, 4_959_000, 20, 10, 2_975_400, 387_802),   // Frost Comet
+        ],
     ),
     (
         "Zog",
@@ -405,6 +450,13 @@ const DEMO_ROWS: [DemoRow; 5] = [
         0,
         [Some(3905), Some(3906)],
         [Some(0), Some(4)],
+        &[
+            (1714, 18_962_000, 63, 23, 8_781_060, 497_321), // Iaido Slash
+            (1715, 11_976_000, 50, 19, 5_736_403, 393_491), // Moonstrike
+            (1727, 7_984_000, 42, 15, 3_629_091, 315_521),  // Piercing Slash
+            (1728, 6_487_000, 32, 12, 3_072_789, 333_885),  // Ultimate Slash
+            (1736, 4_491_000, 23, 8, 1_996_000, 325_350),   // Phantom Slash
+        ],
     ),
     (
         "Thudd",
@@ -416,6 +468,13 @@ const DEMO_ROWS: [DemoRow; 5] = [
         0,
         [Some(3907), Some(3908)],
         [Some(1), Some(1)],
+        &[
+            (1401, 6_764_000, 162, 35, 1_978_329, 74_481), // Windborne Grace - Sweep
+            (1406, 4_272_000, 130, 28, 1_246_000, 58_850), // Windborne Grace
+            (1411, 2_848_000, 108, 23, 822_226, 47_474),   // Swift Blade
+            (1423, 2_314_000, 81, 17, 659_296, 51_417),    // Aegis Gale
+            (1932, 1_602_000, 59, 12, 443_631, 49_060),    // Shield Combo
+        ],
     ),
     (
         "Fizz",
@@ -427,6 +486,12 @@ const DEMO_ROWS: [DemoRow; 5] = [
         0,
         [Some(3909), None],
         [Some(2), None],
+        &[
+            (1550, 4_326_000, 32, 3, 581_104, 252_812), // Feral Seed - Seed Meteor
+            (1551, 2_781_000, 25, 2, 320_885, 209_575), // Regen Bud: Wild Seed
+            (1556, 1_854_000, 18, 1, 150_324, 196_421), // Bloomheal
+            (1560, 1_339_000, 15, 1, 129_581, 169_455), // Regen Pulse
+        ],
     ),
 ];
 
@@ -439,6 +504,71 @@ const DEMO_ROWS: [DemoRow; 5] = [
 /// scene are a real BPSR pull: `Purge! Field of Forgotten Illusions`'s final
 /// boss, `Paradox-Calamity Remnant - Final` (`tables.rs`), a fight that runs
 /// well within this snapshot's 159s duration in practice.
+/// Derives one demo row's `SkillRow`s from its `DemoSkill` fixture list
+/// (issue #16), mirroring `bpsr_meter::encounter::skill_rows`'s formulas
+/// exactly — `share_pct` against `player_damage`, `avg`/`avg_crit`/
+/// `avg_white` as means computed over the fixture's explicit `crit_damage`
+/// (a demo literal has no per-hit event stream to derive that mean from the
+/// way the real aggregator does), and `hits_per_min` over the same
+/// `duration_ms` the demo header derives its DPS from. The arithmetic is
+/// duplicated here rather than run through `skill_rows` on a synthesized
+/// `PlayerStats` because that function is private to
+/// `bpsr_meter::encounter` and this task (plan T5) touches only the demo
+/// seed, not the aggregation. Sorted damage-descending like the real
+/// snapshot, so the breakdown window's default sort (D9) is a no-op on
+/// first paint here too.
+fn demo_skill_rows(skills: &[DemoSkill], player_damage: i64, duration_ms: u64) -> Vec<SkillRow> {
+    let mut rows: Vec<SkillRow> = skills
+        .iter()
+        .map(
+            |&(skill_id, damage, hits, crit_hits, crit_damage, max_crit)| {
+                let share_pct = if player_damage > 0 {
+                    (damage as f64 / player_damage as f64 * 100.0) as f32
+                } else {
+                    0.0
+                };
+                let crit_pct = if hits > 0 {
+                    crit_hits as f32 / hits as f32 * 100.0
+                } else {
+                    0.0
+                };
+                let avg = if hits > 0 {
+                    damage as f64 / hits as f64
+                } else {
+                    0.0
+                };
+                let avg_crit = if crit_hits > 0 {
+                    crit_damage as f64 / crit_hits as f64
+                } else {
+                    0.0
+                };
+                let white_hits = hits - crit_hits;
+                let avg_white = if white_hits > 0 {
+                    (damage - crit_damage) as f64 / white_hits as f64
+                } else {
+                    0.0
+                };
+                let hits_per_min = hits as f64 / (duration_ms as f64 / 60_000.0);
+                SkillRow {
+                    skill_id,
+                    damage,
+                    share_pct,
+                    crit_pct,
+                    max_crit,
+                    avg_crit,
+                    avg_white,
+                    avg,
+                    hits,
+                    crit_hits,
+                    hits_per_min,
+                }
+            },
+        )
+        .collect();
+    rows.sort_by_key(|s| std::cmp::Reverse(s.damage));
+    rows
+}
+
 fn demo_snapshot() -> Snapshot {
     let row_damage_sum: i64 = DEMO_ROWS.iter().map(|(_, _, dmg, ..)| dmg).sum();
     let duration_ms = 159_000u64;
@@ -458,6 +588,7 @@ fn demo_snapshot() -> Snapshot {
                     deaths,
                     imagine_ids,
                     imagine_tiers,
+                    demo_skills,
                 ),
             )| {
                 PlayerRow {
@@ -475,9 +606,7 @@ fn demo_snapshot() -> Snapshot {
                     lucky_pct,
                     hits,
                     deaths,
-                    // T5 fills in demo skill breakdowns; left empty here so
-                    // this compiles without T1 owning the demo-data change.
-                    skills: Vec::new(),
+                    skills: demo_skill_rows(demo_skills, damage, duration_ms),
                 }
             },
         )
@@ -860,7 +989,10 @@ impl eframe::App for OverlayApp {
             let monitor = ctx.input(|i| i.viewport().monitor_size);
             let main_outer = outer_rect
                 .or(inner_rect)
-                .unwrap_or(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::ZERO));
+                .unwrap_or(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::ZERO,
+                ));
             open_skill_window(&mut self.skill_windows, uid, || SkillWindowState {
                 sort: skills::SkillSort::default(),
                 pos: skills::place_window(main_outer, monitor, SKILL_WINDOW_SIZE),
@@ -5130,7 +5262,11 @@ fn draw_skill_window(
     // `draw_header` ordering relies on. Not routed through `WindowGesture`,
     // which owns a root-window-only reposition exemption guard (issue #11)
     // with no analogue for a child viewport.
-    let drag = ui.interact(rect, ui.id().with(("skill_drag", row.uid)), egui::Sense::drag());
+    let drag = ui.interact(
+        rect,
+        ui.id().with(("skill_drag", row.uid)),
+        egui::Sense::drag(),
+    );
     if drag.drag_started_by(egui::PointerButton::Primary) {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
@@ -5148,7 +5284,10 @@ fn draw_skill_window(
     }
     paint_text(
         &painter,
-        egui::pos2(icon_rect.right() + SKILL_HEADER_PAD_X, header_rect.center().y),
+        egui::pos2(
+            icon_rect.right() + SKILL_HEADER_PAD_X,
+            header_rect.center().y,
+        ),
         egui::Align2::LEFT_CENTER,
         &row.name,
         regular(FONT_SIZE_SKILL_HEADER_NAME),
@@ -5294,7 +5433,8 @@ fn draw_skill_window(
     // BPSR's skill ids are flat — there is no "short name" to group
     // sub-skills under, so unlike the reference's expander rows this is
     // deliberately one row per skill id with no expand/collapse tier.
-    let rows_rect = egui::Rect::from_min_max(egui::pos2(rect.left(), col_header_rect.bottom()), rect.max);
+    let rows_rect =
+        egui::Rect::from_min_max(egui::pos2(rect.left(), col_header_rect.bottom()), rect.max);
     let mut skill_rows = row.skills.clone();
     skills::sort_rows(&mut skill_rows, *sort);
 
@@ -5309,7 +5449,8 @@ fn draw_skill_window(
                     egui::Sense::hover(),
                 );
                 if response.hovered() {
-                    ui.painter().rect_filled(skill_rect, 0.0, SKILL_ROW_HOVER_FILL);
+                    ui.painter()
+                        .rect_filled(skill_rect, 0.0, SKILL_ROW_HOVER_FILL);
                 }
                 for (&anchor_x, kind) in anchors.iter().zip(SKILL_COLUMN_ORDER.iter()) {
                     let width = kind.width();
@@ -5470,7 +5611,7 @@ mod tests {
     /// would have caught.
     #[test]
     fn every_demo_row_imagine_id_resolves_to_a_known_icon_with_bytes() {
-        for &(name, _, _, _, _, _, _, ids, _) in &DEMO_ROWS {
+        for &(name, _, _, _, _, _, _, ids, _, _) in &DEMO_ROWS {
             for id in ids.into_iter().flatten() {
                 let imagine = imagines::imagine_of_skill_id(id)
                     .unwrap_or_else(|| panic!("{name:?}'s Imagine id {id} is not curated"));
@@ -5579,6 +5720,100 @@ mod tests {
             snapshot.rows.len() - 2,
             "everyone else in the demo party must be on the Damage role"
         );
+    }
+
+    /// Issue #16: the breakdown window is only worth capturing under
+    /// `SHINRA_DEMO=1` if every row actually has something to show — a
+    /// leftover empty `skills: Vec::new()` (the placeholder T1 left for
+    /// this task) would silently produce a blank window.
+    #[test]
+    fn every_demo_row_has_a_skill_breakdown() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            assert!(
+                !row.skills.is_empty(),
+                "row {} must have a non-empty skill breakdown",
+                row.name
+            );
+        }
+    }
+
+    /// A demo skill breakdown whose damage doesn't sum to the row's own
+    /// `damage` would contradict the row it was opened from — precisely the
+    /// class of header/row disagreement issue #148 already burned this file
+    /// on once for the top-level totals.
+    #[test]
+    fn demo_skill_damage_sums_to_the_row_damage() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            let skill_damage_sum: i64 = row.skills.iter().map(|s| s.damage).sum();
+            assert_eq!(
+                skill_damage_sum, row.damage,
+                "row {}'s skill damages must sum to its own damage",
+                row.name
+            );
+        }
+    }
+
+    /// Same consistency requirement as damage, for hit counts.
+    #[test]
+    fn demo_skill_hits_sum_to_the_row_hits() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            let skill_hits_sum: u64 = row.skills.iter().map(|s| s.hits).sum();
+            assert_eq!(
+                skill_hits_sum, row.hits,
+                "row {}'s skill hits must sum to its own hits",
+                row.name
+            );
+        }
+    }
+
+    /// A demo capture with every skill reading `Skill #<id>` would be
+    /// worthless for eyeballing the breakdown window — issue #16 requires
+    /// real ids picked from the vendored, curated skill-name table.
+    #[test]
+    fn every_demo_skill_id_resolves_to_a_real_name() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            for skill in &row.skills {
+                let name = skills::skill_display_name(skill.skill_id);
+                assert!(
+                    !name.starts_with("Skill #"),
+                    "row {}'s skill id {} must resolve to a real name via the generated \
+                     table, got fallback {name:?}",
+                    row.name,
+                    skill.skill_id
+                );
+            }
+        }
+    }
+
+    /// Sanity bound on the per-skill numbers themselves, independent of the
+    /// row totals: a crit can never be counted more than the skill's own
+    /// hits, and the running max crit can never be smaller than the mean
+    /// crit it's a max of.
+    #[test]
+    fn demo_skill_numbers_are_internally_consistent() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            for skill in &row.skills {
+                assert!(
+                    skill.crit_hits <= skill.hits,
+                    "row {}'s skill {} has more crit_hits than hits",
+                    row.name,
+                    skill.skill_id
+                );
+                assert!(
+                    skill.max_crit as f64 >= skill.avg_crit,
+                    "row {}'s skill {} has max_crit {} < avg_crit {}",
+                    row.name,
+                    skill.skill_id,
+                    skill.max_crit,
+                    skill.avg_crit
+                );
+            }
+        }
     }
 
     /// The regression this guards: a future refactor that deletes or
@@ -11858,7 +12093,9 @@ mod tests {
         // no-op: the first placement is what stays, and the uid is never
         // removed — re-right-clicking an open row re-shows it, it never
         // toggles it closed (D1).
-        open_skill_window(&mut windows, 1, || skill_window_state(egui::pos2(99.0, 99.0)));
+        open_skill_window(&mut windows, 1, || {
+            skill_window_state(egui::pos2(99.0, 99.0))
+        });
         assert!(windows.contains_key(&1));
         assert_eq!(windows[&1].pos, egui::pos2(1.0, 1.0));
     }
