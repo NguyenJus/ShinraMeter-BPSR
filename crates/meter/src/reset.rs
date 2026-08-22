@@ -1,13 +1,26 @@
 //! Reset triggers: manual reset, boss-HP-rollback heuristic, the next
-//! fight's first hit (plan §T2.2).
+//! fight's first hit (plan §T2.2), and entering a dungeon/raid scene (issue
+//! #191).
 //!
-//! `ServerChanged` is deliberately **not** one of these (issue #138): a
+//! `ServerChanged` is still not one of these on its own (issue #138): a
 //! server change invalidates entity/scene state (`Meter::apply`'s
 //! `ServerChanged` arm clears `enemies`/`boss_uid`/`scene_id` directly and
-//! freezes the fight clock) but never clears the displayed stats, so it
-//! never produces a `ResetReason`. The stats-clearing reset on the far side
-//! of a reconnect is `NewFight`, fired by the reconnecting player's first
-//! real hit.
+//! freezes the fight clock) but leaves the displayed stats on screen — it
+//! carries no destination scene id, so it cannot tell a real dungeon entry
+//! from a same-instance reconnect. That call belongs to the `Scene` event
+//! that always follows once the destination is known: issue #191 found
+//! that leaving it entirely to `NewFight` (fired by the reconnecting
+//! player's first real hit) had a gap — a fast transition into a *new*
+//! dungeon can land that hit, or even just a preloaded party-member row,
+//! before the previous fight ever latched `fight_end_ms`, stacking the new
+//! instance's roster on top of the old one. `Meter::apply`'s `Scene` arm
+//! now closes that gap directly with `SceneChanged`, the moment its
+//! resolved id both differs from the one already held *and* resolves as a
+//! dungeon/raid scene (`tables::is_dungeon_scene`) — the one destination
+//! where a fresh roster is actually about to start landing. Any other
+//! destination (town, the open world) still relies on `NewFight`, exactly
+//! as before, which is what keeps issue #78's/#152's hold over a
+//! just-finished dungeon run intact after zoning out to town.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ResetReason {
     Manual,
@@ -16,10 +29,34 @@ pub enum ResetReason {
     /// being held on screen; the first damage of the next fight clears them
     /// (issue #78). Unlike the other reasons this one is *caused* by combat
     /// resuming, so the reset and the new fight's first hit are the same
-    /// event. Also the reset that clears a held fight across a
-    /// `ServerChanged` reconnect (issue #138): the reconnect itself only
-    /// freezes the clock, it does not reset.
+    /// event.
     NewFight,
+    /// `ProtocolEvent::Scene` resolved to a `level_map_id` different from
+    /// the one already held, *and* that id resolves as a dungeon/raid scene
+    /// (issue #191): the old scene's roster cannot possibly be the new
+    /// instance's party, and `NewFight` cannot be relied on to catch it in
+    /// time (it only fires once a previous fight has already latched
+    /// `fight_end_ms`, which a fast transition can easily outrun — and even
+    /// then, only once real damage lands, by which point a preloaded party
+    /// member from the new instance may already be sitting next to the old
+    /// one). Repeated `Scene` events reporting the *same* id are not this,
+    /// nor is a transition to a non-dungeon scene — issue #78's hold is
+    /// untouched by those, so a just-finished fight's numbers still stay on
+    /// screen for the user to screenshot until the next real fight starts.
+    ///
+    /// Also does not fire for a fight this same `Scene` event only just cut
+    /// short (`fight_end_ms` was `None` going in): that fight has not had a
+    /// tick to be observed as `Ended` and recorded to history, so it is
+    /// left latched-but-uncleared for the ordinary `NewFight` reset to
+    /// catch on the new dungeon's first real hit instead, the same way
+    /// issue #138's `ServerChanged`-cut-short case already relies on. Nor
+    /// does it fire when the previous scene id was unknown (`None`) rather
+    /// than a specific different one — that can mean a genuinely new
+    /// instance after a `ServerChanged`, but it can just as well mean this
+    /// `Scene` packet is only the late confirmation of the instance the
+    /// currently-held fight was already fought in (issue #152), and the
+    /// meter cannot tell those apart from here.
+    SceneChanged,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
