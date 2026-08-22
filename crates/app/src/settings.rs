@@ -273,26 +273,34 @@ pub struct Settings {
     #[serde(default)]
     pub window_size: Option<[f32; 2]>,
     /// Overlay-wide panel opacity (issue #166): a single multiplier applied
-    /// to the alpha channel of the panel's background fill and chrome (its
-    /// border stroke) — see `egui::Color32::gamma_multiply`, called at
-    /// `ui::PANEL_FILL`/`ui::PANEL_BORDER_COLOR`'s `CentralPanel` `Frame`
-    /// call site. Deliberately *not* applied to row/text alpha, so dragging
-    /// this down dims the backdrop rather than the stats drawn on top of it.
+    /// to the alpha channel of every *background* surface the overlay
+    /// paints — the main panel's fill and border chrome (`ui::PANEL_FILL`/
+    /// `ui::PANEL_BORDER_COLOR`, at the `CentralPanel` `Frame` call site)
+    /// and, since issue #184, the skill-breakdown window's chrome, tab
+    /// strip, Deaths pill and row-hover fills. See
+    /// `egui::Color32::gamma_multiply`. Deliberately *not* applied to
+    /// row/text alpha, so dragging this down dims the backdrop rather than
+    /// the stats drawn on top of it.
     ///
-    /// Clamped to `OPACITY_MIN..=OPACITY_MAX` (0.2..=1.0) both on every
-    /// `set_opacity` call and on load (`sanitized`), so neither a slider
-    /// drag nor a hand-edited settings.json can ever make the overlay fully
-    /// transparent and unrecoverable — at that point there is no chrome
-    /// left to find the slider with.
+    /// Since issue #182 those background constants are fully opaque at
+    /// rest, so this multiplier is the *only* source of transparency and
+    /// the slider's endpoints are literal: 1.0 paints a solid panel, 0.0
+    /// paints no panel at all.
+    ///
+    /// Clamped to `OPACITY_MIN..=OPACITY_MAX` (0.0..=1.0) both on every
+    /// `set_opacity` call and on load (`sanitized`), so a hand-edited
+    /// settings.json cannot hold a value the slider itself can't express.
+    /// The floor is 0.0 rather than #166's 0.2 — see `OPACITY_MIN` for why
+    /// that is recoverable.
     ///
     /// `#[serde(default = "default_opacity")]` is the same back-compat
     /// guarantee `window_position`/`window_size` make with `#[serde(default)]`:
     /// a settings.json written before issue #166 has no `opacity` key at
     /// all and still deserializes. A named default function is used instead
     /// of `Option`'s bare `None` because `f32` has no single sensible
-    /// `Default::default()` here — `0.0` would render every existing
-    /// user's overlay invisible on their very next launch, exactly the
-    /// silent-upgrade regression this field must not cause.
+    /// `Default::default()` here — `0.0` would strip every existing user's
+    /// overlay down to bare floating text on their very next launch,
+    /// exactly the silent-upgrade regression this field must not cause.
     #[serde(default = "default_opacity")]
     pub opacity: f32,
     /// OS-level mouse passthrough (issue #167): while `true`, the window
@@ -431,12 +439,24 @@ const POSITION_EPSILON: f32 = 1.0;
 const SIZE_EPSILON: f32 = 1.0;
 
 impl Settings {
-    /// Floor of the `opacity` range (issue #166): low enough to read as
-    /// "mostly see-through", but never 0.0 — the overlay has to stay
-    /// visible enough to find and drag its own opacity slider back up.
-    pub const OPACITY_MIN: f32 = 0.2;
-    /// Ceiling of the `opacity` range: fully opaque, the pre-issue-166
-    /// fixed look.
+    /// Floor of the `opacity` range: a genuinely transparent backdrop
+    /// (issue #182, lowering issue #166's 0.2).
+    ///
+    /// #166 kept this above zero so the overlay could never make itself
+    /// invisible and un-draggable. The replacement guarantee is structural
+    /// rather than numeric: `opacity` multiplies *background* fills and
+    /// border chrome only (see the `opacity` field doc), never row text,
+    /// header icons or pill glyphs. At 0.0 the panel's backdrop is gone but
+    /// every glyph still paints at full alpha, so the header is still there
+    /// to drag and the gear that owns the slider is still there to click —
+    /// the setting stays reversible from inside the overlay, with no chrome
+    /// to hunt for. That beats a global hotkey or a tray item: no new input
+    /// plumbing to own, nothing that can itself be shadowed or fail, and no
+    /// second place for the recovery path to rot.
+    pub const OPACITY_MIN: f32 = 0.0;
+    /// Ceiling of the `opacity` range: fully opaque. Since issue #182 this
+    /// really is opaque — `ui::PANEL_FILL` no longer carries a baked-in
+    /// 200/255 that capped the slider's top end at ~78%.
     pub const OPACITY_MAX: f32 = 1.0;
 
     /// Ceiling clamp for `history_max_encounters` (issue #39): a hand-edited
@@ -1340,11 +1360,34 @@ mod tests {
     #[test]
     fn set_opacity_clamps_below_the_floor() {
         let mut settings = Settings::default();
-        settings.set_opacity(0.0);
-        // Floored at `OPACITY_MIN`, not 0.0: a fully transparent panel has
-        // no chrome left to drag the slider back up with, so the slider
-        // itself must never be able to make the overlay disappear.
+        settings.set_opacity(-0.5);
         assert_eq!(settings.opacity, Settings::OPACITY_MIN);
+    }
+
+    /// Issue #182: 0.0 is a legal value now, not something the setter
+    /// quietly lifts to a 0.2 floor. Asserts the stored value rather than
+    /// the constant so this fails loudly if the floor is ever raised back
+    /// up without revisiting the recovery argument on `OPACITY_MIN`.
+    #[test]
+    fn set_opacity_allows_a_fully_transparent_value() {
+        let mut settings = Settings::default();
+        settings.set_opacity(0.0);
+        assert_eq!(settings.opacity, 0.0);
+    }
+
+    /// The other half of the clamp on load: `sanitized()` must accept a
+    /// hand-written `0.0` unchanged (issue #182) the same way it rejects
+    /// the out-of-range `5.0` below.
+    #[test]
+    fn loading_settings_json_with_a_zero_opacity_keeps_it() {
+        let path = temp_settings_path("zero-opacity");
+        fs::write(&path, br#"{"visible_columns":["Damage"],"opacity":0.0}"#)
+            .expect("write fixture");
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded.opacity, 0.0);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
