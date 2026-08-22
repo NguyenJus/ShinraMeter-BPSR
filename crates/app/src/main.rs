@@ -364,7 +364,14 @@ fn main() -> eframe::Result {
             platform::install_tray(cc, default_inner_size);
             platform::clamp_window_to_visible_area(cc);
             Ok(Box::new(
-                OverlayApp::new(rx_snapshot, tx_command, tx_settings, settings).with_status(status),
+                OverlayApp::new(
+                    rx_snapshot,
+                    tx_command,
+                    tx_settings,
+                    settings,
+                    history_handle,
+                )
+                .with_status(status),
             ))
         }),
     );
@@ -380,14 +387,14 @@ fn main() -> eframe::Result {
     }
     let _ = tx_command_shutdown.try_send(UiCommand::Quit);
     let _ = pipeline_thread.join();
-    // Issue #39: both `HistoryHandle` clones are gone by now (the pipeline
-    // thread's with the pipeline, joined just above; this one dropped right
-    // here — `OverlayApp` never held one, since WP3 wires that up), so the
+    // Issue #39: both `HistoryHandle` clones are gone by now — the
+    // pipeline's, joined just above, and `OverlayApp`'s own (moved into
+    // `OverlayApp::new` above, not merely cloned into it), dropped when
+    // `run_native` returned, before capture was even stopped — so the
     // history thread's channel is closed and it exits after draining.
     // Joining here is what guarantees the session's last encounter actually
     // reached disk — the same explicit-shutdown discipline
     // `CacheWriter::shutdown` follows.
-    drop(history_handle);
     if let Some(thread) = history_thread {
         let _ = thread.join();
     }

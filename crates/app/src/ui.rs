@@ -18,6 +18,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui;
 
 use crate::fonts;
+use crate::history;
 use crate::icons::{ClassIcons, GlyphIcon, GlyphIcons, ImagineIcons, ToolbarIcon, ToolbarIcons};
 use crate::imagines;
 use crate::settings::{ColumnKind, Settings};
@@ -256,6 +257,19 @@ pub struct OverlayApp {
     /// through `toggle_cluster`'s own click handling and the tray menu's
     /// "Turn off click-through" escape hatch, not this flag.
     startup_toggles_applied: bool,
+    /// Issue #39: the history thread's handle, or `None` when history is
+    /// disabled or its database could not be opened — every history control is
+    /// then simply absent, and nothing else changes.
+    history: Option<history::writer::HistoryHandle>,
+    /// Issue #39: replies from the history thread. Drained once per frame by
+    /// `poll_history`, regardless of whether the history view is open, so a
+    /// reply that lands while it is closed is not dropped — the same reason
+    /// `poll_update_check` drains unconditionally (issue #171).
+    rx_history: Receiver<history::writer::HistoryEvent>,
+    /// The sender half of `rx_history`, cloned into each request.
+    tx_history: Sender<history::writer::HistoryEvent>,
+    /// Issue #39: which surface is showing. See `OverlayView`.
+    view: OverlayView,
 }
 
 /// All icon textures the overlay paints, bundled so `OverlayApp` has exactly
@@ -518,12 +532,17 @@ impl OverlayApp {
         tx_command: Sender<UiCommand>,
         tx_settings: Sender<Settings>,
         settings: Settings,
+        // Issue #39: `None` when history is disabled in settings.json or its
+        // database could not be opened (`main.rs` already logged why) —
+        // every history control is then simply absent.
+        history: Option<history::writer::HistoryHandle>,
     ) -> Self {
         // Demo seed (see `demo_enabled`/`demo_snapshot` above). Cached once
         // here rather than re-called, so `ui()` below can reuse the same
         // answer every frame instead of re-reading the env var.
         let demo_mode = demo_enabled();
         let snapshot = initial_snapshot(demo_mode);
+        let (tx_history, rx_history) = crossbeam_channel::unbounded();
         Self {
             snapshot,
             status: StatusLine::Ok,
@@ -540,6 +559,10 @@ impl OverlayApp {
             screenshot_capture_frames_waited: 0,
             demo_mode,
             startup_toggles_applied: false,
+            history,
+            rx_history,
+            tx_history,
+            view: OverlayView::Live,
         }
     }
 
@@ -603,6 +626,9 @@ impl eframe::App for OverlayApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_snapshots();
         self.poll_update_check();
+        // Issue #39: drained unconditionally, regardless of whether the
+        // history view is open — see `poll_history`'s doc comment.
+        self.poll_history();
 
         let ctx = ui.ctx().clone();
         apply_theme(&ctx);
@@ -714,6 +740,34 @@ impl eframe::App for OverlayApp {
         // the icon textures (issues #9, #41); every later frame reuses them.
         let icons = self.icons.get_or_insert_with(|| Icons::load(&ctx));
 
+        // Issue #39: the open historical fight's header text and its
+        // rebuilt `Snapshot`, cloned once per frame *before* the panel body
+        // — the two short strings and the ~10-row snapshot are cheap next
+        // to a per-frame egui repaint, and cloning them here (rather than
+        // borrowing `self.view` for the rest of the frame) is what lets the
+        // panel closure below still take `&mut self.settings` for
+        // `draw_header` without the borrow checker seeing that as aliasing
+        // the same historical data. `None` in the `Live` case, and whenever
+        // the history view is open but nothing has been loaded yet, costs
+        // no clone at all.
+        let history_open: Option<(String, Option<String>, Snapshot)> = match &self.view {
+            OverlayView::History(state) => state.open.as_ref().map(|open| {
+                (
+                    open.title.clone(),
+                    open.subtitle.clone(),
+                    open.snapshot.clone(),
+                )
+            }),
+            OverlayView::Live => None,
+        };
+        // Issue #39: set by `draw_header_menu`'s "History" item, inside the
+        // panel closure below; read back out here, *after* that closure has
+        // returned, because acting on it means calling `self.open_history()`
+        // — a method that needs the whole `&mut self` free, which it isn't
+        // while `icons` (borrowed from `self.icons` above) is still alive
+        // for the closure's `draw_header`/`draw_rows` calls.
+        let mut open_history_clicked = false;
+
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
@@ -736,6 +790,22 @@ impl eframe::App for OverlayApp {
                 // First, so the header buttons drawn afterwards stay on top of
                 // the corner zones they overlap.
                 draw_resize_handles(ui, &ctx, &mut self.window_gesture);
+                // Issue #39: what the header and rows paint this frame — the
+                // live snapshot, or the open historical one (`history_open`,
+                // cloned above before this closure existed). Computed here,
+                // once, so both `draw_header` below and the `draw_rows`/
+                // `draw_history` branch further down see the same value.
+                let frame_snapshot = history_open
+                    .as_ref()
+                    .map(|(_, _, snapshot)| snapshot)
+                    .unwrap_or(&self.snapshot);
+                let header_history =
+                    history_open
+                        .as_ref()
+                        .map(|(title, subtitle, _)| HistoryHeader {
+                            title,
+                            subtitle: subtitle.as_deref(),
+                        });
                 // Issue #96 (PR #98 review): whether the Share button fired
                 // a screenshot request this frame — if so, the row bound
                 // this same frame computes below is stashed into
@@ -745,7 +815,7 @@ impl eframe::App for OverlayApp {
                 let screenshot_requested = draw_header(
                     ui,
                     &ctx,
-                    &self.snapshot,
+                    frame_snapshot,
                     &self.tx_command,
                     SettingsHandle {
                         settings: &mut self.settings,
@@ -755,6 +825,9 @@ impl eframe::App for OverlayApp {
                     &mut self.window_gesture,
                     capturing,
                     &mut self.update_check,
+                    self.history.is_some(),
+                    &mut open_history_clicked,
+                    header_history,
                 );
                 // Issue #156: whether this frame's wait for the reply has
                 // gone on long enough that it's never coming — computed
@@ -801,7 +874,29 @@ impl eframe::App for OverlayApp {
                 // false])`.
                 let rows_top = ui.cursor().top();
                 let rows_area_height = ui.available_height();
-                draw_rows(ui, &self.snapshot, &self.settings, icons);
+                // Issue #39: set by the history bar's "← Live" button;
+                // checked right after, once the `&mut self.view` borrow the
+                // match below needed has ended.
+                let mut back_to_live = false;
+                match &mut self.view {
+                    OverlayView::Live => {
+                        draw_rows(ui, &self.snapshot, &self.settings, icons);
+                    }
+                    OverlayView::History(state) => {
+                        draw_history(
+                            ui,
+                            state,
+                            &self.settings,
+                            icons,
+                            self.history.as_ref(),
+                            &self.tx_history,
+                            &mut back_to_live,
+                        );
+                    }
+                }
+                if back_to_live {
+                    self.view = OverlayView::Live;
+                }
                 if screenshot_requested {
                     self.pending_screenshot_bound = Some(rows_content_bottom_y(
                         rows_top,
@@ -811,6 +906,14 @@ impl eframe::App for OverlayApp {
                     ));
                 }
             });
+
+        // Issue #39: acted on here, not inside the panel closure above —
+        // `open_history` needs the whole `&mut self`, which isn't free
+        // until `icons`'s borrow of `self.icons` (alive for that closure's
+        // `draw_header`/`draw_rows` calls) has ended.
+        if open_history_clicked {
+            self.open_history();
+        }
 
         // Read once and share with both trackers rather than each calling
         // `ctx.input` separately — also what lets `minimized` be threaded
@@ -970,9 +1073,21 @@ fn draw_header(
     // in-flight/last-result state — threaded through to `draw_header_menu`,
     // the only place that reads or mutates it.
     update_check: &mut UpdateCheckState,
+    // Issue #39: whether the history thread exists at all — threaded
+    // through to `draw_header_menu` so its "History" item can be disabled
+    // (rather than absent) when history is off in settings.json or its
+    // database could not be opened.
+    has_history: bool,
+    // Issue #39: set by `draw_header_menu`'s "History" item; read by
+    // `OverlayApp::ui` to switch `self.view` into `OverlayView::History`.
+    open_history: &mut bool,
+    // Issue #39: when `Some`, the two header text lines name a *historical*
+    // fight rather than the live encounter (spec DECISION D7). Everything
+    // else about the header — timer, DPS readout, toggle cluster, dropdown —
+    // is identical in both modes.
+    history: Option<HistoryHeader<'_>>,
 ) -> bool {
-    let title = encounter_title(&snapshot.encounter);
-    let subtitle = encounter_subtitle(&snapshot.encounter);
+    let (title, subtitle) = header_text(snapshot, history.as_ref());
     // The header band's height budget — also what `draw_header_wash` and the
     // paint clips below size themselves against, so the whole band is one
     // number derived once rather than several that could drift apart.
@@ -1103,6 +1218,8 @@ fn draw_header(
                 },
                 icons,
                 update_check,
+                has_history,
+                open_history,
             );
         });
     draw_subtitle_line(ui, subtitle.as_deref().unwrap_or(""));
@@ -2896,6 +3013,9 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
 /// checkbox click no longer dismisses the whole dropdown. Minimize/Close
 /// call `ui.close()` themselves so they still dismiss it on click, matching
 /// the root's old `CloseOnClick` default for those two items.
+// Issue #39: same reasoning as `draw_header`'s identical allow just above —
+// one more history-view parameter tips this over clippy's default limit.
+#[allow(clippy::too_many_arguments)]
 fn draw_header_menu(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -2905,6 +3025,12 @@ fn draw_header_menu(
     // Issue #171: the manual "Check for updates" item's in-flight/last-
     // result state — see `UpdateCheckState`'s doc comment.
     update_check: &mut UpdateCheckState,
+    // Issue #39: whether the history thread exists — see `draw_header`'s
+    // parameter of the same name.
+    has_history: bool,
+    // Issue #39: set true on a click of the "History" item below; read by
+    // `OverlayApp::ui` to switch into `OverlayView::History`.
+    open_history: &mut bool,
 ) {
     let SettingsHandle {
         settings,
@@ -2999,6 +3125,22 @@ fn draw_header_menu(
         // writer thread just leaves the in-memory value correct for the
         // rest of this session.
         let _ = tx_settings.send(settings.clone());
+    }
+
+    ui.separator();
+
+    // Issue #39: opens the saved-encounter list. Lives here — the same
+    // dropdown as "Forget learned bosses" — because this is already the
+    // plain-egui, cross-platform surface for actions that need no icon slot
+    // and no Win32 plumbing. Disabled with no history thread (history off in
+    // settings.json, or the database could not be opened), so the item is
+    // visible and self-explanatory rather than silently inert.
+    if ui
+        .add_enabled(has_history, egui::Button::new("History"))
+        .clicked()
+    {
+        *open_history = true;
+        ui.close();
     }
 
     ui.separator();
@@ -4877,6 +5019,397 @@ pub fn apply_theme(ctx: &egui::Context) {
     });
 }
 
+// == Encounter history (issue #39) =======================================
+//
+// Everything below is WP3 of the persistent-history feature: the overlay's
+// "past fights" surface. WP1 (`crate::history`) and WP2
+// (`crate::history::writer`) already own storage and the background
+// thread; this is the view over them.
+
+/// Which surface the overlay is showing (issue #39). `History` is a *mode of
+/// the existing `CentralPanel`*, not a second window: the main HWND is the
+/// only one carrying `WS_EX_NOREDIRECTIONBITMAP` + DirectComposition (issue
+/// #89), the `WM_NCHITTEST` click-through carve-out (issue #167), the
+/// Aero-Snap blocker (issue #11) and the tray subclass (issue #53) — a second
+/// egui viewport would have none of them.
+enum OverlayView {
+    Live,
+    // Boxed (issue #39, clippy::large_enum_variant): `HistoryUi` carries a
+    // `Vec<EncounterSummary>` and an `Option<OpenEncounter>` — enough that
+    // an unboxed variant would make every `OverlayView` (including the
+    // common `Live` case) pay for the larger variant's size.
+    History(Box<HistoryUi>),
+}
+
+/// The history view's own state: what the last reply from the history thread
+/// contained, and which encounter (if any) is open.
+#[derive(Default)]
+struct HistoryUi {
+    /// Newest-first summaries from the last `Listed` reply.
+    encounters: Vec<history::EncounterSummary>,
+    /// The encounter currently being read, already rebuilt into a `Snapshot`
+    /// so `draw_rows` can render it unchanged — a past fight looks pixel
+    /// identical to a live one.
+    open: Option<OpenEncounter>,
+    /// A `HistoryEvent::Failed` message worth showing, cleared on the next
+    /// successful reply.
+    error: Option<String>,
+    /// True between firing a request and its reply landing — the view shows
+    /// "Loading…" rather than a stale empty list.
+    pending: bool,
+    /// Latches "Clear all" into a confirming state after one click; a second
+    /// click while this is true actually fires `HistoryHandle::clear`. Reset
+    /// on every other history-bar/list interaction, so leaving and
+    /// returning to the list never leaves it primed.
+    confirm_clear: bool,
+    /// The id of the in-flight `Load` request, if any. `HistoryEvent::
+    /// Loaded`'s `EncounterRecord` doesn't carry its own row id — only
+    /// `EncounterSummary` does — so this is what lets that reply be paired
+    /// back up with the id that was actually requested.
+    pending_load_id: Option<i64>,
+}
+
+/// One saved encounter, rebuilt for display: the id (needed for the delete
+/// button while it's open) plus everything `draw_header`/`draw_rows` need.
+struct OpenEncounter {
+    // `id`/`ended_at_ms` round out the DTO to match `EncounterSummary`'s
+    // shape (and are what a future "delete the fight I'm looking at" button
+    // would need), but WP3's bar only offers delete from the list — so
+    // neither is read yet.
+    #[allow(dead_code)]
+    id: i64,
+    title: String,
+    subtitle: Option<String>,
+    #[allow(dead_code)]
+    ended_at_ms: u64,
+    snapshot: Snapshot,
+}
+
+/// The header's title/subtitle override for a historical fight (spec
+/// DECISION D7) — bundled rather than passed as two loose parameters so
+/// `draw_header`'s argument list stays readable.
+struct HistoryHeader<'a> {
+    title: &'a str,
+    subtitle: Option<&'a str>,
+}
+
+/// How many encounters the list requests. Comfortably above the default
+/// retention cap (`Settings::history_max_encounters` = 500) so the list is
+/// never silently truncated below what retention already keeps.
+const HISTORY_LIST_LIMIT: u32 = 1_000;
+
+/// Width of the trailing delete button painted into each history row.
+const HISTORY_DELETE_WIDTH: f32 = 18.0;
+
+/// Left/right text inset inside a history row, matching the row list's own
+/// breathing room rather than introducing a new metric scale.
+const HISTORY_ROW_PADDING: f32 = 8.0;
+
+/// The header's title/subtitle selection: a historical fight's saved name
+/// (spec DECISION D7) when `history` is `Some`, the live encounter's derived
+/// name otherwise. Pulled out of `draw_header` as the one pure extraction
+/// WP3 permits, so it is testable without an `egui::Ui`.
+fn header_text(
+    snapshot: &Snapshot,
+    history: Option<&HistoryHeader<'_>>,
+) -> (String, Option<String>) {
+    match history {
+        Some(h) => (h.title.to_string(), h.subtitle.map(str::to_string)),
+        None => (
+            encounter_title(&snapshot.encounter),
+            encounter_subtitle(&snapshot.encounter),
+        ),
+    }
+}
+
+impl OverlayApp {
+    /// Drains the history thread's replies, once per frame (spec DECISION
+    /// D5). Called from `ui()` unconditionally, before the panel — the
+    /// channel is drained even in `Live` view (so replies never pile up
+    /// behind `rx_history`), but a reply is only *applied* to `HistoryUi`
+    /// while that view actually exists to hold it; `open_history` always
+    /// issues a fresh `list` request on the way in, so a reply that arrives
+    /// after the view has already closed is safe to simply discard.
+    fn poll_history(&mut self) {
+        for event in self.rx_history.try_iter() {
+            let OverlayView::History(state) = &mut self.view else {
+                continue;
+            };
+            match event {
+                history::writer::HistoryEvent::Listed(rows) => {
+                    state.encounters = rows;
+                    state.error = None;
+                    state.pending = false;
+                }
+                history::writer::HistoryEvent::Loaded(record) => {
+                    if let Some(id) = state.pending_load_id.take() {
+                        state.open = Some(OpenEncounter {
+                            id,
+                            title: record.title.clone(),
+                            subtitle: record.subtitle.clone(),
+                            ended_at_ms: record.ended_at_ms,
+                            snapshot: record.to_snapshot(),
+                        });
+                        state.error = None;
+                    }
+                    state.pending = false;
+                }
+                history::writer::HistoryEvent::Missing(_) => {
+                    // Deleted, or pruned since the list was taken — drop
+                    // back to the list rather than showing a stale fight.
+                    state.pending_load_id = None;
+                    state.open = None;
+                    state.pending = false;
+                }
+                history::writer::HistoryEvent::Changed => {
+                    // A delete/clear landed; re-request the list so it
+                    // reflects the new state.
+                    state.confirm_clear = false;
+                    if let Some(handle) = &self.history {
+                        handle.list(HISTORY_LIST_LIMIT, &self.tx_history);
+                        state.pending = true;
+                    }
+                }
+                history::writer::HistoryEvent::Failed(message) => {
+                    state.pending_load_id = None;
+                    state.error = Some(message);
+                    state.pending = false;
+                }
+            }
+        }
+    }
+
+    /// Switches to the history view and asks for the list (issue #39).
+    fn open_history(&mut self) {
+        let pending = self.history.is_some();
+        self.view = OverlayView::History(Box::new(HistoryUi {
+            pending,
+            ..HistoryUi::default()
+        }));
+        if let Some(handle) = &self.history {
+            handle.list(HISTORY_LIST_LIMIT, &self.tx_history);
+        }
+    }
+}
+
+/// The whole history surface: the bar, then either the list or the open
+/// encounter's rows (rendered through the same `draw_rows` a live fight
+/// uses, per the spec's reference-fidelity requirement).
+fn draw_history(
+    ui: &mut egui::Ui,
+    state: &mut HistoryUi,
+    settings: &Settings,
+    icons: &Icons,
+    handle: Option<&history::writer::HistoryHandle>,
+    tx: &Sender<history::writer::HistoryEvent>,
+    back_to_live: &mut bool,
+) {
+    match draw_history_bar(ui, state) {
+        HistoryBarAction::None => {}
+        HistoryBarAction::Live => *back_to_live = true,
+        HistoryBarAction::Back => {
+            state.open = None;
+            state.confirm_clear = false;
+        }
+        HistoryBarAction::ClearAll => {
+            if state.confirm_clear {
+                state.confirm_clear = false;
+                if let Some(handle) = handle {
+                    handle.clear(tx);
+                    state.pending = true;
+                }
+            } else {
+                state.confirm_clear = true;
+            }
+        }
+    }
+
+    ui.separator();
+
+    if let Some(open) = &state.open {
+        draw_rows(ui, &open.snapshot, settings, icons);
+        return;
+    }
+
+    match draw_history_list(ui, state) {
+        Some(HistoryRowAction::Open(id)) => {
+            state.confirm_clear = false;
+            state.pending_load_id = Some(id);
+            state.pending = true;
+            if let Some(handle) = handle {
+                handle.load(id, tx);
+            }
+        }
+        Some(HistoryRowAction::Delete(id)) => {
+            state.confirm_clear = false;
+            state.pending = true;
+            if let Some(handle) = handle {
+                handle.delete(id, tx);
+            }
+        }
+        None => {}
+    }
+}
+
+/// The bar under the header: "← Live", a "← Back" when an encounter is
+/// open, and (in list mode) "Clear all".
+fn draw_history_bar(ui: &mut egui::Ui, state: &HistoryUi) -> HistoryBarAction {
+    let mut action = HistoryBarAction::None;
+    ui.horizontal(|ui| {
+        if ui.button("← Live").clicked() {
+            action = HistoryBarAction::Live;
+        }
+        if state.open.is_some() {
+            if ui.button("← Back").clicked() {
+                action = HistoryBarAction::Back;
+            }
+        } else {
+            let label = if state.confirm_clear {
+                "Clear all — confirm?"
+            } else {
+                "Clear all"
+            };
+            if ui.button(label).clicked() {
+                action = HistoryBarAction::ClearAll;
+            }
+        }
+    });
+    action
+}
+
+/// The newest-first list of saved encounters, one fixed-height row each.
+/// Returns the row the user clicked, if any.
+fn draw_history_list(ui: &mut egui::Ui, state: &HistoryUi) -> Option<HistoryRowAction> {
+    if let Some(message) = &state.error {
+        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), message.as_str());
+        return None;
+    }
+    if state.pending && state.encounters.is_empty() {
+        ui.label("Loading…");
+        return None;
+    }
+    if state.encounters.is_empty() {
+        ui.label("No saved encounters yet.");
+        return None;
+    }
+
+    let mut action = None;
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for summary in &state.encounters {
+                if let Some(row_action) = draw_history_row(ui, summary) {
+                    action = Some(row_action);
+                }
+            }
+        });
+    action
+}
+
+/// One list row: title, subtitle, local date+time, duration, total DPS,
+/// player count, and a trailing delete button.
+fn draw_history_row(
+    ui: &mut egui::Ui,
+    summary: &history::EncounterSummary,
+) -> Option<HistoryRowAction> {
+    let width = ui.available_width();
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click());
+
+    if !ui.is_rect_visible(rect) {
+        return None;
+    }
+
+    // The trailing delete button's own hit-test region, inside the row's
+    // already-reserved space — checked ahead of the row's own click below so
+    // a delete click can never also open the encounter underneath it.
+    let delete_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.right() - HISTORY_DELETE_WIDTH - HISTORY_ROW_PADDING,
+            rect.top(),
+        ),
+        egui::vec2(HISTORY_DELETE_WIDTH, rect.height()),
+    );
+    let delete_response = ui.interact(
+        delete_rect,
+        ui.id().with(("history_row_delete", summary.id)),
+        egui::Sense::click(),
+    );
+
+    let painter = ui.painter();
+    let center_y = rect.center().y;
+
+    let title_pos = egui::pos2(rect.left() + HISTORY_ROW_PADDING, center_y);
+    let title_rect = paint_bold_text(
+        painter,
+        title_pos,
+        egui::Align2::LEFT_CENTER,
+        &summary.title,
+        FONT_SIZE_ROW,
+        TITLE_TEXT_COLOR,
+    );
+    if let Some(subtitle) = &summary.subtitle {
+        paint_text(
+            painter,
+            egui::pos2(title_rect.right() + HISTORY_ROW_PADDING, center_y),
+            egui::Align2::LEFT_CENTER,
+            subtitle,
+            regular(FONT_SIZE_SUBTITLE),
+            SUBTITLE_TEXT_COLOR,
+            false,
+        );
+    }
+
+    let stats = format!(
+        "{}    {}    {}/s    {}p",
+        history::format_local_time(summary.ended_at_ms),
+        history::format_duration(summary.duration_ms),
+        fmt_short(summary.total_dps as i64),
+        summary.player_count
+    );
+    paint_text(
+        painter,
+        egui::pos2(delete_rect.left() - HISTORY_ROW_PADDING, center_y),
+        egui::Align2::RIGHT_CENTER,
+        &stats,
+        regular(FONT_SIZE_SUBTITLE),
+        SUBTITLE_TEXT_COLOR,
+        false,
+    );
+
+    paint_text(
+        painter,
+        delete_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "✕",
+        regular(FONT_SIZE_SUBTITLE),
+        PILL_VALUE_COLOR,
+        false,
+    );
+
+    if delete_response.clicked() {
+        Some(HistoryRowAction::Delete(summary.id))
+    } else if response.clicked() {
+        Some(HistoryRowAction::Open(summary.id))
+    } else {
+        None
+    }
+}
+
+/// What a click on the list produced.
+enum HistoryRowAction {
+    Open(i64),
+    Delete(i64),
+}
+
+/// What a click on the bar produced.
+enum HistoryBarAction {
+    None,
+    Live,
+    Back,
+    ClearAll,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5129,7 +5662,13 @@ mod tests {
         let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
-        let mut app = OverlayApp::new(rx_snapshot, tx_command, tx_settings, Settings::default());
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
         app.demo_mode = true;
         app.snapshot = demo_snapshot();
 
@@ -5151,7 +5690,13 @@ mod tests {
         let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
-        let mut app = OverlayApp::new(rx_snapshot, tx_command, tx_settings, Settings::default());
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
         app.demo_mode = false;
 
         tx_snapshot.send(rows_test_snapshot(2)).unwrap();
@@ -5389,6 +5934,9 @@ mod tests {
                 &mut WindowGesture::default(),
                 false,
                 &mut UpdateCheckState::default(),
+                false,
+                &mut false,
+                None,
             );
         });
         let mut texts = Vec::new();
@@ -5543,6 +6091,9 @@ mod tests {
                 &mut WindowGesture::default(),
                 false,
                 &mut UpdateCheckState::default(),
+                false,
+                &mut false,
+                None,
             );
         });
         for clipped in &output.shapes {
@@ -5793,6 +6344,9 @@ mod tests {
                 &mut WindowGesture::default(),
                 false,
                 &mut UpdateCheckState::default(),
+                false,
+                &mut false,
+                None,
             );
         });
         let update = output
@@ -5873,6 +6427,9 @@ mod tests {
                 &mut WindowGesture::default(),
                 false,
                 &mut UpdateCheckState::default(),
+                false,
+                &mut false,
+                None,
             );
             interact_size_y = ui.spacing().interact_size.y;
             rendered_height = ui.min_rect().height();
@@ -6936,7 +7493,13 @@ mod tests {
         let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
-        let mut app = OverlayApp::new(rx_snapshot, tx_command, tx_settings, Settings::default());
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
 
         // What `OverlayApp::ui` does at the end of the frame the Share
         // click fired on: stash *that* frame's row bound, computed from
@@ -10100,7 +10663,13 @@ mod tests {
         let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
-        let mut app = OverlayApp::new(rx_snapshot, tx_command, tx_settings, Settings::default());
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
         let (tx, rx) = crossbeam_channel::unbounded();
         app.update_check = UpdateCheckState::Checking { rx };
         tx.send(Ok(CheckOutcome::UpToDate)).unwrap();
@@ -10122,7 +10691,13 @@ mod tests {
         let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
-        let mut app = OverlayApp::new(rx_snapshot, tx_command, tx_settings, Settings::default());
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
         let (_tx, rx) = crossbeam_channel::unbounded();
         app.update_check = UpdateCheckState::Checking { rx };
 
@@ -10147,7 +10722,13 @@ mod tests {
         let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
-        let mut app = OverlayApp::new(rx_snapshot, tx_command, tx_settings, Settings::default());
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
         let (tx, rx) = crossbeam_channel::unbounded::<Result<CheckOutcome, String>>();
         app.update_check = UpdateCheckState::Checking { rx };
         drop(tx);
@@ -10191,6 +10772,8 @@ mod tests {
                     },
                     &icons,
                     update_check,
+                    false,
+                    &mut false,
                 );
             });
             let update = output
@@ -10245,6 +10828,8 @@ mod tests {
                 },
                 &icons,
                 &mut update_check,
+                false,
+                &mut false,
             );
         });
         let mut texts = Vec::new();
@@ -10287,6 +10872,8 @@ mod tests {
                 },
                 &icons,
                 &mut update_check,
+                false,
+                &mut false,
             );
         });
         let mut texts = Vec::new();
@@ -10331,6 +10918,8 @@ mod tests {
                 },
                 &icons,
                 &mut update_check,
+                false,
+                &mut false,
             );
         });
         let mut texts = Vec::new();
@@ -10378,6 +10967,8 @@ mod tests {
                 },
                 &icons,
                 &mut UpdateCheckState::default(),
+                false,
+                &mut false,
             );
         });
         let update = layout
@@ -10400,6 +10991,8 @@ mod tests {
                 },
                 &icons,
                 &mut UpdateCheckState::default(),
+                false,
+                &mut false,
             );
         });
         let close_commands = output
@@ -10457,6 +11050,8 @@ mod tests {
                 },
                 &icons,
                 &mut UpdateCheckState::default(),
+                false,
+                &mut false,
             );
         });
         let update = layout
@@ -10486,6 +11081,8 @@ mod tests {
                 },
                 &icons,
                 &mut UpdateCheckState::default(),
+                false,
+                &mut false,
             );
         });
         output.drop_without_applying_deltas();
@@ -10519,6 +11116,8 @@ mod tests {
                 },
                 &icons,
                 &mut UpdateCheckState::default(),
+                false,
+                &mut false,
             );
         });
         output.drop_without_applying_deltas();
@@ -10601,6 +11200,9 @@ mod tests {
                     &mut gesture,
                     false,
                     &mut update_check,
+                    false,
+                    &mut false,
+                    None,
                 );
             });
             let update = output
@@ -11284,5 +11886,277 @@ mod tests {
                 "hit box must have area (pixels_per_point {bad})"
             );
         }
+    }
+
+    // -- Encounter history view (issue #39) ---------------------------------
+
+    /// Builds a throwaway `OverlayApp` for the history-view tests below —
+    /// none of them exercise capture/settings/command plumbing, so every
+    /// channel is a fresh, otherwise-unused pair.
+    fn history_test_app() -> OverlayApp {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        )
+    }
+
+    #[test]
+    fn a_fresh_overlay_starts_in_the_live_view() {
+        let app = history_test_app();
+        assert!(matches!(app.view, OverlayView::Live));
+    }
+
+    #[test]
+    fn opening_history_switches_the_view() {
+        let mut app = history_test_app();
+        app.open_history();
+        assert!(matches!(app.view, OverlayView::History(_)));
+    }
+
+    #[test]
+    fn a_listed_reply_populates_the_encounter_list() {
+        let mut app = history_test_app();
+        app.open_history();
+
+        let summary = history::EncounterSummary {
+            id: 1,
+            ended_at_ms: 1_000,
+            duration_ms: 5_000,
+            total_damage: 1_000,
+            total_dps: 200.0,
+            title: "Test Boss".to_string(),
+            subtitle: None,
+            player_count: 3,
+        };
+        app.tx_history
+            .send(history::writer::HistoryEvent::Listed(vec![summary]))
+            .unwrap();
+        app.poll_history();
+
+        let OverlayView::History(state) = &app.view else {
+            panic!("expected the History view");
+        };
+        assert_eq!(state.encounters.len(), 1);
+    }
+
+    #[test]
+    fn a_loaded_reply_opens_that_encounter() {
+        let mut app = history_test_app();
+        app.open_history();
+        let OverlayView::History(state) = &mut app.view else {
+            panic!("expected the History view");
+        };
+        // `HistoryEvent::Loaded`'s `EncounterRecord` doesn't carry its own
+        // row id (see `HistoryUi::pending_load_id`'s doc comment) — this is
+        // what a real `HistoryRowAction::Open(7)` click would have set.
+        state.pending_load_id = Some(7);
+
+        let record = history::EncounterRecord {
+            ended_at_ms: 2_000,
+            duration_ms: 5_000,
+            total_damage: 1_000,
+            total_dps: 200.0,
+            boss_monster_id: None,
+            boss_name: None,
+            is_boss: false,
+            scene_id: None,
+            scene_name: None,
+            title: "Loaded Fight".to_string(),
+            subtitle: None,
+            meter_version: "0.0.0".to_string(),
+            players: Vec::new(),
+        };
+        app.tx_history
+            .send(history::writer::HistoryEvent::Loaded(Box::new(record)))
+            .unwrap();
+        app.poll_history();
+
+        let OverlayView::History(state) = &app.view else {
+            panic!("expected the History view");
+        };
+        assert_eq!(state.open.as_ref().map(|open| open.id), Some(7));
+    }
+
+    #[test]
+    fn a_missing_reply_drops_back_to_the_list() {
+        let mut app = history_test_app();
+        app.open_history();
+        let OverlayView::History(state) = &mut app.view else {
+            panic!("expected the History view");
+        };
+        state.open = Some(OpenEncounter {
+            id: 9,
+            title: "Stale Fight".to_string(),
+            subtitle: None,
+            ended_at_ms: 0,
+            snapshot: header_test_snapshot(1_000),
+        });
+
+        app.tx_history
+            .send(history::writer::HistoryEvent::Missing(9))
+            .unwrap();
+        app.poll_history();
+
+        let OverlayView::History(state) = &app.view else {
+            panic!("expected the History view");
+        };
+        assert!(state.open.is_none());
+    }
+
+    #[test]
+    fn a_failed_reply_is_surfaced_as_an_error() {
+        let mut app = history_test_app();
+        app.open_history();
+
+        app.tx_history
+            .send(history::writer::HistoryEvent::Failed("boom".to_string()))
+            .unwrap();
+        app.poll_history();
+
+        let OverlayView::History(state) = &app.view else {
+            panic!("expected the History view");
+        };
+        assert_eq!(state.error.as_deref(), Some("boom"));
+    }
+
+    /// `draw_history_bar`'s "← Live" button is what `OverlayApp::ui` reads
+    /// (as `back_to_live`) to actually reset `self.view` — see that call
+    /// site's own comment for why the reset itself can't run inside a unit
+    /// test (it needs a live `eframe::Frame`, which nothing in this test
+    /// module can construct). This is the mechanism that drives it.
+    #[test]
+    fn back_to_live_restores_the_live_view() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let state = HistoryUi::default();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_history_bar(ui, &state);
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let live_pos = accessible_rect_for_label(&update, "← Live").center();
+        layout.drop_without_applying_deltas();
+
+        let mut action = HistoryBarAction::None;
+        let output = ctx.run_ui(click_at(live_pos), |ui| {
+            action = draw_history_bar(ui, &state);
+        });
+        output.drop_without_applying_deltas();
+
+        assert!(matches!(action, HistoryBarAction::Live));
+    }
+
+    #[test]
+    fn the_header_prefers_the_historical_title() {
+        let snapshot = header_test_snapshot(1_000);
+        let history = HistoryHeader {
+            title: "Historical Fight",
+            subtitle: Some("Historical Scene"),
+        };
+
+        let (title, subtitle) = header_text(&snapshot, Some(&history));
+
+        assert_eq!(
+            (title, subtitle),
+            (
+                "Historical Fight".to_string(),
+                Some("Historical Scene".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn clear_all_requires_a_second_click() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let settings = Settings::default();
+        let mut state = HistoryUi::default();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut back_to_live = false;
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_history(
+                ui,
+                &mut state,
+                &settings,
+                &icons,
+                None,
+                &tx,
+                &mut back_to_live,
+            );
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let first_pos = accessible_rect_for_label(&update, "Clear all").center();
+        layout.drop_without_applying_deltas();
+
+        ctx.run_ui(click_at(first_pos), |ui| {
+            draw_history(
+                ui,
+                &mut state,
+                &settings,
+                &icons,
+                None,
+                &tx,
+                &mut back_to_live,
+            );
+        })
+        .drop_without_applying_deltas();
+        assert!(
+            state.confirm_clear,
+            "the first click must only arm the confirm state, not fire"
+        );
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_history(
+                ui,
+                &mut state,
+                &settings,
+                &icons,
+                None,
+                &tx,
+                &mut back_to_live,
+            );
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let second_pos = accessible_rect_for_label(&update, "Clear all — confirm?").center();
+        layout.drop_without_applying_deltas();
+
+        ctx.run_ui(click_at(second_pos), |ui| {
+            draw_history(
+                ui,
+                &mut state,
+                &settings,
+                &icons,
+                None,
+                &tx,
+                &mut back_to_live,
+            );
+        })
+        .drop_without_applying_deltas();
+        assert!(
+            !state.confirm_clear,
+            "the second click must fire and reset the confirm state"
+        );
     }
 }

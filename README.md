@@ -63,8 +63,21 @@ game, always on top. A few things to know:
   DPS, Share %, Crit %, Lucky %, Hits, Deaths). Your choices are saved
   automatically.
 - **Data location**: settings are stored in
-  `%APPDATA%\ShinraMeter-BPSR\settings.json`, and logs in
-  `%APPDATA%\ShinraMeter-BPSR\logs\ShinraMeter-BPSR.log`.
+  `%APPDATA%\ShinraMeter-BPSR\settings.json`, logs in
+  `%APPDATA%\ShinraMeter-BPSR\logs\ShinraMeter-BPSR.log`, and your saved
+  encounter history in `%APPDATA%\ShinraMeter-BPSR\history.sqlite`. The
+  history database holds the names of everyone you fought alongside — treat
+  it like a private file (see `CONTRIBUTING.md`).
+- **History**: the gear dropdown's "History" item opens a list of your past
+  encounters — newest first, one row per fight, showing the boss, the
+  dungeon, when it happened, how long it took, the party's DPS and how many
+  players were in it. Click a row to see that fight's table exactly as it
+  looked live; there's a delete for a single fight and a clear-all for the
+  lot. The meter keeps the last 500 encounters and anything from the last 90
+  days, and ignores pulls shorter than 5 seconds; all three are configurable
+  in `settings.json` (`history_max_encounters`, `history_max_age_days`,
+  `history_min_duration_ms`), and `history_enabled: false` turns the whole
+  feature off.
 - All icons — class, Imagine, and toolbar — are compiled into the
   executable, so there's no `assets` folder shipped alongside it to lose,
   delete, or otherwise manage.
@@ -234,6 +247,8 @@ The binaries live in `crates/capture/vendor/windivert/`, taken verbatim from the
   by default. See `docs/packet-inspection.md`.
 - `SHINRA_DEMO=1` — seed a fixed synthetic encounter for UI work when no
   live game session is available.
+- `SHINRA_HISTORY_DB` — points the encounter-history database at a different
+  file; useful for testing against a scratch copy.
 
 Logs and packet-inspection dumps may contain player names and other
 identifying traffic — never attach one to an issue or PR; mint a minimal

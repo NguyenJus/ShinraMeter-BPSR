@@ -20,6 +20,8 @@
 use std::cmp::Reverse;
 use std::path::Path;
 
+use bpsr_app::history::writer::HistoryHandle;
+use bpsr_app::history::{EncounterRecord, EncounterSummary, RetentionPolicy};
 use bpsr_app::pipeline::Pipeline;
 use bpsr_capture::tcp::TcpReassembler;
 use bpsr_meter::{FightState, PlayerRow, ResetReason, Snapshot};
@@ -38,6 +40,11 @@ pub struct Rig {
     seq: u32,
     resets: Vec<(u64, ResetReason)>,
     fight_state: FightState,
+    /// The history thread's handle (issue #39), if `with_history` attached
+    /// one. `None` for every existing test, which is what keeps this change
+    /// inert for them — `Pipeline::record_fight_end` is a no-op without a
+    /// `history` handle.
+    history: Option<HistoryHandle>,
 }
 
 /// One `Step::Capture` observed while running a [`Scenario`].
@@ -64,7 +71,34 @@ impl Rig {
             seq: INITIAL_SEQ,
             resets: Vec::new(),
             fight_state: FightState::Idle,
+            history: None,
         }
+    }
+
+    /// Attaches a history thread (issue #39) so a scenario's fight ends land
+    /// in a real database. `path` is the test's own temp file — `Rig` never
+    /// touches `%APPDATA%`. Rebuilds `self.pipeline` fresh (this `Rig` never
+    /// configures the name/scene-boss caches, so there is nothing else to
+    /// preserve) so the returned `Rig` records every fight end through the
+    /// real `Pipeline::step`/`tick`/`record_fight_end` edge, exactly like
+    /// production.
+    pub fn with_history(
+        mut self,
+        path: std::path::PathBuf,
+        policy: RetentionPolicy,
+    ) -> (Self, std::thread::JoinHandle<()>) {
+        let (handle, thread) =
+            HistoryHandle::spawn(path, policy).expect("open the test history store");
+        self.history = Some(handle.clone());
+        self.pipeline = Pipeline::new().with_history(handle);
+        (self, thread)
+    }
+
+    /// The history handle attached by `with_history`, if any — for a test
+    /// that wants to `list`/`load`/`delete`/`clear` directly against the
+    /// same store the scenario just wrote to.
+    pub fn history(&self) -> Option<&HistoryHandle> {
+        self.history.as_ref()
     }
 
     /// Runs every step of `scenario` in order, returning the `Capture`s taken
@@ -85,6 +119,8 @@ impl Rig {
                 }
                 Step::Tick { at_ms } => {
                     self.fight_state = self.pipeline.tick(*at_ms);
+                    let snapshot = self.pipeline.snapshot(*at_ms);
+                    self.pipeline.record_fight_end(self.fight_state, &snapshot);
                 }
                 Step::Capture { at_ms, label } => {
                     captures.push(Capture {
@@ -127,10 +163,13 @@ impl Rig {
     }
 
     /// Advances the meter's idle-timeout state machine, mirroring what
-    /// `Step::Tick` does inside `run`. Exposed directly for
+    /// `Step::Tick` does inside `run` (issue #39: including the
+    /// `record_fight_end` edge trigger). Exposed directly for
     /// `feed_notify`-driven tests, which don't go through `Scenario`/`run`.
     pub fn tick(&mut self, now_ms: u64) -> FightState {
         self.fight_state = self.pipeline.tick(now_ms);
+        let snapshot = self.pipeline.snapshot(now_ms);
+        self.pipeline.record_fight_end(self.fight_state, &snapshot);
         self.fight_state
     }
 
@@ -229,12 +268,41 @@ fn split_at_offsets(bytes: &[u8], at: &[usize]) -> Vec<Vec<u8>> {
 /// call — parallel-safe, unlike `set_var`.
 pub fn assert_golden(capture: &Capture) {
     let rendered = render(capture);
+    compare_golden(capture.label, &rendered);
+}
+
+/// Renders what the history database holds for one encounter, as
+/// deterministic text — the encounter-history counterpart of `render`
+/// (issue #39) — and compares it with `tests/goldens/<label>.txt` via the
+/// same `compare_golden` machinery `assert_golden` uses.
+///
+/// `encounters` is a `list()` reply (newest first); only its first row is
+/// rendered as the `summary` line, alongside the full `load()`ed `record`
+/// (players included). Deliberately omits `record.meter_version` — it is
+/// `env!("CARGO_PKG_VERSION")` and would churn the golden on every release
+/// bump; assert that separately in code instead.
+pub fn assert_history_golden(
+    label: &str,
+    encounters: &[EncounterSummary],
+    record: &EncounterRecord,
+) {
+    let rendered = render_history(label, encounters, record);
+    compare_golden(label, &rendered);
+}
+
+/// Shared golden-file compare/update tail for `assert_golden` and
+/// `assert_history_golden` (issue #39).
+///
+/// With `SHINRA_UPDATE_GOLDENS` set in the environment, writes the file
+/// instead and passes. Read-only env access (`std::env::var`), read once per
+/// call — parallel-safe, unlike `set_var`.
+fn compare_golden(label: &str, rendered: &str) {
     let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/goldens"));
-    let path = dir.join(format!("{}.txt", capture.label));
+    let path = dir.join(format!("{label}.txt"));
 
     if std::env::var("SHINRA_UPDATE_GOLDENS").is_ok() {
         std::fs::create_dir_all(dir).expect("create tests/goldens");
-        std::fs::write(&path, &rendered).expect("write golden file");
+        std::fs::write(&path, rendered).expect("write golden file");
         return;
     }
 
@@ -250,10 +318,65 @@ pub fn assert_golden(capture: &Capture) {
         expected == rendered,
         "golden mismatch for {label:?} ({path}):\n{diff}\nregenerate with `SHINRA_UPDATE_GOLDENS=1 cargo test -p ShinraMeter-BPSR --tests`, \
          read the diff, then re-run without the variable",
-        label = capture.label,
         path = path.display(),
-        diff = line_diff(&expected, &rendered),
+        diff = line_diff(&expected, rendered),
     );
+}
+
+/// Renders an `assert_history_golden` call as the plain deterministic golden
+/// text format documented on its doc comment.
+fn render_history(
+    label: &str,
+    encounters: &[EncounterSummary],
+    record: &EncounterRecord,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("history={label}\n"));
+    out.push_str(&format!("count={}\n", encounters.len()));
+    if let Some(summary) = encounters.first() {
+        out.push_str(&format!(
+            "summary title={} subtitle={} ended_at_ms={} duration_ms={} total_damage={} total_dps={} players={}\n",
+            summary.title,
+            opt(summary.subtitle.clone()),
+            summary.ended_at_ms,
+            summary.duration_ms,
+            summary.total_damage,
+            fmt_f64(summary.total_dps),
+            summary.player_count,
+        ));
+    }
+    out.push_str(&format!(
+        "record title={} subtitle={} boss_monster_id={} is_boss={} scene_id={} ended_at_ms={} duration_ms={} total_damage={} total_dps={}\n",
+        record.title,
+        opt(record.subtitle.clone()),
+        opt(record.boss_monster_id),
+        record.is_boss,
+        opt(record.scene_id),
+        record.ended_at_ms,
+        record.duration_ms,
+        record.total_damage,
+        fmt_f64(record.total_dps),
+    ));
+    for (slot, player) in record.players.iter().enumerate() {
+        out.push_str(&format!(
+            "row slot={} uid={} name={} class={} damage={} dps={} share={} crit={} lucky={} hits={} deaths={}\n",
+            slot,
+            player.uid,
+            player.name,
+            match player.class {
+                Some(class) => class.name(),
+                None => "-",
+            },
+            player.damage,
+            fmt_f64(player.dps),
+            fmt_f32(player.share_pct),
+            fmt_f32(player.crit_pct),
+            fmt_f32(player.lucky_pct),
+            player.hits,
+            player.deaths,
+        ));
+    }
+    out
 }
 
 /// Renders one `Capture` as the plain deterministic golden text format.
