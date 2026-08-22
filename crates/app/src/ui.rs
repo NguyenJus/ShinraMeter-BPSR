@@ -5504,8 +5504,7 @@ const MIN_COLUMN_SCALE: f32 = 0.6;
 /// this window's "no scrolling needed" promise and the wash's reach can
 /// never drift back out of sync with each other.
 fn default_inner_height() -> f32 {
-    let rows = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
-    first_player_row_top_offset(header_band_height(BUTTON_ROW_HEIGHT)) + rows
+    inner_height_for_rows(DEFAULT_VISIBLE_ROWS)
 }
 
 /// Number of player rows the header dropdown's "Reset to defaults" item
@@ -5524,7 +5523,17 @@ const RESET_TO_DEFAULTS_VISIBLE_ROWS: usize = 5;
 /// the `Settings::default()` column set this reset also restores, with no
 /// dependence on row count — so only height needs its own helper here.
 fn reset_to_defaults_inner_height() -> f32 {
-    let rows = RESET_TO_DEFAULTS_VISIBLE_ROWS as f32 * ROW_HEIGHT;
+    inner_height_for_rows(RESET_TO_DEFAULTS_VISIBLE_ROWS)
+}
+
+/// Shared formula behind both `default_inner_height` and
+/// `reset_to_defaults_inner_height` (issue #203 review finding): the header
+/// band + separator + gap above the roster, plus `rows` player rows below
+/// it. Pulling this out means the two callers can never drift from each
+/// other by editing the top-level math in one and not the other — only the
+/// row count differs between them, and that lives in their own constants.
+fn inner_height_for_rows(rows: usize) -> f32 {
+    let rows = rows as f32 * ROW_HEIGHT;
     first_player_row_top_offset(header_band_height(BUTTON_ROW_HEIGHT)) + rows
 }
 
@@ -11445,10 +11454,19 @@ mod tests {
     }
 
     #[test]
-    fn reset_to_defaults_inner_height_is_shorter_than_the_twenty_row_default() {
-        // The whole point of a separate constant: 5 rows must open a
-        // noticeably shorter window than the full 20-row launch default.
-        assert!(reset_to_defaults_inner_height() < default_inner_height());
+    fn reset_to_defaults_inner_height_is_shorter_than_the_twenty_row_default_by_exactly_the_row_delta()
+     {
+        // Both heights derive from the same `inner_height_for_rows` formula
+        // now, so the *only* thing that can differ between them is the row
+        // count. Asserting the exact gap (not just `<`) is what actually
+        // catches drift: if a future edit changes the top-level formula for
+        // one caller but not the other, this fails even though both heights
+        // still individually "fit their rows".
+        let row_delta = (DEFAULT_VISIBLE_ROWS - RESET_TO_DEFAULTS_VISIBLE_ROWS) as f32;
+        assert_eq!(
+            default_inner_height() - reset_to_defaults_inner_height(),
+            row_delta * ROW_HEIGHT
+        );
     }
 
     // -- draw_rows scrolling (issue #84) and the row-pitch/centering
