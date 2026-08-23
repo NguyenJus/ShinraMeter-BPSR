@@ -129,6 +129,45 @@ pub struct EnemyHp {
     pub timestamp_ms: u64,
 }
 
+/// Dungeon flow state (`decode::opcode::SYNC_DUNGEON_DATA` /
+/// `SYNC_DUNGEON_DIRTY_DATA`'s `FlowInfo.state`, issue #139).
+///
+/// Mirrors BPSR-ZDPS's `EnumEDungeonState.cs` (`Null=0, Active=1, Ready=2,
+/// Playing=3, End=4, Settlement=5, Vote=6`). `Playing` was never observed in
+/// this build's real captures — the capture began mid-dungeon — so it is
+/// modeled from the reference source only, same as every other named
+/// variant here.
+///
+/// `Unknown` is a deliberate, explicit variant: folding a future/unrecognized
+/// state value into `Null` would silently read a still-active dungeon as
+/// "open world", which is exactly the wrong failure mode for this signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EDungeonState {
+    Null,
+    Active,
+    Ready,
+    Playing,
+    End,
+    Settlement,
+    Vote,
+    Unknown(i32),
+}
+
+impl From<i32> for EDungeonState {
+    fn from(v: i32) -> Self {
+        match v {
+            0 => EDungeonState::Null,
+            1 => EDungeonState::Active,
+            2 => EDungeonState::Ready,
+            3 => EDungeonState::Playing,
+            4 => EDungeonState::End,
+            5 => EDungeonState::Settlement,
+            6 => EDungeonState::Vote,
+            other => EDungeonState::Unknown(other),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolEvent {
     Damage(DamageEvent),
@@ -146,6 +185,40 @@ pub enum ProtocolEvent {
         level_map_id: u32,
     },
     ServerChanged,
+    /// A dungeon flow-state transition (issue #139), decoded from either
+    /// `SYNC_DUNGEON_DATA`'s plain-protobuf `FlowInfo` or
+    /// `SYNC_DUNGEON_DIRTY_DATA`'s blob-encoded one — see
+    /// `decode::on_sync_dungeon_data` / `decode::on_sync_dungeon_dirty_data`.
+    /// `scene_uuid` is only ever `Some` alongside a freshly observed
+    /// `state` in this build's real captures; it is not independently
+    /// tracked.
+    DungeonState {
+        state: EDungeonState,
+        scene_uuid: Option<u32>,
+    },
+    /// One dungeon objective's progress (issue #139), decoded from
+    /// `SYNC_DUNGEON_DIRTY_DATA`'s blob-encoded `Target` hashmap —
+    /// `target_id` is always the hashmap key, never
+    /// `blob::TargetData.target_id` (an *update* entry commonly omits it;
+    /// see `blob::TargetData`'s doc comment). Emitted once per changed
+    /// hashmap entry (both the `add` and `update` sides), in ascending
+    /// `target_id` order so the event stream is deterministic — the wire
+    /// hashmap's own iteration order is not.
+    DungeonObjective {
+        target_id: i32,
+        nums: Option<i32>,
+        complete: Option<bool>,
+    },
+    /// A named dungeon variable (issue #139), decoded from
+    /// `SYNC_DUNGEON_DIRTY_DATA`'s blob-encoded `DungeonVar` list. Emitted
+    /// for every var this build carries (`IsFinishTarget` was never
+    /// observed in this build's real captures, but the channel itself —
+    /// 201 messages, real names — is verified) — this crate emits every
+    /// one and leaves interpreting them to the meter layer.
+    DungeonVar {
+        name: String,
+        value: i32,
+    },
 }
 
 #[cfg(test)]

@@ -384,6 +384,80 @@ pub struct TeamUserAttrData {
     pub season_strength: i32,
 }
 
+// -- Dungeon state / objectives (issue #139) --------------------------------
+//
+// Every tag below was read directly off BPSR-ZDPS's protoc-generated
+// `FieldNumber` constants (`BPSR-ZDPSLib/protos/StruDungeonSyncData.cs:169-457`,
+// `StruDungeonFlowInfo.cs:99-183`, `StruDungeonTarget.cs:89`,
+// `StruDungeonTargetData.cs:89-113`, `StruDungeonVarData.cs`, and
+// `Csharp.cs:30399` for `SyncDungeonDirtyData`) — the same provenance
+// discipline `CharSerialize`/`EnterScene` above and `NotifyJoinTeam` follow,
+// not inferred from field order. All plain varint fields are `int32`/
+// `uint32` (never `sint*`/zigzag), matching how BPSR-ZDPS declares them.
+
+/// `SyncDungeonDirtyData` (`decode::opcode::SYNC_DUNGEON_DIRTY_DATA`, `0x18`,
+/// issue #139): the outer protobuf wrapper around the blob-encoded dungeon
+/// dirty-data channel. `v_data.buffer` is **not** protobuf — see
+/// `crate::blob`'s module doc for its wire format, and that module's
+/// `detect_stream_safe` for why `v_data.stream_type` must not be trusted to
+/// say whether `buffer` is padded.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SyncDungeonDirtyData {
+    #[prost(message, optional, tag = "1")]
+    pub v_data: Option<BufferStream>,
+}
+
+/// The blob-carrying wrapper nested inside `SyncDungeonDirtyData`, and, per
+/// BPSR-ZDPS, reused for `SyncContainerDirtyData` (`0x16`) — the channel
+/// this crate deliberately still leaves undecoded (see `decode.rs`'s
+/// comment on that opcode) even though this same blob reader could now
+/// parse it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BufferStream {
+    #[prost(bytes = "vec", tag = "1")]
+    pub buffer: Vec<u8>,
+    #[prost(int32, tag = "2")]
+    pub stream_type: i32,
+}
+
+/// `WorldNtf.SyncDungeonData` (`decode::opcode::SYNC_DUNGEON_DATA`, `0x17`,
+/// issue #139): the plain-protobuf full dungeon sync, as opposed to
+/// `SyncDungeonDirtyData`'s blob-encoded delta above. All six real capture
+/// messages on this opcode were empty (open-world) — `target`/`dungeon_var`
+/// have therefore never been observed populated, so they are modeled as
+/// empty placeholders ([`DungeonTarget`], [`DungeonVar`]) rather than
+/// guessed at; their populated shape is mirrored, with real capture
+/// evidence, by [`crate::blob::HashmapDelta`]/[`crate::blob::VarData`] on
+/// the `0x18` blob path instead.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DungeonSyncData {
+    #[prost(uint32, tag = "1")]
+    pub scene_uuid: u32,
+    #[prost(message, optional, tag = "2")]
+    pub flow_info: Option<DungeonFlowInfo>,
+    #[prost(message, optional, tag = "4")]
+    pub target: Option<DungeonTarget>,
+    #[prost(message, optional, tag = "10")]
+    pub dungeon_var: Option<DungeonVar>,
+}
+
+/// `DungeonSyncData.flow_info`'s message type. Only field 1 (`state`) is
+/// modeled — the same field [`crate::blob::FlowInfo`] decodes from the
+/// blob format.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DungeonFlowInfo {
+    #[prost(int32, tag = "1")]
+    pub state: i32,
+}
+
+/// An empty placeholder — see [`DungeonSyncData`]'s doc comment.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DungeonTarget {}
+
+/// An empty placeholder — see [`DungeonSyncData`]'s doc comment.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DungeonVar {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

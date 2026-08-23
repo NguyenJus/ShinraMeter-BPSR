@@ -219,11 +219,26 @@ mod sanitize {
                 }
                 Some(m.encode_to_vec())
             }
+            // issue #139: dungeon-state/objective/var traffic carries no
+            // player-identifying data — verified against all 392 real
+            // `0x18` capture messages, whose only strings are var names
+            // like `ProgressState` (see the issue #139 spec's
+            // "Validation" section). Nothing to scrub; decode + re-encode
+            // through the modeled schema is enough to satisfy the
+            // whitelist-by-re-encode safety property above.
+            opcode::SYNC_DUNGEON_DATA => {
+                let m = pb::DungeonSyncData::decode(payload).ok()?;
+                Some(m.encode_to_vec())
+            }
+            opcode::SYNC_DUNGEON_DIRTY_DATA => {
+                let m = pb::SyncDungeonDirtyData::decode(payload).ok()?;
+                Some(m.encode_to_vec())
+            }
             _ => None,
         }
     }
 
-    /// The five opcodes `pb.rs` models. Every other opcode is dropped
+    /// The seven opcodes `pb.rs` models. Every other opcode is dropped
     /// entirely by the caller before it ever reaches [`sanitize`].
     pub fn is_modeled(method_id: u32) -> bool {
         matches!(
@@ -233,6 +248,8 @@ mod sanitize {
                 | opcode::SYNC_NEAR_DELTA_INFO
                 | opcode::SYNC_TO_ME_DELTA_INFO
                 | opcode::ENTER_SCENE
+                | opcode::SYNC_DUNGEON_DATA
+                | opcode::SYNC_DUNGEON_DIRTY_DATA
         )
     }
 
@@ -357,12 +374,17 @@ mod sanitize {
         }
 
         #[test]
-        fn is_modeled_accepts_exactly_the_five_known_opcodes() {
+        fn is_modeled_accepts_exactly_the_seven_known_opcodes() {
             assert!(is_modeled(opcode::SYNC_NEAR_ENTITIES));
             assert!(is_modeled(opcode::SYNC_CONTAINER_DATA));
             assert!(is_modeled(opcode::SYNC_NEAR_DELTA_INFO));
             assert!(is_modeled(opcode::SYNC_TO_ME_DELTA_INFO));
             assert!(is_modeled(opcode::ENTER_SCENE));
+            // issue #139: 0x17/0x18 pass through too now — dungeon blobs
+            // carry no player-identifying data (see `sanitize`'s doc
+            // comment on these two arms).
+            assert!(is_modeled(opcode::SYNC_DUNGEON_DATA));
+            assert!(is_modeled(opcode::SYNC_DUNGEON_DIRTY_DATA));
             assert!(!is_modeled(0x1234));
         }
 

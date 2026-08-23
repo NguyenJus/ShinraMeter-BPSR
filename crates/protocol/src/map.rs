@@ -6,9 +6,23 @@
 //! (`bpsr-protocol`'s `sanitize-dump` binary) translate between the two, so
 //! a future field or enum variant only needs fixing once.
 
-use crate::event::{EntityKind, ProtocolEvent};
+use crate::event::{EDungeonState, EntityKind, ProtocolEvent};
 use crate::pb::Class;
 use bpsr_meter as meter;
+
+/// Maps a protocol dungeon state onto the meter's mirror type (issue #139).
+pub fn map_dungeon_state(state: EDungeonState) -> meter::EDungeonState {
+    match state {
+        EDungeonState::Null => meter::EDungeonState::Null,
+        EDungeonState::Active => meter::EDungeonState::Active,
+        EDungeonState::Ready => meter::EDungeonState::Ready,
+        EDungeonState::Playing => meter::EDungeonState::Playing,
+        EDungeonState::End => meter::EDungeonState::End,
+        EDungeonState::Settlement => meter::EDungeonState::Settlement,
+        EDungeonState::Vote => meter::EDungeonState::Vote,
+        EDungeonState::Unknown(v) => meter::EDungeonState::Unknown(v),
+    }
+}
 
 /// Maps a protocol entity kind onto the meter's mirror type.
 pub fn map_kind(kind: EntityKind) -> meter::EntityKind {
@@ -97,5 +111,21 @@ pub fn map_event(
         ProtocolEvent::ServerChanged => meter::ProtocolEvent::ServerChanged {
             timestamp_ms: now_ms,
         },
+        ProtocolEvent::DungeonState { state, scene_uuid } => meter::ProtocolEvent::DungeonState {
+            state: map_dungeon_state(state),
+            scene_uuid,
+        },
+        ProtocolEvent::DungeonObjective {
+            target_id,
+            nums,
+            complete,
+        } => meter::ProtocolEvent::DungeonObjective {
+            target_id,
+            nums,
+            complete,
+        },
+        ProtocolEvent::DungeonVar { name, value } => {
+            meter::ProtocolEvent::DungeonVar { name, value }
+        }
     }
 }

@@ -47,6 +47,13 @@ pub enum FightEndCause {
     /// reconnect, and labelling it as one gives false hits to anyone
     /// grepping these lines for connection bugs.
     SceneChanged,
+    /// The dungeon itself said the run is over — a `DungeonState::End` or
+    /// `Settlement`, or a `DungeonVar { name: "IsFinishTarget" }` with a
+    /// non-zero value (issue #139 §§3,7). More authoritative than a boss
+    /// death or an idle timeout: the instance is telling the meter
+    /// directly, rather than the meter inferring it from combat silence or
+    /// a recognized monster id dying.
+    DungeonEnded,
 }
 
 impl FightEndCause {
@@ -58,6 +65,7 @@ impl FightEndCause {
             Self::Wipe => "wipe",
             Self::ServerChanged => "server_changed",
             Self::SceneChanged => "scene_changed",
+            Self::DungeonEnded => "dungeon_ended",
         }
     }
 }
@@ -146,6 +154,8 @@ mod tests {
             FightEndCause::Wipe.label(),
             FightEndCause::ServerChanged.label(),
             FightEndCause::SceneChanged.label(),
+            // issue #139: DungeonEnded joins the set this test guards.
+            FightEndCause::DungeonEnded.label(),
         ];
         let mut unique = labels.to_vec();
         unique.sort_unstable();

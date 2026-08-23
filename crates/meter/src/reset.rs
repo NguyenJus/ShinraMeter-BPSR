@@ -57,6 +57,18 @@ pub enum ResetReason {
     /// currently-held fight was already fought in (issue #152), and the
     /// meter cannot tell those apart from here.
     SceneChanged,
+    /// A `ProtocolEvent::DungeonState::Playing` was observed, or the
+    /// raid-boss reset detector fired (issue #139 §§2,6): the dungeon
+    /// itself told the meter a fresh encounter is starting, inside the
+    /// same instance either way. Authoritative — unlike `SceneChanged`,
+    /// this needs no "did the id actually change" check, because the
+    /// signal itself already means "start over": `Playing` was never
+    /// observed in this build's captures (the six real dumps begin
+    /// mid-dungeon), so this path stays reachable only via the wire
+    /// events it is named for, exactly like every other new-in-#139
+    /// behaviour — a session that never sees a dungeon packet never
+    /// reaches it.
+    DungeonStarted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
