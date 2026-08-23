@@ -52,6 +52,15 @@ pub struct PlayerStats {
     /// (issue #49). This counts the *victim*, not the attacker — see
     /// `Meter::apply_damage`.
     pub deaths: u32,
+    /// Whether this player is up *right now*, as opposed to `deaths > 0`
+    /// which only ever asks whether they have died at some point this
+    /// encounter (issue #212). Cleared by `Meter::record_death`; set again
+    /// by `Meter::apply_damage` on this player's next outgoing damage
+    /// event — the decode layer delivers no player-HP signal, so a swing
+    /// they land is the only revive evidence available. Starts `true`: a
+    /// freshly-seen row (an attacker, or a roster preload) has not been
+    /// observed dead.
+    pub(crate) alive: bool,
     /// Per-skill breakdown (issue #16), keyed by raw skill id. Emitted in
     /// every snapshot rather than behind a subscription: resonance-logs
     /// gates its equivalent because it serialises to a webview per tick;
@@ -84,6 +93,7 @@ impl PlayerStats {
             lucky_hits: 0,
             lucky_damage: 0,
             deaths: 0,
+            alive: true,
             skills: HashMap::new(),
             last_death_ms: None,
         }

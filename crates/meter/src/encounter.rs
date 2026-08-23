@@ -1003,6 +1003,13 @@ impl Meter {
             }
         }
 
+        // issue #212: reached only for a real (non-heal) outgoing hit —
+        // `d.is_heal` already returned above — so this is exactly the
+        // "next outgoing damage event" revive signal `party_is_wiped`
+        // needs. No player-HP-above-zero signal exists anywhere in
+        // `event::PlayerInfo`/`ProtocolEvent` to prefer over it.
+        stats.alive = true;
+
         stats.hits += 1;
         // Per-skill `hits` is bumped outside the `!d.is_miss` guard below so
         // it stays definitionally identical to the player-level `hits` above
@@ -1135,15 +1142,23 @@ impl Meter {
         })
     }
 
-    /// Whether every party member the meter knows about is down (issue
-    /// #154), i.e. the fight in progress is over and lost.
+    /// Whether every party member the meter knows about is down *right
+    /// now* (issue #154), i.e. the fight in progress is over and lost.
     ///
     /// The roster is `players`: every uid the meter has seen act, plus the
     /// party members preloaded from the game's own roster packet in an
-    /// instance (issue #12/#145/#149). `deaths` is per-encounter — `reset`
-    /// drops the rows that carry it — so "has died" means "has died in this
-    /// attempt", which is exactly the question. An empty roster is never a
-    /// wipe, and neither is a death outside a running fight.
+    /// instance (issue #12/#145/#149). This reads `alive`, not `deaths >
+    /// 0` (issue #212): `deaths` is a cumulative per-encounter counter that
+    /// never comes back down, so in a long pull with battle rezzes it
+    /// eventually goes nonzero on every row without the party ever being
+    /// down at the same time — the moment the last still-standing player
+    /// took their first death, every row read "has died", and the fight
+    /// falsely latched a wipe mid-pull with everyone still fighting.
+    /// `alive` tracks the current state instead: cleared by
+    /// `record_death`, set again by `apply_damage` on that player's next
+    /// outgoing hit (see there — no player-HP-above-zero signal exists to
+    /// prefer over it). An empty roster is never a wipe, and neither is a
+    /// death outside a running fight.
     ///
     /// Detecting the wipe directly is what retires the HP-rollback
     /// heuristic for this case: the rollback shape depends on how fast a
@@ -1153,7 +1168,7 @@ impl Meter {
         self.fight_start_ms.is_some()
             && self.fight_end_ms.is_none()
             && !self.players.is_empty()
-            && self.players.values().all(|p| p.deaths > 0)
+            && self.players.values().all(|p| !p.alive)
     }
 
     /// Whether the wipe hold forbids reading `d` as the first hit of the
@@ -1320,6 +1335,13 @@ impl Meter {
         }
         stats.deaths += 1;
         stats.last_death_ms = Some(timestamp_ms);
+        // issue #212: `deaths` is a cumulative counter — it never resets
+        // once nonzero — so `party_is_wiped` cannot read it directly
+        // without treating a battle-rezzed player as still down for the
+        // rest of the pull. `alive` is the "right now" bit that fixes
+        // that; set back to `true` on this player's next outgoing damage
+        // event in `apply_damage`.
+        stats.alive = false;
     }
 
     fn apply_player(&mut self, p: &PlayerInfo) {
@@ -5005,6 +5027,77 @@ mod tests {
             });
             let r = m.apply(&hit(1, 77, 300, 30_000));
             assert_eq!(r, Some(ResetReason::NewFight));
+        }
+
+        // -- issue #212: "wiped" must mean "down right now", not "has died
+        // at some point this pull" --
+
+        #[test]
+        fn a_staggered_rez_does_not_falsely_latch_a_wipe() {
+            // `party_is_wiped` used to read `deaths > 0` per player — a
+            // *cumulative* count for the whole attempt — so the moment the
+            // last still-standing player took their first death, every row
+            // read `deaths > 0` even though an earlier death had long since
+            // been battle-rezzed and that player was back in the fight.
+            let mut m = pull();
+            m.apply(&killing_blow(1, 5_000));
+            // Alpha gets rezzed and lands a hit — back in the fight.
+            let r = m.apply(&hit(1, BOSS_UID, 100, 6_000));
+            assert_eq!(r, None, "a rez mid-fight is not a new fight");
+            assert_eq!(
+                m.fight_state(6_500),
+                FightState::Active,
+                "one player down (and back up) is not a wipe"
+            );
+
+            // Bravo goes down too. Under the old cumulative rule every row
+            // now has `deaths > 0`, but Alpha is alive and still swinging.
+            m.apply(&killing_blow(2, 7_000));
+            assert_eq!(
+                m.fight_state(7_500),
+                FightState::Active,
+                "cumulative deaths across the pull must not read as a \
+                 simultaneous wipe"
+            );
+
+            // Damage after that point must still be counted, not dropped on
+            // the floor by a falsely-latched hold.
+            let r = m.apply(&hit(1, BOSS_UID, 3_000, 8_000));
+            assert_eq!(r, None);
+            let snap = m.snapshot(8_500);
+            assert_eq!(
+                snap.total_damage,
+                10_000 + 100 + 3_000,
+                "post-false-wipe damage must not be dropped"
+            );
+            assert_eq!(m.fight_state(8_500), FightState::Active);
+        }
+
+        #[test]
+        fn a_rez_followed_by_a_real_full_wipe_still_latches() {
+            // The fix must not overcorrect into never latching once anyone
+            // has ever died: a genuine full-party wipe after an earlier rez
+            // still has to end and freeze the fight.
+            let mut m = pull();
+            m.apply(&killing_blow(1, 5_000));
+            m.apply(&hit(1, BOSS_UID, 100, 6_000));
+            assert_eq!(m.fight_state(6_500), FightState::Active);
+
+            // Now the whole party goes down together, with nobody rezzed in
+            // between.
+            m.apply(&killing_blow(1, 7_000));
+            m.apply(&killing_blow(2, 8_000));
+            assert_eq!(
+                m.fight_state(8_500),
+                FightState::Ended,
+                "a real full-party wipe after a rez must still latch"
+            );
+            let snap = m.snapshot(68_000);
+            assert_eq!(snap.total_damage, 10_000 + 100);
+            assert_eq!(
+                snap.duration_ms, 7_000,
+                "frozen at the second death (8_000) minus the first hit (1_000)"
+            );
         }
     }
 
