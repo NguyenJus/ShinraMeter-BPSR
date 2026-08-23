@@ -63,6 +63,11 @@ windows = { workspace = true, features = [
     # header dropdown's manual "Check for updates" GET against GitHub's
     # releases API (`src/platform.rs::http_get`, issue #171).
     "Win32_Networking_WinHttp",
+    # `GetSaveFileNameW`/`OPENFILENAMEW` for the header dropdown's "Export
+    # logs" save-location dialog (`src/platform.rs::choose_log_export_path`,
+    # issue #220) — the classic common dialog, not `IFileSaveDialog`, so no
+    # COM feature is needed alongside it.
+    "Win32_UI_Controls_Dialogs",
 ] }
 
 [build-dependencies]
