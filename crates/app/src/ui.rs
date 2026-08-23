@@ -1020,7 +1020,7 @@ impl eframe::App for OverlayApp {
             .show(ui, |ui| {
                 // First, so the header buttons drawn afterwards stay on top of
                 // the corner zones they overlap.
-                draw_resize_handles(ui, &ctx, &mut self.window_gesture);
+                draw_resize_handles(ui, &ctx, &mut self.window_gesture, "root");
                 // Issue #39: what the header and rows paint this frame — the
                 // live snapshot, or the open historical one (`history_open`,
                 // cloned above before this closure existed). Computed here,
@@ -1182,6 +1182,7 @@ impl eframe::App for OverlayApp {
                     sort: skills::SkillSort::default(),
                     pos: skills::place_window(main_outer, monitor, SKILL_WINDOW_SIZE),
                     size: SKILL_WINDOW_SIZE,
+                    gesture: WindowGesture::default(),
                 });
             // Issue #189: the window is no longer always-on-top, so an
             // already-open one can be sitting behind a fullscreen game with
@@ -1230,7 +1231,14 @@ impl eframe::App for OverlayApp {
             // at all. This is deliberately not click-through (D2).
             let close_requested =
                 ctx.show_viewport_immediate(skill_viewport_id(uid), builder, |ui, _class| {
-                    let x_clicked = draw_skill_window(ui, row, &mut state.sort, icons, opacity);
+                    let x_clicked = draw_skill_window(
+                        ui,
+                        row,
+                        &mut state.sort,
+                        icons,
+                        opacity,
+                        &mut state.gesture,
+                    );
                     // Issue #181: read from inside the child callback, for
                     // the same reason the close-request check below is —
                     // this is where `ctx.input` reflects the *child*
@@ -4244,12 +4252,29 @@ fn resize_zones(rect: egui::Rect) -> [(egui::Rect, egui::ResizeDirection, egui::
 /// own: invisible strips along the edges that start a manual resize gesture
 /// (`WindowGesture`) rather than handing the window manager a native resize
 /// loop, which on Windows is where Snap would engage.
-fn draw_resize_handles(ui: &mut egui::Ui, ctx: &egui::Context, gesture: &mut WindowGesture) {
+///
+/// `id_salt` namespaces the eight handle ids (issue #218): the same function
+/// now serves the root window and every open breakdown viewport, and both
+/// are drawn from a root `Ui` whose own id is the same in each — without a
+/// salt, two windows' north handles would be one widget.
+fn draw_resize_handles(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    gesture: &mut WindowGesture,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+) {
+    // The viewport this `Ui` belongs to — the root window, or, inside
+    // `show_viewport_immediate`'s callback, the child. Either way it is the
+    // rect `Ui::max_rect` was built from (egui's `root_ui`).
     let window = ctx.input(|i| i.viewport_rect());
     // `ResizeDirection` is not `Hash`, so the zone's position in the array is
     // what keeps the eight ids distinct.
     for (index, (zone, direction, cursor)) in resize_zones(window).into_iter().enumerate() {
-        let handle = ui.interact(zone, ui.id().with(("resize", index)), egui::Sense::drag());
+        let handle = ui.interact(
+            zone,
+            ui.id().with((&id_salt, "resize", index)),
+            egui::Sense::drag(),
+        );
         if handle.hovered() {
             ctx.set_cursor_icon(cursor);
         }
@@ -5777,7 +5802,24 @@ const SKILL_ICON_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x3B
 const SKILL_HEADER_ICON_SIZE: f32 = 50.0;
 const SKILL_HEADER_PAD_X: f32 = 12.0;
 const SKILL_HEADER_PAD_Y: f32 = 10.0;
-const SKILL_CLOSE_SIZE: f32 = 20.0;
+/// The close button's clickable square, which is also the diameter of its
+/// circular hover wash (issue #218).
+///
+/// The reference (`Skills.xaml:214-224`) draws a 16pt `Svg.Close` path with
+/// an 8pt margin on every side inside a `ButtonMainStyle` button: 32pt of
+/// target around 16pt of glyph. The old 20pt square was the glyph's own box
+/// with nothing around it — no radius, no hover fill, no cursor — so there
+/// was nothing to aim at and no feedback once you got there. The family's
+/// icon buttons use radius = half the side (`MainWindow.xaml:49-55`'s
+/// `CornerRadius="18"` on a 36x36 button), i.e. a circle.
+const SKILL_CLOSE_HIT_SIZE: f32 = 32.0;
+/// The `✕` glyph's font size inside that target.
+const SKILL_CLOSE_GLYPH_SIZE: f32 = 16.0;
+/// The hover wash `ButtonMainStyle`'s `hl` border flips to on `IsMouseOver`:
+/// WPF's 4-digit ARGB `#1fff` — white at alpha `0x11`. Spelled premultiplied
+/// because `Color32::from_white_alpha`, which is exactly this, is not `const`.
+const SKILL_CLOSE_HOVER_FILL: egui::Color32 =
+    egui::Color32::from_rgba_premultiplied(0x11, 0x11, 0x11, 0x11);
 /// The reference's `CornerRadius="17"` header pill.
 const SKILL_PILL_CORNER_RADIUS: u8 = 17;
 /// Header pill height, measured at 34px in the reference (issue #200) —
@@ -5847,6 +5889,13 @@ struct SkillWindowState {
     sort: skills::SkillSort,
     pos: egui::Pos2,
     size: egui::Vec2,
+    /// Issue #218: this window's own in-flight move/resize. Per-window
+    /// rather than shared with the root's, because two viewports can be
+    /// dragged in two different (non-overlapping) sessions and because
+    /// `drive_window_gesture` sends its viewport commands to whichever
+    /// context is live — inside `show_viewport_immediate`'s callback that
+    /// is this child, not the root.
+    gesture: WindowGesture,
 }
 
 /// Applies one frame's right-click gesture to the open-window set (D1): a
@@ -5986,38 +6035,107 @@ fn skill_rows_rect(rect: egui::Rect, col_header_rect: egui::Rect) -> egui::Rect 
     egui::Rect::from_min_max(egui::pos2(rect.left(), col_header_rect.bottom()), rect.max)
 }
 
+/// The header band: full width, `SKILL_HEADER_HEIGHT` tall, flush with the
+/// window's top. Pulled out of `draw_skill_window` (issue #218) so the drag
+/// band and close button derived from it are testable without a live `Ui`.
+fn skill_header_rect(rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), SKILL_HEADER_HEIGHT))
+}
+
+/// The window's drag surface (issue #218): the header band only, inset by
+/// `RESIZE_EDGE` on the three window edges it touches.
+///
+/// It used to be `ui.max_rect()` — the whole viewport — which broke two
+/// things at once. It covered the eight `resize_zones` strips, so the
+/// borderless window had no reachable resize grip anywhere; and it covered
+/// the row list, where a `Sense::drag()` strands egui's `dragged_id()` and
+/// so gates off *all* mouse-wheel scrolling
+/// (`scroll_area.rs`' `is_hovering_outer_rect`, which is
+/// `… && ui.ctx().dragged_id().is_none()`).
+///
+/// Same shape and same reasoning as the main window's header band — see the
+/// "a drag surface spanning it would win the hit test and swallow every
+/// north-edge resize" note there. No bottom inset is needed: the south
+/// strip is a window height away.
+fn skill_drag_band(header_rect: egui::Rect) -> egui::Rect {
+    let mut band = header_rect;
+    band.min.y += RESIZE_EDGE;
+    band.min.x += RESIZE_EDGE;
+    band.max.x -= RESIZE_EDGE;
+    band
+}
+
+/// The close button's hit square (issue #218), top-right of the window
+/// inside the header's padding. `SKILL_CLOSE_HIT_SIZE` wide, so it is also
+/// the bounding box of the circular hover wash painted at its centre.
+fn skill_close_rect(rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(
+            rect.right() - SKILL_HEADER_PAD_X - SKILL_CLOSE_HIT_SIZE,
+            rect.top() + SKILL_HEADER_PAD_Y,
+        ),
+        egui::Vec2::splat(SKILL_CLOSE_HIT_SIZE),
+    )
+}
+
+/// Where the Deaths pill's left edge lands: right-aligned into the header,
+/// one `SKILL_HEADER_PAD_X` clear of the close button. Shares
+/// `SKILL_CLOSE_HIT_SIZE` with `skill_close_rect` so growing that button
+/// (issue #218) pushes the pill left instead of letting the two overlap.
+fn skill_deaths_pill_left(header_rect: egui::Rect, pill_width: f32) -> f32 {
+    header_rect.right()
+        - SKILL_HEADER_PAD_X
+        - SKILL_CLOSE_HIT_SIZE
+        - SKILL_HEADER_PAD_X
+        - pill_width
+}
+
 fn draw_skill_window(
     ui: &mut egui::Ui,
     row: &PlayerRow,
     sort: &mut skills::SkillSort,
     icons: &Icons,
     opacity: f32,
+    gesture: &mut WindowGesture,
 ) -> bool {
     let rect = ui.max_rect();
+    let ctx = ui.ctx().clone();
     let painter = ui.painter().clone();
     painter.rect_filled(rect, 0.0, SKILL_CHROME_FILL.gamma_multiply(opacity));
 
-    // Drag anywhere on the background moves the window (the child viewport
-    // has no OS titlebar, D2's `with_decorations(false)`) — registered
-    // first so the more specific interacts below (column headers, close
-    // glyph) win the pixels they overlap with it; egui gives interaction
-    // priority to whatever was registered later, the same "registered
-    // later wins" idiom `OverlayApp::ui`'s `draw_resize_handles`-before-
-    // `draw_header` ordering relies on. Not routed through `WindowGesture`,
-    // which owns a root-window-only reposition exemption guard (issue #11)
-    // with no analogue for a child viewport.
+    // Issue #218: this window is `with_decorations(false)` like the root, so
+    // winit cancels `WS_SIZEBOX` and hands back no OS resize frame — the
+    // `with_resizable(true)` on its builder is dead. It supplies its own
+    // grips exactly as the root window does. Registered first so the header
+    // widgets below win the pixels they overlap; egui gives interaction
+    // priority to whatever was registered later.
+    draw_resize_handles(ui, &ctx, gesture, ("skill", row.uid));
+
+    // -- header: class icon, player name, one Deaths pill (D10) ----------
+    let header_rect = skill_header_rect(rect);
+
+    // Dragging the header moves the window (the child viewport has no OS
+    // titlebar, D2's `with_decorations(false)`). Issue #218: this used to
+    // sense the whole of `rect` and fire `ViewportCommand::StartDrag`, and
+    // both halves were bugs. The full-viewport rect buried the resize
+    // strips and, worse, put a `Sense::drag()` over the row list, where a
+    // stranded `dragged_id()` gates off all wheel scrolling — see
+    // `skill_drag_band`. And `StartDrag` enters Windows' `SC_MOVE` modal
+    // loop, which eats the `WM_LBUTTONUP` that would have cleared that drag
+    // state, on top of being the one place Aero Snap engages (issue #11).
+    // So this goes through `WindowGesture` like the root window's header
+    // does. The reposition exemption that gesture holds is root-HWND-only
+    // and simply inert here — a missing Snap-blocker exemption for a window
+    // the Snap blocker never sees, not a correctness gap.
     let drag = ui.interact(
-        rect,
+        skill_drag_band(header_rect),
         ui.id().with(("skill_drag", row.uid)),
         egui::Sense::drag(),
     );
     if drag.drag_started_by(egui::PointerButton::Primary) {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        begin_window_gesture(&ctx, gesture, GestureKind::Move);
     }
 
-    // -- header: class icon, player name, one Deaths pill (D10) ----------
-    let header_rect =
-        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), SKILL_HEADER_HEIGHT));
     let icon_rect = egui::Rect::from_center_size(
         header_rect.left_center()
             + egui::vec2(SKILL_HEADER_PAD_X + SKILL_HEADER_ICON_SIZE / 2.0, 0.0),
@@ -6064,11 +6182,7 @@ fn draw_skill_window(
     let deaths_pill_size = pill_size(deaths_text_size, deaths_pill.icon_side, SKILL_PILL_HEIGHT);
     let deaths_pill_rect = egui::Rect::from_min_size(
         egui::pos2(
-            header_rect.right()
-                - SKILL_HEADER_PAD_X
-                - SKILL_CLOSE_SIZE
-                - SKILL_HEADER_PAD_X
-                - deaths_pill_size.x,
+            skill_deaths_pill_left(header_rect, deaths_pill_size.x),
             header_rect.center().y - deaths_pill_size.y / 2.0,
         ),
         deaths_pill_size,
@@ -6076,29 +6190,36 @@ fn draw_skill_window(
     paint_stat_pill(&painter, deaths_pill_rect, deaths_text_size, &deaths_pill);
 
     // -- close glyph (D2): the only in-window way to close ---------------
-    let close_rect = egui::Rect::from_min_size(
-        egui::pos2(
-            rect.right() - SKILL_HEADER_PAD_X - SKILL_CLOSE_SIZE,
-            rect.top() + SKILL_HEADER_PAD_Y,
-        ),
-        egui::Vec2::splat(SKILL_CLOSE_SIZE),
+    // Issue #218: interacted *before* it is painted, because the hover wash
+    // is part of the paint — a 32pt circle behind the glyph, matching the
+    // reference's `ButtonMainStyle` (`#1fff` on `IsMouseOver`, radius =
+    // half the side) — and a pointing-hand cursor. The glyph itself used to
+    // be the whole button: a 20pt square with no radius, no hover feedback
+    // and no cursor change, so nothing about it read as clickable.
+    let close_rect = skill_close_rect(rect);
+    let close = ui.interact(
+        close_rect,
+        ui.id().with(("skill_close", row.uid)),
+        egui::Sense::click(),
     );
+    if close.hovered() {
+        painter.circle_filled(
+            close_rect.center(),
+            SKILL_CLOSE_HIT_SIZE / 2.0,
+            SKILL_CLOSE_HOVER_FILL,
+        );
+        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     paint_text(
         &painter,
         close_rect.center(),
         egui::Align2::CENTER_CENTER,
         "\u{2715}",
-        bold(FONT_SIZE_ROW),
+        bold(SKILL_CLOSE_GLYPH_SIZE),
         SKILL_CLOSE_RGB,
         true,
     );
-    let close_clicked = ui
-        .interact(
-            close_rect,
-            ui.id().with(("skill_close", row.uid)),
-            egui::Sense::click(),
-        )
-        .clicked();
+    let close_clicked = close.clicked();
 
     // -- tab strip: `Dps` only, styled selected (D11) ---------------------
     // The reference's other six tabs (Heal, Mana, Buff, Counter,
@@ -6193,6 +6314,10 @@ fn draw_skill_window(
     skills::sort_rows(&mut skill_rows, *sort);
 
     let mut rows_ui = ui.new_child(egui::UiBuilder::new().max_rect(rows_rect));
+    // Issue #218: the reference shows a persistent thin thumb, while egui's
+    // default `ScrollStyle::floating()` only fades one in on hover — which
+    // left the list with no standing hint that it scrolls at all.
+    rows_ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(&mut rows_ui, |ui| {
@@ -6267,6 +6392,14 @@ fn draw_skill_window(
                 }
             }
         });
+
+    // Last, so the header band and the eight resize handles above have all
+    // had their frame to start a gesture (issue #218) — the same ordering
+    // `OverlayApp::ui` uses for the root window. Inside
+    // `show_viewport_immediate`'s callback `ctx`'s viewport commands and
+    // input both address *this* child, so the same driver moves and resizes
+    // it without knowing it is not the root.
+    drive_window_gesture(&ctx, gesture, SKILL_WINDOW_MIN_SIZE);
 
     close_clicked
 }
@@ -11353,6 +11486,95 @@ mod tests {
         assert_eq!(rows_rect.bottom(), rect.bottom());
     }
 
+    // -- breakdown-window chrome gestures (issue #218) ----------------------
+
+    /// The window rect these gesture tests measure against — off-origin so
+    /// an accidental `0.0` in the maths cannot pass by coincidence.
+    fn skill_window_rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(120.0, 80.0), egui::vec2(880.0, 520.0))
+    }
+
+    /// Issue #218: the drag surface used to be `ui.max_rect()` — the whole
+    /// viewport, edges included — so the eight `resize_zones` strips could
+    /// never be grabbed. The band now stops short of them on all three
+    /// sides it touches, exactly as the main header's does.
+    #[test]
+    fn drag_band_is_the_header_inset_by_the_resize_edge() {
+        let rect = skill_window_rect();
+        let header = skill_header_rect(rect);
+        let band = skill_drag_band(header);
+        assert_eq!(band.top(), header.top() + RESIZE_EDGE);
+        assert_eq!(band.left(), header.left() + RESIZE_EDGE);
+        assert_eq!(band.right(), header.right() - RESIZE_EDGE);
+        assert_eq!(band.bottom(), header.bottom());
+    }
+
+    /// The same inset, stated as the property that actually matters: every
+    /// edge resize strip keeps a live pixel the drag band does not cover.
+    #[test]
+    fn drag_band_leaves_every_edge_resize_zone_reachable() {
+        let rect = skill_window_rect();
+        let band = skill_drag_band(skill_header_rect(rect));
+        let zones = resize_zones(rect);
+        let (north, south, west, east) = (zones[0].0, zones[1].0, zones[2].0, zones[3].0);
+        assert!(band.top() >= north.bottom(), "north strip is covered");
+        assert!(band.left() >= west.right(), "west strip is covered");
+        assert!(band.right() <= east.left(), "east strip is covered");
+        assert!(band.bottom() <= south.top(), "south strip is covered");
+    }
+
+    /// Issue #218's scroll bug: a drag sense over the row list wedges
+    /// egui's `dragged_id()`, which gates *all* wheel scrolling
+    /// (`scroll_area.rs`' `is_hovering_outer_rect`). The band must not
+    /// reach the rows band at all.
+    #[test]
+    fn drag_band_never_covers_the_row_list() {
+        let rect = skill_window_rect();
+        let header = skill_header_rect(rect);
+        let tabs = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), header.bottom()),
+            egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
+        );
+        let rows = skill_rows_rect(rect, skill_column_header_rect(rect, tabs));
+        assert!(!skill_drag_band(header).intersects(rows));
+    }
+
+    /// Issue #218: the close glyph was a bare 20pt square. The reference
+    /// (`Skills.xaml:214-224`) is a 16pt `Svg.Close` with an 8pt margin per
+    /// side — a 32pt target, big enough to hit and big enough for a
+    /// circular hover wash of radius `SKILL_CLOSE_HIT_SIZE / 2`.
+    #[test]
+    fn close_button_is_a_32pt_target_around_a_16pt_glyph() {
+        assert_eq!(SKILL_CLOSE_HIT_SIZE, SKILL_CLOSE_GLYPH_SIZE + 2.0 * 8.0);
+        // The wash is `#1fff` — white at alpha 0x11 — written premultiplied
+        // only because `from_white_alpha` is not `const`.
+        assert_eq!(
+            SKILL_CLOSE_HOVER_FILL,
+            egui::Color32::from_white_alpha(0x11)
+        );
+        let rect = skill_window_rect();
+        let close = skill_close_rect(rect);
+        assert_eq!(close.width(), SKILL_CLOSE_HIT_SIZE);
+        assert_eq!(close.height(), SKILL_CLOSE_HIT_SIZE);
+        assert_eq!(close.right(), rect.right() - SKILL_HEADER_PAD_X);
+        assert_eq!(close.top(), rect.top() + SKILL_HEADER_PAD_Y);
+    }
+
+    /// The deaths pill reserves its room off the close button's *hit* size,
+    /// so growing that button (issue #218) pushes the pill left instead of
+    /// letting the two overlap.
+    #[test]
+    fn deaths_pill_clears_the_close_button_by_one_header_pad() {
+        let rect = skill_window_rect();
+        let header = skill_header_rect(rect);
+        let pill_width = 64.0;
+        let left = skill_deaths_pill_left(header, pill_width);
+        assert_eq!(
+            left + pill_width + SKILL_HEADER_PAD_X,
+            skill_close_rect(rect).left()
+        );
+    }
+
     /// The panel is deliberately *not* the source's slate `#232830` — that
     /// reads as washed-out grey over game footage. Lock the near-black.
     #[test]
@@ -13919,6 +14141,7 @@ mod tests {
             sort: skills::SkillSort::default(),
             pos,
             size: SKILL_WINDOW_SIZE,
+            gesture: WindowGesture::default(),
         }
     }
 
@@ -14065,7 +14288,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                draw_skill_window(ui, row, sort, &icons, 1.0);
+                draw_skill_window(ui, row, sort, &icons, 1.0, &mut WindowGesture::default());
             },
         );
         let mut frame = RowFrame {
@@ -14085,7 +14308,8 @@ mod tests {
                 ..click_at_with_button(pos, egui::PointerButton::Primary)
             },
             |ui| {
-                clicked = draw_skill_window(ui, row, sort, &icons, 1.0);
+                clicked =
+                    draw_skill_window(ui, row, sort, &icons, 1.0, &mut WindowGesture::default());
             },
         );
         output.drop_without_applying_deltas();
