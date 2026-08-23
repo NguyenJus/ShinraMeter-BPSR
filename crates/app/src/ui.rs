@@ -987,6 +987,12 @@ impl eframe::App for OverlayApp {
             }),
             OverlayView::Live => None,
         };
+        // Issue #219: whether Share may fire this frame — see
+        // `share_active_for_view`'s doc comment. Read here (rather than
+        // inline in the `draw_header` call below) for the same borrow-
+        // ordering reason as `history_open` just above: a plain `&self.view`
+        // read, done before the panel closure's mutable borrows begin.
+        let share_active = share_active_for_view(&self.view);
         // Issue #39: set by `draw_header_menu`'s "History" item, inside the
         // panel closure below; read back out here, *after* that closure has
         // returned, because acting on it means calling `self.open_history()`
@@ -1055,6 +1061,7 @@ impl eframe::App for OverlayApp {
                     icons,
                     &mut self.window_gesture,
                     capturing,
+                    share_active,
                     &mut self.update_check,
                     self.history.is_some(),
                     &mut open_history_clicked,
@@ -1102,9 +1109,15 @@ impl eframe::App for OverlayApp {
                 // `rows_top` is where the scroll area starts,
                 // `rows_area_height` is all of what's left in the panel for
                 // it, matching `draw_rows`'s own `auto_shrink([false,
-                // false])`.
-                let rows_top = ui.cursor().top();
-                let rows_area_height = ui.available_height();
+                // false])`. Correct as-is for `OverlayView::Live`, which
+                // draws nothing between here and `draw_rows`. Issue #219:
+                // `OverlayView::History` is different — `draw_history` below
+                // paints its own nav bar and a second separator before an
+                // open encounter's rows, so that branch overwrites both with
+                // the post-chrome values `draw_history` itself measures and
+                // returns, rather than leaving these stale ones in place.
+                let mut rows_top = ui.cursor().top();
+                let mut rows_area_height = ui.available_height();
                 // Issue #39: set by the history bar's "← Live" button;
                 // checked right after, once the `&mut self.view` borrow the
                 // match below needed has ended.
@@ -1120,7 +1133,7 @@ impl eframe::App for OverlayApp {
                         );
                     }
                     OverlayView::History(state) => {
-                        draw_history(
+                        (rows_top, rows_area_height) = draw_history(
                             ui,
                             state,
                             &self.settings,
@@ -1135,9 +1148,14 @@ impl eframe::App for OverlayApp {
                     self.view = OverlayView::Live;
                 }
                 if screenshot_requested {
+                    // Issue #219: the *open historical encounter's* row
+                    // count while one is open, not the live snapshot's —
+                    // `screenshot_row_count`'s doc comment covers why the
+                    // two can differ.
+                    let row_count = screenshot_row_count(&self.view, self.snapshot.rows.len());
                     self.pending_screenshot_bound = Some(rows_content_bottom_y(
                         rows_top,
-                        self.snapshot.rows.len(),
+                        row_count,
                         ROW_HEIGHT,
                         rows_area_height,
                     ));
@@ -1397,6 +1415,16 @@ fn draw_header(
     // actually gets captured. See `screenshot_capture_guard`'s doc comment
     // for why this can't just be "the frame the click happened on".
     capturing: bool,
+    // Issue #219: whether the Share button may fire a screenshot capture
+    // this frame — true on `OverlayView::Live` and on `OverlayView::History`
+    // once a specific historical encounter is open, false on the bare
+    // history list. Threaded down to `toggle_cluster`, which gates both the
+    // button's `Sense` (via `toggle_button`'s `enabled`) and its glyph tint
+    // (`toggle_state_tint`) on it — the same disabled treatment the History
+    // button already wears when history is unavailable. Computed by
+    // `share_active_for_view` in `OverlayApp::ui`, the only place that can
+    // see `self.view`.
+    share_active: bool,
     // Issue #171: the manual "Check for updates" header-menu item's
     // in-flight/last-result state — threaded through to `draw_header_menu`,
     // the only place that reads or mutates it.
@@ -1628,7 +1656,15 @@ fn draw_header(
                 icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
             ),
         );
-        toggle_cluster(ui, tx_command, icons, capturing, has_history, open_history)
+        toggle_cluster(
+            ui,
+            tx_command,
+            icons,
+            capturing,
+            share_active,
+            has_history,
+            open_history,
+        )
     })
     .inner
 }
@@ -1902,11 +1938,20 @@ fn click_through_after_tray_request(click_through: bool, requested: bool) -> boo
 /// `draw_header_menu` parameters, rerouted here with the button: the cluster
 /// no longer needs a `SettingsHandle` at all, since the only two controls
 /// that flipped a setting are the ones that left.
+///
+/// `share_active` (issue #219) is whether Share may fire at all this frame
+/// — see `share_active_for_view`'s doc comment. Gated the same way
+/// `has_history` gates History: `toggle_button`'s `enabled` flag (so a
+/// disabled Share senses no click and accesskit reports it disabled) plus
+/// `toggle_state_tint` for the dimmed glyph, rather than hiding the button
+/// outright — hiding it would shift every button to its right on the
+/// frames it's inactive.
 fn toggle_cluster(
     ui: &mut egui::Ui,
     tx_command: &Sender<UiCommand>,
     icons: &Icons,
     capturing: bool,
+    share_active: bool,
     has_history: bool,
     open_history: &mut bool,
 ) -> bool {
@@ -1939,22 +1984,23 @@ fn toggle_cluster(
         egui::Vec2::splat(TOGGLE_MOUSE_SIDE),
     );
     let mut screenshot_requested = false;
-    if toggle_button(
-        ui,
-        share_rect,
-        "Copy screenshot to clipboard",
-        capturing,
-        true,
-    )
-    .clicked()
-    {
+    let share_label = if share_active {
+        "Copy screenshot to clipboard"
+    } else {
+        "Copy screenshot to clipboard: unavailable"
+    };
+    if toggle_button(ui, share_rect, share_label, capturing, share_active).clicked() {
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         screenshot_requested = true;
     }
     if let Some(share) = icons.glyphs.get(GlyphIcon::Share) {
-        ui.painter()
-            .image(share.id(), share_rect, UV_FULL, TOGGLE_ACTIVE_COLOR);
+        ui.painter().image(
+            share.id(),
+            share_rect,
+            UV_FULL,
+            toggle_state_tint(share_active),
+        );
     }
     x += TOGGLE_MOUSE_SIDE + TOGGLE_GAP;
 
@@ -6337,6 +6383,42 @@ struct OpenEncounter {
     snapshot: Snapshot,
 }
 
+/// Whether the Share button may fire a screenshot capture this frame
+/// (issue #219): true on `OverlayView::Live`, and on `OverlayView::History`
+/// only once a specific historical encounter is open (`state.open` is
+/// `Some`) — both render through the same `draw_rows` a DPS-style row list,
+/// per the spec's reference-fidelity requirement. False on the bare history
+/// list, where nothing behind the button is a row screenshot worth taking —
+/// capturing it would just screenshot the list of past encounters. Pure so
+/// the view -> active mapping is unit-testable without an `egui::Context`;
+/// `OverlayApp::ui` is the only caller.
+fn share_active_for_view(view: &OverlayView) -> bool {
+    match view {
+        OverlayView::Live => true,
+        OverlayView::History(state) => state.open.is_some(),
+    }
+}
+
+/// Which row count the Share crop bound (`rows_content_bottom_y`) must use
+/// this frame (issue #219): the open historical encounter's own row count
+/// while one is open, not the *live* snapshot's — the two can differ (a
+/// past fight had a different roster, or the live encounter has since
+/// ended down to zero rows) and cropping against the wrong one either cuts
+/// off real rows or leaves stray blank space. `live_row_count` is the
+/// fallback for `Live` and the (never actually captured, since Share is
+/// inactive there — see `share_active_for_view`) bare history list. Pure so
+/// this is unit-testable without an `egui::Context`.
+fn screenshot_row_count(view: &OverlayView, live_row_count: usize) -> usize {
+    match view {
+        OverlayView::Live => live_row_count,
+        OverlayView::History(state) => state
+            .open
+            .as_ref()
+            .map(|open| open.snapshot.rows.len())
+            .unwrap_or(live_row_count),
+    }
+}
+
 /// The header's title/subtitle override for a historical fight (spec
 /// DECISION D7) — bundled rather than passed as two loose parameters so
 /// `draw_header`'s argument list stays readable.
@@ -6469,6 +6551,18 @@ impl OverlayApp {
 /// The whole history surface: the bar, then either the list or the open
 /// encounter's rows (rendered through the same `draw_rows` a live fight
 /// uses, per the spec's reference-fidelity requirement).
+///
+/// Returns the window-space y coordinate (points) where that content —
+/// list or rows — actually starts, and the height left in the panel for it
+/// at that point (issue #219): `OverlayApp::ui` used to capture both
+/// *before* calling this function, from the outer panel's own separator,
+/// but this function draws its own nav bar (`draw_history_bar`) and a
+/// second separator first, so with a historical encounter open the real
+/// rows start lower than that stale bound — the Share screenshot crop was
+/// computed against too little content and cut the last row(s) off.
+/// Measuring both right here, after this function's own chrome and before
+/// its content, is what keeps the crop bound from drifting out of sync
+/// with what actually gets painted underneath it.
 fn draw_history(
     ui: &mut egui::Ui,
     state: &mut HistoryUi,
@@ -6477,7 +6571,7 @@ fn draw_history(
     handle: Option<&history::writer::HistoryHandle>,
     tx: &Sender<history::writer::HistoryEvent>,
     back_to_live: &mut bool,
-) {
+) -> (f32, f32) {
     match draw_history_bar(ui, state) {
         HistoryBarAction::None => {}
         HistoryBarAction::Live => *back_to_live = true,
@@ -6500,9 +6594,12 @@ fn draw_history(
 
     ui.separator();
 
+    let rows_top = ui.cursor().top();
+    let rows_area_height = ui.available_height();
+
     if let Some(open) = &state.open {
         draw_rows(ui, &open.snapshot, settings, icons, &mut None);
-        return;
+        return (rows_top, rows_area_height);
     }
 
     match draw_history_list(ui, state) {
@@ -6523,6 +6620,8 @@ fn draw_history(
         }
         None => {}
     }
+
+    (rows_top, rows_area_height)
 }
 
 /// The bar under the header: "← Live", a "← Back" when an encounter is
@@ -7361,6 +7460,7 @@ mod tests {
                 &icons,
                 &mut WindowGesture::default(),
                 false,
+                true,
                 &mut UpdateCheckState::default(),
                 false,
                 &mut false,
@@ -7518,6 +7618,7 @@ mod tests {
                 &icons,
                 &mut WindowGesture::default(),
                 false,
+                true,
                 &mut UpdateCheckState::default(),
                 false,
                 &mut false,
@@ -7771,6 +7872,7 @@ mod tests {
                 &icons,
                 &mut WindowGesture::default(),
                 false,
+                true,
                 &mut UpdateCheckState::default(),
                 false,
                 &mut false,
@@ -7854,6 +7956,7 @@ mod tests {
                 &icons,
                 &mut WindowGesture::default(),
                 false,
+                true,
                 &mut UpdateCheckState::default(),
                 false,
                 &mut false,
@@ -8355,7 +8458,15 @@ mod tests {
         let tints = |has_history: bool| -> Vec<(egui::TextureId, egui::Color32)> {
             let mut blits = Vec::new();
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                toggle_cluster(ui, &tx_command, &icons, false, has_history, &mut false);
+                toggle_cluster(
+                    ui,
+                    &tx_command,
+                    &icons,
+                    false,
+                    true,
+                    has_history,
+                    &mut false,
+                );
             });
             for clipped in &output.shapes {
                 collect_image_texture_tints(&clipped.shape, &mut blits);
@@ -8400,7 +8511,7 @@ mod tests {
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
 
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false, true, &mut false);
+            toggle_cluster(ui, &tx_command, &icons, false, true, true, &mut false);
         });
         let update = output
             .platform_output
@@ -8434,7 +8545,15 @@ mod tests {
 
         let disabled = |has_history: bool, label: &str| -> bool {
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                toggle_cluster(ui, &tx_command, &icons, false, has_history, &mut false);
+                toggle_cluster(
+                    ui,
+                    &tx_command,
+                    &icons,
+                    false,
+                    true,
+                    has_history,
+                    &mut false,
+                );
             });
             let update = output
                 .platform_output
@@ -8476,7 +8595,15 @@ mod tests {
 
         let clicked = |has_history: bool, label: &str| -> bool {
             let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-                toggle_cluster(ui, &tx_command, &icons, false, has_history, &mut false);
+                toggle_cluster(
+                    ui,
+                    &tx_command,
+                    &icons,
+                    false,
+                    true,
+                    has_history,
+                    &mut false,
+                );
             });
             let update = layout
                 .platform_output
@@ -8493,6 +8620,7 @@ mod tests {
                     &tx_command,
                     &icons,
                     false,
+                    true,
                     has_history,
                     &mut open_history,
                 );
@@ -8708,7 +8836,7 @@ mod tests {
         let (tx_command, rx_command) = crossbeam_channel::unbounded();
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false, true, &mut false);
+            toggle_cluster(ui, &tx_command, &icons, false, true, true, &mut false);
         });
         let update = layout
             .platform_output
@@ -8719,7 +8847,7 @@ mod tests {
         layout.drop_without_applying_deltas();
 
         let output = ctx.run_ui(click_at(share_pos), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false, true, &mut false);
+            toggle_cluster(ui, &tx_command, &icons, false, true, true, &mut false);
         });
         let commands = output
             .viewport_output
@@ -8752,7 +8880,7 @@ mod tests {
         let (tx_command, rx_command) = crossbeam_channel::unbounded();
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false, true, &mut false);
+            toggle_cluster(ui, &tx_command, &icons, false, true, true, &mut false);
         });
         let update = layout
             .platform_output
@@ -8763,7 +8891,7 @@ mod tests {
         layout.drop_without_applying_deltas();
 
         let output = ctx.run_ui(click_at(reset_pos), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false, true, &mut false);
+            toggle_cluster(ui, &tx_command, &icons, false, true, true, &mut false);
         });
         let commands = output
             .viewport_output
@@ -8808,7 +8936,7 @@ mod tests {
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false, true, &mut false);
+            toggle_cluster(ui, &tx_command, &icons, false, true, true, &mut false);
         });
         let update = layout
             .platform_output
@@ -8825,7 +8953,7 @@ mod tests {
 
         let fills_while_hovered = |capturing: bool| -> Vec<egui::Color32> {
             let output = ctx.run_ui(hover_input(), |ui| {
-                toggle_cluster(ui, &tx_command, &icons, capturing, true, &mut false);
+                toggle_cluster(ui, &tx_command, &icons, capturing, true, true, &mut false);
             });
             let mut fills = Vec::new();
             for clipped in &output.shapes {
@@ -8882,7 +9010,7 @@ mod tests {
         const SHARE_LABEL: &str = "Copy screenshot to clipboard";
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false, true, &mut false);
+            toggle_cluster(ui, &tx_command, &icons, false, true, true, &mut false);
         });
         let update = layout
             .platform_output
@@ -8899,7 +9027,7 @@ mod tests {
 
         let texts_while_hovered = |capturing: bool| -> Vec<String> {
             let output = ctx.run_ui(hover_input(), |ui| {
-                toggle_cluster(ui, &tx_command, &icons, capturing, true, &mut false);
+                toggle_cluster(ui, &tx_command, &icons, capturing, true, true, &mut false);
             });
             let mut texts = Vec::new();
             for clipped in &output.shapes {
@@ -9431,6 +9559,76 @@ mod tests {
     fn click_through_after_tray_request_holds_steady_with_no_request() {
         assert!(!click_through_after_tray_request(false, false));
         assert!(click_through_after_tray_request(true, false));
+    }
+
+    // -- toggle_cluster: Share availability (issue #219) --------------------
+
+    /// The live view is a DPS row surface — Share must be clickable.
+    #[test]
+    fn share_active_for_view_is_true_on_live() {
+        assert!(share_active_for_view(&OverlayView::Live));
+    }
+
+    /// The bare history list (no encounter open) is not a row surface at
+    /// all — clicking Share there would capture the list of past
+    /// encounters, not a fight, so it must be inactive.
+    #[test]
+    fn share_active_for_view_is_false_on_the_bare_history_list() {
+        let view = OverlayView::History(Box::default());
+        assert!(!share_active_for_view(&view));
+    }
+
+    /// A specific historical encounter renders through the same `draw_rows`
+    /// a live fight uses — Share must be just as active there as on Live.
+    #[test]
+    fn share_active_for_view_is_true_when_a_historical_encounter_is_open() {
+        let view = OverlayView::History(Box::new(HistoryUi {
+            open: Some(OpenEncounter {
+                id: 1,
+                title: "Fight".to_string(),
+                subtitle: None,
+                ended_at_ms: 0,
+                snapshot: rows_test_snapshot(3),
+            }),
+            ..HistoryUi::default()
+        }));
+        assert!(share_active_for_view(&view));
+    }
+
+    // -- screenshot_row_count (issue #219) -----------------------------------
+
+    /// Live view: the crop must use the live snapshot's own row count.
+    #[test]
+    fn screenshot_row_count_uses_the_live_count_on_live() {
+        assert_eq!(screenshot_row_count(&OverlayView::Live, 5), 5);
+    }
+
+    /// A historical encounter is open: the crop must use *its* row count,
+    /// not the live snapshot's (which may differ, or even be zero if the
+    /// live encounter has ended) — this is the second half of issue #219's
+    /// crop bug.
+    #[test]
+    fn screenshot_row_count_uses_the_open_encounters_count_when_history_is_open() {
+        let view = OverlayView::History(Box::new(HistoryUi {
+            open: Some(OpenEncounter {
+                id: 1,
+                title: "Fight".to_string(),
+                subtitle: None,
+                ended_at_ms: 0,
+                snapshot: rows_test_snapshot(9),
+            }),
+            ..HistoryUi::default()
+        }));
+        assert_eq!(screenshot_row_count(&view, 5), 9);
+    }
+
+    /// The bare history list has no open encounter — Share is inactive
+    /// there (see `share_active_for_view`), so the fallback value is never
+    /// actually used for a real crop, but must still be well-defined.
+    #[test]
+    fn screenshot_row_count_falls_back_to_the_live_count_on_the_bare_history_list() {
+        let view = OverlayView::History(Box::default());
+        assert_eq!(screenshot_row_count(&view, 5), 5);
     }
 
     // -- handle_share_screenshot (the `OverlayApp::ui` sequencing itself) ---
@@ -13132,6 +13330,7 @@ mod tests {
                     &icons,
                     &mut gesture,
                     false,
+                    true,
                     &mut update_check,
                     false,
                     &mut false,
@@ -14494,6 +14693,56 @@ mod tests {
         assert!(
             !state.confirm_clear,
             "the second click must fire and reset the confirm state"
+        );
+    }
+
+    /// Issue #219: `draw_history` draws its own nav bar and a second
+    /// separator before an open encounter's rows — the crop bound's
+    /// `rows_top` must be measured *after* that chrome, not wherever the
+    /// outer panel's own separator (before `draw_history` even runs) left
+    /// off, or the last row(s) get cropped out of the Share screenshot.
+    /// Returning it from `draw_history` itself, rather than the caller
+    /// re-deriving it, is what keeps the two from drifting apart.
+    #[test]
+    fn draw_history_reports_rows_top_after_its_own_bar_and_separator() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let settings = Settings::default();
+        let mut state = HistoryUi {
+            open: Some(OpenEncounter {
+                id: 1,
+                title: "Fight".to_string(),
+                subtitle: None,
+                ended_at_ms: 0,
+                snapshot: rows_test_snapshot(3),
+            }),
+            ..HistoryUi::default()
+        };
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut back_to_live = false;
+
+        let mut pre_call_top = 0.0;
+        let mut reported_rows_top = 0.0;
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            pre_call_top = ui.cursor().top();
+            let (rows_top, _rows_area_height) = draw_history(
+                ui,
+                &mut state,
+                &settings,
+                &icons,
+                None,
+                &tx,
+                &mut back_to_live,
+            );
+            reported_rows_top = rows_top;
+        })
+        .drop_without_applying_deltas();
+
+        assert!(
+            reported_rows_top > pre_call_top,
+            "rows_top must move past the history bar and separator \
+             (pre-call top {pre_call_top}, reported {reported_rows_top})"
         );
     }
 }
