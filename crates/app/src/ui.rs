@@ -981,6 +981,12 @@ impl eframe::App for OverlayApp {
             OverlayView::History(state) => state.open.clone(),
             OverlayView::Live => None,
         };
+        // Issue #219: whether Share may fire this frame — see
+        // `share_active_for_view`'s doc comment. Read here (rather than
+        // inline in the `draw_header` call below) for the same borrow-
+        // ordering reason as `history_open` just above: a plain `&self.view`
+        // read, done before the panel closure's mutable borrows begin.
+        let share_active = share_active_for_view(&self.view);
         // Issue #39: set by `draw_header_menu`'s "History" item, inside the
         // panel closure below; read back out here, *after* that closure has
         // returned, because acting on it means calling `self.open_history()`
@@ -1014,7 +1020,7 @@ impl eframe::App for OverlayApp {
             .show(ui, |ui| {
                 // First, so the header buttons drawn afterwards stay on top of
                 // the corner zones they overlap.
-                draw_resize_handles(ui, &ctx, &mut self.window_gesture);
+                draw_resize_handles(ui, &ctx, &mut self.window_gesture, "root");
                 // Issue #39: what the header and rows paint this frame — the
                 // live snapshot, or the open historical one (`history_open`,
                 // cloned above before this closure existed). Computed here,
@@ -1046,6 +1052,7 @@ impl eframe::App for OverlayApp {
                     icons,
                     &mut self.window_gesture,
                     capturing,
+                    share_active,
                     &mut self.update_check,
                     self.history.is_some(),
                     &mut open_history_clicked,
@@ -1093,9 +1100,15 @@ impl eframe::App for OverlayApp {
                 // `rows_top` is where the scroll area starts,
                 // `rows_area_height` is all of what's left in the panel for
                 // it, matching `draw_rows`'s own `auto_shrink([false,
-                // false])`.
-                let rows_top = ui.cursor().top();
-                let rows_area_height = ui.available_height();
+                // false])`. Correct as-is for `OverlayView::Live`, which
+                // draws nothing between here and `draw_rows`. Issue #219:
+                // `OverlayView::History` is different — `draw_history` below
+                // paints its own nav bar and a second separator before an
+                // open encounter's rows, so that branch overwrites both with
+                // the post-chrome values `draw_history` itself measures and
+                // returns, rather than leaving these stale ones in place.
+                let mut rows_top = ui.cursor().top();
+                let mut rows_area_height = ui.available_height();
                 // Issue #39: set by the history bar's "← Live" button;
                 // checked right after, once the `&mut self.view` borrow the
                 // match below needed has ended.
@@ -1111,7 +1124,7 @@ impl eframe::App for OverlayApp {
                         );
                     }
                     OverlayView::History(state) => {
-                        draw_history(
+                        (rows_top, rows_area_height) = draw_history(
                             ui,
                             state,
                             &self.settings,
@@ -1123,13 +1136,21 @@ impl eframe::App for OverlayApp {
                         );
                     }
                 }
-                if back_to_live {
-                    self.view = OverlayView::Live;
-                }
+                // PR #225 review of issue #219: resolved through one
+                // function, rather than reading `self.view` for the row
+                // count and then reassigning it inline here, so the "read
+                // before reset" ordering can't drift apart under a future
+                // edit — see `resolve_screenshot_row_count`'s doc comment
+                // for why the order matters.
+                let row_count = resolve_screenshot_row_count(
+                    &mut self.view,
+                    back_to_live,
+                    self.snapshot.rows.len(),
+                );
                 if screenshot_requested {
                     self.pending_screenshot_bound = Some(rows_content_bottom_y(
                         rows_top,
-                        self.snapshot.rows.len(),
+                        row_count,
                         ROW_HEIGHT,
                         rows_area_height,
                     ));
@@ -1186,6 +1207,7 @@ impl eframe::App for OverlayApp {
                     pos: skills::place_window(main_outer, monitor, SKILL_WINDOW_SIZE),
                     size: SKILL_WINDOW_SIZE,
                     source,
+                    gesture: WindowGesture::default(),
                 });
             // Issue #189: the window is no longer always-on-top, so an
             // already-open one can be sitting behind a fullscreen game with
@@ -1248,8 +1270,15 @@ impl eframe::App for OverlayApp {
             // at all. This is deliberately not click-through (D2).
             let close_requested =
                 ctx.show_viewport_immediate(skill_viewport_id(uid), builder, |ui, _class| {
-                    let x_clicked =
-                        draw_skill_window(ui, row, &mut state.sort, state.source, icons, opacity);
+                    let x_clicked = draw_skill_window(
+                        ui,
+                        row,
+                        &mut state.sort,
+                        state.source,
+                        icons,
+                        opacity,
+                        &mut state.gesture,
+                    );
                     // Issue #181: read from inside the child callback, for
                     // the same reason the close-request check below is —
                     // this is where `ctx.input` reflects the *child*
@@ -1416,6 +1445,16 @@ fn draw_header(
     // actually gets captured. See `screenshot_capture_guard`'s doc comment
     // for why this can't just be "the frame the click happened on".
     capturing: bool,
+    // Issue #219: whether the Share button may fire a screenshot capture
+    // this frame — true on `OverlayView::Live` and on `OverlayView::History`
+    // once a specific historical encounter is open, false on the bare
+    // history list. Threaded down to `toggle_cluster`, which gates both the
+    // button's `Sense` (via `toggle_button`'s `enabled`) and its glyph tint
+    // (`toggle_state_tint`) on it — the same disabled treatment the History
+    // button already wears when history is unavailable. Computed by
+    // `share_active_for_view` in `OverlayApp::ui`, the only place that can
+    // see `self.view`.
+    share_active: bool,
     // Issue #171: the manual "Check for updates" header-menu item's
     // in-flight/last-result state — threaded through to `draw_header_menu`,
     // the only place that reads or mutates it.
@@ -1647,7 +1686,15 @@ fn draw_header(
                 icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
             ),
         );
-        toggle_cluster(ui, tx_command, icons, capturing, has_history, open_history)
+        toggle_cluster(
+            ui,
+            tx_command,
+            icons,
+            capturing,
+            share_active,
+            has_history,
+            open_history,
+        )
     })
     .inner
 }
@@ -1921,11 +1968,33 @@ fn click_through_after_tray_request(click_through: bool, requested: bool) -> boo
 /// `draw_header_menu` parameters, rerouted here with the button: the cluster
 /// no longer needs a `SettingsHandle` at all, since the only two controls
 /// that flipped a setting are the ones that left.
+///
+/// `share_active` (issue #219) is whether Share may fire at all this frame
+/// — see `share_active_for_view`'s doc comment. Gated the same way
+/// `has_history` gates History: `toggle_button`'s `enabled` flag (so a
+/// disabled Share senses no click and accesskit reports it disabled) plus
+/// `toggle_state_tint` for the dimmed glyph, rather than hiding the button
+/// outright — hiding it would shift every button to its right on the
+/// frames it's inactive.
+/// The "<label>" / "<label>: unavailable" shape shared by every toggle
+/// whose label doubles as its own disabled-state explanation (Share's
+/// `share_active`, History's `has_history`, PR #225 review of issue #219)
+/// — pulled out so the wording can't drift apart between the two call
+/// sites by a hand-edit to just one of them.
+fn availability_label(
+    active: bool,
+    label: &'static str,
+    unavailable: &'static str,
+) -> &'static str {
+    if active { label } else { unavailable }
+}
+
 fn toggle_cluster(
     ui: &mut egui::Ui,
     tx_command: &Sender<UiCommand>,
     icons: &Icons,
     capturing: bool,
+    share_active: bool,
     has_history: bool,
     open_history: &mut bool,
 ) -> bool {
@@ -1958,22 +2027,23 @@ fn toggle_cluster(
         egui::Vec2::splat(TOGGLE_MOUSE_SIDE),
     );
     let mut screenshot_requested = false;
-    if toggle_button(
-        ui,
-        share_rect,
+    let share_label = availability_label(
+        share_active,
         "Copy screenshot to clipboard",
-        capturing,
-        true,
-    )
-    .clicked()
-    {
+        "Copy screenshot to clipboard: unavailable",
+    );
+    if toggle_button(ui, share_rect, share_label, capturing, share_active).clicked() {
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         screenshot_requested = true;
     }
     if let Some(share) = icons.glyphs.get(GlyphIcon::Share) {
-        ui.painter()
-            .image(share.id(), share_rect, UV_FULL, TOGGLE_ACTIVE_COLOR);
+        ui.painter().image(
+            share.id(),
+            share_rect,
+            UV_FULL,
+            toggle_state_tint(share_active),
+        );
     }
     x += TOGGLE_MOUSE_SIDE + TOGGLE_GAP;
 
@@ -2013,11 +2083,7 @@ fn toggle_cluster(
         egui::pos2(x + TOGGLE_HISTORY_SIDE / 2.0, y),
         egui::Vec2::splat(TOGGLE_HISTORY_SIDE),
     );
-    let history_label = if has_history {
-        "History"
-    } else {
-        "History: unavailable"
-    };
+    let history_label = availability_label(has_history, "History", "History: unavailable");
     if toggle_button(ui, history_rect, history_label, capturing, has_history).clicked() {
         *open_history = true;
     }
@@ -4006,18 +4072,30 @@ fn gesture_pointer(
     os_cursor.unwrap_or_else(|| window.min + local.to_vec2())
 }
 
-/// Issue #74: whether a gesture of `kind` ending should force a DWM frame
-/// recompute (`platform::force_frame_recompute`). Only resizes actually
-/// change the window's size, and the opaque-gray symptom this works around
-/// is a DWM composition artifact left behind by a resize — a pure `Move`
-/// gesture ending has nothing to recompute a frame for.
+/// Issue #74: whether a gesture of `kind` ending in `viewport` should force
+/// a DWM frame recompute (`platform::force_frame_recompute`). Only a resize
+/// changes the window's size, and the frame that goes stale is the one
+/// Win32 was never told about — a pure `Move` gesture ending has nothing to
+/// recompute a frame for.
+///
+/// The `viewport` half is issue #218: `draw_skill_window` now drives this
+/// same gesture code for every open breakdown child viewport, but
+/// `force_frame_recompute` has exactly one window to aim at — the root
+/// `HWND` cached at startup, because the `ui.rs` call sites only ever hold
+/// an `egui::Context` and no per-viewport handle exists (see its doc
+/// comment in `platform`). Firing it from a child would `SetWindowPos` the
+/// *root* window over a resize the root never underwent: nothing for the
+/// window that actually resized, and a stray call against the one `HWND`
+/// the Snap blocker watches. So child viewports are left out — the same
+/// shape of gap as the reposition exemption `draw_skill_window` documents
+/// as root-HWND-only and inert there.
 ///
 /// Pulled out of `drive_window_gesture` as a pure function, the same way
 /// `row_bar_frac`/`share_bar_paints`/`column_anchors` extract pure decisions
 /// out of `Ui`-dependent code elsewhere in this file, so this call-site
 /// choice is unit-testable without a window.
-fn gesture_end_needs_frame_recompute(kind: GestureKind) -> bool {
-    matches!(kind, GestureKind::Resize(_))
+fn gesture_end_needs_frame_recompute(kind: GestureKind, viewport: egui::ViewportId) -> bool {
+    viewport == egui::ViewportId::ROOT && matches!(kind, GestureKind::Resize(_))
 }
 
 /// Issue #183: whether the header's drag band must refuse to start a window
@@ -4108,7 +4186,7 @@ fn drive_window_gesture(ctx: &egui::Context, gesture: &mut WindowGesture, min_si
         // point again, so this can never fire on every frame of an
         // in-progress drag (which would risk reproducing issue #68's resize
         // runaway; see `platform::force_frame_recompute`'s doc comment).
-        if gesture_end_needs_frame_recompute(kind) {
+        if gesture_end_needs_frame_recompute(kind, ctx.viewport_id()) {
             crate::platform::force_frame_recompute();
         }
         return;
@@ -4263,12 +4341,33 @@ fn resize_zones(rect: egui::Rect) -> [(egui::Rect, egui::ResizeDirection, egui::
 /// own: invisible strips along the edges that start a manual resize gesture
 /// (`WindowGesture`) rather than handing the window manager a native resize
 /// loop, which on Windows is where Snap would engage.
-fn draw_resize_handles(ui: &mut egui::Ui, ctx: &egui::Context, gesture: &mut WindowGesture) {
+///
+/// `id_salt` namespaces the eight handle ids (issue #218): the same function
+/// now serves the root window and every open breakdown viewport, and both
+/// are drawn from a root `Ui` whose own id is the same in each — without a
+/// salt, two windows' north handles would be one widget.
+fn draw_resize_handles(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    gesture: &mut WindowGesture,
+    // `Debug` alongside `Hash` because egui's `Id::with` takes an
+    // `AsIdSalt`, and that is `Hash + Debug` — a debug build records the
+    // salt's `Debug` rendering in `id_source` so an id clash names the
+    // widgets that collided. Not ours to drop.
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+) {
+    // The viewport this `Ui` belongs to — the root window, or, inside
+    // `show_viewport_immediate`'s callback, the child. Either way it is the
+    // rect `Ui::max_rect` was built from (egui's `root_ui`).
     let window = ctx.input(|i| i.viewport_rect());
     // `ResizeDirection` is not `Hash`, so the zone's position in the array is
     // what keeps the eight ids distinct.
     for (index, (zone, direction, cursor)) in resize_zones(window).into_iter().enumerate() {
-        let handle = ui.interact(zone, ui.id().with(("resize", index)), egui::Sense::drag());
+        let handle = ui.interact(
+            zone,
+            ui.id().with((&id_salt, "resize", index)),
+            egui::Sense::drag(),
+        );
         if handle.hovered() {
             ctx.set_cursor_icon(cursor);
         }
@@ -5796,7 +5895,44 @@ const SKILL_ICON_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x3B
 const SKILL_HEADER_ICON_SIZE: f32 = 50.0;
 const SKILL_HEADER_PAD_X: f32 = 12.0;
 const SKILL_HEADER_PAD_Y: f32 = 10.0;
-const SKILL_CLOSE_SIZE: f32 = 20.0;
+/// The close button's clickable square, which is also the diameter of its
+/// circular hover wash (issue #218).
+///
+/// The reference (`Skills.xaml:214-224`) draws a 16pt `Svg.Close` path with
+/// an 8pt margin on every side inside a `ButtonMainStyle` button: 32pt of
+/// target around 16pt of glyph. The old 20pt square was the glyph's own box
+/// with nothing around it — no radius, no hover fill, no cursor — so there
+/// was nothing to aim at and no feedback once you got there. The family's
+/// icon buttons use radius = half the side (`MainWindow.xaml:49-55`'s
+/// `CornerRadius="18"` on a 36x36 button), i.e. a circle.
+const SKILL_CLOSE_HIT_SIZE: f32 = 32.0;
+/// The side of the cross's own box inside that target — the reference's
+/// `Path … Width="16"`. Painted as two strokes rather than set as text:
+/// `U+2715` is not covered by `fonts::bold_family`'s chain and came out as
+/// tofu (an empty box), which is what issue #218 called a "square" close
+/// button, and the reference's `Svg.Close` is vector art anyway.
+const SKILL_CLOSE_GLYPH_SIZE: f32 = 16.0;
+/// Stroke weight of those two strokes. `Svg.Close` is a filled path with no
+/// nominal weight; 1.6pt is what reads as the same visual density at 16pt
+/// against `SKILL_CLOSE_RGB`.
+const SKILL_CLOSE_STROKE_WIDTH: f32 = 1.6;
+/// The scroll thumb's fill: white at ~20% over the panel, the same read as
+/// the reference's thin light thumb. Faded with the rest of the chrome
+/// (issue #184).
+const SKILL_SCROLL_THUMB_FILL: egui::Color32 =
+    egui::Color32::from_rgba_premultiplied(0x33, 0x33, 0x33, 0x33);
+/// The thumb never gets shorter than this, however long the list — a
+/// two-pixel nub is not a grabbable or readable position indicator.
+const SKILL_SCROLL_THUMB_MIN_HEIGHT: f32 = 24.0;
+/// Width of the row list's scrollbar, thumb and track alike (issue #218) —
+/// the reference's persistent thin thumb. Also the gutter
+/// `skill_rows_content_rect` reserves for it.
+const SKILL_SCROLL_BAR_WIDTH: f32 = 6.0;
+/// The hover wash `ButtonMainStyle`'s `hl` border flips to on `IsMouseOver`:
+/// WPF's 4-digit ARGB `#1fff` — white at alpha `0x11`. Spelled premultiplied
+/// because `Color32::from_white_alpha`, which is exactly this, is not `const`.
+const SKILL_CLOSE_HOVER_FILL: egui::Color32 =
+    egui::Color32::from_rgba_premultiplied(0x11, 0x11, 0x11, 0x11);
 /// The reference's `CornerRadius="17"` header pill.
 const SKILL_PILL_CORNER_RADIUS: u8 = 17;
 /// Header pill height, measured at 34px in the reference (issue #200) —
@@ -5873,6 +6009,13 @@ struct SkillWindowState {
     pos: egui::Pos2,
     size: egui::Vec2,
     source: SkillWindowSource,
+    /// Issue #218: this window's own in-flight move/resize. Per-window
+    /// rather than shared with the root's, because two viewports can be
+    /// dragged in two different (non-overlapping) sessions and because
+    /// `drive_window_gesture` sends its viewport commands to whichever
+    /// context is live — inside `show_viewport_immediate`'s callback that
+    /// is this child, not the root.
+    gesture: WindowGesture,
 }
 
 /// Which fight one breakdown window is showing (issue #216, PR #221
@@ -6095,6 +6238,121 @@ fn skill_window_empty_message(
     })
 }
 
+/// The header band: full width, `SKILL_HEADER_HEIGHT` tall, flush with the
+/// window's top. Pulled out of `draw_skill_window` (issue #218) so the drag
+/// band and close button derived from it are testable without a live `Ui`.
+fn skill_header_rect(rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), SKILL_HEADER_HEIGHT))
+}
+
+/// The window's drag surface (issue #218): the header band only, inset by
+/// `RESIZE_EDGE` on the three window edges it touches.
+///
+/// It used to be `ui.max_rect()` — the whole viewport — which broke two
+/// things at once. It covered the eight `resize_zones` strips, so the
+/// borderless window had no reachable resize grip anywhere; and it covered
+/// the row list, where a `Sense::drag()` strands egui's `dragged_id()` and
+/// so gates off *all* mouse-wheel scrolling
+/// (`scroll_area.rs`' `is_hovering_outer_rect`, which is
+/// `… && ui.ctx().dragged_id().is_none()`).
+///
+/// Same shape and same reasoning as the main window's header band — see the
+/// "a drag surface spanning it would win the hit test and swallow every
+/// north-edge resize" note there. No bottom inset is needed: the south
+/// strip is a window height away.
+fn skill_drag_band(header_rect: egui::Rect) -> egui::Rect {
+    let mut band = header_rect;
+    band.min.y += RESIZE_EDGE;
+    band.min.x += RESIZE_EDGE;
+    band.max.x -= RESIZE_EDGE;
+    band
+}
+
+/// The close button's hit square (issue #218), top-right of the window
+/// inside the header's padding. `SKILL_CLOSE_HIT_SIZE` wide, so it is also
+/// the bounding box of the circular hover wash painted at its centre.
+fn skill_close_rect(rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(
+            rect.right() - SKILL_HEADER_PAD_X - SKILL_CLOSE_HIT_SIZE,
+            rect.top() + SKILL_HEADER_PAD_Y,
+        ),
+        egui::Vec2::splat(SKILL_CLOSE_HIT_SIZE),
+    )
+}
+
+/// The close cross's two strokes, as endpoint pairs: the diagonals of a
+/// `SKILL_CLOSE_GLYPH_SIZE` box centred in the button (issue #218). Pure so
+/// the shape survives without a font and is checkable without a `Ui`.
+fn skill_close_cross(close_rect: egui::Rect) -> [[egui::Pos2; 2]; 2] {
+    let arms = egui::Rect::from_center_size(
+        close_rect.center(),
+        egui::Vec2::splat(SKILL_CLOSE_GLYPH_SIZE),
+    );
+    [
+        [arms.left_top(), arms.right_bottom()],
+        [arms.right_top(), arms.left_bottom()],
+    ]
+}
+
+/// The rect the row list lays its rows out in: the rows band minus the
+/// scrollbar's gutter (issue #218).
+///
+/// The rows used to be allocated at the full band width, which put every
+/// row's own painting across the strip the bar lives in — a solid bar has
+/// to take its width out of the content, and content that ignores that just
+/// paints over it.
+fn skill_rows_content_rect(rows_rect: egui::Rect) -> egui::Rect {
+    let mut content = rows_rect;
+    content.max.x -= SKILL_SCROLL_BAR_WIDTH;
+    content
+}
+
+/// The scroll thumb for a row list of `content_height` scrolled to
+/// `offset_y`, or `None` when the list fits and needs none.
+///
+/// Painted by hand (issue #218) rather than left to egui's own scroll bar:
+/// that bar never reached the screen here — with `ScrollStyle::solid()` set
+/// on the list's `Ui` it still painted no track and no handle, headless or
+/// live — and the reference's persistent thin thumb is a fixed piece of
+/// chrome anyway, not egui's hover-faded floating bar. Driven off the
+/// `ScrollAreaOutput` egui already hands back, so it cannot drift out of
+/// step with where the list actually is.
+fn skill_scroll_thumb(
+    rows_rect: egui::Rect,
+    content_height: f32,
+    offset_y: f32,
+) -> Option<egui::Rect> {
+    let track = rows_rect.height();
+    if content_height <= track {
+        return None;
+    }
+    // Proportional to how much of the list is on screen, which is what
+    // makes the thumb read as "how far through am I" and not just "there is
+    // more".
+    let thumb_height = (track * track / content_height).clamp(SKILL_SCROLL_THUMB_MIN_HEIGHT, track);
+    let travel = (offset_y / (content_height - track)).clamp(0.0, 1.0);
+    Some(egui::Rect::from_min_size(
+        egui::pos2(
+            rows_rect.right() - SKILL_SCROLL_BAR_WIDTH,
+            rows_rect.top() + (track - thumb_height) * travel,
+        ),
+        egui::vec2(SKILL_SCROLL_BAR_WIDTH, thumb_height),
+    ))
+}
+
+/// Where the Deaths pill's left edge lands: right-aligned into the header,
+/// one `SKILL_HEADER_PAD_X` clear of the close button. Shares
+/// `SKILL_CLOSE_HIT_SIZE` with `skill_close_rect` so growing that button
+/// (issue #218) pushes the pill left instead of letting the two overlap.
+fn skill_deaths_pill_left(header_rect: egui::Rect, pill_width: f32) -> f32 {
+    header_rect.right()
+        - SKILL_HEADER_PAD_X
+        - SKILL_CLOSE_HIT_SIZE
+        - SKILL_HEADER_PAD_X
+        - pill_width
+}
+
 fn draw_skill_window(
     ui: &mut egui::Ui,
     row: &PlayerRow,
@@ -6102,32 +6360,46 @@ fn draw_skill_window(
     source: SkillWindowSource,
     icons: &Icons,
     opacity: f32,
+    gesture: &mut WindowGesture,
 ) -> bool {
     let rect = ui.max_rect();
+    let ctx = ui.ctx().clone();
     let painter = ui.painter().clone();
     painter.rect_filled(rect, 0.0, SKILL_CHROME_FILL.gamma_multiply(opacity));
 
-    // Drag anywhere on the background moves the window (the child viewport
-    // has no OS titlebar, D2's `with_decorations(false)`) — registered
-    // first so the more specific interacts below (column headers, close
-    // glyph) win the pixels they overlap with it; egui gives interaction
-    // priority to whatever was registered later, the same "registered
-    // later wins" idiom `OverlayApp::ui`'s `draw_resize_handles`-before-
-    // `draw_header` ordering relies on. Not routed through `WindowGesture`,
-    // which owns a root-window-only reposition exemption guard (issue #11)
-    // with no analogue for a child viewport.
+    // Issue #218: this window is `with_decorations(false)` like the root, so
+    // winit cancels `WS_SIZEBOX` and hands back no OS resize frame — the
+    // `with_resizable(true)` on its builder is dead. It supplies its own
+    // grips exactly as the root window does. Registered first so the header
+    // widgets below win the pixels they overlap; egui gives interaction
+    // priority to whatever was registered later.
+    draw_resize_handles(ui, &ctx, gesture, ("skill", row.uid));
+
+    // -- header: class icon, player name, one Deaths pill (D10) ----------
+    let header_rect = skill_header_rect(rect);
+
+    // Dragging the header moves the window (the child viewport has no OS
+    // titlebar, D2's `with_decorations(false)`). Issue #218: this used to
+    // sense the whole of `rect` and fire `ViewportCommand::StartDrag`, and
+    // both halves were bugs. The full-viewport rect buried the resize
+    // strips and, worse, put a `Sense::drag()` over the row list, where a
+    // stranded `dragged_id()` gates off all wheel scrolling — see
+    // `skill_drag_band`. And `StartDrag` enters Windows' `SC_MOVE` modal
+    // loop, which eats the `WM_LBUTTONUP` that would have cleared that drag
+    // state, on top of being the one place Aero Snap engages (issue #11).
+    // So this goes through `WindowGesture` like the root window's header
+    // does. The reposition exemption that gesture holds is root-HWND-only
+    // and simply inert here — a missing Snap-blocker exemption for a window
+    // the Snap blocker never sees, not a correctness gap.
     let drag = ui.interact(
-        rect,
+        skill_drag_band(header_rect),
         ui.id().with(("skill_drag", row.uid)),
         egui::Sense::drag(),
     );
     if drag.drag_started_by(egui::PointerButton::Primary) {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        begin_window_gesture(&ctx, gesture, GestureKind::Move);
     }
 
-    // -- header: class icon, player name, one Deaths pill (D10) ----------
-    let header_rect =
-        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), SKILL_HEADER_HEIGHT));
     let icon_rect = egui::Rect::from_center_size(
         header_rect.left_center()
             + egui::vec2(SKILL_HEADER_PAD_X + SKILL_HEADER_ICON_SIZE / 2.0, 0.0),
@@ -6174,11 +6446,7 @@ fn draw_skill_window(
     let deaths_pill_size = pill_size(deaths_text_size, deaths_pill.icon_side, SKILL_PILL_HEIGHT);
     let deaths_pill_rect = egui::Rect::from_min_size(
         egui::pos2(
-            header_rect.right()
-                - SKILL_HEADER_PAD_X
-                - SKILL_CLOSE_SIZE
-                - SKILL_HEADER_PAD_X
-                - deaths_pill_size.x,
+            skill_deaths_pill_left(header_rect, deaths_pill_size.x),
             header_rect.center().y - deaths_pill_size.y / 2.0,
         ),
         deaths_pill_size,
@@ -6186,29 +6454,35 @@ fn draw_skill_window(
     paint_stat_pill(&painter, deaths_pill_rect, deaths_text_size, &deaths_pill);
 
     // -- close glyph (D2): the only in-window way to close ---------------
-    let close_rect = egui::Rect::from_min_size(
-        egui::pos2(
-            rect.right() - SKILL_HEADER_PAD_X - SKILL_CLOSE_SIZE,
-            rect.top() + SKILL_HEADER_PAD_Y,
-        ),
-        egui::Vec2::splat(SKILL_CLOSE_SIZE),
+    // Issue #218: interacted *before* it is painted, because the hover wash
+    // is part of the paint — a 32pt circle behind the glyph, matching the
+    // reference's `ButtonMainStyle` (`#1fff` on `IsMouseOver`, radius =
+    // half the side) — and a pointing-hand cursor. The glyph itself used to
+    // be the whole button: a 20pt square with no radius, no hover feedback
+    // and no cursor change, so nothing about it read as clickable.
+    let close_rect = skill_close_rect(rect);
+    let close = ui.interact(
+        close_rect,
+        ui.id().with(("skill_close", row.uid)),
+        egui::Sense::click(),
     );
-    paint_text(
-        &painter,
-        close_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "\u{2715}",
-        bold(FONT_SIZE_ROW),
-        SKILL_CLOSE_RGB,
-        true,
-    );
-    let close_clicked = ui
-        .interact(
-            close_rect,
-            ui.id().with(("skill_close", row.uid)),
-            egui::Sense::click(),
-        )
-        .clicked();
+    if close.hovered() {
+        painter.circle_filled(
+            close_rect.center(),
+            SKILL_CLOSE_HIT_SIZE / 2.0,
+            SKILL_CLOSE_HOVER_FILL,
+        );
+        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    // Two strokes, not a `\u{2715}`: that codepoint is outside every font in
+    // `fonts::bold_family`'s chain, so it rendered as tofu — the empty box
+    // issue #218 reported as a "square" close button. The reference's
+    // `Svg.Close` is vector art too.
+    let stroke = egui::Stroke::new(SKILL_CLOSE_STROKE_WIDTH, SKILL_CLOSE_RGB);
+    for [from, to] in skill_close_cross(close_rect) {
+        painter.line_segment([from, to], stroke);
+    }
+    let close_clicked = close.clicked();
 
     // -- tab strip: `Dps` only, styled selected (D11) ---------------------
     // The reference's other six tabs (Heal, Mana, Buff, Counter,
@@ -6320,13 +6594,21 @@ fn draw_skill_window(
     }
 
     let mut rows_ui = ui.new_child(egui::UiBuilder::new().max_rect(rows_rect));
-    egui::ScrollArea::vertical()
+    // Issue #218: rows are laid out inside the thumb's gutter, never across
+    // it, so no row's hover fill or clipped cell paints over the thumb.
+    let rows_content_rect = skill_rows_content_rect(rows_rect);
+    let scroll = egui::ScrollArea::vertical()
         .auto_shrink([false, false])
+        // egui's own bar is suppressed rather than styled: it painted
+        // nothing here either way (see `skill_scroll_thumb`), and leaving
+        // it enabled would silently take a second gutter's width out of
+        // the content.
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .show(&mut rows_ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for skill in &skill_rows {
                 let (skill_rect, response) = ui.allocate_exact_size(
-                    egui::vec2(rows_rect.width(), SKILL_ROW_HEIGHT),
+                    egui::vec2(rows_content_rect.width(), SKILL_ROW_HEIGHT),
                     egui::Sense::hover(),
                 );
                 if response.hovered() {
@@ -6394,6 +6676,25 @@ fn draw_skill_window(
                 }
             }
         });
+
+    // Painted after the list, so it sits over the rows rather than under
+    // them, and from the scroll area's own reported geometry.
+    if let Some(thumb) = skill_scroll_thumb(rows_rect, scroll.content_size.y, scroll.state.offset.y)
+    {
+        painter.rect_filled(
+            thumb,
+            egui::CornerRadius::same((SKILL_SCROLL_BAR_WIDTH / 2.0) as u8),
+            SKILL_SCROLL_THUMB_FILL.gamma_multiply(opacity),
+        );
+    }
+
+    // Last, so the header band and the eight resize handles above have all
+    // had their frame to start a gesture (issue #218) — the same ordering
+    // `OverlayApp::ui` uses for the root window. Inside
+    // `show_viewport_immediate`'s callback `ctx`'s viewport commands and
+    // input both address *this* child, so the same driver moves and resizes
+    // it without knowing it is not the root.
+    drive_window_gesture(&ctx, gesture, SKILL_WINDOW_MIN_SIZE);
 
     close_clicked
 }
@@ -6465,6 +6766,68 @@ struct OpenEncounter {
     #[allow(dead_code)]
     ended_at_ms: u64,
     snapshot: Snapshot,
+}
+
+/// Whether the Share button may fire a screenshot capture this frame
+/// (issue #219): true on `OverlayView::Live`, and on `OverlayView::History`
+/// only once a specific historical encounter is open (`state.open` is
+/// `Some`) — both render through the same `draw_rows` a DPS-style row list,
+/// per the spec's reference-fidelity requirement. False on the bare history
+/// list, where nothing behind the button is a row screenshot worth taking —
+/// capturing it would just screenshot the list of past encounters. Pure so
+/// the view -> active mapping is unit-testable without an `egui::Context`;
+/// `OverlayApp::ui` is the only caller.
+fn share_active_for_view(view: &OverlayView) -> bool {
+    match view {
+        OverlayView::Live => true,
+        OverlayView::History(state) => state.open.is_some(),
+    }
+}
+
+/// Which row count the Share crop bound (`rows_content_bottom_y`) must use
+/// this frame (issue #219): the open historical encounter's own row count
+/// while one is open, not the *live* snapshot's — the two can differ (a
+/// past fight had a different roster, or the live encounter has since
+/// ended down to zero rows) and cropping against the wrong one either cuts
+/// off real rows or leaves stray blank space. `live_row_count` is the
+/// fallback for `Live` and the (never actually captured, since Share is
+/// inactive there — see `share_active_for_view`) bare history list. Pure so
+/// this is unit-testable without an `egui::Context`.
+fn screenshot_row_count(view: &OverlayView, live_row_count: usize) -> usize {
+    match view {
+        OverlayView::Live => live_row_count,
+        OverlayView::History(state) => state
+            .open
+            .as_ref()
+            .map(|open| open.snapshot.rows.len())
+            .unwrap_or(live_row_count),
+    }
+}
+
+/// `OverlayApp::ui`'s single entry point for both halves of the Share crop
+/// bound (PR #225 review of issue #219): it must call `screenshot_row_count`
+/// on `view` *before* applying the "← Live" reset (`back_to_live`), because
+/// `draw_history` already painted `view`'s rows this exact frame — even on
+/// the frame a "← Live" click sets `back_to_live`, since that click only
+/// takes effect on the *next* frame's `match`. Reading the row count after
+/// the reset would use the just-reset `OverlayView::Live` instead of the
+/// historical view that was actually on screen, reintroducing the
+/// crop-bound mismatch issue #219 fixed. Folding both steps into one
+/// function — rather than the caller doing `screenshot_row_count` then a
+/// separate `if back_to_live { … }` — is what keeps that ordering from
+/// drifting apart under a future edit. Pure aside from the `&mut
+/// OverlayView` reset, so the ordering itself is unit-testable without an
+/// `egui::Context`.
+fn resolve_screenshot_row_count(
+    view: &mut OverlayView,
+    back_to_live: bool,
+    live_row_count: usize,
+) -> usize {
+    let row_count = screenshot_row_count(view, live_row_count);
+    if back_to_live {
+        *view = OverlayView::Live;
+    }
+    row_count
 }
 
 /// The header's title/subtitle override for a historical fight (spec
@@ -6599,6 +6962,18 @@ impl OverlayApp {
 /// The whole history surface: the bar, then either the list or the open
 /// encounter's rows (rendered through the same `draw_rows` a live fight
 /// uses, per the spec's reference-fidelity requirement).
+///
+/// Returns the window-space y coordinate (points) where that content —
+/// list or rows — actually starts, and the height left in the panel for it
+/// at that point (issue #219): `OverlayApp::ui` used to capture both
+/// *before* calling this function, from the outer panel's own separator,
+/// but this function draws its own nav bar (`draw_history_bar`) and a
+/// second separator first, so with a historical encounter open the real
+/// rows start lower than that stale bound — the Share screenshot crop was
+/// computed against too little content and cut the last row(s) off.
+/// Measuring both right here, after this function's own chrome and before
+/// its content, is what keeps the crop bound from drifting out of sync
+/// with what actually gets painted underneath it.
 #[allow(clippy::too_many_arguments)]
 fn draw_history(
     ui: &mut egui::Ui,
@@ -6615,7 +6990,7 @@ fn draw_history(
     // its player's breakdown window too, instead of the click being
     // swallowed silently.
     opened: &mut Option<i64>,
-) {
+) -> (f32, f32) {
     match draw_history_bar(ui, state) {
         HistoryBarAction::None => {}
         HistoryBarAction::Live => *back_to_live = true,
@@ -6638,9 +7013,12 @@ fn draw_history(
 
     ui.separator();
 
+    let rows_top = ui.cursor().top();
+    let rows_area_height = ui.available_height();
+
     if let Some(open) = &state.open {
         draw_rows(ui, &open.snapshot, settings, icons, opened);
-        return;
+        return (rows_top, rows_area_height);
     }
 
     match draw_history_list(ui, state) {
@@ -6661,6 +7039,8 @@ fn draw_history(
         }
         None => {}
     }
+
+    (rows_top, rows_area_height)
 }
 
 /// The bar under the header: "← Live", a "← Back" when an encounter is
@@ -7499,6 +7879,7 @@ mod tests {
                 &icons,
                 &mut WindowGesture::default(),
                 false,
+                true,
                 &mut UpdateCheckState::default(),
                 false,
                 &mut false,
@@ -7656,6 +8037,7 @@ mod tests {
                 &icons,
                 &mut WindowGesture::default(),
                 false,
+                true,
                 &mut UpdateCheckState::default(),
                 false,
                 &mut false,
@@ -7909,6 +8291,7 @@ mod tests {
                 &icons,
                 &mut WindowGesture::default(),
                 false,
+                true,
                 &mut UpdateCheckState::default(),
                 false,
                 &mut false,
@@ -7992,6 +8375,7 @@ mod tests {
                 &icons,
                 &mut WindowGesture::default(),
                 false,
+                true,
                 &mut UpdateCheckState::default(),
                 false,
                 &mut false,
@@ -8493,7 +8877,15 @@ mod tests {
         let tints = |has_history: bool| -> Vec<(egui::TextureId, egui::Color32)> {
             let mut blits = Vec::new();
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                toggle_cluster(ui, &tx_command, &icons, false, has_history, &mut false);
+                toggle_cluster(
+                    ui,
+                    &tx_command,
+                    &icons,
+                    false,
+                    true,
+                    has_history,
+                    &mut false,
+                );
             });
             for clipped in &output.shapes {
                 collect_image_texture_tints(&clipped.shape, &mut blits);
@@ -8538,7 +8930,7 @@ mod tests {
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
 
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false, true, &mut false);
+            toggle_cluster(ui, &tx_command, &icons, false, true, true, &mut false);
         });
         let update = output
             .platform_output
@@ -8572,7 +8964,15 @@ mod tests {
 
         let disabled = |has_history: bool, label: &str| -> bool {
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                toggle_cluster(ui, &tx_command, &icons, false, has_history, &mut false);
+                toggle_cluster(
+                    ui,
+                    &tx_command,
+                    &icons,
+                    false,
+                    true,
+                    has_history,
+                    &mut false,
+                );
             });
             let update = output
                 .platform_output
@@ -8600,6 +9000,80 @@ mod tests {
         );
     }
 
+    /// Mirrors `the_history_button_reports_itself_disabled_without_history`
+    /// for Share (PR #225 review of issue #219): every existing
+    /// `toggle_cluster` test call site passes `share_active = true`, so
+    /// nothing verified the button is genuinely disabled — not merely
+    /// dim — when it's false. Same contract as History: accesskit must
+    /// publish `enabled: false`, and a click landing on the button's rect
+    /// must not fire a capture.
+    #[test]
+    fn the_share_button_reports_itself_disabled_when_inactive() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+
+        let disabled = |share_active: bool, label: &str| -> bool {
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                toggle_cluster(
+                    ui,
+                    &tx_command,
+                    &icons,
+                    false,
+                    share_active,
+                    true,
+                    &mut false,
+                );
+            });
+            let update = output
+                .platform_output
+                .accesskit_update
+                .clone()
+                .expect("accesskit was enabled for this frame");
+            output.drop_without_applying_deltas();
+            update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label().is_some_and(|s| s == label))
+                .map(|(_, node)| node.is_disabled())
+                .unwrap_or_else(|| panic!("no accessible node labeled {label:?} painted"))
+        };
+
+        assert!(
+            disabled(false, "Copy screenshot to clipboard: unavailable"),
+            "Share must report enabled: false when share_active is false"
+        );
+        assert!(
+            !disabled(true, "Copy screenshot to clipboard"),
+            "Share must stay enabled when share_active is true"
+        );
+
+        let label = "Copy screenshot to clipboard: unavailable";
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            toggle_cluster(ui, &tx_command, &icons, false, false, true, &mut false);
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let pos = accessible_rect_for_label(&update, label).center();
+        layout.drop_without_applying_deltas();
+
+        let mut screenshot_requested = true;
+        let output = ctx.run_ui(click_at(pos), |ui| {
+            screenshot_requested =
+                toggle_cluster(ui, &tx_command, &icons, false, false, true, &mut false);
+        });
+        output.drop_without_applying_deltas();
+        assert!(
+            !screenshot_requested,
+            "clicking a disabled Share button must not fire a capture"
+        );
+    }
+
     /// Issue #186: the History button opens the history view when there is
     /// a history thread, and is inert — not merely dim — when there isn't,
     /// which is the disabled state the `draw_header_menu` item it replaced
@@ -8614,7 +9088,15 @@ mod tests {
 
         let clicked = |has_history: bool, label: &str| -> bool {
             let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-                toggle_cluster(ui, &tx_command, &icons, false, has_history, &mut false);
+                toggle_cluster(
+                    ui,
+                    &tx_command,
+                    &icons,
+                    false,
+                    true,
+                    has_history,
+                    &mut false,
+                );
             });
             let update = layout
                 .platform_output
@@ -8631,6 +9113,7 @@ mod tests {
                     &tx_command,
                     &icons,
                     false,
+                    true,
                     has_history,
                     &mut open_history,
                 );
@@ -8846,7 +9329,7 @@ mod tests {
         let (tx_command, rx_command) = crossbeam_channel::unbounded();
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false, true, &mut false);
+            toggle_cluster(ui, &tx_command, &icons, false, true, true, &mut false);
         });
         let update = layout
             .platform_output
@@ -8857,7 +9340,7 @@ mod tests {
         layout.drop_without_applying_deltas();
 
         let output = ctx.run_ui(click_at(share_pos), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false, true, &mut false);
+            toggle_cluster(ui, &tx_command, &icons, false, true, true, &mut false);
         });
         let commands = output
             .viewport_output
@@ -8890,7 +9373,7 @@ mod tests {
         let (tx_command, rx_command) = crossbeam_channel::unbounded();
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false, true, &mut false);
+            toggle_cluster(ui, &tx_command, &icons, false, true, true, &mut false);
         });
         let update = layout
             .platform_output
@@ -8901,7 +9384,7 @@ mod tests {
         layout.drop_without_applying_deltas();
 
         let output = ctx.run_ui(click_at(reset_pos), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false, true, &mut false);
+            toggle_cluster(ui, &tx_command, &icons, false, true, true, &mut false);
         });
         let commands = output
             .viewport_output
@@ -8946,7 +9429,7 @@ mod tests {
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false, true, &mut false);
+            toggle_cluster(ui, &tx_command, &icons, false, true, true, &mut false);
         });
         let update = layout
             .platform_output
@@ -8963,7 +9446,7 @@ mod tests {
 
         let fills_while_hovered = |capturing: bool| -> Vec<egui::Color32> {
             let output = ctx.run_ui(hover_input(), |ui| {
-                toggle_cluster(ui, &tx_command, &icons, capturing, true, &mut false);
+                toggle_cluster(ui, &tx_command, &icons, capturing, true, true, &mut false);
             });
             let mut fills = Vec::new();
             for clipped in &output.shapes {
@@ -9020,7 +9503,7 @@ mod tests {
         const SHARE_LABEL: &str = "Copy screenshot to clipboard";
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            toggle_cluster(ui, &tx_command, &icons, false, true, &mut false);
+            toggle_cluster(ui, &tx_command, &icons, false, true, true, &mut false);
         });
         let update = layout
             .platform_output
@@ -9037,7 +9520,7 @@ mod tests {
 
         let texts_while_hovered = |capturing: bool| -> Vec<String> {
             let output = ctx.run_ui(hover_input(), |ui| {
-                toggle_cluster(ui, &tx_command, &icons, capturing, true, &mut false);
+                toggle_cluster(ui, &tx_command, &icons, capturing, true, true, &mut false);
             });
             let mut texts = Vec::new();
             for clipped in &output.shapes {
@@ -9569,6 +10052,107 @@ mod tests {
     fn click_through_after_tray_request_holds_steady_with_no_request() {
         assert!(!click_through_after_tray_request(false, false));
         assert!(click_through_after_tray_request(true, false));
+    }
+
+    // -- toggle_cluster: Share availability (issue #219) --------------------
+
+    /// The live view is a DPS row surface — Share must be clickable.
+    #[test]
+    fn share_active_for_view_is_true_on_live() {
+        assert!(share_active_for_view(&OverlayView::Live));
+    }
+
+    /// The bare history list (no encounter open) is not a row surface at
+    /// all — clicking Share there would capture the list of past
+    /// encounters, not a fight, so it must be inactive.
+    #[test]
+    fn share_active_for_view_is_false_on_the_bare_history_list() {
+        let view = OverlayView::History(Box::default());
+        assert!(!share_active_for_view(&view));
+    }
+
+    /// A specific historical encounter renders through the same `draw_rows`
+    /// a live fight uses — Share must be just as active there as on Live.
+    #[test]
+    fn share_active_for_view_is_true_when_a_historical_encounter_is_open() {
+        let view = OverlayView::History(Box::new(HistoryUi {
+            open: Some(OpenEncounter {
+                id: 1,
+                title: "Fight".to_string(),
+                subtitle: None,
+                ended_at_ms: 0,
+                snapshot: rows_test_snapshot(3),
+            }),
+            ..HistoryUi::default()
+        }));
+        assert!(share_active_for_view(&view));
+    }
+
+    // -- screenshot_row_count (issue #219) -----------------------------------
+
+    /// Live view: the crop must use the live snapshot's own row count.
+    #[test]
+    fn screenshot_row_count_uses_the_live_count_on_live() {
+        assert_eq!(screenshot_row_count(&OverlayView::Live, 5), 5);
+    }
+
+    /// A historical encounter is open: the crop must use *its* row count,
+    /// not the live snapshot's (which may differ, or even be zero if the
+    /// live encounter has ended) — this is the second half of issue #219's
+    /// crop bug.
+    #[test]
+    fn screenshot_row_count_uses_the_open_encounters_count_when_history_is_open() {
+        let view = OverlayView::History(Box::new(HistoryUi {
+            open: Some(OpenEncounter {
+                id: 1,
+                title: "Fight".to_string(),
+                subtitle: None,
+                ended_at_ms: 0,
+                snapshot: rows_test_snapshot(9),
+            }),
+            ..HistoryUi::default()
+        }));
+        assert_eq!(screenshot_row_count(&view, 5), 9);
+    }
+
+    /// The bare history list has no open encounter — Share is inactive
+    /// there (see `share_active_for_view`), so the fallback value is never
+    /// actually used for a real crop, but must still be well-defined.
+    #[test]
+    fn screenshot_row_count_falls_back_to_the_live_count_on_the_bare_history_list() {
+        let view = OverlayView::History(Box::default());
+        assert_eq!(screenshot_row_count(&view, 5), 5);
+    }
+
+    /// PR #225 review of issue #219: a "Back to Live" click and a Share
+    /// click landing in the same frame (`back_to_live` and the crop-bound
+    /// use both true) must still crop against the historical encounter
+    /// `draw_history` painted this frame, not the `OverlayView::Live` the
+    /// same frame's reset is about to produce.
+    #[test]
+    fn resolve_screenshot_row_count_uses_the_painted_view_even_when_back_to_live_fires_this_frame()
+    {
+        let mut view = OverlayView::History(Box::new(HistoryUi {
+            open: Some(OpenEncounter {
+                id: 1,
+                title: "Fight".to_string(),
+                subtitle: None,
+                ended_at_ms: 0,
+                snapshot: rows_test_snapshot(9),
+            }),
+            ..HistoryUi::default()
+        }));
+
+        let row_count = resolve_screenshot_row_count(&mut view, true, 5);
+
+        assert_eq!(
+            row_count, 9,
+            "the crop bound must use the historical encounter's row count, not the live snapshot's"
+        );
+        assert!(
+            matches!(view, OverlayView::Live),
+            "back_to_live must still reset the view once the row count is captured"
+        );
     }
 
     // -- handle_share_screenshot (the `OverlayApp::ui` sequencing itself) ---
@@ -11491,6 +12075,339 @@ mod tests {
         assert_eq!(rows_rect.bottom(), rect.bottom());
     }
 
+    // -- breakdown-window chrome gestures (issue #218) ----------------------
+
+    /// The window rect these gesture tests measure against — off-origin so
+    /// an accidental `0.0` in the maths cannot pass by coincidence.
+    fn skill_window_rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(120.0, 80.0), egui::vec2(880.0, 520.0))
+    }
+
+    /// Issue #218: the drag surface used to be `ui.max_rect()` — the whole
+    /// viewport, edges included — so the eight `resize_zones` strips could
+    /// never be grabbed. The band now stops short of them on all three
+    /// sides it touches, exactly as the main header's does.
+    #[test]
+    fn drag_band_is_the_header_inset_by_the_resize_edge() {
+        let rect = skill_window_rect();
+        let header = skill_header_rect(rect);
+        let band = skill_drag_band(header);
+        assert_eq!(band.top(), header.top() + RESIZE_EDGE);
+        assert_eq!(band.left(), header.left() + RESIZE_EDGE);
+        assert_eq!(band.right(), header.right() - RESIZE_EDGE);
+        assert_eq!(band.bottom(), header.bottom());
+    }
+
+    /// The same inset, stated as the property that actually matters: every
+    /// edge resize strip keeps a live pixel the drag band does not cover.
+    #[test]
+    fn drag_band_leaves_every_edge_resize_zone_reachable() {
+        let rect = skill_window_rect();
+        let band = skill_drag_band(skill_header_rect(rect));
+        let zones = resize_zones(rect);
+        let (north, south, west, east) = (zones[0].0, zones[1].0, zones[2].0, zones[3].0);
+        assert!(band.top() >= north.bottom(), "north strip is covered");
+        assert!(band.left() >= west.right(), "west strip is covered");
+        assert!(band.right() <= east.left(), "east strip is covered");
+        assert!(band.bottom() <= south.top(), "south strip is covered");
+    }
+
+    /// Issue #218's scroll bug: a drag sense over the row list wedges
+    /// egui's `dragged_id()`, which gates *all* wheel scrolling
+    /// (`scroll_area.rs`' `is_hovering_outer_rect`). The band must not
+    /// reach the rows band at all.
+    #[test]
+    fn drag_band_never_covers_the_row_list() {
+        let rect = skill_window_rect();
+        let header = skill_header_rect(rect);
+        let tabs = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), header.bottom()),
+            egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
+        );
+        let rows = skill_rows_rect(rect, skill_column_header_rect(rect, tabs));
+        assert!(!skill_drag_band(header).intersects(rows));
+    }
+
+    /// Issue #218: the close glyph was a bare 20pt square. The reference
+    /// (`Skills.xaml:214-224`) is a 16pt `Svg.Close` with an 8pt margin per
+    /// side — a 32pt target, big enough to hit and big enough for a
+    /// circular hover wash of radius `SKILL_CLOSE_HIT_SIZE / 2`.
+    #[test]
+    fn close_button_is_a_32pt_target_around_a_16pt_glyph() {
+        assert_eq!(SKILL_CLOSE_HIT_SIZE, SKILL_CLOSE_GLYPH_SIZE + 2.0 * 8.0);
+        // The wash is `#1fff` — white at alpha 0x11 — written premultiplied
+        // only because `from_white_alpha` is not `const`.
+        assert_eq!(
+            SKILL_CLOSE_HOVER_FILL,
+            egui::Color32::from_white_alpha(0x11)
+        );
+        let rect = skill_window_rect();
+        let close = skill_close_rect(rect);
+        assert_eq!(close.width(), SKILL_CLOSE_HIT_SIZE);
+        assert_eq!(close.height(), SKILL_CLOSE_HIT_SIZE);
+        assert_eq!(close.right(), rect.right() - SKILL_HEADER_PAD_X);
+        assert_eq!(close.top(), rect.top() + SKILL_HEADER_PAD_Y);
+    }
+
+    /// The deaths pill reserves its room off the close button's *hit* size,
+    /// so growing that button (issue #218) pushes the pill left instead of
+    /// letting the two overlap.
+    #[test]
+    fn deaths_pill_clears_the_close_button_by_one_header_pad() {
+        let rect = skill_window_rect();
+        let header = skill_header_rect(rect);
+        let pill_width = 64.0;
+        let left = skill_deaths_pill_left(header, pill_width);
+        assert_eq!(
+            left + pill_width + SKILL_HEADER_PAD_X,
+            skill_close_rect(rect).left()
+        );
+    }
+
+    /// Issue #218 (follow-up): `U+2715` came out as tofu — an empty box —
+    /// because the bold family's font chain does not cover it. The cross is
+    /// vector art now, exactly as the reference draws it
+    /// (`<Path Data="{StaticResource Svg.Close}" ...>`), so no font chain
+    /// can regress it.
+    #[test]
+    fn close_cross_is_two_centred_diagonals_the_size_of_the_glyph_box() {
+        let close = skill_close_rect(skill_window_rect());
+        let [[a0, a1], [b0, b1]] = skill_close_cross(close);
+
+        let box_rect = egui::Rect::from_points(&[a0, a1, b0, b1]);
+        assert_eq!(box_rect.center(), close.center());
+        assert_eq!(box_rect.width(), SKILL_CLOSE_GLYPH_SIZE);
+        assert_eq!(box_rect.height(), SKILL_CLOSE_GLYPH_SIZE);
+        assert!(
+            close.contains_rect(box_rect),
+            "the cross must fit its target"
+        );
+
+        // Opposite diagonals, not two parallel strokes.
+        assert!((a1.x - a0.x) > 0.0 && (a1.y - a0.y) > 0.0);
+        assert!((b1.x - b0.x) < 0.0 && (b1.y - b0.y) > 0.0);
+
+        // And every endpoint stays inside the circular hover wash.
+        for point in [a0, a1, b0, b1] {
+            assert!(point.distance(close.center()) <= SKILL_CLOSE_HIT_SIZE / 2.0);
+        }
+    }
+
+    /// Issue #218: the close button had no hover feedback at all, so
+    /// nothing about it read as clickable. The wash is a circle of
+    /// `SKILL_CLOSE_HOVER_FILL` filling the 32pt target, painted only while
+    /// the pointer is over it — the same shape of check
+    /// `toggle_button_suppresses_its_hover_fill_while_a_screenshot_capture_
+    /// is_in_flight` makes for the toolbar's buttons, and the unhovered
+    /// half is the sanity check that the wash is genuinely conditional
+    /// rather than always painted.
+    #[test]
+    fn the_close_button_paints_its_hover_wash_only_while_hovered() {
+        let row = PlayerRow {
+            skills: vec![sample_skill_row(1550)],
+            ..sample_row(None)
+        };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_MIN_SIZE);
+        let mut sort = skills::SkillSort::default();
+
+        // Two frames per probe: egui resolves hover against the widgets the
+        // *previous* frame registered, so a single frame would report the
+        // close button unhovered however the pointer is placed.
+        let mut fills_with_pointer_at = |pointer: egui::Pos2| -> Vec<egui::Color32> {
+            let mut fills = Vec::new();
+            for frame in 0..2 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen_rect),
+                        events: vec![egui::Event::PointerMoved(pointer)],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        draw_skill_window(
+                            ui,
+                            &row,
+                            &mut sort,
+                            SkillWindowSource::Live,
+                            &icons,
+                            1.0,
+                            &mut WindowGesture::default(),
+                        );
+                    },
+                );
+                if frame == 1 {
+                    for clipped in &output.shapes {
+                        collect_circle_fills(&clipped.shape, &mut fills);
+                    }
+                }
+                output.drop_without_applying_deltas();
+            }
+            fills
+        };
+
+        let hovered = fills_with_pointer_at(skill_close_rect(screen_rect).center());
+        assert!(
+            hovered.contains(&SKILL_CLOSE_HOVER_FILL),
+            "hovering the close button must paint its wash: {hovered:?}"
+        );
+
+        // The player-name end of the header: inside the window, nowhere
+        // near the close button.
+        let elsewhere = fills_with_pointer_at(skill_header_rect(screen_rect).left_center());
+        assert!(
+            !elsewhere.contains(&SKILL_CLOSE_HOVER_FILL),
+            "the wash must not paint with the pointer elsewhere: {elsewhere:?}"
+        );
+    }
+
+    /// Every `Shape::Rect` a frame painted, flattened out of the `Vec`
+    /// nesting -- `collect_row_boxes` deliberately keeps only text and
+    /// meshes, and a scrollbar is neither.
+    fn painted_rects(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Rect(rect) => out.push(rect.rect),
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    painted_rects(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Issue #218 (follow-up): with the list overflowing, the reference
+    /// shows a persistent thin thumb down the right edge of the rows band.
+    /// `ScrollStyle::solid()` alone did not put one on screen.
+    #[test]
+    fn an_overflowing_row_list_paints_a_scrollbar_in_its_rows_band() {
+        let row = PlayerRow {
+            skills: (0..40).map(|i| sample_skill_row(1550 + i)).collect(),
+            ..sample_row(None)
+        };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        // Deliberately at the window's floor: 40 rows cannot fit, so a bar
+        // is needed.
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_MIN_SIZE);
+        let mut sort = skills::SkillSort::default();
+        // Two frames: egui animates a scroll bar in, so the first frame's
+        // `show_factor` is still 0 and paints nothing either way.
+        for _ in 0..2 {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    ..Default::default()
+                },
+                |ui| {
+                    draw_skill_window(
+                        ui,
+                        &row,
+                        &mut sort,
+                        SkillWindowSource::Live,
+                        &icons,
+                        1.0,
+                        &mut WindowGesture::default(),
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_skill_window(
+                    ui,
+                    &row,
+                    &mut sort,
+                    SkillWindowSource::Live,
+                    &icons,
+                    1.0,
+                    &mut WindowGesture::default(),
+                );
+            },
+        );
+        let mut rects = Vec::new();
+        for clipped in &output.shapes {
+            painted_rects(&clipped.shape, &mut rects);
+        }
+        output.drop_without_applying_deltas();
+
+        let header = skill_header_rect(screen_rect);
+        let tabs = egui::Rect::from_min_size(
+            egui::pos2(screen_rect.left(), header.bottom()),
+            egui::vec2(screen_rect.width(), SKILL_TAB_HEIGHT),
+        );
+        let rows = skill_rows_rect(screen_rect, skill_column_header_rect(screen_rect, tabs));
+        let bar = rects.iter().find(|r| {
+            r.right() == rows.right()
+                && r.width() == SKILL_SCROLL_BAR_WIDTH
+                && r.top() >= rows.top()
+                && r.bottom() <= rows.bottom()
+                && r.height() >= SKILL_SCROLL_THUMB_MIN_HEIGHT
+        });
+        assert!(
+            bar.is_some(),
+            "no scroll thumb painted down the rows band's right edge"
+        );
+    }
+
+    /// A list that fits needs no thumb at all — the reference shows one
+    /// only where there is something to scroll.
+    #[test]
+    fn no_scroll_thumb_when_the_list_fits() {
+        let rows = egui::Rect::from_min_size(egui::pos2(0.0, 132.0), egui::vec2(360.0, 88.0));
+        assert_eq!(skill_scroll_thumb(rows, 88.0, 0.0), None);
+        assert_eq!(skill_scroll_thumb(rows, 40.0, 0.0), None);
+    }
+
+    /// The thumb rides the gutter: fixed width at the band's right edge,
+    /// proportional height with a floor, and it travels from the band's top
+    /// at offset 0 to its bottom at the end of the scroll (issue #218).
+    #[test]
+    fn scroll_thumb_tracks_the_offset_inside_the_rows_band() {
+        let rows = egui::Rect::from_min_size(egui::pos2(0.0, 132.0), egui::vec2(360.0, 88.0));
+        let content = 264.0;
+
+        let top = skill_scroll_thumb(rows, content, 0.0).expect("the list overflows");
+        assert_eq!(top.width(), SKILL_SCROLL_BAR_WIDTH);
+        assert_eq!(top.right(), rows.right());
+        assert_eq!(top.top(), rows.top());
+        // A third of the list is on screen, so the thumb is a third as tall.
+        assert!((top.height() - rows.height() / 3.0).abs() < 0.001);
+
+        let bottom =
+            skill_scroll_thumb(rows, content, content - rows.height()).expect("the list overflows");
+        assert!((bottom.bottom() - rows.bottom()).abs() < 0.001);
+        assert_eq!(bottom.height(), top.height());
+
+        // Overscroll (egui's elastic bounce) must not push it out of the band.
+        let past = skill_scroll_thumb(rows, content, 10_000.0).expect("the list overflows");
+        assert!((past.bottom() - rows.bottom()).abs() < 0.001);
+
+        // A very long list still leaves something grabbable.
+        let tiny = skill_scroll_thumb(rows, 100_000.0, 0.0).expect("the list overflows");
+        assert_eq!(tiny.height(), SKILL_SCROLL_THUMB_MIN_HEIGHT);
+    }
+
+    /// The rows lay out inside the gutter, so nothing they paint can cover
+    /// the thumb (issue #218).
+    #[test]
+    fn rows_content_reserves_the_thumbs_gutter() {
+        let rows = egui::Rect::from_min_size(egui::pos2(0.0, 132.0), egui::vec2(360.0, 88.0));
+        let content = skill_rows_content_rect(rows);
+        assert_eq!(content.right(), rows.right() - SKILL_SCROLL_BAR_WIDTH);
+        assert_eq!(content.left(), rows.left());
+        assert_eq!(content.height(), rows.height());
+        let thumb = skill_scroll_thumb(rows, 264.0, 0.0).expect("the list overflows");
+        assert!(!content.intersects(thumb) || content.right() <= thumb.left());
+    }
+
     /// The panel is deliberately *not* the source's slate `#232830` — that
     /// reads as washed-out grey over game footage. Lock the near-black.
     #[test]
@@ -13270,6 +14187,7 @@ mod tests {
                     &icons,
                     &mut gesture,
                     false,
+                    true,
                     &mut update_check,
                     false,
                     &mut false,
@@ -13505,14 +14423,31 @@ mod tests {
         // Issue #74: a resize is the gesture kind that can leave DWM's frame
         // stale, so its end must trigger `platform::force_frame_recompute`.
         let resize = GestureKind::Resize(egui::ResizeDirection::West);
-        assert!(gesture_end_needs_frame_recompute(resize));
+        assert!(gesture_end_needs_frame_recompute(
+            resize,
+            egui::ViewportId::ROOT
+        ));
     }
 
     #[test]
     fn a_finished_move_does_not_need_a_frame_recompute() {
         // A pure move never changes the window's size, so there is nothing
         // for a DWM frame recompute to fix.
-        assert!(!gesture_end_needs_frame_recompute(GestureKind::Move));
+        assert!(!gesture_end_needs_frame_recompute(
+            GestureKind::Move,
+            egui::ViewportId::ROOT
+        ));
+    }
+
+    #[test]
+    fn a_resize_finished_in_a_child_viewport_needs_no_frame_recompute() {
+        // Issue #218: the breakdown windows share this driver, but
+        // `platform::force_frame_recompute` can only reach the root `HWND`
+        // it cached at startup. A child's resize must not fire a
+        // `SetWindowPos` at the root window, which did not resize.
+        let resize = GestureKind::Resize(egui::ResizeDirection::West);
+        let child = egui::ViewportId::from_hash_of("skill-1550");
+        assert!(!gesture_end_needs_frame_recompute(resize, child));
     }
 
     // --- death-count column (issue #49) ---------------------------------
@@ -14163,6 +15098,7 @@ mod tests {
             pos,
             size: SKILL_WINDOW_SIZE,
             source: SkillWindowSource::Live,
+            gesture: WindowGesture::default(),
         }
     }
 
@@ -14451,6 +15387,17 @@ mod tests {
     /// whatever this run reports the `X` glyph did, leaving `sort` mutated
     /// in place for the caller to inspect.
     fn click_skill_window_at(row: &PlayerRow, sort: &mut skills::SkillSort, value: &str) -> bool {
+        click_skill_window(row, sort, |frame| frame.text_box(value).center())
+    }
+
+    /// The same two-frame harness, aimed by an arbitrary `locate` instead of
+    /// by a painted string — the close button paints no text at all since
+    /// issue #218 turned its `\u{2715}` into two line segments.
+    fn click_skill_window(
+        row: &PlayerRow,
+        sort: &mut skills::SkillSort,
+        locate: impl FnOnce(&RowFrame) -> egui::Pos2,
+    ) -> bool {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
@@ -14462,7 +15409,15 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                draw_skill_window(ui, row, sort, SkillWindowSource::Live, &icons, 1.0);
+                draw_skill_window(
+                    ui,
+                    row,
+                    sort,
+                    SkillWindowSource::Live,
+                    &icons,
+                    1.0,
+                    &mut WindowGesture::default(),
+                );
             },
         );
         let mut frame = RowFrame {
@@ -14472,7 +15427,7 @@ mod tests {
         for clipped in &layout.shapes {
             collect_row_boxes(&clipped.shape, clipped.clip_rect, &mut frame);
         }
-        let pos = frame.text_box(value).center();
+        let pos = locate(&frame);
         layout.drop_without_applying_deltas();
 
         let mut clicked = false;
@@ -14482,7 +15437,15 @@ mod tests {
                 ..click_at_with_button(pos, egui::PointerButton::Primary)
             },
             |ui| {
-                clicked = draw_skill_window(ui, row, sort, SkillWindowSource::Live, &icons, 1.0);
+                clicked = draw_skill_window(
+                    ui,
+                    row,
+                    sort,
+                    SkillWindowSource::Live,
+                    &icons,
+                    1.0,
+                    &mut WindowGesture::default(),
+                );
             },
         );
         output.drop_without_applying_deltas();
@@ -14802,7 +15765,15 @@ mod tests {
         };
         let mut sort = skills::SkillSort::default();
 
-        let closed = click_skill_window_at(&row, &mut sort, "\u{2715}");
+        // The close button is aimed at geometrically: it paints two line
+        // segments now, not a glyph (issue #218).
+        let closed = click_skill_window(&row, &mut sort, |_| {
+            skill_close_rect(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                SKILL_WINDOW_SIZE,
+            ))
+            .center()
+        });
 
         assert!(
             closed,
@@ -14895,6 +15866,57 @@ mod tests {
         assert!(
             !state.confirm_clear,
             "the second click must fire and reset the confirm state"
+        );
+    }
+
+    /// Issue #219: `draw_history` draws its own nav bar and a second
+    /// separator before an open encounter's rows — the crop bound's
+    /// `rows_top` must be measured *after* that chrome, not wherever the
+    /// outer panel's own separator (before `draw_history` even runs) left
+    /// off, or the last row(s) get cropped out of the Share screenshot.
+    /// Returning it from `draw_history` itself, rather than the caller
+    /// re-deriving it, is what keeps the two from drifting apart.
+    #[test]
+    fn draw_history_reports_rows_top_after_its_own_bar_and_separator() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let settings = Settings::default();
+        let mut state = HistoryUi {
+            open: Some(OpenEncounter {
+                id: 1,
+                title: "Fight".to_string(),
+                subtitle: None,
+                ended_at_ms: 0,
+                snapshot: rows_test_snapshot(3),
+            }),
+            ..HistoryUi::default()
+        };
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut back_to_live = false;
+
+        let mut pre_call_top = 0.0;
+        let mut reported_rows_top = 0.0;
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            pre_call_top = ui.cursor().top();
+            let (rows_top, _rows_area_height) = draw_history(
+                ui,
+                &mut state,
+                &settings,
+                &icons,
+                None,
+                &tx,
+                &mut back_to_live,
+                &mut None,
+            );
+            reported_rows_top = rows_top;
+        })
+        .drop_without_applying_deltas();
+
+        assert!(
+            reported_rows_top > pre_call_top,
+            "rows_top must move past the history bar and separator \
+             (pre-call top {pre_call_top}, reported {reported_rows_top})"
         );
     }
 }
