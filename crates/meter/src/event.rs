@@ -194,6 +194,21 @@ pub struct EnemyHp {
     pub timestamp_ms: u64,
 }
 
+/// Mirrors `bpsr_protocol::event::EDungeonState` exactly (issue #139): see
+/// that type's doc comment for the wire source and why `Unknown` is a
+/// distinct variant rather than folded into `Null`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EDungeonState {
+    Null,
+    Active,
+    Ready,
+    Playing,
+    End,
+    Settlement,
+    Vote,
+    Unknown(i32),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolEvent {
     Damage(DamageEvent),
@@ -209,6 +224,32 @@ pub enum ProtocolEvent {
     /// post-reset cooldown so it isn't stamped with a stale prior event time.
     ServerChanged {
         timestamp_ms: u64,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::DungeonState` (issue #139).
+    /// `Meter::apply` acts on this — see `Meter::apply_dungeon_state` for
+    /// the full dungeon-state / objective behaviour.
+    DungeonState {
+        state: EDungeonState,
+        scene_uuid: Option<u32>,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::DungeonObjective` (issue
+    /// #139). See `Meter::apply_dungeon_objective`.
+    DungeonObjective {
+        target_id: i32,
+        nums: Option<i32>,
+        complete: Option<bool>,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::DungeonObjectiveRemoved`
+    /// (issue #139). See `Meter::apply_dungeon_objective_removed`.
+    DungeonObjectiveRemoved {
+        target_id: i32,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::DungeonVar` (issue #139).
+    /// `Meter::apply` acts only on `name == "IsFinishTarget"`; every other
+    /// var is decoded and ignored.
+    DungeonVar {
+        name: String,
+        value: i32,
     },
 }
 

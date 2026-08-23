@@ -10,7 +10,10 @@ use prost::Message;
 use std::sync::Arc;
 
 use crate::attrs::{enemy_hp_from_attrs, player_info_from_attrs, scene_id_from_attrs};
-use crate::event::{DamageEvent, EntityKind, PlayerInfo, ProtocolEvent, kind_of, uid_of};
+use crate::blob;
+use crate::event::{
+    DamageEvent, EDungeonState, EntityKind, PlayerInfo, ProtocolEvent, kind_of, uid_of,
+};
 use crate::frame::{
     Desync, MAX_TAIL_LEN, Notify, SERVICE_UUID, TEAM_NTF_SERVICE_UUID, parse_frame, split_frames,
 };
@@ -34,6 +37,22 @@ pub mod opcode {
     /// disproven `SyncContainerData.CharSerialize.scene_data` path (see
     /// `pb::CharSerialize`'s doc comment).
     pub const ENTER_SCENE: u32 = 0x0000_0003;
+    /// `WorldNtf.SyncDungeonData` (issue #139): the plain-protobuf full
+    /// dungeon sync (`pb::DungeonSyncData`). Validated against this
+    /// build's real captures — 6/6 `Notify` records on this opcode, every
+    /// one empty (open world). See
+    /// `docs/specs/2026-08-23-issue-139-dungeon-state-spec.md` for the
+    /// capture evidence and `decode::on_sync_dungeon_data`.
+    pub const SYNC_DUNGEON_DATA: u32 = 0x0000_0017;
+    /// `WorldNtf.SyncDungeonDirtyData` (issue #139): the blob-wrapped
+    /// dungeon dirty-data channel (`pb::SyncDungeonDirtyData`, see
+    /// `crate::blob`'s module doc for the inner wire format). Validated
+    /// against this build's real captures — 392/392 `Notify` records on
+    /// this opcode parsed with zero failures by the Python prototype this
+    /// port reproduces; see
+    /// `docs/specs/2026-08-23-issue-139-dungeon-state-spec.md` and
+    /// `decode::on_sync_dungeon_dirty_data`.
+    pub const SYNC_DUNGEON_DIRTY_DATA: u32 = 0x0000_0018;
 }
 
 /// Method ids on `frame::TEAM_NTF_SERVICE_UUID` (`EServiceId.GrpcTeamNtf`,
@@ -94,6 +113,18 @@ pub fn decode_notify(
             Ok(msg) => on_enter_scene(&msg, out, sink),
             Err(_) => log::debug!("bpsr-protocol: EnterScene decode failed"),
         },
+        (SERVICE_UUID, opcode::SYNC_DUNGEON_DATA) => {
+            match pb::DungeonSyncData::decode(n.payload.as_slice()) {
+                Ok(msg) => on_sync_dungeon_data(&msg, out),
+                Err(_) => log::debug!("bpsr-protocol: DungeonSyncData decode failed"),
+            }
+        }
+        (SERVICE_UUID, opcode::SYNC_DUNGEON_DIRTY_DATA) => {
+            match pb::SyncDungeonDirtyData::decode(n.payload.as_slice()) {
+                Ok(msg) => on_sync_dungeon_dirty_data(&msg, out),
+                Err(_) => log::debug!("bpsr-protocol: SyncDungeonDirtyData decode failed"),
+            }
+        }
         (SERVICE_UUID, opcode::SYNC_NEAR_DELTA_INFO) => {
             match pb::SyncNearDeltaInfo::decode(n.payload.as_slice()) {
                 Ok(msg) => {
@@ -387,6 +418,88 @@ fn on_enter_scene(
     };
     if let Some(level_map_id) = scene_id_from_attrs(&attrs.attrs, sink) {
         out.push(ProtocolEvent::Scene { level_map_id });
+    }
+}
+
+/// `WorldNtf.SyncDungeonData` (issue #139, `opcode::SYNC_DUNGEON_DATA`):
+/// the plain-protobuf full dungeon sync. Every one of this build's real
+/// capture messages on this opcode was empty, so this only ever emits
+/// `ProtocolEvent::DungeonState` when a future capture actually carries a
+/// `flow_info` — matching `on_sync_dungeon_dirty_data`'s condition for the
+/// blob path below rather than guessing at `target`/`dungeon_var`, which
+/// are unmodeled placeholders on this message (see `pb::DungeonSyncData`'s
+/// doc comment).
+fn on_sync_dungeon_data(msg: &pb::DungeonSyncData, out: &mut Vec<ProtocolEvent>) {
+    if let Some(flow_info) = &msg.flow_info {
+        out.push(ProtocolEvent::DungeonState {
+            state: EDungeonState::from(flow_info.state),
+            scene_uuid: (msg.scene_uuid != 0).then_some(msg.scene_uuid),
+        });
+    }
+}
+
+/// `WorldNtf.SyncDungeonDirtyData` (issue #139,
+/// `opcode::SYNC_DUNGEON_DIRTY_DATA`): the blob-wrapped dungeon dirty-data
+/// channel. `v_data.buffer` is parsed by `blob::parse_dungeon_dirty_data`
+/// (not protobuf — see that module's doc comment); a parse failure there
+/// is a truncated/malformed blob and is dropped the same way a prost
+/// decode failure is everywhere else in this crate.
+///
+/// `DungeonObjective` events are emitted in ascending `target_id` order
+/// (both the hashmap's `add` and `update` sides carry real objective data
+/// on this build, so both are applied, `update` last so it wins over a
+/// same-message `add` for the same key) — the wire hashmap's own iteration
+/// order is not deterministic, so this crate makes the event stream
+/// deterministic instead. `TargetData.target_id` is deliberately never
+/// used for this: the hashmap key is the authoritative target id (see
+/// `blob::TargetData`'s doc comment) — an *update* entry commonly omits
+/// `target_id` on the wire entirely. The hashmap's `remove` side carries
+/// bare keys and no value at all, so it becomes `DungeonObjectiveRemoved`
+/// — sorted for the same determinism reason, and emitted *before* the
+/// add/update events so a key this same message removes and re-adds ends
+/// up tracked rather than dropped. Dropping removals instead (as this
+/// function first did) left the meter's `current_objective_id` pointing
+/// at an objective the game had thrown away, which nothing could ever
+/// clear (PR #226 review, finding 2).
+fn on_sync_dungeon_dirty_data(msg: &pb::SyncDungeonDirtyData, out: &mut Vec<ProtocolEvent>) {
+    let Some(v_data) = &msg.v_data else {
+        return;
+    };
+    let Some(data) = blob::parse_dungeon_dirty_data(&v_data.buffer) else {
+        log::debug!("bpsr-protocol: SyncDungeonDirtyData blob decode failed");
+        return;
+    };
+    if let Some(flow_info) = data.flow_info {
+        out.push(ProtocolEvent::DungeonState {
+            state: EDungeonState::from(flow_info.state),
+            scene_uuid: data.scene_uuid,
+        });
+    }
+    if let Some(target) = data.target {
+        let mut removed = target.remove;
+        removed.sort_unstable();
+        for target_id in removed {
+            out.push(ProtocolEvent::DungeonObjectiveRemoved { target_id });
+        }
+        let mut objectives = std::collections::BTreeMap::new();
+        for (target_id, value) in target.add.into_iter().chain(target.update) {
+            objectives.insert(target_id, value);
+        }
+        for (target_id, value) in objectives {
+            out.push(ProtocolEvent::DungeonObjective {
+                target_id,
+                nums: value.nums,
+                complete: value.complete.map(|c| c != 0),
+            });
+        }
+    }
+    if let Some(vars) = data.dungeon_var {
+        for var in vars {
+            out.push(ProtocolEvent::DungeonVar {
+                name: var.name,
+                value: var.value,
+            });
+        }
     }
 }
 
@@ -1340,5 +1453,241 @@ mod tests {
             *sink.notifies.lock().unwrap(),
             vec![(other_service, 0x42, b"hello".to_vec(), true, 999)]
         );
+    }
+
+    // -- Dungeon state / objectives (issue #139) ----------------------------
+    //
+    // Real `Notify.payload` hex for `opcode::SYNC_DUNGEON_DIRTY_DATA`
+    // (`0x18`), captured on this build — see
+    // docs/specs/2026-08-23-issue-139-dungeon-state-spec.md. Each is the
+    // full protobuf-wrapped payload `decode_notify` actually receives, not
+    // just the inner blob (that's covered in isolation by `blob::tests`).
+
+    /// `FlowInfo.State = 4 (End)`.
+    const DUNGEON_FLOW_INFO_END_HEX: &str = "0a9b010a9801feffffffefbeadde80000000efbeadde02000000efbeaddefeffffffefbeadde30000000efbeadde01000000efbeadde04000000efbeadde05000000efbeaddedecb836aefbeadde08000000efbeadde01000000efbeaddefdffffffefbeadde07000000efbeaddefeffffffefbeadde10000000efbeadde01000000efbeadde8f010000efbeaddefdffffffefbeaddefdffffffefbeadde";
+    /// New objective, `add` path: target 1083, nums 0, complete 0.
+    const DUNGEON_NEW_OBJECTIVE_HEX: &str = "0aab010aa801feffffffefbeadde90000000efbeadde04000000efbeaddefeffffffefbeadde70000000efbeadde01000000efbeadde01000000efbeadde00000000efbeadde00000000efbeadde3b040000efbeaddefeffffffefbeadde30000000efbeadde01000000efbeadde3b040000efbeadde02000000efbeadde00000000efbeadde03000000efbeadde00000000efbeaddefdffffffefbeaddefdffffffefbeaddefdffffffefbeadde";
+    /// Objective completed, `update` path: key 111123, nums 900, complete
+    /// 1, no `target_id` inside the value itself.
+    const DUNGEON_OBJECTIVE_COMPLETED_HEX: &str = "0a9b010a9801feffffffefbeadde80000000efbeadde04000000efbeaddefeffffffefbeadde60000000efbeadde01000000efbeadde00000000efbeadde00000000efbeadde01000000efbeadde13b20100efbeaddefeffffffefbeadde20000000efbeadde02000000efbeadde84030000efbeadde03000000efbeadde01000000efbeaddefdffffffefbeaddefdffffffefbeaddefdffffffefbeadde";
+    /// Dungeon vars, 9 entries: first `InteractTimes=2`, last
+    /// `cur_qinshi=90`.
+    const DUNGEON_VARS_HEX: &str = "0ade050adb05feffffffefbeaddec3020000efbeadde0a000000efbeaddefeffffffefbeaddea3020000efbeadde01000000efbeadde09000000efbeaddefeffffffefbeadde31000000efbeadde01000000efbeadde0d000000efbeadde496e74657261637454696d6573efbeadde02000000efbeadde02000000efbeaddefdffffffefbeaddefeffffffefbeadde37000000efbeadde01000000efbeadde13000000efbeadde436f756e74446f776e54696d65725374617465efbeadde02000000efbeadde01000000efbeaddefdffffffefbeaddefeffffffefbeadde31000000efbeadde01000000efbeadde0d000000efbeadde50726f67726573735374617465efbeadde02000000efbeadde01000000efbeaddefdffffffefbeaddefeffffffefbeadde30000000efbeadde01000000efbeadde0c000000efbeadde626c756562616c6c5f6e756defbeadde02000000efbeadde00000000efbeaddefdffffffefbeaddefeffffffefbeadde34000000efbeadde01000000efbeadde10000000efbeadde626c756562616c6c5f6e756d5f6d6178efbeadde02000000efbeadde04000000efbeaddefdffffffefbeaddefeffffffefbeadde33000000efbeadde01000000efbeadde0f000000efbeadde6d757369635f76616c75655f6d6178efbeadde02000000efbeadde84030000efbeaddefdffffffefbeaddefeffffffefbeadde2f000000efbeadde01000000efbeadde0b000000efbeadde6d757369635f76616c7565efbeadde02000000efbeadde7a020000efbeaddefdffffffefbeaddefeffffffefbeadde2e000000efbeadde01000000efbeadde0a000000efbeadde6d61785f71696e736869efbeadde02000000efbeadde64000000efbeaddefdffffffefbeaddefeffffffefbeadde2e000000efbeadde01000000efbeadde0a000000efbeadde6375725f71696e736869efbeadde02000000efbeadde5a000000efbeaddefdffffffefbeaddefdffffffefbeaddefdffffffefbeadde";
+
+    /// Hand-built blob (unpadded -- the `0xDEADBEEF` guard words every
+    /// real capture carries are irrelevant to the hashmap sections under
+    /// test, and `blob::tests` covers both padding modes already). Shape:
+    /// `DungeonDirtyData { 4: Target { 1: hashmap{ add: [], remove:
+    /// [target_id], update: [] } } }`. No real capture on this build was
+    /// ever seen carrying a `remove` entry -- this fixture exists to pin
+    /// the decode side of the removal path (PR #226 review, finding 2),
+    /// not to claim the shape was observed.
+    fn synthetic_objective_removed_blob(target_id: i32) -> Vec<u8> {
+        fn i32le(v: i32) -> [u8; 4] {
+            v.to_le_bytes()
+        }
+        // `-2` struct begin, `-3` struct end (see `blob`'s module doc).
+        const BEGIN: i32 = -2;
+        const END: i32 = -3;
+        fn wrap(body: &[u8]) -> Vec<u8> {
+            [
+                i32le(BEGIN).as_slice(),
+                i32le(body.len() as i32).as_slice(),
+                body,
+                i32le(END).as_slice(),
+            ]
+            .concat()
+        }
+        // add = 0, remove = 1, update = 0, then the bare removed key.
+        let hashmap = [i32le(0), i32le(1), i32le(0), i32le(target_id)].concat();
+        // `Target` field 1 is the hashmap; `DungeonDirtyData` field 4 is
+        // the target struct.
+        let target = wrap(&[i32le(1).as_slice(), hashmap.as_slice()].concat());
+        wrap(&[i32le(4).as_slice(), target.as_slice()].concat())
+    }
+
+    fn dungeon_notify(method_id: u32, payload: Vec<u8>) -> Notify {
+        Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id,
+            payload,
+        }
+    }
+
+    /// `SYNC_DUNGEON_DATA` (`0x17`) is plain protobuf, so its fixtures are
+    /// built with prost rather than capture hex: all six real messages on
+    /// this opcode were empty (see `pb::DungeonSyncData`), which leaves
+    /// the populated-`flow_info` branch with no capture to replay.
+    fn dungeon_data_notify(scene_uuid: u32, state: Option<i32>) -> Notify {
+        let msg = pb::DungeonSyncData {
+            scene_uuid,
+            flow_info: state.map(|state| pb::DungeonFlowInfo { state }),
+            target: None,
+            dungeon_var: None,
+        };
+        dungeon_notify(opcode::SYNC_DUNGEON_DATA, msg.encode_to_vec())
+    }
+
+    #[test]
+    fn dungeon_data_flow_info_emits_state_and_scene_uuid() {
+        // 3 = `Playing`, per `EDungeonState`'s `From<i32>`.
+        let n = dungeon_data_notify(4_242, Some(3));
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ProtocolEvent::DungeonState { state, scene_uuid } => {
+                assert_eq!(*state, EDungeonState::Playing);
+                assert_eq!(*scene_uuid, Some(4_242));
+            }
+            other => panic!("expected DungeonState, got {other:?}"),
+        }
+    }
+
+    /// Protobuf cannot tell an unset `uint32` from a real 0, so
+    /// `on_sync_dungeon_data` reads 0 as absent -- the same call
+    /// `attrs::scene_id_from_attrs` already makes for scene ids.
+    #[test]
+    fn dungeon_data_zero_scene_uuid_decodes_as_absent() {
+        let n = dungeon_data_notify(0, Some(4));
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ProtocolEvent::DungeonState { state, scene_uuid } => {
+                assert_eq!(*state, EDungeonState::End);
+                assert_eq!(*scene_uuid, None);
+            }
+            other => panic!("expected DungeonState, got {other:?}"),
+        }
+    }
+
+    /// The shape every real `0x17` message on this build actually had:
+    /// nothing to report, and nothing emitted -- `target`/`dungeon_var`
+    /// are unmodeled placeholders and are never guessed at.
+    #[test]
+    fn dungeon_data_without_flow_info_emits_nothing() {
+        let n = dungeon_data_notify(0, None);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn dungeon_dirty_data_removed_objective_emits_a_removal() {
+        let msg = pb::SyncDungeonDirtyData {
+            v_data: Some(pb::BufferStream {
+                buffer: synthetic_objective_removed_blob(1083),
+                stream_type: 0,
+            }),
+        };
+        let n = dungeon_notify(opcode::SYNC_DUNGEON_DIRTY_DATA, msg.encode_to_vec());
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(
+            out,
+            vec![ProtocolEvent::DungeonObjectiveRemoved { target_id: 1083 }]
+        );
+    }
+
+    fn dungeon_dirty_notify(hex: &str) -> Notify {
+        Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id: opcode::SYNC_DUNGEON_DIRTY_DATA,
+            payload: crate::dump_format::hex_decode(hex).expect("valid fixture hex"),
+        }
+    }
+
+    #[test]
+    fn dungeon_dirty_data_flow_info_end() {
+        let n = dungeon_dirty_notify(DUNGEON_FLOW_INFO_END_HEX);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ProtocolEvent::DungeonState { state, scene_uuid } => {
+                assert_eq!(*state, EDungeonState::End);
+                assert_eq!(*scene_uuid, None);
+            }
+            other => panic!("expected DungeonState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dungeon_dirty_data_new_objective_add_path() {
+        let n = dungeon_dirty_notify(DUNGEON_NEW_OBJECTIVE_HEX);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ProtocolEvent::DungeonObjective {
+                target_id,
+                nums,
+                complete,
+            } => {
+                assert_eq!(*target_id, 1083);
+                assert_eq!(*nums, Some(0));
+                assert_eq!(*complete, Some(false));
+            }
+            other => panic!("expected DungeonObjective, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dungeon_dirty_data_objective_completed_update_path_uses_hashmap_key() {
+        let n = dungeon_dirty_notify(DUNGEON_OBJECTIVE_COMPLETED_HEX);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ProtocolEvent::DungeonObjective {
+                target_id,
+                nums,
+                complete,
+            } => {
+                // The value itself carries no `target_id` on this fixture
+                // (an update entry) — the hashmap key (111123) must still
+                // be the id that lands on the event.
+                assert_eq!(*target_id, 111123);
+                assert_eq!(*nums, Some(900));
+                assert_eq!(*complete, Some(true));
+            }
+            other => panic!("expected DungeonObjective, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dungeon_dirty_data_vars_all_nine_in_wire_order() {
+        let n = dungeon_dirty_notify(DUNGEON_VARS_HEX);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 9);
+        match &out[0] {
+            ProtocolEvent::DungeonVar { name, value } => {
+                assert_eq!(name, "InteractTimes");
+                assert_eq!(*value, 2);
+            }
+            other => panic!("expected DungeonVar, got {other:?}"),
+        }
+        match &out[8] {
+            ProtocolEvent::DungeonVar { name, value } => {
+                assert_eq!(name, "cur_qinshi");
+                assert_eq!(*value, 90);
+            }
+            other => panic!("expected DungeonVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dungeon_dirty_data_truncated_payload_drops_silently_without_panic() {
+        let full = crate::dump_format::hex_decode(DUNGEON_FLOW_INFO_END_HEX).unwrap();
+        let n = Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id: opcode::SYNC_DUNGEON_DIRTY_DATA,
+            payload: full[..full.len() / 2].to_vec(),
+        };
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.is_empty());
     }
 }

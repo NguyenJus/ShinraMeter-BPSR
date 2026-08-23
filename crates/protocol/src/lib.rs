@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod attrs;
+pub mod blob;
 pub mod decode;
 pub mod dump_format;
 pub mod event;
