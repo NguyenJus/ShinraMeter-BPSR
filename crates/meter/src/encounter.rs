@@ -923,6 +923,33 @@ impl Meter {
             return None;
         }
 
+        // issue #212: a player *acting* is the only evidence this crate
+        // ever gets that they are back up — `event::PlayerInfo` carries no
+        // HP, and no other `apply_*` entry point sees a player-side signal
+        // at all. So any outgoing event counts, heal-typed ones included: a
+        // healer or support whose whole output is heals would otherwise
+        // stay `alive: false` from their first death to the end of the
+        // pull, and `party_is_wiped` would read the party as down the next
+        // time everyone else happened to be between a death and their next
+        // hit (PR #224 review, finding 2).
+        //
+        // Above the death handling below, so that when a single event is
+        // both — a player landing a killing blow on themselves, via a
+        // reflect or a self-damaging skill — the death is the write that
+        // lands last and they stay down (finding 1). `set_alive` lets the
+        // equal timestamps through in that order deliberately.
+        //
+        // `get_mut`, not the `entry` API that the attacker path below
+        // uses: a heal is proof of life for a row the roster already
+        // holds, but it must not *create* one, or a stranger healing their
+        // way past the player in town would open a row in a damage meter
+        // they are no part of.
+        if d.attacker_kind == EntityKind::Player
+            && let Some(stats) = self.players.get_mut(&d.attacker_uid)
+        {
+            stats.set_alive(true, d.timestamp_ms);
+        }
+
         // `d.is_dead` flags that `target_uid` (the victim, not the
         // attacker) died from this hit — count it against the target
         // regardless of who or what dealt the blow (issue #49), and
@@ -1223,15 +1250,25 @@ impl Meter {
         })
     }
 
-    /// Whether every party member the meter knows about is down (issue
-    /// #154), i.e. the fight in progress is over and lost.
+    /// Whether every party member the meter knows about is down *right
+    /// now* (issue #154), i.e. the fight in progress is over and lost.
     ///
     /// The roster is `players`: every uid the meter has seen act, plus the
     /// party members preloaded from the game's own roster packet in an
-    /// instance (issue #12/#145/#149). `deaths` is per-encounter — `reset`
-    /// drops the rows that carry it — so "has died" means "has died in this
-    /// attempt", which is exactly the question. An empty roster is never a
-    /// wipe, and neither is a death outside a running fight.
+    /// instance (issue #12/#145/#149). This reads `alive`, not `deaths >
+    /// 0` (issue #212): `deaths` is a cumulative per-encounter counter that
+    /// never comes back down, so in a long pull with battle rezzes it
+    /// eventually goes nonzero on every row without the party ever being
+    /// down at the same time — the moment the last still-standing player
+    /// took their first death, every row read "has died", and the fight
+    /// falsely latched a wipe mid-pull with everyone still fighting.
+    /// `alive` tracks the current state instead: cleared by
+    /// `record_death`, set again by `apply_damage` on the next event that
+    /// player acts in — a heal they cast counts, since no
+    /// player-HP-above-zero signal exists to prefer over it (see there) —
+    /// and ordered by the event clock, so a stale packet cannot flip a
+    /// corpse back up (`PlayerStats::set_alive`). An empty roster is never
+    /// a wipe, and neither is a death outside a running fight.
     ///
     /// Detecting the wipe directly is what retires the HP-rollback
     /// heuristic for this case: the rollback shape depends on how fast a
@@ -1241,7 +1278,7 @@ impl Meter {
         self.fight_start_ms.is_some()
             && self.fight_end_ms.is_none()
             && !self.players.is_empty()
-            && self.players.values().all(|p| p.deaths > 0)
+            && self.players.values().all(|p| !p.alive)
     }
 
     /// Whether the wipe hold forbids reading `d` as the first hit of the
@@ -1400,6 +1437,18 @@ impl Meter {
             .players
             .entry(target_uid)
             .or_insert_with(|| PlayerStats::new(target_uid));
+        // issue #212: `deaths` is a cumulative counter — it never resets
+        // once nonzero — so `party_is_wiped` cannot read it directly
+        // without treating a battle-rezzed player as still down for the
+        // rest of the pull. `alive` is the "right now" bit that fixes
+        // that; set back to `true` in `apply_damage` on the next event
+        // this player acts in.
+        //
+        // Above the debounce return, not below it: the debounce exists so
+        // a retransmitted packet cannot count one death twice, and a
+        // duplicate still reports a player who is down. The bit is
+        // idempotent, so there is nothing there to protect it from.
+        stats.set_alive(false, timestamp_ms);
         let debounced = stats
             .last_death_ms
             .is_some_and(|last| timestamp_ms.saturating_sub(last) < DEATH_DEBOUNCE_MS);
@@ -4798,6 +4847,38 @@ mod tests {
             })
         }
 
+        /// A player landing a killing blow on *themselves* — a reflected
+        /// hit, or a self-damaging skill. Attacker and victim are one uid,
+        /// which is the case `killing_blow_from` (always a monster
+        /// attacker) cannot express.
+        fn self_killing_blow(uid: i64, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: uid,
+                attacker_kind: EntityKind::Player,
+                target_uid: uid,
+                target_kind: EntityKind::Player,
+                value: 9_999,
+                is_dead: true,
+                timestamp_ms: ts,
+                ..Default::default()
+            })
+        }
+
+        /// A player healing a party member — the only kind of outgoing
+        /// event a pure support ever produces.
+        fn heal(attacker_uid: i64, target_uid: i64, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::Damage(DamageEvent {
+                attacker_uid,
+                attacker_kind: EntityKind::Player,
+                target_uid,
+                target_kind: EntityKind::Player,
+                value: 4_000,
+                is_heal: true,
+                timestamp_ms: ts,
+                ..Default::default()
+            })
+        }
+
         /// The boss carrying on swinging after the party is down.
         fn monster_swing(target_uid: i64, ts: u64) -> ProtocolEvent {
             ProtocolEvent::Damage(DamageEvent {
@@ -5177,6 +5258,149 @@ mod tests {
             });
             let r = m.apply(&hit(1, 77, 300, 30_000));
             assert_eq!(r, Some(ResetReason::NewFight));
+        }
+
+        // -- issue #212: "wiped" must mean "down right now", not "has died
+        // at some point this pull" --
+
+        #[test]
+        fn a_staggered_rez_does_not_falsely_latch_a_wipe() {
+            // `party_is_wiped` used to read `deaths > 0` per player — a
+            // *cumulative* count for the whole attempt — so the moment the
+            // last still-standing player took their first death, every row
+            // read `deaths > 0` even though an earlier death had long since
+            // been battle-rezzed and that player was back in the fight.
+            let mut m = pull();
+            m.apply(&killing_blow(1, 5_000));
+            // Alpha gets rezzed and lands a hit — back in the fight.
+            let r = m.apply(&hit(1, BOSS_UID, 100, 6_000));
+            assert_eq!(r, None, "a rez mid-fight is not a new fight");
+            assert_eq!(
+                m.fight_state(6_500),
+                FightState::Active,
+                "one player down (and back up) is not a wipe"
+            );
+
+            // Bravo goes down too. Under the old cumulative rule every row
+            // now has `deaths > 0`, but Alpha is alive and still swinging.
+            m.apply(&killing_blow(2, 7_000));
+            assert_eq!(
+                m.fight_state(7_500),
+                FightState::Active,
+                "cumulative deaths across the pull must not read as a \
+                 simultaneous wipe"
+            );
+
+            // Damage after that point must still be counted, not dropped on
+            // the floor by a falsely-latched hold.
+            let r = m.apply(&hit(1, BOSS_UID, 3_000, 8_000));
+            assert_eq!(r, None);
+            let snap = m.snapshot(8_500);
+            assert_eq!(
+                snap.total_damage,
+                10_000 + 100 + 3_000,
+                "post-false-wipe damage must not be dropped"
+            );
+            assert_eq!(m.fight_state(8_500), FightState::Active);
+        }
+
+        #[test]
+        fn a_rez_followed_by_a_real_full_wipe_still_latches() {
+            // The fix must not overcorrect into never latching once anyone
+            // has ever died: a genuine full-party wipe after an earlier rez
+            // still has to end and freeze the fight.
+            let mut m = pull();
+            m.apply(&killing_blow(1, 5_000));
+            m.apply(&hit(1, BOSS_UID, 100, 6_000));
+            assert_eq!(m.fight_state(6_500), FightState::Active);
+
+            // Now the whole party goes down together, with nobody rezzed in
+            // between.
+            m.apply(&killing_blow(1, 7_000));
+            m.apply(&killing_blow(2, 8_000));
+            assert_eq!(
+                m.fight_state(8_500),
+                FightState::Ended,
+                "a real full-party wipe after a rez must still latch"
+            );
+            let snap = m.snapshot(68_000);
+            assert_eq!(snap.total_damage, 10_000 + 100);
+            assert_eq!(
+                snap.duration_ms, 7_000,
+                "frozen at the second death (8_000) minus the first hit (1_000)"
+            );
+        }
+
+        #[test]
+        fn a_self_inflicted_killing_blow_leaves_the_player_down() {
+            // PR #224 review, finding 1: the death write and the revive
+            // write used to sit on either side of the same `apply_damage`
+            // call, so an event whose attacker *is* its victim recorded
+            // the death and then immediately un-recorded it. That player
+            // read `alive` for the rest of the pull, and no wipe involving
+            // them could ever latch.
+            let mut m = pull();
+            m.apply(&self_killing_blow(1, 5_000));
+            assert_eq!(
+                m.fight_state(5_500),
+                FightState::Active,
+                "one player down is not a wipe"
+            );
+
+            m.apply(&killing_blow(2, 6_000));
+            assert_eq!(
+                m.fight_state(6_500),
+                FightState::Ended,
+                "a player who killed themselves is still down for the wipe"
+            );
+        }
+
+        #[test]
+        fn a_rezzed_healer_who_only_ever_heals_is_not_a_corpse() {
+            // PR #224 review, finding 2: the revive write sat below the
+            // `is_heal` early return, so a player whose whole output is
+            // heal-typed never reached it. One death and they stayed down
+            // for the rest of the pull — the same false wipe issue #212 is
+            // about, scoped to the roles that deal no damage.
+            let mut m = pull();
+            m.apply(&killing_blow(1, 5_000));
+            // Alpha is battle-rezzed and goes back to healing. No damage
+            // of their own, ever again.
+            let r = m.apply(&heal(1, 2, 6_000));
+            assert_eq!(r, None, "a heal is not a new fight");
+            assert_eq!(m.fight_state(6_500), FightState::Active);
+
+            // Bravo goes down. Alpha is up and casting, so the party is
+            // not down together.
+            m.apply(&killing_blow(2, 7_000));
+            assert_eq!(
+                m.fight_state(7_500),
+                FightState::Active,
+                "a healer who is casting is not a corpse"
+            );
+
+            // ...and the healer going down too still latches the wipe.
+            m.apply(&killing_blow(1, 9_000));
+            assert_eq!(m.fight_state(9_500), FightState::Ended);
+        }
+
+        #[test]
+        fn a_stale_hit_behind_a_death_packet_is_not_a_rez() {
+            // PR #224 review, finding 3: `alive` was a last-write-wins
+            // bool with no clock on it, unlike every other order-sensitive
+            // field here (`EnemyState::last_damaged_ms` and friends), so a
+            // hit retransmitted *behind* the death packet it preceded
+            // flipped the victim back up and the wipe went unnoticed.
+            let mut m = pull();
+            m.apply(&killing_blow(1, 5_000));
+            // Alpha's last swing before dying, arriving late.
+            m.apply(&hit(1, BOSS_UID, 100, 4_500));
+            m.apply(&killing_blow(2, 6_000));
+            assert_eq!(
+                m.fight_state(6_500),
+                FightState::Ended,
+                "a hit older than the death it preceded cannot revive a corpse"
+            );
         }
     }
 
