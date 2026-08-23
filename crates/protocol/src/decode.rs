@@ -453,8 +453,14 @@ fn on_sync_dungeon_data(msg: &pb::DungeonSyncData, out: &mut Vec<ProtocolEvent>)
 /// deterministic instead. `TargetData.target_id` is deliberately never
 /// used for this: the hashmap key is the authoritative target id (see
 /// `blob::TargetData`'s doc comment) — an *update* entry commonly omits
-/// `target_id` on the wire entirely. Hashmap `remove` entries carry no
-/// modeled data to emit and are dropped.
+/// `target_id` on the wire entirely. The hashmap's `remove` side carries
+/// bare keys and no value at all, so it becomes `DungeonObjectiveRemoved`
+/// — sorted for the same determinism reason, and emitted *before* the
+/// add/update events so a key this same message removes and re-adds ends
+/// up tracked rather than dropped. Dropping removals instead (as this
+/// function first did) left the meter's `current_objective_id` pointing
+/// at an objective the game had thrown away, which nothing could ever
+/// clear (PR #226 review, finding 2).
 fn on_sync_dungeon_dirty_data(msg: &pb::SyncDungeonDirtyData, out: &mut Vec<ProtocolEvent>) {
     let Some(v_data) = &msg.v_data else {
         return;
@@ -470,6 +476,11 @@ fn on_sync_dungeon_dirty_data(msg: &pb::SyncDungeonDirtyData, out: &mut Vec<Prot
         });
     }
     if let Some(target) = data.target {
+        let mut removed = target.remove;
+        removed.sort_unstable();
+        for target_id in removed {
+            out.push(ProtocolEvent::DungeonObjectiveRemoved { target_id });
+        }
         let mut objectives = std::collections::BTreeMap::new();
         for (target_id, value) in target.add.into_iter().chain(target.update) {
             objectives.insert(target_id, value);
@@ -1462,6 +1473,122 @@ mod tests {
     /// Dungeon vars, 9 entries: first `InteractTimes=2`, last
     /// `cur_qinshi=90`.
     const DUNGEON_VARS_HEX: &str = "0ade050adb05feffffffefbeaddec3020000efbeadde0a000000efbeaddefeffffffefbeaddea3020000efbeadde01000000efbeadde09000000efbeaddefeffffffefbeadde31000000efbeadde01000000efbeadde0d000000efbeadde496e74657261637454696d6573efbeadde02000000efbeadde02000000efbeaddefdffffffefbeaddefeffffffefbeadde37000000efbeadde01000000efbeadde13000000efbeadde436f756e74446f776e54696d65725374617465efbeadde02000000efbeadde01000000efbeaddefdffffffefbeaddefeffffffefbeadde31000000efbeadde01000000efbeadde0d000000efbeadde50726f67726573735374617465efbeadde02000000efbeadde01000000efbeaddefdffffffefbeaddefeffffffefbeadde30000000efbeadde01000000efbeadde0c000000efbeadde626c756562616c6c5f6e756defbeadde02000000efbeadde00000000efbeaddefdffffffefbeaddefeffffffefbeadde34000000efbeadde01000000efbeadde10000000efbeadde626c756562616c6c5f6e756d5f6d6178efbeadde02000000efbeadde04000000efbeaddefdffffffefbeaddefeffffffefbeadde33000000efbeadde01000000efbeadde0f000000efbeadde6d757369635f76616c75655f6d6178efbeadde02000000efbeadde84030000efbeaddefdffffffefbeaddefeffffffefbeadde2f000000efbeadde01000000efbeadde0b000000efbeadde6d757369635f76616c7565efbeadde02000000efbeadde7a020000efbeaddefdffffffefbeaddefeffffffefbeadde2e000000efbeadde01000000efbeadde0a000000efbeadde6d61785f71696e736869efbeadde02000000efbeadde64000000efbeaddefdffffffefbeaddefeffffffefbeadde2e000000efbeadde01000000efbeadde0a000000efbeadde6375725f71696e736869efbeadde02000000efbeadde5a000000efbeaddefdffffffefbeaddefdffffffefbeaddefdffffffefbeadde";
+
+    /// Hand-built blob (unpadded -- the `0xDEADBEEF` guard words every
+    /// real capture carries are irrelevant to the hashmap sections under
+    /// test, and `blob::tests` covers both padding modes already). Shape:
+    /// `DungeonDirtyData { 4: Target { 1: hashmap{ add: [], remove:
+    /// [target_id], update: [] } } }`. No real capture on this build was
+    /// ever seen carrying a `remove` entry -- this fixture exists to pin
+    /// the decode side of the removal path (PR #226 review, finding 2),
+    /// not to claim the shape was observed.
+    fn synthetic_objective_removed_blob(target_id: i32) -> Vec<u8> {
+        fn i32le(v: i32) -> [u8; 4] {
+            v.to_le_bytes()
+        }
+        // `-2` struct begin, `-3` struct end (see `blob`'s module doc).
+        const BEGIN: i32 = -2;
+        const END: i32 = -3;
+        fn wrap(body: &[u8]) -> Vec<u8> {
+            [
+                i32le(BEGIN).as_slice(),
+                i32le(body.len() as i32).as_slice(),
+                body,
+                i32le(END).as_slice(),
+            ]
+            .concat()
+        }
+        // add = 0, remove = 1, update = 0, then the bare removed key.
+        let hashmap = [i32le(0), i32le(1), i32le(0), i32le(target_id)].concat();
+        // `Target` field 1 is the hashmap; `DungeonDirtyData` field 4 is
+        // the target struct.
+        let target = wrap(&[i32le(1).as_slice(), hashmap.as_slice()].concat());
+        wrap(&[i32le(4).as_slice(), target.as_slice()].concat())
+    }
+
+    fn dungeon_notify(method_id: u32, payload: Vec<u8>) -> Notify {
+        Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id,
+            payload,
+        }
+    }
+
+    /// `SYNC_DUNGEON_DATA` (`0x17`) is plain protobuf, so its fixtures are
+    /// built with prost rather than capture hex: all six real messages on
+    /// this opcode were empty (see `pb::DungeonSyncData`), which leaves
+    /// the populated-`flow_info` branch with no capture to replay.
+    fn dungeon_data_notify(scene_uuid: u32, state: Option<i32>) -> Notify {
+        let msg = pb::DungeonSyncData {
+            scene_uuid,
+            flow_info: state.map(|state| pb::DungeonFlowInfo { state }),
+            target: None,
+            dungeon_var: None,
+        };
+        dungeon_notify(opcode::SYNC_DUNGEON_DATA, msg.encode_to_vec())
+    }
+
+    #[test]
+    fn dungeon_data_flow_info_emits_state_and_scene_uuid() {
+        // 3 = `Playing`, per `EDungeonState`'s `From<i32>`.
+        let n = dungeon_data_notify(4_242, Some(3));
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ProtocolEvent::DungeonState { state, scene_uuid } => {
+                assert_eq!(*state, EDungeonState::Playing);
+                assert_eq!(*scene_uuid, Some(4_242));
+            }
+            other => panic!("expected DungeonState, got {other:?}"),
+        }
+    }
+
+    /// Protobuf cannot tell an unset `uint32` from a real 0, so
+    /// `on_sync_dungeon_data` reads 0 as absent -- the same call
+    /// `attrs::scene_id_from_attrs` already makes for scene ids.
+    #[test]
+    fn dungeon_data_zero_scene_uuid_decodes_as_absent() {
+        let n = dungeon_data_notify(0, Some(4));
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ProtocolEvent::DungeonState { state, scene_uuid } => {
+                assert_eq!(*state, EDungeonState::End);
+                assert_eq!(*scene_uuid, None);
+            }
+            other => panic!("expected DungeonState, got {other:?}"),
+        }
+    }
+
+    /// The shape every real `0x17` message on this build actually had:
+    /// nothing to report, and nothing emitted -- `target`/`dungeon_var`
+    /// are unmodeled placeholders and are never guessed at.
+    #[test]
+    fn dungeon_data_without_flow_info_emits_nothing() {
+        let n = dungeon_data_notify(0, None);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn dungeon_dirty_data_removed_objective_emits_a_removal() {
+        let msg = pb::SyncDungeonDirtyData {
+            v_data: Some(pb::BufferStream {
+                buffer: synthetic_objective_removed_blob(1083),
+                stream_type: 0,
+            }),
+        };
+        let n = dungeon_notify(opcode::SYNC_DUNGEON_DIRTY_DATA, msg.encode_to_vec());
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(
+            out,
+            vec![ProtocolEvent::DungeonObjectiveRemoved { target_id: 1083 }]
+        );
+    }
 
     fn dungeon_dirty_notify(hex: &str) -> Notify {
         Notify {

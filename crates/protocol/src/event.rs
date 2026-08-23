@@ -209,6 +209,19 @@ pub enum ProtocolEvent {
         nums: Option<i32>,
         complete: Option<bool>,
     },
+    /// One dungeon objective disappearing from the wire's `Target`
+    /// hashmap (issue #139), decoded from `SYNC_DUNGEON_DIRTY_DATA`'s
+    /// `remove` side. The remove entries carry bare keys and no
+    /// `TargetData` at all (see `blob::HashmapDelta`), so this event says
+    /// only that the objective is gone — emphatically *not* that it
+    /// completed; the meter has to be able to tell those apart, which is
+    /// the whole reason this is its own variant rather than a synthesized
+    /// `DungeonObjective { complete: Some(true) }`. Emitted before the
+    /// same message's `add`/`update` events, and in ascending id order —
+    /// see `decode::on_sync_dungeon_dirty_data` for both reasons.
+    DungeonObjectiveRemoved {
+        target_id: i32,
+    },
     /// A named dungeon variable (issue #139), decoded from
     /// `SYNC_DUNGEON_DIRTY_DATA`'s blob-encoded `DungeonVar` list. Emitted
     /// for every var this build carries (`IsFinishTarget` was never

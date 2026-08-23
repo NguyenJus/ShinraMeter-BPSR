@@ -124,6 +124,9 @@ pub fn map_event(
             nums,
             complete,
         },
+        ProtocolEvent::DungeonObjectiveRemoved { target_id } => {
+            meter::ProtocolEvent::DungeonObjectiveRemoved { target_id }
+        }
         ProtocolEvent::DungeonVar { name, value } => {
             meter::ProtocolEvent::DungeonVar { name, value }
         }

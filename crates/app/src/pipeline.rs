@@ -672,6 +672,77 @@ mod tests {
         );
     }
 
+    /// Issue #139's three (now four) dungeon events are pure pass-through
+    /// mappings, but the pass-through is exactly what has to hold: the
+    /// meter's dungeon-state machine reads nothing else.
+    #[test]
+    fn maps_dungeon_state_event() {
+        let mapped = map_event(
+            proto::ProtocolEvent::DungeonState {
+                state: proto::event::EDungeonState::Playing,
+                scene_uuid: Some(4_242),
+            },
+            0,
+        );
+        assert_eq!(
+            mapped,
+            meter::ProtocolEvent::DungeonState {
+                state: meter::EDungeonState::Playing,
+                scene_uuid: Some(4_242),
+            }
+        );
+    }
+
+    #[test]
+    fn maps_dungeon_objective_event() {
+        let mapped = map_event(
+            proto::ProtocolEvent::DungeonObjective {
+                target_id: 1083,
+                nums: Some(0),
+                complete: Some(false),
+            },
+            0,
+        );
+        assert_eq!(
+            mapped,
+            meter::ProtocolEvent::DungeonObjective {
+                target_id: 1083,
+                nums: Some(0),
+                complete: Some(false),
+            }
+        );
+    }
+
+    #[test]
+    fn maps_dungeon_objective_removed_event() {
+        let mapped = map_event(
+            proto::ProtocolEvent::DungeonObjectiveRemoved { target_id: 1083 },
+            0,
+        );
+        assert_eq!(
+            mapped,
+            meter::ProtocolEvent::DungeonObjectiveRemoved { target_id: 1083 }
+        );
+    }
+
+    #[test]
+    fn maps_dungeon_var_event() {
+        let mapped = map_event(
+            proto::ProtocolEvent::DungeonVar {
+                name: "IsFinishTarget".to_string(),
+                value: 1,
+            },
+            0,
+        );
+        assert_eq!(
+            mapped,
+            meter::ProtocolEvent::DungeonVar {
+                name: "IsFinishTarget".to_string(),
+                value: 1,
+            }
+        );
+    }
+
     #[test]
     fn damage_accumulates_into_the_snapshot() {
         let mut p = Pipeline::new();

@@ -797,10 +797,7 @@ impl Meter {
                     if entering_dungeon {
                         self.enemies.clear();
                         self.boss_uid = None;
-                        self.dungeon_state = None;
-                        self.objectives.clear();
-                        self.first_objective_id = None;
-                        self.current_objective_id = None;
+                        self.clear_dungeon_instance_state();
                     }
 
                     // issue #154 / PR #163 review, finding 1: a wipe hold
@@ -879,10 +876,7 @@ impl Meter {
                 // even land back in the same dungeon, let alone the same
                 // objective sequence, so nothing about the old instance's
                 // dungeon-state tracking can be trusted to describe it.
-                self.dungeon_state = None;
-                self.objectives.clear();
-                self.first_objective_id = None;
-                self.current_objective_id = None;
+                self.clear_dungeon_instance_state();
                 if let Some(msg) = scene_transition_log(self.scene_id, None) {
                     log::info!("{msg}");
                 }
@@ -909,6 +903,10 @@ impl Meter {
                 nums,
                 complete,
             } => self.apply_dungeon_objective(*target_id, *nums, *complete),
+            ProtocolEvent::DungeonObjectiveRemoved { target_id } => {
+                self.apply_dungeon_objective_removed(*target_id);
+                None
+            }
             ProtocolEvent::DungeonVar { name, value } => {
                 // §7: `IsFinishTarget` with a non-zero value is ZDPS's
                 // documented completion fallback (never observed in this
@@ -929,6 +927,27 @@ impl Meter {
         }
     }
 
+    /// Drops everything the meter tracks about *one dungeon instance*
+    /// (issue #139): the flow state, the objective table, and both
+    /// objective-id markers. Every path that leaves an instance behind
+    /// clears all four together — a scene change into a different
+    /// dungeon, a server change, the dungeon reporting itself back to
+    /// `Null`, and a `Playing` re-send restarting the run in place — so
+    /// they are named in exactly one spot rather than four (PR #226
+    /// review, finding 4). Clearing only some of them is precisely what
+    /// makes §6's raid-boss detector fire on the *previous* instance's
+    /// ids.
+    ///
+    /// Deliberately not `Meter::reset`'s job: a reset is about the
+    /// encounter (rows, enemies, fight clocks), and plenty of resets
+    /// happen *within* one instance, where this tracking must survive.
+    fn clear_dungeon_instance_state(&mut self) {
+        self.dungeon_state = None;
+        self.objectives.clear();
+        self.first_objective_id = None;
+        self.current_objective_id = None;
+    }
+
     /// Applies a `DungeonState` transition (issue #139 §§2-4).
     fn apply_dungeon_state(&mut self, state: EDungeonState) -> Option<ResetReason> {
         self.dungeon_state = Some(state);
@@ -937,7 +956,21 @@ impl Meter {
             // started" signal — force a fresh encounter even though
             // nothing else (damage, a scene change) has necessarily
             // happened yet.
+            //
+            // PR #226 review, finding 1: the reset alone is not enough.
+            // `reset` clears the encounter and nothing else — the
+            // instance-level objective tracking is not its business (see
+            // `clear_dungeon_instance_state`) — and a raid retried in
+            // place re-sends `Playing` with no `Scene`/`ServerChanged`/
+            // `Null` in between (`ResetReason::DungeonStarted`: "inside
+            // the same instance either way"). Without the clear, the new
+            // attempt inherits the previous one's `first_objective_id`
+            // and objective table, and §6 arms on stale data. The flow
+            // state is re-asserted straight after, since the helper drops
+            // that too and `Playing` is exactly what this event reported.
             EDungeonState::Playing => {
+                self.clear_dungeon_instance_state();
+                self.dungeon_state = Some(state);
                 self.reset(ResetReason::DungeonStarted, self.last_event_ms);
                 Some(ResetReason::DungeonStarted)
             }
@@ -961,10 +994,7 @@ impl Meter {
             // path — the same tracking a session that never sees a
             // dungeon packet never populates in the first place.
             EDungeonState::Null => {
-                self.dungeon_state = None;
-                self.objectives.clear();
-                self.first_objective_id = None;
-                self.current_objective_id = None;
+                self.clear_dungeon_instance_state();
                 None
             }
             EDungeonState::Active
@@ -1000,6 +1030,20 @@ impl Meter {
             entry.complete = Some(c);
         }
 
+        // §6 arms on `first_objective_id`, so the first objective the
+        // instance reports has to establish it — *whatever* state that
+        // objective is reported in (PR #226 review, finding 3). A target
+        // that arrives already complete fails the new-objective signature
+        // below and used to return early, leaving `first_objective_id`
+        // unset for the rest of the instance: §6 then never armed at all,
+        // and the next genuine transition wrongly read as "first".
+        // Deliberately separate from `current_objective_id`, which only a
+        // real transition may move — an already-complete objective is not
+        // running.
+        if self.first_objective_id.is_none() {
+            self.first_objective_id = Some(target_id);
+        }
+
         let prior_current = self.current_objective_id;
         // §5: the wire's signature for "a new objective just started" — a
         // different target id, freshly at zero progress and not yet
@@ -1013,9 +1057,6 @@ impl Meter {
             return None;
         }
 
-        if self.first_objective_id.is_none() {
-            self.first_objective_id = Some(target_id);
-        }
         // §6 (issue #210's case): the raid-boss reset detector. Fires only
         // once the instance has genuinely moved off the first objective —
         // `prior_current` is known (`Some`) and differs from
@@ -1037,6 +1078,27 @@ impl Meter {
             Some(ResetReason::DungeonStarted)
         } else {
             None
+        }
+    }
+
+    /// Applies one objective *removal* (issue #139; PR #226 review,
+    /// finding 2): the wire dropped `target_id` out of its objective
+    /// hashmap without ever reporting it complete. A removal is not a
+    /// completion, so the entry is dropped rather than marked done — and
+    /// when it was the objective §8 is gating on, `current_objective_id`
+    /// goes back to unknown, which is what lifts that gate. Left standing,
+    /// a removed-but-never-completed objective held
+    /// `dungeon_objective_still_running` true for the rest of the
+    /// instance, suppressing every boss-death fight end in it. An
+    /// objective the meter never tracked is a no-op.
+    ///
+    /// `first_objective_id` deliberately survives: it records which
+    /// objective *opened* this instance, which a later removal does not
+    /// change, and §6 needs it for the whole run.
+    fn apply_dungeon_objective_removed(&mut self, target_id: i32) {
+        self.objectives.remove(&target_id);
+        if self.current_objective_id == Some(target_id) {
+            self.current_objective_id = None;
         }
     }
 
@@ -6523,6 +6585,10 @@ mod tests {
             }
         }
 
+        fn objective_removed(target_id: i32) -> ProtocolEvent {
+            ProtocolEvent::DungeonObjectiveRemoved { target_id }
+        }
+
         fn var(name: &str, value: i32) -> ProtocolEvent {
             ProtocolEvent::DungeonVar {
                 name: name.to_string(),
@@ -6727,6 +6793,93 @@ mod tests {
             m.apply(&boss_hit(BOSS_UID, 2_000, true));
 
             assert_eq!(m.fight_state(2_100), FightState::Ended);
+        }
+
+        /// PR #226 review, finding 1: a raid retried in place re-sends
+        /// `Playing` with no scene change, no reconnect and no `Null` in
+        /// between, so `Playing` is the only chance to drop the failed
+        /// attempt's objective tracking. Witnessed through §6: with the
+        /// old attempt's `first_objective_id` (100) and
+        /// `current_objective_id` (200) carried over, the retry's own
+        /// opening objective -- the same id 100, since it is the same
+        /// raid -- looks exactly like "moved off the first objective and
+        /// came back to it" and wrongly wipes the fresh attempt.
+        #[test]
+        fn a_raid_retried_in_place_does_not_inherit_the_previous_attempts_objectives() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Playing));
+            m.apply(&objective(100, Some(0), Some(false)));
+            m.apply(&objective(200, Some(0), Some(false)));
+
+            m.apply(&dungeon_state(EDungeonState::Playing));
+            m.apply(&dmg(1, 5_000, 1_000));
+            let reason = m.apply(&objective(100, Some(0), Some(false)));
+
+            assert_eq!(reason, None);
+            assert_eq!(m.snapshot(1_000).total_damage, 5_000);
+        }
+
+        /// PR #226 review, finding 3: an objective can be reported for
+        /// the first time already complete (a step the party finished
+        /// before the meter was looking, or one the instance hands out
+        /// pre-satisfied). That fails §5's new-objective signature, but
+        /// it is still the objective that opened this instance, so it has
+        /// to establish `first_objective_id` -- otherwise §6 never arms
+        /// and the *second* objective (200) wrongly becomes "first",
+        /// which makes the genuine return to 100 below read as ordinary
+        /// progress instead of the raid-boss reset it is.
+        #[test]
+        fn an_objective_already_complete_on_its_first_sighting_still_establishes_the_first_id() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&objective(100, Some(0), Some(true)));
+            m.apply(&objective(200, Some(0), Some(false)));
+            m.apply(&dmg(1, 5_000, 1_000));
+            assert_eq!(m.snapshot(1_000).total_damage, 5_000);
+
+            let reason = m.apply(&objective(100, Some(0), Some(false)));
+
+            assert_eq!(reason, Some(ResetReason::DungeonStarted));
+            assert_eq!(m.snapshot(1_000).total_damage, 0);
+        }
+
+        /// PR #226 review, finding 2: the game can drop an objective out
+        /// of its table without ever marking it complete. Nothing else
+        /// clears `current_objective_id`, so before removals were
+        /// propagated at all this left §8's gate stuck open for the rest
+        /// of the instance -- no boss death could end a fight in it
+        /// again. A removal is not a completion, so the objective is
+        /// forgotten rather than marked done; the gate lifts because the
+        /// current objective is unknown again.
+        #[test]
+        fn an_objective_removed_without_completing_stops_gating_the_fight_end() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&objective(100, Some(0), Some(false)));
+            m.apply(&objective_removed(100));
+
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp(BOSS_UID, BOSS, 1_000));
+            m.apply(&boss_hit(BOSS_UID, 2_000, true));
+
+            assert_eq!(m.fight_state(2_100), FightState::Ended);
+        }
+
+        /// The removal's other half: an id the meter is not tracking is
+        /// simply nothing to do, and must not disturb the objective that
+        /// *is* current (200 here still gates §8).
+        #[test]
+        fn removing_an_untracked_objective_leaves_the_current_one_alone() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&objective(200, Some(0), Some(false)));
+            m.apply(&objective_removed(999));
+
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp(BOSS_UID, BOSS, 1_000));
+            m.apply(&boss_hit(BOSS_UID, 2_000, true));
+
+            assert_eq!(m.fight_state(2_100), FightState::Active);
         }
 
         /// §8 does not gate at all when the current objective is unknown

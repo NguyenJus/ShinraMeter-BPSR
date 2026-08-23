@@ -239,6 +239,11 @@ pub enum ProtocolEvent {
         nums: Option<i32>,
         complete: Option<bool>,
     },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::DungeonObjectiveRemoved`
+    /// (issue #139). See `Meter::apply_dungeon_objective_removed`.
+    DungeonObjectiveRemoved {
+        target_id: i32,
+    },
     /// Mirrors `bpsr_protocol::ProtocolEvent::DungeonVar` (issue #139).
     /// `Meter::apply` acts only on `name == "IsFinishTarget"`; every other
     /// var is decoded and ignored.
