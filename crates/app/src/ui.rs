@@ -3995,18 +3995,30 @@ fn gesture_pointer(
     os_cursor.unwrap_or_else(|| window.min + local.to_vec2())
 }
 
-/// Issue #74: whether a gesture of `kind` ending should force a DWM frame
-/// recompute (`platform::force_frame_recompute`). Only resizes actually
-/// change the window's size, and the opaque-gray symptom this works around
-/// is a DWM composition artifact left behind by a resize — a pure `Move`
-/// gesture ending has nothing to recompute a frame for.
+/// Issue #74: whether a gesture of `kind` ending in `viewport` should force
+/// a DWM frame recompute (`platform::force_frame_recompute`). Only a resize
+/// changes the window's size, and the frame that goes stale is the one
+/// Win32 was never told about — a pure `Move` gesture ending has nothing to
+/// recompute a frame for.
+///
+/// The `viewport` half is issue #218: `draw_skill_window` now drives this
+/// same gesture code for every open breakdown child viewport, but
+/// `force_frame_recompute` has exactly one window to aim at — the root
+/// `HWND` cached at startup, because the `ui.rs` call sites only ever hold
+/// an `egui::Context` and no per-viewport handle exists (see its doc
+/// comment in `platform`). Firing it from a child would `SetWindowPos` the
+/// *root* window over a resize the root never underwent: nothing for the
+/// window that actually resized, and a stray call against the one `HWND`
+/// the Snap blocker watches. So child viewports are left out — the same
+/// shape of gap as the reposition exemption `draw_skill_window` documents
+/// as root-HWND-only and inert there.
 ///
 /// Pulled out of `drive_window_gesture` as a pure function, the same way
 /// `row_bar_frac`/`share_bar_paints`/`column_anchors` extract pure decisions
 /// out of `Ui`-dependent code elsewhere in this file, so this call-site
 /// choice is unit-testable without a window.
-fn gesture_end_needs_frame_recompute(kind: GestureKind) -> bool {
-    matches!(kind, GestureKind::Resize(_))
+fn gesture_end_needs_frame_recompute(kind: GestureKind, viewport: egui::ViewportId) -> bool {
+    viewport == egui::ViewportId::ROOT && matches!(kind, GestureKind::Resize(_))
 }
 
 /// Issue #183: whether the header's drag band must refuse to start a window
@@ -4097,7 +4109,7 @@ fn drive_window_gesture(ctx: &egui::Context, gesture: &mut WindowGesture, min_si
         // point again, so this can never fire on every frame of an
         // in-progress drag (which would risk reproducing issue #68's resize
         // runaway; see `platform::force_frame_recompute`'s doc comment).
-        if gesture_end_needs_frame_recompute(kind) {
+        if gesture_end_needs_frame_recompute(kind, ctx.viewport_id()) {
             crate::platform::force_frame_recompute();
         }
         return;
@@ -4261,6 +4273,10 @@ fn draw_resize_handles(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     gesture: &mut WindowGesture,
+    // `Debug` alongside `Hash` because egui's `Id::with` takes an
+    // `AsIdSalt`, and that is `Hash + Debug` — a debug build records the
+    // salt's `Debug` rendering in `id_source` so an id clash names the
+    // widgets that collided. Not ours to drop.
     id_salt: impl std::hash::Hash + std::fmt::Debug,
 ) {
     // The viewport this `Ui` belongs to — the root window, or, inside
@@ -11698,6 +11714,74 @@ mod tests {
         }
     }
 
+    /// Issue #218: the close button had no hover feedback at all, so
+    /// nothing about it read as clickable. The wash is a circle of
+    /// `SKILL_CLOSE_HOVER_FILL` filling the 32pt target, painted only while
+    /// the pointer is over it — the same shape of check
+    /// `toggle_button_suppresses_its_hover_fill_while_a_screenshot_capture_
+    /// is_in_flight` makes for the toolbar's buttons, and the unhovered
+    /// half is the sanity check that the wash is genuinely conditional
+    /// rather than always painted.
+    #[test]
+    fn the_close_button_paints_its_hover_wash_only_while_hovered() {
+        let row = PlayerRow {
+            skills: vec![sample_skill_row(1550)],
+            ..sample_row(None)
+        };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_MIN_SIZE);
+        let mut sort = skills::SkillSort::default();
+
+        // Two frames per probe: egui resolves hover against the widgets the
+        // *previous* frame registered, so a single frame would report the
+        // close button unhovered however the pointer is placed.
+        let mut fills_with_pointer_at = |pointer: egui::Pos2| -> Vec<egui::Color32> {
+            let mut fills = Vec::new();
+            for frame in 0..2 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen_rect),
+                        events: vec![egui::Event::PointerMoved(pointer)],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        draw_skill_window(
+                            ui,
+                            &row,
+                            &mut sort,
+                            &icons,
+                            1.0,
+                            &mut WindowGesture::default(),
+                        );
+                    },
+                );
+                if frame == 1 {
+                    for clipped in &output.shapes {
+                        collect_circle_fills(&clipped.shape, &mut fills);
+                    }
+                }
+                output.drop_without_applying_deltas();
+            }
+            fills
+        };
+
+        let hovered = fills_with_pointer_at(skill_close_rect(screen_rect).center());
+        assert!(
+            hovered.contains(&SKILL_CLOSE_HOVER_FILL),
+            "hovering the close button must paint its wash: {hovered:?}"
+        );
+
+        // The player-name end of the header: inside the window, nowhere
+        // near the close button.
+        let elsewhere = fills_with_pointer_at(skill_header_rect(screen_rect).left_center());
+        assert!(
+            !elsewhere.contains(&SKILL_CLOSE_HOVER_FILL),
+            "the wash must not paint with the pointer elsewhere: {elsewhere:?}"
+        );
+    }
+
     /// Every `Shape::Rect` a frame painted, flattened out of the `Vec`
     /// nesting -- `collect_row_boxes` deliberately keeps only text and
     /// meshes, and a scrollbar is neither.
@@ -13856,14 +13940,31 @@ mod tests {
         // Issue #74: a resize is the gesture kind that can leave DWM's frame
         // stale, so its end must trigger `platform::force_frame_recompute`.
         let resize = GestureKind::Resize(egui::ResizeDirection::West);
-        assert!(gesture_end_needs_frame_recompute(resize));
+        assert!(gesture_end_needs_frame_recompute(
+            resize,
+            egui::ViewportId::ROOT
+        ));
     }
 
     #[test]
     fn a_finished_move_does_not_need_a_frame_recompute() {
         // A pure move never changes the window's size, so there is nothing
         // for a DWM frame recompute to fix.
-        assert!(!gesture_end_needs_frame_recompute(GestureKind::Move));
+        assert!(!gesture_end_needs_frame_recompute(
+            GestureKind::Move,
+            egui::ViewportId::ROOT
+        ));
+    }
+
+    #[test]
+    fn a_resize_finished_in_a_child_viewport_needs_no_frame_recompute() {
+        // Issue #218: the breakdown windows share this driver, but
+        // `platform::force_frame_recompute` can only reach the root `HWND`
+        // it cached at startup. A child's resize must not fire a
+        // `SetWindowPos` at the root window, which did not resize.
+        let resize = GestureKind::Resize(egui::ResizeDirection::West);
+        let child = egui::ViewportId::from_hash_of("skill-1550");
+        assert!(!gesture_end_needs_frame_recompute(resize, child));
     }
 
     // --- death-count column (issue #49) ---------------------------------
