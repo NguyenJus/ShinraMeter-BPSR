@@ -1128,6 +1128,7 @@ impl eframe::App for OverlayApp {
                             self.history.as_ref(),
                             &self.tx_history,
                             &mut back_to_live,
+                            &mut opened_skill_uid,
                         );
                     }
                 }
@@ -1207,7 +1208,16 @@ impl eframe::App for OverlayApp {
         let icons = self.icons.as_ref().expect("loaded on the first frame");
         let opacity = self.settings.opacity;
         let mut closed_skill_windows: Vec<i64> = Vec::new();
-        for (row, uid) in skill_windows_to_draw(&self.skill_windows, &self.snapshot.rows) {
+        // Issue #216: a window opened from a historical fight must keep
+        // rendering *that* fight's rows, not whoever the live encounter
+        // currently has under the same uid — `history_open` (built above,
+        // before the panel closure) is still this frame's source of truth
+        // for which snapshot is on screen.
+        let rows_for_skill_windows = skill_window_rows(
+            &self.snapshot,
+            history_open.as_ref().map(|(_, _, snapshot)| snapshot),
+        );
+        for (row, uid) in skill_windows_to_draw(&self.skill_windows, rows_for_skill_windows) {
             let state = self
                 .skill_windows
                 .get_mut(&uid)
@@ -5924,6 +5934,22 @@ fn track_skill_window_size(size: &mut egui::Vec2, inner_rect: Option<egui::Rect>
 /// one gates a viewport command.
 const SKILL_WINDOW_SIZE_EPSILON: f32 = 1.0;
 
+/// Which snapshot's rows `skill_windows_to_draw` should search this frame
+/// (issue #216): the open historical fight's, when one is open, so a
+/// breakdown window opened from history renders that fight's player list —
+/// not, by uid coincidence, whoever the live encounter currently has under
+/// the same uid. A window whose uid isn't present in the chosen source this
+/// frame is simply skipped for the frame (`skill_windows_to_draw`'s existing
+/// tolerance for a uid missing from `rows`), so a live-opened window quietly
+/// stops drawing for as long as History is open and resumes the moment the
+/// user switches back — no extra bookkeeping needed here.
+fn skill_window_rows<'a>(
+    live: &'a Snapshot,
+    history_open: Option<&'a Snapshot>,
+) -> &'a [PlayerRow] {
+    history_open.map_or(&live.rows, |snapshot| &snapshot.rows)
+}
+
 /// The `(row, uid)` pairs this frame's viewport-draw loop should actually
 /// paint: every open uid that still has a row in the current snapshot. A
 /// uid with no matching row (a player who dropped off the live encounter,
@@ -5984,6 +6010,16 @@ fn skill_column_header_rect(rect: egui::Rect, tabs_rect: egui::Rect) -> egui::Re
 /// `SKILL_PANEL_FILL`, not the window's `SKILL_CHROME_FILL`.
 fn skill_rows_rect(rect: egui::Rect, col_header_rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_max(egui::pos2(rect.left(), col_header_rect.bottom()), rect.max)
+}
+
+/// The message painted where the row list would go when a breakdown window
+/// has nothing to show (issue #216). A live row always carries at least one
+/// `SkillRow` while it has any damage at all, so this only fires for a
+/// window opened from a historical fight, whose `PlayerRow::skills` is
+/// always empty (the history schema doesn't persist per-skill totals — see
+/// `history::PlayerRecord::to_row`).
+fn skill_window_empty_message(skill_row_count: usize) -> Option<&'static str> {
+    (skill_row_count == 0).then_some("No per-skill data recorded for this fight")
 }
 
 fn draw_skill_window(
@@ -6191,6 +6227,25 @@ fn draw_skill_window(
     painter.rect_filled(rows_rect, 0.0, SKILL_PANEL_FILL.gamma_multiply(opacity));
     let mut skill_rows = row.skills.clone();
     skills::sort_rows(&mut skill_rows, *sort);
+
+    // Issue #216: a window opened from a historical fight has an empty
+    // `skill_rows` every time today — the history schema persists only
+    // per-player totals (`PlayerRecord::to_row` always rebuilds `skills` as
+    // `Vec::new()`), never the per-skill breakdown. Naming that here, in
+    // place of the row list, is what keeps a historical right-click from
+    // reading as silent breakage rather than a known limitation.
+    if let Some(message) = skill_window_empty_message(skill_rows.len()) {
+        paint_text(
+            &painter,
+            rows_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            message,
+            regular(FONT_SIZE_ROW),
+            egui::Color32::GRAY,
+            false,
+        );
+        return close_clicked;
+    }
 
     let mut rows_ui = ui.new_child(egui::UiBuilder::new().max_rect(rows_rect));
     egui::ScrollArea::vertical()
@@ -6469,6 +6524,7 @@ impl OverlayApp {
 /// The whole history surface: the bar, then either the list or the open
 /// encounter's rows (rendered through the same `draw_rows` a live fight
 /// uses, per the spec's reference-fidelity requirement).
+#[allow(clippy::too_many_arguments)]
 fn draw_history(
     ui: &mut egui::Ui,
     state: &mut HistoryUi,
@@ -6477,6 +6533,13 @@ fn draw_history(
     handle: Option<&history::writer::HistoryHandle>,
     tx: &Sender<history::writer::HistoryEvent>,
     back_to_live: &mut bool,
+    // Issue #216: set to `Some(uid)` when a right-click on an open
+    // historical fight's row is sensed this frame — the same out-parameter
+    // `draw_rows` already threads for the live view (see its own doc
+    // comment), plumbed one level further in so a historical row can open
+    // its player's breakdown window too, instead of the click being
+    // swallowed silently.
+    opened: &mut Option<i64>,
 ) {
     match draw_history_bar(ui, state) {
         HistoryBarAction::None => {}
@@ -6501,7 +6564,7 @@ fn draw_history(
     ui.separator();
 
     if let Some(open) = &state.open {
-        draw_rows(ui, &open.snapshot, settings, icons, &mut None);
+        draw_rows(ui, &open.snapshot, settings, icons, opened);
         return;
     }
 
@@ -13914,6 +13977,111 @@ mod tests {
         assert_eq!(opened, None);
     }
 
+    /// Same two-frame click harness as `opened_uid_after_click`, but through
+    /// `draw_history`'s open-encounter branch (issue #216) — the seam that
+    /// used to swallow every right-click behind a hardcoded `&mut None`.
+    fn opened_uid_after_history_click(
+        open: OpenEncounter,
+        button: egui::PointerButton,
+    ) -> Option<i64> {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let settings = Settings::default();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        let name = open.snapshot.rows[0].name.clone();
+
+        let mut state = HistoryUi {
+            open: Some(open),
+            ..HistoryUi::default()
+        };
+        let mut back_to_live = false;
+        let mut discarded = None;
+        let layout = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_history(
+                    ui,
+                    &mut state,
+                    &settings,
+                    &icons,
+                    None,
+                    &tx,
+                    &mut back_to_live,
+                    &mut discarded,
+                );
+            },
+        );
+        let mut frame = RowFrame {
+            texts: Vec::new(),
+            meshes: Vec::new(),
+        };
+        for clipped in &layout.shapes {
+            collect_row_boxes(&clipped.shape, clipped.clip_rect, &mut frame);
+        }
+        let pos = frame.text_box(&name).center();
+        layout.drop_without_applying_deltas();
+
+        let mut opened: Option<i64> = None;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..click_at_with_button(pos, button)
+            },
+            |ui| {
+                draw_history(
+                    ui,
+                    &mut state,
+                    &settings,
+                    &icons,
+                    None,
+                    &tx,
+                    &mut back_to_live,
+                    &mut opened,
+                );
+            },
+        );
+        output.drop_without_applying_deltas();
+        opened
+    }
+
+    #[test]
+    fn a_right_click_on_a_historical_row_opens_that_players_breakdown() {
+        let snapshot = rows_test_snapshot(1);
+        let uid = snapshot.rows[0].uid;
+        let open = OpenEncounter {
+            id: 1,
+            title: "Historical Fight".to_string(),
+            subtitle: None,
+            ended_at_ms: 0,
+            snapshot,
+        };
+
+        let opened = opened_uid_after_history_click(open, egui::PointerButton::Secondary);
+
+        assert_eq!(opened, Some(uid));
+    }
+
+    #[test]
+    fn a_left_click_on_a_historical_row_opens_nothing() {
+        let snapshot = rows_test_snapshot(1);
+        let open = OpenEncounter {
+            id: 1,
+            title: "Historical Fight".to_string(),
+            subtitle: None,
+            ended_at_ms: 0,
+            snapshot,
+        };
+
+        let opened = opened_uid_after_history_click(open, egui::PointerButton::Primary);
+
+        assert_eq!(opened, None);
+    }
+
     fn skill_window_state(pos: egui::Pos2) -> SkillWindowState {
         SkillWindowState {
             sort: skills::SkillSort::default(),
@@ -14028,6 +14196,39 @@ mod tests {
             windows.contains_key(&2),
             "a uid missing from the snapshot must stay open, not be closed"
         );
+    }
+
+    #[test]
+    fn skill_window_rows_prefers_the_open_historical_snapshot() {
+        let live = rows_test_snapshot(1);
+        let historical = rows_test_snapshot(2);
+
+        let rows = skill_window_rows(&live, Some(&historical));
+
+        assert_eq!(
+            rows.len(),
+            historical.rows.len(),
+            "a breakdown window's rows must come from the open historical \
+             fight, not whoever the live encounter has under the same uid"
+        );
+    }
+
+    #[test]
+    fn skill_window_rows_falls_back_to_live_when_no_history_is_open() {
+        let live = rows_test_snapshot(1);
+
+        let rows = skill_window_rows(&live, None);
+
+        assert_eq!(rows.len(), live.rows.len());
+    }
+
+    #[test]
+    fn skill_window_empty_message_fires_only_when_there_are_no_skill_rows() {
+        assert_eq!(
+            skill_window_empty_message(0),
+            Some("No per-skill data recorded for this fight")
+        );
+        assert_eq!(skill_window_empty_message(3), None);
     }
 
     fn sample_skill_row(skill_id: i32) -> SkillRow {
@@ -14433,6 +14634,7 @@ mod tests {
                 None,
                 &tx,
                 &mut back_to_live,
+                &mut None,
             );
         });
         let update = layout
@@ -14452,6 +14654,7 @@ mod tests {
                 None,
                 &tx,
                 &mut back_to_live,
+                &mut None,
             );
         })
         .drop_without_applying_deltas();
@@ -14469,6 +14672,7 @@ mod tests {
                 None,
                 &tx,
                 &mut back_to_live,
+                &mut None,
             );
         });
         let update = layout
@@ -14488,6 +14692,7 @@ mod tests {
                 None,
                 &tx,
                 &mut back_to_live,
+                &mut None,
             );
         })
         .drop_without_applying_deltas();
