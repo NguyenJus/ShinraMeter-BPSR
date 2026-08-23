@@ -2584,6 +2584,18 @@ pub fn write_clipboard_image(_image: &egui::ColorImage) -> Result<(), String> {
     Err("clipboard image writes are only implemented on Windows".to_string())
 }
 
+/// UTF-16, NUL-terminated — the shape every Win32 string parameter in this
+/// module wants (`WinHTTP`'s `PCWSTR`s in `http_get`, the `OPENFILENAMEW`
+/// fields in `choose_log_export_path`). One helper rather than one per
+/// caller: the two used to carry byte-identical private copies.
+///
+/// The returned buffer owns the bytes a `PCWSTR`/`PWSTR` built from it
+/// points at, so it must stay alive for as long as the call using it.
+#[cfg(windows)]
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 /// Opens the native "Save As" common dialog so the user picks where the
 /// header dropdown's "Export logs" item (`ui::draw_header_menu`, issue
 /// #220) writes the bundled log file — issue #220 is explicit that this
@@ -2605,9 +2617,13 @@ pub fn write_clipboard_image(_image: &egui::ColorImage) -> Result<(), String> {
 /// from a spawned thread" rule: `GetSaveFileNameW` is itself a modal
 /// dialog — the OS already blocks input to its owner window for as long as
 /// it's up — so calling it straight from `ui.rs`'s click handler adds no
-/// blocking that wasn't already going to happen, the same reasoning
-/// "Reset to defaults" inline-mutates on its own click rather than
-/// spawning anything.
+/// blocking that wasn't already going to happen.
+///
+/// That reasoning covers this dialog and nothing after it (PR #227
+/// review): the export's own copy can move up to two files of
+/// `logging::MAX_LOG_BYTES` each, which the OS is *not* already blocking
+/// the frame thread on, so `ui::start_log_export` runs it on a spawned
+/// thread once this function has returned a destination.
 ///
 /// Owned by the cached `OVERLAY_HWND` when it's available (same
 /// load-and-guard shape as `force_frame_recompute`) so the dialog is modal
@@ -2624,12 +2640,6 @@ pub fn choose_log_export_path(default_filename: &str) -> Option<std::path::PathB
         GetSaveFileNameW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
     };
     use windows::core::{PCWSTR, PWSTR};
-
-    /// UTF-16, NUL-terminated — same shape `http_get`'s own `wide` helper
-    /// uses for every Win32 string parameter.
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
 
     let raw = OVERLAY_HWND.load(std::sync::atomic::Ordering::SeqCst);
     // Inverse of the store in `disable_aero_snap` — see
@@ -2743,12 +2753,6 @@ pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, Stri
                 let _ = unsafe { WinHttpCloseHandle(self.0) };
             }
         }
-    }
-
-    /// UTF-16, NUL-terminated — every WinHTTP string parameter below wants
-    /// exactly this shape.
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
     // SAFETY (this whole function): every WinHTTP call below is handed

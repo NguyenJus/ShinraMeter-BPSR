@@ -23,6 +23,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 /// A log file at or above this size gets rotated to `<path>.1`.
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
@@ -142,6 +143,31 @@ fn rotate_if_needed(path: &Path, len: u64, warnings: &mut Vec<String>) {
     }
 }
 
+/// Serializes [`Tee::rotate`]'s rename against [`export_logs_to`]'s read of
+/// the parts it snapshotted (PR #227 review). Without it the logging thread
+/// could rename `<path>` onto `<path>.1` in between — replacing the very
+/// `.1` the export had already decided to bundle, and leaving a fresh empty
+/// primary behind — so a whole rotation's worth of records would vanish
+/// from the bundle with nothing reporting it.
+///
+/// Only the rename is guarded, not every record: an append racing an export
+/// just adds lines to the tail of the part being copied, which is harmless.
+///
+/// [`Tee::rotate`] runs *inside* `env_logger`'s own writer lock, so whoever
+/// holds this must never log while holding it — that would take the two
+/// locks in the opposite order and deadlock. [`export_logs_to`] accordingly
+/// logs nothing and only returns its errors, for the caller to report once
+/// the guard is gone.
+static ROTATION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Takes [`ROTATION_LOCK`], ignoring poisoning: the guarded sections are a
+/// rename and a file copy, neither of which leaves shared state a panic
+/// could have made inconsistent, and a poisoned lock must not be allowed to
+/// wedge logging or exporting for the rest of the session.
+fn lock_rotation() -> MutexGuard<'static, ()> {
+    ROTATION_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+}
+
 /// Opens `path` for appending, creating its parent directories as needed.
 fn open_log_file(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent()
@@ -203,6 +229,10 @@ impl Tee {
     /// than on every subsequent record.
     fn rotate(&mut self) {
         let rotated = rotated_path(&self.path);
+        // Held across the rename (and the reopen that follows it) so an
+        // "Export logs" bundle can't have snapshotted its parts before it
+        // and read them back after it — see `ROTATION_LOCK`.
+        let _guard = lock_rotation();
         // The handle stays open across the rename (Rust opens files with
         // `FILE_SHARE_DELETE` on Windows, so this is legal there too); it is
         // dropped by the reopen below, which is the last write it could have
@@ -276,7 +306,8 @@ pub(crate) fn files_to_export(primary: &Path) -> Vec<PathBuf> {
 /// rotated `.1`) still reads unambiguously once concatenated.
 ///
 /// Errors if there is nothing to export ([`files_to_export`] came back
-/// empty) or if any part can't be read, or `dest` can't be written — a
+/// empty), if `dest` is itself one of those parts (see below), or if any
+/// part can't be read, or `dest` can't be written — a
 /// half-written export file is still useful information (see below), so a
 /// failure partway through is reported rather than cleaned up: the caller
 /// only logs a warning on `Err` (issue #220 is a best-effort debugging aid,
@@ -284,11 +315,37 @@ pub(crate) fn files_to_export(primary: &Path) -> Vec<PathBuf> {
 /// the read/write failed is more useful to whoever's debugging the bug
 /// report than silently deleting it.
 pub(crate) fn export_logs_to(primary: &Path, dest: &Path) -> io::Result<()> {
+    // Held for the whole export, the snapshot below included, so a
+    // concurrent `Tee::rotate` can't rename a part out from under the copy.
+    // Nothing in here may log while it is held — see `ROTATION_LOCK`.
+    let _guard = lock_rotation();
+
     let parts = files_to_export(primary);
     if parts.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("no log file found at {} to export", primary.display()),
+        ));
+    }
+
+    // Exporting *onto* one of the sources would gut the log being exported:
+    // the `File::create` below truncates `dest` before any part is opened,
+    // so the "export" would read back empty (and the live log with it). The
+    // save dialog can't catch this — `OFN_OVERWRITEPROMPT` happily accepts
+    // the app's own log file, and asking the user to confirm an overwrite
+    // is not the same as telling them it destroys the thing they're trying
+    // to hand over — so the destination is checked here instead.
+    let dest_key = comparable_path(dest)?;
+    if let Some(part) = parts
+        .iter()
+        .find(|part| comparable_path(part).is_ok_and(|key| key == dest_key))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is one of the log files being exported; pick a different destination",
+                part.display()
+            ),
         ));
     }
 
@@ -300,6 +357,37 @@ pub(crate) fn export_logs_to(primary: &Path, dest: &Path) -> io::Result<()> {
         writeln!(out)?;
     }
     Ok(())
+}
+
+/// The form of `path` that any two paths naming the same file share —
+/// symlinks, `.` and `..` resolved — so a destination spelled
+/// `logs\..\logs\ShinraMeter-BPSR.log` is still recognized as the live log
+/// (PR #227 review).
+///
+/// `canonicalize` only works on a file that exists, and an export
+/// destination usually doesn't yet — naming a new file is the save
+/// dialog's whole job — so a missing path falls back to canonicalizing its
+/// parent directory (which the dialog's `OFN_PATHMUSTEXIST` guarantees does
+/// exist) and re-joining the file name. That is enough for the comparison
+/// it feeds: a destination that doesn't exist can't be a source part, which
+/// by definition does.
+fn comparable_path(path: &Path) -> io::Result<PathBuf> {
+    if let Ok(canonical) = path.canonicalize() {
+        return Ok(canonical);
+    }
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} names no file to export to", path.display()),
+        )
+    })?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        // A bare file name is relative to the working directory — the same
+        // place `log_file_path_from`'s own fallback puts the log file.
+        _ => Path::new("."),
+    };
+    Ok(parent.canonicalize()?.join(name))
 }
 
 /// Chains onto whatever panic hook was previously installed (never replaces
@@ -510,6 +598,40 @@ mod tests {
         // Neither `path` nor its rotated sibling exists.
 
         assert!(export_logs_to(&path, &dest).is_err());
+    }
+
+    /// The destination is truncated before any source is opened, so an
+    /// export onto the live log (or its rotated sibling) would destroy the
+    /// very records it was meant to hand over. Both parts must be rejected
+    /// *and* left untouched.
+    #[test]
+    fn export_logs_to_refuses_a_destination_that_is_one_of_its_sources() {
+        let path = scratch_path("export-dest-is-a-source");
+        let rotated = rotated_path(&path);
+        fs::write(&rotated, b"OLDER-PART").unwrap();
+        fs::write(&path, b"NEWER-PART").unwrap();
+
+        let err = export_logs_to(&path, &path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = export_logs_to(&path, &rotated).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Spelled differently, same file — the comparison canonicalizes, so
+        // a detour through the parent directory doesn't slip past it.
+        let indirect = path
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(path.file_name().unwrap());
+        let err = export_logs_to(&path, &indirect).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        assert_eq!(fs::read(&path).unwrap(), b"NEWER-PART");
+        assert_eq!(fs::read(&rotated).unwrap(), b"OLDER-PART");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&rotated);
     }
 
     #[test]
