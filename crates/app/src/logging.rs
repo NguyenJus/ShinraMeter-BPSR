@@ -85,8 +85,10 @@ pub fn init() {
 }
 
 /// Where the log file lives. See the module doc comment for the default and
-/// the `SHINRA_LOG_FILE` override.
-fn log_file_path() -> (PathBuf, Option<String>) {
+/// the `SHINRA_LOG_FILE` override. `pub(crate)` (rather than private) since
+/// `ui`'s "Export logs" header-menu item (issue #220) needs the resolved
+/// path to know what to bundle up.
+pub(crate) fn log_file_path() -> (PathBuf, Option<String>) {
     log_file_path_from(
         std::env::var("SHINRA_LOG_FILE").ok().as_deref(),
         std::env::var("APPDATA").ok().as_deref(),
@@ -244,6 +246,62 @@ impl Write for Tee {
     }
 }
 
+/// Suggested file name the "Export logs" header-menu item (issue #220)
+/// hands the native save dialog as a starting point — the user can still
+/// rename it before saving, since the dialog is what lets them pick the
+/// destination in the first place.
+pub(crate) const EXPORT_DEFAULT_FILENAME: &str = "ShinraMeter-BPSR-logs.log";
+
+/// Which on-disk log files a "Export logs" export (issue #220) should
+/// bundle, oldest first: the rotated `<path>.1` (if [`Tee::rotate`] ever
+/// ran this session or a previous one) followed by the live file at `path`.
+/// Oldest-first so a plain concatenation reads chronologically, same
+/// direction a user scrolling a single combined file would expect.
+///
+/// A part that doesn't exist on disk is simply left out rather than erroring
+/// — there's nothing unusual about a fresh install with no rotation yet, or
+/// (defensively, in tests) a primary file that hasn't been written to yet.
+pub(crate) fn files_to_export(primary: &Path) -> Vec<PathBuf> {
+    [rotated_path(primary), primary.to_path_buf()]
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
+}
+
+/// Bundles every file [`files_to_export`] finds for `primary` into a single
+/// file at `dest` — the destination the user picked via the native save
+/// dialog (`platform::choose_log_export_path`), since that dialog can only
+/// ever choose one file, not a folder. Each part is preceded by a header
+/// line naming its source path, so a multi-part export (current file plus a
+/// rotated `.1`) still reads unambiguously once concatenated.
+///
+/// Errors if there is nothing to export ([`files_to_export`] came back
+/// empty) or if any part can't be read, or `dest` can't be written — a
+/// half-written export file is still useful information (see below), so a
+/// failure partway through is reported rather than cleaned up: the caller
+/// only logs a warning on `Err` (issue #220 is a best-effort debugging aid,
+/// not a critical path), and a partial file on disk showing exactly where
+/// the read/write failed is more useful to whoever's debugging the bug
+/// report than silently deleting it.
+pub(crate) fn export_logs_to(primary: &Path, dest: &Path) -> io::Result<()> {
+    let parts = files_to_export(primary);
+    if parts.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no log file found at {} to export", primary.display()),
+        ));
+    }
+
+    let mut out = File::create(dest)?;
+    for part in parts {
+        writeln!(out, "----- {} -----", part.display())?;
+        let mut source = File::open(&part)?;
+        io::copy(&mut source, &mut out)?;
+        writeln!(out)?;
+    }
+    Ok(())
+}
+
 /// Chains onto whatever panic hook was previously installed (never replaces
 /// it silently) and additionally logs the panic's payload and location at
 /// `error` — with no console under `windows_subsystem = "windows"`, an
@@ -373,5 +431,89 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&rotated);
+    }
+
+    // -- files_to_export / export_logs_to (issue #220) ----------------------
+
+    #[test]
+    fn files_to_export_returns_only_the_primary_when_nothing_rotated() {
+        let path = scratch_path("export-primary-only");
+        fs::write(&path, b"session log").unwrap();
+
+        assert_eq!(files_to_export(&path), vec![path.clone()]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn files_to_export_puts_the_rotated_file_before_the_primary() {
+        let path = scratch_path("export-with-rotation");
+        let rotated = rotated_path(&path);
+        fs::write(&rotated, b"older session").unwrap();
+        fs::write(&path, b"current session").unwrap();
+
+        assert_eq!(files_to_export(&path), vec![rotated.clone(), path.clone()]);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&rotated);
+    }
+
+    #[test]
+    fn files_to_export_is_empty_when_neither_file_exists_yet() {
+        let path = scratch_path("export-neither-exists");
+        // Deliberately not created — e.g. exported before the app has
+        // logged anything this session.
+        assert!(files_to_export(&path).is_empty());
+    }
+
+    #[test]
+    fn export_logs_to_copies_a_single_file_verbatim_under_a_header() {
+        let path = scratch_path("export-dest-single-source");
+        let dest = scratch_path("export-dest-single-dest");
+        fs::write(&path, b"line one\nline two\n").unwrap();
+
+        export_logs_to(&path, &dest).unwrap();
+
+        let exported = fs::read_to_string(&dest).unwrap();
+        assert!(exported.contains(&path.display().to_string()));
+        assert!(exported.contains("line one\nline two\n"));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn export_logs_to_orders_the_rotated_part_before_the_current_one() {
+        let path = scratch_path("export-dest-multi-source");
+        let rotated = rotated_path(&path);
+        let dest = scratch_path("export-dest-multi-dest");
+        fs::write(&rotated, b"OLDER-PART").unwrap();
+        fs::write(&path, b"NEWER-PART").unwrap();
+
+        export_logs_to(&path, &dest).unwrap();
+
+        let exported = fs::read_to_string(&dest).unwrap();
+        assert!(
+            exported.find("OLDER-PART").unwrap() < exported.find("NEWER-PART").unwrap(),
+            "rotated (older) content must come before the current file's content: {exported:?}"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&rotated);
+        let _ = fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn export_logs_to_errors_when_there_is_nothing_to_export() {
+        let path = scratch_path("export-dest-nothing-source");
+        let dest = scratch_path("export-dest-nothing-dest");
+        // Neither `path` nor its rotated sibling exists.
+
+        assert!(export_logs_to(&path, &dest).is_err());
+    }
+
+    #[test]
+    fn default_export_filename_is_a_stable_shinra_named_log_file() {
+        assert_eq!(EXPORT_DEFAULT_FILENAME, "ShinraMeter-BPSR-logs.log");
     }
 }

@@ -3541,7 +3541,8 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
 /// Order matches the spec: a Columns disclosure section (issue #13's stat
 /// column toggles, unchanged in behavior — just relocated), a separator,
 /// the Opacity slider (issue #166), a separator, Minimize to tray, a
-/// separator, Check for updates and its result line (issue #171), a
+/// separator, Reset to defaults (issue #203) and Export logs (issue #220),
+/// a separator, Check for updates and its result line (issue #171), a
 /// separator, then Close. "Forget learned bosses" (issue #131) sat between
 /// the Opacity slider and Minimize until issue #201 replaced the runtime
 /// scene -> boss learning it reset with a curated static table
@@ -3721,6 +3722,31 @@ fn draw_header_menu(
         )));
         settings.set_opacity(Settings::default_opacity());
         let _ = tx_settings.send(settings.clone());
+        ui.close();
+    }
+
+    // Issue #220: a user hitting a bug has no in-app way to hand over the
+    // logs `logging::init` already writes for exactly this purpose. Wired
+    // the same synchronous, inline way as "Reset to defaults" just above
+    // rather than through `tx_command`/a spawned-thread state machine (the
+    // "Check for updates" shape): `platform::choose_log_export_path`'s own
+    // doc comment explains why its blocking native dialog call needs no
+    // thread of its own. Never a fixed or hidden path — the save dialog is
+    // what lets the user pick the destination themselves, per the issue.
+    if ui.button("Export logs").clicked() {
+        if let Some(dest) =
+            crate::platform::choose_log_export_path(crate::logging::EXPORT_DEFAULT_FILENAME)
+        {
+            let (log_path, _warning) = crate::logging::log_file_path();
+            // Best-effort, same as this module's other file-IO failures
+            // (e.g. `settings::spawn_writer`'s dropped-receiver case): a
+            // failed export isn't worth a blocking error dialog over, so
+            // it's only logged — which, notably, still lands in the very
+            // log file the next export attempt would try to bundle.
+            if let Err(err) = crate::logging::export_logs_to(&log_path, &dest) {
+                log::warn!("failed to export logs to {}: {err}", dest.display());
+            }
+        }
         ui.close();
     }
 
