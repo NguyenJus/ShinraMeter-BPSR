@@ -156,8 +156,10 @@ impl TcpReassembler {
             if self.stall_pushes >= Self::MAX_STALL_PUSHES {
                 match self.nearest_cached_seq() {
                     // Give up on the gap and restart from the cached segment
-                    // nearest ahead of it, in modular order.
-                    Some(nearest) => self.resync(nearest),
+                    // nearest ahead of it, in modular order — keeping (not
+                    // discarding) its data and whatever is contiguous with
+                    // it (#211).
+                    Some(nearest) => self.resync_to_cached(nearest),
                     // Nothing cached: the live stream is behind `next_seq`,
                     // so re-anchor on this segment and deliver it.
                     None => {
@@ -260,7 +262,8 @@ impl TcpReassembler {
     }
 
     /// Clears cached and buffered state and re-anchors the stream at `seq`.
-    /// Called on server change / zone change / stall recovery.
+    /// Called on server change / zone change: the cache genuinely belongs to
+    /// a dead flow there, so throwing it away is correct.
     pub fn resync(&mut self, seq: u32) {
         self.cache.clear();
         self.cache_cost = 0;
@@ -268,6 +271,27 @@ impl TcpReassembler {
         self.next_seq = Some(seq);
         self.stall_pushes = 0;
         self.loss = false;
+    }
+
+    /// Re-anchors the stream on `nearest`, a cached segment the stall guard
+    /// (see [`Self::push`]) is giving up the unfillable gap in favor of.
+    ///
+    /// Unlike [`Self::resync`], the cache must survive here: `nearest` came
+    /// from [`Self::nearest_cached_seq`], so it — and anything contiguous
+    /// with it — is payload already in hand, not a dead flow's leftovers.
+    /// Clearing the cache would discard the very segment being re-anchored
+    /// on; since this is a passive one-way sniff, the server never
+    /// retransmits a segment the real client already ACKed, so `next_seq`
+    /// would then point at bytes that never arrive again — a permanent
+    /// stall that re-fires the guard every `MAX_STALL_PUSHES` pushes forever
+    /// (#211). Draining right after re-anchoring flushes `nearest` and every
+    /// segment contiguous with it in one go.
+    fn resync_to_cached(&mut self, nearest: u32) {
+        self.next_seq = Some(nearest);
+        self.loss = true;
+        self.buffer.clear();
+        self.stall_pushes = 0;
+        self.drain_contiguous();
     }
 
     /// Total bytes currently held in out-of-order cache, waiting on a gap.
@@ -392,11 +416,60 @@ mod tests {
         for _ in 0..TcpReassembler::MAX_STALL_PUSHES {
             r.push(5000, b"X");
         }
-        // recovery: after the stall guard resyncs to the stuck seq, a fresh
-        // push at that seq must append immediately instead of being cached
-        // forever.
-        r.push(5000, b"YES");
+        // The guard re-anchors on the cached segment (5000) *and delivers
+        // it* (#211) instead of discarding it, so next_seq lands just past
+        // it at 5001.
+        assert_eq!(r.take_stream(), b"X".to_vec());
+        // recovery: a fresh segment right after it continues to be
+        // delivered immediately instead of being cached forever.
+        r.push(5001, b"YES");
         assert_eq!(r.take_stream(), b"YES".to_vec());
+    }
+
+    #[test]
+    fn stall_guard_resync_delivers_cached_bytes_instead_of_dropping_them() {
+        // Regression test for #211: the two tests above re-push the SAME
+        // seq after the guard fires, a retransmit shape a one-way passive
+        // sniff of a *permanently* lost segment never produces (the real
+        // client already ACKed it; the server never sends it again). This
+        // reproduces the real shape: a permanent gap, then a run of
+        // DISTINCT never-repeated segments past it.
+        let mut r = TcpReassembler::new();
+        r.push(1000, b"AAA"); // next_seq = 1003
+        let _ = r.take_stream();
+
+        // [1003, 2000) is a permanent gap: never pushed, not even once.
+        const SEG_LEN: u32 = 100;
+        const SEGS: u32 = TcpReassembler::MAX_STALL_PUSHES as u32;
+        for i in 0..SEGS {
+            let seq = 2000 + i * SEG_LEN;
+            // Distinct, non-retransmitted payload per segment, and the
+            // segments are laid out contiguously so a correct resync that
+            // keeps the cache drains the whole run in one go.
+            let payload = vec![(i % 256) as u8; SEG_LEN as usize];
+            r.push(seq, &payload);
+        }
+
+        // The guard trips on the 256th push. It must re-anchor on the
+        // cached segment nearest the gap (seq 2000) *without* discarding
+        // it — and its contiguous successors must drain right along with
+        // it.
+        let delivered = r.take_stream();
+        assert_eq!(
+            delivered.len(),
+            (SEGS * SEG_LEN) as usize,
+            "cached segments were dropped instead of delivered"
+        );
+        assert_eq!(delivered[0], 0u8);
+        assert_eq!(delivered[delivered.len() - 1], ((SEGS - 1) % 256) as u8);
+        assert!(r.take_loss());
+
+        // The stream must keep working afterwards: a brand-new segment
+        // right after the drained chain is delivered immediately, not
+        // cached forever.
+        let resumed_seq = 2000 + SEGS * SEG_LEN;
+        r.push(resumed_seq, b"NEW");
+        assert_eq!(r.take_stream(), b"NEW".to_vec());
     }
 
     #[test]
