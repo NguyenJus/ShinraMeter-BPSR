@@ -55,11 +55,15 @@ pub struct PlayerStats {
     /// Whether this player is up *right now*, as opposed to `deaths > 0`
     /// which only ever asks whether they have died at some point this
     /// encounter (issue #212). Cleared by `Meter::record_death`; set again
-    /// by `Meter::apply_damage` on this player's next outgoing damage
-    /// event — the decode layer delivers no player-HP signal, so a swing
-    /// they land is the only revive evidence available. Starts `true`: a
-    /// freshly-seen row (an attacker, or a roster preload) has not been
-    /// observed dead.
+    /// by `Meter::apply_damage` on the next event this player *acts* in,
+    /// heal-typed events included — the decode layer delivers no
+    /// player-HP signal, so acting at all is the only revive evidence
+    /// available, and a support who never deals damage has nothing else
+    /// to offer. Starts `true`: a freshly-seen row (an attacker, or a
+    /// roster preload) has not been observed dead.
+    ///
+    /// Written only through [`Self::set_alive`], which orders the
+    /// transitions by the event clock — see there.
     pub(crate) alive: bool,
     /// Per-skill breakdown (issue #16), keyed by raw skill id. Emitted in
     /// every snapshot rather than behind a subscription: resonance-logs
@@ -74,6 +78,10 @@ pub struct PlayerStats {
     /// from double-counting a single death (issue #49). `pub(crate)`, not
     /// part of the display DTO (`PlayerRow`) — see `DEATH_DEBOUNCE_MS`.
     pub(crate) last_death_ms: Option<u64>,
+    /// Timestamp (event clock) of the transition `alive` currently
+    /// records, i.e. how fresh that evidence is. `pub(crate)`, not part of
+    /// the display DTO (`PlayerRow`) — see [`Self::set_alive`].
+    pub(crate) alive_as_of_ms: Option<u64>,
 }
 
 impl PlayerStats {
@@ -96,7 +104,31 @@ impl PlayerStats {
             alive: true,
             skills: HashMap::new(),
             last_death_ms: None,
+            alive_as_of_ms: None,
         }
+    }
+
+    /// Records that this player is (or is not) up as of `timestamp_ms`
+    /// (issue #212).
+    ///
+    /// Ordered by the event clock, the way `EnemyState::last_damaged_ms`
+    /// is and for the same reason: a packet older than the transition
+    /// already recorded is dropped rather than allowed to flip the bit
+    /// back. Without that a hit retransmitted *behind* the death packet it
+    /// preceded would read as a battle rez and hide a real wipe — a
+    /// failure mode the cumulative `deaths` counter this replaced could
+    /// not have, being monotonic (PR #224 review, finding 3).
+    ///
+    /// Equal timestamps still write, so events sharing one packet's clock
+    /// apply in arrival order — which is what makes a killing blow a
+    /// player deals to themselves land *after* the swing that carried it
+    /// and leave them down.
+    pub(crate) fn set_alive(&mut self, alive: bool, timestamp_ms: u64) {
+        if self.alive_as_of_ms.is_some_and(|last| timestamp_ms < last) {
+            return;
+        }
+        self.alive = alive;
+        self.alive_as_of_ms = Some(timestamp_ms);
     }
 
     pub fn crit_pct(&self) -> f32 {
