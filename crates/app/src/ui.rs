@@ -5813,8 +5813,28 @@ const SKILL_HEADER_PAD_Y: f32 = 10.0;
 /// icon buttons use radius = half the side (`MainWindow.xaml:49-55`'s
 /// `CornerRadius="18"` on a 36x36 button), i.e. a circle.
 const SKILL_CLOSE_HIT_SIZE: f32 = 32.0;
-/// The `✕` glyph's font size inside that target.
+/// The side of the cross's own box inside that target — the reference's
+/// `Path … Width="16"`. Painted as two strokes rather than set as text:
+/// `U+2715` is not covered by `fonts::bold_family`'s chain and came out as
+/// tofu (an empty box), which is what issue #218 called a "square" close
+/// button, and the reference's `Svg.Close` is vector art anyway.
 const SKILL_CLOSE_GLYPH_SIZE: f32 = 16.0;
+/// Stroke weight of those two strokes. `Svg.Close` is a filled path with no
+/// nominal weight; 1.6pt is what reads as the same visual density at 16pt
+/// against `SKILL_CLOSE_RGB`.
+const SKILL_CLOSE_STROKE_WIDTH: f32 = 1.6;
+/// The scroll thumb's fill: white at ~20% over the panel, the same read as
+/// the reference's thin light thumb. Faded with the rest of the chrome
+/// (issue #184).
+const SKILL_SCROLL_THUMB_FILL: egui::Color32 =
+    egui::Color32::from_rgba_premultiplied(0x33, 0x33, 0x33, 0x33);
+/// The thumb never gets shorter than this, however long the list — a
+/// two-pixel nub is not a grabbable or readable position indicator.
+const SKILL_SCROLL_THUMB_MIN_HEIGHT: f32 = 24.0;
+/// Width of the row list's scrollbar, thumb and track alike (issue #218) —
+/// the reference's persistent thin thumb. Also the gutter
+/// `skill_rows_content_rect` reserves for it.
+const SKILL_SCROLL_BAR_WIDTH: f32 = 6.0;
 /// The hover wash `ButtonMainStyle`'s `hl` border flips to on `IsMouseOver`:
 /// WPF's 4-digit ARGB `#1fff` — white at alpha `0x11`. Spelled premultiplied
 /// because `Color32::from_white_alpha`, which is exactly this, is not `const`.
@@ -6078,6 +6098,66 @@ fn skill_close_rect(rect: egui::Rect) -> egui::Rect {
     )
 }
 
+/// The close cross's two strokes, as endpoint pairs: the diagonals of a
+/// `SKILL_CLOSE_GLYPH_SIZE` box centred in the button (issue #218). Pure so
+/// the shape survives without a font and is checkable without a `Ui`.
+fn skill_close_cross(close_rect: egui::Rect) -> [[egui::Pos2; 2]; 2] {
+    let arms = egui::Rect::from_center_size(
+        close_rect.center(),
+        egui::Vec2::splat(SKILL_CLOSE_GLYPH_SIZE),
+    );
+    [
+        [arms.left_top(), arms.right_bottom()],
+        [arms.right_top(), arms.left_bottom()],
+    ]
+}
+
+/// The rect the row list lays its rows out in: the rows band minus the
+/// scrollbar's gutter (issue #218).
+///
+/// The rows used to be allocated at the full band width, which put every
+/// row's own painting across the strip the bar lives in — a solid bar has
+/// to take its width out of the content, and content that ignores that just
+/// paints over it.
+fn skill_rows_content_rect(rows_rect: egui::Rect) -> egui::Rect {
+    let mut content = rows_rect;
+    content.max.x -= SKILL_SCROLL_BAR_WIDTH;
+    content
+}
+
+/// The scroll thumb for a row list of `content_height` scrolled to
+/// `offset_y`, or `None` when the list fits and needs none.
+///
+/// Painted by hand (issue #218) rather than left to egui's own scroll bar:
+/// that bar never reached the screen here — with `ScrollStyle::solid()` set
+/// on the list's `Ui` it still painted no track and no handle, headless or
+/// live — and the reference's persistent thin thumb is a fixed piece of
+/// chrome anyway, not egui's hover-faded floating bar. Driven off the
+/// `ScrollAreaOutput` egui already hands back, so it cannot drift out of
+/// step with where the list actually is.
+fn skill_scroll_thumb(
+    rows_rect: egui::Rect,
+    content_height: f32,
+    offset_y: f32,
+) -> Option<egui::Rect> {
+    let track = rows_rect.height();
+    if content_height <= track {
+        return None;
+    }
+    // Proportional to how much of the list is on screen, which is what
+    // makes the thumb read as "how far through am I" and not just "there is
+    // more".
+    let thumb_height = (track * track / content_height).clamp(SKILL_SCROLL_THUMB_MIN_HEIGHT, track);
+    let travel = (offset_y / (content_height - track)).clamp(0.0, 1.0);
+    Some(egui::Rect::from_min_size(
+        egui::pos2(
+            rows_rect.right() - SKILL_SCROLL_BAR_WIDTH,
+            rows_rect.top() + (track - thumb_height) * travel,
+        ),
+        egui::vec2(SKILL_SCROLL_BAR_WIDTH, thumb_height),
+    ))
+}
+
 /// Where the Deaths pill's left edge lands: right-aligned into the header,
 /// one `SKILL_HEADER_PAD_X` clear of the close button. Shares
 /// `SKILL_CLOSE_HIT_SIZE` with `skill_close_rect` so growing that button
@@ -6210,15 +6290,14 @@ fn draw_skill_window(
         );
         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    paint_text(
-        &painter,
-        close_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "\u{2715}",
-        bold(SKILL_CLOSE_GLYPH_SIZE),
-        SKILL_CLOSE_RGB,
-        true,
-    );
+    // Two strokes, not a `\u{2715}`: that codepoint is outside every font in
+    // `fonts::bold_family`'s chain, so it rendered as tofu — the empty box
+    // issue #218 reported as a "square" close button. The reference's
+    // `Svg.Close` is vector art too.
+    let stroke = egui::Stroke::new(SKILL_CLOSE_STROKE_WIDTH, SKILL_CLOSE_RGB);
+    for [from, to] in skill_close_cross(close_rect) {
+        painter.line_segment([from, to], stroke);
+    }
     let close_clicked = close.clicked();
 
     // -- tab strip: `Dps` only, styled selected (D11) ---------------------
@@ -6314,17 +6393,21 @@ fn draw_skill_window(
     skills::sort_rows(&mut skill_rows, *sort);
 
     let mut rows_ui = ui.new_child(egui::UiBuilder::new().max_rect(rows_rect));
-    // Issue #218: the reference shows a persistent thin thumb, while egui's
-    // default `ScrollStyle::floating()` only fades one in on hover — which
-    // left the list with no standing hint that it scrolls at all.
-    rows_ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
-    egui::ScrollArea::vertical()
+    // Issue #218: rows are laid out inside the thumb's gutter, never across
+    // it, so no row's hover fill or clipped cell paints over the thumb.
+    let rows_content_rect = skill_rows_content_rect(rows_rect);
+    let scroll = egui::ScrollArea::vertical()
         .auto_shrink([false, false])
+        // egui's own bar is suppressed rather than styled: it painted
+        // nothing here either way (see `skill_scroll_thumb`), and leaving
+        // it enabled would silently take a second gutter's width out of
+        // the content.
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .show(&mut rows_ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for skill in &skill_rows {
                 let (skill_rect, response) = ui.allocate_exact_size(
-                    egui::vec2(rows_rect.width(), SKILL_ROW_HEIGHT),
+                    egui::vec2(rows_content_rect.width(), SKILL_ROW_HEIGHT),
                     egui::Sense::hover(),
                 );
                 if response.hovered() {
@@ -6392,6 +6475,17 @@ fn draw_skill_window(
                 }
             }
         });
+
+    // Painted after the list, so it sits over the rows rather than under
+    // them, and from the scroll area's own reported geometry.
+    if let Some(thumb) = skill_scroll_thumb(rows_rect, scroll.content_size.y, scroll.state.offset.y)
+    {
+        painter.rect_filled(
+            thumb,
+            egui::CornerRadius::same((SKILL_SCROLL_BAR_WIDTH / 2.0) as u8),
+            SKILL_SCROLL_THUMB_FILL.gamma_multiply(opacity),
+        );
+    }
 
     // Last, so the header band and the eight resize handles above have all
     // had their frame to start a gesture (issue #218) — the same ordering
@@ -11575,6 +11669,179 @@ mod tests {
         );
     }
 
+    /// Issue #218 (follow-up): `U+2715` came out as tofu — an empty box —
+    /// because the bold family's font chain does not cover it. The cross is
+    /// vector art now, exactly as the reference draws it
+    /// (`<Path Data="{StaticResource Svg.Close}" ...>`), so no font chain
+    /// can regress it.
+    #[test]
+    fn close_cross_is_two_centred_diagonals_the_size_of_the_glyph_box() {
+        let close = skill_close_rect(skill_window_rect());
+        let [[a0, a1], [b0, b1]] = skill_close_cross(close);
+
+        let box_rect = egui::Rect::from_points(&[a0, a1, b0, b1]);
+        assert_eq!(box_rect.center(), close.center());
+        assert_eq!(box_rect.width(), SKILL_CLOSE_GLYPH_SIZE);
+        assert_eq!(box_rect.height(), SKILL_CLOSE_GLYPH_SIZE);
+        assert!(
+            close.contains_rect(box_rect),
+            "the cross must fit its target"
+        );
+
+        // Opposite diagonals, not two parallel strokes.
+        assert!((a1.x - a0.x) > 0.0 && (a1.y - a0.y) > 0.0);
+        assert!((b1.x - b0.x) < 0.0 && (b1.y - b0.y) > 0.0);
+
+        // And every endpoint stays inside the circular hover wash.
+        for point in [a0, a1, b0, b1] {
+            assert!(point.distance(close.center()) <= SKILL_CLOSE_HIT_SIZE / 2.0);
+        }
+    }
+
+    /// Every `Shape::Rect` a frame painted, flattened out of the `Vec`
+    /// nesting -- `collect_row_boxes` deliberately keeps only text and
+    /// meshes, and a scrollbar is neither.
+    fn painted_rects(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Rect(rect) => out.push(rect.rect),
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    painted_rects(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Issue #218 (follow-up): with the list overflowing, the reference
+    /// shows a persistent thin thumb down the right edge of the rows band.
+    /// `ScrollStyle::solid()` alone did not put one on screen.
+    #[test]
+    fn an_overflowing_row_list_paints_a_scrollbar_in_its_rows_band() {
+        let row = PlayerRow {
+            skills: (0..40).map(|i| sample_skill_row(1550 + i)).collect(),
+            ..sample_row(None)
+        };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        // Deliberately at the window's floor: 40 rows cannot fit, so a bar
+        // is needed.
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_MIN_SIZE);
+        let mut sort = skills::SkillSort::default();
+        // Two frames: egui animates a scroll bar in, so the first frame's
+        // `show_factor` is still 0 and paints nothing either way.
+        for _ in 0..2 {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    ..Default::default()
+                },
+                |ui| {
+                    draw_skill_window(
+                        ui,
+                        &row,
+                        &mut sort,
+                        &icons,
+                        1.0,
+                        &mut WindowGesture::default(),
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_skill_window(
+                    ui,
+                    &row,
+                    &mut sort,
+                    &icons,
+                    1.0,
+                    &mut WindowGesture::default(),
+                );
+            },
+        );
+        let mut rects = Vec::new();
+        for clipped in &output.shapes {
+            painted_rects(&clipped.shape, &mut rects);
+        }
+        output.drop_without_applying_deltas();
+
+        let header = skill_header_rect(screen_rect);
+        let tabs = egui::Rect::from_min_size(
+            egui::pos2(screen_rect.left(), header.bottom()),
+            egui::vec2(screen_rect.width(), SKILL_TAB_HEIGHT),
+        );
+        let rows = skill_rows_rect(screen_rect, skill_column_header_rect(screen_rect, tabs));
+        let bar = rects.iter().find(|r| {
+            r.right() == rows.right()
+                && r.width() == SKILL_SCROLL_BAR_WIDTH
+                && r.top() >= rows.top()
+                && r.bottom() <= rows.bottom()
+                && r.height() >= SKILL_SCROLL_THUMB_MIN_HEIGHT
+        });
+        assert!(
+            bar.is_some(),
+            "no scroll thumb painted down the rows band's right edge"
+        );
+    }
+
+    /// A list that fits needs no thumb at all — the reference shows one
+    /// only where there is something to scroll.
+    #[test]
+    fn no_scroll_thumb_when_the_list_fits() {
+        let rows = egui::Rect::from_min_size(egui::pos2(0.0, 132.0), egui::vec2(360.0, 88.0));
+        assert_eq!(skill_scroll_thumb(rows, 88.0, 0.0), None);
+        assert_eq!(skill_scroll_thumb(rows, 40.0, 0.0), None);
+    }
+
+    /// The thumb rides the gutter: fixed width at the band's right edge,
+    /// proportional height with a floor, and it travels from the band's top
+    /// at offset 0 to its bottom at the end of the scroll (issue #218).
+    #[test]
+    fn scroll_thumb_tracks_the_offset_inside_the_rows_band() {
+        let rows = egui::Rect::from_min_size(egui::pos2(0.0, 132.0), egui::vec2(360.0, 88.0));
+        let content = 264.0;
+
+        let top = skill_scroll_thumb(rows, content, 0.0).expect("the list overflows");
+        assert_eq!(top.width(), SKILL_SCROLL_BAR_WIDTH);
+        assert_eq!(top.right(), rows.right());
+        assert_eq!(top.top(), rows.top());
+        // A third of the list is on screen, so the thumb is a third as tall.
+        assert!((top.height() - rows.height() / 3.0).abs() < 0.001);
+
+        let bottom =
+            skill_scroll_thumb(rows, content, content - rows.height()).expect("the list overflows");
+        assert!((bottom.bottom() - rows.bottom()).abs() < 0.001);
+        assert_eq!(bottom.height(), top.height());
+
+        // Overscroll (egui's elastic bounce) must not push it out of the band.
+        let past = skill_scroll_thumb(rows, content, 10_000.0).expect("the list overflows");
+        assert!((past.bottom() - rows.bottom()).abs() < 0.001);
+
+        // A very long list still leaves something grabbable.
+        let tiny = skill_scroll_thumb(rows, 100_000.0, 0.0).expect("the list overflows");
+        assert_eq!(tiny.height(), SKILL_SCROLL_THUMB_MIN_HEIGHT);
+    }
+
+    /// The rows lay out inside the gutter, so nothing they paint can cover
+    /// the thumb (issue #218).
+    #[test]
+    fn rows_content_reserves_the_thumbs_gutter() {
+        let rows = egui::Rect::from_min_size(egui::pos2(0.0, 132.0), egui::vec2(360.0, 88.0));
+        let content = skill_rows_content_rect(rows);
+        assert_eq!(content.right(), rows.right() - SKILL_SCROLL_BAR_WIDTH);
+        assert_eq!(content.left(), rows.left());
+        assert_eq!(content.height(), rows.height());
+        let thumb = skill_scroll_thumb(rows, 264.0, 0.0).expect("the list overflows");
+        assert!(!content.intersects(thumb) || content.right() <= thumb.left());
+    }
+
     /// The panel is deliberately *not* the source's slate `#232830` — that
     /// reads as washed-out grey over game footage. Lock the near-black.
     #[test]
@@ -14277,6 +14544,17 @@ mod tests {
     /// whatever this run reports the `X` glyph did, leaving `sort` mutated
     /// in place for the caller to inspect.
     fn click_skill_window_at(row: &PlayerRow, sort: &mut skills::SkillSort, value: &str) -> bool {
+        click_skill_window(row, sort, |frame| frame.text_box(value).center())
+    }
+
+    /// The same two-frame harness, aimed by an arbitrary `locate` instead of
+    /// by a painted string — the close button paints no text at all since
+    /// issue #218 turned its `\u{2715}` into two line segments.
+    fn click_skill_window(
+        row: &PlayerRow,
+        sort: &mut skills::SkillSort,
+        locate: impl FnOnce(&RowFrame) -> egui::Pos2,
+    ) -> bool {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
@@ -14298,7 +14576,7 @@ mod tests {
         for clipped in &layout.shapes {
             collect_row_boxes(&clipped.shape, clipped.clip_rect, &mut frame);
         }
-        let pos = frame.text_box(value).center();
+        let pos = locate(&frame);
         layout.drop_without_applying_deltas();
 
         let mut clicked = false;
@@ -14629,7 +14907,15 @@ mod tests {
         };
         let mut sort = skills::SkillSort::default();
 
-        let closed = click_skill_window_at(&row, &mut sort, "\u{2715}");
+        // The close button is aimed at geometrically: it paints two line
+        // segments now, not a glyph (issue #218).
+        let closed = click_skill_window(&row, &mut sort, |_| {
+            skill_close_rect(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                SKILL_WINDOW_SIZE,
+            ))
+            .center()
+        });
 
         assert!(
             closed,
