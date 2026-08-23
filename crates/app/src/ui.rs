@@ -1144,15 +1144,18 @@ impl eframe::App for OverlayApp {
                         );
                     }
                 }
-                if back_to_live {
-                    self.view = OverlayView::Live;
-                }
+                // PR #225 review of issue #219: resolved through one
+                // function, rather than reading `self.view` for the row
+                // count and then reassigning it inline here, so the "read
+                // before reset" ordering can't drift apart under a future
+                // edit — see `resolve_screenshot_row_count`'s doc comment
+                // for why the order matters.
+                let row_count = resolve_screenshot_row_count(
+                    &mut self.view,
+                    back_to_live,
+                    self.snapshot.rows.len(),
+                );
                 if screenshot_requested {
-                    // Issue #219: the *open historical encounter's* row
-                    // count while one is open, not the live snapshot's —
-                    // `screenshot_row_count`'s doc comment covers why the
-                    // two can differ.
-                    let row_count = screenshot_row_count(&self.view, self.snapshot.rows.len());
                     self.pending_screenshot_bound = Some(rows_content_bottom_y(
                         rows_top,
                         row_count,
@@ -1946,6 +1949,19 @@ fn click_through_after_tray_request(click_through: bool, requested: bool) -> boo
 /// `toggle_state_tint` for the dimmed glyph, rather than hiding the button
 /// outright — hiding it would shift every button to its right on the
 /// frames it's inactive.
+/// The "<label>" / "<label>: unavailable" shape shared by every toggle
+/// whose label doubles as its own disabled-state explanation (Share's
+/// `share_active`, History's `has_history`, PR #225 review of issue #219)
+/// — pulled out so the wording can't drift apart between the two call
+/// sites by a hand-edit to just one of them.
+fn availability_label(
+    active: bool,
+    label: &'static str,
+    unavailable: &'static str,
+) -> &'static str {
+    if active { label } else { unavailable }
+}
+
 fn toggle_cluster(
     ui: &mut egui::Ui,
     tx_command: &Sender<UiCommand>,
@@ -1984,11 +2000,11 @@ fn toggle_cluster(
         egui::Vec2::splat(TOGGLE_MOUSE_SIDE),
     );
     let mut screenshot_requested = false;
-    let share_label = if share_active {
-        "Copy screenshot to clipboard"
-    } else {
-        "Copy screenshot to clipboard: unavailable"
-    };
+    let share_label = availability_label(
+        share_active,
+        "Copy screenshot to clipboard",
+        "Copy screenshot to clipboard: unavailable",
+    );
     if toggle_button(ui, share_rect, share_label, capturing, share_active).clicked() {
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
@@ -2040,11 +2056,7 @@ fn toggle_cluster(
         egui::pos2(x + TOGGLE_HISTORY_SIDE / 2.0, y),
         egui::Vec2::splat(TOGGLE_HISTORY_SIDE),
     );
-    let history_label = if has_history {
-        "History"
-    } else {
-        "History: unavailable"
-    };
+    let history_label = availability_label(has_history, "History", "History: unavailable");
     if toggle_button(ui, history_rect, history_label, capturing, has_history).clicked() {
         *open_history = true;
     }
@@ -6419,6 +6431,32 @@ fn screenshot_row_count(view: &OverlayView, live_row_count: usize) -> usize {
     }
 }
 
+/// `OverlayApp::ui`'s single entry point for both halves of the Share crop
+/// bound (PR #225 review of issue #219): it must call `screenshot_row_count`
+/// on `view` *before* applying the "← Live" reset (`back_to_live`), because
+/// `draw_history` already painted `view`'s rows this exact frame — even on
+/// the frame a "← Live" click sets `back_to_live`, since that click only
+/// takes effect on the *next* frame's `match`. Reading the row count after
+/// the reset would use the just-reset `OverlayView::Live` instead of the
+/// historical view that was actually on screen, reintroducing the
+/// crop-bound mismatch issue #219 fixed. Folding both steps into one
+/// function — rather than the caller doing `screenshot_row_count` then a
+/// separate `if back_to_live { … }` — is what keeps that ordering from
+/// drifting apart under a future edit. Pure aside from the `&mut
+/// OverlayView` reset, so the ordering itself is unit-testable without an
+/// `egui::Context`.
+fn resolve_screenshot_row_count(
+    view: &mut OverlayView,
+    back_to_live: bool,
+    live_row_count: usize,
+) -> usize {
+    let row_count = screenshot_row_count(view, live_row_count);
+    if back_to_live {
+        *view = OverlayView::Live;
+    }
+    row_count
+}
+
 /// The header's title/subtitle override for a historical fight (spec
 /// DECISION D7) — bundled rather than passed as two loose parameters so
 /// `draw_header`'s argument list stays readable.
@@ -8581,6 +8619,80 @@ mod tests {
         );
     }
 
+    /// Mirrors `the_history_button_reports_itself_disabled_without_history`
+    /// for Share (PR #225 review of issue #219): every existing
+    /// `toggle_cluster` test call site passes `share_active = true`, so
+    /// nothing verified the button is genuinely disabled — not merely
+    /// dim — when it's false. Same contract as History: accesskit must
+    /// publish `enabled: false`, and a click landing on the button's rect
+    /// must not fire a capture.
+    #[test]
+    fn the_share_button_reports_itself_disabled_when_inactive() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+
+        let disabled = |share_active: bool, label: &str| -> bool {
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                toggle_cluster(
+                    ui,
+                    &tx_command,
+                    &icons,
+                    false,
+                    share_active,
+                    true,
+                    &mut false,
+                );
+            });
+            let update = output
+                .platform_output
+                .accesskit_update
+                .clone()
+                .expect("accesskit was enabled for this frame");
+            output.drop_without_applying_deltas();
+            update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label().is_some_and(|s| s == label))
+                .map(|(_, node)| node.is_disabled())
+                .unwrap_or_else(|| panic!("no accessible node labeled {label:?} painted"))
+        };
+
+        assert!(
+            disabled(false, "Copy screenshot to clipboard: unavailable"),
+            "Share must report enabled: false when share_active is false"
+        );
+        assert!(
+            !disabled(true, "Copy screenshot to clipboard"),
+            "Share must stay enabled when share_active is true"
+        );
+
+        let label = "Copy screenshot to clipboard: unavailable";
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            toggle_cluster(ui, &tx_command, &icons, false, false, true, &mut false);
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let pos = accessible_rect_for_label(&update, label).center();
+        layout.drop_without_applying_deltas();
+
+        let mut screenshot_requested = true;
+        let output = ctx.run_ui(click_at(pos), |ui| {
+            screenshot_requested =
+                toggle_cluster(ui, &tx_command, &icons, false, false, true, &mut false);
+        });
+        output.drop_without_applying_deltas();
+        assert!(
+            !screenshot_requested,
+            "clicking a disabled Share button must not fire a capture"
+        );
+    }
+
     /// Issue #186: the History button opens the history view when there is
     /// a history thread, and is inert — not merely dim — when there isn't,
     /// which is the disabled state the `draw_header_menu` item it replaced
@@ -9629,6 +9741,37 @@ mod tests {
     fn screenshot_row_count_falls_back_to_the_live_count_on_the_bare_history_list() {
         let view = OverlayView::History(Box::default());
         assert_eq!(screenshot_row_count(&view, 5), 5);
+    }
+
+    /// PR #225 review of issue #219: a "Back to Live" click and a Share
+    /// click landing in the same frame (`back_to_live` and the crop-bound
+    /// use both true) must still crop against the historical encounter
+    /// `draw_history` painted this frame, not the `OverlayView::Live` the
+    /// same frame's reset is about to produce.
+    #[test]
+    fn resolve_screenshot_row_count_uses_the_painted_view_even_when_back_to_live_fires_this_frame()
+    {
+        let mut view = OverlayView::History(Box::new(HistoryUi {
+            open: Some(OpenEncounter {
+                id: 1,
+                title: "Fight".to_string(),
+                subtitle: None,
+                ended_at_ms: 0,
+                snapshot: rows_test_snapshot(9),
+            }),
+            ..HistoryUi::default()
+        }));
+
+        let row_count = resolve_screenshot_row_count(&mut view, true, 5);
+
+        assert_eq!(
+            row_count, 9,
+            "the crop bound must use the historical encounter's row count, not the live snapshot's"
+        );
+        assert!(
+            matches!(view, OverlayView::Live),
+            "back_to_live must still reset the view once the row count is captured"
+        );
     }
 
     // -- handle_share_screenshot (the `OverlayApp::ui` sequencing itself) ---
