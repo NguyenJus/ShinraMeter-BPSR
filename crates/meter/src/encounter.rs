@@ -108,6 +108,12 @@ const WIPE_HOLD_RELEASE_MS: u64 = 60_000;
 /// plain "ever damaged" question rather than dropping the fallback.
 /// Damage *newer* than `engaged_at` — an `EnemyHp` packet arriving between
 /// two hits — is trivially inside the window, not outside it.
+///
+/// Also used by `Meter::engaged_boss_still_up` (issue #210/#211), with
+/// `engaged_at` there being the caller's own `now_ms` rather than another
+/// enemy's damage clock — the same "is this recent enough to still count as
+/// the pull in progress" question, just measured against wall-clock time
+/// instead of a sibling boss's last hit.
 fn engaged_within_window(last_damaged_ms: Option<u64>, engaged_at: Option<u64>) -> bool {
     match (last_damaged_ms, engaged_at) {
         (Some(last), Some(now)) => now.saturating_sub(last) <= BOSS_ENGAGEMENT_WINDOW_MS,
@@ -479,7 +485,7 @@ impl Meter {
         let idle = self.fight_cfg.idle_timeout_ms;
         if idle > 0
             && now_ms.saturating_sub(self.last_event_ms) >= idle
-            && !self.engaged_boss_still_up()
+            && !self.engaged_boss_still_up(now_ms)
         {
             Some(self.last_event_ms)
         } else {
@@ -517,10 +523,30 @@ impl Meter {
     /// Deliberately scoped by `took_damage`, like `has_other_living_boss`:
     /// a boss standing in the room the party walked past is not a pull in
     /// progress.
-    fn engaged_boss_still_up(&self) -> bool {
+    ///
+    /// Bounded by [`BOSS_ENGAGEMENT_WINDOW_MS`] against `last_damaged_ms`
+    /// (issue #210/#211): the meter has exactly two death signals
+    /// (`DamageEvent::is_dead` and an `EnemyHp` sync to `curr_hp == Some(0)`),
+    /// and production logs show a boss can simply never produce either —
+    /// no death packet, no zero-HP sync, it just stops being mentioned (a
+    /// dropped TCP segment, most likely). `EnemyState::is_alive` reads that
+    /// boss as alive forever, which used to make this `true` forever too,
+    /// permanently suppressing the only fallback that could still end the
+    /// fight (the idle timeout) — the meter never saved the encounter, reset
+    /// the meter, or stopped the clock, and the *next* boss's damage
+    /// accumulated into the dead one's rows for as long as the instance
+    /// stayed open. Bounding this to `now_ms` recent still covers every
+    /// genuine immunity/mechanic lull the guard exists for (real windows
+    /// are far shorter than 60s), while turning a missed death signal from
+    /// a permanent wedge into one bounded the same way a boss nobody has
+    /// ever touched already is.
+    fn engaged_boss_still_up(&self, now_ms: u64) -> bool {
         self.in_dungeon_scene()
             && self.enemies.values().any(|e| {
-                e.took_damage && e.is_alive() && e.monster_id.is_some_and(tables::is_boss_monster)
+                e.took_damage
+                    && e.is_alive()
+                    && e.monster_id.is_some_and(tables::is_boss_monster)
+                    && engaged_within_window(e.last_damaged_ms, Some(now_ms))
             })
     }
 
@@ -563,7 +589,7 @@ impl Meter {
     /// to screenshot.
     pub fn tick(&mut self, now_ms: u64) -> FightState {
         if let Some(end_ms) = self.fight_ended_at(now_ms) {
-            self.latch_fight_end(FightEndCause::IdleTimeout, end_ms);
+            self.latch_fight_end(FightEndCause::IdleTimeout, end_ms, self.boss_monster_id());
             FightState::Ended
         } else if self.fight_start_ms.is_some() {
             FightState::Active
@@ -623,7 +649,11 @@ impl Meter {
                     // for it.
                     let cut_short = self.fight_start_ms.is_some() && self.fight_end_ms.is_none();
                     if cut_short {
-                        self.latch_fight_end(FightEndCause::SceneChanged, self.last_event_ms);
+                        self.latch_fight_end(
+                            FightEndCause::SceneChanged,
+                            self.last_event_ms,
+                            self.boss_monster_id(),
+                        );
                     }
 
                     // issue #191: only entering a *dungeon/raid* scene
@@ -804,7 +834,11 @@ impl Meter {
                 // `boss_monster_id=<unknown>` — losing the one fact it
                 // exists to record about a fight cut short by a reconnect.
                 if self.fight_start_ms.is_some() && self.fight_end_ms.is_none() {
-                    self.latch_fight_end(FightEndCause::ServerChanged, *timestamp_ms);
+                    self.latch_fight_end(
+                        FightEndCause::ServerChanged,
+                        *timestamp_ms,
+                        self.boss_monster_id(),
+                    );
                 }
 
                 self.prune_stale_preloads();
@@ -833,7 +867,7 @@ impl Meter {
         // without ever producing a row, which would otherwise drag an
         // already-ended fight back into `Active`.
         if let Some(end_ms) = self.fight_ended_at(d.timestamp_ms) {
-            self.latch_fight_end(FightEndCause::IdleTimeout, end_ms);
+            self.latch_fight_end(FightEndCause::IdleTimeout, end_ms, self.boss_monster_id());
         }
 
         // issue #124: before the hold is allowed to clear the board, check
@@ -941,8 +975,8 @@ impl Meter {
             // dropped. Elsewhere a wipe still freezes the numbers — the
             // idle timeout takes it, now that issue #155 stops the mob
             // swinging at the corpses from holding the fight open.
-            if self.party_is_wiped() && self.engaged_boss_still_up() {
-                self.latch_fight_end(FightEndCause::Wipe, d.timestamp_ms);
+            if self.party_is_wiped() && self.engaged_boss_still_up(d.timestamp_ms) {
+                self.latch_fight_end(FightEndCause::Wipe, d.timestamp_ms, self.boss_monster_id());
                 self.wipe_hold = true;
             }
         }
@@ -975,12 +1009,20 @@ impl Meter {
             if d.is_dead {
                 self.mark_enemy_dead(d.target_uid);
             }
+            // issue #210/#211: captured *before* `recompute_boss`, which
+            // ranks a living recognized boss above a dead one — so the
+            // instant `mark_enemy_dead` above stamps this uid's death
+            // order, any other recognized boss already damaged and still
+            // alive (the raid's next selection, say) outranks the corpse
+            // and `recompute_boss` moves `boss_uid` off it. Reading
+            // `boss_uid` after that point can no longer tell whether the
+            // enemy that just died was the one being tracked.
+            let was_tracked_boss = self.boss_uid == Some(d.target_uid);
             self.recompute_boss();
             // issue #78: a recognized boss dying ends the fight now, rather
             // than after the idle timeout, so the meter freezes on the kill
             // instead of on a straggler's last tick of DoT damage.
-            if self.fight_cfg.end_on_boss_death && d.is_dead && self.boss_uid == Some(d.target_uid)
-            {
+            if self.fight_cfg.end_on_boss_death && d.is_dead && was_tracked_boss {
                 self.end_fight_on_boss_death(d.target_uid, d.timestamp_ms);
             }
         }
@@ -1071,13 +1113,30 @@ impl Meter {
     /// selects it, and without this guard its death would freeze the meter
     /// mid-encounter while the party fights the phase that is still up. The
     /// same guard covers a multi-part boss (`Dragonbane Golem`'s two
-    /// cannons) and a raid boss pulled alongside another. Suppressing costs
-    /// only the instant freeze — the idle timeout still ends the fight.
+    /// cannons). Suppressing costs only the instant freeze — the idle
+    /// timeout still ends the fight.
+    ///
+    /// issue #210/#211: *not* a raid boss pulled alongside another that the
+    /// party has genuinely moved on from, though — `has_other_living_boss`
+    /// is scene-aware. In a boss-select scene a sequential next selection
+    /// (untouched, or touched long enough ago to fall outside
+    /// `BOSS_ENGAGEMENT_WINDOW_MS`) does not count, so killing the
+    /// in-progress selection still ends the fight. A boss genuinely being
+    /// fought *concurrently* with the one that just died — Dreambloom
+    /// Ruins' Caprahorn pair, which spawns inside a boss-select scene same
+    /// as the sequential raids do — still counts, exactly as it does
+    /// outside a boss-select scene.
     fn end_fight_on_boss_death(&mut self, uid: i64, now_ms: u64) {
-        // Both call sites guard on `self.boss_uid == Some(uid)`, so the
-        // selected boss's id *is* the dying enemy's id — no second lookup
-        // (PR #163 review, finding 4).
-        let monster_id = self.boss_monster_id();
+        // issue #210/#211: `uid`'s own monster id, not `self.boss_monster_id()`
+        // (== whatever `self.boss_uid` currently is). Both call sites used to
+        // guard on `self.boss_uid == Some(uid)`, so the two were always the
+        // same id — but that guard is now the pre-`recompute_boss` capture
+        // `was_tracked_boss` (defect 2), and by the time this runs
+        // `recompute_boss` may already have moved `boss_uid` onto another
+        // living boss `uid`'s death just promoted (e.g. a raid's next
+        // selection). This function must still record *this* dying boss's
+        // identity, not whichever one the header now follows.
+        let monster_id = self.enemies.get(&uid).and_then(|e| e.monster_id);
         let recognized = monster_id.is_some_and(tables::is_boss_monster);
         // Guarded on an in-progress fight so a kill packet arriving while no
         // fight is running (the tail of a pull the user just reset away)
@@ -1086,27 +1145,31 @@ impl Meter {
         if recognized
             && self.fight_start_ms.is_some()
             && self.fight_end_ms.is_none()
-            && !self.has_other_living_boss(uid)
+            && !self.has_other_living_boss(uid, now_ms)
         {
-            self.latch_fight_end(FightEndCause::BossDeath, now_ms);
+            self.latch_fight_end(FightEndCause::BossDeath, now_ms, monster_id);
             self.fight_end_boss_id = monster_id;
         }
     }
 
     /// Latches the fight end at `end_ms` and logs the single `info`-level
     /// line that says a fight ended and why (issue #151's diagnostics gap).
+    /// `boss_monster_id` is the id the log line should name — ordinarily
+    /// `self.boss_monster_id()`, except from `end_fight_on_boss_death`
+    /// (issue #210/#211), which passes the dying boss's own id since
+    /// `self.boss_uid` may already have moved on by the time this runs.
     ///
     /// Every path that ends a fight goes through here — boss death, idle
     /// timeout, party wipe, server change — so the line fires exactly once
     /// per fight end: a fight already latched returns untouched, which is
     /// also what makes the repeated "pin the end" calls in `apply_damage`
     /// and `tick` idempotent.
-    fn latch_fight_end(&mut self, cause: FightEndCause, end_ms: u64) {
+    fn latch_fight_end(&mut self, cause: FightEndCause, end_ms: u64, boss_monster_id: Option<u32>) {
         if self.fight_end_ms.is_some() {
             return;
         }
         self.fight_end_ms = Some(end_ms);
-        log::info!("{}", fight_end_log(cause, self.boss_monster_id()));
+        log::info!("{}", fight_end_log(cause, boss_monster_id));
     }
 
     /// The monster id of the currently selected boss target, if it has one.
@@ -1146,19 +1209,44 @@ impl Meter {
     /// observed as alive — see its doc comment for why that asymmetry is the
     /// safe one.
     ///
-    /// Mostly a backstop, since `recompute_boss` now ranks a living
-    /// recognized boss above a dead one and so usually moves `boss_uid` off
-    /// the corpse before this is reached at all. What it still catches is the
-    /// enemy `recompute_boss` cannot rank: one with neither `max_hp` nor
-    /// `curr_hp` is filtered out of the ranking entirely, so a living damaged
-    /// boss known only by its `monster_id` would otherwise be invisible and
-    /// the dead phase's latch would fire over the top of it.
-    fn has_other_living_boss(&self, dying_uid: i64) -> bool {
+    /// Catches the enemy `recompute_boss` cannot rank: one with neither
+    /// `max_hp` nor `curr_hp` is filtered out of the ranking entirely, so a
+    /// living damaged boss known only by its `monster_id` would otherwise be
+    /// invisible and the dead phase's latch would fire over the top of it.
+    /// (`recompute_boss` itself ranks a living recognized boss above a dead
+    /// one, but both call sites now capture whether `dying_uid` was the
+    /// tracked boss *before* calling it — issue #210/#211 — so this is no
+    /// longer only a backstop for the unrankable case: it is consulted for
+    /// every recognized-boss death.)
+    ///
+    /// Scene-aware since issue #210/#211, via *co-engagement* rather than a
+    /// blanket scene check: a `phase::is_boss_select_scene` raid can hold
+    /// several final bosses, but not all of them are "still being fought"
+    /// in the same sense. Field of Forgotten Illusions' three selections
+    /// are sequential — the next one sits untouched (or was poked once and
+    /// abandoned) while the current one is being fought, so it must not
+    /// hold this one's death open. Dreambloom Ruins' Caprahorn selection is
+    /// the opposite: it spawns *two* equal-HP bosses fought concurrently in
+    /// that same kind of scene (see `phase::BOSS_SELECT_SCENES`'s own
+    /// comment on it), so its twin — still being actively hit — must keep
+    /// holding the pull open exactly as it does outside a boss-select scene.
+    ///
+    /// The two read identically as "another living, damaged, recognized
+    /// boss"; what tells them apart is recency, the same signal
+    /// `engaged_boss_still_up` uses for the same reason (issue #210/#211):
+    /// inside a boss-select scene, an other-boss candidate only counts if it
+    /// was damaged within `BOSS_ENGAGEMENT_WINDOW_MS` of `now_ms`. Outside a
+    /// boss-select scene the check stays unconditional, as it always has —
+    /// an ordinary dungeon's multi-phase/multi-part pull (the Dragonbane
+    /// Golem cannons, say) has no "next selection" to distinguish from.
+    fn has_other_living_boss(&self, dying_uid: i64, now_ms: u64) -> bool {
+        let boss_select = self.scene_id.is_some_and(phase::is_boss_select_scene);
         self.enemies.iter().any(|(uid, e)| {
             *uid != dying_uid
                 && e.took_damage
                 && e.is_alive()
                 && e.monster_id.is_some_and(tables::is_boss_monster)
+                && (!boss_select || engaged_within_window(e.last_damaged_ms, Some(now_ms)))
         })
     }
 
@@ -1500,9 +1588,20 @@ impl Meter {
             self.mark_enemy_dead(e.uid);
         }
 
+        // issue #210/#211: captured *before* `recompute_boss`, which ranks a
+        // living recognized boss above a dead one — so the instant this
+        // sync's `curr_hp == 0` stamps `e.uid`'s death order above, any
+        // other recognized boss already damaged and still alive outranks
+        // the corpse and `recompute_boss` moves `boss_uid` off it. Mirrors
+        // `apply_damage`'s capture: it answers whether `e.uid` was the
+        // tracked boss when this update landed, which is the only form of
+        // the question a *death* can still be asked after the ranking has
+        // reacted to it.
+        let was_tracked_boss = self.boss_uid == Some(e.uid);
+
         self.recompute_boss();
 
-        if self.boss_uid == Some(e.uid) {
+        if was_tracked_boss {
             // issue #78: the boss's HP reaching 0 is the other end-of-fight
             // signal (the death packet can be missed; an HP sync to 0 is
             // hard to miss). Same recognized-boss gate as the death path.
@@ -1511,7 +1610,22 @@ impl Meter {
             {
                 self.end_fight_on_boss_death(e.uid, e.timestamp_ms);
             }
+        }
 
+        // PR #223 review, finding 1: deliberately the *post*-`recompute_boss`
+        // identity, not `was_tracked_boss`. The two checks ask opposite
+        // questions of the same sync. A death asks "was this the boss we were
+        // following?", and only the pre-capture can answer it, because dying
+        // is itself what demotes the enemy out of `boss_uid`. A rollback asks
+        // "is the boss we are following the one whose bar just refilled?" —
+        // and refilling is what *promotes* an enemy into `boss_uid`, since in
+        // the tier-0 (`curr_hp`-only, issue #76) ranking the bar's height is
+        // the rank. The canonical wipe is exactly that: the boss the party
+        // burned to 20% snaps back to full in one sync, overtaking whatever
+        // trash or sibling boss led the ranking while it was low. Gating that
+        // on the pre-capture drops the reset on the floor, which is how the
+        // wipe's damage keeps piling into the next pull.
+        if self.boss_uid == Some(e.uid) {
             let cooldown_ok = match self.last_reset_ms {
                 Some(last) => e.timestamp_ms.saturating_sub(last) >= self.reset_cfg.cooldown_ms,
                 None => true,
@@ -3507,6 +3621,58 @@ mod tests {
             assert_eq!(m.apply(&curr_hp_only(10, 500_000, 300)), None);
         }
 
+        /// PR #223 review, finding 2: the rollback reset must survive the
+        /// sync that *hands* `boss_uid` to the boss doing the rolling back.
+        ///
+        /// Two recognized bosses pulled together, both known only by
+        /// `curr_hp` (issue #76's mid-pull join), so the ranking is a raw HP
+        /// comparison and the leader changes whenever their bars cross. The
+        /// wipe arrives as one `EnemyHp` that does two things at once: it
+        /// completes B's 20% -> 100% rollback shape *and* lifts B's bar over
+        /// A's, promoting B to `boss_uid` inside the very call that has to
+        /// notice the rollback. Gating the rollback on the pre-`recompute_boss`
+        /// capture the boss-death latch needs (issue #210/#211) made this
+        /// return `None`: B was not the tracked boss when the sync landed,
+        /// only immediately afterwards.
+        #[test]
+        fn rollback_fires_when_the_refill_itself_promotes_the_boss() {
+            /// A second recognized boss, so both sides of the pair clear the
+            /// `is_boss_monster` gate and only their HP separates them.
+            const OTHER_BOSS: u32 = 102_801;
+
+            fn curr_only(uid: i64, curr: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
+                ProtocolEvent::EnemyHp(EnemyHp {
+                    uid,
+                    curr_hp: Some(curr),
+                    max_hp: None,
+                    monster_id: Some(monster_id),
+                    timestamp_ms: ts,
+                })
+            }
+
+            let mut m = Meter::new();
+            // A is the bigger bar, so it holds `boss_uid` throughout the
+            // pull...
+            m.apply(&boss_hit(10, 0));
+            assert_eq!(m.apply(&curr_only(10, 1_000, BOSS, 0)), None);
+            // ...while B is engaged alongside it and burned to 20% of its
+            // own peak.
+            m.apply(&boss_hit(11, 10));
+            assert_eq!(m.apply(&curr_only(11, 500, OTHER_BOSS, 10)), None);
+            assert_eq!(m.apply(&curr_only(11, 100, OTHER_BOSS, 100)), None);
+            assert_eq!(m.boss_uid, Some(10));
+
+            // The wipe: B's bar snaps back past its peak in a single sync,
+            // which is both the rollback signature and the moment B outranks
+            // A.
+            let r = m.apply(&curr_only(11, 2_000, OTHER_BOSS, 200));
+            assert_eq!(r, Some(ResetReason::BossHpRollback));
+            // The reset clears the board, `boss_uid` included, so B's
+            // promotion is only observable through the reset having fired
+            // at all.
+            assert_eq!(m.snapshot(1_000).total_damage, 0);
+        }
+
         #[test]
         fn rollback_100_to_55_to_95_triggers_once() {
             let mut m = Meter::new();
@@ -4479,12 +4645,15 @@ mod tests {
         fn an_idle_lull_does_not_end_the_fight_while_a_dungeon_boss_is_still_up() {
             // The raid immunity/mechanic window from issue #151: nothing can
             // be hit for far longer than the 9s idle timeout, but the pull is
-            // still very much in progress.
+            // still very much in progress. Kept inside `BOSS_ENGAGEMENT_WINDOW_MS`
+            // (issue #210/#211): past that bound a boss nobody has touched
+            // reads as abandoned, not as a lull, however long the fight has
+            // otherwise been running.
             let mut m = in_dungeon();
             m.apply(&hp(10, 50, Some(BOSS), 0));
             m.apply(&boss_hit(10, 1_000, false));
-            assert_eq!(m.fight_state(1_000 + 10 * idle()), FightState::Active);
-            assert_eq!(m.tick(1_000 + 10 * idle()), FightState::Active);
+            assert_eq!(m.fight_state(1_000 + 6 * idle()), FightState::Active);
+            assert_eq!(m.tick(1_000 + 6 * idle()), FightState::Active);
         }
 
         #[test]
@@ -4518,10 +4687,13 @@ mod tests {
             m.apply(&boss_hit(10, 1_000, false));
             m.apply(&boss_hit(11, 1_100, false));
 
-            // The first of the pair falls; its twin is still up.
+            // The first of the pair falls; its twin is still up. Checked
+            // inside `BOSS_ENGAGEMENT_WINDOW_MS` of the twin's own last hit
+            // (issue #210/#211) — past that bound an untouched boss reads as
+            // abandoned rather than as a lull, pair or not.
             m.apply(&boss_hit(10, 2_000, true));
             assert_eq!(m.fight_end_ms, None, "the pull is not over");
-            assert_eq!(m.fight_state(2_000 + 10 * idle()), FightState::Active);
+            assert_eq!(m.fight_state(2_000 + 6 * idle()), FightState::Active);
 
             // ...and once the twin falls too, the fight ends on the kill.
             m.apply(&boss_hit(11, 3_000, true));
@@ -5229,6 +5401,214 @@ mod tests {
                 FightState::Ended,
                 "a hit older than the death it preceded cannot revive a corpse"
             );
+        }
+    }
+
+    /// Issue #210/#211: a boss-select raid scene lets the party pick which
+    /// of several final bosses to pull (`phase::is_boss_select_scene`).
+    /// Killing the currently-engaged selection must end that fight exactly
+    /// like an ordinary single-boss dungeon, and picking the next selection
+    /// must start a brand-new fight rather than continuing the dead one's.
+    mod boss_select_scene {
+        use super::*;
+
+        /// Scene 13023, "Purge! Field of Forgotten Illusions" — the raid
+        /// issue #150 and issue #210 were both reported from
+        /// (`tables::scene_name`, `phase::is_boss_select_scene`).
+        const RAID_SCENE: u32 = 13_023;
+        /// Paradox-Calamity Remnant - Origin: the raid's first selection.
+        const ORIGIN: u32 = 103_108;
+        /// Paradox-Calamity Remnant - Continuation: the second selection.
+        const CONTINUATION: u32 = 103_208;
+
+        fn idle() -> u64 {
+            FightConfig::default().idle_timeout_ms
+        }
+
+        fn in_raid() -> Meter {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: RAID_SCENE,
+            });
+            m
+        }
+
+        fn hp(uid: i64, curr: u64, max: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::EnemyHp(EnemyHp {
+                uid,
+                curr_hp: Some(curr),
+                max_hp: Some(max),
+                monster_id: Some(monster_id),
+                timestamp_ms: ts,
+            })
+        }
+
+        /// A player hit on monster `uid`, optionally the killing blow.
+        fn hit(uid: i64, ts: u64, is_dead: bool) -> ProtocolEvent {
+            ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: uid,
+                target_kind: EntityKind::Monster,
+                value: 500,
+                is_dead,
+                timestamp_ms: ts,
+                ..Default::default()
+            })
+        }
+
+        #[test]
+        fn killing_the_first_selection_ends_the_fight_and_the_next_selection_starts_fresh() {
+            let mut m = in_raid();
+            m.apply(&hp(10, 1_000_000, 1_000_000, ORIGIN, 0));
+            m.apply(&hit(10, 1_000, false));
+            m.apply(&hit(10, 2_000, true));
+
+            assert_eq!(
+                m.fight_state(2_100),
+                FightState::Ended,
+                "the kill should end the fight immediately"
+            );
+            assert_eq!(
+                m.fight_end_boss_id,
+                Some(ORIGIN),
+                "cause=boss_death: only end_fight_on_boss_death ever sets this"
+            );
+
+            // Selecting the next boss must start a brand-new fight, not
+            // resume the dead one's numbers — Origin and Continuation are
+            // deliberately not phase-grouped (issue #153).
+            m.apply(&hp(11, 1_000_000, 1_000_000, CONTINUATION, 5_000));
+            let reason = m.apply(&hit(11, 6_000, false));
+            assert_eq!(reason, Some(ResetReason::NewFight));
+            assert_eq!(
+                m.snapshot(6_100).total_damage,
+                500,
+                "boss 2's damage must not include boss 1's"
+            );
+        }
+
+        #[test]
+        fn a_boss_never_seen_to_die_does_not_wedge_the_fight_open_forever() {
+            // Issue #210/#211: production logs show a boss's death can
+            // simply never be observed — no `is_dead` damage event and no
+            // `EnemyHp` sync to 0, ever (a dropped TCP segment). The old
+            // `engaged_boss_still_up` read a never-observed death as "alive"
+            // permanently, which permanently suppressed the idle-timeout
+            // fallback that is the only other way a fight can end.
+            let mut m = in_raid();
+            m.apply(&hp(10, 1_000_000, 1_000_000, ORIGIN, 0));
+            m.apply(&hit(10, 1_000, false));
+
+            // Well past the idle timeout but still inside the boss
+            // engagement window: a real mechanic/immunity lull, so the pull
+            // must still read as active (issue #151).
+            assert_eq!(
+                m.fight_state(1_000 + 5 * idle()),
+                FightState::Active,
+                "a lull inside the engagement window must not end the fight"
+            );
+
+            // No death signal ever arrives. Once nobody has touched the
+            // boss for longer than the engagement window, the idle timeout
+            // must be allowed to reclaim the fight instead of hanging
+            // forever.
+            let far_later = 1_000 + BOSS_ENGAGEMENT_WINDOW_MS + idle() + 1;
+            assert_eq!(m.fight_state(far_later), FightState::Ended);
+            assert_eq!(
+                m.fight_end_boss_id, None,
+                "an idle-timeout end, not a boss-death end"
+            );
+        }
+
+        #[test]
+        fn a_selections_death_still_ends_the_fight_even_though_the_other_selection_was_engaged_long_ago_and_left_alone()
+         {
+            // Defect 2: `recompute_boss` ranks a living enemy above a dead
+            // one, so once Origin is marked dead, `recompute_boss` moves
+            // `boss_uid` onto the already-damaged, still-alive Continuation
+            // *before* the `boss_uid == target_uid` guard below is checked
+            // — unless that fact is captured first.
+            //
+            // Defect 3: even with the ordering fixed, `has_other_living_boss`
+            // must not read Continuation as "another living boss" holding
+            // the pull open just because it is the raid's other selection —
+            // sequential play, issue #150/#210's raid shape, not Caprahorn's
+            // concurrent pair.
+            //
+            // Continuation is deliberately engaged *once*, long enough ago
+            // to fall outside `BOSS_ENGAGEMENT_WINDOW_MS` by the time Origin
+            // dies, and never touched again — a single stray hit followed by
+            // abandonment, not the sustained concurrent engagement the
+            // co-engagement rule exists to recognize (see the Caprahorn test
+            // below for that case). Origin is re-hit periodically, always
+            // within the idle timeout of the previous event, so none of
+            // those hits are themselves intercepted by the idle-timeout
+            // preemption at the top of `apply_damage`.
+            let mut m = in_raid();
+            // Origin carries the bigger pool, so it is the tracked boss.
+            m.apply(&hp(10, 2_000_000, 2_000_000, ORIGIN, 0));
+            m.apply(&hp(11, 1_000_000, 1_000_000, CONTINUATION, 0));
+            m.apply(&hit(10, 1_000, false));
+            m.apply(&hit(11, 1_100, false));
+            assert_eq!(m.boss_uid, Some(10), "Origin, the larger pool, is tracked");
+
+            let step = idle() - 1_000; // comfortably inside the idle timeout
+            let mut ts = 1_100;
+            while ts <= 1_100 + BOSS_ENGAGEMENT_WINDOW_MS {
+                ts += step;
+                m.apply(&hit(10, ts, false));
+            }
+            let kill_ts = ts + step;
+            m.apply(&hit(10, kill_ts, true));
+
+            assert_eq!(
+                m.fight_end_ms,
+                Some(kill_ts),
+                "Origin's death must still end the fight"
+            );
+            assert_eq!(m.fight_end_boss_id, Some(ORIGIN));
+        }
+
+        #[test]
+        fn the_real_caprahorn_pair_holds_the_pull_open_in_its_own_boss_select_scene() {
+            // Regression guard (issue #210 review): Dreambloom Ruins
+            // (13011/13012/13013) is itself a `phase::is_boss_select_scene`
+            // — the same kind of scene as Field of Forgotten Illusions — but
+            // its Caprahorn selection spawns *two* equal-HP bosses fought
+            // *concurrently* rather than sequentially
+            // (`phase::BOSS_SELECT_SCENES`'s own doc comment). A blanket
+            // "boss-select scene disables `has_other_living_boss`" fix would
+            // end the fight the instant the first twin falls even though its
+            // partner is still being actively hit — exactly the bug
+            // `the_second_of_a_boss_pair_holds_the_pull_open_after_the_first_dies`
+            // guards against, just inside a real boss-select scene instead
+            // of a synthetic dungeon id.
+            const DREAMBLOOM_SCENE: u32 = 13_011;
+            /// "Rathalos", a recognized boss — stands in for one Caprahorn
+            /// twin.
+            const CAPRAHORN_A: u32 = 103;
+            /// "Moonstrike", the other half of the pair.
+            const CAPRAHORN_B: u32 = 102_801;
+
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: DREAMBLOOM_SCENE,
+            });
+            m.apply(&hp(10, 60, 60, CAPRAHORN_A, 0));
+            m.apply(&hp(11, 50, 50, CAPRAHORN_B, 0));
+            m.apply(&hit(10, 1_000, false));
+            m.apply(&hit(11, 1_100, false));
+
+            // The first twin falls; its partner was hit moments ago and is
+            // still very much being fought.
+            m.apply(&hit(10, 2_000, true));
+
+            assert_eq!(
+                m.fight_end_ms, None,
+                "the twin is still up and recently engaged"
+            );
+            assert_eq!(m.fight_state(2_100), FightState::Active);
         }
     }
 

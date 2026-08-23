@@ -2584,6 +2584,128 @@ pub fn write_clipboard_image(_image: &egui::ColorImage) -> Result<(), String> {
     Err("clipboard image writes are only implemented on Windows".to_string())
 }
 
+/// UTF-16, NUL-terminated — the shape every Win32 string parameter in this
+/// module wants (`WinHTTP`'s `PCWSTR`s in `http_get`, the `OPENFILENAMEW`
+/// fields in `choose_log_export_path`). One helper rather than one per
+/// caller: the two used to carry byte-identical private copies.
+///
+/// The returned buffer owns the bytes a `PCWSTR`/`PWSTR` built from it
+/// points at, so it must stay alive for as long as the call using it.
+#[cfg(windows)]
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Opens the native "Save As" common dialog so the user picks where the
+/// header dropdown's "Export logs" item (`ui::draw_header_menu`, issue
+/// #220) writes the bundled log file — issue #220 is explicit that this
+/// crate must never pick a fixed or hidden destination itself (logs may
+/// carry player names and other identifying traffic, per `logging`'s
+/// module doc comment, so silently dropping a file somewhere is worse than
+/// just not exporting). `default_filename` seeds the dialog's file name box
+/// (`logging::EXPORT_DEFAULT_FILENAME`); the user can still rename it
+/// before saving.
+///
+/// `GetSaveFileNameW` (the classic common dialog), not `IFileSaveDialog`
+/// (the modern COM one): this crate has no COM initialization anywhere
+/// today, and the COM dialog needs one (`CoInitializeEx`) plus a new
+/// `Win32_System_Com` feature — for a plain "pick a file to save" prompt
+/// with none of `IFileSaveDialog`'s extras (custom places, multiple
+/// simultaneous filters) actually needed here.
+///
+/// Synchronous and blocking, deliberately unlike `http_get`'s "always call
+/// from a spawned thread" rule: `GetSaveFileNameW` is itself a modal
+/// dialog — the OS already blocks input to its owner window for as long as
+/// it's up — so calling it straight from `ui.rs`'s click handler adds no
+/// blocking that wasn't already going to happen.
+///
+/// That reasoning covers this dialog and nothing after it (PR #227
+/// review): the export's own copy can move up to two files of
+/// `logging::MAX_LOG_BYTES` each, which the OS is *not* already blocking
+/// the frame thread on, so `ui::start_log_export` runs it on a spawned
+/// thread once this function has returned a destination.
+///
+/// Owned by the cached `OVERLAY_HWND` when it's available (same
+/// load-and-guard shape as `force_frame_recompute`) so the dialog is modal
+/// to the overlay window; falls back to no owner if it hasn't been cached
+/// yet rather than failing outright.
+///
+/// Returns `None` if the user cancels, closes the dialog, or the call
+/// otherwise fails (e.g. `CommDlgExtendedError`-reported failure) — the
+/// caller treats every one of those the same: do nothing.
+#[cfg(windows)]
+pub fn choose_log_export_path(default_filename: &str) -> Option<std::path::PathBuf> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetSaveFileNameW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    let raw = OVERLAY_HWND.load(std::sync::atomic::Ordering::SeqCst);
+    // Inverse of the store in `disable_aero_snap` — see
+    // `force_frame_recompute`'s identical cast/guard for why a zero raw
+    // value means "not cached yet" rather than a literal null HWND to pass
+    // through.
+    let owner = if raw == 0 {
+        HWND(std::ptr::null_mut())
+    } else {
+        HWND(raw as *mut std::ffi::c_void)
+    };
+
+    // `lpstrFile` is in/out: seeded with the suggested name below, and
+    // overwritten with the user's chosen full path on success. 32767 is
+    // the documented practical ceiling for this API's buffer (the NTFS
+    // long-path limit), so it comfortably fits any real save location.
+    let mut file_buf = vec![0u16; 32767];
+    let default_wide = wide(default_filename);
+    file_buf[..default_wide.len()].copy_from_slice(&default_wide);
+
+    let filter = wide("Log files\0*.log\0All files\0*.*\0");
+    let title = wide("Export ShinraMeter-BPSR logs");
+    let def_ext = wide("log");
+
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(file_buf.as_mut_ptr()),
+        nMaxFile: file_buf.len() as u32,
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        lpstrDefExt: PCWSTR(def_ext.as_ptr()),
+        Flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST,
+        ..Default::default()
+    };
+
+    // SAFETY: every pointer field set above (`lpstrFilter`, `lpstrFile`,
+    // `lpstrTitle`, `lpstrDefExt`) is backed by a `Vec<u16>` that outlives
+    // this call and, for `lpstrFile`, is sized well past anything
+    // `GetSaveFileNameW` could write back into it. `hwndOwner` is either a
+    // still-live handle cached from winit's own window (see
+    // `force_frame_recompute`'s identical reasoning) or the null default,
+    // both valid `HWND` values for this call.
+    let ok = unsafe { GetSaveFileNameW(&mut ofn) };
+    if !ok.as_bool() {
+        return None;
+    }
+
+    let end = file_buf.iter().position(|&unit| unit == 0).unwrap_or(0);
+    if end == 0 {
+        return None;
+    }
+    Some(std::path::PathBuf::from(String::from_utf16_lossy(
+        &file_buf[..end],
+    )))
+}
+
+/// Non-Windows stub — see `choose_log_export_path`'s doc comment. Dev/CI
+/// hosts for this crate are Linux, so there is no native save dialog to
+/// call; `ui.rs`'s click handler treats `None` as "the user didn't pick a
+/// destination" either way, which is also the correct behavior here.
+#[cfg(not(windows))]
+pub fn choose_log_export_path(_default_filename: &str) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Issue #171: the manual "Check for updates" header-menu item needs an
 /// HTTPS GET to GitHub's releases API, and — same reasoning as every other
 /// function in this module — egui/eframe expose no HTTP client at all, so
@@ -2631,12 +2753,6 @@ pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, Stri
                 let _ = unsafe { WinHttpCloseHandle(self.0) };
             }
         }
-    }
-
-    /// UTF-16, NUL-terminated — every WinHTTP string parameter below wants
-    /// exactly this shape.
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
     // SAFETY (this whole function): every WinHTTP call below is handed
