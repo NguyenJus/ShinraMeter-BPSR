@@ -4,13 +4,15 @@
 //! `bpsr_meter::Snapshot` handed to it over a channel and emits `UiCommand`s
 //! for the app layer to act on. No threads or channels are created in this
 //! module beyond the `crossbeam_channel` endpoints eframe's caller hands in
-//! — with one deliberate exception: issue #171's "Check for updates"
-//! header-menu item (`draw_header_menu`, `UpdateCheckState`) spawns its own
-//! one-shot `std::thread` and owns its own `crossbeam_channel` pair, the
-//! same way `settings::spawn_writer` and `pipeline::spawn` do at the app
-//! layer, because the app layer has no channel of its own suited to a
-//! single manual, UI-triggered request/reply.
+//! — with two deliberate exceptions, both header-menu items: issue #171's
+//! "Check for updates" (`draw_header_menu`, `UpdateCheckState`) and issue
+//! #220's "Export logs" (`start_log_export`). Each spawns its own one-shot
+//! `std::thread` and reports back over a `crossbeam_channel`, the same way
+//! `settings::spawn_writer` and `pipeline::spawn` do at the app layer,
+//! because the app layer has no channel of its own suited to a single
+//! manual, UI-triggered request/reply.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bpsr_meter::{
@@ -265,6 +267,20 @@ pub struct OverlayApp {
     /// per frame regardless of whether the dropdown happens to be open
     /// that frame. See `UpdateCheckState`'s own doc comment.
     update_check: UpdateCheckState,
+    /// Issue #220 (PR #227 review): replies from the one-shot threads
+    /// `start_log_export` spawns for the header dropdown's "Export logs"
+    /// item. Drained once per frame by `poll_log_export`, unconditionally,
+    /// the same shape `poll_update_check` and `poll_history` use — the
+    /// dropdown closes on the click, so a reply has no menu state left to
+    /// land in and goes to the status banner instead.
+    ///
+    /// A persistent channel pair (rather than `UpdateCheckState`'s
+    /// per-request channel) because nothing disables the menu item while an
+    /// export runs: two exports can legitimately be in flight at once, and
+    /// a single stored `Receiver` would drop the first one's reply.
+    rx_log_export: Receiver<LogExportOutcome>,
+    /// The sender half of `rx_log_export`, cloned into each export thread.
+    tx_log_export: Sender<LogExportOutcome>,
     /// Issue #156: consecutive frames `screenshot_capturing` has been
     /// held `true` with neither a new request nor a landed reply this
     /// frame — reset to `0` by `advance_screenshot_capture_wait` the
@@ -685,6 +701,7 @@ impl OverlayApp {
         let demo_mode = demo_enabled();
         let snapshot = initial_snapshot(demo_mode);
         let (tx_history, rx_history) = crossbeam_channel::unbounded();
+        let (tx_log_export, rx_log_export) = crossbeam_channel::unbounded();
         Self {
             snapshot,
             status: StatusLine::Ok,
@@ -700,6 +717,8 @@ impl OverlayApp {
             pending_screenshot_bound: None,
             screenshot_capturing: false,
             update_check: UpdateCheckState::Idle,
+            rx_log_export,
+            tx_log_export,
             screenshot_capture_frames_waited: 0,
             demo_mode,
             startup_toggles_applied: false,
@@ -793,6 +812,35 @@ impl OverlayApp {
         };
         if let Some(outcome) = landed {
             self.update_check = UpdateCheckState::Done(outcome);
+        }
+    }
+
+    /// Issue #220 (PR #227 review): picks up whatever the "Export logs"
+    /// threads have finished. Like `poll_update_check`, drained once per
+    /// frame whether or not the dropdown is open — the item closes the
+    /// dropdown on click, so by the time a multi-megabyte copy finishes
+    /// there is no menu left to report through.
+    ///
+    /// A failure lands on the panel's existing transient error banner (the
+    /// same one the Share clipboard failure uses) as well as the log: the
+    /// log-only reporting this used to do told a user whose export silently
+    /// produced nothing exactly nothing, in the one situation where they
+    /// are already trying to hand over a log. A success is logged only —
+    /// `StatusLine` has no non-error state to say it with, and the file
+    /// appearing where the user just chose to put it is its own feedback.
+    fn poll_log_export(&mut self, now: Instant) {
+        // Collected before the loop rather than iterated in place: the
+        // failure arm below needs `&mut self`, which a live borrow of
+        // `self.rx_log_export` would rule out.
+        let landed: Vec<LogExportOutcome> = self.rx_log_export.try_iter().collect();
+        for outcome in landed {
+            match outcome {
+                Ok(dest) => log::info!("exported logs to {}", dest.display()),
+                Err((dest, err)) => {
+                    log::warn!("failed to export logs to {}: {err}", dest.display());
+                    self.raise_transient_status(format!("Export logs failed: {err}"), now);
+                }
+            }
         }
     }
 }
@@ -935,6 +983,10 @@ impl eframe::App for OverlayApp {
         } else if screenshot_event_landed {
             self.clear_transient_status();
         }
+        // Issue #220 (PR #227 review): drained here, alongside the Share
+        // banner handling just above, because a failed export raises the
+        // same transient banner and so needs the same `now`.
+        self.poll_log_export(now);
         self.expire_transient_status(now);
         // Issue #183: reconcile the OS-level mouse passthrough with what
         // click-through wants *this* frame — see `platform::click_through_
@@ -1054,6 +1106,7 @@ impl eframe::App for OverlayApp {
                     capturing,
                     share_active,
                     &mut self.update_check,
+                    &self.tx_log_export,
                     self.history.is_some(),
                     &mut open_history_clicked,
                     header_history,
@@ -1459,6 +1512,10 @@ fn draw_header(
     // in-flight/last-result state — threaded through to `draw_header_menu`,
     // the only place that reads or mutates it.
     update_check: &mut UpdateCheckState,
+    // Issue #220: where the "Export logs" item's spawned copy thread
+    // reports back to — threaded through to `draw_header_menu`, the only
+    // place that clones it.
+    tx_log_export: &Sender<LogExportOutcome>,
     // Issue #39: whether the history thread exists at all — threaded
     // through to `toggle_cluster` (issue #186 moved the History control
     // there from `draw_header_menu`) so its History button can be disabled
@@ -1635,6 +1692,7 @@ fn draw_header(
                 },
                 icons,
                 update_check,
+                tx_log_export,
             );
         });
     draw_subtitle_line(ui, subtitle.as_deref().unwrap_or(""));
@@ -3626,7 +3684,8 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
 /// Order matches the spec: a Columns disclosure section (issue #13's stat
 /// column toggles, unchanged in behavior — just relocated), a separator,
 /// the Opacity slider (issue #166), a separator, Minimize to tray, a
-/// separator, Check for updates and its result line (issue #171), a
+/// separator, Reset to defaults (issue #203) and Export logs (issue #220),
+/// a separator, Check for updates and its result line (issue #171), a
 /// separator, then Close. "Forget learned bosses" (issue #131) sat between
 /// the Opacity slider and Minimize until issue #201 replaced the runtime
 /// scene -> boss learning it reset with a curated static table
@@ -3678,6 +3737,9 @@ fn draw_header_menu(
     // Issue #171: the manual "Check for updates" item's in-flight/last-
     // result state — see `UpdateCheckState`'s doc comment.
     update_check: &mut UpdateCheckState,
+    // Issue #220: the reply channel each "Export logs" click's spawned
+    // thread sends its outcome back over — see `LogExportOutcome`.
+    tx_log_export: &Sender<LogExportOutcome>,
 ) {
     let SettingsHandle {
         settings,
@@ -3809,6 +3871,26 @@ fn draw_header_menu(
         ui.close();
     }
 
+    // Issue #220: a user hitting a bug has no in-app way to hand over the
+    // logs `logging::init` already writes for exactly this purpose. Never a
+    // fixed or hidden path — the save dialog is what lets the user pick the
+    // destination themselves, per the issue.
+    //
+    // The dialog itself is called inline, on this thread:
+    // `platform::choose_log_export_path`'s own doc comment explains why a
+    // modal the OS is already blocking on needs no thread. The copy that
+    // follows is a different matter — up to two files of
+    // `logging::MAX_LOG_BYTES` — so it goes to a spawned thread (PR #227
+    // review), the "Check for updates" shape.
+    if ui.button("Export logs").clicked() {
+        if let Some(dest) =
+            crate::platform::choose_log_export_path(crate::logging::EXPORT_DEFAULT_FILENAME)
+        {
+            start_log_export(dest, tx_log_export.clone());
+        }
+        ui.close();
+    }
+
     ui.separator();
 
     // Issue #171: manual-only, per the issue — there is no automatic or
@@ -3919,6 +4001,54 @@ fn start_update_check() -> UpdateCheckState {
         })
         .expect("failed to spawn the update-check thread");
     UpdateCheckState::Checking { rx }
+}
+
+/// What one "Export logs" thread reports back (issue #220): the
+/// destination it finished writing, or that destination plus why it
+/// couldn't. The destination rides along on the failure too so
+/// `OverlayApp::poll_log_export` can name it in the log line — by the time
+/// a reply lands, the click that chose it is long gone.
+type LogExportOutcome = Result<PathBuf, (PathBuf, String)>;
+
+/// Starts a log export (issue #220, PR #227 review): spawns a one-shot
+/// `std::thread` that bundles the log files into `dest` and sends the
+/// outcome back over `tx`, a clone of `OverlayApp::tx_log_export` that
+/// `poll_log_export` drains once a frame.
+///
+/// Off the frame thread because `logging::export_logs_to` copies up to two
+/// files of `logging::MAX_LOG_BYTES` each — a ~10MB disk copy, which is
+/// exactly the multi-frame stall the overlay must not take while the game
+/// is running. Same one-shot shape as `start_update_check`, and for the
+/// same reason.
+///
+/// Resolving the log path happens on the spawned thread as well: it is
+/// `std::env::var` plus path joining, cheap either way, and keeping it
+/// beside the copy leaves the click handler with nothing to do but hand
+/// over the destination.
+fn start_log_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
+    std::thread::Builder::new()
+        .name("export-logs".to_string())
+        .spawn(move || {
+            let (log_path, _warning) = crate::logging::log_file_path();
+            let outcome = match crate::logging::export_logs_to(&log_path, &dest) {
+                Ok(()) => Ok(dest),
+                Err(err) => Err((dest, err.to_string())),
+            };
+            // A dropped receiver means the app is shutting down; the export
+            // itself already happened, so there is nothing to report or
+            // retry.
+            let _ = tx.send(outcome);
+        })
+        .expect("failed to spawn the export-logs thread");
+}
+
+/// The "Export logs" reply channel the header tests below hand to
+/// `draw_header`/`draw_header_menu`. None of them click that item, so
+/// nothing is ever sent over it — it exists only to satisfy the parameter,
+/// and its dropped `Receiver` matters to nobody for the same reason.
+#[cfg(test)]
+fn unused_log_export_sender() -> Sender<LogExportOutcome> {
+    crossbeam_channel::unbounded().0
 }
 
 /// Smallest inner size the overlay may be resized to, in points. Shared by
@@ -7651,6 +7781,48 @@ mod tests {
         );
     }
 
+    /// Issue #220 (PR #227 review): the export copy runs on a spawned
+    /// thread now, so its outcome lands on some later frame — a failure on
+    /// the same transient banner the Share failure uses, a success on the
+    /// log alone (`StatusLine` has no non-error state to say it with).
+    #[test]
+    fn a_failed_log_export_raises_a_transient_banner_and_a_successful_one_stays_quiet() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+        let now = Instant::now();
+        let dest = PathBuf::from("exported-logs.log");
+
+        app.tx_log_export.send(Ok(dest.clone())).unwrap();
+        app.poll_log_export(now);
+        assert_eq!(
+            app.status,
+            StatusLine::Ok,
+            "an export that worked must not raise a banner"
+        );
+
+        app.tx_log_export
+            .send(Err((dest, "permission denied".to_owned())))
+            .unwrap();
+        app.poll_log_export(now);
+        assert!(
+            matches!(&app.status, StatusLine::Error(msg) if msg.contains("permission denied")),
+            "a failed export must say why on the banner, not only in the log: {:?}",
+            app.status
+        );
+
+        // Transient, like the Share failure it borrows the banner from.
+        app.expire_transient_status(now + TRANSIENT_STATUS_LINGER);
+        assert_eq!(app.status, StatusLine::Ok);
+    }
+
     #[test]
     fn fmt_short_below_thousand_is_plain() {
         assert_eq!(fmt_short(999), "999");
@@ -7881,6 +8053,7 @@ mod tests {
                 false,
                 true,
                 &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
                 false,
                 &mut false,
                 None,
@@ -8039,6 +8212,7 @@ mod tests {
                 false,
                 true,
                 &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
                 false,
                 &mut false,
                 None,
@@ -8293,6 +8467,7 @@ mod tests {
                 false,
                 true,
                 &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
                 false,
                 &mut false,
                 None,
@@ -8377,6 +8552,7 @@ mod tests {
                 false,
                 true,
                 &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
                 false,
                 &mut false,
                 None,
@@ -13693,6 +13869,7 @@ mod tests {
                     },
                     &icons,
                     update_check,
+                    &unused_log_export_sender(),
                 );
             });
             let update = output
@@ -13747,6 +13924,7 @@ mod tests {
                 },
                 &icons,
                 &mut update_check,
+                &unused_log_export_sender(),
             );
         });
         let mut texts = Vec::new();
@@ -13789,6 +13967,7 @@ mod tests {
                 },
                 &icons,
                 &mut update_check,
+                &unused_log_export_sender(),
             );
         });
         let mut texts = Vec::new();
@@ -13833,6 +14012,7 @@ mod tests {
                 },
                 &icons,
                 &mut update_check,
+                &unused_log_export_sender(),
             );
         });
         let mut texts = Vec::new();
@@ -13880,6 +14060,7 @@ mod tests {
                 },
                 &icons,
                 &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
             );
         });
         let update = layout
@@ -13902,6 +14083,7 @@ mod tests {
                 },
                 &icons,
                 &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
             );
         });
         let close_commands = output
@@ -13959,6 +14141,7 @@ mod tests {
                 },
                 &icons,
                 &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
             );
         });
         let update = layout
@@ -13988,6 +14171,7 @@ mod tests {
                 },
                 &icons,
                 &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
             );
         });
         output.drop_without_applying_deltas();
@@ -14021,6 +14205,7 @@ mod tests {
                 },
                 &icons,
                 &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
             );
         });
         output.drop_without_applying_deltas();
@@ -14064,6 +14249,7 @@ mod tests {
                 },
                 &icons,
                 &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
             );
         });
         let update = layout
@@ -14086,6 +14272,7 @@ mod tests {
                 },
                 &icons,
                 &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
             );
         });
         let viewport_commands = output
@@ -14189,6 +14376,7 @@ mod tests {
                     false,
                     true,
                     &mut update_check,
+                    &unused_log_export_sender(),
                     false,
                     &mut false,
                     None,
