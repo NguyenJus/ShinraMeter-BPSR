@@ -1544,10 +1544,10 @@ impl Meter {
         // sync's `curr_hp == 0` stamps `e.uid`'s death order above, any
         // other recognized boss already damaged and still alive outranks
         // the corpse and `recompute_boss` moves `boss_uid` off it. Mirrors
-        // `apply_damage`'s capture, and gates the whole block below (the
-        // death latch and the HP-rollback reset alike) on whether `e.uid`
-        // was the tracked boss when this update landed, not on whichever
-        // enemy `recompute_boss` happens to prefer afterward.
+        // `apply_damage`'s capture: it answers whether `e.uid` was the
+        // tracked boss when this update landed, which is the only form of
+        // the question a *death* can still be asked after the ranking has
+        // reacted to it.
         let was_tracked_boss = self.boss_uid == Some(e.uid);
 
         self.recompute_boss();
@@ -1561,7 +1561,22 @@ impl Meter {
             {
                 self.end_fight_on_boss_death(e.uid, e.timestamp_ms);
             }
+        }
 
+        // PR #223 review, finding 1: deliberately the *post*-`recompute_boss`
+        // identity, not `was_tracked_boss`. The two checks ask opposite
+        // questions of the same sync. A death asks "was this the boss we were
+        // following?", and only the pre-capture can answer it, because dying
+        // is itself what demotes the enemy out of `boss_uid`. A rollback asks
+        // "is the boss we are following the one whose bar just refilled?" —
+        // and refilling is what *promotes* an enemy into `boss_uid`, since in
+        // the tier-0 (`curr_hp`-only, issue #76) ranking the bar's height is
+        // the rank. The canonical wipe is exactly that: the boss the party
+        // burned to 20% snaps back to full in one sync, overtaking whatever
+        // trash or sibling boss led the ranking while it was low. Gating that
+        // on the pre-capture drops the reset on the floor, which is how the
+        // wipe's damage keeps piling into the next pull.
+        if self.boss_uid == Some(e.uid) {
             let cooldown_ok = match self.last_reset_ms {
                 Some(last) => e.timestamp_ms.saturating_sub(last) >= self.reset_cfg.cooldown_ms,
                 None => true,
@@ -3555,6 +3570,58 @@ mod tests {
             // A partial recovery well short of the peak is just healing.
             assert_eq!(m.apply(&curr_hp_only(10, 2_000_000, 200)), None);
             assert_eq!(m.apply(&curr_hp_only(10, 500_000, 300)), None);
+        }
+
+        /// PR #223 review, finding 2: the rollback reset must survive the
+        /// sync that *hands* `boss_uid` to the boss doing the rolling back.
+        ///
+        /// Two recognized bosses pulled together, both known only by
+        /// `curr_hp` (issue #76's mid-pull join), so the ranking is a raw HP
+        /// comparison and the leader changes whenever their bars cross. The
+        /// wipe arrives as one `EnemyHp` that does two things at once: it
+        /// completes B's 20% -> 100% rollback shape *and* lifts B's bar over
+        /// A's, promoting B to `boss_uid` inside the very call that has to
+        /// notice the rollback. Gating the rollback on the pre-`recompute_boss`
+        /// capture the boss-death latch needs (issue #210/#211) made this
+        /// return `None`: B was not the tracked boss when the sync landed,
+        /// only immediately afterwards.
+        #[test]
+        fn rollback_fires_when_the_refill_itself_promotes_the_boss() {
+            /// A second recognized boss, so both sides of the pair clear the
+            /// `is_boss_monster` gate and only their HP separates them.
+            const OTHER_BOSS: u32 = 102_801;
+
+            fn curr_only(uid: i64, curr: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
+                ProtocolEvent::EnemyHp(EnemyHp {
+                    uid,
+                    curr_hp: Some(curr),
+                    max_hp: None,
+                    monster_id: Some(monster_id),
+                    timestamp_ms: ts,
+                })
+            }
+
+            let mut m = Meter::new();
+            // A is the bigger bar, so it holds `boss_uid` throughout the
+            // pull...
+            m.apply(&boss_hit(10, 0));
+            assert_eq!(m.apply(&curr_only(10, 1_000, BOSS, 0)), None);
+            // ...while B is engaged alongside it and burned to 20% of its
+            // own peak.
+            m.apply(&boss_hit(11, 10));
+            assert_eq!(m.apply(&curr_only(11, 500, OTHER_BOSS, 10)), None);
+            assert_eq!(m.apply(&curr_only(11, 100, OTHER_BOSS, 100)), None);
+            assert_eq!(m.boss_uid, Some(10));
+
+            // The wipe: B's bar snaps back past its peak in a single sync,
+            // which is both the rollback signature and the moment B outranks
+            // A.
+            let r = m.apply(&curr_only(11, 2_000, OTHER_BOSS, 200));
+            assert_eq!(r, Some(ResetReason::BossHpRollback));
+            // The reset clears the board, `boss_uid` included, so B's
+            // promotion is only observable through the reset having fired
+            // at all.
+            assert_eq!(m.snapshot(1_000).total_damage, 0);
         }
 
         #[test]
