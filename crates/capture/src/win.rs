@@ -34,7 +34,9 @@ use crate::driver::{Api, WinDivertAddress};
 use crate::error::CaptureError;
 use crate::restart::CaptureRestart;
 use crate::tcp::TcpReassembler;
-use crate::throughput::{self, Heartbeat, ThroughputMonitor};
+use crate::throughput::{
+    self, Heartbeat, HeartbeatKind, PacketRecord, SharedMonitor, Tick, WATCHDOG_TICK, run_watchdog,
+};
 
 /// WinDivert filter: every non-loopback TCP/IP packet, in either direction.
 const FILTER: &str = "!loopback && ip && tcp";
@@ -78,6 +80,11 @@ pub struct CaptureHandle {
     /// to move it out through `&mut self` — a value of a type that
     /// implements `Drop` cannot be partially moved out of by value.
     join: Option<JoinHandle<()>>,
+    /// The heartbeat watchdog (issue #271). Held separately because it is
+    /// deliberately *not* the packet thread: it wakes on a wall clock, so
+    /// the diagnostics keep running when no packet the capture loop cares
+    /// about — or no packet at all — is arriving.
+    heartbeat_join: Option<JoinHandle<()>>,
     /// Set once [`Self::shutdown_and_close`] has run, so a second call
     /// (`stop()` followed by the `Drop` that runs when it returns) is a
     /// no-op instead of re-running `WinDivertShutdown`/`WinDivertClose` on an
@@ -140,6 +147,12 @@ impl CaptureHandle {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+        // The watchdog never touches the driver handle, but it is joined
+        // here anyway so the thread is gone before the process moves on —
+        // it notices the stop flag within one `WATCHDOG_TICK`.
+        if let Some(join) = self.heartbeat_join.take() {
+            let _ = join.join();
+        }
         // SAFETY: the capture thread has exited (or was never spawned with
         // this handle outstanding), so nothing can use the handle after
         // this point.
@@ -189,6 +202,12 @@ pub fn start_capture(
     // HANDLE`-style escape hatch — which would silently cover every other
     // handle type too — has to exist for it.
     let thread_handle = handle.0 as usize;
+    // Issue #213: what capture is actually delivering, so "the game sent
+    // nothing" and "reassembly ate the stream" stop looking identical in a
+    // log. Shared rather than owned by the packet loop because of #271 —
+    // see `heartbeat_loop`.
+    let monitor = SharedMonitor::new(Instant::now());
+    let loop_monitor = monitor.clone();
     let join = thread::spawn(move || {
         recv_loop(
             api,
@@ -197,7 +216,14 @@ pub fn start_capture(
             thread_stop,
             thread_restart,
             inspect_sink,
+            loop_monitor,
         )
+    });
+
+    let heartbeat_stop = Arc::clone(&stop);
+    let heartbeat_restart = restart.clone();
+    let heartbeat_join = thread::spawn(move || {
+        heartbeat_loop(&monitor, &heartbeat_stop, &heartbeat_restart);
     });
 
     Ok(CaptureHandle {
@@ -206,8 +232,51 @@ pub fn start_capture(
         handle,
         api,
         join: Some(join),
+        heartbeat_join: Some(heartbeat_join),
         closed: false,
     })
+}
+
+/// Issue #271: the heartbeat's own thread.
+///
+/// `ThroughputMonitor::poll` used to be called from the bottom of
+/// [`recv_loop`], below six `continue`s — two of which skip every packet
+/// that is not a server→client segment of the adopted flow. The result was
+/// that the heartbeat, and #214's self-restart with it, fell silent in
+/// precisely the two states they exist to name: the game closed (nothing is
+/// ever adopted again, so nothing reaches the bottom of the loop) and the
+/// capture handle wedged (nothing arrives at all, so `recv` never returns).
+/// Both produced total log silence, indistinguishable from a healthy idle
+/// session.
+///
+/// Deciding on a wall clock in a thread of its own removes the question
+/// entirely: no `continue` can skip it and no packet has to arrive for it
+/// to run. The packet loop only records; the recovery action is routed back
+/// through the same [`CaptureRestart`] the UI uses, so there is exactly one
+/// re-anchoring code path.
+fn heartbeat_loop(monitor: &SharedMonitor, stop: &AtomicBool, restart: &CaptureRestart) {
+    run_watchdog(monitor, stop, WATCHDOG_TICK, |tick: Tick| {
+        if let Some(beat) = tick.beat {
+            log_heartbeat(&beat);
+        }
+        // Issue #214: the recovery #211 had no path to. Packets are still
+        // arriving on the adopted connection but nothing has reached the
+        // decoder for minutes, which no amount of further sniffing fixes —
+        // only re-anchoring does.
+        if tick.restart {
+            // The connection is named from the tick rather than from a local:
+            // this thread has no `known_server`, and a session with several
+            // zone changes needs the log to say *which* flow stalled.
+            log::error!(
+                "capture: nothing has reached the decoder in {:?} while packets kept arriving on \
+                 the tracked connection {}; re-running server detection and reassembly from \
+                 scratch (issue #214)",
+                throughput::STALL_RESTART_AFTER,
+                describe(tick.tracked.as_ref()),
+            );
+            restart.request();
+        }
+    });
 }
 
 /// Blocking single-packet receive. On success returns how many bytes of
@@ -228,6 +297,31 @@ fn recv_packet(api: &Api, handle: HANDLE, buffer: &mut [u8]) -> Result<usize, st
     unsafe { api.recv(handle, buffer, addr.as_mut_ptr()) }
 }
 
+/// Sets the shared stop flag when the packet loop leaves `recv_loop` by any
+/// route at all.
+///
+/// Only [`CaptureHandle::shutdown_and_close`] used to set it, so a
+/// `recv_loop` that gave up on its own — a handle dead for
+/// [`MAX_CONSECUTIVE_RECV_ERRORS`] receives in a row, or an event channel
+/// whose pipeline thread is gone — left [`heartbeat_loop`]'s watchdog awake
+/// for the rest of the session, waking every [`WATCHDOG_TICK`] to warn about
+/// a capture subsystem that is permanently dead. A `Drop` guard rather than a
+/// store at each `break`/`return` so a future exit path cannot forget to do
+/// it.
+struct StopOnExit(Arc<AtomicBool>);
+
+impl StopOnExit {
+    fn is_set(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for StopOnExit {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 fn recv_loop(
     api: &Api,
     handle: HANDLE,
@@ -235,7 +329,9 @@ fn recv_loop(
     stop: Arc<AtomicBool>,
     restart: CaptureRestart,
     inspect_sink: Option<Arc<dyn InspectSink>>,
+    monitor: SharedMonitor,
 ) {
+    let stop = StopOnExit(stop);
     let mut buffer = vec![0u8; RECV_BUFFER_SIZE];
     let mut known_server: Option<Conn> = None;
     let mut detector = ServerDetector::new();
@@ -245,14 +341,10 @@ fn recv_loop(
         None => Decoder::new(),
     };
     let mut consecutive_errors: u32 = 0;
-    // Issue #213: what capture is actually delivering, so "the game sent
-    // nothing" and "reassembly ate the stream" stop looking identical in a
-    // log. Polled on every packet; it rate-limits itself.
-    let mut monitor = ThroughputMonitor::new(Instant::now());
 
     log::info!("capture: WinDivert sniff loop started on filter {FILTER:?}");
 
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.is_set() {
         if restart.take_requested() {
             log::info!(
                 "capture: restart requested; dropping the tracked connection {} and re-running server detection",
@@ -266,6 +358,11 @@ fn recv_loop(
             // stream's sequence space — which is the state the restart
             // exists to escape (#211, #214).
             reassembler = TcpReassembler::new();
+            // The stall evidence goes with it: the packets that funded the
+            // verdict belonged to a connection that is no longer tracked,
+            // so they must not fund a second restart a tick later (#271).
+            monitor.note_detached();
+            monitor.record_gap_cache(0, 0);
         }
 
         let packet_len = match recv_packet(api, handle, &mut buffer) {
@@ -277,7 +374,7 @@ fn recv_loop(
                 // `CaptureHandle::stop` sets the flag *before* calling
                 // `WinDivertShutdown`, so an expected shutdown wakeup always
                 // finds it set: this is the normal exit, not a failure.
-                if stop.load(Ordering::Relaxed) {
+                if stop.is_set() {
                     break;
                 }
                 consecutive_errors += 1;
@@ -300,6 +397,12 @@ fn recv_loop(
             }
         };
         let packet = &buffer[..packet_len];
+        // Counted here, above every `continue` below, so a heartbeat can
+        // say whether the driver was delivering anything at all — which is
+        // what separates "the game is closed" from "the capture handle has
+        // stopped working" (#271).
+        monitor.record_observed();
+        let now = Instant::now();
 
         let Ok(sliced) = SlicedPacket::from_ip(packet) else {
             continue;
@@ -344,6 +447,7 @@ fn recv_loop(
                 tcp.fin(),
                 tcp.rst(),
             );
+            monitor.note_detached();
         }
         if decision.skip {
             // Either the client→server half of the adopted connection
@@ -360,14 +464,13 @@ fn recv_loop(
             );
             reassembler.resync(seq);
             decoder.reset();
+            monitor.note_adopted(conn);
             if tx.send(ProtocolEvent::ServerChanged).is_err() {
                 break;
             }
         }
 
-        if !payload.is_empty() {
-            monitor.record_packet();
-        }
+        let payload_packet = !payload.is_empty();
         reassembler.push(seq, payload);
         if reassembler.take_loss() {
             log::info!(
@@ -377,31 +480,19 @@ fn recv_loop(
         }
         let stream = reassembler.take_stream();
 
-        let now = Instant::now();
-        if !stream.is_empty() {
-            monitor.record_delivered(stream.len(), now);
-        }
-        if let Some(beat) = monitor.poll(now) {
-            log_heartbeat(&beat, &reassembler);
-        }
-        // Issue #214: the recovery #211 had no path to. Packets are still
-        // arriving on the adopted connection but nothing has reached the
-        // decoder for minutes, which no amount of further sniffing fixes —
-        // only re-anchoring does, and until now only the user changing
-        // zones could trigger that.
-        if monitor.restart_due(now) {
-            log::error!(
-                "capture: nothing has reached the decoder in {:?} while packets kept arriving on {}; \
-                 re-running server detection and reassembly from scratch (issue #214)",
-                throughput::STALL_RESTART_AFTER,
-                describe(known_server.as_ref()),
-            );
-            known_server = None;
-            detector.reset();
-            decoder.reset();
-            reassembler = TcpReassembler::new();
-            continue;
-        }
+        // One lock for the whole packet's accounting rather than one per
+        // counter. The gap cache is published here rather than read back at
+        // heartbeat time: the watchdog thread decides when to log and cannot
+        // reach the reassembler.
+        monitor.record(
+            PacketRecord {
+                payload_packet,
+                delivered: stream.len(),
+                gap_segments: reassembler.gap_segments(),
+                gap_bytes: reassembler.gap_bytes(),
+            },
+            now,
+        );
 
         if stream.is_empty() {
             continue;
@@ -430,31 +521,60 @@ fn describe(known_server: Option<&Conn>) -> String {
     }
 }
 
-/// Issue #213's throughput heartbeat. A window that delivered nothing while
-/// packets kept arriving is the #211 fingerprint and gets a `warn`;
-/// everything else is one `info` a minute, which is the entire budget for a
-/// log a user may have to hand over.
-fn log_heartbeat(beat: &Heartbeat, reassembler: &TcpReassembler) {
-    if beat.is_silent() && beat.packets > 0 {
-        log::warn!(
-            "capture: 0 bytes delivered to the decoder in {:.1?} while {} payload packet(s) arrived \
-             (silent for {:.1?}); reassembly is holding {} segment(s) / {} byte(s) behind a gap",
-            beat.window,
-            beat.packets,
-            beat.silent_for,
-            reassembler.gap_segments(),
-            reassembler.gap_bytes(),
-        );
-    } else {
-        log::info!(
-            "capture: {} byte(s) delivered to the decoder in {:.1?} from {} payload packet(s); \
-             gap cache {} segment(s) / {} byte(s)",
+/// Issue #213's throughput heartbeat, in the four flavours #271 asked it to
+/// tell apart. One line a minute is the entire budget for a log a user may
+/// have to hand over, so the level carries the diagnosis: `warn` for the two
+/// states that need looking at (a wedged stream, a handle that has stopped
+/// delivering) and `info` for the two that do not (bytes are flowing; the
+/// game simply is not running).
+fn log_heartbeat(beat: &Heartbeat) {
+    match beat.kind() {
+        HeartbeatKind::Delivering => log::info!(
+            "capture: {} byte(s) delivered to the decoder in {:.1?} from {} payload packet(s) \
+             ({} packet(s) seen on the link); gap cache {} segment(s) / {} byte(s)",
             beat.bytes,
             beat.window,
             beat.packets,
-            reassembler.gap_segments(),
-            reassembler.gap_bytes(),
-        );
+            beat.observed,
+            beat.gap_segments,
+            beat.gap_bytes,
+        ),
+        HeartbeatKind::Wedged => log::warn!(
+            "capture: 0 bytes delivered to the decoder in {:.1?} while {} payload packet(s) arrived \
+             on the tracked connection (silent for {:.1?}); reassembly is holding {} segment(s) / \
+             {} byte(s) behind a gap",
+            beat.window,
+            beat.packets,
+            beat.silent_for,
+            beat.gap_segments,
+            beat.gap_bytes,
+        ),
+        // Not a fault: the capture handle is demonstrably alive, the game
+        // is not sending. Said out loud anyway, because before #271 this
+        // was the silence that looked identical to a dead capture.
+        HeartbeatKind::NoGameTraffic => log::info!(
+            "capture: no game traffic in {:.1?} — {} packet(s) crossed the link, none of them on \
+             {} (silent for {:.1?}); capture is alive and waiting",
+            beat.window,
+            beat.observed,
+            if beat.adopted {
+                "the tracked connection"
+            } else {
+                "any adopted connection (none is adopted)"
+            },
+            beat.silent_for,
+        ),
+        // A filter this wide (`!loopback && ip && tcp`) going a full minute
+        // without a single packet is either a machine with no network
+        // activity whatsoever or a handle that has stopped delivering. The
+        // second is invisible from the app's UI, so it is worth the `warn`.
+        HeartbeatKind::LinkSilent => log::warn!(
+            "capture: WinDivert delivered no packets at all in {:.1?} on filter {FILTER:?} \
+             (silent for {:.1?}); either this machine has no network traffic or the capture \
+             handle has stopped delivering",
+            beat.window,
+            beat.silent_for,
+        ),
     }
 }
 
