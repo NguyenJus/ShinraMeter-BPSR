@@ -6,7 +6,7 @@
 //! (`bpsr-protocol`'s `sanitize-dump` binary) translate between the two, so
 //! a future field or enum variant only needs fixing once.
 
-use crate::event::{EDungeonState, EntityKind, ProtocolEvent};
+use crate::event::{DisappearReason, EDungeonState, EntityKind, ProtocolEvent};
 use crate::pb::Class;
 use bpsr_meter as meter;
 
@@ -21,6 +21,18 @@ pub fn map_dungeon_state(state: EDungeonState) -> meter::EDungeonState {
         EDungeonState::Settlement => meter::EDungeonState::Settlement,
         EDungeonState::Vote => meter::EDungeonState::Vote,
         EDungeonState::Unknown(v) => meter::EDungeonState::Unknown(v),
+    }
+}
+
+/// Maps a protocol despawn reason onto the meter's mirror type (issue #276).
+pub fn map_disappear_reason(reason: DisappearReason) -> meter::DisappearReason {
+    match reason {
+        DisappearReason::Normal => meter::DisappearReason::Normal,
+        DisappearReason::Dead => meter::DisappearReason::Dead,
+        DisappearReason::Destroy => meter::DisappearReason::Destroy,
+        DisappearReason::TransferLeave => meter::DisappearReason::TransferLeave,
+        DisappearReason::TransferPassLineLeave => meter::DisappearReason::TransferPassLineLeave,
+        DisappearReason::Unknown(v) => meter::DisappearReason::Unknown(v),
     }
 }
 
@@ -130,6 +142,9 @@ pub fn map_event(
         ProtocolEvent::DungeonVar { name, value } => {
             meter::ProtocolEvent::DungeonVar { name, value }
         }
-        ProtocolEvent::EnemyGone { uid } => meter::ProtocolEvent::EnemyGone { uid },
+        ProtocolEvent::EnemyGone { uid, reason } => meter::ProtocolEvent::EnemyGone {
+            uid,
+            reason: reason.map(map_disappear_reason),
+        },
     }
 }
