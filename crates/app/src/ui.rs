@@ -6412,9 +6412,11 @@ const SKILL_ICON_PLACEHOLDER_RADIUS: f32 = SKILL_ICON_SIZE / 2.0 - SKILL_ICON_PL
 /// since "no derivable glyph" is still a real (if unobserved) case.
 const SKILL_ICON_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x3B);
 /// Font size of the issue #275 monogram placeholder's 1-2 character glyph,
-/// centered on a `SKILL_ICON_SIZE` (38pt) disc — large enough to read at a
-/// glance as a letterform rather than a texture artifact, small enough that
-/// two characters ("LS", "FF") stay clear of the disc's edge.
+/// centered on the `SKILL_ICON_PLACEHOLDER_RADIUS` disc (33pt across, since
+/// issue #281 inset it off the full `SKILL_ICON_SIZE` slot) — large enough
+/// to read at a glance as a letterform rather than a texture artifact,
+/// small enough that two characters ("LS", "FF") stay clear of the disc's
+/// edge.
 const SKILL_ICON_MONOGRAM_FONT_SIZE: f32 = 15.0;
 /// `Skills.xaml:151-154` draws the class icon at 50x50. Issue #190 could
 /// only fit 40 of that, because `SKILL_HEADER_HEIGHT` was a made-up 56 and
@@ -7787,14 +7789,19 @@ mod tests {
         }
     }
 
+    /// Const-only regression pin for `SKILL_ICON_PLACEHOLDER_INSET`'s
+    /// relationship to `SKILL_ICON_SIZE` — it does not touch anything
+    /// `paint_skill_icon_placeholder` paints (see
+    /// `placeholder_disc_paints_at_the_inset_radius_inside_the_icon_slot`
+    /// for that). Issue #281: the placeholder disc used to fill the full
+    /// `SKILL_ICON_SIZE` slot, reading heavier than real vendored art's
+    /// ~26x28 visible footprint (its own transparent padding) in the same
+    /// 38x38 slot. Pins the inset to the small "~2-3px" range that closes
+    /// that gap without shrinking the disc out of the same size class as
+    /// real icon art, and pins `SKILL_ICON_PLACEHOLDER_RADIUS`'s formula so
+    /// a hand-edit of either constant is caught here first.
     #[test]
-    fn placeholder_disc_is_inset_from_the_full_icon_slot() {
-        // Issue #281: the placeholder disc used to fill the full
-        // `SKILL_ICON_SIZE` slot, reading heavier than real vendored art's
-        // ~26x28 visible footprint (its own transparent padding) in the
-        // same 38x38 slot. Pins the inset to the small "~2-3px" range that
-        // closes that gap without shrinking the disc out of the same size
-        // class as real icon art.
+    fn placeholder_disc_inset_pins_the_slot_relationship() {
         const { assert!(SKILL_ICON_PLACEHOLDER_INSET >= 2.0 && SKILL_ICON_PLACEHOLDER_INSET <= 3.0) };
         const {
             assert!(
@@ -7803,6 +7810,100 @@ mod tests {
             )
         };
         const { assert!(SKILL_ICON_PLACEHOLDER_RADIUS < SKILL_ICON_SIZE / 2.0) };
+    }
+
+    /// Renders a real skill row through `draw_skill_window` and reads the
+    /// disc `paint_skill_icon_placeholder` actually painted back out of the
+    /// frame's `Shape::Circle`s — `placeholder_disc_inset_pins_the_slot_
+    /// relationship` only checks the constants' own arithmetic against each
+    /// other, which can't catch either of `paint_skill_icon_placeholder`'s
+    /// two `circle_filled` call sites drifting from
+    /// `SKILL_ICON_PLACEHOLDER_RADIUS` (e.g. a copy-pasted literal).
+    #[test]
+    fn placeholder_disc_paints_at_the_inset_radius_inside_the_icon_slot() {
+        let row = PlayerRow {
+            // A negative id: `skill_icon_basename` is keyed by `u32`, so a
+            // negative one can never resolve to a vendored icon and always
+            // takes the placeholder branch — unlike a real id, which could
+            // start shipping an icon later and silently switch this test
+            // onto the textured branch instead.
+            skills: vec![sample_skill_row(-1)],
+            ..sample_row(None)
+        };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_SIZE);
+        let mut sort = skills::SkillSort::default();
+
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_skill_window(
+                    ui,
+                    &row,
+                    &mut sort,
+                    SkillWindowSource::Live,
+                    &icons,
+                    1.0,
+                    &mut WindowGesture::default(),
+                );
+            },
+        );
+        let mut circles = Vec::new();
+        for clipped in &output.shapes {
+            collect_circle_geometry(&clipped.shape, &mut circles);
+        }
+        output.drop_without_applying_deltas();
+
+        // The same geometry `draw_skill_window` derives the icon cell's
+        // center from (issue #200's `skill_header_rect`/
+        // `skill_column_header_rect`/`skill_rows_rect`, and the shared
+        // column `anchors` the row loop reuses from the column-header
+        // row) — replicated here rather than pulled into a shared helper,
+        // since nothing else needs "where does the icon column sit"
+        // outside this one check.
+        let header = skill_header_rect(screen_rect);
+        let tabs = egui::Rect::from_min_size(
+            egui::pos2(screen_rect.left(), header.bottom()),
+            egui::vec2(screen_rect.width(), SKILL_TAB_HEIGHT),
+        );
+        let col_header = skill_column_header_rect(screen_rect, tabs);
+        let rows_rect = skill_rows_rect(screen_rect, col_header);
+        let widths: Vec<f32> = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).collect();
+        let anchors = column_anchors_from_widths(
+            col_header.left() + SKILL_HEADER_PAD_X,
+            col_header.right() - SKILL_HEADER_PAD_X,
+            &widths,
+            0.0,
+        );
+        let icon_index = SKILL_COLUMN_ORDER
+            .iter()
+            .position(|k| *k == skills::SkillColumn::Icon)
+            .expect("skill columns always include Icon");
+        let icon_width = skills::SkillColumn::Icon.width();
+        let expected_center = egui::pos2(
+            anchors[icon_index] - icon_width + SKILL_ICON_SIZE / 2.0,
+            rows_rect.top() + SKILL_ROW_HEIGHT / 2.0,
+        );
+
+        let mut found_radius = None;
+        for &(center, radius) in &circles {
+            if (center - expected_center).length() < 0.01 {
+                found_radius = Some(radius);
+                break;
+            }
+        }
+        let radius = found_radius.unwrap_or_else(|| {
+            panic!("no circle painted at the icon slot's center {expected_center:?}: {circles:?}")
+        });
+        assert_eq!(
+            radius, SKILL_ICON_PLACEHOLDER_RADIUS,
+            "the painted disc must use SKILL_ICON_PLACEHOLDER_RADIUS, not the full SKILL_ICON_SIZE/2.0 slot"
+        );
     }
 
     #[test]
@@ -8535,6 +8636,22 @@ mod tests {
             egui::Shape::Vec(shapes) => {
                 for s in shapes {
                     collect_circle_fills(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Walks a painted `Shape`, collecting every `Shape::Circle`'s
+    /// `(center, radius)` — like `collect_circle_fills` but keeping the
+    /// geometry instead of the fill, for a caller that needs to check
+    /// *where* and *how big* a circle painted, not just what color.
+    fn collect_circle_geometry(shape: &egui::Shape, out: &mut Vec<(egui::Pos2, f32)>) {
+        match shape {
+            egui::Shape::Circle(circle) => out.push((circle.center, circle.radius)),
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_circle_geometry(s, out);
                 }
             }
             _ => {}
