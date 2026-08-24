@@ -21,7 +21,7 @@ use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bpsr_protocol::{Decoder, InspectSink, ProtocolEvent};
 use crossbeam_channel::Sender;
@@ -34,7 +34,9 @@ use crate::detect::{
 };
 use crate::driver::{Api, WinDivertAddress};
 use crate::error::CaptureError;
+use crate::restart::CaptureRestart;
 use crate::tcp::TcpReassembler;
+use crate::throughput::{self, Heartbeat, ThroughputMonitor};
 
 /// WinDivert filter: every non-loopback TCP/IP packet, in either direction.
 const FILTER: &str = "!loopback && ip && tcp";
@@ -59,7 +61,11 @@ const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 64;
 /// Handle to the running capture thread.
 pub struct CaptureHandle {
     stop: Arc<AtomicBool>,
-    restart: Arc<AtomicBool>,
+    /// The restart request the capture thread reads once per packet. Held
+    /// as the shared [`CaptureRestart`] rather than a bare flag so the app
+    /// can hand a clone to its command loop — the handle itself cannot
+    /// travel between threads (see [`Self::restart_requester`]).
+    restart: CaptureRestart,
     /// The driver handle, owned as the `Copy` OS value the C API takes. Both
     /// the capture thread (`WinDivertRecv`) and [`Self::stop`]
     /// (`WinDivertShutdown`) pass it to the driver by value; no Rust
@@ -85,7 +91,19 @@ impl CaptureHandle {
     /// Forces the capture loop to forget the currently-known server
     /// connection and re-run detection from scratch on the next packet.
     pub fn request_restart(&self) {
-        self.restart.store(true, Ordering::SeqCst);
+        self.restart.request();
+    }
+
+    /// A `Send`-able clone of the restart request, for callers that cannot
+    /// hold the handle itself (issue #214).
+    ///
+    /// `CaptureHandle` owns a raw Windows `HANDLE`, so it is neither `Send`
+    /// nor `Sync` and has to stay on the thread that opened it — which is
+    /// precisely why [`Self::request_restart`] shipped with no caller
+    /// anywhere in the app. The pipeline thread, which is where the UI's
+    /// command channel is drained, can hold one of these instead.
+    pub fn restart_requester(&self) -> CaptureRestart {
+        self.restart.clone()
     }
 
     /// Signals the capture thread to stop and waits for it to exit.
@@ -160,9 +178,9 @@ pub fn start_capture(
     let handle = api.open_sniff(&filter)?;
 
     let stop = Arc::new(AtomicBool::new(false));
-    let restart = Arc::new(AtomicBool::new(false));
+    let restart = CaptureRestart::new();
     let thread_stop = Arc::clone(&stop);
-    let thread_restart = Arc::clone(&restart);
+    let thread_restart = restart.clone();
     // `HANDLE` is a `Copy` newtype over a raw `*mut c_void`, which makes it
     // neither `Send` nor `Sync` — so the closure below cannot capture one
     // directly, even though a WinDivert handle has no thread affinity and the
@@ -217,7 +235,7 @@ fn recv_loop(
     handle: HANDLE,
     tx: Sender<ProtocolEvent>,
     stop: Arc<AtomicBool>,
-    restart: Arc<AtomicBool>,
+    restart: CaptureRestart,
     inspect_sink: Option<Arc<dyn InspectSink>>,
 ) {
     let mut buffer = vec![0u8; RECV_BUFFER_SIZE];
@@ -229,12 +247,27 @@ fn recv_loop(
         None => Decoder::new(),
     };
     let mut consecutive_errors: u32 = 0;
+    // Issue #213: what capture is actually delivering, so "the game sent
+    // nothing" and "reassembly ate the stream" stop looking identical in a
+    // log. Polled on every packet; it rate-limits itself.
+    let mut monitor = ThroughputMonitor::new(Instant::now());
+
+    log::info!("capture: WinDivert sniff loop started on filter {FILTER:?}");
 
     while !stop.load(Ordering::Relaxed) {
-        if restart.swap(false, Ordering::SeqCst) {
+        if restart.take_requested() {
+            log::info!(
+                "capture: restart requested; dropping the tracked connection {} and re-running server detection",
+                describe(known_server.as_ref()),
+            );
             known_server = None;
             detector.reset();
             decoder.reset();
+            // The reassembler has to go too, or the restart re-adopts a
+            // connection while `next_seq` still points into the wedged
+            // stream's sequence space — which is the state the restart
+            // exists to escape (#211, #214).
+            reassembler = TcpReassembler::new();
         }
 
         let packet_len = match recv_packet(api, handle, &mut buffer) {
@@ -296,6 +329,11 @@ fn recv_loop(
         // fallback re-arm on its own for the connection that replaces it —
         // otherwise only a user-initiated restart ever re-enables it.
         if is_teardown_of_known(role, tcp.fin(), tcp.rst()) {
+            log::info!(
+                "capture: tracked connection {conn} torn down (fin={} rst={}); re-arming server detection",
+                tcp.fin(),
+                tcp.rst(),
+            );
             known_server = None;
         }
 
@@ -310,6 +348,10 @@ fn recv_loop(
                 if !detector.detects(&conn, payload, known_server.is_some()) {
                     continue;
                 }
+                log::info!(
+                    "capture: adopted game-server connection {conn} at seq={seq} ({} payload bytes)",
+                    payload.len(),
+                );
                 known_server = Some(conn);
                 detector.adopt(&conn);
                 reassembler.resync(seq);
@@ -320,20 +362,96 @@ fn recv_loop(
             }
         }
 
+        if !payload.is_empty() {
+            monitor.record_packet();
+        }
         reassembler.push(seq, payload);
         if reassembler.take_loss() {
+            log::info!(
+                "capture: reassembly reported a break in the byte stream; resetting the decoder"
+            );
             decoder.reset();
         }
         let stream = reassembler.take_stream();
+
+        let now = Instant::now();
+        if !stream.is_empty() {
+            monitor.record_delivered(stream.len(), now);
+        }
+        if let Some(beat) = monitor.poll(now) {
+            log_heartbeat(&beat, &reassembler);
+        }
+        // Issue #214: the recovery #211 had no path to. Packets are still
+        // arriving on the adopted connection but nothing has reached the
+        // decoder for minutes, which no amount of further sniffing fixes —
+        // only re-anchoring does, and until now only the user changing
+        // zones could trigger that.
+        if monitor.restart_due(now) {
+            log::error!(
+                "capture: nothing has reached the decoder in {:?} while packets kept arriving on {}; \
+                 re-running server detection and reassembly from scratch (issue #214)",
+                throughput::STALL_RESTART_AFTER,
+                describe(known_server.as_ref()),
+            );
+            known_server = None;
+            detector.reset();
+            decoder.reset();
+            reassembler = TcpReassembler::new();
+            continue;
+        }
+
         if stream.is_empty() {
             continue;
         }
 
         for event in decoder.push_stream(&stream, now_ms()) {
             if tx.send(event).is_err() {
+                log::error!(
+                    "capture: the protocol-event channel is closed (the pipeline thread is gone); \
+                     the capture loop is exiting"
+                );
                 return;
             }
         }
+    }
+
+    log::info!("capture: WinDivert sniff loop exited");
+}
+
+/// The tracked connection for a log line, or a placeholder when detection
+/// has not adopted one.
+fn describe(known_server: Option<&Conn>) -> String {
+    match known_server {
+        Some(conn) => conn.to_string(),
+        None => "<none adopted>".to_string(),
+    }
+}
+
+/// Issue #213's throughput heartbeat. A window that delivered nothing while
+/// packets kept arriving is the #211 fingerprint and gets a `warn`;
+/// everything else is one `info` a minute, which is the entire budget for a
+/// log a user may have to hand over.
+fn log_heartbeat(beat: &Heartbeat, reassembler: &TcpReassembler) {
+    if beat.is_silent() && beat.packets > 0 {
+        log::warn!(
+            "capture: 0 bytes delivered to the decoder in {:.1?} while {} payload packet(s) arrived \
+             (silent for {:.1?}); reassembly is holding {} segment(s) / {} byte(s) behind a gap",
+            beat.window,
+            beat.packets,
+            beat.silent_for,
+            reassembler.gap_segments(),
+            reassembler.gap_bytes(),
+        );
+    } else {
+        log::info!(
+            "capture: {} byte(s) delivered to the decoder in {:.1?} from {} payload packet(s); \
+             gap cache {} segment(s) / {} byte(s)",
+            beat.bytes,
+            beat.window,
+            beat.packets,
+            reassembler.gap_segments(),
+            reassembler.gap_bytes(),
+        );
     }
 }
 

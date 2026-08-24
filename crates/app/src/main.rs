@@ -278,11 +278,20 @@ fn main() -> eframe::Result {
         None => (None, None),
     };
 
+    // Issue #214: the pipeline thread drains the UI's command channel, so
+    // it is what has to act on "Restart packet capture" — but the
+    // `CaptureHandle` cannot go with it (raw Windows `HANDLE`, neither
+    // `Send` nor `Sync`). Hand over the shared flag instead; `None` when
+    // capture failed to start, in which case the banner above already says
+    // why and there is nothing to restart.
+    let capture_restart = capture.as_ref().map(|handle| handle.restart_requester());
+
     let (rx_snapshot, pipeline_thread) = pipeline::spawn(
         rx_events,
         rx_command,
         names_cache_path(),
         history_handle.clone(),
+        capture_restart,
     );
     let (tx_settings, settings_thread) = settings::spawn_writer();
 

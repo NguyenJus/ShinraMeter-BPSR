@@ -135,6 +135,17 @@ impl TcpReassembler {
                 None => true,
             };
             if longer_than_cached {
+                // Issue #213: logged only on the *opening* of a gap — the
+                // empty-to-non-empty transition — not per cached segment.
+                // A gap ahead of `next_seq` is the first observable symptom
+                // of the #211 wedge, but a busy stream reorders constantly,
+                // so one line per gap is the whole budget.
+                if self.cache.is_empty() {
+                    log::debug!(
+                        "tcp: sequence gap opened: next_seq={before} seq={seq} gap={diff} bytes; caching {} bytes ahead of it",
+                        payload.len()
+                    );
+                }
                 self.cache_insert(seq, payload.to_vec());
             }
         }
@@ -159,11 +170,31 @@ impl TcpReassembler {
                     // nearest ahead of it, in modular order — keeping (not
                     // discarding) its data and whatever is contiguous with
                     // it (#211).
-                    Some(nearest) => self.resync_to_cached(nearest),
+                    Some(nearest) => {
+                        // Issue #213: the one line that would have named
+                        // #211 in the log. Rate-limited by construction —
+                        // the guard fires at most once per
+                        // `MAX_STALL_PUSHES` pushes — so `warn` is
+                        // affordable for something this abnormal.
+                        log::warn!(
+                            "tcp: stall guard tripped: stall_pushes={} next_seq={after} nearest={nearest} \
+                             gap={} bytes cache_segments={} cache_bytes={}; re-anchoring on the nearest cached segment",
+                            self.stall_pushes,
+                            nearest.wrapping_sub(after),
+                            self.cache.len(),
+                            self.gap_bytes(),
+                        );
+                        self.resync_to_cached(nearest);
+                    }
                     // Nothing cached: the live stream is behind `next_seq`,
                     // so re-anchor on this segment and deliver it.
                     None => {
-                        self.resync(seq);
+                        log::warn!(
+                            "tcp: stall guard tripped: stall_pushes={} next_seq={after} nearest=none; \
+                             the peer re-anchored behind next_seq, so re-anchoring on the live segment at seq={seq}",
+                            self.stall_pushes,
+                        );
+                        self.resync_with_reason(seq, "stall_guard_re_anchor");
                         self.advance_with(payload);
                     }
                 }
@@ -242,6 +273,16 @@ impl TcpReassembler {
             let excess = self.buffer.len() - self.max_buffer;
             self.buffer.drain(0..excess);
             self.loss = true;
+            // Issue #213: the other path that raises `loss`, and the one
+            // with no other symptom at all — downstream it surfaces only as
+            // an unexplained decoder reset. Reaching this at all means the
+            // caller has left ~10 MiB undrained, so the volume is bounded
+            // by how pathological the situation already is.
+            log::warn!(
+                "tcp: buffer cap of {} bytes exceeded; discarded_bytes={excess} from the front of \
+                 the stream (the delivered stream is no longer contiguous)",
+                self.max_buffer,
+            );
         }
     }
 
@@ -277,6 +318,27 @@ impl TcpReassembler {
     /// event for the server-change caller; the stall-guard path raises the
     /// flag again after the call, because there the stream really did break.
     pub fn resync(&mut self, seq: u32) {
+        self.resync_with_reason(seq, "new_connection");
+    }
+
+    /// [`Self::resync`]'s body, with the caller's reason threaded into the
+    /// diagnostic (issue #213). Which of the two callers re-anchored the
+    /// stream is the single most useful fact about a resync line — an
+    /// adopted new connection is routine, the stall guard giving up is not
+    /// — and neither is recoverable from the sequence numbers alone.
+    fn resync_with_reason(&mut self, seq: u32, reason: &str) {
+        // `Option`'s own `Display`-via-`Debug` would render `Some(1234)`,
+        // which is noise in a log line and awkward to grep for.
+        let old_next_seq = match self.next_seq {
+            Some(next) => next.to_string(),
+            None => "none".to_string(),
+        };
+        log::info!(
+            "tcp: resync reason={reason} old_next_seq={old_next_seq} new_next_seq={seq} \
+             discarded_bytes={} discarded_segments={}",
+            self.buffer.len() + self.gap_bytes(),
+            self.cache.len(),
+        );
         self.cache.clear();
         self.cache_cost = 0;
         self.buffer.clear();
@@ -828,5 +890,213 @@ mod tests {
         let mut expected = vec![b'G'; 100];
         expected.extend(std::iter::repeat_n(b'N', 100));
         assert_eq!(r.take_stream(), expected);
+    }
+
+    /// Issue #213: the reassembler used to contain zero `log::` calls, so
+    /// the 24 minutes of dead capture in #211 produced 24 minutes of total
+    /// log silence. These drive the real `push`/`resync` paths and assert
+    /// on what actually reached the `log` facade.
+    ///
+    /// `log` allows exactly one logger per process, so the capture buffer
+    /// below is shared with every other test in this binary. Assertions on
+    /// it must therefore be *positive* ("this exact line was logged") — an
+    /// absence says nothing — and each test must use a sequence-number base
+    /// no other test in this file uses, so a matched line can only have
+    /// come from the test that logged it.
+    mod diagnostics {
+        use super::*;
+        use std::sync::{Mutex, Once};
+
+        static CAPTURED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
+
+        struct CaptureLogger;
+
+        impl log::Log for CaptureLogger {
+            fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn log(&self, record: &log::Record<'_>) {
+                if let Ok(mut captured) = CAPTURED.lock() {
+                    captured.push(record.args().to_string());
+                }
+            }
+
+            fn flush(&self) {}
+        }
+
+        /// Installs [`CAPTURE_LOGGER`] once per process. Idempotent, so any
+        /// number of tests can call it, in any order, from any thread.
+        fn install_capture() {
+            static INSTALL: Once = Once::new();
+            INSTALL.call_once(|| {
+                let _ = log::set_logger(&CAPTURE_LOGGER);
+                log::set_max_level(log::LevelFilter::Trace);
+            });
+        }
+
+        /// Whether any captured line contains `needle`.
+        fn logged(needle: &str) -> bool {
+            CAPTURED
+                .lock()
+                .map(|captured| captured.iter().any(|line| line.contains(needle)))
+                .unwrap_or(false)
+        }
+
+        /// How many captured lines contain every one of `needles`.
+        fn count_logged(needles: &[&str]) -> usize {
+            CAPTURED
+                .lock()
+                .map(|captured| {
+                    captured
+                        .iter()
+                        .filter(|line| needles.iter().all(|needle| line.contains(needle)))
+                        .count()
+                })
+                .unwrap_or(0)
+        }
+
+        /// Everything captured so far, for a failing assertion's message.
+        fn dump() -> String {
+            CAPTURED
+                .lock()
+                .map(|captured| captured.join("\n"))
+                .unwrap_or_default()
+        }
+
+        /// The gap that opens ahead of `next_seq` is the first observable
+        /// symptom of a stream about to wedge, and nothing used to say so.
+        #[test]
+        fn a_sequence_gap_opening_is_logged_with_both_ends() {
+            install_capture();
+            let base: u32 = 0x0121_0000;
+            let mut r = TcpReassembler::new();
+            r.push(base, b"AAA");
+            r.push(base + 0x1000, b"BBB");
+
+            assert!(logged("sequence gap"), "no gap line at all:\n{}", dump());
+            assert!(
+                logged(&format!("next_seq={}", base + 3)),
+                "the gap line must name the byte the stream is waiting on:\n{}",
+                dump()
+            );
+            assert!(
+                logged(&format!("seq={}", base + 0x1000)),
+                "the gap line must name the segment that arrived early:\n{}",
+                dump()
+            );
+        }
+
+        /// A gap that stays open must not re-log on every segment behind
+        /// it — the whole point of #213 is low-volume logging a user can
+        /// actually hand over.
+        #[test]
+        fn a_gap_that_stays_open_is_logged_only_once() {
+            install_capture();
+            let base: u32 = 0x0221_0000;
+            let mut r = TcpReassembler::new();
+            r.push(base, b"AAA");
+            for i in 0..50u32 {
+                r.push(base + 0x1000 + i * 8, b"BBB");
+            }
+
+            assert_eq!(
+                count_logged(&["sequence gap", &format!("next_seq={}", base + 3)]),
+                1,
+                "one open gap must produce exactly one line:\n{}",
+                dump()
+            );
+        }
+
+        /// The #211 wedge itself. The trip has to name what it gave up on
+        /// and what it re-anchored to, or the log still cannot tell a
+        /// reassembly stall from packets never arriving at all.
+        #[test]
+        fn a_stall_guard_trip_is_logged_with_the_anchor_it_gave_up_on() {
+            install_capture();
+            let base: u32 = 0x0321_0000;
+            let mut r = TcpReassembler::new();
+            r.push(base, b"AAA");
+            for _ in 0..TcpReassembler::MAX_STALL_PUSHES {
+                r.push(base + 0x1000, b"X");
+            }
+
+            assert!(
+                logged("stall guard"),
+                "no stall-guard line at all:\n{}",
+                dump()
+            );
+            assert!(
+                logged(&format!("next_seq={}", base + 3)),
+                "the trip must name the anchor it gave up on:\n{}",
+                dump()
+            );
+            assert!(
+                logged(&format!("nearest={}", base + 0x1000)),
+                "the trip must name the cached segment it re-anchors to:\n{}",
+                dump()
+            );
+            assert!(
+                logged(&format!(
+                    "stall_pushes={}",
+                    TcpReassembler::MAX_STALL_PUSHES
+                )),
+                "the trip must name the counter that fired:\n{}",
+                dump()
+            );
+        }
+
+        /// The new-connection resync in `win.rs` throws away everything it
+        /// holds; how much it threw away is exactly what distinguishes a
+        /// clean zone change from one that ate a raid's worth of stream.
+        #[test]
+        fn a_resync_logs_the_old_anchor_the_new_one_and_what_it_discarded() {
+            install_capture();
+            let base: u32 = 0x0421_0000;
+            let mut r = TcpReassembler::new();
+            r.push(base, b"AAAAA"); // 5 undrained buffered bytes
+            r.push(base + 0x1000, b"BBB"); // 3 cached bytes behind a gap
+            r.resync(base + 0x9000);
+
+            assert!(logged("resync"), "no resync line at all:\n{}", dump());
+            assert!(
+                logged("reason=new_connection"),
+                "a resync must say why it happened:\n{}",
+                dump()
+            );
+            assert!(
+                logged(&format!("old_next_seq={}", base + 5)),
+                "the resync must name the anchor it left:\n{}",
+                dump()
+            );
+            assert!(
+                logged(&format!("new_next_seq={}", base + 0x9000)),
+                "the resync must name the anchor it took:\n{}",
+                dump()
+            );
+            assert!(
+                logged("discarded_bytes=8"),
+                "the resync must name what it threw away (5 buffered + 3 cached):\n{}",
+                dump()
+            );
+        }
+
+        /// A buffer-cap trim silently drops the oldest stream bytes and
+        /// used to show up only as an unexplained downstream decoder reset.
+        #[test]
+        fn a_buffer_cap_trim_is_logged_as_loss() {
+            install_capture();
+            let base: u32 = 0x0521_0000;
+            let mut r = TcpReassembler::with_max_buffer(8);
+            r.push(base, b"AAAAAAAA");
+            r.push(base + 8, b"BBBB");
+
+            assert!(
+                logged("buffer cap") && logged("discarded_bytes=4"),
+                "expected a trim line naming the bytes dropped:\n{}",
+                dump()
+            );
+        }
     }
 }
