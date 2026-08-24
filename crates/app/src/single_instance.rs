@@ -67,14 +67,21 @@ pub fn lock_file_path() -> (PathBuf, Option<String>) {
 }
 
 /// Resolves the lock path and tries to claim the meter slot, logging the
-/// path warning (if any) on the way through. Call once, early in `main`,
-/// and hold the returned guard for the life of the process.
+/// path warning (if any) on the way through, plus a debug breadcrumb on
+/// success — otherwise a claimed lock leaves no trace in the log at all,
+/// and a `SHINRA_INSTANCE_LOCK` override would be invisible to a support
+/// log. Call once, early in `main`, and hold the returned guard for the
+/// life of the process.
 pub fn acquire() -> Acquisition {
     let (path, warning) = lock_file_path();
     if let Some(warning) = warning {
         log::warn!("{warning}");
     }
-    acquire_at(&path)
+    let acquisition = acquire_at(&path);
+    if matches!(acquisition, Acquisition::Acquired(_)) {
+        log::debug!("single-instance lock acquired at {}", path.display());
+    }
+    acquisition
 }
 
 /// [`acquire`] against an explicit path — the testable half.
