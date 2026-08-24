@@ -20,6 +20,26 @@ pub struct SkillStats {
     pub max_crit: i64,
 }
 
+impl SkillStats {
+    /// Folds `other` into `self` (issue #245). Used to build the "Skill
+    /// dealt" view, which is the union of a player's outgoing damage and
+    /// outgoing healing under one skill id — a skill that both damages and
+    /// heals contributes to both accumulators, and the dealt view wants the
+    /// sum rather than either half.
+    ///
+    /// `max_crit` takes the larger of the two rather than summing, being a
+    /// running max and not a total.
+    pub fn merge(&mut self, other: &SkillStats) {
+        self.total_damage += other.total_damage;
+        self.hits += other.hits;
+        self.crit_hits += other.crit_hits;
+        self.crit_damage += other.crit_damage;
+        self.lucky_hits += other.lucky_hits;
+        self.lucky_damage += other.lucky_damage;
+        self.max_crit = self.max_crit.max(other.max_crit);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PlayerStats {
     pub uid: i64,
@@ -73,6 +93,29 @@ pub struct PlayerStats {
     /// draw time from the static table), so nothing allocates per skill per
     /// tick.
     pub skills: HashMap<i32, SkillStats>,
+    /// Per-skill breakdown of this player's *outgoing healing* (issue
+    /// #245), keyed the same way `skills` is. Kept as its own map rather
+    /// than folded into `skills` because the damage view must stay a
+    /// damage view: a healer's output would otherwise inflate every DPS
+    /// figure that divides `total_damage` by the fight clock.
+    ///
+    /// `SkillStats::total_damage` here holds healing done — the accumulator
+    /// is amount-agnostic and reusing it keeps one set of per-skill
+    /// arithmetic (`skill_row_from_stats`) for every tab.
+    pub heals: HashMap<i32, SkillStats>,
+    /// Per-skill breakdown of what this player *received* (issue #245):
+    /// damage taken and healing received alike, keyed by the raw skill id
+    /// of the effect that landed on them. This is the one accumulator keyed
+    /// off `DamageEvent::target_uid` rather than `attacker_uid`.
+    pub incoming: HashMap<i32, SkillStats>,
+    /// Sum of `heals`' amounts, i.e. the denominator for the Heal tab's
+    /// `% Heal` column. Tracked alongside the map for the same reason
+    /// `total_damage` is: the share column needs a player total that does
+    /// not depend on iterating the map on every snapshot.
+    pub total_heal: i64,
+    /// Sum of `incoming`'s amounts — the "Skill received" tab's share
+    /// denominator.
+    pub total_incoming: i64,
     /// Timestamp (event clock, not wall time) of the last death counted for
     /// this player, used to debounce a retransmitted/duplicated delta packet
     /// from double-counting a single death (issue #49). `pub(crate)`, not
@@ -130,6 +173,10 @@ impl PlayerStats {
             deaths: 0,
             alive: true,
             skills: HashMap::new(),
+            heals: HashMap::new(),
+            incoming: HashMap::new(),
+            total_heal: 0,
+            total_incoming: 0,
             last_death_ms: None,
             alive_as_of_ms: None,
             dead_ms: 0,
@@ -259,6 +306,21 @@ pub struct PlayerRow {
     /// grouping has no analogue in BPSR's flat ids, so there is deliberately
     /// no expander/grouping tier here (D12).
     pub skills: Vec<SkillRow>,
+    /// The Heal tab's rows (issue #245): this player's outgoing healing per
+    /// skill, healing-descending. `SkillRow::damage`/`share_pct` carry the
+    /// heal amount and its share of this player's healing — `SkillRow` is
+    /// deliberately reused verbatim across every tab so one set of
+    /// per-skill arithmetic, one sort path and one history record shape
+    /// serve them all.
+    pub heals: Vec<SkillRow>,
+    /// The "Skill dealt" tab's rows (issue #245): everything this player
+    /// put out, damage and healing merged under one skill id,
+    /// amount-descending.
+    pub dealt: Vec<SkillRow>,
+    /// The "Skill received" tab's rows (issue #245): everything that landed
+    /// *on* this player, damage taken and healing received alike,
+    /// amount-descending.
+    pub received: Vec<SkillRow>,
 }
 
 /// One row of a player's skill breakdown (issue #16). This is the contract

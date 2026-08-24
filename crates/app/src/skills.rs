@@ -7,9 +7,13 @@
 //! (T4) owns painting this; it must not be touched here.
 
 use crate::ui::{fmt_pct0, fmt_short};
-use bpsr_meter::SkillRow;
+use bpsr_meter::{PlayerRow, SkillRow};
 
-/// One column of the Dps tab (issue #16, D5), in on-screen order.
+/// One column of a breakdown tab (issue #16, D5; issue #245), in
+/// on-screen order. Which of these a tab shows is [`SkillTab::columns`] —
+/// this enum is the union across every tab, so a column that means the same
+/// thing on two tabs (`Name`, `CritPct`, `Hits`, ...) is one variant used
+/// twice rather than two near-duplicates.
 ///
 /// `Icon` is the reference's leading skill-icon column (issue #192). It was
 /// omitted originally because this repo had no skill-icon assets; it now
@@ -32,6 +36,25 @@ pub enum SkillColumn {
     Hits,
     Crits,
     HitPerMin,
+    /// The Heal tab's amount column and its share (issue #245). Distinct
+    /// variants from `Damage`/`DmgPct` purely for their labels — the
+    /// underlying `SkillRow` field is the same, because `SkillRow` is
+    /// reused verbatim for every tab (see `bpsr_meter::PlayerRow::heals`).
+    Heal,
+    HealPct,
+    /// The Skill dealt / Skill received tabs' amount column and its share
+    /// (issue #245). Those two tabs mix damage and healing under one skill
+    /// id, so neither "Damage" nor "Heal" is an honest label for the
+    /// figure; "Amount" is what the reference's own dealt/received log
+    /// calls it (`SkillLog.xaml`'s `SkillAmount`).
+    Amount,
+    AmountPct,
+    /// The Skill casts tab (issue #245), modelled on the reference's
+    /// `SkillsHeaderCounter` (skill name + a single count column). Reads
+    /// `SkillRow::hits`/`hits_per_min`, which for a cast breakdown are use
+    /// counts rather than landed hits.
+    Casts,
+    CastPerMin,
 }
 
 impl SkillColumn {
@@ -52,6 +75,12 @@ impl SkillColumn {
             SkillColumn::Hits => "Hits",
             SkillColumn::Crits => "Crits",
             SkillColumn::HitPerMin => "Hit/m",
+            SkillColumn::Heal => "Heal",
+            SkillColumn::HealPct => "% Heal",
+            SkillColumn::Amount => "Amount",
+            SkillColumn::AmountPct => "% Amt",
+            SkillColumn::Casts => "Casts",
+            SkillColumn::CastPerMin => "Cast/m",
         }
     }
 
@@ -77,13 +106,19 @@ impl SkillColumn {
             | SkillColumn::AvgWhite
             | SkillColumn::Avg
             | SkillColumn::Hits
-            | SkillColumn::Crits => 56.0,
+            | SkillColumn::Crits
+            | SkillColumn::Heal
+            | SkillColumn::Amount
+            | SkillColumn::Casts => 56.0,
             // Whole-number percentage, same budget as `ColumnKind::CritPct`.
-            SkillColumn::DmgPct | SkillColumn::CritPct => 40.0,
+            SkillColumn::DmgPct
+            | SkillColumn::CritPct
+            | SkillColumn::HealPct
+            | SkillColumn::AmountPct => 40.0,
             // `format!("{:.2}", ..)` on a hits-per-minute rate; a few
             // hundred hits/min is already an extreme value, so 5-6 chars
             // plus the 2-decimal tail comfortably fits.
-            SkillColumn::HitPerMin => 48.0,
+            SkillColumn::HitPerMin | SkillColumn::CastPerMin => 48.0,
         }
     }
 
@@ -107,6 +142,10 @@ impl SkillColumn {
             SkillColumn::Hits => fmt_short(row.hits as i64),
             SkillColumn::Crits => fmt_short(row.crit_hits as i64),
             SkillColumn::HitPerMin => format!("{:.2}", row.hits_per_min),
+            SkillColumn::Heal | SkillColumn::Amount => fmt_short(row.damage),
+            SkillColumn::HealPct | SkillColumn::AmountPct => fmt_pct0(row.share_pct),
+            SkillColumn::Casts => fmt_short(row.hits as i64),
+            SkillColumn::CastPerMin => format!("{:.2}", row.hits_per_min),
         }
     }
 
@@ -118,6 +157,15 @@ impl SkillColumn {
     /// reach `numeric_key`'s `unreachable!` for it.
     pub fn sortable(self) -> bool {
         !matches!(self, SkillColumn::Icon)
+    }
+
+    /// Whether this column's text hugs the left edge of its cell rather
+    /// than the right. Only `Name` does — every figure column is
+    /// right-aligned so its digits line up down the list, exactly as in
+    /// the reference. `Icon` paints no text at all and its answer is
+    /// unused.
+    pub fn left_aligned(self) -> bool {
+        matches!(self, SkillColumn::Name)
     }
 
     /// This column's numeric sort key, as `f64` so every column but `Name`
@@ -139,8 +187,217 @@ impl SkillColumn {
             SkillColumn::Hits => row.hits as f64,
             SkillColumn::Crits => row.crit_hits as f64,
             SkillColumn::HitPerMin => row.hits_per_min,
+            SkillColumn::Heal | SkillColumn::Amount => row.damage as f64,
+            SkillColumn::HealPct | SkillColumn::AmountPct => row.share_pct as f64,
+            SkillColumn::Casts => row.hits as f64,
+            SkillColumn::CastPerMin => row.hits_per_min,
         }
     }
+}
+
+/// One tab of the breakdown window (issue #245), in tab-strip order.
+///
+/// The reference (`Skills.xaml:227-236`) offers seven: Dps, Heal, Mana,
+/// Buff, Counter, SkillDealt, SkillReceived. `Mana` is dropped — BPSR has
+/// no mana resource in the decoded packet stream at all, so it could only
+/// ever be an empty tab about nothing. `Counter` is renamed `Casts`, which
+/// is what its single count column actually measures
+/// (`SkillsHeaderCounter.xaml.cs:13`) and what issue #245 asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SkillTab {
+    Dps,
+    Heal,
+    Buff,
+    Casts,
+    Dealt,
+    Received,
+}
+
+/// Every tab, in the order the strip paints them — the reference's own
+/// order with `Mana` removed.
+pub const SKILL_TABS: [SkillTab; 6] = [
+    SkillTab::Dps,
+    SkillTab::Heal,
+    SkillTab::Buff,
+    SkillTab::Casts,
+    SkillTab::Dealt,
+    SkillTab::Received,
+];
+
+/// The Dps tab's columns (issue #16, D5) — the reference's
+/// `SkillsHeaderDps` plus issue #192's leading icon.
+const DPS_COLUMNS: [SkillColumn; 12] = [
+    SkillColumn::Icon,
+    SkillColumn::Name,
+    SkillColumn::Damage,
+    SkillColumn::DmgPct,
+    SkillColumn::CritPct,
+    SkillColumn::MaxCrit,
+    SkillColumn::AvgCrit,
+    SkillColumn::AvgWhite,
+    SkillColumn::Avg,
+    SkillColumn::Hits,
+    SkillColumn::Crits,
+    SkillColumn::HitPerMin,
+];
+
+/// The Heal tab's columns (issue #245), from the reference's
+/// `SkillsHeaderHeal.xaml.cs`: skill name, heal, avg crit, avg white, avg,
+/// max crit, max white, % crit, hits, crits.
+///
+/// `Max white` is the one reference column dropped: `bpsr_meter::SkillRow`
+/// keeps a running max of *crit* values only (`SkillStats::max_crit`), and
+/// adding a second running max would change the row contract the on-disk
+/// fight history serialises. Every other column is a straight port.
+const HEAL_COLUMNS: [SkillColumn; 11] = [
+    SkillColumn::Icon,
+    SkillColumn::Name,
+    SkillColumn::Heal,
+    SkillColumn::HealPct,
+    SkillColumn::CritPct,
+    SkillColumn::MaxCrit,
+    SkillColumn::AvgCrit,
+    SkillColumn::AvgWhite,
+    SkillColumn::Avg,
+    SkillColumn::Hits,
+    SkillColumn::Crits,
+];
+
+/// The Skill dealt / Skill received tabs' columns (issue #245). Both tabs
+/// answer the same question in opposite directions, so they share one
+/// column set: what landed, how much of it, how hard it hit.
+const AMOUNT_COLUMNS: [SkillColumn; 10] = [
+    SkillColumn::Icon,
+    SkillColumn::Name,
+    SkillColumn::Amount,
+    SkillColumn::AmountPct,
+    SkillColumn::CritPct,
+    SkillColumn::MaxCrit,
+    SkillColumn::Avg,
+    SkillColumn::Hits,
+    SkillColumn::Crits,
+    SkillColumn::HitPerMin,
+];
+
+/// The Skill casts tab's columns (issue #245) — the reference's
+/// `SkillsHeaderCounter` (name + one count), plus the per-minute rate the
+/// Dps tab already establishes, since a cast count with no denominator is
+/// hard to read across fights of different lengths.
+const CAST_COLUMNS: [SkillColumn; 4] = [
+    SkillColumn::Icon,
+    SkillColumn::Name,
+    SkillColumn::Casts,
+    SkillColumn::CastPerMin,
+];
+
+impl SkillTab {
+    /// Tab-strip label. Kept to the reference's own wording where it has
+    /// one, and to issue #245's where it doesn't.
+    pub fn label(self) -> &'static str {
+        match self {
+            SkillTab::Dps => "Dps",
+            SkillTab::Heal => "Heal",
+            SkillTab::Buff => "Buff",
+            SkillTab::Casts => "Skill casts",
+            SkillTab::Dealt => "Skill dealt",
+            SkillTab::Received => "Skill received",
+        }
+    }
+
+    /// This tab's columns, in on-screen order. Fixed slices so the header
+    /// row and every data row iterate the identical list — a column can
+    /// never appear in one but not the other.
+    pub fn columns(self) -> &'static [SkillColumn] {
+        match self {
+            SkillTab::Dps => &DPS_COLUMNS,
+            SkillTab::Heal => &HEAL_COLUMNS,
+            SkillTab::Dealt | SkillTab::Received => &AMOUNT_COLUMNS,
+            SkillTab::Casts => &CAST_COLUMNS,
+            // A tab with no data has no rows to give columns to; the body
+            // paints `empty_message` instead of a header row.
+            SkillTab::Buff => &[],
+        }
+    }
+
+    /// The sort a freshly-shown tab starts on: its amount column,
+    /// descending — matching both the reference (every header sets its
+    /// amount label's `"↓"` and makes it `_currentSortedLabel`) and the
+    /// order `bpsr_meter` already hands the rows over in, so the default
+    /// is a no-op on first paint.
+    pub fn default_sort(self) -> SkillSort {
+        let column = match self {
+            SkillTab::Dps => SkillColumn::Damage,
+            SkillTab::Heal => SkillColumn::Heal,
+            SkillTab::Dealt | SkillTab::Received => SkillColumn::Amount,
+            SkillTab::Casts => SkillColumn::Casts,
+            SkillTab::Buff => SkillColumn::Name,
+        };
+        SkillSort {
+            column,
+            descending: true,
+        }
+    }
+
+    /// This tab's rows out of one player's snapshot row.
+    ///
+    /// `Buff` and `Casts` return nothing: neither has any packet-level
+    /// tracking behind it (see `empty_message`), so the honest answer is an
+    /// empty list and an explanatory body, not fabricated numbers.
+    pub fn rows(self, row: &PlayerRow) -> &[SkillRow] {
+        match self {
+            SkillTab::Dps => &row.skills,
+            SkillTab::Heal => &row.heals,
+            SkillTab::Dealt => &row.dealt,
+            SkillTab::Received => &row.received,
+            SkillTab::Buff | SkillTab::Casts => &[],
+        }
+    }
+
+    /// Whether anything in the decoder feeds this tab today. A tab that is
+    /// not backed is still drawn and still selectable — dimming it out of
+    /// existence would leave the user guessing why the reference has a tab
+    /// this build doesn't — but it is painted muted and says why when
+    /// opened.
+    pub fn is_tracked(self) -> bool {
+        !matches!(self, SkillTab::Buff | SkillTab::Casts)
+    }
+
+    /// What an empty body says. An untracked tab explains the gap rather
+    /// than implying the fight simply had none of that; a tracked one falls
+    /// through to the caller's live/history wording.
+    pub fn untracked_message(self) -> Option<&'static str> {
+        match self {
+            SkillTab::Buff => Some("Buff uptime is not tracked yet (needs buff packet decoding)"),
+            SkillTab::Casts => Some("Skill casts are not tracked yet (needs cast packet decoding)"),
+            _ => None,
+        }
+    }
+}
+
+/// Lays out one tab's columns across `available` points of content width
+/// (issue #245).
+///
+/// Every column takes its own [`SkillColumn::width`]; whatever is left over
+/// goes to `Name`, the one column with no bounded formatter and so the one
+/// that can always use more room. Without this the narrower tabs (`Casts`
+/// is four columns totalling 312pt) would pack hard against the window's
+/// right edge with a wide dead gap after the icon, because
+/// `column_anchors_from_widths` lays columns out right-to-left from the
+/// content's right edge.
+///
+/// Returns the widths unchanged when they already overflow `available` —
+/// shrinking them is `column_anchors_from_widths`' job, and
+/// `SKILL_WINDOW_MIN_SIZE` keeps the widest tab clear of that path anyway.
+pub fn column_widths(columns: &[SkillColumn], available: f32) -> Vec<f32> {
+    let mut widths: Vec<f32> = columns.iter().map(|c| c.width()).collect();
+    let total: f32 = widths.iter().sum();
+    let slack = available - total;
+    if slack > 0.0
+        && let Some(name) = columns.iter().position(|c| *c == SkillColumn::Name)
+    {
+        widths[name] += slack;
+    }
+    widths
 }
 
 /// Resolves a raw skill id to display text, via the generated `skill_name`
@@ -328,6 +585,29 @@ pub fn place_window(
 mod tests {
     use super::*;
 
+    fn player_row() -> PlayerRow {
+        PlayerRow {
+            uid: 1,
+            name: "Tester".to_owned(),
+            class: None,
+            ability_score: None,
+            season_strength: None,
+            imagines: [None, None],
+            imagine_tiers: [None, None],
+            damage: 0,
+            dps: 0.0,
+            share_pct: 0.0,
+            crit_pct: 0.0,
+            lucky_pct: 0.0,
+            hits: 0,
+            deaths: 0,
+            skills: Vec::new(),
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+        }
+    }
+
     fn skill_row(skill_id: i32, damage: i64) -> SkillRow {
         SkillRow {
             skill_id,
@@ -394,8 +674,170 @@ mod tests {
             SkillColumn::Hits,
             SkillColumn::Crits,
             SkillColumn::HitPerMin,
+            SkillColumn::Heal,
+            SkillColumn::HealPct,
+            SkillColumn::Amount,
+            SkillColumn::AmountPct,
+            SkillColumn::Casts,
+            SkillColumn::CastPerMin,
         ] {
             assert!(column.sortable(), "{column:?} should be sortable");
+        }
+    }
+
+    // -- issue #245: tabs -------------------------------------------------
+
+    #[test]
+    fn every_tab_but_buff_has_a_name_column_and_a_leading_icon() {
+        for tab in SKILL_TABS {
+            if tab == SkillTab::Buff {
+                assert!(tab.columns().is_empty(), "{tab:?} should have no columns");
+                continue;
+            }
+            let columns = tab.columns();
+            assert_eq!(columns[0], SkillColumn::Icon, "{tab:?}");
+            assert_eq!(columns[1], SkillColumn::Name, "{tab:?}");
+        }
+    }
+
+    #[test]
+    fn every_tabs_default_sort_column_is_one_of_its_own_columns() {
+        for tab in SKILL_TABS {
+            if tab == SkillTab::Buff {
+                continue;
+            }
+            let sort = tab.default_sort();
+            assert!(
+                tab.columns().contains(&sort.column),
+                "{tab:?} defaults to sorting by {:?}, which it does not show",
+                sort.column
+            );
+            assert!(sort.descending, "{tab:?} should default to descending");
+        }
+    }
+
+    #[test]
+    fn every_tabs_columns_fit_the_windows_minimum_content_width() {
+        // `SKILL_WINDOW_MIN_SIZE.x` (752) minus the column header row's
+        // two `SKILL_HEADER_PAD_X` insets (24) — the budget `ui.rs`'s
+        // `skill_window_min_width_fits_every_column_at_its_stated_width`
+        // pins for the Dps tab, applied to all of them.
+        for tab in SKILL_TABS {
+            let total: f32 = tab.columns().iter().map(|c| c.width()).sum();
+            assert!(total <= 728.0, "{tab:?} needs {total}pt of column width");
+        }
+    }
+
+    #[test]
+    fn tab_labels_are_unique() {
+        let mut labels: Vec<&str> = SKILL_TABS.iter().map(|t| t.label()).collect();
+        labels.sort_unstable();
+        let count = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), count);
+    }
+
+    #[test]
+    fn untracked_tabs_say_so_and_tracked_ones_do_not() {
+        assert!(!SkillTab::Buff.is_tracked());
+        assert!(!SkillTab::Casts.is_tracked());
+        assert!(SkillTab::Buff.untracked_message().is_some());
+        assert!(SkillTab::Casts.untracked_message().is_some());
+        for tab in [
+            SkillTab::Dps,
+            SkillTab::Heal,
+            SkillTab::Dealt,
+            SkillTab::Received,
+        ] {
+            assert!(tab.is_tracked(), "{tab:?}");
+            assert_eq!(tab.untracked_message(), None, "{tab:?}");
+        }
+    }
+
+    #[test]
+    fn each_tab_reads_its_own_slice_of_the_player_row() {
+        let mut row = player_row();
+        row.skills = vec![skill_row(1, 10)];
+        row.heals = vec![skill_row(2, 20), skill_row(3, 30)];
+        row.dealt = vec![skill_row(4, 40)];
+        row.received = vec![skill_row(5, 50)];
+        assert_eq!(SkillTab::Dps.rows(&row).len(), 1);
+        assert_eq!(SkillTab::Heal.rows(&row)[1].skill_id, 3);
+        assert_eq!(SkillTab::Dealt.rows(&row)[0].skill_id, 4);
+        assert_eq!(SkillTab::Received.rows(&row)[0].skill_id, 5);
+        assert!(SkillTab::Buff.rows(&row).is_empty());
+        assert!(SkillTab::Casts.rows(&row).is_empty());
+    }
+
+    #[test]
+    fn the_amount_columns_read_the_same_fields_the_damage_ones_do() {
+        let mut row = skill_row(1, 4242);
+        row.share_pct = 25.0;
+        row.hits = 7;
+        row.hits_per_min = 3.5;
+        assert_eq!(
+            SkillColumn::Amount.text(&row),
+            SkillColumn::Damage.text(&row)
+        );
+        assert_eq!(SkillColumn::Heal.text(&row), SkillColumn::Damage.text(&row));
+        assert_eq!(
+            SkillColumn::AmountPct.text(&row),
+            SkillColumn::DmgPct.text(&row)
+        );
+        assert_eq!(SkillColumn::Casts.text(&row), SkillColumn::Hits.text(&row));
+        assert_eq!(
+            SkillColumn::CastPerMin.text(&row),
+            SkillColumn::HitPerMin.text(&row)
+        );
+    }
+
+    #[test]
+    fn sorting_a_heal_tab_by_its_own_amount_column_works() {
+        let mut rows = vec![skill_row(1, 100), skill_row(2, 300), skill_row(3, 200)];
+        sort_rows(&mut rows, SkillTab::Heal.default_sort());
+        let ids: Vec<i32> = rows.iter().map(|r| r.skill_id).collect();
+        assert_eq!(ids, vec![2, 3, 1]);
+    }
+
+    // -- issue #245: column widths ----------------------------------------
+
+    #[test]
+    fn leftover_content_width_goes_to_the_name_column() {
+        let columns = SkillTab::Casts.columns();
+        let stated: f32 = columns.iter().map(|c| c.width()).sum();
+        let widths = column_widths(columns, 728.0);
+        assert_eq!(widths.len(), columns.len());
+        assert!((widths.iter().sum::<f32>() - 728.0).abs() < 0.01);
+        // Only `Name` grew.
+        for (i, column) in columns.iter().enumerate() {
+            if *column == SkillColumn::Name {
+                assert!((widths[i] - (column.width() + 728.0 - stated)).abs() < 0.01);
+            } else {
+                assert!((widths[i] - column.width()).abs() < 0.01);
+            }
+        }
+    }
+
+    #[test]
+    fn column_widths_are_left_alone_when_they_already_overflow() {
+        let columns = SkillTab::Dps.columns();
+        let widths = column_widths(columns, 100.0);
+        for (i, column) in columns.iter().enumerate() {
+            assert!((widths[i] - column.width()).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn only_the_name_column_is_left_aligned() {
+        assert!(SkillColumn::Name.left_aligned());
+        for column in [
+            SkillColumn::Damage,
+            SkillColumn::Heal,
+            SkillColumn::Amount,
+            SkillColumn::Casts,
+            SkillColumn::HitPerMin,
+        ] {
+            assert!(!column.left_aligned(), "{column:?}");
         }
     }
 

@@ -1898,6 +1898,9 @@ mod tests {
             imagines: [None, None],
             imagine_tiers: [None, None],
             skills: Vec::new(),
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
         };
         assert_eq!((ColumnKind::Deaths.spec().text)(&row), "12");
     }
