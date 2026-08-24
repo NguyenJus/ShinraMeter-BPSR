@@ -12,7 +12,7 @@ use bpsr_meter::Class;
 
 use super::{
     EncounterRecord, EncounterSummary, HistoryError, HistoryStore, PlayerRecord, RetentionPolicy,
-    SCHEMA_VERSION,
+    SCHEMA_VERSION, SkillRecord,
 };
 
 /// Owns the single connection to `history.sqlite`. Never shared across
@@ -27,9 +27,11 @@ pub struct SqliteHistory {
 impl SqliteHistory {
     /// Opens (creating if needed) the history database at `path`, applying
     /// the schema-version policy of spec §5.4: a fresh or already-current
-    /// file is used as-is, and a file stamped with any other
-    /// `PRAGMA user_version` is renamed aside (`<path>.v<n>.bak`) and
-    /// replaced with a new empty schema rather than migrated (DECISION D11).
+    /// file is used as-is, a file stamped with a *known older* version is
+    /// migrated forward in place by [`migrate`] (issue #222), and only a
+    /// version this build has never heard of — a downgrade, or a hand-edited
+    /// file — is renamed aside (`<path>.v<n>.bak`) and replaced with a new
+    /// empty schema, since there is nothing to migrate from.
     /// Creates the parent directory if it doesn't exist yet.
     pub fn open(path: &Path, policy: RetentionPolicy) -> Result<Self, HistoryError> {
         Self::open_inner(path, policy, true)
@@ -65,6 +67,14 @@ impl SqliteHistory {
                 conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             v if v == SCHEMA_VERSION => {}
+            v if v > 0 && v < SCHEMA_VERSION => {
+                log::info!(
+                    "history db: migrating {} from schema v{v} to v{SCHEMA_VERSION}",
+                    path.display()
+                );
+                migrate(&conn, v)?;
+                conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
             v if allow_reset => {
                 log::warn!(
                     "history db: unrecognized schema version {v} in {} (expected {SCHEMA_VERSION}); \
@@ -150,6 +160,50 @@ fn init_schema(conn: &Connection) -> Result<(), HistoryError> {
             PRIMARY KEY (encounter_id, slot)
         );",
     )?;
+    conn.execute_batch(SKILLS_DDL)?;
+    Ok(())
+}
+
+/// The `encounter_player_skills` DDL (issue #222), shared by [`init_schema`]
+/// and the v1 → v2 step of [`migrate`] so a freshly created file and a
+/// migrated one can never end up with different tables.
+///
+/// Keyed by `(encounter_id, slot, skill_slot)` rather than by skill id:
+/// `slot` joins back to `encounter_players`' own `slot`, and `skill_slot`
+/// preserves the damage-descending order the meter produced, so a loaded
+/// breakdown needs no re-sort. The cascade is off `encounters(id)` — the
+/// same parent `encounter_players` cascades from — so deleting one encounter
+/// (retention pruning included) takes its skill rows with it.
+const SKILLS_DDL: &str = "CREATE TABLE IF NOT EXISTS encounter_player_skills (
+        encounter_id    INTEGER NOT NULL REFERENCES encounters(id) ON DELETE CASCADE,
+        slot            INTEGER NOT NULL,
+        skill_slot      INTEGER NOT NULL,
+        skill_id        INTEGER NOT NULL,
+        damage          INTEGER NOT NULL,
+        share_pct       REAL    NOT NULL,
+        crit_pct        REAL    NOT NULL,
+        max_crit        INTEGER NOT NULL,
+        avg_crit        REAL    NOT NULL,
+        avg_white       REAL    NOT NULL,
+        avg             REAL    NOT NULL,
+        hits            INTEGER NOT NULL,
+        crit_hits       INTEGER NOT NULL,
+        hits_per_min    REAL    NOT NULL,
+        PRIMARY KEY (encounter_id, slot, skill_slot)
+    );";
+
+/// Upgrades a file stamped with the known older version `from` to
+/// `SCHEMA_VERSION`, in place. Every step here is *additive* by construction:
+/// no existing row is rewritten or dropped, so an interrupted upgrade leaves
+/// a file the previous version could still read, and a user's history is
+/// never wiped to gain a column.
+fn migrate(conn: &Connection, from: i32) -> Result<(), HistoryError> {
+    // v1 → v2 (issue #222): per-skill totals. Nothing but a new table, so
+    // encounters saved before it keep every field they had and simply have
+    // no skill rows to hand back.
+    if from < 2 {
+        conn.execute_batch(SKILLS_DDL)?;
+    }
     Ok(())
 }
 
@@ -219,10 +273,17 @@ impl HistoryStore for SqliteHistory {
                     damage, dps, share_pct, crit_pct, lucky_pct, hits, deaths
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             )?;
+            let mut skill_stmt = tx.prepare(
+                "INSERT INTO encounter_player_skills (
+                    encounter_id, slot, skill_slot, skill_id, damage, share_pct, crit_pct,
+                    max_crit, avg_crit, avg_white, avg, hits, crit_hits, hits_per_min
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            )?;
             for (slot, player) in record.players.iter().enumerate() {
+                let slot_id = i64::try_from(slot).unwrap_or(i64::MAX);
                 stmt.execute(params![
                     encounter_id,
-                    i64::try_from(slot).unwrap_or(i64::MAX),
+                    slot_id,
                     player.uid,
                     player.name,
                     player.class.map(|c| c.name()),
@@ -240,6 +301,25 @@ impl HistoryStore for SqliteHistory {
                     i64::try_from(player.hits).unwrap_or(i64::MAX),
                     i64::from(player.deaths),
                 ])?;
+
+                for (skill_slot, skill) in player.skills.iter().enumerate() {
+                    skill_stmt.execute(params![
+                        encounter_id,
+                        slot_id,
+                        i64::try_from(skill_slot).unwrap_or(i64::MAX),
+                        skill.skill_id,
+                        skill.damage,
+                        f64::from(skill.share_pct),
+                        f64::from(skill.crit_pct),
+                        skill.max_crit,
+                        skill.avg_crit,
+                        skill.avg_white,
+                        skill.avg,
+                        i64::try_from(skill.hits).unwrap_or(i64::MAX),
+                        i64::try_from(skill.crit_hits).unwrap_or(i64::MAX),
+                        skill.hits_per_min,
+                    ])?;
+                }
             }
         }
 
@@ -357,9 +437,45 @@ impl HistoryStore for SqliteHistory {
                     lucky_pct: row.get::<_, f64>(13)? as f32,
                     hits: u64::try_from(row.get::<_, i64>(14)?).unwrap_or(0),
                     deaths: u32::try_from(row.get::<_, i64>(15)?).unwrap_or(0),
+                    skills: Vec::new(),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+
+        // Issue #222: one query for the whole encounter's breakdown, fanned
+        // out by `slot` into the players just loaded (their index *is* their
+        // slot, since they came back ordered by it). An encounter written
+        // before schema v2 matches no rows here and keeps every player's
+        // breakdown empty — the pre-#222 behaviour, without a crash.
+        let mut stmt = self.conn.prepare(
+            "SELECT slot, skill_id, damage, share_pct, crit_pct, max_crit, avg_crit,
+                    avg_white, avg, hits, crit_hits, hits_per_min
+             FROM encounter_player_skills WHERE encounter_id = ?1 ORDER BY slot, skill_slot",
+        )?;
+        let skills = stmt.query_map(params![id], |row| {
+            Ok((
+                usize::try_from(row.get::<_, i64>(0)?).unwrap_or(usize::MAX),
+                SkillRecord {
+                    skill_id: row.get(1)?,
+                    damage: row.get(2)?,
+                    share_pct: row.get::<_, f64>(3)? as f32,
+                    crit_pct: row.get::<_, f64>(4)? as f32,
+                    max_crit: row.get(5)?,
+                    avg_crit: row.get(6)?,
+                    avg_white: row.get(7)?,
+                    avg: row.get(8)?,
+                    hits: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
+                    crit_hits: u64::try_from(row.get::<_, i64>(10)?).unwrap_or(0),
+                    hits_per_min: row.get(11)?,
+                },
+            ))
+        })?;
+        for entry in skills {
+            let (slot, skill) = entry?;
+            if let Some(player) = record.players.get_mut(slot) {
+                player.skills.push(skill);
+            }
+        }
 
         Ok(Some(record))
     }
@@ -397,6 +513,7 @@ mod tests {
             lucky_pct: 6.25,
             hits: 40,
             deaths: 2,
+            skills: Vec::new(),
         }
     }
 
@@ -674,6 +791,176 @@ mod tests {
             })
             .unwrap();
         assert_eq!((encounter_count, player_count), (0, 0));
+    }
+
+    fn sample_skill(skill_id: i32, damage: i64) -> SkillRecord {
+        SkillRecord {
+            skill_id,
+            damage,
+            share_pct: 60.5,
+            crit_pct: 25.25,
+            max_crit: damage / 2,
+            avg_crit: 1_500.5,
+            avg_white: 900.25,
+            avg: 1_200.75,
+            hits: 8,
+            crit_hits: 2,
+            hits_per_min: 40.5,
+        }
+    }
+
+    /// The v1 DDL verbatim (the schema that shipped before issue #222), so
+    /// the migration is exercised against what is actually on disk in the
+    /// wild rather than against today's `init_schema`.
+    const V1_SCHEMA: &str = "CREATE TABLE encounters (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ended_at_ms     INTEGER NOT NULL,
+            duration_ms     INTEGER NOT NULL,
+            total_damage    INTEGER NOT NULL,
+            total_dps       REAL    NOT NULL,
+            boss_monster_id INTEGER,
+            boss_name       TEXT,
+            is_boss         INTEGER NOT NULL,
+            scene_id        INTEGER,
+            scene_name      TEXT,
+            title           TEXT    NOT NULL,
+            subtitle        TEXT,
+            player_count    INTEGER NOT NULL,
+            meter_version   TEXT    NOT NULL
+        );
+        CREATE INDEX idx_encounters_ended_at ON encounters(ended_at_ms DESC);
+        CREATE TABLE encounter_players (
+            encounter_id    INTEGER NOT NULL REFERENCES encounters(id) ON DELETE CASCADE,
+            slot            INTEGER NOT NULL,
+            uid             INTEGER NOT NULL,
+            name            TEXT    NOT NULL,
+            class           TEXT,
+            ability_score   INTEGER,
+            season_strength INTEGER,
+            imagine_0       INTEGER,
+            imagine_1       INTEGER,
+            imagine_tier_0  INTEGER,
+            imagine_tier_1  INTEGER,
+            damage          INTEGER NOT NULL,
+            dps             REAL    NOT NULL,
+            share_pct       REAL    NOT NULL,
+            crit_pct        REAL    NOT NULL,
+            lucky_pct       REAL    NOT NULL,
+            hits            INTEGER NOT NULL,
+            deaths          INTEGER NOT NULL,
+            PRIMARY KEY (encounter_id, slot)
+        );";
+
+    #[test]
+    fn loading_an_encounter_restores_each_player_s_skill_rows() {
+        let mut store = SqliteHistory::in_memory(RetentionPolicy::default()).unwrap();
+        let mut alice = sample_player(1, "Alice");
+        alice.skills = vec![sample_skill(101, 3_000), sample_skill(102, 2_000)];
+        let id = store
+            .insert(&sample_record(
+                1_000,
+                10_000,
+                vec![alice.clone(), sample_player(2, "Bob")],
+            ))
+            .unwrap()
+            .unwrap();
+
+        let loaded = store.load(id).unwrap().unwrap();
+
+        assert_eq!(loaded.players[0].skills, alice.skills);
+        assert!(
+            loaded.players[1].skills.is_empty(),
+            "a player who never hit anything keeps an empty breakdown"
+        );
+    }
+
+    #[test]
+    fn deleting_an_encounter_drops_its_skill_rows() {
+        let mut store = SqliteHistory::in_memory(RetentionPolicy::default()).unwrap();
+        let mut alice = sample_player(1, "Alice");
+        alice.skills = vec![sample_skill(101, 3_000)];
+        let id = store
+            .insert(&sample_record(1_000, 10_000, vec![alice]))
+            .unwrap()
+            .unwrap();
+
+        store.delete(id).unwrap();
+
+        let skill_rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM encounter_player_skills", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(skill_rows, 0);
+    }
+
+    /// Issue #222: an existing history file must open, keep every encounter
+    /// it already holds, and start recording skill rows from then on — the
+    /// pre-#222 encounters simply have none.
+    #[test]
+    fn a_v1_database_migrates_in_place_and_keeps_its_encounters() {
+        let path = crate::history::temp_history_path("v1-migration");
+        let bak_path = path.with_extension("v1.bak");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&bak_path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V1_SCHEMA).unwrap();
+            conn.execute(
+                "INSERT INTO encounters (
+                    ended_at_ms, duration_ms, total_damage, total_dps, boss_monster_id,
+                    boss_name, is_boss, scene_id, scene_name, title, subtitle,
+                    player_count, meter_version
+                 ) VALUES (1000, 10000, 10000, 1000.0, 7, 'Boss', 1, 3, 'Scene', 'Boss',
+                           'Scene', 1, '0.2.2')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO encounter_players (
+                    encounter_id, slot, uid, name, class, ability_score, season_strength,
+                    imagine_0, imagine_1, imagine_tier_0, imagine_tier_1,
+                    damage, dps, share_pct, crit_pct, lucky_pct, hits, deaths
+                 ) VALUES (1, 0, 1, 'Alice', 'FrostMage', 999, 42, 1, NULL, 3, NULL,
+                           5000, 500.0, 33.3, 12.5, 6.25, 40, 2)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+
+        let mut store = SqliteHistory::open(&path, RetentionPolicy::default()).unwrap();
+        let old = store.load(1).unwrap().unwrap();
+        let mut bob = sample_player(2, "Bob");
+        bob.skills = vec![sample_skill(101, 3_000)];
+        let new_id = store
+            .insert(&sample_record(2_000, 10_000, vec![bob.clone()]))
+            .unwrap()
+            .unwrap();
+        let fresh = store.load(new_id).unwrap().unwrap();
+        let version: i32 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        drop(store);
+        let bak_exists = bak_path.exists();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&bak_path);
+
+        assert_eq!(old.players.len(), 1, "the pre-#222 encounter survives");
+        assert_eq!(old.players[0].name, "Alice");
+        assert!(
+            old.players[0].skills.is_empty(),
+            "an encounter saved before the skill table simply has no skill rows"
+        );
+        assert_eq!(fresh.players[0].skills, bob.skills);
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(
+            !bak_exists,
+            "a migratable file is upgraded in place, never renamed aside"
+        );
     }
 
     #[test]
