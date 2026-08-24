@@ -8,7 +8,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bpsr_app::{fonts, history, inspect, logging, paths, pipeline, platform, settings, ui};
+use bpsr_app::{
+    fonts, history, inspect, logging, paths, pipeline, platform, settings, ui, update_check,
+};
 use bpsr_protocol::ProtocolEvent;
 use crossbeam_channel::bounded;
 use ui::{OverlayApp, StatusLine, UiCommand};
@@ -236,6 +238,16 @@ fn main() -> eframe::Result {
     // `logging::init` (issue #69) turns logging on by default and tees it to
     // a file so a user hitting a bug can actually produce diagnostics.
     logging::init();
+
+    // Issue #250: the previous in-place update, if there was one, left the
+    // build it replaced beside the executable as `<exe>.old` — Windows will
+    // not let a running image be deleted, so the process that installed the
+    // update could not clean up after itself. This one can: whatever held
+    // that file open is the process that exited to make room for this one.
+    // Best-effort and never fatal (see the function's doc comment), and
+    // deliberately after `logging::init` so a failure has somewhere to be
+    // logged.
+    update_check::clean_up_previous_update();
 
     let (tx_events, rx_events) = bounded::<ProtocolEvent>(EVENT_CAPACITY);
     let (tx_command, rx_command) = bounded::<UiCommand>(COMMAND_CAPACITY);
