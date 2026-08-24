@@ -33,6 +33,21 @@ const MAX_SCAN_FRAGMENTS: usize = 1000;
 /// well above the largest size ever seen from a genuine reconnect and well
 /// below the smallest observed false positive, so it closes the race
 /// instead of merely papering over it.
+///
+/// The evidence behind 512 is thin: a single field-log session (11
+/// adoptions, one false positive at 1400 bytes) — plausible, not proven.
+/// This is a hard, unconditional reject with no fallback: a legitimate
+/// first reconnect packet that exceeds it (NIC offload/GRO coalescing
+/// several TCP segments into one payload, a VPN changing effective MTU, a
+/// protocol revision that grows the handshake) *and* fails the
+/// size-independent signature scan tried first
+/// ([`looks_like_game_server`], [`is_login_return`]) is rejected outright —
+/// the subnet-reconnect path silently never fires for that connection, and
+/// capture stays dead until a manual restart. This has not been observed in
+/// the field. If it starts happening, [`ServerDetector::detects`] logs the
+/// rejection (`log::debug!`, once per connection) precisely so a future
+/// field log can settle whether the cap needs to move, instead of leaving a
+/// dead capture with no trace.
 pub const SUBNET_ADOPTION_MAX_PAYLOAD: usize = 512;
 
 /// A TCP 4-tuple identifying one connection.
@@ -203,6 +218,22 @@ pub fn subnet_adoption_eligible(conn: &Conn, payload: &[u8], known_subnet: [u8; 
         && [conn.src[0], conn.src[1]] == known_subnet
 }
 
+/// True if `conn`/`payload` satisfy every [`subnet_adoption_eligible`]
+/// requirement *except* the payload-size cap — i.e. [`SUBNET_ADOPTION_MAX_PAYLOAD`]
+/// is the sole reason the candidate is being turned away. Used only to
+/// decide whether a rejection is worth a log line (see
+/// [`ServerDetector::detects`]); has no bearing on the adoption decision
+/// itself.
+fn subnet_adoption_rejected_only_by_size(
+    conn: &Conn,
+    payload: &[u8],
+    known_subnet: [u8; 2],
+) -> bool {
+    payload.len() > SUBNET_ADOPTION_MAX_PAYLOAD
+        && !is_private(conn.src)
+        && [conn.src[0], conn.src[1]] == known_subnet
+}
+
 /// Whether the signature-scan paths (`looks_like_game_server`,
 /// `is_login_return`) may treat `conn` as a candidate server connection.
 ///
@@ -269,6 +300,14 @@ pub struct ServerDetector {
     /// `known_server` clears (a reconnect must not forget its own address).
     /// Only [`Self::reset`] forgets it. See [`signature_direction_ok`].
     local_endpoint: Option<[u8; 4]>,
+    /// Subnet-path candidates already logged as rejected solely by
+    /// [`SUBNET_ADOPTION_MAX_PAYLOAD`], so a connection that keeps sending
+    /// oversized packets logs once instead of once per packet. Purely an
+    /// observability aid — never consulted by the adoption decision — so,
+    /// unlike `subnet_candidates`, dropping an insert once bounded costs
+    /// nothing but a rare missed log line. Cleared on the same triggers as
+    /// `subnet_candidates` (see [`Self::adopt`], [`Self::reset`]).
+    size_capped_candidates: HashSet<Conn>,
 }
 
 impl ServerDetector {
@@ -288,6 +327,7 @@ impl ServerDetector {
         self.known_subnet = None;
         self.subnet_candidates.clear();
         self.local_endpoint = None;
+        self.size_capped_candidates.clear();
     }
 
     /// Game-server detection per §0.7: payload signature scan, then the
@@ -325,10 +365,32 @@ impl ServerDetector {
         let Some(prefix) = self.known_subnet else {
             return false;
         };
-        if !signature_direction_ok(conn, self.local_endpoint)
-            || !subnet_adoption_eligible(conn, payload, prefix)
-            || self.subnet_candidates.contains(conn)
-        {
+        if !signature_direction_ok(conn, self.local_endpoint) {
+            return false;
+        }
+        if !subnet_adoption_eligible(conn, payload, prefix) {
+            // Observability for issue #258's size cap (see
+            // SUBNET_ADOPTION_MAX_PAYLOAD docs): if this ever fires in the
+            // field it means the fallback silently gave up on a real
+            // reconnect, which otherwise leaves no trace at all. Logged at
+            // most once per connection, and only when the size cap is the
+            // sole reason for rejection — a candidate failing for another
+            // reason (wrong subnet, empty payload, wrong direction) isn't
+            // evidence the cap itself is wrong.
+            if subnet_adoption_rejected_only_by_size(conn, payload, prefix)
+                && self.size_capped_candidates.len() < Self::MAX_SUBNET_CONNECTIONS
+                && self.size_capped_candidates.insert(*conn)
+            {
+                log::debug!(
+                    "capture: subnet-reconnect candidate {conn} rejected solely by the \
+                     {SUBNET_ADOPTION_MAX_PAYLOAD}-byte payload cap ({} bytes); see \
+                     SUBNET_ADOPTION_MAX_PAYLOAD docs if this recurs",
+                    payload.len(),
+                );
+            }
+            return false;
+        }
+        if self.subnet_candidates.contains(conn) {
             return false;
         }
         if self.subnet_candidates.len() >= Self::MAX_SUBNET_CONNECTIONS {
@@ -351,6 +413,7 @@ impl ServerDetector {
         // resetting the decoder and wiping the meter.
         if self.known_subnet != Some(prefix) {
             self.subnet_candidates.clear();
+            self.size_capped_candidates.clear();
         }
         self.known_subnet = Some(prefix);
         // Bounded for the same reason `detects` is: the payload-signature
@@ -361,6 +424,91 @@ impl ServerDetector {
         // candidate, so there is no re-adoption left for the record to block.
         if self.subnet_candidates.len() < Self::MAX_SUBNET_CONNECTIONS {
             self.subnet_candidates.insert(*conn);
+        }
+    }
+}
+
+/// One packet's effect on the adopted-server state machine, decided without
+/// touching the reassembler, decoder, or event channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdoptionDecision {
+    /// The packet's relationship to the (possibly now-stale) adopted
+    /// connection, as classified before any teardown/adoption in this call.
+    pub role: ConnStreamRole,
+    /// A FIN/RST on this packet tore down the previously-tracked connection
+    /// (see [`is_teardown_of_known`]); `known_server` has already been
+    /// cleared to reflect it.
+    pub torn_down: bool,
+    /// The packet must not be reassembled at all (`Reverse`, or `Unrelated`
+    /// with no adoption).
+    pub skip: bool,
+    /// This call is the one that adopted `conn` as the server connection.
+    /// The caller must resync the reassembler to this packet's sequence
+    /// number, reset the decoder, and emit exactly one
+    /// `ProtocolEvent::ServerChanged` — never on any other decision, which
+    /// is what keeps a still-`Adopted` packet from re-triggering the event.
+    pub newly_adopted: bool,
+}
+
+/// Decides what a captured packet means for the adopted-server state
+/// machine: role classification, teardown detection, and (for an unrelated
+/// connection) whether it adopts.
+///
+/// Pulled out of win.rs's `#[cfg(windows)]` recv loop as a host-testable
+/// seam: `classify_connection` -> `detector.detects` -> `detector.adopt` ->
+/// "caller must emit `ServerChanged`" is exactly the sequence that a prior
+/// bug in this class (fixed in 6363e90 via `classify_connection` /
+/// [`ConnStreamRole::Reverse`]) got wrong, and it had no regression test.
+/// This function *is* that sequence — everything Win32-specific (WinDivert
+/// recv, etherparse slicing, `TcpReassembler`, `Decoder`, the
+/// `crossbeam_channel::Sender`) stays in win.rs, which only needs to act on
+/// the returned [`AdoptionDecision`]. See win.rs's `sniff_loop` for the call
+/// site and how it maps `torn_down`/`skip`/`newly_adopted` onto those
+/// side effects.
+pub fn decide_packet(
+    detector: &mut ServerDetector,
+    known_server: &mut Option<Conn>,
+    conn: &Conn,
+    payload: &[u8],
+    fin: bool,
+    rst: bool,
+) -> AdoptionDecision {
+    let role = classify_connection(conn, known_server.as_ref());
+    let torn_down = is_teardown_of_known(role, fin, rst);
+    if torn_down {
+        *known_server = None;
+    }
+    match role {
+        ConnStreamRole::Reverse => AdoptionDecision {
+            role,
+            torn_down,
+            skip: true,
+            newly_adopted: false,
+        },
+        ConnStreamRole::Adopted => AdoptionDecision {
+            role,
+            torn_down,
+            skip: false,
+            newly_adopted: false,
+        },
+        ConnStreamRole::Unrelated => {
+            if !detector.detects(conn, payload, known_server.is_some()) {
+                AdoptionDecision {
+                    role,
+                    torn_down,
+                    skip: true,
+                    newly_adopted: false,
+                }
+            } else {
+                *known_server = Some(*conn);
+                detector.adopt(conn);
+                AdoptionDecision {
+                    role,
+                    torn_down,
+                    skip: false,
+                    newly_adopted: true,
+                }
+            }
         }
     }
 }
@@ -881,5 +1029,159 @@ mod tests {
     #[test]
     fn fin_on_an_unrelated_connection_is_not_a_teardown() {
         assert!(!is_teardown_of_known(ConnStreamRole::Unrelated, true, true));
+    }
+
+    // --- `decide_packet` (win.rs adopt/emit sequence, extracted host-testable) ---
+
+    fn login_return_payload() -> Vec<u8> {
+        let mut payload = vec![0u8; LOGIN_RETURN_SIGNATURE_SIZE];
+        payload[0..10].copy_from_slice(&LOGIN_RETURN_SIGNATURE_1);
+        payload[14..20].copy_from_slice(&LOGIN_RETURN_SIGNATURE_2);
+        payload
+    }
+
+    #[test]
+    fn decide_packet_adopts_once_then_never_re_emits_for_the_same_connection() {
+        // The double-ServerChanged case: win.rs must send exactly one
+        // `ServerChanged` per adoption, never one per packet on an
+        // already-adopted connection.
+        let mut detector = ServerDetector::new();
+        let mut known_server = None;
+        let conn = server_to_client([203, 0, 113, 7], 5000);
+        let payload = login_return_payload();
+
+        let first = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &conn,
+            &payload,
+            false,
+            false,
+        );
+        assert_eq!(first.role, ConnStreamRole::Unrelated);
+        assert!(!first.skip);
+        assert!(first.newly_adopted);
+        assert_eq!(known_server, Some(conn));
+
+        // Same connection, next packet: now classifies as `Adopted`, must
+        // not re-adopt or signal a second `ServerChanged`.
+        let second = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &conn,
+            b"more bytes",
+            false,
+            false,
+        );
+        assert_eq!(second.role, ConnStreamRole::Adopted);
+        assert!(!second.skip);
+        assert!(!second.newly_adopted);
+        assert_eq!(known_server, Some(conn));
+    }
+
+    #[test]
+    fn decide_packet_skips_the_reverse_direction_without_touching_known_server() {
+        let mut detector = ServerDetector::new();
+        let adopted = server_to_client([203, 0, 113, 7], 5000);
+        let mut known_server = Some(adopted);
+        detector.adopt(&adopted);
+
+        // The client→server half of the same connection: the reversed tuple.
+        let reverse = Conn {
+            src: adopted.dst,
+            src_port: adopted.dst_port,
+            dst: adopted.src,
+            dst_port: adopted.src_port,
+        };
+        let decision = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &reverse,
+            b"client bytes",
+            false,
+            false,
+        );
+        assert_eq!(decision.role, ConnStreamRole::Reverse);
+        assert!(decision.skip);
+        assert!(!decision.newly_adopted);
+        assert!(!decision.torn_down);
+        assert_eq!(known_server, Some(adopted));
+    }
+
+    #[test]
+    fn decide_packet_reports_teardown_and_clears_known_server() {
+        let mut detector = ServerDetector::new();
+        let adopted = server_to_client([203, 0, 113, 7], 5000);
+        let mut known_server = Some(adopted);
+        detector.adopt(&adopted);
+
+        let decision = decide_packet(&mut detector, &mut known_server, &adopted, b"", true, false);
+        assert_eq!(decision.role, ConnStreamRole::Adopted);
+        assert!(decision.torn_down);
+        assert!(!decision.skip);
+        assert_eq!(known_server, None);
+    }
+
+    #[test]
+    fn decide_packet_leaves_unrelated_non_matching_traffic_alone() {
+        let mut detector = ServerDetector::new();
+        let mut known_server = None;
+        let conn = server_to_client([203, 0, 113, 7], 5000);
+        let decision = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &conn,
+            b"not a signature",
+            false,
+            false,
+        );
+        assert_eq!(decision.role, ConnStreamRole::Unrelated);
+        assert!(decision.skip);
+        assert!(!decision.newly_adopted);
+        assert_eq!(known_server, None);
+    }
+
+    // --- size-cap rejection logging bookkeeping (finding: observability) ---
+
+    #[test]
+    fn size_capped_rejection_bookkeeping_does_not_consume_the_real_candidate_budget() {
+        // `size_capped_candidates` exists purely so a rejection gets logged
+        // once instead of once per packet; it must not share state with
+        // `subnet_candidates`, which gates how many connections the
+        // reconnect path is actually willing to try.
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        let big_payload = vec![0u8; SUBNET_ADOPTION_MAX_PAYLOAD + 1];
+
+        // Repeatedly reject more oversized candidates than the real budget
+        // (`MAX_SUBNET_CONNECTIONS`) would allow.
+        for port in 5001..5001 + ServerDetector::MAX_SUBNET_CONNECTIONS as u16 * 2 {
+            assert!(!d.detects(
+                &server_to_client([203, 0, 113, 200], port),
+                &big_payload,
+                false
+            ));
+        }
+
+        // The real adoption budget is untouched: legitimately small
+        // candidates still succeed up to the real cap. `detector_knowing`
+        // already consumed one slot via its own `adopt`, so only
+        // `MAX_SUBNET_CONNECTIONS - 1` more fit.
+        for port in 6000..6000 + (ServerDetector::MAX_SUBNET_CONNECTIONS as u16 - 1) {
+            assert!(d.detects(&server_to_client([203, 0, 113, 201], port), b"ok", false));
+        }
+    }
+
+    #[test]
+    fn size_capped_rejection_is_not_relogged_for_the_same_connection() {
+        // Calling `detects` again for the exact same over-cap connection must
+        // not grow `size_capped_candidates` a second time (keeps the "once
+        // per connection" log promise cheap to verify by construction).
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        let big_payload = vec![0u8; SUBNET_ADOPTION_MAX_PAYLOAD + 1];
+        let candidate = server_to_client([203, 0, 113, 200], 5001);
+        assert!(!d.detects(&candidate, &big_payload, false));
+        assert_eq!(d.size_capped_candidates.len(), 1);
+        assert!(!d.detects(&candidate, &big_payload, false));
+        assert_eq!(d.size_capped_candidates.len(), 1);
     }
 }
