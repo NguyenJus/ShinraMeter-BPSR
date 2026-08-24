@@ -93,6 +93,15 @@ pub const HANDOFF_VAR: &str = "SHINRA_INSTANCE_HANDOFF";
 /// releases its handle. Bounded all the same — if the predecessor is wedged
 /// rather than exiting, the successor eventually says so instead of hanging
 /// with no window and no message.
+///
+/// Kept at 10s rather than shortened (issue #278 review): the joins on the
+/// outgoing side (`pipeline_thread`, the names-cache writer, the settings
+/// thread — see `main.rs`'s shutdown path) block on `JoinHandle::join` with
+/// no internal timeout of their own, so nothing bounds how long a slow but
+/// healthy shutdown — e.g. the SQLite flush contending with disk I/O — can
+/// take. A shorter ceiling would risk cutting off exactly the non-wedged
+/// case this wait exists to cover; there was no evidence here that 5s is
+/// still safe.
 const HANDOFF_WAIT: Duration = Duration::from_secs(10);
 
 /// How often the wait re-tries. Short enough that a normal handoff — a
@@ -109,6 +118,32 @@ fn handoff_wait(flag: Option<&str>) -> Duration {
     }
 }
 
+/// Reads [`HANDOFF_VAR`] and removes it from this process's own
+/// environment in the same step, so the flag is consumed exactly once
+/// rather than staying live for the rest of the process's life.
+///
+/// # Safety
+///
+/// `std::env::remove_var` is `unsafe` on the 2024 edition because mutating
+/// the environment races with any other thread that reads or writes it
+/// concurrently. This is called from [`acquire`], which runs at the very
+/// top of `main` — right after `logging::init` (which only *reads* env
+/// vars such as `RUST_LOG`/`APPDATA`/`SHINRA_LOG_FILE` and spawns nothing)
+/// and before this process spawns any thread of its own. The app crate's
+/// other `std::thread::spawn`/`Builder` call sites are all in `settings`,
+/// `pipeline`, `dump` and `ui`, none of which run before this point, and
+/// the crate has no `ctor`-style static initializer either. No other
+/// thread exists yet to race with, so the mutation is sound here — it
+/// would not be, called anywhere past that point.
+fn consume_handoff_var() -> Option<String> {
+    let value = std::env::var(HANDOFF_VAR).ok();
+    // SAFETY: see the function doc comment above.
+    unsafe {
+        std::env::remove_var(HANDOFF_VAR);
+    }
+    value
+}
+
 /// Resolves the lock path and tries to claim the meter slot, logging the
 /// path warning (if any) on the way through, plus a debug breadcrumb on
 /// success — otherwise a claimed lock leaves no trace in the log at all,
@@ -120,19 +155,51 @@ pub fn acquire() -> Acquisition {
     if let Some(warning) = warning {
         log::warn!("{warning}");
     }
-    let wait = handoff_wait(std::env::var(HANDOFF_VAR).ok().as_deref());
-    if !wait.is_zero() {
-        log::info!(
-            "relaunched by an in-place update; waiting up to {}s for the previous instance to release {}",
-            wait.as_secs(),
-            path.display()
-        );
-    }
-    let acquisition = acquire_at_within(&path, wait);
+    let wait = handoff_wait(consume_handoff_var().as_deref());
+    let acquisition = if wait.is_zero() {
+        acquire_at_within(&path, wait)
+    } else {
+        acquire_with_logged_handoff(&path, wait)
+    };
     if matches!(acquisition, Acquisition::Acquired(_)) {
         log::info!("single-instance lock acquired at {}", path.display());
     }
     acquisition
+}
+
+/// [`acquire_at_within`], but only for the relaunch case, and narrating the
+/// wait to the log as it happens (issue #278 review): `acquire` runs before
+/// any window, splash or tray icon exists, so if the predecessor is wedged
+/// rather than exiting, a silent wait here is the only place the delay
+/// could ever be explained. The "waiting" line fires only once the first
+/// attempt actually finds the slot held — not merely because a wait is
+/// armed — so a handoff that wins immediately logs nothing extra.
+fn acquire_with_logged_handoff(path: &Path, wait: Duration) -> Acquisition {
+    match acquire_at(path) {
+        Acquisition::AlreadyRunning => {}
+        settled => return settled,
+    }
+    log::info!(
+        "relaunched by an in-place update; the previous instance still holds {} — waiting up to {}s for it to release the slot",
+        path.display(),
+        wait.as_secs()
+    );
+    let started = Instant::now();
+    let outcome = acquire_at_within(path, wait);
+    match &outcome {
+        Acquisition::Acquired(_) => log::info!(
+            "previous instance released {} after {:.2}s",
+            path.display(),
+            started.elapsed().as_secs_f64()
+        ),
+        Acquisition::AlreadyRunning => log::warn!(
+            "gave up waiting for the previous instance to release {} after {}s; it may be stuck rather than exiting",
+            path.display(),
+            wait.as_secs()
+        ),
+        Acquisition::Unavailable(_) => {}
+    }
+    outcome
 }
 
 /// [`acquire_at`], but willing to wait up to `wait` for a lock another
