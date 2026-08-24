@@ -14666,6 +14666,87 @@ mod tests {
         );
     }
 
+    /// Issue #248: the skill table used to be laid out right-to-left from
+    /// the window's right inset against fixed column widths, so all surplus
+    /// width landed in the *left* gutter — measured at 60px at the minimum
+    /// width, 68px at the initial one and ~290px at 1074 wide, i.e.
+    /// widening the window shoved the whole table right, behind a growing
+    /// empty band.
+    ///
+    /// Issue #245's `skills::column_widths` is what closes that gap, and it
+    /// is the reading the main meter window already has: the leftover goes
+    /// to `Name` — the one column with no bounded formatter — so the widths
+    /// sum to the content width exactly and `column_anchors_from_widths`'
+    /// right-to-left walk lands the leading column on the content's left
+    /// edge at every size, the same way `draw_rows` starts the main meter's
+    /// anchors from `avail.left()`. Checked end to end here, through the
+    /// same two calls `draw_skill_window` makes.
+    #[test]
+    fn skill_columns_stay_left_inset_at_every_window_width() {
+        let columns = skills::SkillTab::Dps.columns();
+        let layout_at = |window_width: f32| {
+            let left = SKILL_HEADER_PAD_X;
+            let right = window_width - SKILL_HEADER_PAD_X;
+            let widths = skills::column_widths(columns, right - left);
+            (
+                column_anchors_from_widths(left, right, &widths, 0.0),
+                widths,
+            )
+        };
+        let surplus = 300.0;
+        let (narrow, narrow_widths) = layout_at(SKILL_WINDOW_MIN_SIZE.x);
+        let (wide, wide_widths) = layout_at(SKILL_WINDOW_MIN_SIZE.x + surplus);
+
+        // The leading column's left edge sits one pad in from the window at
+        // both sizes: no dead left gutter opens up as the window grows.
+        assert_eq!(narrow[0] - narrow_widths[0], SKILL_HEADER_PAD_X);
+        assert_eq!(wide[0] - wide_widths[0], SKILL_HEADER_PAD_X);
+        // The surplus went to `Name` rather than to a gutter at either end
+        // — every other column keeps its stated width, and the trailing
+        // column stays pinned one pad in from the window's right edge.
+        let name = columns
+            .iter()
+            .position(|c| *c == skills::SkillColumn::Name)
+            .expect("every tab shows the Name column");
+        assert_eq!(wide_widths[name] - narrow_widths[name], surplus);
+        for (i, column) in columns.iter().enumerate() {
+            if i != name {
+                assert_eq!(wide_widths[i], column.width(), "{column:?} was resized");
+            }
+        }
+        assert_eq!(
+            *wide.last().unwrap(),
+            SKILL_WINDOW_MIN_SIZE.x + surplus - SKILL_HEADER_PAD_X
+        );
+    }
+
+    /// Below the columns' own sum there is no leftover for
+    /// `skills::column_widths` to hand `Name`, so the pre-existing
+    /// proportional shrink (`column_anchors_from_widths`) still takes the
+    /// full inset width — the table spans the window rather than
+    /// left-aligning inside a slot it no longer fits.
+    #[test]
+    fn skill_columns_still_span_the_window_when_it_is_too_narrow() {
+        let columns = skills::SkillTab::Dps.columns();
+        let window_width = SKILL_WINDOW_MIN_SIZE.x / 2.0;
+        let left = SKILL_HEADER_PAD_X;
+        let right = window_width - SKILL_HEADER_PAD_X;
+        let widths = skills::column_widths(columns, right - left);
+        // Nothing to give away, so the shrink is the anchors' job alone.
+        for (width, column) in widths.iter().zip(columns) {
+            assert_eq!(*width, column.width());
+        }
+        let anchors = column_anchors_from_widths(left, right, &widths, 0.0);
+        assert_eq!(*anchors.last().unwrap(), right);
+        // Same graceful degradation `column_anchors_degrade_gracefully_in_
+        // a_narrow_window` pins for the main meter: scaled slots, still
+        // ordered, still inside the window.
+        assert!(anchors[0] >= 0.0, "columns spilled past the left edge");
+        for pair in anchors.windows(2) {
+            assert!(pair[0] < pair[1]);
+        }
+    }
+
     /// Issue #228: dragging the window down to `SKILL_WINDOW_MIN_SIZE`
     /// used to be reachable at a width far narrower than the columns'
     /// combined budget. `column_anchors_from_widths` scales every column's
