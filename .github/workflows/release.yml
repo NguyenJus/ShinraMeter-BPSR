@@ -49,7 +49,20 @@ jobs:
         run: |
           set -euo pipefail
           tag_version="${GITHUB_REF_NAME#v}"
-          crate_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/app/Cargo.toml)
+          # Restricted to the [package] section (not a bare whole-file sed):
+          # an expanded dependency table (`[dependencies.foo]` with its own
+          # unindented `version = "..."` line) would otherwise match a second
+          # time and turn crate_version into two lines. No Rust toolchain is
+          # guaranteed yet at this point (it runs before the mingw-w64
+          # cross-toolchain step and `rustup target add`, deliberately, to
+          # fail fast before any of that work starts), so this stays a
+          # manifest-parsing sed rather than `cargo metadata`.
+          crate_version=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p}' crates/app/Cargo.toml)
+          crate_version_lines=$(printf '%s\n' "$crate_version" | grep -c .)
+          if [ "$crate_version_lines" -ne 1 ]; then
+            echo "::error::expected exactly one version line in crates/app/Cargo.toml's [package] section, found $crate_version_lines"
+            exit 1
+          fi
           if [ "$tag_version" != "$crate_version" ]; then
             echo "::error::pushed tag $GITHUB_REF_NAME (version $tag_version) does not match crates/app/Cargo.toml's version $crate_version — bump the crate version in the same PR that adds the tag"
             exit 1
