@@ -1532,6 +1532,13 @@ impl Meter {
             return;
         }
         let other_boss = self.other_living_boss(uid, now_ms);
+        // issue #256: computed unconditionally rather than short-circuited
+        // behind `other_boss.is_none()` — the diagnostic log line below
+        // reports `dungeon_objective_still_running={objective_holds}` on
+        // every path that falls through here, including when `other_boss`
+        // alone is why the fight didn't end, so the value is needed either
+        // way. Don't restore the `&&`'s short-circuit; it would silently
+        // break that field.
         let objective_holds = self.dungeon_objective_still_running();
         if other_boss.is_none() && !objective_holds {
             self.latch_fight_end(FightEndCause::BossDeath, now_ms, monster_id);
@@ -7772,6 +7779,76 @@ mod tests {
             assert!(
                 logged(&format!("cause=server_changed boss_monster_id={DIAG_BOSS}")),
                 "the fight-end line must still name the boss the fight was on"
+            );
+        }
+
+        /// issue #256: pins every field of the new "boss death did not end
+        /// the fight" diagnostic itself, so a typo swapping
+        /// `other_living_boss` and `dungeon_objective_still_running` (or
+        /// any other field) in the format string fails a test instead of
+        /// only being caught by someone reading the log later.
+        #[test]
+        fn boss_death_that_does_not_end_the_fight_logs_every_guard_input() {
+            install_capture();
+
+            const DIAG_UID: i64 = 20;
+            let mut m = Meter::new();
+
+            // A dungeon whose own objective is still running holds the
+            // gate open (issue #139 §8) even though no other living boss
+            // exists — so this death falls through to the log rather than
+            // ending the fight.
+            m.apply(&ProtocolEvent::DungeonState {
+                state: EDungeonState::Active,
+                scene_uuid: None,
+            });
+            m.apply(&ProtocolEvent::DungeonObjective {
+                target_id: 700,
+                nums: Some(0),
+                complete: Some(false),
+            });
+
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                uid: DIAG_UID,
+                curr_hp: Some(100),
+                max_hp: Some(100),
+                monster_id: Some(DIAG_BOSS),
+                timestamp_ms: 0,
+            }));
+            m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: DIAG_UID,
+                target_kind: EntityKind::Monster,
+                value: 100,
+                timestamp_ms: 1_000,
+                ..Default::default()
+            }));
+            assert_eq!(m.boss_uid, Some(DIAG_UID));
+
+            m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: DIAG_UID,
+                target_kind: EntityKind::Monster,
+                value: 100,
+                is_dead: true,
+                timestamp_ms: 2_000,
+                ..Default::default()
+            }));
+
+            assert_eq!(
+                m.fight_end_ms, None,
+                "the still-running objective must hold the fight open"
+            );
+            assert!(
+                logged(&format!(
+                    "encounter: boss death of uid={DIAG_UID} monster_id={DIAG_BOSS} did not end the fight: \
+                     other_living_boss=-1 dungeon_objective_still_running=true \
+                     scene=-1 boss_select=false dungeon_state=Some(Active) current_objective=Some(700) \
+                     objective_complete=Some(false)"
+                )),
+                "the diagnostic line must name every guard input, not just say a boss death was dropped"
             );
         }
 
