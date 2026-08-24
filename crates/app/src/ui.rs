@@ -7645,18 +7645,6 @@ fn draw_skill_window(
     if let Some(texture) = row.class.and_then(|class| icons.classes.get(class)) {
         painter.image(texture.id(), icon_rect, UV_FULL, CLASS_ICON_TINT);
     }
-    paint_text(
-        &painter,
-        egui::pos2(
-            icon_rect.right() + SKILL_HEADER_PAD_X,
-            header_rect.center().y,
-        ),
-        egui::Align2::LEFT_CENTER,
-        &row.name,
-        regular(FONT_SIZE_SKILL_HEADER_NAME),
-        egui::Color32::WHITE,
-        false,
-    );
 
     // D10: the Deaths pill, and beside it issue #254's death-time pill —
     // the first two of the reference's four-capsule cluster
@@ -7664,6 +7652,10 @@ fn draw_skill_window(
     // two (aggro count, aggro time) need threat data this decoder never
     // captures, so they stay out: rendering them would be inventing
     // numbers rather than reporting them.
+    //
+    // Sized and placed *before* the name is painted (issue #270 follow-up)
+    // so `cluster_left` exists in time to clip the name against it — see
+    // below.
     let deaths_text = row.deaths.to_string();
     let deaths_pill = StatPill {
         value: &deaths_text,
@@ -7709,6 +7701,40 @@ fn draw_skill_window(
             death_time_sizes.map(|(_, size)| size.x),
         ),
     );
+
+    // Issue #270 follow-up: the name used to paint with no clip, max-width
+    // or elision at all, so a long enough player name ran underneath the
+    // pill cluster — pre-existing, but #270 made it materially worse
+    // (the new death-time pill costs another `SKILL_HEADER_PILL_GAP` +
+    // pill width of cluster real estate, moving `cluster_left` further
+    // left on every row that carries one). Clipped, not elided: the same
+    // "cut off, never truncated to `…`" choice `column_clip_rect` makes for
+    // the main meter's stat columns (an overlong value there is bounded by
+    // its slot rather than losing characters to an ellipsis), rather than
+    // the "leave it unclipped" call issues #26/#168 made for the main
+    // meter's *name* column — that one gets away with it because the stat
+    // columns painted after it are opaque at every opacity setting, while
+    // this cluster's pill fill is `opacity`-scaled and would otherwise let
+    // an overrun name bleed through it. One `SKILL_HEADER_PAD_X` of gap
+    // before the cluster, matching the pad already used everywhere else in
+    // this header.
+    let name_painter = painter.with_clip_rect(egui::Rect::from_min_max(
+        header_rect.left_top(),
+        egui::pos2(cluster_left - SKILL_HEADER_PAD_X, header_rect.bottom()),
+    ));
+    paint_text(
+        &name_painter,
+        egui::pos2(
+            icon_rect.right() + SKILL_HEADER_PAD_X,
+            header_rect.center().y,
+        ),
+        egui::Align2::LEFT_CENTER,
+        &row.name,
+        regular(FONT_SIZE_SKILL_HEADER_NAME),
+        egui::Color32::WHITE,
+        false,
+    );
+
     let deaths_pill_rect = egui::Rect::from_min_size(
         egui::pos2(
             cluster_left,
@@ -14040,6 +14066,121 @@ mod tests {
     #[test]
     fn a_cluster_with_one_pill_is_just_that_pill() {
         assert_eq!(skill_header_pill_cluster_width(64.0, None), 64.0);
+    }
+
+    /// Issue #270 follow-up: the header used to paint the player name with
+    /// no clip, max-width or elision at all, so a long enough name ran
+    /// underneath the pill cluster — and #254's death-time pill widened the
+    /// cluster, cutting the safe name length further. Renders a real frame
+    /// (through the real font, not a hardcoded pixel budget) with both
+    /// pills present — the worst-case cluster width — at the window's
+    /// narrowest allowed size, and asserts the painted name never reaches
+    /// past one `SKILL_HEADER_PAD_X` short of the cluster.
+    #[test]
+    fn an_overlong_name_stays_clear_of_the_pill_cluster() {
+        let row = PlayerRow {
+            name: "A Name So Long It Would Otherwise Run Under The Header Pills".to_string(),
+            deaths: 3,
+            dead_ms: Some(12_400),
+            ..sample_row(None)
+        };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_MIN_SIZE);
+        let mut sort = skills::SkillSort::default();
+
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_skill_window(
+                    ui,
+                    &row,
+                    &mut sort,
+                    SkillWindowSource::Live,
+                    &icons,
+                    1.0,
+                    &mut WindowGesture::default(),
+                );
+            },
+        );
+
+        let mut name_rect: Option<egui::Rect> = None;
+        for clipped in &output.shapes {
+            collect_name_text_boxes(&clipped.shape, clipped.clip_rect, &row.name, &mut name_rect);
+        }
+        output.drop_without_applying_deltas();
+
+        let name_rect = name_rect.expect("the header never painted the player name");
+        let header = skill_header_rect(screen_rect);
+        let deaths_pill = StatPill {
+            value: "3",
+            icon: None,
+            icon_side: COUNTER_GLYPH_SIDE,
+            size: FONT_SIZE_PILL_VALUE,
+            value_color: egui::Color32::WHITE,
+            icon_color: COUNTER_ICON_COLOR,
+            icon_first: true,
+            corner_radius: egui::CornerRadius::same(SKILL_PILL_CORNER_RADIUS),
+            fill: SKILL_PANEL_FILL,
+            stroke: None,
+        };
+        let death_time_text = skill_death_time_text(row.dead_ms).unwrap();
+        let painter = egui::Painter::new(ctx.clone(), egui::LayerId::debug(), screen_rect);
+        let deaths_width = pill_size(
+            pill_text_size(&painter, &deaths_pill),
+            deaths_pill.icon_side,
+            SKILL_PILL_HEIGHT,
+        )
+        .x;
+        let death_time_pill = StatPill {
+            value: &death_time_text,
+            ..deaths_pill
+        };
+        let death_time_width = pill_size(
+            pill_text_size(&painter, &death_time_pill),
+            death_time_pill.icon_side,
+            SKILL_PILL_HEIGHT,
+        )
+        .x;
+        let cluster_left = skill_deaths_pill_left(
+            header,
+            skill_header_pill_cluster_width(deaths_width, Some(death_time_width)),
+        );
+
+        assert!(
+            name_rect.right() <= cluster_left - SKILL_HEADER_PAD_X + 0.5,
+            "name right edge {} must stay clear of the cluster by SKILL_HEADER_PAD_X \
+             (cluster_left {cluster_left}, pad {SKILL_HEADER_PAD_X})",
+            name_rect.right()
+        );
+    }
+
+    /// Collects the painted (and clip-intersected) rect of every `Text`
+    /// shape whose galley text is exactly `name` — the same clip-aware
+    /// extraction `collect_painted_boxes` does for the main header's tests,
+    /// scoped down to just the one string this test cares about.
+    fn collect_name_text_boxes(
+        shape: &egui::Shape,
+        clip: egui::Rect,
+        name: &str,
+        out: &mut Option<egui::Rect>,
+    ) {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == name => {
+                let rect = egui::Rect::from_min_size(text.pos, text.galley.size()).intersect(clip);
+                *out = Some(out.map_or(rect, |existing| existing.union(rect)));
+            }
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_name_text_boxes(s, clip, name, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Issue #254: the total is an estimate (the revive edge is inferred
