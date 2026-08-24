@@ -719,19 +719,17 @@ mod tests {
     }
 
     #[test]
-    fn pruning_leaves_no_orphan_player_rows() {
+    fn pruning_leaves_no_orphan_player_or_skill_rows() {
         let policy = RetentionPolicy {
             max_encounters: 3,
             ..RetentionPolicy::default()
         };
         let mut store = SqliteHistory::in_memory(policy).unwrap();
         for i in 0..5 {
+            let mut alice = sample_player(1, "Alice");
+            alice.skills = vec![sample_skill(101, 3_000)];
             store
-                .insert(&sample_record(
-                    1_000 + i,
-                    10_000,
-                    vec![sample_player(1, "Alice")],
-                ))
+                .insert(&sample_record(1_000 + i, 10_000, vec![alice]))
                 .unwrap();
         }
 
@@ -741,8 +739,18 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
+        let skill_row_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM encounter_player_skills", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
 
         assert_eq!(player_row_count, 3);
+        assert_eq!(
+            skill_row_count, 3,
+            "each surviving encounter's single skill row must survive the prune"
+        );
     }
 
     #[test]
