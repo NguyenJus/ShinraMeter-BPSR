@@ -148,3 +148,86 @@ pub fn map_event(
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins every `DisappearReason`/`meter::DisappearReason` pairing
+    /// individually (issue #276's finding 2) — a transposed pair of match
+    /// arms in `map_disappear_reason` (e.g. `Destroy` <-> `TransferLeave`)
+    /// would stay exhaustive and compile, so this must assert each variant
+    /// on its own rather than a loop that would pass either way.
+    #[test]
+    fn map_disappear_reason_pins_every_variant() {
+        assert_eq!(
+            map_disappear_reason(DisappearReason::Normal),
+            meter::DisappearReason::Normal
+        );
+        assert_eq!(
+            map_disappear_reason(DisappearReason::Dead),
+            meter::DisappearReason::Dead
+        );
+        assert_eq!(
+            map_disappear_reason(DisappearReason::Destroy),
+            meter::DisappearReason::Destroy
+        );
+        assert_eq!(
+            map_disappear_reason(DisappearReason::TransferLeave),
+            meter::DisappearReason::TransferLeave
+        );
+        assert_eq!(
+            map_disappear_reason(DisappearReason::TransferPassLineLeave),
+            meter::DisappearReason::TransferPassLineLeave
+        );
+        assert_eq!(
+            map_disappear_reason(DisappearReason::Unknown(42)),
+            meter::DisappearReason::Unknown(42)
+        );
+    }
+
+    #[test]
+    fn map_event_enemy_gone_carries_reason_through() {
+        let ev = ProtocolEvent::EnemyGone {
+            uid: 7,
+            reason: Some(DisappearReason::TransferLeave),
+        };
+        assert_eq!(
+            map_event(ev, 0, None, None),
+            meter::ProtocolEvent::EnemyGone {
+                uid: 7,
+                reason: Some(meter::DisappearReason::TransferLeave),
+            }
+        );
+    }
+
+    #[test]
+    fn map_event_enemy_gone_with_no_reason() {
+        let ev = ProtocolEvent::EnemyGone {
+            uid: 9,
+            reason: None,
+        };
+        assert_eq!(
+            map_event(ev, 0, None, None),
+            meter::ProtocolEvent::EnemyGone {
+                uid: 9,
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn map_event_enemy_gone_with_unrecognized_wire_reason() {
+        let ev = ProtocolEvent::EnemyGone {
+            uid: 3,
+            reason: Some(DisappearReason::Unknown(99)),
+        };
+        assert_eq!(
+            map_event(ev, 0, None, None),
+            meter::ProtocolEvent::EnemyGone {
+                uid: 3,
+                reason: Some(meter::DisappearReason::Unknown(99)),
+            }
+        );
+    }
+}
