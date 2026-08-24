@@ -2445,15 +2445,18 @@ fn draw_header(
 // the case that carve-out ever fails or the window ends up off-screen.
 
 /// Tint a toggle-cluster button paints with while its state is "off" —
-/// white at half of `TOGGLE_ACTIVE_COLOR`'s alpha (issue #251). The
-/// previous value (`0x11`, the still-inert queue ring's borrowed stroke
-/// color, source `OffBrush="#1fff"`) read as ~7% opacity and made the
-/// click-through/always-on-top buttons nearly invisible when off. `0x40` —
-/// exactly half of `TOGGLE_ACTIVE_COLOR`'s `0x80` — keeps the glyph clearly
-/// legible as a button while staying visibly dimmer than the "on" tint, so
-/// the two states stay distinguishable at a glance.
+/// white at a fraction of `TOGGLE_ACTIVE_COLOR`'s alpha (issue #251, raised
+/// again by issue #255's live-window pass). The original value (`0x11`, the
+/// still-inert queue ring's borrowed stroke color, source `OffBrush=
+/// "#1fff"`) read as ~7% opacity and made the click-through/always-on-top
+/// buttons nearly invisible when off. `0x40` — exactly half of
+/// `TOGGLE_ACTIVE_COLOR`'s `0x80` — fixed that but, against the header
+/// chrome's `#25282f`, still landed under the 3:1 WCAG minimum for a
+/// non-text UI component (the "on" tint clears it at ~5:1). `0x50` clears
+/// 3:1 while staying visibly dimmer than the "on" tint, so the two states
+/// stay distinguishable at a glance.
 const TOGGLE_OFF_COLOR: egui::Color32 =
-    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x40);
+    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x50);
 /// Tint the toggle cluster's buttons are painted with while active — the
 /// same half-white `TOOLBAR_ICON_TINT` every other clickable icon in this
 /// module uses. Share and Reset (one-shot actions, not on/off state) always
@@ -4171,7 +4174,16 @@ const HEADER_WASH_EMBLEM_SIZE: f32 = 200.0;
 /// in points: the source right-aligns the wash `Svg.HPBar` with a `-25` right
 /// margin, so its last 25pt hang off the panel and the wash's clip rect cuts
 /// them away — the mirror of the gutter emblem's `HEADER_EMBLEM_LEFT_BLEED`.
-const HEADER_WASH_EMBLEM_BLEED: f32 = 25.0;
+///
+/// Nudged in from the source's literal `25` to `17` (issue #255's
+/// live-window pass): at `25` the emblem's circular arc edge sat almost
+/// dead-center under the title row's toggle pill (`title_toggle_pill_rect`),
+/// cutting through the click-through glyph's box and locally lifting the
+/// background behind it. Shrinking the overhang slides the whole square —
+/// and the visible arc inside it — further from the panel's right edge,
+/// clearing the toggle glyph boxes without touching the wash's size, alpha
+/// or the toggle cluster's own layout.
+const HEADER_WASH_EMBLEM_BLEED: f32 = 17.0;
 /// `Opacity=".05"` on a SlateGray fill.
 const HEADER_WASH_EMBLEM_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(0x70, 0x80, 0x90, 13);
