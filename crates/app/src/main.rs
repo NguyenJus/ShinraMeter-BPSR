@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bpsr_app::{
-    fonts, history, inspect, logging, paths, pipeline, platform, settings, ui, update_check,
+    fonts, history, inspect, logging, paths, pipeline, platform, settings, single_instance, ui,
+    update_check,
 };
 use bpsr_protocol::ProtocolEvent;
 use crossbeam_channel::bounded;
@@ -248,6 +249,31 @@ fn main() -> eframe::Result {
     // deliberately after `logging::init` so a failure has somewhere to be
     // logged.
     update_check::clean_up_previous_update();
+
+    // Issue #277: a second copy of the meter is never what the user meant.
+    // Both instances append to the same log (every event line then appears
+    // twice, from two independent capture loops) and both write the same
+    // fight to `history.sqlite`, so the history list grows a duplicate row
+    // per fight. Claimed before capture opens a WinDivert handle, so a
+    // refused instance never touches the driver — and held in `_instance`
+    // for the rest of `main`, because dropping the guard frees the slot.
+    let _instance = match single_instance::acquire() {
+        single_instance::Acquisition::Acquired(guard) => Some(guard),
+        single_instance::Acquisition::AlreadyRunning => {
+            log::error!("{}", single_instance::ALREADY_RUNNING_MESSAGE);
+            platform::warn_already_running(single_instance::ALREADY_RUNNING_MESSAGE);
+            return Ok(());
+        }
+        // A guard that cannot be evaluated must not be able to stop the app:
+        // refusing to start because the *lock* is broken would be a worse
+        // failure than the duplicate rows it exists to prevent.
+        single_instance::Acquisition::Unavailable(reason) => {
+            log::warn!(
+                "single-instance guard unavailable ({reason}); a second copy of the meter would go undetected (issue #277)"
+            );
+            None
+        }
+    };
 
     let (tx_events, rx_events) = bounded::<ProtocolEvent>(EVENT_CAPACITY);
     let (tx_command, rx_command) = bounded::<UiCommand>(COMMAND_CAPACITY);
