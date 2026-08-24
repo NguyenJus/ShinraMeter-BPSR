@@ -23,7 +23,7 @@
 //! for deliberately running two builds side by side: point them at different
 //! lock files (and different `SHINRA_HISTORY_DB`s) and both start.
 
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -84,10 +84,8 @@ pub fn acquire() -> Acquisition {
 /// because a pid on disk cannot distinguish "still running" from "crashed,
 /// and the number has since been reused".
 pub fn acquire_at(path: &Path) -> Acquisition {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-        && let Err(err) = fs::create_dir_all(parent)
-    {
+    if let Err(err) = paths::ensure_parent_dir(path) {
+        let parent = path.parent().unwrap_or(path);
         return Acquisition::Unavailable(format!(
             "could not create {} for the single-instance lock ({err})",
             parent.display()
@@ -136,6 +134,8 @@ pub const ALREADY_RUNNING_MESSAGE: &str = "ShinraMeter-BPSR is already running; 
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     /// Each test gets its own directory, so a lock left held by one cannot
