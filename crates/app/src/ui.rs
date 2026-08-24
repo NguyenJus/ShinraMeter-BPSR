@@ -825,13 +825,23 @@ impl OverlayApp {
     /// does not write a line per frame at ~10 Hz for the rest of the
     /// session.
     ///
-    /// An error banner that is already up wins. The capture-init failure
-    /// `main.rs` seeds through `with_status` names an actual cause
+    /// A *permanent* error banner that is already up wins. The capture-init
+    /// failure `main.rs` seeds through `with_status` names an actual cause
     /// ("WinDivert is not installed"), which is strictly more useful than
     /// "the pipeline stopped" — and a pipeline whose capture never started
     /// will disconnect at shutdown like any other.
+    ///
+    /// A *transient* error banner (`status_expires_at.is_some()` — e.g. a
+    /// failed Share/Export logs copy) does not win: it is scheduled to clear
+    /// itself in `expire_transient_status`, which runs after
+    /// `drain_snapshots` in `ui()`'s per-frame order, so without this check
+    /// a dead pipeline discovered while that banner is showing would stay
+    /// hidden behind it for up to `TRANSIENT_STATUS_LINGER` before the fatal
+    /// banner finally appears. Overriding clears `status_expires_at` too, or
+    /// the permanent banner would inherit the transient one's expiry and
+    /// vanish on schedule.
     fn raise_pipeline_dead_status(&mut self) {
-        if matches!(self.status, StatusLine::Error(_)) {
+        if matches!(self.status, StatusLine::Error(_)) && self.status_expires_at.is_none() {
             return;
         }
         log::error!(
@@ -16344,6 +16354,49 @@ mod tests {
             app.status,
             StatusLine::Error("WinDivert is not installed".to_string()),
             "the more specific capture failure must survive"
+        );
+    }
+
+    /// Counterpart to `a_dead_pipeline_does_not_overwrite_an_existing_error_banner`:
+    /// a *transient* banner (Share/Export logs failure) is not "already up"
+    /// in the sense that guard cares about — it is scheduled to clear itself
+    /// in `expire_transient_status`, which runs after `drain_snapshots` in
+    /// `ui()`'s per-frame order. Without distinguishing it from a permanent
+    /// banner, a dead pipeline discovered mid-linger would stay masked by
+    /// the stale clipboard message for up to `TRANSIENT_STATUS_LINGER`
+    /// instead of raising the fatal banner immediately.
+    #[test]
+    fn a_dead_pipeline_overwrites_a_transient_error_banner() {
+        let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded::<Snapshot>();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+
+        app.raise_transient_status("Copy screenshot failed: oops".to_string(), Instant::now());
+        assert!(
+            app.status_expires_at.is_some(),
+            "sanity: banner is transient"
+        );
+
+        drop(tx_snapshot);
+        app.drain_snapshots();
+
+        match &app.status {
+            StatusLine::Error(message) => assert!(
+                message.contains("pipeline"),
+                "the permanent banner must replace the transient one, got {message:?}"
+            ),
+            other => panic!("expected the permanent pipeline-dead banner, got {other:?}"),
+        }
+        assert_eq!(
+            app.status_expires_at, None,
+            "the permanent banner must not inherit the transient banner's expiry"
         );
     }
 }
