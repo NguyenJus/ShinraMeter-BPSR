@@ -32,6 +32,43 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+
+      # Issue #234: v0.2.4 was tagged and published while
+      # `crates/app/Cargo.toml` still said `version = "0.2.3"` — the last
+      # version bump landed in a separate commit that nothing forced to
+      # happen alongside the tag push, so it never caught up. The running
+      # build's `env!("CARGO_PKG_VERSION")` (what the in-app "check for
+      # updates" compares itself against, see `update_check.rs`) is baked
+      # in at compile time straight from this field, so a mismatched tag
+      # here is exactly what makes an up-to-date build report itself as
+      # out of date. Failing fast here — before the cross-compile, DLL/UAC
+      # checks, or the `gh release create` that would otherwise publish the
+      # mismatched build — is cheaper than a bad release and a manual
+      # re-tag.
+      - name: Verify the pushed tag matches the crate version
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          # Restricted to the [package] section (not a bare whole-file sed):
+          # an expanded dependency table (`[dependencies.foo]` with its own
+          # unindented `version = "..."` line) would otherwise match a second
+          # time and turn crate_version into two lines. No Rust toolchain is
+          # guaranteed yet at this point (it runs before the mingw-w64
+          # cross-toolchain step and `rustup target add`, deliberately, to
+          # fail fast before any of that work starts), so this stays a
+          # manifest-parsing sed rather than `cargo metadata`.
+          crate_version=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p}' crates/app/Cargo.toml)
+          crate_version_lines=$(printf '%s\n' "$crate_version" | grep -c .)
+          if [ "$crate_version_lines" -ne 1 ]; then
+            echo "::error::expected exactly one version line in crates/app/Cargo.toml's [package] section, found $crate_version_lines"
+            exit 1
+          fi
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "::error::pushed tag $GITHUB_REF_NAME (version $tag_version) does not match crates/app/Cargo.toml's version $crate_version — bump the crate version in the same PR that adds the tag"
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches crate version $crate_version"
+
       # Same composite action as CI, so a tag build can never diverge from the
       # toolchain `build-windows` verified. The action asserts every
       # cross-binary works before cargo runs, so a degraded cache restore

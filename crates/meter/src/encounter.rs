@@ -99,6 +99,35 @@ const BOSS_ENGAGEMENT_WINDOW_MS: u64 = 60_000;
 /// wedge this exists to bound.
 const WIPE_HOLD_RELEASE_MS: u64 = 60_000;
 
+/// The most health an enemy may have been last seen with for its despawn to
+/// be readable as a death (issue #215), as a percentage of its pool.
+///
+/// `pb::DisappearEntity` carries a bare `uuid` and no reason code at all, so
+/// "the corpse was removed" and "the player walked out of AOI range" arrive
+/// on the wire as literally the same bytes. Everything else the rule tests
+/// (see [`Meter::apply_enemy_gone`]) is about *which* enemy vanished; this is
+/// the only condition that speaks to whether it plausibly *died*. A boss at
+/// 3% of its bar that stops being mentioned is the tail of a kill whose death
+/// packet went missing; the same boss at 80% is a party that ran away.
+///
+/// 10% rather than something looser because the two error directions are not
+/// symmetric — the same asymmetry `EnemyState::is_alive` is built on, pointed
+/// the other way. Refusing a real death costs only the instant freeze: the
+/// idle timeout still ends the fight, bounded by
+/// [`BOSS_ENGAGEMENT_WINDOW_MS`] since issue #210/#211. Accepting a range-out
+/// as a death ends a live pull early, saves a truncated encounter, and splits
+/// the rest of it into a second one — strictly worse than the behaviour this
+/// replaces. A percentage rather than an absolute figure because it has to
+/// hold across pools three orders of magnitude apart, and it reuses
+/// `EnemyState::pct`, which measures against the observed peak when `max_hp`
+/// was never synced.
+///
+/// Not a `FightConfig` tunable, for the same reason `BOSS_ENGAGEMENT_WINDOW_MS`
+/// is not: it bounds a heuristic's blast radius rather than expressing a
+/// user-visible preference, and a 100 there would turn every AOI eviction
+/// into a boss death.
+const DESPAWN_DEATH_MAX_HP_PCT: f64 = 10.0;
+
 /// Whether an enemy last damaged at `last_damaged_ms` was still being
 /// fought when the enemy now holding the target was hit at `engaged_at`,
 /// per [`BOSS_ENGAGEMENT_WINDOW_MS`].
@@ -122,6 +151,34 @@ fn engaged_within_window(last_damaged_ms: Option<u64>, engaged_at: Option<u64>) 
         (Some(_), None) => true,
         (None, _) => false,
     }
+}
+
+/// Whether `e` is a recognized boss (`tables::is_boss_monster`) the party
+/// has actually engaged this fight and that is not known to be dead.
+///
+/// The identity half of the question every boss-liveness guard asks —
+/// [`Meter::engaged_boss_still_up`], [`Meter::has_other_living_boss`] and
+/// [`Meter::apply_enemy_gone`] all start here. `took_damage` is what scopes
+/// it to the current encounter (a boss standing in a room the party walked
+/// past was never part of one), and "not known to be dead" is
+/// [`EnemyState::is_alive`], which reads never-observed health as alive.
+///
+/// Deliberately says nothing about *recency*: the callers disagree there.
+/// Two of them always require [`engaged_within_window`] on top (see
+/// [`is_engaged_recognized_boss`]); `has_other_living_boss` requires it only
+/// inside a boss-select scene, where a sequential next selection must not
+/// hold the current one's death open.
+fn is_damaged_living_boss(e: &EnemyState) -> bool {
+    e.took_damage && e.is_alive() && e.monster_id.is_some_and(tables::is_boss_monster)
+}
+
+/// [`is_damaged_living_boss`] plus the recency half: the party was hitting
+/// `e` within [`BOSS_ENGAGEMENT_WINDOW_MS`] of `now_ms` (issue #210/#211),
+/// so it is a pull genuinely in progress rather than one abandoned — or a
+/// boss whose death signal was simply never delivered, which
+/// `EnemyState::is_alive` would otherwise read as alive forever.
+fn is_engaged_recognized_boss(e: &EnemyState, now_ms: u64) -> bool {
+    is_damaged_living_boss(e) && engaged_within_window(e.last_damaged_ms, Some(now_ms))
 }
 
 /// One player-identity cache entry. `seq` is a monotonic touch counter (set
@@ -589,12 +646,10 @@ impl Meter {
     /// ever touched already is.
     fn engaged_boss_still_up(&self, now_ms: u64) -> bool {
         self.in_dungeon_scene()
-            && self.enemies.values().any(|e| {
-                e.took_damage
-                    && e.is_alive()
-                    && e.monster_id.is_some_and(tables::is_boss_monster)
-                    && engaged_within_window(e.last_damaged_ms, Some(now_ms))
-            })
+            && self
+                .enemies
+                .values()
+                .any(|e| is_engaged_recognized_boss(e, now_ms))
     }
 
     /// Where the meter is in the fight lifecycle as of `now_ms`.
@@ -939,6 +994,13 @@ impl Meter {
             } => self.apply_dungeon_objective(*target_id, *nums, *complete),
             ProtocolEvent::DungeonObjectiveRemoved { target_id } => {
                 self.apply_dungeon_objective_removed(*target_id);
+                None
+            }
+            // issue #215: an entity left AOI. Almost always nothing to do —
+            // see `apply_enemy_gone` for the one case where it is allowed to
+            // stand in for a death signal that never arrived.
+            ProtocolEvent::EnemyGone { uid } => {
+                self.apply_enemy_gone(*uid);
                 None
             }
             ProtocolEvent::DungeonVar { name, value } => {
@@ -1506,6 +1568,121 @@ impl Meter {
         }
     }
 
+    /// Reacts to `uid` leaving the client's area of interest (issue #215).
+    ///
+    /// The wire fact is deliberately thin: `pb::SyncNearEntities.disappear`
+    /// carries a bare `uuid` and **no reason code**, so a corpse being
+    /// despawned, the player walking out of AOI range, and an ordinary
+    /// streaming eviction are indistinguishable at this layer. A despawn is
+    /// therefore not a death signal, and this function's default answer is to
+    /// do nothing at all.
+    ///
+    /// It exists because the meter's two real death signals can both go
+    /// missing. Issue #210: across every logged clear of scene 13023 the
+    /// first boss's death produced neither a `DamageEvent::is_dead` nor an
+    /// `EnemyHp` syncing `curr_hp` to 0 — the boss simply stopped being
+    /// mentioned. `EnemyState::is_alive` reads a never-observed death as
+    /// alive forever, which used to wedge the fight open permanently; issue
+    /// #210/#211 bounded that wedge to `BOSS_ENGAGEMENT_WINDOW_MS` but the
+    /// end still lands as `cause=idle_timeout` a minute late, with the next
+    /// boss's opening damage already accumulated into the dead one's rows.
+    /// The despawn is the one packet that *does* arrive in that case, and
+    /// under a tight enough rule it recovers the missing death.
+    ///
+    /// ## The rule, and why every clause of it is load-bearing
+    ///
+    /// A despawn is read as a death only when **all** of the following hold.
+    /// Each one alone admits far too much; the conjunction is what makes this
+    /// safe enough to ship:
+    ///
+    /// 1. `end_on_boss_death` is on — the same switch every other
+    ///    boss-death-driven end already respects.
+    /// 2. A fight is running and not already ended. A despawn can never
+    ///    *start* anything, and must never re-stamp a held fight's end time.
+    /// 3. The enemy is the currently tracked boss (`boss_uid`). This is the
+    ///    strongest clause: the header is following it, so `recompute_boss`
+    ///    has already ranked it above everything else the party has engaged.
+    ///    A sibling boss, an add, or a mob nobody is looking at cannot end a
+    ///    fight by vanishing, however low its health.
+    /// 4. It took damage from the party. A boss standing in a room the party
+    ///    walked past and streamed out again was never part of an encounter —
+    ///    the same scoping `has_other_living_boss` and `engaged_boss_still_up`
+    ///    use.
+    /// 5. It is a *recognized* boss (`tables::is_boss_monster`). Without this
+    ///    the biggest trash mob in a pull ends the fight every time the AOI
+    ///    evicts it, exactly as it would in `end_fight_on_boss_death`.
+    /// 6. It is not already known to be dead — so the ordinary case (a real
+    ///    death signal, then the corpse's despawn seconds later) stays inert
+    ///    rather than stamping a second death rank.
+    /// 7. The party was hitting it within `BOSS_ENGAGEMENT_WINDOW_MS` of the
+    ///    last combat event. A boss burned low, abandoned, and evicted from
+    ///    AOI minutes later is a range-out; a corpse removed mid-pull is not.
+    /// 8. Its last observed health was at or below
+    ///    [`DESPAWN_DEATH_MAX_HP_PCT`], and was observed *at all*. This is
+    ///    the only clause that speaks to dying rather than to identity, and
+    ///    the never-observed case is refused on purpose: with no health to
+    ///    check there is no evidence, and `EnemyState::is_alive`'s
+    ///    conservative "unknown means alive" must not be flipped by a packet
+    ///    that carries a uuid and nothing else.
+    ///
+    /// Getting this wrong in the permissive direction is worse than the
+    /// status quo: a range-out mid-pull would freeze the meter, save a
+    /// truncated encounter, and split the rest of the fight into a second
+    /// one. Getting it wrong in the strict direction costs only the instant
+    /// freeze — the idle timeout still ends the fight, which is precisely
+    /// today's behaviour. So every uncertain case is refused.
+    ///
+    /// When the rule does fire the despawn is routed through exactly the same
+    /// machinery a death packet is: `mark_enemy_dead`, then `recompute_boss`,
+    /// then `end_fight_on_boss_death` — which keeps its own guards
+    /// (`has_other_living_boss`, `dungeon_objective_still_running`), so a
+    /// multi-part boss or an instance whose own objective tracking says the
+    /// run is still going still holds the pull open. The end is stamped at
+    /// `last_event_ms`, the last real player damage, not at the despawn
+    /// packet: the fight ended when the hitting stopped (the same rule the
+    /// `Scene`/`SceneChanged` arm uses), and the despawn may trail it by
+    /// seconds.
+    ///
+    /// The enemy is deliberately **not** removed from `enemies`. A despawn is
+    /// not an invalidation — the entity keeps its uid and can stream straight
+    /// back in — and the row is what `boss_monster_id` reads to caption the
+    /// held fight. Only a `ProtocolEvent::ServerChanged` clears that map.
+    ///
+    /// **Verification status:** the decode side is exercised by unit tests
+    /// against synthesized `SyncNearEntities` payloads, but no live
+    /// `SHINRA_INSPECT=1` capture of a real raid-boss despawn has been taken
+    /// yet (issue #215 asks for one, on the evidence bar issues #35 and #111
+    /// set). Until it has, this rule's field behaviour on scene 13023 is
+    /// argued, not observed — which is the other reason it is written this
+    /// tightly.
+    fn apply_enemy_gone(&mut self, uid: i64) {
+        if !self.fight_cfg.end_on_boss_death
+            || self.fight_start_ms.is_none()
+            || self.fight_end_ms.is_some()
+            || self.boss_uid != Some(uid)
+        {
+            return;
+        }
+        let now_ms = self.last_event_ms;
+        let Some(enemy) = self.enemies.get(&uid) else {
+            return;
+        };
+        let plausibly_dead = is_engaged_recognized_boss(enemy, now_ms)
+            && enemy
+                .pct()
+                .is_some_and(|pct| pct <= DESPAWN_DEATH_MAX_HP_PCT);
+        if !plausibly_dead {
+            return;
+        }
+        log::info!(
+            "encounter: treating despawn of uid={uid} monster_id={} as a death (issue #215)",
+            enemy.monster_id.map_or(-1i64, i64::from)
+        );
+        self.mark_enemy_dead(uid);
+        self.recompute_boss();
+        self.end_fight_on_boss_death(uid, now_ms);
+    }
+
     /// Whether some enemy other than `dying_uid` is a recognized boss that
     /// has taken damage this fight and is not known to be dead (issue #124).
     ///
@@ -1551,9 +1728,7 @@ impl Meter {
         let boss_select = self.scene_id.is_some_and(phase::is_boss_select_scene);
         self.enemies.iter().any(|(uid, e)| {
             *uid != dying_uid
-                && e.took_damage
-                && e.is_alive()
-                && e.monster_id.is_some_and(tables::is_boss_monster)
+                && is_damaged_living_boss(e)
                 && (!boss_select || engaged_within_window(e.last_damaged_ms, Some(now_ms)))
         })
     }
@@ -5917,6 +6092,395 @@ mod tests {
                 "the twin is still up and recently engaged"
             );
             assert_eq!(m.fight_state(2_100), FightState::Active);
+        }
+    }
+
+    /// Issue #215: `SyncNearEntities.disappear` — an entity leaving the
+    /// client's area of interest. The wire gives no reason for it, so the
+    /// meter may only read a despawn as a death under the narrow rule
+    /// documented on `Meter::apply_enemy_gone`; every other despawn must
+    /// leave the encounter exactly as it found it.
+    mod enemy_despawn {
+        use super::*;
+
+        /// Scene 13023, "Purge! Field of Forgotten Illusions" — the raid
+        /// issue #210 was reported from, whose boss death never produced
+        /// either of the two ordinary death signals.
+        const RAID_SCENE: u32 = 13_023;
+        /// Paradox-Calamity Remnant - Origin: the raid's first selection.
+        const ORIGIN: u32 = 103_108;
+        /// Paradox-Calamity Remnant - Continuation: the second selection.
+        const CONTINUATION: u32 = 103_208;
+        /// "Golden Nappo": named but `MonsterType == 0`, i.e. a trash add
+        /// that `tables::is_boss_monster` rejects.
+        const TRASH: u32 = 10_900;
+        const BOSS_UID: i64 = 10;
+        const OTHER_UID: i64 = 11;
+
+        fn idle() -> u64 {
+            FightConfig::default().idle_timeout_ms
+        }
+
+        fn in_raid() -> Meter {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: RAID_SCENE,
+            });
+            m
+        }
+
+        fn hp(uid: i64, curr: u64, max: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::EnemyHp(EnemyHp {
+                uid,
+                curr_hp: Some(curr),
+                max_hp: Some(max),
+                monster_id: Some(monster_id),
+                timestamp_ms: ts,
+            })
+        }
+
+        /// An identity-only sync: the entity is recognized, but its health
+        /// was never observed at all.
+        fn hp_unknown(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::EnemyHp(EnemyHp {
+                uid,
+                curr_hp: None,
+                max_hp: None,
+                monster_id: Some(monster_id),
+                timestamp_ms: ts,
+            })
+        }
+
+        fn hit(uid: i64, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: uid,
+                target_kind: EntityKind::Monster,
+                value: 500,
+                timestamp_ms: ts,
+                ..Default::default()
+            })
+        }
+
+        fn gone(uid: i64) -> ProtocolEvent {
+            ProtocolEvent::EnemyGone { uid }
+        }
+
+        /// The raid boss burned to 3% of its bar and hit a moment ago —
+        /// every condition of the despawn rule but the despawn itself.
+        fn pull() -> Meter {
+            let mut m = in_raid();
+            m.apply(&hp(BOSS_UID, 1_000_000, 1_000_000, ORIGIN, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            m.apply(&hp(BOSS_UID, 30_000, 1_000_000, ORIGIN, 1_500));
+            m
+        }
+
+        #[test]
+        fn a_damaged_low_hp_engaged_boss_despawning_ends_the_fight() {
+            // Issue #210's shape: neither death signal ever arrives, and
+            // the corpse is simply removed from AOI. That despawn is the
+            // only evidence the meter will ever get.
+            let mut m = pull();
+            assert_eq!(m.boss_uid, Some(BOSS_UID));
+
+            let reason = m.apply(&gone(BOSS_UID));
+
+            assert_eq!(reason, None, "a despawn never reports a reset itself");
+            assert_eq!(
+                m.fight_end_ms,
+                Some(1_000),
+                "stamped at the last real damage, not at the despawn packet"
+            );
+            assert_eq!(m.fight_end_boss_id, Some(ORIGIN));
+            assert_eq!(m.fight_state(2_000), FightState::Ended);
+            assert!(
+                !m.enemies[&BOSS_UID].is_alive(),
+                "the boss must read as dead so nothing holds the pull open"
+            );
+        }
+
+        #[test]
+        fn a_boss_despawning_at_full_health_is_a_range_out_not_a_death() {
+            // The case that makes the rule worth having: a boss the party
+            // damaged and then ran away from evicts from AOI at full
+            // health. Ending the fight here is strictly worse than doing
+            // nothing.
+            let mut m = in_raid();
+            m.apply(&hp(BOSS_UID, 1_000_000, 1_000_000, ORIGIN, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+
+            m.apply(&gone(BOSS_UID));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_state(1_100), FightState::Active);
+            assert!(m.enemies[&BOSS_UID].is_alive());
+        }
+
+        #[test]
+        fn a_boss_despawning_just_above_the_low_hp_threshold_is_not_a_death() {
+            let mut m = in_raid();
+            m.apply(&hp(BOSS_UID, 1_000_000, 1_000_000, ORIGIN, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            let just_above = (DESPAWN_DEATH_MAX_HP_PCT / 100.0 * 1_000_000.0) as u64 + 1;
+            m.apply(&hp(BOSS_UID, just_above, 1_000_000, ORIGIN, 1_500));
+
+            m.apply(&gone(BOSS_UID));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert!(m.enemies[&BOSS_UID].is_alive());
+        }
+
+        #[test]
+        fn a_boss_despawning_exactly_at_the_low_hp_threshold_is_a_death() {
+            let mut m = in_raid();
+            m.apply(&hp(BOSS_UID, 1_000_000, 1_000_000, ORIGIN, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            let at_threshold = (DESPAWN_DEATH_MAX_HP_PCT / 100.0 * 1_000_000.0) as u64;
+            m.apply(&hp(BOSS_UID, at_threshold, 1_000_000, ORIGIN, 1_500));
+
+            m.apply(&gone(BOSS_UID));
+
+            assert_eq!(m.fight_end_ms, Some(1_000));
+        }
+
+        #[test]
+        fn a_boss_whose_health_was_never_observed_despawning_is_not_a_death() {
+            // `EnemyState::is_alive` reads a never-observed enemy as alive,
+            // deliberately. A despawn must not be the thing that converts
+            // "no idea" into "dead": with no HP to check, the despawn is
+            // just as likely a streaming eviction.
+            let mut m = in_raid();
+            m.apply(&hp_unknown(BOSS_UID, ORIGIN, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+
+            m.apply(&gone(BOSS_UID));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert!(m.enemies[&BOSS_UID].is_alive());
+        }
+
+        #[test]
+        fn an_undamaged_boss_despawning_is_not_a_death() {
+            // A boss standing in the room the party walked past, streamed
+            // out again as they walk on. Nobody ever engaged it.
+            let mut m = in_raid();
+            m.apply(&hp(BOSS_UID, 1_000, 1_000_000, ORIGIN, 0));
+            m.apply(&hit(OTHER_UID, 1_000));
+
+            m.apply(&gone(BOSS_UID));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert!(m.enemies[&BOSS_UID].is_alive());
+        }
+
+        #[test]
+        fn an_unrecognized_monster_despawning_is_not_a_death() {
+            // The same gate every other end-of-fight signal already has:
+            // without it the biggest trash mob in the pull ends the fight
+            // every time the AOI streams it out.
+            let mut m = in_raid();
+            m.apply(&hp(OTHER_UID, 100, 100_000, TRASH, 0));
+            m.apply(&hit(OTHER_UID, 1_000));
+
+            m.apply(&gone(OTHER_UID));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert!(m.enemies[&OTHER_UID].is_alive());
+        }
+
+        #[test]
+        fn a_boss_that_is_not_the_tracked_one_despawning_is_not_a_death() {
+            // Only the boss the header is actually following can end the
+            // fight this way. A second selection poked once and left at low
+            // health despawning says nothing about the pull in progress.
+            let mut m = in_raid();
+            m.apply(&hp(BOSS_UID, 2_000_000, 2_000_000, ORIGIN, 0));
+            m.apply(&hp(OTHER_UID, 1_000_000, 1_000_000, CONTINUATION, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            m.apply(&hit(OTHER_UID, 1_100));
+            m.apply(&hp(OTHER_UID, 10_000, 1_000_000, CONTINUATION, 1_200));
+            assert_eq!(m.boss_uid, Some(BOSS_UID), "Origin, the larger pool");
+
+            m.apply(&gone(OTHER_UID));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert!(m.enemies[&OTHER_UID].is_alive());
+            assert_eq!(m.fight_state(1_300), FightState::Active);
+        }
+
+        #[test]
+        fn a_boss_abandoned_long_ago_despawning_is_not_a_death() {
+            // The party burned the boss low, gave up, and spent the next
+            // few minutes on trash. The boss finally streams out of AOI.
+            // `BOSS_ENGAGEMENT_WINDOW_MS` is what separates that from a
+            // corpse being removed mid-pull, exactly as it does for
+            // `engaged_boss_still_up` and `has_other_living_boss`.
+            let mut m = pull();
+            m.apply(&hp(OTHER_UID, 50_000, 50_000, TRASH, 1_600));
+            let step = idle() - 1_000;
+            let mut ts = 1_600;
+            while ts <= 1_000 + BOSS_ENGAGEMENT_WINDOW_MS {
+                ts += step;
+                m.apply(&hit(OTHER_UID, ts));
+            }
+            assert_eq!(m.boss_uid, Some(BOSS_UID), "the recognized boss is tracked");
+
+            m.apply(&gone(BOSS_UID));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert!(m.enemies[&BOSS_UID].is_alive());
+        }
+
+        #[test]
+        fn a_corpse_despawning_after_an_ordinary_death_changes_nothing() {
+            // The common case once this is live: the boss dies normally and
+            // its corpse is removed a few seconds later. The despawn must
+            // be inert — no second death rank, no re-latched end time.
+            let mut m = in_raid();
+            m.apply(&hp(BOSS_UID, 1_000_000, 1_000_000, ORIGIN, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: BOSS_UID,
+                target_kind: EntityKind::Monster,
+                value: 500,
+                is_dead: true,
+                timestamp_ms: 2_000,
+                ..Default::default()
+            }));
+            assert_eq!(m.fight_end_ms, Some(2_000));
+            let rank = m.enemies[&BOSS_UID].death_order;
+            let seen = m.deaths_seen;
+
+            m.apply(&gone(BOSS_UID));
+
+            assert_eq!(m.fight_end_ms, Some(2_000));
+            assert_eq!(m.enemies[&BOSS_UID].death_order, rank);
+            assert_eq!(m.deaths_seen, seen, "the corpse must not die twice");
+        }
+
+        #[test]
+        fn a_despawn_of_an_entity_the_meter_never_saw_is_inert() {
+            let mut m = pull();
+            let before = m.enemies.len();
+
+            m.apply(&gone(9_999));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.enemies.len(), before, "no phantom enemy row");
+        }
+
+        #[test]
+        fn the_end_on_boss_death_switch_also_governs_the_despawn_death() {
+            let mut m = pull();
+            m.set_fight_config(FightConfig {
+                end_on_boss_death: false,
+                ..FightConfig::default()
+            });
+
+            m.apply(&gone(BOSS_UID));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert!(m.enemies[&BOSS_UID].is_alive());
+        }
+
+        /// PR #239 review, finding 2: the despawn death is routed through
+        /// `end_fight_on_boss_death`, so `has_other_living_boss` still
+        /// governs it — Dreambloom Ruins' Caprahorn pair is fought
+        /// concurrently in a boss-select scene, and one twin's corpse
+        /// vanishing must not freeze the meter while the other is still
+        /// being hit. The damage-death path's equivalent is
+        /// `multi_phase_boss::an_earlier_phase_dying_does_not_end_the_fight_while_a_later_one_lives`.
+        #[test]
+        fn a_despawn_does_not_end_the_fight_while_a_co_engaged_boss_lives() {
+            let mut m = in_raid();
+            m.apply(&hp(BOSS_UID, 2_000_000, 2_000_000, ORIGIN, 0));
+            m.apply(&hp(OTHER_UID, 1_000_000, 1_000_000, CONTINUATION, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            m.apply(&hit(OTHER_UID, 1_100));
+            m.apply(&hp(BOSS_UID, 30_000, 2_000_000, ORIGIN, 1_200));
+            assert_eq!(m.boss_uid, Some(BOSS_UID), "Origin, the larger pool");
+
+            m.apply(&gone(BOSS_UID));
+
+            assert!(
+                !m.enemies[&BOSS_UID].is_alive(),
+                "the despawn itself was read as a death -- this test is about \
+                 the guard downstream of that, not about refusing the despawn"
+            );
+            assert!(m.enemies[&OTHER_UID].is_alive());
+            assert_eq!(m.fight_end_ms, None, "the twin is still being fought");
+            assert_eq!(m.fight_state(1_200), FightState::Active);
+        }
+
+        /// PR #239 review, finding 2, the other guard
+        /// `end_fight_on_boss_death` keeps (issue #139 section 8): while the
+        /// instance's own tracking says the run is going and the current
+        /// objective is incomplete, this boss was a phase of it. The
+        /// damage-death path's equivalent is
+        /// `dungeon::a_boss_death_does_not_end_the_fight_while_the_objective_is_still_incomplete`.
+        #[test]
+        fn a_despawn_does_not_end_the_fight_while_the_objective_is_still_running() {
+            let mut m = in_raid();
+            m.apply(&ProtocolEvent::DungeonState {
+                state: EDungeonState::Active,
+                scene_uuid: None,
+            });
+            m.apply(&ProtocolEvent::DungeonObjective {
+                target_id: 100,
+                nums: Some(0),
+                complete: Some(false),
+            });
+            m.apply(&hp(BOSS_UID, 1_000_000, 1_000_000, ORIGIN, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            m.apply(&hp(BOSS_UID, 30_000, 1_000_000, ORIGIN, 1_500));
+
+            m.apply(&gone(BOSS_UID));
+
+            assert!(
+                !m.enemies[&BOSS_UID].is_alive(),
+                "the despawn itself was read as a death -- this test is about \
+                 the guard downstream of that, not about refusing the despawn"
+            );
+            assert_eq!(
+                m.fight_end_ms, None,
+                "the instance's own objective says the run is still going"
+            );
+            assert_eq!(m.fight_state(1_600), FightState::Active);
+        }
+
+        /// The control for both guards above: same despawn, but the
+        /// objective is complete and nothing else is up, so the ordinary
+        /// despawn-death end still fires. Without this, the two tests above
+        /// would pass just as happily if the despawn rule stopped working.
+        #[test]
+        fn a_despawn_ends_the_fight_once_the_objective_completes() {
+            let mut m = in_raid();
+            m.apply(&ProtocolEvent::DungeonState {
+                state: EDungeonState::Active,
+                scene_uuid: None,
+            });
+            m.apply(&ProtocolEvent::DungeonObjective {
+                target_id: 100,
+                nums: Some(0),
+                complete: Some(false),
+            });
+            m.apply(&ProtocolEvent::DungeonObjective {
+                target_id: 100,
+                nums: None,
+                complete: Some(true),
+            });
+            m.apply(&hp(BOSS_UID, 1_000_000, 1_000_000, ORIGIN, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            m.apply(&hp(BOSS_UID, 30_000, 1_000_000, ORIGIN, 1_500));
+
+            m.apply(&gone(BOSS_UID));
+
+            assert_eq!(m.fight_end_ms, Some(1_000));
+            assert_eq!(m.fight_state(1_600), FightState::Ended);
         }
     }
 

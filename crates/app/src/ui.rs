@@ -149,6 +149,15 @@ fn paint_bold_text(
 pub enum UiCommand {
     Reset,
     Quit,
+    /// Issue #214: tear down what capture is tracking and re-run server
+    /// detection from scratch. Routed through this channel like every other
+    /// command, because the thing that has to act on it — the
+    /// `CaptureHandle` — cannot be reached from the frame thread: it owns a
+    /// raw Windows `HANDLE` and is neither `Send` nor `Sync`, which is why
+    /// `CaptureHandle::request_restart` shipped with no caller at all.
+    /// `pipeline::run` holds the `Send`-able half (`CaptureRestart`) and
+    /// makes the request on this command's behalf.
+    RestartCapture,
 }
 
 /// Non-fatal status banner shown above the player rows.
@@ -164,6 +173,13 @@ pub enum StatusLine {
 /// encounter it happened during — see `OverlayApp::status_expires_at` for
 /// which banners expire and which are permanent.
 const TRANSIENT_STATUS_LINGER: Duration = Duration::from_secs(5);
+
+/// What the banner says when the pipeline thread has died (issue #214).
+/// Names a recovery rather than a cause: from the UI's seat the cause is
+/// unknowable (the thread is simply gone), and the log line
+/// `raise_pipeline_dead_status` writes alongside it is where the detail
+/// belongs.
+const PIPELINE_DEAD_STATUS: &str = "Meter pipeline stopped — restart ShinraMeter-BPSR to resume";
 
 /// The overlay's eframe app: holds the latest snapshot plus the channel
 /// endpoints used to receive updates and send commands.
@@ -776,11 +792,64 @@ impl OverlayApp {
     /// this skip avoids. Split out of `ui()` so the guard is unit-testable
     /// without an `egui::Context`.
     fn drain_snapshots(&mut self) {
-        if !self.demo_mode {
-            for snap in self.rx_snapshot.try_iter() {
-                self.snapshot = snap;
+        if self.demo_mode {
+            return;
+        }
+        loop {
+            match self.rx_snapshot.try_recv() {
+                Ok(snap) => self.snapshot = snap,
+                // Nothing new this frame — the overwhelmingly common case.
+                Err(TryRecvError::Empty) => break,
+                // Issue #214: the pipeline thread is gone. `try_iter`, which
+                // this replaced, collapsed this into `Empty`, so a panicked
+                // pipeline looked exactly like a quiet one and the overlay
+                // went on painting the last snapshot forever — a frozen
+                // meter with no banner, no log line, and nothing the user
+                // could do but guess. `main.rs` never joins the thread
+                // either, so this dropped `Sender` is the only signal that
+                // reaches the UI at all.
+                Err(TryRecvError::Disconnected) => {
+                    self.raise_pipeline_dead_status();
+                    break;
+                }
             }
         }
+    }
+
+    /// Raises the *permanent* banner for a dead pipeline thread (#214).
+    ///
+    /// Permanent (no `status_expires_at`) because nothing in the process
+    /// restarts that thread: unlike the Share clipboard blip, this is still
+    /// true on every later frame. Logged and raised exactly once — the
+    /// early return below sees the banner it just set — so a disconnect
+    /// does not write a line per frame at ~10 Hz for the rest of the
+    /// session.
+    ///
+    /// A *permanent* error banner that is already up wins. The capture-init
+    /// failure `main.rs` seeds through `with_status` names an actual cause
+    /// ("WinDivert is not installed"), which is strictly more useful than
+    /// "the pipeline stopped" — and a pipeline whose capture never started
+    /// will disconnect at shutdown like any other.
+    ///
+    /// A *transient* error banner (`status_expires_at.is_some()` — e.g. a
+    /// failed Share/Export logs copy) does not win: it is scheduled to clear
+    /// itself in `expire_transient_status`, which runs after
+    /// `drain_snapshots` in `ui()`'s per-frame order, so without this check
+    /// a dead pipeline discovered while that banner is showing would stay
+    /// hidden behind it for up to `TRANSIENT_STATUS_LINGER` before the fatal
+    /// banner finally appears. Overriding clears `status_expires_at` too, or
+    /// the permanent banner would inherit the transient one's expiry and
+    /// vanish on schedule.
+    fn raise_pipeline_dead_status(&mut self) {
+        if matches!(self.status, StatusLine::Error(_)) && self.status_expires_at.is_none() {
+            return;
+        }
+        log::error!(
+            "the pipeline thread is gone (its snapshot channel disconnected); the meter is frozen \
+             for the rest of this session"
+        );
+        self.status = StatusLine::Error(PIPELINE_DEAD_STATUS.to_string());
+        self.status_expires_at = None;
     }
 
     /// Issue #171: picks up the manual update-check thread's result, if one
@@ -3905,6 +3974,13 @@ fn draw_header_menu(
             // here has to guard the bottom end — `Settings::OPACITY_MIN` documents
             // why a fully transparent backdrop stays recoverable.
             let mut opacity = settings.opacity;
+            // Issue #235: `Slider` has no width-builder of its own — its rail is
+            // sized entirely off `Spacing::slider_width` (a fixed ~100pt default),
+            // unlike the Columns checkboxes and buttons below, which already stretch
+            // to the row's available width. This is the only `Slider` in the whole
+            // overlay, so widening the shared spacing setting here can't affect
+            // anything painted after it.
+            ui.spacing_mut().slider_width = ui.available_width();
             let opacity_response = ui.add(
                 egui::Slider::new(&mut opacity, Settings::OPACITY_MIN..=Settings::OPACITY_MAX)
                     .show_value(false),
@@ -3972,6 +4048,24 @@ fn draw_header_menu(
                 {
                     start_log_export(dest, tx_log_export.clone());
                 }
+                ui.close();
+            }
+
+            // Issue #214: the only in-process recovery from a capture wedge that no
+            // new TCP connection happens to clear. Before this, `request_restart`
+            // had no caller anywhere and #211's 24-minute stall could only be
+            // escaped by leaving the instance (which opens a fresh connection) or
+            // relaunching the app. `bpsr-logs` ships the same escape hatch, worded
+            // almost identically — upstream evidently concluded that not every
+            // stall condition is automatically detectable.
+            //
+            // Deliberately unconfirmed and never disabled: the request is a
+            // latching flag rather than a queue, so clicking twice is one restart;
+            // the cost is a fraction of a second of missed packets plus a decoder
+            // reset; and anyone reaching for it is already looking at a meter that
+            // has stopped moving.
+            if ui.button("Restart packet capture").clicked() {
+                let _ = tx_command.try_send(UiCommand::RestartCapture);
                 ui.close();
             }
 
@@ -6241,9 +6335,23 @@ const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 572.0);
 /// Floor on the skill breakdown viewport's inner size (issue #181) so a
 /// resize can't shrink it into uselessness — tall enough for the header, tab
 /// strip and column-header row plus a couple of rows before the list
-/// scrolls, wide enough to keep the columns legible once
-/// `column_anchors_from_widths` scales them down.
-const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(360.0, 220.0);
+/// scrolls, wide enough to fit every column at its stated width.
+///
+/// Issue #228: the width used to be a flat 360.0, far narrower than the sum
+/// of `SkillColumn::width`s (728.0) plus the column header row's left/right
+/// `SKILL_HEADER_PAD_X` inset (24.0) — so dragging the window down toward
+/// this floor pushed `column_anchors_from_widths` into its proportional
+/// shrink path (see its doc comment) while the header labels stayed
+/// unclipped at full size, colliding them into unreadable text (e.g.
+/// `Damag%Dmg%Max cr…`). Of the fixes the issue lists — eliding column
+/// text, progressively dropping columns, or raising this floor — raising
+/// the floor is the one taken: it's the smallest change, and every column
+/// stays fully legible at every reachable size rather than switching to a
+/// second, narrower text-rendering mode. The floor is now exactly that
+/// budget, so `column_anchors_from_widths` can still scale a fraction of a
+/// point for rounding but never enough to visibly compress a label. See
+/// `skill_window_min_width_fits_every_column_at_its_stated_width`.
+const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(752.0, 220.0);
 
 /// One open breakdown window's own state (issue #16, D9): its sort column/
 /// direction, the screen position it was placed at when opened, and the
@@ -6472,11 +6580,12 @@ fn skill_rows_rect(rect: egui::Rect, col_header_rect: egui::Rect) -> egui::Rect 
 /// has nothing to show (issue #216) — which of the two it is depends on the
 /// window's source, not just on the row count (PR #221 review).
 ///
-/// A historical fight's `PlayerRow::skills` is empty *permanently*: the
-/// history schema doesn't persist per-skill totals (see
-/// `history::PlayerRecord::to_row`), so nothing will ever populate it and
-/// naming that limitation is what keeps the window from reading as silent
-/// breakage. A live row's empty `skills` means only "not yet": the dungeon
+/// A historical fight's `PlayerRow::skills` is empty *for good*: schema v2
+/// persists per-skill totals (issue #222), so a fight recorded by this build
+/// has its breakdown, and an empty one is a fight saved before v2 or a player
+/// who never landed a hit — either way nothing will ever populate it now, and
+/// naming that is what keeps the window from reading as silent breakage. A
+/// live row's empty `skills` means only "not yet": the dungeon
 /// roster preload (`encounter::apply_player`) puts a party member in the
 /// snapshot with an empty skill map before their first hit lands, and a
 /// healer can sit there for a whole fight — telling that user "nothing was
@@ -12343,6 +12452,35 @@ mod tests {
         );
     }
 
+    /// Issue #228: dragging the window down to `SKILL_WINDOW_MIN_SIZE`
+    /// used to be reachable at a width far narrower than the columns'
+    /// combined budget. `column_anchors_from_widths` scales every column's
+    /// *slot* down to fit at that point, but the header labels
+    /// (`draw_skill_window`'s column-header loop) are painted unclipped at
+    /// fixed size — they don't shrink or elide with their slot — so a
+    /// too-narrow floor collided them into unreadable text (e.g.
+    /// `Damag%Dmg%Max cr…`). The fix keeps the floor itself wide enough
+    /// that no column is ever below the width its label needs: the sum of
+    /// every `SkillColumn::width` plus the column header row's left/right
+    /// `SKILL_HEADER_PAD_X` inset (the same margin
+    /// `skill_columns_fit_the_initial_window_at_their_stated_widths`
+    /// checks against for the *initial* size). This is the "raise the
+    /// floor" fix from the alternatives the issue lists (eliding text or
+    /// progressively dropping columns): it is the smallest change that
+    /// removes the collision, and it keeps every column's full label
+    /// legible at every reachable size instead of introducing a second,
+    /// narrower text-rendering mode.
+    #[test]
+    fn skill_window_min_width_fits_every_column_at_its_stated_width() {
+        let total: f32 = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).sum();
+        assert!(
+            SKILL_WINDOW_MIN_SIZE.x >= total + 2.0 * SKILL_HEADER_PAD_X,
+            "min width {} is narrower than the columns' {total} + padding, \
+             so a resize down to it collides their header text",
+            SKILL_WINDOW_MIN_SIZE.x
+        );
+    }
+
     /// Measured off the reference at x=860, where the game background
     /// behind the window is continuous across all three band edges:
     /// header/tabs (29,28,33), rows (45,44,49), column header (51,50,55).
@@ -14278,11 +14416,12 @@ mod tests {
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, rx_settings) = crossbeam_channel::unbounded();
         let mut settings = Settings::default();
-        assert_eq!(
-            settings.opacity,
-            Settings::OPACITY_MAX,
-            "the default must start at full opacity for this test to prove a drag actually moved it"
-        );
+        // Issue #233 lowered the default below `OPACITY_MAX`, so this can no
+        // longer assume `Settings::default()` already sits at the ceiling —
+        // it needs to start there explicitly for the drag-to-the-floor below
+        // to prove it actually moved something.
+        settings.set_opacity(Settings::OPACITY_MAX);
+        assert_eq!(settings.opacity, Settings::OPACITY_MAX);
 
         // Frame 1: lay the menu out with no input, and read back where
         // AccessKit says the opacity slider actually painted — its rect
@@ -14373,6 +14512,71 @@ mod tests {
         );
     }
 
+    /// Issue #235: the opacity slider used to size itself off
+    /// `Spacing::slider_width` (a fixed ~100pt rail) instead of stretching
+    /// to fill its row the way the menu's other full-width controls do.
+    /// Compares its painted rect against the "Minimize to tray" button's —
+    /// a plain, always-visible control in the same popup, not nested inside
+    /// the Columns disclosure.
+    ///
+    /// Every other `draw_header_menu` test calls it directly on the bare
+    /// `Ui` `ctx.run_ui` hands back, bypassing the real
+    /// `egui::Popup::menu(&chevron_response)` wiring `draw_header` builds
+    /// around it (see the doc comment on the Close-button regression test
+    /// above). That's fine for click/drag behavior, but the "full width"
+    /// this issue is about only exists because `Popup::menu` sets
+    /// `Layout::top_down_justified` — outside that layout, *every* widget
+    /// here (button included) just reports its own natural minimum size,
+    /// so this test recreates that one piece of the real wiring by hand
+    /// rather than the whole popup/anchor apparatus.
+    #[test]
+    fn draw_header_menu_opacity_slider_fills_the_row_width() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_max_width(220.0);
+            ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+                draw_header_menu(
+                    ui,
+                    &ctx,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    &mut UpdateCheckState::default(),
+                    &unused_log_export_sender(),
+                );
+            });
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let slider_rect = accessible_rect_for_role(&update, egui::accesskit::Role::Slider);
+        let button_rect = accessible_rect_for_label(&update, "Minimize to tray");
+        layout.drop_without_applying_deltas();
+
+        assert!(
+            (slider_rect.left() - button_rect.left()).abs() < 1.0,
+            "the slider must start at the same left edge as the row below it: \
+             slider {slider_rect:?}, button {button_rect:?}"
+        );
+        assert!(
+            (slider_rect.width() - button_rect.width()).abs() < 1.0,
+            "the slider must fill the same row width as the row below it, not a fixed rail: \
+             slider {slider_rect:?}, button {button_rect:?}"
+        );
+    }
+
     /// Issue #203: the header dropdown's "Reset to defaults" item must
     /// resize the window to fit `RESET_TO_DEFAULTS_VISIBLE_ROWS` rows (not
     /// the tray's own 20-row `TrayCommand::ResetWindow`) and reset opacity
@@ -14442,7 +14646,7 @@ mod tests {
         assert_eq!(
             settings.opacity,
             Settings::default_opacity(),
-            "Reset to defaults must restore full opacity"
+            "Reset to defaults must restore the default opacity"
         );
         let sent = rx_settings
             .try_recv()
@@ -15880,7 +16084,8 @@ mod tests {
 
     /// A zero-skill row means two different things (PR #221 review): a live
     /// row is a roster-preloaded or not-yet-hitting player mid-fight, a
-    /// historical one is the history schema never storing per-skill totals.
+    /// historical one is a fight saved before schema v2 stored per-skill
+    /// totals (issue #222) — settled either way, not still arriving.
     #[test]
     fn skill_window_empty_message_is_worded_for_the_window_s_source() {
         assert_eq!(
@@ -16454,6 +16659,211 @@ mod tests {
             reported_rows_top > pre_call_top,
             "rows_top must move past the history bar and separator \
              (pre-call top {pre_call_top}, reported {reported_rows_top})"
+        );
+    }
+
+    /// Issue #214: `CaptureHandle::request_restart` shipped with no caller
+    /// anywhere in this crate, so a capture wedge that no new TCP connection
+    /// cleared (#211) left "relaunch the app" as the only recovery. This
+    /// drives a real click on the dropdown item that now reaches it, the
+    /// same way `draw_header_menu_dispatches_close_to_the_right_command`
+    /// drives Close.
+    #[test]
+    fn draw_header_menu_dispatches_restart_packet_capture() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
+            );
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let item_pos = accessible_rect_for_label(&update, "Restart packet capture").center();
+        layout.drop_without_applying_deltas();
+
+        let output = ctx.run_ui(click_at(item_pos), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
+            );
+        });
+        let viewport_commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            rx_command
+                .try_recv()
+                .expect("Restart packet capture must send a command"),
+            UiCommand::RestartCapture
+        );
+        assert!(
+            !viewport_commands.contains(&egui::ViewportCommand::Close),
+            "restarting capture must not close the overlay: {viewport_commands:?}"
+        );
+    }
+
+    /// Issue #214, part 2: the pipeline thread's death used to be entirely
+    /// silent — `main.rs` never checks its `JoinHandle`, so a panic in it
+    /// left a frozen-but-normal-looking meter for the rest of the process's
+    /// life. The dropped `Sender` it leaves behind is the signal, and the
+    /// banner is what makes it visible.
+    #[test]
+    fn a_dead_pipeline_thread_raises_an_error_banner() {
+        let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+        assert_eq!(app.status, StatusLine::Ok, "a live pipeline starts clean");
+
+        drop(tx_snapshot);
+        app.drain_snapshots();
+
+        match &app.status {
+            StatusLine::Error(message) => assert!(
+                message.contains("pipeline"),
+                "the banner must name what died, got {message:?}"
+            ),
+            other => panic!("expected an error banner, got {other:?}"),
+        }
+        assert_eq!(
+            app.status_expires_at, None,
+            "a dead pipeline never recovers, so its banner must not time out"
+        );
+    }
+
+    /// The counterpart: a pipeline that is merely idle — connected, with
+    /// nothing new to say — must leave the banner alone, or the overlay
+    /// would cry wolf on every quiet frame.
+    #[test]
+    fn an_idle_pipeline_leaves_the_status_alone() {
+        let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+
+        app.drain_snapshots();
+        assert_eq!(app.status, StatusLine::Ok);
+
+        tx_snapshot.send(demo_snapshot()).unwrap();
+        app.drain_snapshots();
+        assert_eq!(
+            app.status,
+            StatusLine::Ok,
+            "a delivered snapshot is good news"
+        );
+    }
+
+    /// The capture-init failure `main.rs` seeds through `with_status` is
+    /// permanent and more specific than "the pipeline is gone"; a later
+    /// pipeline disconnect at shutdown must not overwrite it with the
+    /// vaguer message.
+    #[test]
+    fn a_dead_pipeline_does_not_overwrite_an_existing_error_banner() {
+        let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded::<Snapshot>();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        )
+        .with_status(StatusLine::Error("WinDivert is not installed".to_string()));
+
+        drop(tx_snapshot);
+        app.drain_snapshots();
+
+        assert_eq!(
+            app.status,
+            StatusLine::Error("WinDivert is not installed".to_string()),
+            "the more specific capture failure must survive"
+        );
+    }
+
+    /// Counterpart to `a_dead_pipeline_does_not_overwrite_an_existing_error_banner`:
+    /// a *transient* banner (Share/Export logs failure) is not "already up"
+    /// in the sense that guard cares about — it is scheduled to clear itself
+    /// in `expire_transient_status`, which runs after `drain_snapshots` in
+    /// `ui()`'s per-frame order. Without distinguishing it from a permanent
+    /// banner, a dead pipeline discovered mid-linger would stay masked by
+    /// the stale clipboard message for up to `TRANSIENT_STATUS_LINGER`
+    /// instead of raising the fatal banner immediately.
+    #[test]
+    fn a_dead_pipeline_overwrites_a_transient_error_banner() {
+        let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded::<Snapshot>();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+
+        app.raise_transient_status("Copy screenshot failed: oops".to_string(), Instant::now());
+        assert!(
+            app.status_expires_at.is_some(),
+            "sanity: banner is transient"
+        );
+
+        drop(tx_snapshot);
+        app.drain_snapshots();
+
+        match &app.status {
+            StatusLine::Error(message) => assert!(
+                message.contains("pipeline"),
+                "the permanent banner must replace the transient one, got {message:?}"
+            ),
+            other => panic!("expected the permanent pipeline-dead banner, got {other:?}"),
+        }
+        assert_eq!(
+            app.status_expires_at, None,
+            "the permanent banner must not inherit the transient banner's expiry"
         );
     }
 }
