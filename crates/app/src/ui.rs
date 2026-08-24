@@ -146,6 +146,158 @@ fn paint_bold_text(
     paint_text(painter, pos, anchor, text, bold(size), color, true)
 }
 
+/// Deterministic 32-bit FNV-1a — routes a skill id to a
+/// `SKILL_PLACEHOLDER_PALETTE` swatch (issue #275). Picked over
+/// `std::hash::DefaultHasher`/`RandomState` specifically because those are
+/// *not* guaranteed stable across Rust versions or process runs, which
+/// would break "the same id looks the same every time" — the one property
+/// this hash exists to provide. Not used for anything else; not a general
+/// hashing utility.
+fn fnv1a_u32(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for &byte in bytes {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Placeholder disc swatches for issue #275: twelve vivid, mid-dark solid
+/// hues, chosen for two things at once. First, distance from the row
+/// chrome's near-black neutrals (`SKILL_CHROME_FILL` 0x11/0x11/0x17,
+/// `SKILL_PANEL_FILL` 0x21/0x21/0x27, `SKILL_COLUMN_HEADER_FILL`
+/// 0x2a/0x2a/0x30) so a placeholder never reads as "nothing painted" the
+/// way the old `SKILL_ICON_EMPTY` (0x33/0x33/0x3B, barely lighter than
+/// that chrome) could. Second, being flat and saturated rather than
+/// gradients or texture, so a placeholder never reads as photographic
+/// game-art either — a user glancing at the row list should be able to
+/// tell which rows have real vendored icons and which don't.
+const SKILL_PLACEHOLDER_PALETTE: [(u8, u8, u8); 12] = [
+    (0xB0, 0x3A, 0x2E), // brick red
+    (0xC5, 0x6A, 0x1E), // burnt orange
+    (0xD8, 0xB0, 0x2A), // gold
+    (0x52, 0x97, 0x2E), // moss green
+    (0x1C, 0x80, 0x6C), // teal
+    (0x1E, 0x6F, 0x9E), // steel blue
+    (0x3A, 0x4E, 0xB0), // indigo
+    (0x6A, 0x3A, 0xB0), // violet
+    (0xA5, 0x2E, 0x8C), // magenta
+    (0x8C, 0x4A, 0x2E), // umber
+    (0x4A, 0x5A, 0x6A), // slate
+    (0xC0, 0x4A, 0x6A), // rose
+];
+
+/// WCAG relative luminance of an sRGB triple (0-255 channels) — used only
+/// to pick a legible glyph color over a placeholder swatch (issue #275).
+fn relative_luminance((r, g, b): (u8, u8, u8)) -> f32 {
+    fn channel(c: u8) -> f32 {
+        let c = f32::from(c) / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+}
+
+/// Background and glyph color for `skill_id`'s placeholder icon (issue
+/// #275), as `(background, glyph)`. The background is `skill_id` — not the
+/// name — routed through `fnv1a_u32` into `SKILL_PLACEHOLDER_PALETTE`: id,
+/// because two ids that resolve to the same `skills::skill_monogram` (e.g.
+/// every Lucky Strike weapon variant, all "LS") still need their own disc
+/// color to stay told apart in a row list, which a name-derived color
+/// could not give them.
+///
+/// The glyph color is whichever of near-black (`#1A1A1A`, matched to this
+/// window's dark theme rather than a pure `#000`) or white gives the
+/// higher WCAG contrast ratio against that background. `0.2017` is not a
+/// round-number guess: it is the relative luminance at which the two
+/// ratios cross, solved from `(l + 0.05)^2 = 1.05 * (l_black + 0.05)` where
+/// `l_black` is `#1A1A1A`'s own luminance. Every current palette entry
+/// clears 4.5:1 (WCAG AA's minimum for *normal* text, stricter than the
+/// 3:1 large-text floor this glyph's ~15pt bold weight would otherwise
+/// only need to clear) against its chosen glyph color — issue #281's
+/// live-window pass found the original teal (4.25:1 against white) and
+/// moss green (4.23:1 against black) both fell short of 4.5 despite
+/// clearing 3:1, so both were darkened/lightened respectively until they
+/// cleared 4.5 with a small margin, without changing which glyph color
+/// either one picks.
+///
+/// Lives here rather than in `skills.rs` (moved in the issue #281 review
+/// pass): `skills.rs`'s module doc says this file owns skill-name/sort
+/// view-model logic and that "`ui.rs` (T4) owns painting this; it must not
+/// be touched here" — a WCAG contrast decision producing `egui::Color32`
+/// paint values is exactly the painting decision that line rules out, so
+/// it belongs beside `paint_skill_icon_placeholder`, the only caller.
+fn skill_placeholder_colors(skill_id: i32) -> (egui::Color32, egui::Color32) {
+    let idx = (fnv1a_u32(&skill_id.to_le_bytes()) as usize) % SKILL_PLACEHOLDER_PALETTE.len();
+    let bg = SKILL_PLACEHOLDER_PALETTE[idx];
+    let fg = if relative_luminance(bg) > 0.2017 {
+        (0x1A, 0x1A, 0x1A)
+    } else {
+        (0xFF, 0xFF, 0xFF)
+    };
+    (
+        egui::Color32::from_rgb(bg.0, bg.1, bg.2),
+        egui::Color32::from_rgb(fg.0, fg.1, fg.2),
+    )
+}
+
+/// Paints the issue #275 monogram placeholder that fills the skill-icon
+/// column for an id with no upstream art: a flat disc in
+/// `skill_placeholder_colors(skill_id)`'s background, with the 1-2
+/// character monogram `skills::skill_monogram` derives from `name` centered
+/// on top in the matching foreground. `name` is the skill's already
+/// resolved display name (`skills::skill_display_name`), passed in rather
+/// than re-resolved here, since the caller's per-row column loop also needs
+/// it for the Name column cell and resolving it twice would repeat the
+/// table lookup and its allocation for no reason.
+///
+/// Falls back to the original flat `SKILL_ICON_EMPTY` disc for the one case
+/// `skill_monogram` returns `None` — a name with no derivable glyph at all
+/// (blank, or pure punctuation) — since #275 found every id actually
+/// observed in capture resolves to a real name (down to the `Skill #<id>`
+/// fallback), so `SKILL_ICON_EMPTY` still exists for a hypothetical
+/// genuinely-nameless id rather than for the 65 ids this issue is about.
+///
+/// Both the placeholder disc and its glyph are `.gamma_multiply(opacity)`'d.
+/// That is a deliberate divergence from the real-icon branch beside this one
+/// (`CLASS_ICON_TINT`, painted at full alpha per issue #166's row-content
+/// rule) and from the old `SKILL_ICON_EMPTY` fallback this replaces (also
+/// never faded) — but this content is new and *generated*, not real
+/// content or chrome, and #252/#253 established that every visible surface
+/// should track the opacity slider. A solid, saturated placeholder disc
+/// pinned at full alpha while the rest of a low-opacity window fades would
+/// make it the loudest element in the row list, which is the opposite of
+/// reading as a fallback for missing art.
+fn paint_skill_icon_placeholder(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    skill_id: i32,
+    name: &str,
+    opacity: f32,
+) {
+    let Some(glyph) = skills::skill_monogram(name) else {
+        painter.circle_filled(center, SKILL_ICON_PLACEHOLDER_RADIUS, SKILL_ICON_EMPTY);
+        return;
+    };
+    let (bg, fg) = skill_placeholder_colors(skill_id);
+    painter.circle_filled(
+        center,
+        SKILL_ICON_PLACEHOLDER_RADIUS,
+        bg.gamma_multiply(opacity),
+    );
+    paint_bold_text(
+        painter,
+        center,
+        egui::Align2::CENTER_CENTER,
+        &glyph,
+        SKILL_ICON_MONOGRAM_FONT_SIZE,
+        fg.gamma_multiply(opacity),
+    );
+}
+
 /// Commands the overlay emits for the app layer to consume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiCommand {
@@ -6864,10 +7016,40 @@ const SKILL_ROW_HEIGHT: f32 = 44.0;
 /// (`scripts/prep-skill-icons.py`), so this is still a downscale at 100%
 /// display scaling.
 const SKILL_ICON_SIZE: f32 = 38.0;
-/// Fill for a row whose skill has no icon to paint. Deliberately the same
-/// flat disc the Imagine slots degrade to, so an empty slot reads as a
-/// deliberate blank rather than a rendering failure.
+/// Per-side inset the issue #275 monogram placeholder disc (and the
+/// `SKILL_ICON_EMPTY` fallback beside it) is drawn at, versus the full
+/// `SKILL_ICON_SIZE / 2.0` radius vendored skill-icon PNGs occupy in code.
+/// Issue #281's live-window pass found the placeholder disc painted at the
+/// full 38x38 slot while real vendored art's own baked-in transparent
+/// padding gives it a visible footprint of only ~26x28 within that same
+/// slot — in a mixed row list, the placeholder read noticeably heavier
+/// than its neighbors. `2.5` isn't a reproduction of that rectangle (a
+/// circle can't match a rectangle's two different margins); it is a small
+/// uniform inset that closes the weight gap without shrinking the disc so
+/// far it stops looking like it belongs in the same size class as the
+/// other 38px slot content.
+const SKILL_ICON_PLACEHOLDER_INSET: f32 = 2.5;
+/// Radius the issue #275 monogram placeholder disc and the
+/// `SKILL_ICON_EMPTY` fallback are painted at — see
+/// `SKILL_ICON_PLACEHOLDER_INSET`.
+const SKILL_ICON_PLACEHOLDER_RADIUS: f32 = SKILL_ICON_SIZE / 2.0 - SKILL_ICON_PLACEHOLDER_INSET;
+/// Fill for a row whose skill has no icon to paint *and* no name to derive
+/// a monogram placeholder from (issue #275 — see
+/// `paint_skill_icon_placeholder`). Deliberately the same flat disc the
+/// Imagine slots degrade to, so an empty slot reads as a deliberate blank
+/// rather than a rendering failure. In practice every observed skill id
+/// resolves to at least the `Skill #<id>` fallback name
+/// (`skills::skill_display_name`), so this now only fires for a
+/// hypothetically blank/punctuation-only name — kept rather than removed,
+/// since "no derivable glyph" is still a real (if unobserved) case.
 const SKILL_ICON_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x3B);
+/// Font size of the issue #275 monogram placeholder's 1-2 character glyph,
+/// centered on the `SKILL_ICON_PLACEHOLDER_RADIUS` disc (33pt across, since
+/// issue #281 inset it off the full `SKILL_ICON_SIZE` slot) — large enough
+/// to read at a glance as a letterform rather than a texture artifact,
+/// small enough that two characters ("LS", "FF") stay clear of the disc's
+/// edge.
+const SKILL_ICON_MONOGRAM_FONT_SIZE: f32 = 15.0;
 /// `Skills.xaml:151-154` draws the class icon at 50x50. Issue #190 could
 /// only fit 40 of that, because `SKILL_HEADER_HEIGHT` was a made-up 56 and
 /// 50 would have overflowed its padded content area. Issue #200 measured
@@ -7607,6 +7789,10 @@ fn draw_skill_window(
         .show(&mut rows_ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for skill in &skill_rows {
+                // Resolved once per row (table lookup + allocation) and
+                // reused below for both the icon column's monogram and the
+                // Name column's cell text, rather than resolving it twice.
+                let display_name = skills::skill_display_name(skill.skill_id);
                 let (skill_rect, response) = ui.allocate_exact_size(
                     egui::vec2(rows_content_rect.width(), SKILL_ROW_HEIGHT),
                     egui::Sense::hover(),
@@ -7633,30 +7819,43 @@ fn draw_skill_window(
                     // skill name, exactly as in the reference. A skill the
                     // name tables know no icon for, an icon whose PNG is not
                     // vendored here, and one that failed to decode all land
-                    // on the same blank-disc branch — one degrade path,
+                    // on the same no-texture branch — one degrade path,
                     // never a panic, the same shape `ImagineIcons`' empty
-                    // slot uses.
+                    // slot uses. Issue #275: that branch used to be one flat
+                    // `SKILL_ICON_EMPTY` disc for every such id, painting the
+                    // capture's single largest damage source identically to
+                    // a 0.01% tick three rows below it. It now paints a
+                    // monogram placeholder — see `skills::skill_monogram`
+                    // and `paint_skill_icon_placeholder` — keyed off the
+                    // *name* every one of those ids already resolves to,
+                    // and only falls through to the old blank disc for a
+                    // name with no derivable glyph at all (see
+                    // `skills::skill_monogram`'s doc comment).
                     if *kind == skills::SkillColumn::Icon {
                         let center =
                             egui::pos2(clip.left() + SKILL_ICON_SIZE / 2.0, clip.center().y);
                         match skills::skill_icon_basename(skill.skill_id)
                             .and_then(|basename| icons.skills.get(basename))
                         {
-                            Some(texture) => cell_painter.image(
-                                texture.id(),
-                                egui::Rect::from_center_size(
-                                    center,
-                                    egui::Vec2::splat(SKILL_ICON_SIZE),
-                                ),
-                                UV_FULL,
-                                CLASS_ICON_TINT,
-                            ),
-                            None => cell_painter.circle_filled(
+                            Some(texture) => {
+                                cell_painter.image(
+                                    texture.id(),
+                                    egui::Rect::from_center_size(
+                                        center,
+                                        egui::Vec2::splat(SKILL_ICON_SIZE),
+                                    ),
+                                    UV_FULL,
+                                    CLASS_ICON_TINT,
+                                );
+                            }
+                            None => paint_skill_icon_placeholder(
+                                &cell_painter,
                                 center,
-                                SKILL_ICON_SIZE / 2.0,
-                                SKILL_ICON_EMPTY,
+                                skill.skill_id,
+                                &display_name,
+                                opacity,
                             ),
-                        };
+                        }
                         continue;
                     }
                     let (align, pos) = if *kind == skills::SkillColumn::Name {
@@ -7664,11 +7863,16 @@ fn draw_skill_window(
                     } else {
                         (egui::Align2::RIGHT_CENTER, clip.right_center())
                     };
+                    let text = if *kind == skills::SkillColumn::Name {
+                        display_name.clone()
+                    } else {
+                        kind.text(skill)
+                    };
                     paint_text(
                         &cell_painter,
                         pos,
                         align,
-                        &kind.text(skill),
+                        &text,
                         regular(FONT_SIZE_ROW),
                         egui::Color32::WHITE,
                         false,
@@ -8207,6 +8411,183 @@ mod tests {
     use super::*;
     use crate::settings::{ColumnKind, Settings};
     use bpsr_meter::Class;
+
+    // -- Skill-icon monogram placeholder colors (issue #275) ----------------
+
+    #[test]
+    fn placeholder_colors_are_deterministic_per_id() {
+        for id in [2031103, 2203291, 35107, -5, 0] {
+            assert_eq!(skill_placeholder_colors(id), skill_placeholder_colors(id));
+        }
+    }
+
+    /// Const-only regression pin for `SKILL_ICON_PLACEHOLDER_INSET`'s
+    /// relationship to `SKILL_ICON_SIZE` — it does not touch anything
+    /// `paint_skill_icon_placeholder` paints (see
+    /// `placeholder_disc_paints_at_the_inset_radius_inside_the_icon_slot`
+    /// for that). Issue #281: the placeholder disc used to fill the full
+    /// `SKILL_ICON_SIZE` slot, reading heavier than real vendored art's
+    /// ~26x28 visible footprint (its own transparent padding) in the same
+    /// 38x38 slot. Pins the inset to the small "~2-3px" range that closes
+    /// that gap without shrinking the disc out of the same size class as
+    /// real icon art, and pins `SKILL_ICON_PLACEHOLDER_RADIUS`'s formula so
+    /// a hand-edit of either constant is caught here first.
+    #[test]
+    fn placeholder_disc_inset_pins_the_slot_relationship() {
+        const { assert!(SKILL_ICON_PLACEHOLDER_INSET >= 2.0 && SKILL_ICON_PLACEHOLDER_INSET <= 3.0) };
+        const {
+            assert!(
+                SKILL_ICON_PLACEHOLDER_RADIUS
+                    == SKILL_ICON_SIZE / 2.0 - SKILL_ICON_PLACEHOLDER_INSET
+            )
+        };
+        const { assert!(SKILL_ICON_PLACEHOLDER_RADIUS < SKILL_ICON_SIZE / 2.0) };
+    }
+
+    /// Renders a real skill row through `draw_skill_window` and reads the
+    /// disc `paint_skill_icon_placeholder` actually painted back out of the
+    /// frame's `Shape::Circle`s — `placeholder_disc_inset_pins_the_slot_
+    /// relationship` only checks the constants' own arithmetic against each
+    /// other, which can't catch either of `paint_skill_icon_placeholder`'s
+    /// two `circle_filled` call sites drifting from
+    /// `SKILL_ICON_PLACEHOLDER_RADIUS` (e.g. a copy-pasted literal).
+    #[test]
+    fn placeholder_disc_paints_at_the_inset_radius_inside_the_icon_slot() {
+        let row = PlayerRow {
+            // A negative id: `skill_icon_basename` is keyed by `u32`, so a
+            // negative one can never resolve to a vendored icon and always
+            // takes the placeholder branch — unlike a real id, which could
+            // start shipping an icon later and silently switch this test
+            // onto the textured branch instead.
+            skills: vec![sample_skill_row(-1)],
+            ..sample_row(None)
+        };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_SIZE);
+        let mut sort = skills::SkillSort::default();
+
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_skill_window(
+                    ui,
+                    &row,
+                    &mut sort,
+                    SkillWindowSource::Live,
+                    &icons,
+                    1.0,
+                    &mut WindowGesture::default(),
+                );
+            },
+        );
+        let mut circles = Vec::new();
+        for clipped in &output.shapes {
+            collect_circle_geometry(&clipped.shape, &mut circles);
+        }
+        output.drop_without_applying_deltas();
+
+        // The same geometry `draw_skill_window` derives the icon cell's
+        // center from (issue #200's `skill_header_rect`/
+        // `skill_column_header_rect`/`skill_rows_rect`, and the shared
+        // column `anchors` the row loop reuses from the column-header
+        // row) — replicated here rather than pulled into a shared helper,
+        // since nothing else needs "where does the icon column sit"
+        // outside this one check.
+        let header = skill_header_rect(screen_rect);
+        let tabs = egui::Rect::from_min_size(
+            egui::pos2(screen_rect.left(), header.bottom()),
+            egui::vec2(screen_rect.width(), SKILL_TAB_HEIGHT),
+        );
+        let col_header = skill_column_header_rect(screen_rect, tabs);
+        let rows_rect = skill_rows_rect(screen_rect, col_header);
+        let widths: Vec<f32> = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).collect();
+        let anchors = column_anchors_from_widths(
+            col_header.left() + SKILL_HEADER_PAD_X,
+            col_header.right() - SKILL_HEADER_PAD_X,
+            &widths,
+            0.0,
+        );
+        let icon_index = SKILL_COLUMN_ORDER
+            .iter()
+            .position(|k| *k == skills::SkillColumn::Icon)
+            .expect("skill columns always include Icon");
+        let icon_width = skills::SkillColumn::Icon.width();
+        let expected_center = egui::pos2(
+            anchors[icon_index] - icon_width + SKILL_ICON_SIZE / 2.0,
+            rows_rect.top() + SKILL_ROW_HEIGHT / 2.0,
+        );
+
+        let mut found_radius = None;
+        for &(center, radius) in &circles {
+            if (center - expected_center).length() < 0.01 {
+                found_radius = Some(radius);
+                break;
+            }
+        }
+        let radius = found_radius.unwrap_or_else(|| {
+            panic!("no circle painted at the icon slot's center {expected_center:?}: {circles:?}")
+        });
+        assert_eq!(
+            radius, SKILL_ICON_PLACEHOLDER_RADIUS,
+            "the painted disc must use SKILL_ICON_PLACEHOLDER_RADIUS, not the full SKILL_ICON_SIZE/2.0 slot"
+        );
+    }
+
+    #[test]
+    fn different_ids_sharing_a_monogram_can_still_land_on_different_swatches() {
+        // Every Lucky Strike weapon variant collapses to the same "LS"
+        // glyph (they are literally the same base skill), so the id-keyed
+        // background is the only thing that can still tell the rows apart.
+        let ids = [2031101, 2031102, 2031103, 2031105];
+        let colors: std::collections::HashSet<_> = ids
+            .iter()
+            .map(|&id| {
+                let (bg, _fg) = skill_placeholder_colors(id);
+                (bg.r(), bg.g(), bg.b())
+            })
+            .collect();
+        assert!(
+            colors.len() > 1,
+            "expected the four Lucky Strike variants to spread across more than one swatch"
+        );
+    }
+
+    #[test]
+    fn every_placeholder_swatch_clears_wcag_normal_text_contrast_with_its_chosen_glyph_color() {
+        // Exercises the legibility rule this placeholder encodes: whichever
+        // of near-black or white `skill_placeholder_colors` picks must clear
+        // WCAG AA's 4.5:1 minimum for normal text against every swatch in
+        // the palette, not just the ones a spot check happens to hit.
+        // Issue #281's live-window pass found two swatches (teal, moss
+        // green) that cleared the looser 3:1 large-text floor but fell
+        // short of 4.5 — this asserts the stricter bound so that class of
+        // regression can't land unnoticed again.
+        for &(r, g, b) in &SKILL_PLACEHOLDER_PALETTE {
+            let bg_lum = relative_luminance((r, g, b));
+            let fg = if bg_lum > 0.2017 {
+                (0x1A, 0x1A, 0x1A)
+            } else {
+                (0xFF, 0xFF, 0xFF)
+            };
+            let fg_lum = relative_luminance(fg);
+            let (hi, lo) = if bg_lum > fg_lum {
+                (bg_lum, fg_lum)
+            } else {
+                (fg_lum, bg_lum)
+            };
+            let ratio = (hi + 0.05) / (lo + 0.05);
+            assert!(
+                ratio >= 4.5,
+                "swatch {:?} only reaches a {ratio:.2}:1 contrast ratio",
+                (r, g, b)
+            );
+        }
+    }
 
     // -- Imagine tier hover text / gold ring (issues #169/#170) -------------
 
@@ -8887,6 +9268,22 @@ mod tests {
             egui::Shape::Vec(shapes) => {
                 for s in shapes {
                     collect_circle_fills(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Walks a painted `Shape`, collecting every `Shape::Circle`'s
+    /// `(center, radius)` — like `collect_circle_fills` but keeping the
+    /// geometry instead of the fill, for a caller that needs to check
+    /// *where* and *how big* a circle painted, not just what color.
+    fn collect_circle_geometry(shape: &egui::Shape, out: &mut Vec<(egui::Pos2, f32)>) {
+        match shape {
+            egui::Shape::Circle(circle) => out.push((circle.center, circle.radius)),
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_circle_geometry(s, out);
                 }
             }
             _ => {}

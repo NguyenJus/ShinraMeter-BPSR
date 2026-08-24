@@ -159,14 +159,55 @@ pub fn skill_display_name(skill_id: i32) -> String {
 /// Resolves a raw skill id to its vendored icon basename (issue #192), via
 /// the generated `skill_icon` table. `None` — an id the table names no icon
 /// for, or a negative id, both falling through the same `try_from` — is the
-/// normal "no icon" answer, and the caller paints the blank placeholder.
-/// Note that `Some` is not a promise the icon is *shipped*: the table names
-/// every icon BPSR-ZDPS references, and `SkillIcons::get` returns `None` for
-/// any whose PNG is not committed under `crates/app/assets/skills/`.
+/// normal "no icon" answer, and the caller paints a generated placeholder
+/// (issue #275) in its place. Note that `Some` is not a promise the icon is
+/// *shipped*: the table names every icon BPSR-ZDPS references, and
+/// `SkillIcons::get` returns `None` for any whose PNG is not committed
+/// under `crates/app/assets/skills/`.
 pub fn skill_icon_basename(skill_id: i32) -> Option<&'static str> {
     u32::try_from(skill_id)
         .ok()
         .and_then(bpsr_meter::tables::skill_icon)
+}
+
+/// Derives a 1-2 character monogram from a resolved skill display name
+/// (issue #275's placeholder for the 65 observed ids with no upstream
+/// icon). Splits `name` on every non-alphanumeric boundary, so punctuation
+/// ("Lucky Strike (Battle Axe)"), dashes ("Wild Wolf - Coordinated
+/// Attack") and the `skill_display_name` fallback's `#` ("Skill #2426")
+/// all separate into real words rather than leaking a symbol into the
+/// glyph. A multi-word name takes the first letter of its first two words
+/// ("Falcon Strike" -> "FS", "Skill #2426" -> "S2"); a single-word name
+/// takes its own first two characters ("Burn" -> "BU"). Every character of
+/// the result goes through `char::to_uppercase` — Unicode-aware casing,
+/// not an ASCII-only flip — so a non-Latin name still produces glyphs in
+/// its own script rather than being mangled or dropped; a script with no
+/// case distinction (e.g. CJK) passes its characters through unchanged,
+/// which is exactly what a monogram of it should do.
+///
+/// Returns `None` only when `name` has no alphanumeric content at all
+/// (empty, or pure punctuation/whitespace) — there is nothing to derive a
+/// monogram from, so the caller keeps painting the flat `SKILL_ICON_EMPTY`
+/// disc for that one case. In practice no observed skill id reaches this:
+/// `skill_display_name` always falls back to `Skill #<id>`, which is never
+/// blank.
+pub fn skill_monogram(name: &str) -> Option<String> {
+    let words: Vec<&str> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let chars: Vec<char> = match words.as_slice() {
+        [] => return None,
+        [only] => only.chars().take(2).collect(),
+        [first, second, ..] => {
+            vec![
+                first.chars().next().unwrap(),
+                second.chars().next().unwrap(),
+            ]
+        }
+    };
+    let monogram: String = chars.into_iter().flat_map(char::to_uppercase).collect();
+    Some(monogram)
 }
 
 /// Sort state for one open breakdown window. Per-window, not global (D9) —
@@ -467,5 +508,98 @@ mod tests {
             egui::Rect::from_min_size(egui::Pos2::new(1700.0, 50.0), egui::Vec2::new(200.0, 600.0));
         let pos = place_window(main_outer, None, egui::Vec2::new(300.0, 500.0));
         assert_eq!(pos, egui::Pos2::new(1900.0, 50.0));
+    }
+
+    // == Issue #275: skill-icon monogram placeholder ======================
+
+    #[test]
+    fn a_single_word_name_takes_its_own_first_two_characters() {
+        assert_eq!(skill_monogram("Burn").as_deref(), Some("BU"));
+    }
+
+    #[test]
+    fn a_two_word_name_takes_the_first_letter_of_each_word() {
+        assert_eq!(skill_monogram("Falcon Strike").as_deref(), Some("FS"));
+    }
+
+    #[test]
+    fn a_punctuated_multi_word_name_splits_on_the_punctuation_not_through_it() {
+        // Real #275 example: parentheses must not leak into the glyph, and
+        // the two leading real words ("Lucky", "Strike") win over the
+        // parenthesized weapon-variant qualifier.
+        assert_eq!(
+            skill_monogram("Lucky Strike (Battle Axe)").as_deref(),
+            Some("LS")
+        );
+        // A dash-separated name (issue example) splits the same way.
+        assert_eq!(
+            skill_monogram("Wild Wolf - Coordinated Attack").as_deref(),
+            Some("WW")
+        );
+    }
+
+    #[test]
+    fn the_number_id_fallback_name_still_yields_a_monogram() {
+        // `skill_display_name`'s own fallback for an id with no table entry
+        // ("Skill #2426") must not choke on the `#` or the digits.
+        assert_eq!(skill_monogram("Skill #2426").as_deref(), Some("S2"));
+    }
+
+    #[test]
+    fn a_name_with_no_alphanumeric_content_yields_no_monogram() {
+        // Empty, whitespace-only, and pure-punctuation names all have
+        // nothing to derive a glyph from — `ui.rs` keeps painting the flat
+        // `SKILL_ICON_EMPTY` disc for exactly this case.
+        assert_eq!(skill_monogram(""), None);
+        assert_eq!(skill_monogram("   "), None);
+        assert_eq!(skill_monogram("---"), None);
+    }
+
+    #[test]
+    fn a_non_latin_name_uppercases_per_script_instead_of_mangling() {
+        // Cyrillic has case, so it uppercases like Latin does.
+        assert_eq!(skill_monogram("привет мир").as_deref(), Some("ПМ"));
+        // CJK has no case distinction; the characters pass through as-is
+        // rather than being dropped or replaced.
+        assert_eq!(skill_monogram("火焰 斩击").as_deref(), Some("火斩"));
+    }
+
+    #[test]
+    fn monogram_derivation_is_deterministic() {
+        for name in ["Burn", "Falcon Strike", "Lucky Strike (Battle Axe)"] {
+            assert_eq!(skill_monogram(name), skill_monogram(name));
+        }
+    }
+
+    #[test]
+    fn every_skill_id_issue_275_cites_as_art_less_resolves_a_real_monogram() {
+        // The concrete ids issue #275's evidence table names (its top
+        // uncovered-damage rows) — not an exhaustive list of all 65, which
+        // the issue itself only characterizes in aggregate, but the
+        // ground-truth cases it gives skill ids and names for. Every one of
+        // these must resolve a name (down to the `Skill #<id>` fallback,
+        // never blank) and, from that name, a real placeholder glyph —
+        // never falling through to the blank `SKILL_ICON_EMPTY` disc.
+        let art_less_ids = [
+            2031103, // Lucky Strike (Battle Axe) — 17.12% of damage
+            2203291, // Falcon Strike
+            2031105, // Lucky Strike (Forest Ring)
+            1700820, // Wild Wolf - Coordinated Attack
+            35107,   // Formless Flame Slash - Stage 1
+            2031102, // Lucky Strike (Staff)
+            35108,   // Formless Flame Slash - Stage 2
+            2031101, // Lucky Strike (Tachi)
+            35109,   // Formless Flame Slash - Stage 3
+            2203521, // Implosion (Steel Beak Trigger)
+            2208172, // Burn
+        ];
+        for id in art_less_ids {
+            let name = skill_display_name(id);
+            let monogram = skill_monogram(&name);
+            assert!(
+                monogram.is_some(),
+                "id {id} (name {name:?}) should still produce a placeholder monogram"
+            );
+        }
     }
 }
