@@ -144,6 +144,52 @@ fn paint_bold_text(
     paint_text(painter, pos, anchor, text, bold(size), color, true)
 }
 
+/// Paints the issue #275 monogram placeholder that fills the skill-icon
+/// column for an id with no upstream art: a flat disc in
+/// `skills::skill_placeholder_colors(skill_id)`'s background, with the 1-2
+/// character monogram `skills::skill_monogram` derives from the skill's
+/// resolved display name centered on top in the matching foreground.
+///
+/// Falls back to the original flat `SKILL_ICON_EMPTY` disc for the one case
+/// `skill_monogram` returns `None` — a name with no derivable glyph at all
+/// (blank, or pure punctuation) — since #275 found every id actually
+/// observed in capture resolves to a real name (down to the `Skill #<id>`
+/// fallback), so `SKILL_ICON_EMPTY` still exists for a hypothetical
+/// genuinely-nameless id rather than for the 65 ids this issue is about.
+///
+/// Both the placeholder disc and its glyph are `.gamma_multiply(opacity)`'d.
+/// That is a deliberate divergence from the real-icon branch beside this one
+/// (`CLASS_ICON_TINT`, painted at full alpha per issue #166's row-content
+/// rule) and from the old `SKILL_ICON_EMPTY` fallback this replaces (also
+/// never faded) — but this content is new and *generated*, not real
+/// content or chrome, and #252/#253 established that every visible surface
+/// should track the opacity slider. A solid, saturated placeholder disc
+/// pinned at full alpha while the rest of a low-opacity window fades would
+/// make it the loudest element in the row list, which is the opposite of
+/// reading as a fallback for missing art.
+fn paint_skill_icon_placeholder(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    skill_id: i32,
+    opacity: f32,
+) {
+    let name = skills::skill_display_name(skill_id);
+    let Some(glyph) = skills::skill_monogram(&name) else {
+        painter.circle_filled(center, SKILL_ICON_SIZE / 2.0, SKILL_ICON_EMPTY);
+        return;
+    };
+    let (bg, fg) = skills::skill_placeholder_colors(skill_id);
+    painter.circle_filled(center, SKILL_ICON_SIZE / 2.0, bg.gamma_multiply(opacity));
+    paint_bold_text(
+        painter,
+        center,
+        egui::Align2::CENTER_CENTER,
+        &glyph,
+        SKILL_ICON_MONOGRAM_FONT_SIZE,
+        fg.gamma_multiply(opacity),
+    );
+}
+
 /// Commands the overlay emits for the app layer to consume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiCommand {
@@ -6232,10 +6278,21 @@ const SKILL_ROW_HEIGHT: f32 = 44.0;
 /// (`scripts/prep-skill-icons.py`), so this is still a downscale at 100%
 /// display scaling.
 const SKILL_ICON_SIZE: f32 = 38.0;
-/// Fill for a row whose skill has no icon to paint. Deliberately the same
-/// flat disc the Imagine slots degrade to, so an empty slot reads as a
-/// deliberate blank rather than a rendering failure.
+/// Fill for a row whose skill has no icon to paint *and* no name to derive
+/// a monogram placeholder from (issue #275 — see
+/// `paint_skill_icon_placeholder`). Deliberately the same flat disc the
+/// Imagine slots degrade to, so an empty slot reads as a deliberate blank
+/// rather than a rendering failure. In practice every observed skill id
+/// resolves to at least the `Skill #<id>` fallback name
+/// (`skills::skill_display_name`), so this now only fires for a
+/// hypothetically blank/punctuation-only name — kept rather than removed,
+/// since "no derivable glyph" is still a real (if unobserved) case.
 const SKILL_ICON_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x3B);
+/// Font size of the issue #275 monogram placeholder's 1-2 character glyph,
+/// centered on a `SKILL_ICON_SIZE` (38pt) disc — large enough to read at a
+/// glance as a letterform rather than a texture artifact, small enough that
+/// two characters ("LS", "FF") stay clear of the disc's edge.
+const SKILL_ICON_MONOGRAM_FONT_SIZE: f32 = 15.0;
 /// `Skills.xaml:151-154` draws the class icon at 50x50. Issue #190 could
 /// only fit 40 of that, because `SKILL_HEADER_HEIGHT` was a made-up 56 and
 /// 50 would have overflowed its padded content area. Issue #200 measured
@@ -7001,30 +7058,41 @@ fn draw_skill_window(
                     // skill name, exactly as in the reference. A skill the
                     // name tables know no icon for, an icon whose PNG is not
                     // vendored here, and one that failed to decode all land
-                    // on the same blank-disc branch — one degrade path,
+                    // on the same no-texture branch — one degrade path,
                     // never a panic, the same shape `ImagineIcons`' empty
-                    // slot uses.
+                    // slot uses. Issue #275: that branch used to be one flat
+                    // `SKILL_ICON_EMPTY` disc for every such id, painting the
+                    // capture's single largest damage source identically to
+                    // a 0.01% tick three rows below it. It now paints a
+                    // monogram placeholder — see `skill_monogram_glyph` —
+                    // keyed off the *name* every one of those ids already
+                    // resolves to, and only falls through to the old blank
+                    // disc for a name with no derivable glyph at all (see
+                    // `skills::skill_monogram`'s doc comment).
                     if *kind == skills::SkillColumn::Icon {
                         let center =
                             egui::pos2(clip.left() + SKILL_ICON_SIZE / 2.0, clip.center().y);
                         match skills::skill_icon_basename(skill.skill_id)
                             .and_then(|basename| icons.skills.get(basename))
                         {
-                            Some(texture) => cell_painter.image(
-                                texture.id(),
-                                egui::Rect::from_center_size(
-                                    center,
-                                    egui::Vec2::splat(SKILL_ICON_SIZE),
-                                ),
-                                UV_FULL,
-                                CLASS_ICON_TINT,
-                            ),
-                            None => cell_painter.circle_filled(
+                            Some(texture) => {
+                                cell_painter.image(
+                                    texture.id(),
+                                    egui::Rect::from_center_size(
+                                        center,
+                                        egui::Vec2::splat(SKILL_ICON_SIZE),
+                                    ),
+                                    UV_FULL,
+                                    CLASS_ICON_TINT,
+                                );
+                            }
+                            None => paint_skill_icon_placeholder(
+                                &cell_painter,
                                 center,
-                                SKILL_ICON_SIZE / 2.0,
-                                SKILL_ICON_EMPTY,
+                                skill.skill_id,
+                                opacity,
                             ),
-                        };
+                        }
                         continue;
                     }
                     let (align, pos) = if *kind == skills::SkillColumn::Name {

@@ -159,14 +159,140 @@ pub fn skill_display_name(skill_id: i32) -> String {
 /// Resolves a raw skill id to its vendored icon basename (issue #192), via
 /// the generated `skill_icon` table. `None` — an id the table names no icon
 /// for, or a negative id, both falling through the same `try_from` — is the
-/// normal "no icon" answer, and the caller paints the blank placeholder.
-/// Note that `Some` is not a promise the icon is *shipped*: the table names
-/// every icon BPSR-ZDPS references, and `SkillIcons::get` returns `None` for
-/// any whose PNG is not committed under `crates/app/assets/skills/`.
+/// normal "no icon" answer, and the caller paints a generated placeholder
+/// (issue #275) in its place. Note that `Some` is not a promise the icon is
+/// *shipped*: the table names every icon BPSR-ZDPS references, and
+/// `SkillIcons::get` returns `None` for any whose PNG is not committed
+/// under `crates/app/assets/skills/`.
 pub fn skill_icon_basename(skill_id: i32) -> Option<&'static str> {
     u32::try_from(skill_id)
         .ok()
         .and_then(bpsr_meter::tables::skill_icon)
+}
+
+/// Derives a 1-2 character monogram from a resolved skill display name
+/// (issue #275's placeholder for the 65 observed ids with no upstream
+/// icon). Splits `name` on every non-alphanumeric boundary, so punctuation
+/// ("Lucky Strike (Battle Axe)"), dashes ("Wild Wolf - Coordinated
+/// Attack") and the `skill_display_name` fallback's `#` ("Skill #2426")
+/// all separate into real words rather than leaking a symbol into the
+/// glyph. A multi-word name takes the first letter of its first two words
+/// ("Falcon Strike" -> "FS", "Skill #2426" -> "S2"); a single-word name
+/// takes its own first two characters ("Burn" -> "BU"). Every character of
+/// the result goes through `char::to_uppercase` — Unicode-aware casing,
+/// not an ASCII-only flip — so a non-Latin name still produces glyphs in
+/// its own script rather than being mangled or dropped; a script with no
+/// case distinction (e.g. CJK) passes its characters through unchanged,
+/// which is exactly what a monogram of it should do.
+///
+/// Returns `None` only when `name` has no alphanumeric content at all
+/// (empty, or pure punctuation/whitespace) — there is nothing to derive a
+/// monogram from, so the caller keeps painting the flat `SKILL_ICON_EMPTY`
+/// disc for that one case. In practice no observed skill id reaches this:
+/// `skill_display_name` always falls back to `Skill #<id>`, which is never
+/// blank.
+pub fn skill_monogram(name: &str) -> Option<String> {
+    let words: Vec<&str> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let chars: Vec<char> = match words.as_slice() {
+        [] => return None,
+        [only] => only.chars().take(2).collect(),
+        [first, second, ..] => {
+            vec![
+                first.chars().next().unwrap(),
+                second.chars().next().unwrap(),
+            ]
+        }
+    };
+    let monogram: String = chars.into_iter().flat_map(char::to_uppercase).collect();
+    Some(monogram)
+}
+
+/// Deterministic 32-bit FNV-1a — routes a skill id to a
+/// `SKILL_PLACEHOLDER_PALETTE` swatch (issue #275). Picked over
+/// `std::hash::DefaultHasher`/`RandomState` specifically because those are
+/// *not* guaranteed stable across Rust versions or process runs, which
+/// would break "the same id looks the same every time" — the one property
+/// this hash exists to provide. Not used for anything else; not a general
+/// hashing utility.
+fn fnv1a_u32(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for &byte in bytes {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Placeholder disc swatches for issue #275: twelve vivid, mid-dark solid
+/// hues, chosen for two things at once. First, distance from the row
+/// chrome's near-black neutrals (`ui.rs`'s `SKILL_CHROME_FILL` 0x11/0x11/
+/// 0x17, `SKILL_PANEL_FILL` 0x21/0x21/0x27, `SKILL_COLUMN_HEADER_FILL`
+/// 0x2a/0x2a/0x30) so a placeholder never reads as "nothing painted" the
+/// way the old `SKILL_ICON_EMPTY` (0x33/0x33/0x3B, barely lighter than
+/// that chrome) could. Second, being flat and saturated rather than
+/// gradients or texture, so a placeholder never reads as photographic
+/// game-art either — a user glancing at the row list should be able to
+/// tell which rows have real vendored icons and which don't.
+const SKILL_PLACEHOLDER_PALETTE: [(u8, u8, u8); 12] = [
+    (0xB0, 0x3A, 0x2E), // brick red
+    (0xC5, 0x6A, 0x1E), // burnt orange
+    (0xD8, 0xB0, 0x2A), // gold
+    (0x4C, 0x8C, 0x2B), // moss green
+    (0x1E, 0x8A, 0x74), // teal
+    (0x1E, 0x6F, 0x9E), // steel blue
+    (0x3A, 0x4E, 0xB0), // indigo
+    (0x6A, 0x3A, 0xB0), // violet
+    (0xA5, 0x2E, 0x8C), // magenta
+    (0x8C, 0x4A, 0x2E), // umber
+    (0x4A, 0x5A, 0x6A), // slate
+    (0xC0, 0x4A, 0x6A), // rose
+];
+
+/// WCAG relative luminance of an sRGB triple (0-255 channels) — used only
+/// to pick a legible glyph color over a placeholder swatch (issue #275).
+fn relative_luminance((r, g, b): (u8, u8, u8)) -> f32 {
+    fn channel(c: u8) -> f32 {
+        let c = f32::from(c) / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+}
+
+/// Background and glyph color for `skill_id`'s placeholder icon (issue
+/// #275), as `(background, glyph)`. The background is `skill_id` — not the
+/// name — routed through `fnv1a_u32` into `SKILL_PLACEHOLDER_PALETTE`: id,
+/// because two ids that resolve to the same `skill_monogram` (e.g. every
+/// Lucky Strike weapon variant, all "LS") still need their own disc color
+/// to stay told apart in a row list, which a name-derived color could not
+/// give them.
+///
+/// The glyph color is whichever of near-black (`#1A1A1A`, matched to this
+/// window's dark theme rather than a pure `#000`) or white gives the
+/// higher WCAG contrast ratio against that background. `0.2017` is not a
+/// round-number guess: it is the relative luminance at which the two
+/// ratios cross, solved from `(l + 0.05)^2 = 1.05 * (l_black + 0.05)` where
+/// `l_black` is `#1A1A1A`'s own luminance. Every current palette entry
+/// clears 3:1 (WCAG AA's minimum for large text, which this glyph's ~15pt
+/// bold weight qualifies as) against its chosen color; most clear 4.5+.
+pub fn skill_placeholder_colors(skill_id: i32) -> (egui::Color32, egui::Color32) {
+    let idx = (fnv1a_u32(&skill_id.to_le_bytes()) as usize) % SKILL_PLACEHOLDER_PALETTE.len();
+    let bg = SKILL_PLACEHOLDER_PALETTE[idx];
+    let fg = if relative_luminance(bg) > 0.2017 {
+        (0x1A, 0x1A, 0x1A)
+    } else {
+        (0xFF, 0xFF, 0xFF)
+    };
+    (
+        egui::Color32::from_rgb(bg.0, bg.1, bg.2),
+        egui::Color32::from_rgb(fg.0, fg.1, fg.2),
+    )
 }
 
 /// Sort state for one open breakdown window. Per-window, not global (D9) —
@@ -467,5 +593,152 @@ mod tests {
             egui::Rect::from_min_size(egui::Pos2::new(1700.0, 50.0), egui::Vec2::new(200.0, 600.0));
         let pos = place_window(main_outer, None, egui::Vec2::new(300.0, 500.0));
         assert_eq!(pos, egui::Pos2::new(1900.0, 50.0));
+    }
+
+    // == Issue #275: skill-icon monogram placeholder ======================
+
+    #[test]
+    fn a_single_word_name_takes_its_own_first_two_characters() {
+        assert_eq!(skill_monogram("Burn").as_deref(), Some("BU"));
+    }
+
+    #[test]
+    fn a_two_word_name_takes_the_first_letter_of_each_word() {
+        assert_eq!(skill_monogram("Falcon Strike").as_deref(), Some("FS"));
+    }
+
+    #[test]
+    fn a_punctuated_multi_word_name_splits_on_the_punctuation_not_through_it() {
+        // Real #275 example: parentheses must not leak into the glyph, and
+        // the two leading real words ("Lucky", "Strike") win over the
+        // parenthesized weapon-variant qualifier.
+        assert_eq!(
+            skill_monogram("Lucky Strike (Battle Axe)").as_deref(),
+            Some("LS")
+        );
+        // A dash-separated name (issue example) splits the same way.
+        assert_eq!(
+            skill_monogram("Wild Wolf - Coordinated Attack").as_deref(),
+            Some("WW")
+        );
+    }
+
+    #[test]
+    fn the_number_id_fallback_name_still_yields_a_monogram() {
+        // `skill_display_name`'s own fallback for an id with no table entry
+        // ("Skill #2426") must not choke on the `#` or the digits.
+        assert_eq!(skill_monogram("Skill #2426").as_deref(), Some("S2"));
+    }
+
+    #[test]
+    fn a_name_with_no_alphanumeric_content_yields_no_monogram() {
+        // Empty, whitespace-only, and pure-punctuation names all have
+        // nothing to derive a glyph from — `ui.rs` keeps painting the flat
+        // `SKILL_ICON_EMPTY` disc for exactly this case.
+        assert_eq!(skill_monogram(""), None);
+        assert_eq!(skill_monogram("   "), None);
+        assert_eq!(skill_monogram("---"), None);
+    }
+
+    #[test]
+    fn a_non_latin_name_uppercases_per_script_instead_of_mangling() {
+        // Cyrillic has case, so it uppercases like Latin does.
+        assert_eq!(skill_monogram("привет мир").as_deref(), Some("ПМ"));
+        // CJK has no case distinction; the characters pass through as-is
+        // rather than being dropped or replaced.
+        assert_eq!(skill_monogram("火焰 斩击").as_deref(), Some("火斩"));
+    }
+
+    #[test]
+    fn monogram_derivation_is_deterministic() {
+        for name in ["Burn", "Falcon Strike", "Lucky Strike (Battle Axe)"] {
+            assert_eq!(skill_monogram(name), skill_monogram(name));
+        }
+    }
+
+    #[test]
+    fn placeholder_colors_are_deterministic_per_id() {
+        for id in [2031103, 2203291, 35107, -5, 0] {
+            assert_eq!(skill_placeholder_colors(id), skill_placeholder_colors(id));
+        }
+    }
+
+    #[test]
+    fn different_ids_sharing_a_monogram_can_still_land_on_different_swatches() {
+        // Every Lucky Strike weapon variant collapses to the same "LS"
+        // glyph (they are literally the same base skill), so the id-keyed
+        // background is the only thing that can still tell the rows apart.
+        let ids = [2031101, 2031102, 2031103, 2031105];
+        let colors: std::collections::HashSet<_> = ids
+            .iter()
+            .map(|&id| {
+                let (bg, _fg) = skill_placeholder_colors(id);
+                (bg.r(), bg.g(), bg.b())
+            })
+            .collect();
+        assert!(
+            colors.len() > 1,
+            "expected the four Lucky Strike variants to spread across more than one swatch"
+        );
+    }
+
+    #[test]
+    fn every_placeholder_swatch_clears_wcag_large_text_contrast_with_its_chosen_glyph_color() {
+        // Exercises the legibility rule this placeholder encodes: whichever
+        // of near-black or white `skill_placeholder_colors` picks must clear
+        // WCAG AA's 3:1 minimum for large text against every swatch in the
+        // palette, not just the ones a spot check happens to hit.
+        for &(r, g, b) in &SKILL_PLACEHOLDER_PALETTE {
+            let bg_lum = relative_luminance((r, g, b));
+            let fg = if bg_lum > 0.2017 {
+                (0x1A, 0x1A, 0x1A)
+            } else {
+                (0xFF, 0xFF, 0xFF)
+            };
+            let fg_lum = relative_luminance(fg);
+            let (hi, lo) = if bg_lum > fg_lum {
+                (bg_lum, fg_lum)
+            } else {
+                (fg_lum, bg_lum)
+            };
+            let ratio = (hi + 0.05) / (lo + 0.05);
+            assert!(
+                ratio >= 3.0,
+                "swatch {:?} only reaches a {ratio:.2}:1 contrast ratio",
+                (r, g, b)
+            );
+        }
+    }
+
+    #[test]
+    fn every_skill_id_issue_275_cites_as_art_less_resolves_a_real_monogram() {
+        // The concrete ids issue #275's evidence table names (its top
+        // uncovered-damage rows) — not an exhaustive list of all 65, which
+        // the issue itself only characterizes in aggregate, but the
+        // ground-truth cases it gives skill ids and names for. Every one of
+        // these must resolve a name (down to the `Skill #<id>` fallback,
+        // never blank) and, from that name, a real placeholder glyph —
+        // never falling through to the blank `SKILL_ICON_EMPTY` disc.
+        let art_less_ids = [
+            2031103, // Lucky Strike (Battle Axe) — 17.12% of damage
+            2203291, // Falcon Strike
+            2031105, // Lucky Strike (Forest Ring)
+            1700820, // Wild Wolf - Coordinated Attack
+            35107,   // Formless Flame Slash - Stage 1
+            2031102, // Lucky Strike (Staff)
+            35108,   // Formless Flame Slash - Stage 2
+            2031101, // Lucky Strike (Tachi)
+            35109,   // Formless Flame Slash - Stage 3
+            2203521, // Implosion (Steel Beak Trigger)
+            2208172, // Burn
+        ];
+        for id in art_less_ids {
+            let name = skill_display_name(id);
+            let monogram = skill_monogram(&name);
+            assert!(
+                monogram.is_some(),
+                "id {id} (name {name:?}) should still produce a placeholder monogram"
+            );
+        }
     }
 }
