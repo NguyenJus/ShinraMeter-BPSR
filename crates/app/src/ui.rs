@@ -448,9 +448,17 @@ fn background_image_tint(opacity: f32) -> egui::Color32 {
     egui::Color32::WHITE.gamma_multiply(opacity)
 }
 
-/// Resolves the texture to paint for `slot` over `rect`, or `None` for
-/// "paint the default artwork" — no path configured, or the configured one
-/// did not load (issues #121, #253).
+/// Resolves the texture to paint for `slot` over `rect` — together with
+/// the source rectangle it holds, which `custom_image::cover_uv` needs to
+/// build the blit's UV — or `None` for "paint the default artwork": no
+/// path configured, or the configured one did not load (issues #121,
+/// #253).
+///
+/// The size handed to the cache is the region's *true* pixel size. The
+/// bucketing that keeps a resize drag from re-decoding happens inside the
+/// cache, on the key alone; letting it reach the crop geometry is what
+/// stretched the image on both regions before this returned a second
+/// value.
 ///
 /// Also the cache's eviction point: a slot with no path clears its entry,
 /// so an image the user just removed stops holding GPU memory immediately
@@ -465,14 +473,14 @@ fn custom_image_texture(
     slot: ImageSlot,
     settings: &Settings,
     rect: egui::Rect,
-) -> Option<egui::TextureId> {
+) -> Option<(egui::TextureId, [u32; 2])> {
     let mut cache = icons.custom.borrow_mut();
     let Some(path) = settings.background_image(slot) else {
         cache.clear(slot);
         return None;
     };
-    let dst = crate::custom_image::target_pixels(rect.size(), ctx.pixels_per_point());
-    cache.texture(ctx, slot, path, dst)
+    let region = crate::custom_image::region_pixels(rect.size(), ctx.pixels_per_point());
+    cache.texture(ctx, slot, path, region)
 }
 
 /// Paints a user's background image over `rect` — the image itself at the
@@ -490,15 +498,20 @@ fn paint_background_image(
     settings: &Settings,
     rect: egui::Rect,
 ) -> bool {
-    let Some(texture) = custom_image_texture(painter.ctx(), icons, slot, settings, rect) else {
+    let Some((texture, content)) = custom_image_texture(painter.ctx(), icons, slot, settings, rect)
+    else {
         return false;
     };
-    // Full UV: `custom_image` baked the cover-crop and the scale into the
-    // texture, so there is no per-frame geometry left to compute here.
+    // Not a full-UV blit: the texture's own size is rounded up to
+    // `custom_image`'s cache bucket, so its aspect ratio is not this rect's
+    // and painting all of it into `rect` would scale the two axes by
+    // different factors — the stretch this parameter exists to undo (see
+    // `custom_image::cover_uv`). Computed from the live rect every frame,
+    // since the cached texture deliberately outlives small size changes.
     painter.image(
         texture,
         rect,
-        UV_FULL,
+        crate::custom_image::cover_uv(content, rect.size()),
         background_image_tint(settings.opacity),
     );
     painter.rect_filled(
@@ -4238,8 +4251,26 @@ fn background_image_row(
     });
     if let Some(path) = settings.background_image(slot) {
         let error = icons.custom.borrow().error(slot, path);
-        ui.label(background_image_status(path, error.as_ref()))
-            .on_hover_text(path.display().to_string());
+        // Inset from the right before the label wraps. Every other row in
+        // this dropdown is a `ui.horizontal` strip of intrinsically sized
+        // widgets, so nothing else here ever reaches the popup's right
+        // content edge; the `⚠ …` status is the one label long enough to
+        // wrap, and egui wraps it at the full content width — which the
+        // `ScrollArea`'s *floating* scrollbar overlays rather than reserves
+        // space for (`ScrollStyle::floating` allocates no width), so the
+        // message ran hard into the panel edge and under the bar. Taking
+        // the scrollbar's own width plus its inner margin back gives the
+        // wrapped text the same breathing room the rest of the section has.
+        let inset = {
+            let scroll = &ui.spacing().scroll;
+            scroll.bar_width + scroll.bar_inner_margin
+        };
+        let wrap_width = (ui.available_width() - inset).max(1.0);
+        ui.scope(|ui| {
+            ui.set_max_width(wrap_width);
+            ui.label(background_image_status(path, error.as_ref()))
+                .on_hover_text(path.display().to_string());
+        });
     }
     if changed {
         icons.custom.borrow_mut().clear(slot);
