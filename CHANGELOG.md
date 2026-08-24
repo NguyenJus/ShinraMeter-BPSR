@@ -10,8 +10,8 @@ affiliated with the game's publisher.
 
 - The header dropdown gains a "Restart packet capture" item. When the meter
   stops updating while the game is still running, it re-anchors capture in
-  place instead of leaving relaunching the app, or leaving and re-entering
-  the instance, as the only way out.
+  place, so relaunching the app or re-entering the instance is no longer the
+  only way out.
 - A saved fight now has the same per-skill breakdown a live one does.
   Right-clicking a player row in a historical encounter lists that player's
   skills instead of reporting that none were recorded. Encounters already on
