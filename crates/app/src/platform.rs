@@ -2892,6 +2892,104 @@ fn winhttp_reachability_reason(hresult: u32) -> Option<&'static str> {
     }
 }
 
+/// Opens the native "Open" common dialog so the user picks the image file
+/// the settings dropdown's "Header image"/"Row backdrop" rows point at
+/// (issues #121 and #253). `title` names the region being customized, so
+/// the same dialog serves both rows without either having to guess which
+/// one it is looking at.
+///
+/// A native picker rather than a text field in the dropdown: an overlay
+/// with no keyboard focus of its own is a poor place to type a Windows
+/// path, and the dialog costs nothing new — `GetOpenFileNameW` lives in the
+/// same `Win32_UI_Controls_Dialogs` feature `choose_log_export_path`
+/// already pulls in, needs no COM initialization, and needs no new crate.
+/// The settings.json field stays a plain string either way, so hand-editing
+/// remains available for anyone who prefers it.
+///
+/// `OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST` only stops the *dialog* from
+/// returning something that was not there when it closed. It is not a
+/// validity guarantee the caller may lean on: the file can still be
+/// deleted, replaced, or turn out not to be a decodable image, all of which
+/// `custom_image` handles on its own (see its module doc's failure
+/// section).
+///
+/// Synchronous, blocking, owner-window and cancellation behavior are all
+/// identical to `choose_log_export_path` — see its doc comment for why a
+/// modal the OS is already blocking on needs no thread of its own. Unlike
+/// that one there is no follow-on file copy here: the caller just stores
+/// the path.
+#[cfg(windows)]
+pub fn choose_background_image_path(title: &str) -> Option<std::path::PathBuf> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    let raw = OVERLAY_HWND.load(std::sync::atomic::Ordering::SeqCst);
+    // Same cast/guard as `choose_log_export_path` — a zero raw value means
+    // "not cached yet", not a literal null HWND worth passing through.
+    let owner = if raw == 0 {
+        HWND(std::ptr::null_mut())
+    } else {
+        HWND(raw as *mut std::ffi::c_void)
+    };
+
+    // In/out, same as the save dialog's, but seeded empty: there is no
+    // sensible default file name for "pick any image on this machine".
+    let mut file_buf = vec![0u16; 32767];
+
+    // Built from `custom_image::SUPPORTED_EXTENSIONS` rather than a literal
+    // list, so the dialog can never offer a format this binary was not
+    // compiled to decode (or omit one it was). The `\0`-separated,
+    // double-`\0`-terminated shape is `lpstrFilter`'s, not a string
+    // convention: pairs of (label, pattern).
+    let patterns = crate::custom_image::SUPPORTED_EXTENSIONS
+        .iter()
+        .map(|ext| format!("*.{ext}"))
+        .collect::<Vec<_>>()
+        .join(";");
+    let filter = wide(&format!("Images\0{patterns}\0All files\0*.*\0"));
+    let title = wide(title);
+
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(file_buf.as_mut_ptr()),
+        nMaxFile: file_buf.len() as u32,
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
+        ..Default::default()
+    };
+
+    // SAFETY: identical to `choose_log_export_path`'s call — every pointer
+    // field is backed by a `Vec<u16>` that outlives this call, `lpstrFile`
+    // is sized past anything the dialog can write back, and `hwndOwner` is
+    // either a still-live cached handle or the null default.
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) };
+    if !ok.as_bool() {
+        return None;
+    }
+
+    let end = file_buf.iter().position(|&unit| unit == 0).unwrap_or(0);
+    if end == 0 {
+        return None;
+    }
+    Some(std::path::PathBuf::from(String::from_utf16_lossy(
+        &file_buf[..end],
+    )))
+}
+
+/// Non-Windows stub — see `choose_background_image_path`'s doc comment, and
+/// `choose_log_export_path`'s stub for the same reasoning: dev/CI hosts are
+/// Linux, and the caller already treats `None` as "the user picked
+/// nothing", which is the correct behavior here too.
+#[cfg(not(windows))]
+pub fn choose_background_image_path(_title: &str) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Issue #171: the manual "Check for updates" header-menu item needs an
 /// HTTPS GET to GitHub's releases API, and — same reasoning as every other
 /// function in this module — egui/eframe expose no HTTP client at all, so

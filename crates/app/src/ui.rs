@@ -12,6 +12,7 @@
 //! because the app layer has no channel of its own suited to a single
 //! manual, UI-triggered request/reply.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,7 @@ use bpsr_meter::{
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui;
 
+use crate::custom_image::{CustomImages, ImageError, ImageSlot};
 use crate::fonts;
 use crate::history;
 use crate::icons::{
@@ -363,6 +365,23 @@ struct Icons {
     imagines: ImagineIcons,
     /// Per-skill row icons for the breakdown window (issue #192).
     skills: SkillIcons,
+    /// Issues #121/#253: the one exception to this struct's doc comment —
+    /// the user's own header background and row backdrop, read off disk at
+    /// runtime rather than `include_bytes!`-ed, and therefore loaded lazily
+    /// (and re-loaded when the path or the region size changes) instead of
+    /// once in `Icons::load`. See `custom_image` for the cache's shape.
+    ///
+    /// Behind a `RefCell` because every painter in this module holds
+    /// `&Icons`, not `&mut Icons`: `draw_header`, `draw_header_wash`,
+    /// `draw_header_menu` and `draw_rows` between them have some two dozen
+    /// call sites, and threading a fresh `&mut` parameter through all of
+    /// them to reach one lazily-populated cache would be a far larger and
+    /// more merge-hostile change than confining the mutation here. The
+    /// overlay's UI is single-threaded (one `eframe` frame callback), and
+    /// every borrow taken in this module is released before the next —
+    /// `custom_image_texture` in particular drops its guard before it
+    /// paints — so the runtime check never actually fires.
+    custom: RefCell<CustomImages>,
 }
 
 impl Icons {
@@ -377,8 +396,117 @@ impl Icons {
             glyphs: GlyphIcons::load(ctx),
             imagines: ImagineIcons::load(ctx),
             skills: SkillIcons::load(ctx),
+            // Issues #121/#253: nothing to load here — the user's images
+            // are resolved on the first frame that paints a region they
+            // are configured for, at the size that region turns out to be.
+            custom: RefCell::new(CustomImages::default()),
         }
     }
+}
+
+/// Alpha of the scrim painted over a user's background image, before rows
+/// or header text go on top of it (issues #121, #253).
+///
+/// #253 asks for "a dimming scrim or minimum-contrast rule … the way
+/// `SKILL_ROW_HOVER_FILL` already layers over chrome rather than content".
+/// This is that rule, and it is the whole legibility story: a user can
+/// point either region at an arbitrary photograph, which may be white,
+/// high-contrast, or busy exactly where the DPS numbers land, and no choice
+/// of text color survives all of those. Compositing the image ~55% of the
+/// way back towards `PANEL_FILL` bounds how bright the brightest possible
+/// backdrop can get, so the row text keeps its contrast against *any*
+/// image while the artwork is still plainly visible.
+///
+/// Deliberately a scrim over the image rather than a cap on the image's own
+/// alpha: fading the image toward the panel fill by lowering its alpha
+/// would make it disappear entirely as the opacity slider comes down (the
+/// panel fill is fading too), whereas a scrim painted at the *same*
+/// multiplied opacity keeps the image/scrim ratio — and so the contrast
+/// guarantee — constant at every slider position.
+const BACKGROUND_IMAGE_SCRIM_ALPHA: u8 = 0x8C;
+
+/// The scrim itself: `PANEL_FILL`'s color at `BACKGROUND_IMAGE_SCRIM_ALPHA`,
+/// so a dimmed custom image tends towards the same near-black the default
+/// panel already is rather than towards some second, unrelated tone.
+/// Spelled out rather than derived from `PANEL_FILL` because `Color32`'s
+/// channel accessors are not `const fn`; the
+/// `background_image_scrim_matches_the_panel_fill_color` test is what keeps
+/// the two from drifting apart.
+const BACKGROUND_IMAGE_SCRIM: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(18, 18, 22, BACKGROUND_IMAGE_SCRIM_ALPHA);
+
+/// The tint a user's background image is blitted with: white (i.e. the
+/// image's own colors, untouched) scaled by the overlay's opacity setting.
+///
+/// This is the rule issue #253 makes a hard requirement — the same
+/// `.gamma_multiply(settings.opacity)` `PANEL_FILL` and every other
+/// background surface already uses — hoisted into one pure function so both
+/// regions get it and neither can quietly stop applying it. `Color32`
+/// stores channels premultiplied, so scaling white this way scales the
+/// blit's alpha, which is exactly "fade the image with the slider".
+fn background_image_tint(opacity: f32) -> egui::Color32 {
+    egui::Color32::WHITE.gamma_multiply(opacity)
+}
+
+/// Resolves the texture to paint for `slot` over `rect`, or `None` for
+/// "paint the default artwork" — no path configured, or the configured one
+/// did not load (issues #121, #253).
+///
+/// Also the cache's eviction point: a slot with no path clears its entry,
+/// so an image the user just removed stops holding GPU memory immediately
+/// rather than until the process exits.
+///
+/// The `RefCell` guard is dropped before this returns (a `TextureId` is
+/// `Copy`), so no caller can still be holding it while painting — see
+/// `Icons::custom` for why that matters.
+fn custom_image_texture(
+    ctx: &egui::Context,
+    icons: &Icons,
+    slot: ImageSlot,
+    settings: &Settings,
+    rect: egui::Rect,
+) -> Option<egui::TextureId> {
+    let mut cache = icons.custom.borrow_mut();
+    let Some(path) = settings.background_image(slot) else {
+        cache.clear(slot);
+        return None;
+    };
+    let dst = crate::custom_image::target_pixels(rect.size(), ctx.pixels_per_point());
+    cache.texture(ctx, slot, path, dst)
+}
+
+/// Paints a user's background image over `rect` — the image itself at the
+/// overlay's opacity, then the legibility scrim at the same opacity —
+/// returning whether anything was painted. `false` means the caller should
+/// fall back to its compiled-in artwork.
+///
+/// One function for both regions so the opacity rule and the scrim rule are
+/// written once: #253 is explicit that the backdrop must not ship at a
+/// fixed opacity, and #121's header image is held to the same rule.
+fn paint_background_image(
+    painter: &egui::Painter,
+    icons: &Icons,
+    slot: ImageSlot,
+    settings: &Settings,
+    rect: egui::Rect,
+) -> bool {
+    let Some(texture) = custom_image_texture(painter.ctx(), icons, slot, settings, rect) else {
+        return false;
+    };
+    // Full UV: `custom_image` baked the cover-crop and the scale into the
+    // texture, so there is no per-frame geometry left to compute here.
+    painter.image(
+        texture,
+        rect,
+        UV_FULL,
+        background_image_tint(settings.opacity),
+    );
+    painter.rect_filled(
+        rect,
+        0.0,
+        BACKGROUND_IMAGE_SCRIM.gamma_multiply(settings.opacity),
+    );
+    true
 }
 
 /// The overlay only ever renders real data when the game is running on
@@ -1337,6 +1465,25 @@ impl eframe::App for OverlayApp {
                 // checked right after, once the `&mut self.view` borrow the
                 // match below needed has ended.
                 let mut back_to_live = false;
+                // Issue #253: the user's own artwork behind whichever of
+                // the two row surfaces paints next. Deliberately here and
+                // not inside `draw_rows`/`draw_history`: painting first is
+                // what puts it *behind* every row, hover fill and share
+                // bar, and it keeps both of their signatures (and every
+                // test that calls them) untouched. `ui.max_rect()` is the
+                // central panel's own rect — the same `panel` `draw_header`
+                // captured for the header wash — while
+                // `available_rect_before_wrap` is the strip left under the
+                // header, so `row_backdrop_rect` can clip the image to the
+                // rows' area without letting it reach the panel's rounded
+                // border.
+                draw_row_backdrop(
+                    ui,
+                    ui.max_rect(),
+                    ui.available_rect_before_wrap(),
+                    icons,
+                    &self.settings,
+                );
                 match &mut self.view {
                     OverlayView::Live => {
                         draw_rows(
@@ -1757,7 +1904,7 @@ fn draw_header(
     // and keeps the two derivations from ever drifting apart again. Never a
     // literal.
     let wash_height = first_player_row_top_offset(band_height) - HEADER_WASH_INSET;
-    draw_header_wash(ui, panel, icons, wash_height);
+    draw_header_wash(ui, panel, icons, wash_height, settings.settings);
 
     // Issue #183: pinning the overlay locks its *position* as well as its
     // Z-order, so the drag band refuses to start a move while
@@ -3728,9 +3875,29 @@ fn header_wash_emblem_rect(wash: egui::Rect) -> egui::Rect {
 /// cannot clip to a rounded rect this cheaply, so the wash keeps square
 /// corners — at alpha `0x50` under the panel's own 8pt-rounded, 1pt border
 /// the difference is sub-pixel.
-fn draw_header_wash(ui: &egui::Ui, panel: egui::Rect, icons: &Icons, height: f32) {
+///
+/// Issue #121: when `settings.header_image` names a loadable file, that
+/// image replaces both layers below — the gradient *and* the oversized
+/// emblem — cover-cropped to this same rect and painted at
+/// `settings.opacity`, with the legibility scrim over it. It replaces the
+/// wash only; the small gutter emblem beside the title (`header_emblem_rect`,
+/// painted by `draw_header` after this returns) is a foreground mark on the
+/// title rows rather than background artwork, and the title's own indent is
+/// sized for it, so it stays. Anything that fails to load falls straight
+/// through to the default artwork below.
+fn draw_header_wash(
+    ui: &egui::Ui,
+    panel: egui::Rect,
+    icons: &Icons,
+    height: f32,
+    settings: &Settings,
+) {
     let wash_rect = header_wash_rect(panel, height);
     let painter = ui.painter().with_clip_rect(wash_rect);
+
+    if paint_background_image(&painter, icons, ImageSlot::Header, settings, wash_rect) {
+        return;
+    }
 
     // Top-left brightest, fading to zero at the bottom-right — the source's
     // `LinearGradientBrush` with no explicit start/end points defaults to
@@ -3749,6 +3916,57 @@ fn draw_header_wash(ui: &egui::Ui, panel: egui::Rect, icons: &Icons, height: f32
         let emblem_rect = header_wash_emblem_rect(wash_rect);
         painter.image(emblem.id(), emblem_rect, UV_FULL, HEADER_WASH_EMBLEM_COLOR);
     }
+}
+
+// -- row-list backdrop (issue #253) --------------------------------------
+
+/// Where the user's row-list backdrop is painted, for a row area of
+/// `available` inside a central panel of `panel`.
+///
+/// `available` is what `OverlayApp::ui`'s layout cursor has left once the
+/// header band and its separator are behind it — i.e. exactly the strip
+/// `draw_rows`/`draw_history` are about to fill — so the backdrop always
+/// starts flush under the header wash and never overlaps it, whatever the
+/// header's height works out to this frame.
+///
+/// The intersection with the inset panel is what keeps the image's square
+/// corners off the panel's own `PANEL_CORNER_RADIUS`-rounded,
+/// `PANEL_BORDER_WIDTH`-thick border along the bottom and sides — the same
+/// job, and the same `HEADER_WASH_INSET`, that `header_wash_rect` does at
+/// the top. Pure geometry, so both properties are unit-testable without a
+/// painter, the same factoring as `header_wash_rect`/`header_emblem_rect`.
+fn row_backdrop_rect(available: egui::Rect, panel: egui::Rect) -> egui::Rect {
+    available.intersect(panel.shrink(HEADER_WASH_INSET))
+}
+
+/// Paints the user's backdrop image behind the player-row list (issue
+/// #253), or nothing at all when none is configured or it failed to load —
+/// in which case the panel's own `PANEL_FILL` shows through exactly as it
+/// always has.
+///
+/// Called from `OverlayApp::ui` *before* `draw_rows`/`draw_history` rather
+/// than from inside them, which is what puts it behind every row: egui
+/// paints in call order, so the row hover fills, the accent lines, the
+/// share bar and all the text land on top of this without any of them
+/// needing to know it exists. That also means it costs nothing on the
+/// (default) path where no image is configured, and it needs no change to
+/// `draw_rows`' signature or its half-dozen call sites.
+///
+/// The scrim `paint_background_image` lays over the image is what keeps the
+/// rows legible over arbitrary artwork — see `BACKGROUND_IMAGE_SCRIM_ALPHA`.
+fn draw_row_backdrop(
+    ui: &egui::Ui,
+    panel: egui::Rect,
+    available: egui::Rect,
+    icons: &Icons,
+    settings: &Settings,
+) {
+    let rect = row_backdrop_rect(available, panel);
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(rect);
+    paint_background_image(&painter, icons, ImageSlot::Backdrop, settings, rect);
 }
 
 /// Color of the fading separator line painted under the header title
@@ -3943,6 +4161,86 @@ fn header_menu_scroll_max_height(screen_height: f32, margin: f32) -> f32 {
 // Issue #39: same reasoning as `draw_header`'s identical allow just above —
 // one more history-view parameter tips this over clippy's default limit.
 #[allow(clippy::too_many_arguments)]
+/// The status line under one background-image row in the settings dropdown
+/// (issues #121, #253): the chosen file's name, or — when `error` says the
+/// load failed — that name prefixed with a warning and followed by the
+/// reason.
+///
+/// This is the "surface something to the user rather than failing silently"
+/// half of the failure story. Without it a mistyped path in a hand-edited
+/// settings.json, or artwork the user has since moved, simply looks like
+/// the feature does not work: the overlay would keep painting its default
+/// artwork with nothing anywhere saying why.
+///
+/// Shows the file name rather than the full path — the dropdown is a narrow
+/// popover over a game, and a full Windows path wraps into several lines of
+/// it — with the full path on the row's hover tooltip instead (see
+/// `background_image_row`). Pure, and split out for the same reason
+/// `title_separator_segments` is: unit-testable without a live `egui::Ui`.
+fn background_image_status(path: &Path, error: Option<&ImageError>) -> String {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        // A path ending in `..` or a bare root has no file name; showing
+        // the whole thing beats showing an empty label.
+        .unwrap_or_else(|| path.display().to_string());
+    match error {
+        Some(err) => format!("⚠ {name} {err}"),
+        None => name,
+    }
+}
+
+/// One row of the settings dropdown's "Background images" section: the
+/// region's name, a button that opens the native picker, a button that
+/// clears it, and the status line below (issues #121, #253).
+///
+/// Both buttons clear this slot's cache entry before sending: the path is
+/// the cache key, so a *different* path would invalidate on its own, but
+/// re-picking the *same* path is precisely how a user says "I have replaced
+/// that file, load it again", and clearing here is what makes that work.
+fn background_image_row(
+    ui: &mut egui::Ui,
+    slot: ImageSlot,
+    settings: &mut Settings,
+    tx_settings: &Sender<Settings>,
+    icons: &Icons,
+) {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(slot.label());
+        if ui.button("Choose…").clicked() {
+            // Inline on this thread, like "Export logs"' save dialog — see
+            // `platform::choose_log_export_path`'s doc comment for why a modal
+            // the OS is already blocking on needs no thread of its own. `None`
+            // means the user cancelled, which must leave the current choice
+            // alone rather than clearing it.
+            if let Some(path) = crate::platform::choose_background_image_path(slot.label()) {
+                settings.set_background_image(slot, Some(path));
+                changed = true;
+            }
+        }
+        let configured = settings.background_image(slot).is_some();
+        if ui
+            .add_enabled(configured, egui::Button::new("Clear"))
+            .clicked()
+        {
+            settings.set_background_image(slot, None);
+            changed = true;
+        }
+    });
+    if let Some(path) = settings.background_image(slot) {
+        let error = icons.custom.borrow().error(slot);
+        ui.label(background_image_status(path, error.as_ref()))
+            .on_hover_text(path.display().to_string());
+    }
+    if changed {
+        icons.custom.borrow_mut().clear(slot);
+        // Same persistence path as the Columns checkboxes and the opacity
+        // slider: blocking file IO stays off this render thread.
+        let _ = tx_settings.send(settings.clone());
+    }
+}
+
 fn draw_header_menu(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -4091,6 +4389,19 @@ fn draw_header_menu(
 
             ui.separator();
 
+            // Issues #121 and #253: one labelled section owning both custom
+            // background regions. Its own section rather than a nesting inside
+            // Columns (which is a per-column list) and rather than two scattered
+            // items, because the two rows are the same control twice and read as a
+            // pair — and because it sits directly under the Opacity slider that
+            // fades both of them, which is the relationship #253 is about.
+            ui.label("Background images");
+            for slot in ImageSlot::ALL {
+                background_image_row(ui, slot, settings, tx_settings, icons);
+            }
+
+            ui.separator();
+
             // Issue #53: this minimize goes to the notification area, not the
             // taskbar. `platform::install_tray`'s subclass intercepts the
             // `WM_SIZE`/`SIZE_MINIMIZED` this command produces, adds a tray icon
@@ -4111,12 +4422,30 @@ fn draw_header_menu(
             // same column set `default_inner_width` already sizes for, and puts
             // opacity back to `Settings::default_opacity()` through the same
             // `set_opacity` + `tx_settings` path the slider above uses.
+            //
+            // Issue #121 widens what "defaults" means here: this used to put back
+            // `opacity` and nothing else, so every field added since issue #203 —
+            // the visible-column set, the click-through and pin toggles, the
+            // history retention values, and now both custom images — quietly
+            // escaped the reset the button's own label promised.
+            // `Settings::reset_to_defaults` covers the whole struct, and the image
+            // cache is dropped alongside it so the textures for images that are no
+            // longer configured are released the same frame rather than lingering
+            // until the next paint notices.
+            //
+            // Still distinct from the header toggle cluster's Reset *icon*, which
+            // resets encounter data (`UiCommand::Reset`) and touches no settings at
+            // all — issue #121 is explicit that the two must not be confused, which
+            // is why this one lives here in the dropdown and says "to defaults".
             if ui.button("Reset to defaults").clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     default_inner_width(),
                     reset_to_defaults_inner_height(),
                 )));
-                settings.set_opacity(Settings::default_opacity());
+                settings.reset_to_defaults();
+                for slot in ImageSlot::ALL {
+                    icons.custom.borrow_mut().clear(slot);
+                }
                 let _ = tx_settings.send(settings.clone());
                 ui.close();
             }
@@ -11929,6 +12258,202 @@ mod tests {
         egui::Rect::from_min_size(egui::pos2(12.0, 30.0), egui::vec2(400.0, 300.0))
     }
 
+    // -- custom background images (issues #121, #253) ---------------------
+
+    /// #253's hard requirement, and #121's by extension: the image is
+    /// painted at `.gamma_multiply(settings.opacity)`, so the existing
+    /// slider fades it exactly as it fades `PANEL_FILL`. A backdrop that
+    /// painted at a fixed opacity regardless of the slider is precisely the
+    /// defect the issue exists to prevent, so the tint's dependence on the
+    /// slider is asserted at both endpoints and in between rather than
+    /// assumed.
+    #[test]
+    fn background_image_tint_tracks_the_opacity_slider() {
+        assert_eq!(
+            background_image_tint(1.0),
+            egui::Color32::WHITE,
+            "a full-opacity overlay must paint the image untouched"
+        );
+        assert_eq!(
+            background_image_tint(Settings::OPACITY_MIN).a(),
+            0,
+            "a zero-opacity overlay must paint no image at all"
+        );
+        let half = background_image_tint(0.5).a();
+        assert!(
+            half > 0 && half < 255,
+            "a mid-slider overlay must paint a partly-faded image, got alpha {half}"
+        );
+        assert!(
+            background_image_tint(0.25).a() < half,
+            "dragging the slider down must fade the image further"
+        );
+    }
+
+    /// The scrim fades with the image rather than staying put, so the
+    /// contrast guarantee it provides holds at every slider position — and
+    /// so a 0% overlay is genuinely empty rather than showing a dark
+    /// rectangle where the artwork was.
+    #[test]
+    fn background_image_scrim_tracks_the_opacity_slider() {
+        assert_eq!(
+            BACKGROUND_IMAGE_SCRIM.gamma_multiply(1.0),
+            BACKGROUND_IMAGE_SCRIM
+        );
+        assert_eq!(
+            BACKGROUND_IMAGE_SCRIM
+                .gamma_multiply(Settings::OPACITY_MIN)
+                .a(),
+            0
+        );
+        assert!(
+            BACKGROUND_IMAGE_SCRIM.gamma_multiply(0.5).a() < BACKGROUND_IMAGE_SCRIM.a(),
+            "the scrim must fade along with the image it dims"
+        );
+    }
+
+    /// The scrim exists to pull a bright image back towards the panel's own
+    /// tone, so it has to *be* that tone — and it has to be partial, since a
+    /// fully opaque scrim would hide the artwork entirely and a fully
+    /// transparent one would guarantee nothing.
+    #[test]
+    fn background_image_scrim_matches_the_panel_fill_color() {
+        // Unmultiplied on both sides: `Color32` stores premultiplied
+        // channels, so the scrim's raw `.r()` is already scaled by its own
+        // alpha and would never equal the opaque `PANEL_FILL`'s.
+        let scrim = BACKGROUND_IMAGE_SCRIM.to_srgba_unmultiplied();
+        assert_eq!(
+            [scrim[0], scrim[1], scrim[2]],
+            [PANEL_FILL.r(), PANEL_FILL.g(), PANEL_FILL.b()],
+        );
+        assert_eq!(scrim[3], BACKGROUND_IMAGE_SCRIM_ALPHA);
+        assert!(
+            (1..255).contains(&BACKGROUND_IMAGE_SCRIM_ALPHA),
+            "the scrim must dim the image without hiding it"
+        );
+    }
+
+    /// The backdrop fills the row strip it is given — it is the rows'
+    /// background, so anything less would leave bare panel fill showing
+    /// beside the artwork.
+    #[test]
+    fn row_backdrop_covers_the_whole_row_area_it_is_given() {
+        let panel = wash_test_panel();
+        let available = egui::Rect::from_min_max(egui::pos2(panel.left() + 20.0, 120.0), panel.max);
+
+        let backdrop = row_backdrop_rect(available, panel);
+
+        assert_eq!(
+            backdrop.top(),
+            available.top(),
+            "the backdrop must start where the rows do, under the header"
+        );
+        assert_eq!(backdrop.left(), available.left());
+    }
+
+    /// …but never past the panel's own rounded, stroked border: the image
+    /// has square corners, so an un-inset backdrop would poke out of the
+    /// overlay's bottom corners. Same guarantee, and same inset, as
+    /// `header_wash_rect`'s at the top.
+    #[test]
+    fn row_backdrop_stays_inside_the_panels_rounded_border() {
+        let panel = wash_test_panel();
+        // A row area that (as the real one does) runs to the panel's own
+        // bottom and side edges.
+        let available = egui::Rect::from_min_max(egui::pos2(panel.left(), 120.0), panel.max);
+
+        let backdrop = row_backdrop_rect(available, panel);
+
+        assert!(
+            backdrop.left() >= panel.left() + HEADER_WASH_INSET,
+            "{} pokes past the panel's left border",
+            backdrop.left()
+        );
+        assert!(
+            backdrop.right() <= panel.right() - HEADER_WASH_INSET,
+            "{} pokes past the panel's right border",
+            backdrop.right()
+        );
+        assert!(
+            backdrop.bottom() <= panel.bottom() - HEADER_WASH_INSET,
+            "{} pokes past the panel's bottom border",
+            backdrop.bottom()
+        );
+    }
+
+    /// The header wash and the row backdrop are two independent images
+    /// (#253: "a user may want one, the other, or both"), so they must not
+    /// overlap — the header's artwork ending mid-row, or the rows' artwork
+    /// riding up over the title, would read as a rendering bug either way.
+    #[test]
+    fn row_backdrop_starts_below_the_header_wash() {
+        let panel = wash_test_panel();
+        let wash = header_wash_rect(panel, WASH_TEST_HEIGHT);
+        // What `OverlayApp::ui`'s layout cursor has left once the header
+        // band and its separator are behind it.
+        let available =
+            egui::Rect::from_min_max(egui::pos2(panel.left(), wash.bottom()), panel.max);
+
+        let backdrop = row_backdrop_rect(available, panel);
+
+        assert!(
+            backdrop.top() >= wash.bottom(),
+            "the row backdrop ({}) overlaps the header wash ({})",
+            backdrop.top(),
+            wash.bottom()
+        );
+    }
+
+    /// A collapsed window can hand the layout a degenerate strip; that must
+    /// produce an empty rect the painter skips, not a negative-size one.
+    #[test]
+    fn row_backdrop_of_an_empty_row_area_is_empty() {
+        let panel = wash_test_panel();
+        let available = egui::Rect::from_min_max(panel.max, panel.max);
+
+        let backdrop = row_backdrop_rect(available, panel);
+
+        assert!(backdrop.width() <= 0.0 || backdrop.height() <= 0.0);
+    }
+
+    // -- background-image status line (issues #121, #253) -----------------
+
+    #[test]
+    fn background_image_status_shows_the_file_name_when_it_loaded() {
+        assert_eq!(
+            background_image_status(Path::new("C:/Users/x/Pictures/wallpaper.png"), None),
+            "wallpaper.png"
+        );
+    }
+
+    /// The whole point of the status line: a path that does not load has to
+    /// say so, and say *why*, or the feature just looks broken.
+    #[test]
+    fn background_image_status_names_the_failure_when_it_did_not_load() {
+        let status = background_image_status(
+            Path::new("C:/gone.png"),
+            Some(&ImageError::Unreadable("os error 2".to_string())),
+        );
+        assert!(status.contains("gone.png"), "{status}");
+        assert!(status.contains("could not be read"), "{status}");
+        assert!(status.contains("os error 2"), "{status}");
+        assert!(status.starts_with('⚠'), "{status}");
+
+        let status = background_image_status(
+            Path::new("notes.txt"),
+            Some(&ImageError::Undecodable("unsupported".to_string())),
+        );
+        assert!(status.contains("not a readable image"), "{status}");
+    }
+
+    /// A path with no file-name component (a bare root, or one ending in
+    /// `..`) must still produce a label rather than an empty one.
+    #[test]
+    fn background_image_status_falls_back_to_the_whole_path_without_a_file_name() {
+        assert!(!background_image_status(Path::new("/"), None).is_empty());
+        assert!(!background_image_status(Path::new("../.."), None).is_empty());
+    }
+
     /// A stand-in wash height for the geometry tests below — issue #81 made
     /// this the caller's to choose (`draw_header` derives it from
     /// `header_text_band_height`) rather than a fixed constant, so these
@@ -15263,6 +15788,144 @@ mod tests {
             viewport_commands.contains(&egui::ViewportCommand::InnerSize(expected_size)),
             "Reset to defaults must resize to fit {RESET_TO_DEFAULTS_VISIBLE_ROWS} rows: \
              {viewport_commands:?}"
+        );
+    }
+
+    /// Issue #121: the same button must now put back *every* customization,
+    /// not just the opacity the test above covers — the custom header and
+    /// backdrop images the issue names first, plus the visible-column set
+    /// and the window size it names alongside them. Driven through the real
+    /// `draw_header_menu` (not `Settings::reset_to_defaults` directly) so
+    /// this also proves the button is wired to the wider reset at all, and
+    /// that the persisted copy on `tx_settings` carries it.
+    #[test]
+    fn draw_header_menu_reset_to_defaults_clears_every_customization() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, rx_settings) = crossbeam_channel::unbounded();
+        // Every field issue #121 names, moved off its default first.
+        let mut settings = Settings {
+            visible_columns: vec![ColumnKind::Hits],
+            window_size: Some([1234.0, 567.0]),
+            ..Settings::default()
+        };
+        settings.set_background_image(ImageSlot::Header, Some(PathBuf::from("header.png")));
+        settings.set_background_image(ImageSlot::Backdrop, Some(PathBuf::from("rows.png")));
+
+        // Frame 1: lay the menu out and find where the button painted.
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
+            );
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let reset_pos = accessible_rect_for_label(&update, "Reset to defaults").center();
+        layout.drop_without_applying_deltas();
+
+        // Frame 2: click it.
+        let output = ctx.run_ui(click_at(reset_pos), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
+            );
+        });
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            settings,
+            Settings::default(),
+            "Reset to defaults must restore every user customization"
+        );
+        let sent = rx_settings
+            .try_recv()
+            .expect("Reset to defaults must send the updated settings on tx_settings");
+        assert_eq!(
+            sent,
+            Settings::default(),
+            "the persisted copy must carry the reset too"
+        );
+    }
+
+    /// Issues #121/#253: the dropdown grows one Choose/Clear pair per
+    /// customizable region, so a user can point the two at different files
+    /// (or configure only one, which the issue is explicit about). Asserted
+    /// on the *buttons* rather than the region labels beside them because
+    /// egui puts only interactive widgets into the AccessKit tree — the
+    /// plain `ui.label` rows, like the "Opacity" label above them, are not
+    /// in it to look for.
+    #[test]
+    fn draw_header_menu_offers_a_row_for_every_background_image_slot() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
+            );
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let labels: Vec<String> = update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().map(str::to_owned))
+            .collect();
+        layout.drop_without_applying_deltas();
+
+        let expected = ImageSlot::ALL.len();
+        for button in ["Choose…", "Clear"] {
+            let found = labels.iter().filter(|label| *label == button).count();
+            assert_eq!(
+                found, expected,
+                "expected one \"{button}\" per background-image slot, found {found}: {labels:?}"
+            );
+        }
+        // The rows are told apart by their labels, so those must differ.
+        assert_ne!(
+            ImageSlot::Header.label(),
+            ImageSlot::Backdrop.label(),
+            "the two rows would be indistinguishable"
         );
     }
 
