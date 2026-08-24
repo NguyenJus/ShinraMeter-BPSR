@@ -4198,6 +4198,14 @@ fn background_image_status(path: &Path, error: Option<&ImageError>) -> String {
 /// the cache key, so a *different* path would invalidate on its own, but
 /// re-picking the *same* path is precisely how a user says "I have replaced
 /// that file, load it again", and clearing here is what makes that work.
+///
+/// That `clear` happens after this frame's status label is already drawn
+/// below, though: a re-pick still leaves one frame where `settings` reports
+/// the new path but the cache entry is the old one's. Rather than relying
+/// on draw order to dodge that window, `CustomImages::error` itself refuses
+/// to hand back a cached failure whose `Entry.path` doesn't match the path
+/// being asked about — see its doc comment — so a stale error can never be
+/// attributed to a different file no matter which order things repaint in.
 fn background_image_row(
     ui: &mut egui::Ui,
     slot: ImageSlot,
@@ -4229,7 +4237,7 @@ fn background_image_row(
         }
     });
     if let Some(path) = settings.background_image(slot) {
-        let error = icons.custom.borrow().error(slot);
+        let error = icons.custom.borrow().error(slot, path);
         ui.label(background_image_status(path, error.as_ref()))
             .on_hover_text(path.display().to_string());
     }
@@ -12452,6 +12460,55 @@ mod tests {
     fn background_image_status_falls_back_to_the_whole_path_without_a_file_name() {
         assert!(!background_image_status(Path::new("/"), None).is_empty());
         assert!(!background_image_status(Path::new("../.."), None).is_empty());
+    }
+
+    /// Regression test for the stale-error mixup this PR fixes: pick a
+    /// path that fails to load, then re-pick a *different*, valid path.
+    /// The status line for the new path must never carry the old path's
+    /// failure — `CustomImages::error` is what `background_image_row`
+    /// reads to build that line, and it must reject a cached entry whose
+    /// own `path` no longer matches the one being asked about, exactly as
+    /// happens for one frame between a re-pick and the next `texture()`
+    /// call re-keying the cache.
+    #[test]
+    fn background_image_status_never_attributes_a_stale_error_to_a_different_path() {
+        let ctx = egui::Context::default();
+        let mut cache = CustomImages::default();
+        let bad = std::env::temp_dir().join("shinra-ui-status-mismatch-missing.png");
+        let _ = std::fs::remove_file(&bad);
+
+        // First pick: a path that fails to load. This caches an `Err` entry
+        // keyed on `bad`, exactly like a real failed pick.
+        assert!(
+            cache
+                .texture(&ctx, ImageSlot::Header, &bad, [64, 32])
+                .is_none()
+        );
+        let status = background_image_status(&bad, cache.error(ImageSlot::Header, &bad).as_ref());
+        assert!(status.starts_with('⚠'), "{status}");
+        assert!(
+            status.contains("shinra-ui-status-mismatch-missing.png"),
+            "{status}"
+        );
+
+        // Second pick: a different, valid path. Settings now reports the
+        // new path, but nothing has called `texture()` for it yet (that
+        // only happens once the header/backdrop is actually painted) — so
+        // the row's very next frame reads `error` against a cache entry
+        // that is still keyed on `bad`. That must not surface as an error
+        // for `good`.
+        let good = std::env::temp_dir().join("shinra-ui-status-mismatch-good.png");
+        let error = cache.error(ImageSlot::Header, &good);
+        assert!(
+            error.is_none(),
+            "a stale entry for a different path must not be reported: {error:?}"
+        );
+        let status = background_image_status(&good, error.as_ref());
+        assert_eq!(
+            status, "shinra-ui-status-mismatch-good.png",
+            "the new path's status must not mention the old path's failure"
+        );
+        assert!(!status.contains('⚠'), "{status}");
     }
 
     /// A stand-in wash height for the geometry tests below — issue #81 made

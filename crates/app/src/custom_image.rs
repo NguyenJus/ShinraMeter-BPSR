@@ -331,8 +331,20 @@ impl CustomImages {
     /// Why `slot`'s configured image is not painting, if it isn't. Read by
     /// the settings dropdown, which is the only place a user can see that
     /// a path they set is not doing anything.
-    pub fn error(&self, slot: ImageSlot) -> Option<ImageError> {
-        match &self.slot_ref(slot).as_ref()?.result {
+    ///
+    /// `path` must be the *currently configured* path for `slot` — the
+    /// cached entry is only trusted when its own `path` still matches.
+    /// Without that check, a slot re-picked from a failing path to a
+    /// different, valid one would still hand back the old failure for one
+    /// frame (the settings row reads this before `texture` has had a
+    /// chance to re-key the cache under the new path), misattributing a
+    /// stale error to a file that was never attempted.
+    pub fn error(&self, slot: ImageSlot, path: &Path) -> Option<ImageError> {
+        let entry = self.slot_ref(slot).as_ref()?;
+        if entry.path != path {
+            return None;
+        }
+        match &entry.result {
             Ok(_) => None,
             Err(err) => Some(err.clone()),
         }
@@ -559,14 +571,14 @@ mod tests {
                 .is_none()
         );
         assert!(matches!(
-            cache.error(ImageSlot::Header),
+            cache.error(ImageSlot::Header, &missing),
             Some(ImageError::Unreadable(_))
         ));
         // The other slot is untouched by the first one's failure.
-        assert_eq!(cache.error(ImageSlot::Backdrop), None);
+        assert_eq!(cache.error(ImageSlot::Backdrop, &missing), None);
 
         cache.clear(ImageSlot::Header);
-        assert_eq!(cache.error(ImageSlot::Header), None);
+        assert_eq!(cache.error(ImageSlot::Header, &missing), None);
     }
 
     #[test]
@@ -584,7 +596,7 @@ mod tests {
             Some(first),
             "the same key must not re-decode"
         );
-        assert_eq!(cache.error(ImageSlot::Backdrop), None);
+        assert_eq!(cache.error(ImageSlot::Backdrop, &path), None);
 
         let resized = cache
             .texture(&ctx, ImageSlot::Backdrop, &path, [128, 64])
