@@ -12,7 +12,7 @@
 //! because the app layer has no channel of its own suited to a single
 //! manual, UI-triggered request/reply.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bpsr_meter::{
@@ -927,6 +927,22 @@ impl OverlayApp {
         available: CheckOutcome,
         result: Result<PathBuf, String>,
     ) -> UpdateCheckState {
+        self.finish_update_install_with(ctx, available, result, update_check::relaunch)
+    }
+
+    /// The body of `finish_update_install`, with the actual relaunch call
+    /// taken as a parameter instead of hard-coded to `update_check::relaunch`.
+    /// `finish_update_install` is the only production caller and always
+    /// passes `update_check::relaunch`, so behavior is unchanged; tests use
+    /// this seam to drive the success branch without spawning a real
+    /// process.
+    fn finish_update_install_with(
+        &self,
+        ctx: &egui::Context,
+        available: CheckOutcome,
+        result: Result<PathBuf, String>,
+        relaunch: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> UpdateCheckState {
         let installed = match result {
             Ok(installed) => installed,
             Err(err) => {
@@ -936,7 +952,7 @@ impl OverlayApp {
                 };
             }
         };
-        if let Err(err) = update_check::relaunch(&installed) {
+        if let Err(err) = relaunch(&installed) {
             // The swap succeeded, so the executable on disk *is* the new
             // build — only starting it failed. Say so explicitly: telling
             // the user the update failed would be wrong, and re-running the
@@ -14811,6 +14827,105 @@ mod tests {
             app.update_check,
             UpdateCheckState::Installing { .. }
         ));
+    }
+
+    /// `finish_update_install`'s relaunch-failure branch, exercised through
+    /// `poll_update_check` exactly as production hits it: the install
+    /// thread reports `Ok(path)`, and starting that path fails. A
+    /// nonexistent path makes `Command::spawn` fail deterministically on
+    /// any OS, so no seam is needed here — unlike the success branch below,
+    /// which must not spawn a real process.
+    #[test]
+    fn poll_update_check_reports_a_relaunch_failure_after_a_successful_install() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+        let offer = update_available(Some("https://github.com/x/y.exe"));
+        let (tx, rx) = crossbeam_channel::unbounded::<Result<PathBuf, String>>();
+        app.update_check = UpdateCheckState::Installing {
+            available: offer.clone(),
+            rx,
+        };
+        tx.send(Ok(PathBuf::from(
+            "/definitely/does/not/exist/ShinraMeter-BPSR.exe",
+        )))
+        .unwrap();
+
+        app.poll_update_check(&egui::Context::default());
+
+        match &app.update_check {
+            UpdateCheckState::InstallFailed { available, error } => {
+                assert_eq!(available, &offer);
+                assert!(
+                    error.contains("installed") && error.contains("couldn't be started"),
+                    "expected a relaunch-failure message, got {error:?}"
+                );
+            }
+            other => panic!("expected InstallFailed, got {other:?}"),
+        }
+        assert!(
+            rx_command.try_recv().is_err(),
+            "a relaunch failure must not tell the pipeline to quit — the old \
+             process is still what's running"
+        );
+    }
+
+    /// `finish_update_install`'s success branch: quit the pipeline, ask the
+    /// viewport to close, and land on `Restarting`. Goes through
+    /// `finish_update_install_with` (the seam added alongside this test)
+    /// rather than `poll_update_check`, so the relaunch itself never spawns
+    /// a real process — `poll_update_check`'s own plumbing into
+    /// `finish_update_install` is unchanged production code and is not
+    /// what's under test here.
+    #[test]
+    fn update_check_finish_install_relaunches_quits_and_closes_on_success() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+        let offer = update_available(Some("https://github.com/x/y.exe"));
+        let installed = PathBuf::from("/fake/relaunched/ShinraMeter-BPSR.exe");
+        let ctx = egui::Context::default();
+
+        let state = app.finish_update_install_with(&ctx, offer, Ok(installed.clone()), |exe| {
+            assert_eq!(exe, installed.as_path());
+            Ok(())
+        });
+
+        assert!(
+            matches!(state, UpdateCheckState::Restarting),
+            "expected Restarting, got {state:?}"
+        );
+        assert_eq!(
+            rx_command
+                .try_recv()
+                .expect("a successful relaunch must send a command"),
+            UiCommand::Quit
+        );
+        let output = ctx.run_ui(egui::RawInput::default(), |_ui| {});
+        let close_commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
+        assert!(
+            close_commands.contains(&egui::ViewportCommand::Close),
+            "a successful relaunch must also ask the viewport to close: {close_commands:?}"
+        );
+        output.drop_without_applying_deltas();
     }
 
     /// Reset moved out of this menu into the toggle cluster (issue #82;

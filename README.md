@@ -85,8 +85,9 @@ game, always on top. A few things to know:
   no manual download, and no second UAC prompt (the new process inherits
   the elevation this one already has). The build it replaced is left beside
   it as `ShinraMeter-BPSR.exe.old` and deleted the next time the meter
-  starts. Releases tagged before v0.2.6 shipped a `.zip` instead of a bare
-  `.exe`, so for those the item still just offers a download link.
+  starts. Releases tagged before this in-place-update feature shipped used a
+  `.zip` instead of a bare `.exe`, so for those the item still just offers a
+  download link.
 - All icons — class, Imagine, and toolbar — are compiled into the
   executable, so there's no `assets` folder shipped alongside it to lose,
   delete, or otherwise manage.
