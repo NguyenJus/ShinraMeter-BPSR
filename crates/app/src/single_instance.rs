@@ -79,7 +79,7 @@ pub fn acquire() -> Acquisition {
     }
     let acquisition = acquire_at(&path);
     if matches!(acquisition, Acquisition::Acquired(_)) {
-        log::debug!("single-instance lock acquired at {}", path.display());
+        log::info!("single-instance lock acquired at {}", path.display());
     }
     acquisition
 }
