@@ -368,7 +368,13 @@ impl SkillTab {
     /// through to the caller's live/history wording.
     pub fn untracked_message(self) -> Option<&'static str> {
         match self {
-            SkillTab::Buff => Some("Buff uptime is not tracked yet (needs buff packet decoding)"),
+            SkillTab::Buff => {
+                // Issue #267 has the full decode recipe and the reason it
+                // is not here: the two reference trackers disagree on
+                // `AoiSyncDelta`'s buff field tag, and this project's own
+                // dumps cannot yet tell them apart.
+                Some("Buff uptime is not tracked yet (needs buff packet decoding — see issue #267)")
+            }
             _ => None,
         }
     }
