@@ -600,13 +600,21 @@ function Set-AppRect {
       into a different one. The app refuses it a second time
       (`platform::oversize_response`), but a harness whose own arguments
       depend on that backstop is testing the backstop, not the app.
+
+      -AllowOversize bypasses this guard on purpose: it is the only
+      documented way (docs/ui-debugging.md) to manufacture a live oversize
+      `WM_WINDOWPOSCHANGING` proposal and exercise `platform::window_proc`'s
+      Refuse/Clamp handling end to end. Without it the harness cannot
+      reproduce issue #257 at all; the default (unswitched) call keeps
+      refusing, since that is this function's intended everyday behaviour.
     #>
     param(
         [int]$X = [int]::MinValue,
         [int]$Y = [int]::MinValue,
         [int]$W = 0,
         [int]$H = 0,
-        [int]$SettleMs = 500
+        [int]$SettleMs = 500,
+        [switch]$AllowOversize
     )
 
     # Mirrors `MAX_WINDOW_EXTENT_PX` in crates/app/src/platform.rs -- the
@@ -622,13 +630,14 @@ function Set-AppRect {
     $nw = if ($W -gt 0) { $W } else { $before.Right - $before.Left }
     $nh = if ($H -gt 0) { $H } else { $before.Bottom - $before.Top }
 
-    if ($nw -gt $maxExtent -or $nh -gt $maxExtent) {
+    if (-not $AllowOversize -and ($nw -gt $maxExtent -or $nh -gt $maxExtent)) {
         # Built in two steps on purpose: mixing `+` and `-f` in one expression
         # is a precedence trap, and this line only ever gets read when
         # something has already gone wrong.
         $fmt = 'ERR out-of-range requested={0}x{1} max={2}x{2} -- the renderer cannot present ' +
             'a surface larger than {2}px on either axis, and Win32 saturates a window extent ' +
-            'at 32767, so the app would never have seen the number you typed (issue #257)'
+            'at 32767, so the app would never have seen the number you typed (issue #257). ' +
+            'Pass -AllowOversize to send it anyway (e.g. to reproduce issue #257 on purpose).'
         Write-Output ($fmt -f $nw, $nh, $maxExtent)
         return
     }

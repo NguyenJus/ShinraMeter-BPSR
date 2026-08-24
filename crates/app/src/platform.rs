@@ -872,6 +872,40 @@ fn oversize_response(cx: i32, cy: i32, current: Option<Rect>) -> Option<Oversize
     }
 }
 
+/// The mutation `window_proc` applies to a `WM_WINDOWPOSCHANGING`
+/// proposal's `WINDOWPOS` for a given [`OversizeResponse`], expressed over
+/// plain values instead of `windows`-crate types so it is unit-testable
+/// without a window — `window_proc` applies this verbatim, so testing it
+/// here is exactly as good as testing `window_proc` itself for the one
+/// thing that matters: a `Refuse` response must carry `size: None`. Under
+/// `Refuse` the window is meant to keep whatever size it already has, and
+/// a regression that starts writing `cx`/`cy` unconditionally (the pre-#257
+/// clamp-always behaviour) is exactly what let a stray external
+/// `MoveWindow` decide the overlay's height in the first place.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OversizeWindowPosPatch {
+    /// Whether to OR `SWP_NOSIZE` into the proposal's flags.
+    set_no_size: bool,
+    /// `Some((cx, cy))` to overwrite the proposal's `cx`/`cy`; `None` to
+    /// leave them untouched.
+    size: Option<(i32, i32)>,
+}
+
+#[cfg(any(windows, test))]
+fn oversize_windowpos_patch(response: OversizeResponse) -> OversizeWindowPosPatch {
+    match response {
+        OversizeResponse::Refuse => OversizeWindowPosPatch {
+            set_no_size: true,
+            size: None,
+        },
+        OversizeResponse::Clamp(cx, cy) => OversizeWindowPosPatch {
+            set_no_size: false,
+            size: Some((cx, cy)),
+        },
+    }
+}
+
 /// Best guess at who sent an oversize proposal, from the only evidence
 /// `WM_WINDOWPOSCHANGING` carries (issue #257): the `SWP_*` flags and
 /// whether one of this crate's own repositions is in flight.
@@ -1592,22 +1626,26 @@ unsafe extern "system" fn window_proc(
             );
             log::warn!("{message}");
             store_last_oversize_proposal(message);
-            match response {
-                // Issue #257: refusing, not clamping, is what stops this
-                // guard from being the thing that decides the window's
-                // height. Pinning `SWP_NOSIZE` also makes `already_pinned`
-                // below true, so the Snap veto skips a proposal whose size
-                // half has already been countermanded — correct, and not
-                // a loss: the move half of an oversize proposal is
-                // harmless, and `MAX_WINDOW_EXTENT_PX` is far beyond any
-                // Snap shape.
-                OversizeResponse::Refuse => {
-                    windowpos.flags |= SWP_NOSIZE;
-                }
-                OversizeResponse::Clamp(cx, cy) => {
-                    windowpos.cx = cx;
-                    windowpos.cy = cy;
-                }
+            // Issue #257: refusing, not clamping, is what stops this
+            // guard from being the thing that decides the window's
+            // height. Pinning `SWP_NOSIZE` also makes `already_pinned`
+            // below true, so the Snap veto skips a proposal whose size
+            // half has already been countermanded — correct, and not
+            // a loss: the move half of an oversize proposal is
+            // harmless, and `MAX_WINDOW_EXTENT_PX` is far beyond any
+            // Snap shape.
+            //
+            // The decision of what to apply is `oversize_windowpos_patch`
+            // (unit-tested), kept pure so a regression that starts writing
+            // `cx`/`cy` under `Refuse` fails a test instead of only
+            // showing up live.
+            let patch = oversize_windowpos_patch(response);
+            if patch.set_no_size {
+                windowpos.flags |= SWP_NOSIZE;
+            }
+            if let Some((cx, cy)) = patch.size {
+                windowpos.cx = cx;
+                windowpos.cy = cy;
             }
         }
 
@@ -3347,6 +3385,32 @@ mod tests {
             oversize_response(MAX_WINDOW_EXTENT_PX, MAX_WINDOW_EXTENT_PX + 1, current),
             Some(OversizeResponse::Refuse)
         );
+    }
+
+    // -- oversize_windowpos_patch (test-coverage gap on window_proc's
+    // applied side effect) -------------------------------------------
+
+    /// The regression this exists to catch: a `Refuse` response must never
+    /// carry a size to write. `window_proc` has no test of its own (it
+    /// can't be called off a real `HWND`), so this is the only thing
+    /// standing between a change here and `windowpos.cx`/`cy` going back
+    /// to being written unconditionally — the exact pre-#257 behaviour
+    /// that let a stray external `MoveWindow` decide the overlay's height.
+    #[test]
+    fn refuse_pins_no_size_and_does_not_touch_the_proposed_size() {
+        let patch = oversize_windowpos_patch(OversizeResponse::Refuse);
+        assert!(patch.set_no_size);
+        assert_eq!(patch.size, None);
+    }
+
+    /// `Clamp` is the mirror image: it must not pin `SWP_NOSIZE` (the
+    /// clamped size still needs to be applied), and it must carry exactly
+    /// the clamped extents through untouched.
+    #[test]
+    fn clamp_does_not_pin_no_size_and_carries_the_clamped_extents() {
+        let patch = oversize_windowpos_patch(OversizeResponse::Clamp(800, 600));
+        assert!(!patch.set_no_size);
+        assert_eq!(patch.size, Some((800, 600)));
     }
 
     /// A refusal has to *say* it refused — the #257 report could only tell

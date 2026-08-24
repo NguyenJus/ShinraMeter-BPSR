@@ -302,7 +302,11 @@ Each of these cost real time to find; they are commented at the site in
   anything over 8192 on either axis with `ERR out-of-range`; the app refuses it
   independently (`platform::oversize_response` pins `SWP_NOSIZE` and keeps the
   size it had), so an oversize request is a no-op at both ends rather than a
-  silently different window.
+  silently different window. To deliberately manufacture a live oversize
+  proposal — e.g. to reproduce issue #257 or exercise `window_proc`'s
+  Refuse/Clamp handling — pass `-AllowOversize` to bypass the guard:
+  `Set-AppRect -H 100000 -AllowOversize` sends the request unclamped. The
+  default (no switch) keeps refusing out-of-range values; this is opt-in only.
 - **Deploying over a running exe fails.** Windows locks a running image;
   `Copy-AppExe` kills the app first and retries the copy, because `Stop-Process`
   returns before the kernel has finished tearing the process down.
