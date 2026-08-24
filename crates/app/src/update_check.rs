@@ -550,11 +550,21 @@ pub fn install_update(asset_url: &str, current_version: &str) -> Result<PathBuf,
 /// `current_dir` is pinned to the executable's own folder so the new
 /// process starts where the old one's *file* lives rather than wherever the
 /// old one's working directory happened to point.
+///
+/// Issue #277 made "not waited on" something the child has to be told about:
+/// this process still holds the single-instance lock, and goes on holding it
+/// through window teardown and four thread joins, so the child would reach
+/// `single_instance::acquire` first and be refused as a second copy — the
+/// update would read as the app closing itself. `HANDOFF_VAR` marks the
+/// child as this process's successor, which makes it wait for the slot
+/// rather than refuse it. Set here, on the one spawn that has the right to
+/// claim it, and never in the environment generally.
 pub fn relaunch(exe: &Path) -> Result<(), String> {
     let mut command = std::process::Command::new(exe);
     if let Some(dir) = exe.parent() {
         command.current_dir(dir);
     }
+    command.env(crate::single_instance::HANDOFF_VAR, "1");
     command
         .spawn()
         .map(|_child| ())

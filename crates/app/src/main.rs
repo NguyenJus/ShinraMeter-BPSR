@@ -280,16 +280,6 @@ fn main() -> eframe::Result {
     // a file so a user hitting a bug can actually produce diagnostics.
     logging::init();
 
-    // Issue #250: the previous in-place update, if there was one, left the
-    // build it replaced beside the executable as `<exe>.old` — Windows will
-    // not let a running image be deleted, so the process that installed the
-    // update could not clean up after itself. This one can: whatever held
-    // that file open is the process that exited to make room for this one.
-    // Best-effort and never fatal (see the function's doc comment), and
-    // deliberately after `logging::init` so a failure has somewhere to be
-    // logged.
-    update_check::clean_up_previous_update();
-
     // Issue #277: a second copy of the meter is never what the user meant.
     // Both instances append to the same log (every event line then appears
     // twice, from two independent capture loops) and both write the same
@@ -310,6 +300,18 @@ fn main() -> eframe::Result {
             return Ok(());
         }
     };
+
+    // Issue #250: the previous in-place update, if there was one, left the
+    // build it replaced beside the executable as `<exe>.old` — Windows will
+    // not let a running image be deleted, so the process that installed the
+    // update could not clean up after itself. This one can: whatever held
+    // that file open is the process that exited to make room for this one.
+    // Which is only true *here*, after the guard: on a relaunch the
+    // predecessor is still running until it releases the lock, and deleting
+    // its own running image would have failed. Best-effort and never fatal
+    // (see the function's doc comment), and still after `logging::init` so a
+    // failure has somewhere to be logged.
+    update_check::clean_up_previous_update();
 
     let (tx_events, rx_events) = bounded::<ProtocolEvent>(EVENT_CAPACITY);
     let (tx_command, rx_command) = bounded::<UiCommand>(COMMAND_CAPACITY);
