@@ -2870,6 +2870,13 @@ pub fn choose_log_export_path(_default_filename: &str) -> Option<std::path::Path
 /// the one piece of the update-check HTTP path this dev/CI host (Linux)
 /// can actually unit-test — see `http_get_bytes`'s doc comment below on
 /// why nothing else here can be.
+///
+/// `cfg(any(windows, test))`: on a plain non-Windows build this has no
+/// caller at all (`http_get_bytes`'s only non-Windows variant is the stub
+/// below, which never touches WinHTTP), so without `test` in the cfg it
+/// would be flat-out dead code on the Linux dev/CI host — compiled in for
+/// `cfg(test)` so the unit tests below can still exercise it there.
+#[cfg(any(windows, test))]
 fn winhttp_reachability_reason(hresult: u32) -> Option<&'static str> {
     match hresult {
         // ERROR_WINHTTP_TIMEOUT: the connect or send/receive ran past
