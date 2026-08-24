@@ -130,5 +130,6 @@ pub fn map_event(
         ProtocolEvent::DungeonVar { name, value } => {
             meter::ProtocolEvent::DungeonVar { name, value }
         }
+        ProtocolEvent::EnemyGone { uid } => meter::ProtocolEvent::EnemyGone { uid },
     }
 }

@@ -6359,11 +6359,12 @@ fn skill_rows_rect(rect: egui::Rect, col_header_rect: egui::Rect) -> egui::Rect 
 /// has nothing to show (issue #216) — which of the two it is depends on the
 /// window's source, not just on the row count (PR #221 review).
 ///
-/// A historical fight's `PlayerRow::skills` is empty *permanently*: the
-/// history schema doesn't persist per-skill totals (see
-/// `history::PlayerRecord::to_row`), so nothing will ever populate it and
-/// naming that limitation is what keeps the window from reading as silent
-/// breakage. A live row's empty `skills` means only "not yet": the dungeon
+/// A historical fight's `PlayerRow::skills` is empty *for good*: schema v2
+/// persists per-skill totals (issue #222), so a fight recorded by this build
+/// has its breakdown, and an empty one is a fight saved before v2 or a player
+/// who never landed a hit — either way nothing will ever populate it now, and
+/// naming that is what keeps the window from reading as silent breakage. A
+/// live row's empty `skills` means only "not yet": the dungeon
 /// roster preload (`encounter::apply_player`) puts a party member in the
 /// snapshot with an empty skill map before their first hit lands, and a
 /// healer can sit there for a whole fight — telling that user "nothing was
@@ -15574,7 +15575,8 @@ mod tests {
 
     /// A zero-skill row means two different things (PR #221 review): a live
     /// row is a roster-preloaded or not-yet-hitting player mid-fight, a
-    /// historical one is the history schema never storing per-skill totals.
+    /// historical one is a fight saved before schema v2 stored per-skill
+    /// totals (issue #222) — settled either way, not still arriving.
     #[test]
     fn skill_window_empty_message_is_worded_for_the_window_s_source() {
         assert_eq!(

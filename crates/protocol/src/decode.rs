@@ -210,6 +210,19 @@ fn on_sync_near_entities(
             EntityKind::Unknown => {}
         }
     }
+    // issue #215: the `disappear` list, decoded after `appear` so a single
+    // packet's events stay in wire-field order. Monsters only — a player
+    // leaving AOI range is not something the meter models, and an entity
+    // type it has no model for is dropped here exactly as it is above.
+    // See `ProtocolEvent::EnemyGone` for why this is emitted as a bare
+    // "gone" fact rather than as a death.
+    for entity in &msg.disappear {
+        if kind_of(entity.uuid) == EntityKind::Monster {
+            out.push(ProtocolEvent::EnemyGone {
+                uid: uid_of(entity.uuid),
+            });
+        }
+    }
 }
 
 /// `uuid` is the delta's identity (the entity the attrs/damage apply to); it
@@ -1689,5 +1702,92 @@ mod tests {
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
         assert!(out.is_empty());
+    }
+
+    // -- SyncNearEntities.disappear (issue #215) ---------------------------
+
+    fn near_entities_notify(appear: Vec<pb::Entity>, disappear: Vec<i64>) -> Notify {
+        let msg = pb::SyncNearEntities {
+            appear,
+            disappear: disappear
+                .into_iter()
+                .map(|uuid| pb::DisappearEntity { uuid })
+                .collect(),
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id: opcode::SYNC_NEAR_ENTITIES,
+            payload,
+        }
+    }
+
+    #[test]
+    fn disappearing_monster_emits_enemy_gone() {
+        let n = near_entities_notify(vec![], vec![TARGET_UUID]);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ProtocolEvent::EnemyGone { uid } => assert_eq!(*uid, uid_of(TARGET_UUID)),
+            other => panic!("expected EnemyGone, got {other:?}"),
+        }
+    }
+
+    /// A player walking out of AOI range is not an enemy, and must not
+    /// produce an entity-gone signal the meter would have to filter itself.
+    #[test]
+    fn disappearing_player_emits_nothing() {
+        let n = near_entities_notify(vec![], vec![ATTACKER_UUID]);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.is_empty());
+    }
+
+    /// An entity type the meter has no model for (NPC, pet, ...) is dropped
+    /// exactly as it is on the `appear` side.
+    #[test]
+    fn disappearing_unknown_entity_kind_emits_nothing() {
+        let n = near_entities_notify(vec![], vec![(77i64 << 16) | (2 << 6)]);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.is_empty());
+    }
+
+    /// One packet can both introduce entities and retire others; the
+    /// `appear` side keeps its existing behaviour and the events stay in
+    /// wire-field order (appear first, then disappear).
+    #[test]
+    fn appear_and_disappear_in_one_message_both_decode() {
+        let appear = pb::Entity {
+            uuid: (31i64 << 16) | 64,
+            ent_type: pb::EEntityType::EntMonster as i32,
+            attrs: Some(AttrCollection {
+                uuid: (31i64 << 16) | 64,
+                attrs: vec![],
+            }),
+        };
+        let n = near_entities_notify(vec![appear], vec![TARGET_UUID]);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(&out[0], ProtocolEvent::EnemyHp(e) if e.uid == 31));
+        assert!(
+            matches!(&out[1], ProtocolEvent::EnemyGone { uid } if *uid == uid_of(TARGET_UUID)),
+            "expected EnemyGone second, got {:?}",
+            out[1]
+        );
+    }
+
+    /// Every disappearing monster in a batch is reported, in wire order.
+    #[test]
+    fn every_disappearing_monster_in_a_batch_is_reported() {
+        let n = near_entities_notify(vec![], vec![TARGET_UUID, (31i64 << 16) | 64]);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(&out[0], ProtocolEvent::EnemyGone { uid } if *uid == 30));
+        assert!(matches!(&out[1], ProtocolEvent::EnemyGone { uid } if *uid == 31));
     }
 }
