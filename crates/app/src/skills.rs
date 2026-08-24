@@ -86,10 +86,31 @@ impl SkillColumn {
 
     /// Fixed on-screen width this column reserves, in points. Sized the
     /// same way `ColumnKind::spec`'s widths in `settings.rs` are: enough
-    /// for the widest text the column's formatter can plausibly produce,
-    /// rounded up to the next multiple of 8. `Name` gets a generous flex
-    /// budget since skill names (unlike every other column here) are not
-    /// bounded by `fmt_short`.
+    /// for the widest text the column can plausibly paint, rounded up to
+    /// the next multiple of 8. "Widest text" is the wider of two things —
+    /// the column's own formatted values, and its *header label*.
+    ///
+    /// Issue #245's live-window pass found the header half had never been
+    /// measured: every width here was eyeballed off `fmt_short`'s longest
+    /// *value* alone, while `draw_skill_window` paints header labels
+    /// right-aligned on each column's anchor at fixed size, so a label
+    /// wider than its slot spills *left* over its neighbour. Four of the
+    /// six tabs' header rows were overlapping at both the initial and the
+    /// minimum width: Dps and Heal read `Avg criAvg white`, Skill dealt
+    /// and Skill received read `Amount ↓% Amt` with no gap at all.
+    /// Sorting made it worse, because the sorted column's label carries
+    /// `SkillSort::header_label`'s trailing arrow on top of its own text —
+    /// Heal sorted by `% Crit` degraded to `Hea% Hea% Crit ↑`.
+    ///
+    /// So every width below clears its own widest label *including that
+    /// arrow*, and `ui.rs`'s
+    /// `every_tab_header_label_fits_its_column_at_every_sort_state`
+    /// measures that through the exact font the header loop paints with,
+    /// for every tab and every sort state — a relabelled or re-budgeted
+    /// column can't quietly reintroduce the overlap.
+    ///
+    /// `Name` gets a generous flex budget since skill names (unlike every
+    /// other column here) are not bounded by `fmt_short`.
     pub fn width(self) -> f32 {
         match self {
             // The 38pt icon (`SKILL_ICON_SIZE` in `ui.rs`) plus the 10pt
@@ -99,26 +120,36 @@ impl SkillColumn {
             SkillColumn::Icon => 48.0,
             SkillColumn::Name => 160.0,
             // `fmt_short` bounds every damage/count figure to ~7 chars,
-            // same budget `ColumnKind::Damage`/`Hits` use in settings.rs.
-            SkillColumn::Damage
-            | SkillColumn::MaxCrit
-            | SkillColumn::AvgCrit
-            | SkillColumn::AvgWhite
-            | SkillColumn::Avg
+            // same budget `ColumnKind::Damage`/`Hits` use in settings.rs —
+            // and these five keep it, their labels being the short ones:
+            // sorted, "Avg" measures 38.2pt, "Hits" 39.0, "Crits" 42.8,
+            // "Heal" 42.4 and "Casts" 47.0, all inside 56.
+            SkillColumn::Avg
             | SkillColumn::Hits
             | SkillColumn::Crits
             | SkillColumn::Heal
-            | SkillColumn::Amount
             | SkillColumn::Casts => 56.0,
-            // Whole-number percentage, same budget as `ColumnKind::CritPct`.
-            SkillColumn::DmgPct
-            | SkillColumn::CritPct
-            | SkillColumn::HealPct
-            | SkillColumn::AmountPct => 40.0,
+            // Same 7-char value budget, but the header label is the wider
+            // half here. Sorted (arrow included), "Damage" measures
+            // 64.5pt, "Amount" 63.3, "Max crit" 62.6, "Avg crit" 60.2 and
+            // "Avg white" 73.9 — and "Avg white" overflows 56 even
+            // unsorted, which is the pair that collided on Dps and Heal.
+            SkillColumn::Damage | SkillColumn::Amount => 72.0,
+            SkillColumn::MaxCrit | SkillColumn::AvgCrit => 64.0,
+            SkillColumn::AvgWhite => 80.0,
+            // A whole-number percentage fits `ColumnKind::CritPct`'s 40pt
+            // with room to spare; the labels do not — "% Dmg" is already
+            // 41.6pt bare and 57.9 sorted, "% Heal" 56.2 sorted, against
+            // "% Amt"'s 54.7 and "% Crit"'s 51.0.
+            SkillColumn::DmgPct | SkillColumn::HealPct => 64.0,
+            SkillColumn::CritPct | SkillColumn::AmountPct => 56.0,
             // `format!("{:.2}", ..)` on a hits-per-minute rate; a few
             // hundred hits/min is already an extreme value, so 5-6 chars
-            // plus the 2-decimal tail comfortably fits.
-            SkillColumn::HitPerMin | SkillColumn::CastPerMin => 48.0,
+            // plus the 2-decimal tail fit well inside these — which are
+            // set by the sorted "Hit/m" (49.3pt) and "Cast/m" (57.3)
+            // labels instead.
+            SkillColumn::HitPerMin => 56.0,
+            SkillColumn::CastPerMin => 64.0,
         }
     }
 
@@ -392,8 +423,15 @@ impl SkillTab {
 /// content's right edge.
 ///
 /// Returns the widths unchanged when they already overflow `available` —
-/// shrinking them is `column_anchors_from_widths`' job, and
-/// `SKILL_WINDOW_MIN_SIZE` keeps the widest tab clear of that path anyway.
+/// shrinking them is `column_anchors_from_widths`' job. Shrinking a slot
+/// does not shrink the header label painted in it, so that path collides
+/// the header text; `SKILL_WINDOW_MIN_SIZE` is what keeps it out of reach,
+/// being at least the widest tab's own column sum plus the header row's
+/// padding (`skill_window_min_width_fits_every_column_at_its_stated_width`
+/// in `ui.rs` is what holds that true, and it is only true because the
+/// widths above are now measured against their labels — before issue
+/// #245's live-window pass they were not, and the labels overlapped at
+/// every reachable width).
 pub fn column_widths(columns: &[SkillColumn], available: f32) -> Vec<f32> {
     let mut widths: Vec<f32> = columns.iter().map(|c| c.width()).collect();
     let total: f32 = widths.iter().sum();
@@ -509,6 +547,13 @@ impl SkillSort {
 
     /// This column's header text, with a direction arrow appended only when
     /// it is the active sort column (D9) — every other header stays plain.
+    ///
+    /// The arrow is part of what the header row paints, so it is part of
+    /// what `SkillColumn::width` has to budget for: appending it to a
+    /// width chosen for the bare label is exactly how the sorted column
+    /// came to overflow its slot on four of the six tabs (see
+    /// `SkillColumn::width`). Every width there now clears this string,
+    /// not just `SkillColumn::label`.
     pub fn header_label(&self, column: SkillColumn) -> String {
         if column == self.column {
             let arrow = if self.descending {
@@ -725,13 +770,17 @@ mod tests {
 
     #[test]
     fn every_tabs_columns_fit_the_windows_minimum_content_width() {
-        // `SKILL_WINDOW_MIN_SIZE.x` (752) minus the column header row's
+        // `SKILL_WINDOW_MIN_SIZE.x` (856) minus the column header row's
         // two `SKILL_HEADER_PAD_X` insets (24) — the budget `ui.rs`'s
         // `skill_window_min_width_fits_every_column_at_its_stated_width`
-        // pins for the Dps tab, applied to all of them.
+        // pins for the widest tab, applied to all of them. It grew with
+        // the widths themselves when issue #245's live-window pass found
+        // the header labels overflowing their columns (`SkillColumn::
+        // width`); `ui.rs` owns that constant, so this is the mirror of
+        // it that this `egui`-free module can assert.
         for tab in SKILL_TABS {
             let total: f32 = tab.columns().iter().map(|c| c.width()).sum();
-            assert!(total <= 728.0, "{tab:?} needs {total}pt of column width");
+            assert!(total <= 832.0, "{tab:?} needs {total}pt of column width");
         }
     }
 

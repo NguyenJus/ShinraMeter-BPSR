@@ -7339,7 +7339,14 @@ impl SkillTabs {
 // breaking the "roughly ten rows" promise above. 572 is also the reference
 // capture's own content height (928x574 minus its 2px border), where ten
 // 44px rows fill y=133..573 exactly.
-const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 572.0);
+// Issue #245's live-window pass then measured the *header labels* against
+// their columns for the first time and found nine of them overflowing (see
+// `SkillColumn::width`), so their widths grew too: the widest tab's sum,
+// Dps, went 728 -> 832, and this with it, 760 -> 864 — still 8pt of slack
+// over the floor below. It stays inside the reference capture's own
+// 928x574 content box, so the window this is modelled on is still the
+// wider of the two.
+const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(864.0, 572.0);
 /// Floor on the skill breakdown viewport's inner size (issue #181) so a
 /// resize can't shrink it into uselessness — tall enough for the header, tab
 /// strip and column-header row plus a couple of rows before the list
@@ -7359,7 +7366,14 @@ const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 572.0);
 /// budget, so `column_anchors_from_widths` can still scale a fraction of a
 /// point for rounding but never enough to visibly compress a label. See
 /// `skill_window_min_width_fits_every_column_at_its_stated_width`.
-const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(752.0, 220.0);
+///
+/// Issue #245 widened that budget twice over: first with five more tabs,
+/// whose column sets this floor has to clear too (the widest, `Dps`, is
+/// what sets it), and then by measuring the header labels themselves — the
+/// widths were only ever sized to their columns' *values*, so the labels
+/// overlapped even at the initial width. The widest tab's sum went 728 ->
+/// 832 and this floor with it, 752 -> 856.
+const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(856.0, 220.0);
 
 /// One open breakdown window's own state (issue #16, D9): its sort column/
 /// direction, the screen position it was placed at when opened, and the
@@ -7580,10 +7594,27 @@ fn skill_tab_rects(tabs_rect: egui::Rect, text_widths: &[f32]) -> Vec<egui::Rect
 /// The column-header band's rect (issue #200): flush with the window's
 /// left/right edges, directly beneath the tab strip, `SKILL_COLUMN_HEADER_
 /// HEIGHT` tall. Painted with `SKILL_COLUMN_HEADER_FILL`.
-fn skill_column_header_rect(rect: egui::Rect, tabs_rect: egui::Rect) -> egui::Rect {
+///
+/// A tab with no columns (issue #245: `Buff`, which has nothing behind it
+/// to tabulate) gets a zero-height band instead of an empty one. The live
+/// window painted the full 40pt of `SKILL_COLUMN_HEADER_FILL` there with
+/// no labels in it, which read as a stray lighter strip above the
+/// explanatory text rather than as a header. Collapsing the rect — rather
+/// than special-casing the paint — also lifts `skill_rows_rect`, so the
+/// explanation sits where the rows would, directly under the tab strip.
+fn skill_column_header_rect(
+    rect: egui::Rect,
+    tabs_rect: egui::Rect,
+    columns: &[skills::SkillColumn],
+) -> egui::Rect {
+    let height = if columns.is_empty() {
+        0.0
+    } else {
+        SKILL_COLUMN_HEADER_HEIGHT
+    };
     egui::Rect::from_min_size(
         egui::pos2(rect.left(), tabs_rect.bottom()),
-        egui::vec2(rect.width(), SKILL_COLUMN_HEADER_HEIGHT),
+        egui::vec2(rect.width(), height),
     )
 }
 
@@ -8070,7 +8101,7 @@ fn draw_skill_window(
     let sort = tabs.sort_mut();
 
     // -- column header row: click (either button, D9) toggles sort -------
-    let col_header_rect = skill_column_header_rect(rect, tabs_rect);
+    let col_header_rect = skill_column_header_rect(rect, tabs_rect, columns);
     painter.rect_filled(
         col_header_rect,
         0.0,
@@ -14290,14 +14321,104 @@ mod tests {
     /// silently shrink every column to fit (the trap issue #192 hit).
     #[test]
     fn skill_columns_fit_the_initial_window_at_their_stated_widths() {
-        let total: f32 = skills::SkillTab::Dps
-            .columns()
-            .iter()
-            .map(|c| c.width())
-            .sum();
+        // Issue #245: every tab, not just `Dps` — each one lays its own
+        // column set out in the same window.
+        for tab in skills::SKILL_TABS {
+            let total: f32 = tab.columns().iter().map(|c| c.width()).sum();
+            assert!(
+                total <= SKILL_WINDOW_SIZE.x - 2.0 * SKILL_HEADER_PAD_X,
+                "{tab:?} columns total {total}"
+            );
+        }
+    }
+
+    /// Every column header label must fit the width its column reserves,
+    /// on every tab and in every sort state. None of them were measured
+    /// before: the widths were eyeballed off `fmt_short`'s longest *value*
+    /// only, and `draw_skill_window`'s header loop paints labels
+    /// right-aligned on each column's anchor at fixed size, so a label
+    /// wider than its own slot spills *left* over its neighbour. Four of
+    /// the six tabs shipped overlapping header rows at both the initial
+    /// and the minimum width — Dps and Heal read `Avg criAvg white`, the
+    /// two amount tabs read `Amount ↓% Amt`.
+    ///
+    /// The sort state is half the bug: `SkillSort::header_label` appends
+    /// its direction arrow to the active column's label *after* the widths
+    /// were chosen, so sorting could push a label out of a slot that fit
+    /// it bare (Heal sorted by `% Crit` degraded to `Hea% Hea% Crit ↑`).
+    /// So this walks every column of every tab against every sort state
+    /// that tab can reach — each of its own columns, both directions —
+    /// and measures through the exact font the header loop paints with
+    /// (`bold(FONT_SIZE_ROW)`) rather than against any hardcoded
+    /// expectation.
+    #[test]
+    fn every_tab_header_label_fits_its_column_at_every_sort_state() {
+        let ctx = egui::Context::default();
+        // Load the real (non-empty) default fonts so glyph metrics match
+        // what the header loop actually paints with.
+        ctx.run_ui(egui::RawInput::default(), |_ui| {})
+            .drop_without_applying_deltas();
+        let mut overflowing = Vec::new();
+        for tab in skills::SKILL_TABS {
+            let sorts: Vec<skills::SkillSort> = tab
+                .columns()
+                .iter()
+                .flat_map(|column| {
+                    [true, false].map(|descending| skills::SkillSort {
+                        column: *column,
+                        descending,
+                    })
+                })
+                .chain(std::iter::once(tab.default_sort()))
+                .collect();
+            for kind in tab.columns() {
+                for sort in &sorts {
+                    let label = sort.header_label(*kind);
+                    let text_width = ctx.fonts_mut(|f| {
+                        f.layout_no_wrap(label.clone(), bold(FONT_SIZE_ROW), egui::Color32::WHITE)
+                            .rect
+                            .size()
+                            .x
+                    });
+                    let complaint = format!(
+                        "{tab:?}/{kind:?}: \"{label}\" is {text_width}pt in a {}pt column",
+                        kind.width()
+                    );
+                    // The same label recurs once per sort state that
+                    // leaves it bare, so report each distinct overflow
+                    // once rather than n times.
+                    if text_width > kind.width() && !overflowing.contains(&complaint) {
+                        overflowing.push(complaint);
+                    }
+                }
+            }
+        }
         assert!(
-            total <= SKILL_WINDOW_SIZE.x - 2.0 * SKILL_HEADER_PAD_X,
-            "columns total {total}"
+            overflowing.is_empty(),
+            "header labels overflow their columns and overdraw their \
+             neighbours: {overflowing:?}"
+        );
+    }
+
+    /// Issue #245: `Buff` has no columns, and painted a full 40pt band of
+    /// `SKILL_COLUMN_HEADER_FILL` with nothing in it — a stray lighter
+    /// strip above the explanatory text. A tab with no columns gets no
+    /// band at all, so its rows area (and the explanation in it) starts
+    /// straight under the tab strip.
+    #[test]
+    fn a_tab_with_no_columns_gets_no_column_header_band() {
+        let rect = egui::Rect::from_min_size(egui::pos2(5.0, 5.0), egui::vec2(800.0, 600.0));
+        let tabs_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), 75.0),
+            egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
+        );
+        assert!(skills::SkillTab::Buff.columns().is_empty());
+        let col_header_rect =
+            skill_column_header_rect(rect, tabs_rect, skills::SkillTab::Buff.columns());
+        assert_eq!(col_header_rect.height(), 0.0);
+        assert_eq!(
+            skill_rows_rect(rect, col_header_rect).top(),
+            tabs_rect.bottom()
         );
     }
 
@@ -14431,7 +14552,8 @@ mod tests {
             egui::pos2(rect.left(), 75.0),
             egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
         );
-        let col_header_rect = skill_column_header_rect(rect, tabs_rect);
+        let col_header_rect =
+            skill_column_header_rect(rect, tabs_rect, skills::SkillTab::Dps.columns());
         assert_eq!(col_header_rect.left(), rect.left());
         assert_eq!(col_header_rect.right(), rect.right());
         assert_eq!(col_header_rect.top(), tabs_rect.bottom());
@@ -14505,7 +14627,10 @@ mod tests {
             egui::pos2(rect.left(), header.bottom()),
             egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
         );
-        let rows = skill_rows_rect(rect, skill_column_header_rect(rect, tabs));
+        let rows = skill_rows_rect(
+            rect,
+            skill_column_header_rect(rect, tabs, skills::SkillTab::Dps.columns()),
+        );
         assert!(!skill_drag_band(header).intersects(rows));
     }
 
@@ -14902,7 +15027,10 @@ mod tests {
             egui::pos2(screen_rect.left(), header.bottom()),
             egui::vec2(screen_rect.width(), SKILL_TAB_HEIGHT),
         );
-        let rows = skill_rows_rect(screen_rect, skill_column_header_rect(screen_rect, tabs));
+        let rows = skill_rows_rect(
+            screen_rect,
+            skill_column_header_rect(screen_rect, tabs, skills::SkillTab::Dps.columns()),
+        );
         let bar = rects.iter().find(|r| {
             r.right() == rows.right()
                 && r.width() == SKILL_SCROLL_BAR_WIDTH
