@@ -53,6 +53,45 @@ fn valid_stream() -> Vec<u8> {
     stream
 }
 
+/// A `SyncNearEntities` stream whose `disappear` list retires three entities
+/// (issue #215) — one monster, one player, one entity type the meter has no
+/// model for. The whole list is attacker-controlled length-delimited data, so
+/// it gets the same mutation treatment as every other decoded field.
+fn disappear_stream() -> Vec<u8> {
+    notify(
+        bpsr_protocol::decode::opcode::SYNC_NEAR_ENTITIES,
+        &sync_near_entities_disappear_payload(&[
+            (6i64 << 16) | 64,
+            (7i64 << 16) | 640,
+            (8i64 << 16) | (2 << 6),
+        ]),
+        false,
+    )
+}
+
+/// The `disappear` decode path under truncation and byte mutation: every
+/// prefix and every corrupted variant must be dropped without panicking.
+#[test]
+fn mutated_and_truncated_disappear_lists_never_panic() {
+    let base = disappear_stream();
+    assert!(!base.is_empty());
+    for i in 0..base.len() + 1 {
+        let mut decoder = Decoder::new();
+        let _ = decoder.push_stream(&base[..i], i as u64);
+    }
+    let mut rng = XorShift64::new(SEED ^ 0x0215_0215_0215_0215);
+    for i in 0..20_000u64 {
+        let mut mutated = base.clone();
+        let mutations = 1 + (rng.next_u32() % 4);
+        for _ in 0..mutations {
+            let idx = (rng.next_u32() as usize) % mutated.len();
+            mutated[idx] = rng.next_byte();
+        }
+        let mut decoder = Decoder::new();
+        let _ = decoder.push_stream(&mutated, i);
+    }
+}
+
 /// 50k fully random byte buffers of random length, pushed through a reused
 /// `Decoder` (simulating a continuous garbage stream): must never panic, and
 /// must keep its buffer bounded *without* any `reset()` — production has no

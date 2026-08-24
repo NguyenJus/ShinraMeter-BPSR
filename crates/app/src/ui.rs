@@ -3890,6 +3890,13 @@ fn draw_header_menu(
     // here has to guard the bottom end — `Settings::OPACITY_MIN` documents
     // why a fully transparent backdrop stays recoverable.
     let mut opacity = settings.opacity;
+    // Issue #235: `Slider` has no width-builder of its own — its rail is
+    // sized entirely off `Spacing::slider_width` (a fixed ~100pt default),
+    // unlike the Columns checkboxes and buttons below, which already stretch
+    // to the row's available width. This is the only `Slider` in the whole
+    // overlay, so widening the shared spacing setting here can't affect
+    // anything painted after it.
+    ui.spacing_mut().slider_width = ui.available_width();
     let opacity_response = ui.add(
         egui::Slider::new(&mut opacity, Settings::OPACITY_MIN..=Settings::OPACITY_MAX)
             .show_value(false),
@@ -6201,9 +6208,23 @@ const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 572.0);
 /// Floor on the skill breakdown viewport's inner size (issue #181) so a
 /// resize can't shrink it into uselessness — tall enough for the header, tab
 /// strip and column-header row plus a couple of rows before the list
-/// scrolls, wide enough to keep the columns legible once
-/// `column_anchors_from_widths` scales them down.
-const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(360.0, 220.0);
+/// scrolls, wide enough to fit every column at its stated width.
+///
+/// Issue #228: the width used to be a flat 360.0, far narrower than the sum
+/// of `SkillColumn::width`s (728.0) plus the column header row's left/right
+/// `SKILL_HEADER_PAD_X` inset (24.0) — so dragging the window down toward
+/// this floor pushed `column_anchors_from_widths` into its proportional
+/// shrink path (see its doc comment) while the header labels stayed
+/// unclipped at full size, colliding them into unreadable text (e.g.
+/// `Damag%Dmg%Max cr…`). Of the fixes the issue lists — eliding column
+/// text, progressively dropping columns, or raising this floor — raising
+/// the floor is the one taken: it's the smallest change, and every column
+/// stays fully legible at every reachable size rather than switching to a
+/// second, narrower text-rendering mode. The floor is now exactly that
+/// budget, so `column_anchors_from_widths` can still scale a fraction of a
+/// point for rounding but never enough to visibly compress a label. See
+/// `skill_window_min_width_fits_every_column_at_its_stated_width`.
+const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(752.0, 220.0);
 
 /// One open breakdown window's own state (issue #16, D9): its sort column/
 /// direction, the screen position it was placed at when opened, and the
@@ -6432,11 +6453,12 @@ fn skill_rows_rect(rect: egui::Rect, col_header_rect: egui::Rect) -> egui::Rect 
 /// has nothing to show (issue #216) — which of the two it is depends on the
 /// window's source, not just on the row count (PR #221 review).
 ///
-/// A historical fight's `PlayerRow::skills` is empty *permanently*: the
-/// history schema doesn't persist per-skill totals (see
-/// `history::PlayerRecord::to_row`), so nothing will ever populate it and
-/// naming that limitation is what keeps the window from reading as silent
-/// breakage. A live row's empty `skills` means only "not yet": the dungeon
+/// A historical fight's `PlayerRow::skills` is empty *for good*: schema v2
+/// persists per-skill totals (issue #222), so a fight recorded by this build
+/// has its breakdown, and an empty one is a fight saved before v2 or a player
+/// who never landed a hit — either way nothing will ever populate it now, and
+/// naming that is what keeps the window from reading as silent breakage. A
+/// live row's empty `skills` means only "not yet": the dungeon
 /// roster preload (`encounter::apply_player`) puts a party member in the
 /// snapshot with an empty skill map before their first hit lands, and a
 /// healer can sit there for a whole fight — telling that user "nothing was
@@ -12273,6 +12295,35 @@ mod tests {
         );
     }
 
+    /// Issue #228: dragging the window down to `SKILL_WINDOW_MIN_SIZE`
+    /// used to be reachable at a width far narrower than the columns'
+    /// combined budget. `column_anchors_from_widths` scales every column's
+    /// *slot* down to fit at that point, but the header labels
+    /// (`draw_skill_window`'s column-header loop) are painted unclipped at
+    /// fixed size — they don't shrink or elide with their slot — so a
+    /// too-narrow floor collided them into unreadable text (e.g.
+    /// `Damag%Dmg%Max cr…`). The fix keeps the floor itself wide enough
+    /// that no column is ever below the width its label needs: the sum of
+    /// every `SkillColumn::width` plus the column header row's left/right
+    /// `SKILL_HEADER_PAD_X` inset (the same margin
+    /// `skill_columns_fit_the_initial_window_at_their_stated_widths`
+    /// checks against for the *initial* size). This is the "raise the
+    /// floor" fix from the alternatives the issue lists (eliding text or
+    /// progressively dropping columns): it is the smallest change that
+    /// removes the collision, and it keeps every column's full label
+    /// legible at every reachable size instead of introducing a second,
+    /// narrower text-rendering mode.
+    #[test]
+    fn skill_window_min_width_fits_every_column_at_its_stated_width() {
+        let total: f32 = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).sum();
+        assert!(
+            SKILL_WINDOW_MIN_SIZE.x >= total + 2.0 * SKILL_HEADER_PAD_X,
+            "min width {} is narrower than the columns' {total} + padding, \
+             so a resize down to it collides their header text",
+            SKILL_WINDOW_MIN_SIZE.x
+        );
+    }
+
     /// Measured off the reference at x=860, where the game background
     /// behind the window is continuous across all three band edges:
     /// header/tabs (29,28,33), rows (45,44,49), column header (51,50,55).
@@ -14208,11 +14259,12 @@ mod tests {
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, rx_settings) = crossbeam_channel::unbounded();
         let mut settings = Settings::default();
-        assert_eq!(
-            settings.opacity,
-            Settings::OPACITY_MAX,
-            "the default must start at full opacity for this test to prove a drag actually moved it"
-        );
+        // Issue #233 lowered the default below `OPACITY_MAX`, so this can no
+        // longer assume `Settings::default()` already sits at the ceiling —
+        // it needs to start there explicitly for the drag-to-the-floor below
+        // to prove it actually moved something.
+        settings.set_opacity(Settings::OPACITY_MAX);
+        assert_eq!(settings.opacity, Settings::OPACITY_MAX);
 
         // Frame 1: lay the menu out with no input, and read back where
         // AccessKit says the opacity slider actually painted — its rect
@@ -14303,6 +14355,71 @@ mod tests {
         );
     }
 
+    /// Issue #235: the opacity slider used to size itself off
+    /// `Spacing::slider_width` (a fixed ~100pt rail) instead of stretching
+    /// to fill its row the way the menu's other full-width controls do.
+    /// Compares its painted rect against the "Minimize to tray" button's —
+    /// a plain, always-visible control in the same popup, not nested inside
+    /// the Columns disclosure.
+    ///
+    /// Every other `draw_header_menu` test calls it directly on the bare
+    /// `Ui` `ctx.run_ui` hands back, bypassing the real
+    /// `egui::Popup::menu(&chevron_response)` wiring `draw_header` builds
+    /// around it (see the doc comment on the Close-button regression test
+    /// above). That's fine for click/drag behavior, but the "full width"
+    /// this issue is about only exists because `Popup::menu` sets
+    /// `Layout::top_down_justified` — outside that layout, *every* widget
+    /// here (button included) just reports its own natural minimum size,
+    /// so this test recreates that one piece of the real wiring by hand
+    /// rather than the whole popup/anchor apparatus.
+    #[test]
+    fn draw_header_menu_opacity_slider_fills_the_row_width() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_max_width(220.0);
+            ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+                draw_header_menu(
+                    ui,
+                    &ctx,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    &mut UpdateCheckState::default(),
+                    &unused_log_export_sender(),
+                );
+            });
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let slider_rect = accessible_rect_for_role(&update, egui::accesskit::Role::Slider);
+        let button_rect = accessible_rect_for_label(&update, "Minimize to tray");
+        layout.drop_without_applying_deltas();
+
+        assert!(
+            (slider_rect.left() - button_rect.left()).abs() < 1.0,
+            "the slider must start at the same left edge as the row below it: \
+             slider {slider_rect:?}, button {button_rect:?}"
+        );
+        assert!(
+            (slider_rect.width() - button_rect.width()).abs() < 1.0,
+            "the slider must fill the same row width as the row below it, not a fixed rail: \
+             slider {slider_rect:?}, button {button_rect:?}"
+        );
+    }
+
     /// Issue #203: the header dropdown's "Reset to defaults" item must
     /// resize the window to fit `RESET_TO_DEFAULTS_VISIBLE_ROWS` rows (not
     /// the tray's own 20-row `TrayCommand::ResetWindow`) and reset opacity
@@ -14372,7 +14489,7 @@ mod tests {
         assert_eq!(
             settings.opacity,
             Settings::default_opacity(),
-            "Reset to defaults must restore full opacity"
+            "Reset to defaults must restore the default opacity"
         );
         let sent = rx_settings
             .try_recv()
@@ -15618,7 +15735,8 @@ mod tests {
 
     /// A zero-skill row means two different things (PR #221 review): a live
     /// row is a roster-preloaded or not-yet-hitting player mid-fight, a
-    /// historical one is the history schema never storing per-skill totals.
+    /// historical one is a fight saved before schema v2 stored per-skill
+    /// totals (issue #222) — settled either way, not still arriving.
     #[test]
     fn skill_window_empty_message_is_worded_for_the_window_s_source() {
         assert_eq!(

@@ -271,6 +271,21 @@ pub fn sync_near_entities_payload(entities: Vec<pb::Entity>) -> Vec<u8> {
     buf
 }
 
+/// Prost-encodes a `SyncNearEntities` payload whose `disappear` list retires
+/// `uuids` (issue #215), with no `appear` entities.
+pub fn sync_near_entities_disappear_payload(uuids: &[i64]) -> Vec<u8> {
+    let msg = pb::SyncNearEntities {
+        appear: Vec::new(),
+        disappear: uuids
+            .iter()
+            .map(|uuid| pb::DisappearEntity { uuid: *uuid })
+            .collect(),
+    };
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+    buf
+}
+
 /// Prost-encodes a `SyncContainerData` payload (not wrapped in a frame)
 /// carrying a character name + profession id. `char_id` is the **uid**
 /// directly (`on_sync_container_data` does not call `uid_of`), unlike the
