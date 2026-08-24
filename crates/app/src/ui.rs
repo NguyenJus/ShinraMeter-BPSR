@@ -944,6 +944,11 @@ fn demo_snapshot() -> Snapshot {
                     lucky_pct,
                     hits,
                     deaths,
+                    // A plausible corpse run per death (issue #254): the
+                    // demo snapshot exists to show the chrome, and a
+                    // death-time pill reading 00:00 next to a nonzero
+                    // Deaths count would show the wrong chrome.
+                    dead_ms: Some(u64::from(deaths) * 12_000),
                     skills: demo_skill_rows(demo_skills, damage, duration_ms),
                 }
             },
@@ -7105,6 +7110,11 @@ const SKILL_PILL_CORNER_RADIUS: u8 = 17;
 /// be derived from the header band instead, which made it 40 tall against a
 /// 17 radius: a rounded rectangle with flat sides, not the reference's pill.
 const SKILL_PILL_HEIGHT: f32 = 34.0;
+/// Gap between two adjacent header pills (issue #254) — the reference's
+/// `Margin="0,0,10,0"` on every `Border` in the header's pill `StackPanel`
+/// (`Skills.xaml`), which is what separates its Deaths, death-time, aggro
+/// and aggro-time capsules.
+const SKILL_HEADER_PILL_GAP: f32 = 10.0;
 /// The reference's 24pt player name — the one size in this window with no
 /// equivalent in the main row scale (`FONT_SIZE_ROW` tops out at 13.0).
 const FONT_SIZE_SKILL_HEADER_NAME: f32 = 24.0;
@@ -7521,16 +7531,61 @@ fn skill_scroll_thumb(
     ))
 }
 
-/// Where the Deaths pill's left edge lands: right-aligned into the header,
+/// Where the header's pill cluster starts — the Deaths pill's left edge,
+/// and with it every pill that follows it: right-aligned into the header,
 /// one `SKILL_HEADER_PAD_X` clear of the close button. Shares
 /// `SKILL_CLOSE_HIT_SIZE` with `skill_close_rect` so growing that button
-/// (issue #218) pushes the pill left instead of letting the two overlap.
-fn skill_deaths_pill_left(header_rect: egui::Rect, pill_width: f32) -> f32 {
+/// (issue #218) pushes the cluster left instead of letting the two overlap.
+///
+/// Takes the *cluster's* width, not the Deaths pill's alone (issue #254):
+/// the death-time pill sits to the Deaths pill's right, so right-aligning
+/// on the first pill only would push the last one under the close button.
+fn skill_deaths_pill_left(header_rect: egui::Rect, cluster_width: f32) -> f32 {
     header_rect.right()
         - SKILL_HEADER_PAD_X
         - SKILL_CLOSE_HIT_SIZE
         - SKILL_HEADER_PAD_X
-        - pill_width
+        - cluster_width
+}
+
+/// Total width of the header's pill cluster: the Deaths pill, plus the
+/// death-time pill and the gap before it when there is one to draw (issue
+/// #254). One helper so the cluster is measured in exactly one place
+/// whether it holds one pill or two.
+fn skill_header_pill_cluster_width(deaths_width: f32, death_time_width: Option<f32>) -> f32 {
+    deaths_width + death_time_width.map_or(0.0, |w| SKILL_HEADER_PILL_GAP + w)
+}
+
+/// The death-time pill's text (issue #254), or `None` when there is no pill
+/// to draw at all.
+///
+/// - `None` in, `None` out: a history row carries no death time (see
+///   `PlayerRow::dead_ms`), and an empty capsule would read as "nobody was
+///   on the floor" rather than "not recorded".
+/// - Zero renders as a bare `00:00`. Nobody died, so the figure is exact,
+///   and marking it as an estimate would be the lie — the tilde below is
+///   reserved for numbers that actually are estimated.
+/// - Anything else takes a `~` prefix: `~00:12`. The revive edge feeding
+///   this total is *inferred* from the player's next action, not observed
+///   (`PlayerStats::dead_ms`), so the number is real but biased high, and
+///   it sits one pill away from the exact Deaths counter. The tilde is the
+///   cheapest honest marker available here: these header capsules are bare
+///   painted ovals with no widget behind them — the header's whole width is
+///   a drag band — so a tooltip would mean carving a hover region out of
+///   that band, and a dimmer tint would read as "less important" rather
+///   than "less certain", on top of being invisible to anyone who never
+///   sees the two side by side.
+///
+/// Formatted `mm:ss` through `fmt_duration`, matching the reference's
+/// `interval.ToString(@"mm\:ss")` (`Skills.xaml.cs`) and the fight timer in
+/// the main window's header.
+fn skill_death_time_text(dead_ms: Option<u64>) -> Option<String> {
+    let ms = dead_ms?;
+    Some(if ms == 0 {
+        fmt_duration(0)
+    } else {
+        format!("~{}", fmt_duration(ms))
+    })
 }
 
 fn draw_skill_window(
@@ -7557,7 +7612,7 @@ fn draw_skill_window(
     // main-window setting — so its resize handles are never locked here.
     draw_resize_handles(ui, &ctx, gesture, ("skill", row.uid), false);
 
-    // -- header: class icon, player name, one Deaths pill (D10) ----------
+    // -- header: class icon, player name, the pill cluster (D10) ---------
     let header_rect = skill_header_rect(rect);
 
     // Dragging the header moves the window (the child viewport has no OS
@@ -7603,11 +7658,12 @@ fn draw_skill_window(
         false,
     );
 
-    // D10: only the Deaths pill. The reference's other three header pills
-    // (death time, aggro count, aggro time) need revive-timing and threat/
-    // aggro data this decoder never captures — rendering them would be
-    // inventing numbers rather than reporting them. Follow-up candidate,
-    // noted in the PR body.
+    // D10: the Deaths pill, and beside it issue #254's death-time pill —
+    // the first two of the reference's four-capsule cluster
+    // (`Skills.xaml`), in its order and with its 10pt gap. The remaining
+    // two (aggro count, aggro time) need threat data this decoder never
+    // captures, so they stay out: rendering them would be inventing
+    // numbers rather than reporting them.
     let deaths_text = row.deaths.to_string();
     let deaths_pill = StatPill {
         value: &deaths_text,
@@ -7624,16 +7680,53 @@ fn draw_skill_window(
         fill: SKILL_PANEL_FILL.gamma_multiply(opacity),
         stroke: None,
     };
+    // Issue #254: the same chrome as the Deaths pill — one cluster, one
+    // look — led by the stopwatch the main header's fight timer already
+    // uses, since neither vendored icon set has the reference's dedicated
+    // death-time mark and a second clock reads as "time" on sight. Absent
+    // (not empty) when the row carries no measured death time; see
+    // `skill_death_time_text` for the `~` on an estimated total.
+    let death_time_text = skill_death_time_text(row.dead_ms);
+    let death_time_pill = death_time_text.as_ref().map(|value| StatPill {
+        value,
+        icon: icons.glyphs.get(GlyphIcon::Timer).map(|t| t.id()),
+        ..deaths_pill
+    });
+
     let deaths_text_size = pill_text_size(&painter, &deaths_pill);
     let deaths_pill_size = pill_size(deaths_text_size, deaths_pill.icon_side, SKILL_PILL_HEIGHT);
+    let death_time_sizes = death_time_pill.as_ref().map(|pill| {
+        let text_size = pill_text_size(&painter, pill);
+        (
+            text_size,
+            pill_size(text_size, pill.icon_side, SKILL_PILL_HEIGHT),
+        )
+    });
+    let cluster_left = skill_deaths_pill_left(
+        header_rect,
+        skill_header_pill_cluster_width(
+            deaths_pill_size.x,
+            death_time_sizes.map(|(_, size)| size.x),
+        ),
+    );
     let deaths_pill_rect = egui::Rect::from_min_size(
         egui::pos2(
-            skill_deaths_pill_left(header_rect, deaths_pill_size.x),
+            cluster_left,
             header_rect.center().y - deaths_pill_size.y / 2.0,
         ),
         deaths_pill_size,
     );
     paint_stat_pill(&painter, deaths_pill_rect, deaths_text_size, &deaths_pill);
+    if let (Some(pill), Some((text_size, size))) = (&death_time_pill, death_time_sizes) {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(
+                deaths_pill_rect.right() + SKILL_HEADER_PILL_GAP,
+                header_rect.center().y - size.y / 2.0,
+            ),
+            size,
+        );
+        paint_stat_pill(&painter, rect, text_size, pill);
+    }
 
     // -- close glyph (D2): the only in-window way to close ---------------
     // Issue #218: interacted *before* it is painted, because the hover wash
@@ -12302,6 +12395,7 @@ mod tests {
             lucky_pct: 0.0,
             hits: 0,
             deaths: 0,
+            dead_ms: Some(0),
             ability_score,
             season_strength: None,
             imagines: [None, None],
@@ -13304,6 +13398,9 @@ mod tests {
             // widest plausible one, not `u32::MAX`, same reasoning as the
             // in-game ceilings above.
             deaths: 99,
+            // `fmt_duration`'s documented worst case, `120:00` — the pill
+            // is not a column, so this only keeps the fixture honest.
+            dead_ms: Some(120 * 60 * 1000),
             ability_score: Some(99_999),
             season_strength: Some(9_999),
             imagines: [Some(99_999), Some(99_999)],
@@ -13906,6 +14003,65 @@ mod tests {
         assert_eq!(
             left + pill_width + SKILL_HEADER_PAD_X,
             skill_close_rect(rect).left()
+        );
+    }
+
+    /// Issue #254: the death-time pill follows the Deaths pill by one
+    /// reference gap, and it is the *cluster* — not its first pill — that
+    /// keeps one header pad clear of the close button.
+    #[test]
+    fn the_death_time_pill_follows_the_deaths_pill_by_one_gap() {
+        let rect = skill_window_rect();
+        let header = skill_header_rect(rect);
+        let deaths_width = 64.0;
+        let death_time_width = 96.0;
+
+        let cluster = skill_header_pill_cluster_width(deaths_width, Some(death_time_width));
+        assert_eq!(
+            cluster,
+            deaths_width + SKILL_HEADER_PILL_GAP + death_time_width
+        );
+
+        let deaths_left = skill_deaths_pill_left(header, cluster);
+        let death_time_left = deaths_left + deaths_width + SKILL_HEADER_PILL_GAP;
+        assert!(
+            death_time_left >= deaths_left + deaths_width,
+            "the two pills must not overlap"
+        );
+        assert_eq!(
+            death_time_left + death_time_width + SKILL_HEADER_PAD_X,
+            skill_close_rect(rect).left(),
+            "the last pill in the cluster is the one that clears the close button"
+        );
+    }
+
+    /// A row with no death-time pill lays out exactly as it did before
+    /// issue #254 — the gap is part of the pill, not of the Deaths pill.
+    #[test]
+    fn a_cluster_with_one_pill_is_just_that_pill() {
+        assert_eq!(skill_header_pill_cluster_width(64.0, None), 64.0);
+    }
+
+    /// Issue #254: the total is an estimate (the revive edge is inferred
+    /// from the player's next action), so it wears a `~` — except at zero,
+    /// which is exact, and except for a history row, which has no measured
+    /// total at all and gets no pill rather than a misleading `00:00`.
+    #[test]
+    fn death_time_text_marks_the_estimate_but_not_an_exact_zero() {
+        assert_eq!(skill_death_time_text(None), None);
+        assert_eq!(skill_death_time_text(Some(0)).as_deref(), Some("00:00"));
+        assert_eq!(
+            skill_death_time_text(Some(12_400)).as_deref(),
+            Some("~00:12")
+        );
+        assert_eq!(
+            skill_death_time_text(Some(159_000)).as_deref(),
+            Some("~02:39")
+        );
+        assert_eq!(
+            skill_death_time_text(Some(120 * 60 * 1000)).as_deref(),
+            Some("~120:00"),
+            "minutes keep counting up rather than rolling over, like fmt_duration"
         );
     }
 

@@ -82,6 +82,33 @@ pub struct PlayerStats {
     /// records, i.e. how fresh that evidence is. `pub(crate)`, not part of
     /// the display DTO (`PlayerRow`) — see [`Self::set_alive`].
     pub(crate) alive_as_of_ms: Option<u64>,
+    /// Total time this player has spent down this encounter, in event-clock
+    /// milliseconds, summed over every death→revive interval that has
+    /// *closed* (issue #254). The interval still open — a player who is
+    /// down right now — is added at read time by [`Self::dead_ms_as_of`],
+    /// so this field never depends on a poll.
+    ///
+    /// This is an **estimate, biased high**, and the display labels it as
+    /// one. Only the death edge is observed: `Meter::record_death` has a
+    /// real `DamageEvent::is_dead` timestamp. The revive edge is inferred
+    /// from the player's next *acted* event (see [`Self::alive`]), because
+    /// the decode layer delivers no player-HP or revive signal, so a player
+    /// who is back up but not yet acting — repositioning, out of range, a
+    /// support between casts — still counts as down until their next hit or
+    /// heal. Should a direct revive signal ever be decoded (issue #254's PR
+    /// body records where the reference trackers find one), it lands here
+    /// with no change to this accounting: every transition already goes
+    /// through the one [`Self::set_alive`] call below.
+    pub(crate) dead_ms: u64,
+    /// Event-clock time of the death that opened the interval currently
+    /// running, or `None` while this player is up (issue #254).
+    ///
+    /// Deliberately *not* `alive_as_of_ms`, which every `set_alive` call
+    /// rewrites: a retransmitted death packet arriving while this player is
+    /// already down advances that field, and reusing it as the interval's
+    /// start would silently shorten the death by the gap between the two
+    /// copies. This one is written on the up→down edge only.
+    pub(crate) dead_since_ms: Option<u64>,
 }
 
 impl PlayerStats {
@@ -105,6 +132,8 @@ impl PlayerStats {
             skills: HashMap::new(),
             last_death_ms: None,
             alive_as_of_ms: None,
+            dead_ms: 0,
+            dead_since_ms: None,
         }
     }
 
@@ -127,8 +156,44 @@ impl PlayerStats {
         if self.alive_as_of_ms.is_some_and(|last| timestamp_ms < last) {
             return;
         }
+        // Issue #254: the two *edges* — and only the edges — move the dead
+        // clock. A repeated `set_alive(false)` while already down (the
+        // retransmitted death packet `Meter::record_death` debounces) leaves
+        // the open interval's start where the first copy put it, and a
+        // repeated `set_alive(true)` adds nothing.
+        match (self.alive, alive) {
+            (true, false) => self.dead_since_ms = Some(timestamp_ms),
+            (false, true) => {
+                if let Some(since) = self.dead_since_ms.take() {
+                    self.dead_ms += timestamp_ms.saturating_sub(since);
+                }
+            }
+            _ => {}
+        }
         self.alive = alive;
         self.alive_as_of_ms = Some(timestamp_ms);
+    }
+
+    /// Estimated total time this player has spent down this encounter as of
+    /// `now_ms`, closed intervals plus the one still open (issue #254).
+    ///
+    /// A death still open at the end of the encounter — the player never
+    /// revived before the pull ended, wiped or reset — is counted **up to
+    /// the encounter's end**, which is what `Meter::snapshot` passes here:
+    /// its `effective_now_ms`, i.e. the fight's end once the fight has
+    /// ended and the caller's clock while it is live. That matches the
+    /// reference (`Skills.xaml.cs` totals death time over
+    /// `BeginTime..EndTime`) and keeps a wipe reading as "down for the rest
+    /// of the fight" rather than as no death time at all. It also means a
+    /// live open death ticks upward between snapshots, exactly like the
+    /// fight timer beside it.
+    ///
+    /// See [`Self::dead_ms`] for why the total is an estimate.
+    pub(crate) fn dead_ms_as_of(&self, now_ms: u64) -> u64 {
+        self.dead_ms
+            + self
+                .dead_since_ms
+                .map_or(0, |since| now_ms.saturating_sub(since))
     }
 
     pub fn crit_pct(&self) -> f32 {
@@ -179,6 +244,16 @@ pub struct PlayerRow {
     /// Times this player died this encounter (issue #49). See
     /// `PlayerStats::deaths`.
     pub deaths: u32,
+    /// Estimated total time this player spent dead this encounter, in
+    /// milliseconds (issue #254) — see `PlayerStats::dead_ms` for how it is
+    /// accumulated and why it is an estimate rather than an exact figure
+    /// like `deaths`.
+    ///
+    /// `None` means *not measured*, not zero: a row replayed out of the
+    /// history database predates the column that would carry it, and the
+    /// UI hides the pill for those rather than claiming a saved encounter
+    /// had no deaths on the floor.
+    pub dead_ms: Option<u64>,
     /// This player's per-skill breakdown, damage-descending (issue #16). One
     /// row per raw skill id — the reference's sub-skill "short name"
     /// grouping has no analogue in BPSR's flat ids, so there is deliberately
@@ -278,6 +353,77 @@ pub struct Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #254: only the two edges move the dead clock, and the total
+    /// is the sum of the closed intervals.
+    #[test]
+    fn set_alive_edges_accumulate_dead_time() {
+        let mut s = PlayerStats::new(1);
+        s.set_alive(false, 1_000);
+        s.set_alive(true, 4_000);
+        s.set_alive(false, 10_000);
+        s.set_alive(true, 10_500);
+        assert_eq!(s.dead_ms, 3_500);
+        assert_eq!(s.dead_since_ms, None);
+        assert_eq!(s.dead_ms_as_of(60_000), 3_500);
+    }
+
+    /// A second death packet for a player who is already down (the
+    /// retransmission `Meter::record_death` debounces) leaves the interval's
+    /// start where the first one put it.
+    #[test]
+    fn a_repeated_death_keeps_the_first_start() {
+        let mut s = PlayerStats::new(1);
+        s.set_alive(false, 1_000);
+        s.set_alive(false, 1_400);
+        s.set_alive(true, 5_000);
+        assert_eq!(s.dead_ms, 4_000);
+    }
+
+    /// A repeated proof of life adds nothing — every acted event calls
+    /// `set_alive(true, _)`, so this runs constantly in a real fight.
+    #[test]
+    fn a_repeated_revive_adds_nothing() {
+        let mut s = PlayerStats::new(1);
+        s.set_alive(false, 1_000);
+        s.set_alive(true, 5_000);
+        s.set_alive(true, 6_000);
+        s.set_alive(true, 7_000);
+        assert_eq!(s.dead_ms, 4_000);
+    }
+
+    #[test]
+    fn dead_ms_as_of_adds_the_interval_still_open() {
+        let mut s = PlayerStats::new(1);
+        s.set_alive(false, 1_000);
+        s.set_alive(true, 3_000);
+        s.set_alive(false, 8_000);
+        assert_eq!(s.dead_ms, 2_000, "only the closed interval is stored");
+        assert_eq!(s.dead_ms_as_of(9_500), 3_500);
+        assert_eq!(
+            s.dead_ms_as_of(7_000),
+            2_000,
+            "a clock behind the open death saturates instead of underflowing"
+        );
+    }
+
+    /// The out-of-order clamp covers the dead clock too: a transition older
+    /// than the one already recorded is dropped whole.
+    #[test]
+    fn a_stale_transition_moves_neither_the_bit_nor_the_dead_clock() {
+        let mut s = PlayerStats::new(1);
+        s.set_alive(false, 5_000);
+        s.set_alive(true, 4_000);
+        assert!(!s.alive);
+        assert_eq!(s.dead_ms, 0);
+        assert_eq!(s.dead_ms_as_of(9_000), 4_000);
+    }
+
+    #[test]
+    fn a_player_who_never_died_has_no_dead_time() {
+        let s = PlayerStats::new(1);
+        assert_eq!(s.dead_ms_as_of(600_000), 0);
+    }
 
     #[test]
     fn crit_pct_zero_hits_is_zero() {

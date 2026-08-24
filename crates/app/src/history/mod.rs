@@ -189,6 +189,10 @@ impl PlayerRecord {
             lucky_pct: self.lucky_pct,
             hits: self.hits,
             deaths: self.deaths,
+            // Issue #254: the schema has no death-time column, so a
+            // replayed row reports the total as unmeasured rather than as
+            // zero. See `PlayerRow::dead_ms`.
+            dead_ms: None,
             // Issue #222: persisted since schema v2, so a historical row
             // opens the same breakdown a live one does. Encounters saved
             // before v2 have no skill rows and land here empty.
@@ -373,6 +377,7 @@ mod tests {
             lucky_pct: 5.0,
             hits: 20,
             deaths: 1,
+            dead_ms: None,
             skills: Vec::new(),
         }
     }

@@ -1892,6 +1892,7 @@ mod tests {
             lucky_pct: 0.0,
             hits: 0,
             deaths: 12,
+            dead_ms: Some(0),
             ability_score: None,
             season_strength: None,
             imagines: [None, None],
