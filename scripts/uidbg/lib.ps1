@@ -621,9 +621,13 @@ function Set-AppRect {
     # renderer's hard limit, not a taste decision (8192 clears an 8K panel).
     $maxExtent = 8192
 
-    $h = Get-AppHwnd
-    if ($h -eq [IntPtr]::Zero) { Write-Output 'ERR no-window'; return }
-    $before = Get-AppRect -Hwnd $h
+    # NOT named $h: PowerShell variable names are case-insensitive, so $h
+    # would be the *same variable* as the [int]$H parameter above and would
+    # silently overwrite every -H the caller passed (issue #88's $Rows hazard,
+    # again). See Get-AppScreenBitmap's $ht for the same avoidance.
+    $hwnd = Get-AppHwnd
+    if ($hwnd -eq [IntPtr]::Zero) { Write-Output 'ERR no-window'; return }
+    $before = Get-AppRect -Hwnd $hwnd
 
     $nx = if ($X -eq [int]::MinValue) { $before.Left } else { $X }
     $ny = if ($Y -eq [int]::MinValue) { $before.Top } else { $Y }
@@ -636,19 +640,20 @@ function Set-AppRect {
         # something has already gone wrong.
         $fmt = 'ERR out-of-range requested={0}x{1} max={2}x{2} -- the renderer cannot present ' +
             'a surface larger than {2}px on either axis, and Win32 saturates a window extent ' +
-            'at 32767, so the app would never have seen the number you typed (issue #257). ' +
-            'Pass -AllowOversize to send it anyway (e.g. to reproduce issue #257 on purpose).'
+            'at 32767, so sending it would arrive at the app as a different, silently-truncated ' +
+            'number (issue #257). Pass -AllowOversize to send it anyway (e.g. to reproduce issue ' +
+            '#257 on purpose).'
         Write-Output ($fmt -f $nw, $nh, $maxExtent)
         return
     }
 
     Invoke-UidbgWin32 -What 'MoveWindow' -Call {
-        [ShinraUidbgNativeV1]::MoveWindow($h, $nx, $ny, $nw, $nh, $true)
+        [ShinraUidbgNativeV1]::MoveWindow($hwnd, $nx, $ny, $nw, $nh, $true)
     }
     $moveOk = $script:UidbgLastCallOk
     Start-Sleep -Milliseconds $SettleMs
 
-    $after = Get-AppRect -Hwnd $h
+    $after = Get-AppRect -Hwnd $hwnd
     $actualW = $after.Right - $after.Left
     $actualH = $after.Bottom - $after.Top
     $verdict = if ($after.Left -eq $nx -and $after.Top -eq $ny -and $actualW -eq $nw -and $actualH -eq $nh) {

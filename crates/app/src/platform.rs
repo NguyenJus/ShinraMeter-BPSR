@@ -946,8 +946,9 @@ fn proposal_origin_hint(flags: u32, gesture_active: bool) -> &'static str {
     let moves_and_resizes = flags & (SWP_NOMOVE_BIT | SWP_NOSIZE_BIT) == 0;
     let move_window_shape = flags & !SWP_NOREDRAW_BIT == SWP_NOZORDER_BIT | SWP_NOACTIVATE_BIT;
     if moves_and_resizes && move_window_shape {
-        return "an external MoveWindow (another process; scripts/uidbg/lib.ps1's \
-                Set-AppRect sends exactly this shape)";
+        return "an external MoveWindow/SetWindowPos call (another process; this is the flag \
+                shape a plain move+resize sends, e.g. NOZORDER|NOACTIVATE with neither NOMOVE \
+                nor NOSIZE set)";
     }
     "unknown (neither an app_driven_reposition nor winit's SWP_ASYNCWINDOWPOS shape)"
 }
