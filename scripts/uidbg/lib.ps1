@@ -624,7 +624,9 @@ function Set-AppRect {
     # NOT named $h: PowerShell variable names are case-insensitive, so $h
     # would be the *same variable* as the [int]$H parameter above and would
     # silently overwrite every -H the caller passed (issue #88's $Rows hazard,
-    # again). See Get-AppScreenBitmap's $ht for the same avoidance.
+    # again). Get-AppScreenBitmap's $ht is a related but distinct case: that
+    # function has no $H parameter to clash with -- $ht there only avoids
+    # colliding with its own $h local.
     $hwnd = Get-AppHwnd
     if ($hwnd -eq [IntPtr]::Zero) { Write-Output 'ERR no-window'; return }
     $before = Get-AppRect -Hwnd $hwnd
@@ -639,10 +641,11 @@ function Set-AppRect {
         # is a precedence trap, and this line only ever gets read when
         # something has already gone wrong.
         $fmt = 'ERR out-of-range requested={0}x{1} max={2}x{2} -- the renderer cannot present ' +
-            'a surface larger than {2}px on either axis, and Win32 saturates a window extent ' +
-            'at 32767, so sending it would arrive at the app as a different, silently-truncated ' +
-            'number (issue #257). Pass -AllowOversize to send it anyway (e.g. to reproduce issue ' +
-            '#257 on purpose).'
+            'a surface larger than {2}px on either axis. Below 32767 the number would arrive ' +
+            'at the app intact and get refused there instead (platform::oversize_response); ' +
+            'at or above 32767 Win32 saturates the window extent first, so the app never sees ' +
+            'the number typed (issue #257). Pass -AllowOversize to send it anyway (e.g. to ' +
+            'reproduce issue #257 on purpose).'
         Write-Output ($fmt -f $nw, $nh, $maxExtent)
         return
     }
