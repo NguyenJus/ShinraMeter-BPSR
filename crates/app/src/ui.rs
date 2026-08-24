@@ -149,6 +149,15 @@ fn paint_bold_text(
 pub enum UiCommand {
     Reset,
     Quit,
+    /// Issue #214: tear down what capture is tracking and re-run server
+    /// detection from scratch. Routed through this channel like every other
+    /// command, because the thing that has to act on it — the
+    /// `CaptureHandle` — cannot be reached from the frame thread: it owns a
+    /// raw Windows `HANDLE` and is neither `Send` nor `Sync`, which is why
+    /// `CaptureHandle::request_restart` shipped with no caller at all.
+    /// `pipeline::run` holds the `Send`-able half (`CaptureRestart`) and
+    /// makes the request on this command's behalf.
+    RestartCapture,
 }
 
 /// Non-fatal status banner shown above the player rows.
@@ -164,6 +173,13 @@ pub enum StatusLine {
 /// encounter it happened during — see `OverlayApp::status_expires_at` for
 /// which banners expire and which are permanent.
 const TRANSIENT_STATUS_LINGER: Duration = Duration::from_secs(5);
+
+/// What the banner says when the pipeline thread has died (issue #214).
+/// Names a recovery rather than a cause: from the UI's seat the cause is
+/// unknowable (the thread is simply gone), and the log line
+/// `raise_pipeline_dead_status` writes alongside it is where the detail
+/// belongs.
+const PIPELINE_DEAD_STATUS: &str = "Meter pipeline stopped — restart ShinraMeter-BPSR to resume";
 
 /// The overlay's eframe app: holds the latest snapshot plus the channel
 /// endpoints used to receive updates and send commands.
@@ -776,11 +792,64 @@ impl OverlayApp {
     /// this skip avoids. Split out of `ui()` so the guard is unit-testable
     /// without an `egui::Context`.
     fn drain_snapshots(&mut self) {
-        if !self.demo_mode {
-            for snap in self.rx_snapshot.try_iter() {
-                self.snapshot = snap;
+        if self.demo_mode {
+            return;
+        }
+        loop {
+            match self.rx_snapshot.try_recv() {
+                Ok(snap) => self.snapshot = snap,
+                // Nothing new this frame — the overwhelmingly common case.
+                Err(TryRecvError::Empty) => break,
+                // Issue #214: the pipeline thread is gone. `try_iter`, which
+                // this replaced, collapsed this into `Empty`, so a panicked
+                // pipeline looked exactly like a quiet one and the overlay
+                // went on painting the last snapshot forever — a frozen
+                // meter with no banner, no log line, and nothing the user
+                // could do but guess. `main.rs` never joins the thread
+                // either, so this dropped `Sender` is the only signal that
+                // reaches the UI at all.
+                Err(TryRecvError::Disconnected) => {
+                    self.raise_pipeline_dead_status();
+                    break;
+                }
             }
         }
+    }
+
+    /// Raises the *permanent* banner for a dead pipeline thread (#214).
+    ///
+    /// Permanent (no `status_expires_at`) because nothing in the process
+    /// restarts that thread: unlike the Share clipboard blip, this is still
+    /// true on every later frame. Logged and raised exactly once — the
+    /// early return below sees the banner it just set — so a disconnect
+    /// does not write a line per frame at ~10 Hz for the rest of the
+    /// session.
+    ///
+    /// A *permanent* error banner that is already up wins. The capture-init
+    /// failure `main.rs` seeds through `with_status` names an actual cause
+    /// ("WinDivert is not installed"), which is strictly more useful than
+    /// "the pipeline stopped" — and a pipeline whose capture never started
+    /// will disconnect at shutdown like any other.
+    ///
+    /// A *transient* error banner (`status_expires_at.is_some()` — e.g. a
+    /// failed Share/Export logs copy) does not win: it is scheduled to clear
+    /// itself in `expire_transient_status`, which runs after
+    /// `drain_snapshots` in `ui()`'s per-frame order, so without this check
+    /// a dead pipeline discovered while that banner is showing would stay
+    /// hidden behind it for up to `TRANSIENT_STATUS_LINGER` before the fatal
+    /// banner finally appears. Overriding clears `status_expires_at` too, or
+    /// the permanent banner would inherit the transient one's expiry and
+    /// vanish on schedule.
+    fn raise_pipeline_dead_status(&mut self) {
+        if matches!(self.status, StatusLine::Error(_)) && self.status_expires_at.is_none() {
+            return;
+        }
+        log::error!(
+            "the pipeline thread is gone (its snapshot channel disconnected); the meter is frozen \
+             for the rest of this session"
+        );
+        self.status = StatusLine::Error(PIPELINE_DEAD_STATUS.to_string());
+        self.status_expires_at = None;
     }
 
     /// Issue #171: picks up the manual update-check thread's result, if one
@@ -3895,6 +3964,24 @@ fn draw_header_menu(
         {
             start_log_export(dest, tx_log_export.clone());
         }
+        ui.close();
+    }
+
+    // Issue #214: the only in-process recovery from a capture wedge that no
+    // new TCP connection happens to clear. Before this, `request_restart`
+    // had no caller anywhere and #211's 24-minute stall could only be
+    // escaped by leaving the instance (which opens a fresh connection) or
+    // relaunching the app. `bpsr-logs` ships the same escape hatch, worded
+    // almost identically — upstream evidently concluded that not every
+    // stall condition is automatically detectable.
+    //
+    // Deliberately unconfirmed and never disabled: the request is a
+    // latching flag rather than a queue, so clicking twice is one restart;
+    // the cost is a fraction of a second of missed packets plus a decoder
+    // reset; and anyone reaching for it is already looking at a meter that
+    // has stopped moving.
+    if ui.button("Restart packet capture").clicked() {
+        let _ = tx_command.try_send(UiCommand::RestartCapture);
         ui.close();
     }
 
@@ -16223,6 +16310,211 @@ mod tests {
             reported_rows_top > pre_call_top,
             "rows_top must move past the history bar and separator \
              (pre-call top {pre_call_top}, reported {reported_rows_top})"
+        );
+    }
+
+    /// Issue #214: `CaptureHandle::request_restart` shipped with no caller
+    /// anywhere in this crate, so a capture wedge that no new TCP connection
+    /// cleared (#211) left "relaunch the app" as the only recovery. This
+    /// drives a real click on the dropdown item that now reaches it, the
+    /// same way `draw_header_menu_dispatches_close_to_the_right_command`
+    /// drives Close.
+    #[test]
+    fn draw_header_menu_dispatches_restart_packet_capture() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
+            );
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let item_pos = accessible_rect_for_label(&update, "Restart packet capture").center();
+        layout.drop_without_applying_deltas();
+
+        let output = ctx.run_ui(click_at(item_pos), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
+            );
+        });
+        let viewport_commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            rx_command
+                .try_recv()
+                .expect("Restart packet capture must send a command"),
+            UiCommand::RestartCapture
+        );
+        assert!(
+            !viewport_commands.contains(&egui::ViewportCommand::Close),
+            "restarting capture must not close the overlay: {viewport_commands:?}"
+        );
+    }
+
+    /// Issue #214, part 2: the pipeline thread's death used to be entirely
+    /// silent — `main.rs` never checks its `JoinHandle`, so a panic in it
+    /// left a frozen-but-normal-looking meter for the rest of the process's
+    /// life. The dropped `Sender` it leaves behind is the signal, and the
+    /// banner is what makes it visible.
+    #[test]
+    fn a_dead_pipeline_thread_raises_an_error_banner() {
+        let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+        assert_eq!(app.status, StatusLine::Ok, "a live pipeline starts clean");
+
+        drop(tx_snapshot);
+        app.drain_snapshots();
+
+        match &app.status {
+            StatusLine::Error(message) => assert!(
+                message.contains("pipeline"),
+                "the banner must name what died, got {message:?}"
+            ),
+            other => panic!("expected an error banner, got {other:?}"),
+        }
+        assert_eq!(
+            app.status_expires_at, None,
+            "a dead pipeline never recovers, so its banner must not time out"
+        );
+    }
+
+    /// The counterpart: a pipeline that is merely idle — connected, with
+    /// nothing new to say — must leave the banner alone, or the overlay
+    /// would cry wolf on every quiet frame.
+    #[test]
+    fn an_idle_pipeline_leaves_the_status_alone() {
+        let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+
+        app.drain_snapshots();
+        assert_eq!(app.status, StatusLine::Ok);
+
+        tx_snapshot.send(demo_snapshot()).unwrap();
+        app.drain_snapshots();
+        assert_eq!(
+            app.status,
+            StatusLine::Ok,
+            "a delivered snapshot is good news"
+        );
+    }
+
+    /// The capture-init failure `main.rs` seeds through `with_status` is
+    /// permanent and more specific than "the pipeline is gone"; a later
+    /// pipeline disconnect at shutdown must not overwrite it with the
+    /// vaguer message.
+    #[test]
+    fn a_dead_pipeline_does_not_overwrite_an_existing_error_banner() {
+        let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded::<Snapshot>();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        )
+        .with_status(StatusLine::Error("WinDivert is not installed".to_string()));
+
+        drop(tx_snapshot);
+        app.drain_snapshots();
+
+        assert_eq!(
+            app.status,
+            StatusLine::Error("WinDivert is not installed".to_string()),
+            "the more specific capture failure must survive"
+        );
+    }
+
+    /// Counterpart to `a_dead_pipeline_does_not_overwrite_an_existing_error_banner`:
+    /// a *transient* banner (Share/Export logs failure) is not "already up"
+    /// in the sense that guard cares about — it is scheduled to clear itself
+    /// in `expire_transient_status`, which runs after `drain_snapshots` in
+    /// `ui()`'s per-frame order. Without distinguishing it from a permanent
+    /// banner, a dead pipeline discovered mid-linger would stay masked by
+    /// the stale clipboard message for up to `TRANSIENT_STATUS_LINGER`
+    /// instead of raising the fatal banner immediately.
+    #[test]
+    fn a_dead_pipeline_overwrites_a_transient_error_banner() {
+        let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded::<Snapshot>();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+
+        app.raise_transient_status("Copy screenshot failed: oops".to_string(), Instant::now());
+        assert!(
+            app.status_expires_at.is_some(),
+            "sanity: banner is transient"
+        );
+
+        drop(tx_snapshot);
+        app.drain_snapshots();
+
+        match &app.status {
+            StatusLine::Error(message) => assert!(
+                message.contains("pipeline"),
+                "the permanent banner must replace the transient one, got {message:?}"
+            ),
+            other => panic!("expected the permanent pipeline-dead banner, got {other:?}"),
+        }
+        assert_eq!(
+            app.status_expires_at, None,
+            "the permanent banner must not inherit the transient banner's expiry"
         );
     }
 }

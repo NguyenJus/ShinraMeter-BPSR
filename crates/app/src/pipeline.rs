@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bpsr_capture::CaptureRestart;
 use bpsr_meter as meter;
 use bpsr_protocol as proto;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select, tick};
@@ -379,6 +380,11 @@ pub fn spawn(
     commands: Receiver<UiCommand>,
     names_cache_path: PathBuf,
     history: Option<HistoryHandle>,
+    // Issue #214: the `Send`-able half of the running capture, or `None`
+    // when capture never started. This thread owns the UI's command
+    // channel, so it is where `UiCommand::RestartCapture` has to land — the
+    // `CaptureHandle` itself is pinned to `main`'s thread.
+    capture_restart: Option<CaptureRestart>,
 ) -> (Receiver<meter::Snapshot>, JoinHandle<()>) {
     let (tx_snapshot, rx_snapshot) = bounded::<meter::Snapshot>(1);
     let stale = rx_snapshot.clone();
@@ -393,6 +399,7 @@ pub fn spawn(
                 stale,
                 names_cache_path,
                 history,
+                capture_restart,
             )
         })
         .expect("failed to spawn the pipeline thread");
@@ -407,6 +414,7 @@ fn run(
     stale: Receiver<meter::Snapshot>,
     names_cache_path: PathBuf,
     history: Option<HistoryHandle>,
+    capture_restart: Option<CaptureRestart>,
 ) {
     let mut pipeline = Pipeline::with_names_cache_path(names_cache_path);
     if let Some(history) = history {
@@ -430,6 +438,20 @@ fn run(
             },
             recv(commands) -> msg => match msg {
                 Ok(UiCommand::Reset) => pipeline.reset(now_ms()),
+                // Issue #214. Logged unconditionally: knowing the user had
+                // to reach for this — and when — is exactly the context
+                // #211's silent log was missing, and it is what makes the
+                // capture-side lines that follow interpretable.
+                Ok(UiCommand::RestartCapture) => match &capture_restart {
+                    Some(restart) => {
+                        log::info!("restarting packet capture at the user's request");
+                        restart.request();
+                    }
+                    None => log::warn!(
+                        "a packet-capture restart was requested, but capture never started \
+                         (the status banner explains why); nothing to restart"
+                    ),
+                },
                 Ok(UiCommand::Quit) => break,
                 Err(_) => break,
             },
@@ -1194,5 +1216,74 @@ mod tests {
             let snap = pipeline.snapshot(0);
             pipeline.record_fight_end(meter::FightState::Ended, &snap);
         }
+    }
+
+    /// Issue #214: the header dropdown's "Restart packet capture" item
+    /// sends `UiCommand::RestartCapture` down the same channel Reset and
+    /// Quit already use, and this thread is what turns it into a request
+    /// the capture thread will read. Driven through the real spawned
+    /// pipeline, since the routing *is* the behaviour under test.
+    #[test]
+    fn a_restart_capture_command_reaches_the_capture_thread() {
+        use bpsr_test_support::scratch_path;
+        use std::time::{Duration, Instant};
+
+        let (_tx_events, rx_events) = crossbeam_channel::unbounded();
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let restart = bpsr_capture::CaptureRestart::new();
+
+        // Held for the pipeline's whole life: its snapshot channel is
+        // `bounded(1)` with a drop-the-stale fallback, so a dropped
+        // receiver would be a disconnect rather than back-pressure.
+        let (_rx_snapshot, thread) = spawn(
+            rx_events,
+            rx_command,
+            scratch_path("restart-capture"),
+            None,
+            Some(restart.clone()),
+        );
+
+        tx_command.send(UiCommand::RestartCapture).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut requested = false;
+        while Instant::now() < deadline {
+            if restart.take_requested() {
+                requested = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        tx_command.send(UiCommand::Quit).unwrap();
+        thread.join().unwrap();
+
+        assert!(
+            requested,
+            "RestartCapture must reach the capture thread's restart flag"
+        );
+    }
+
+    /// The same command with no capture running (`start_capture` failed, so
+    /// `main.rs` has no handle to take a requester from) must be a no-op
+    /// the pipeline survives, not a panic or an exit.
+    #[test]
+    fn a_restart_capture_command_without_capture_is_harmless() {
+        use bpsr_test_support::scratch_path;
+
+        let (_tx_events, rx_events) = crossbeam_channel::unbounded();
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let (_rx_snapshot, thread) = spawn(
+            rx_events,
+            rx_command,
+            scratch_path("restart-capture-none"),
+            None,
+            None,
+        );
+
+        tx_command.send(UiCommand::RestartCapture).unwrap();
+        // Still alive and still listening: `Quit` is what stops it.
+        tx_command.send(UiCommand::Quit).unwrap();
+        thread.join().unwrap();
     }
 }

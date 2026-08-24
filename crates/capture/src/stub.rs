@@ -11,6 +11,7 @@ use bpsr_protocol::{InspectSink, ProtocolEvent};
 use crossbeam_channel::Sender;
 
 use crate::error::CaptureError;
+use crate::restart::CaptureRestart;
 
 /// No-op handle returned by [`start_capture`] on non-Windows platforms.
 pub struct CaptureHandle;
@@ -18,6 +19,14 @@ pub struct CaptureHandle;
 impl CaptureHandle {
     /// No-op: there is no running capture thread to restart.
     pub fn request_restart(&self) {}
+
+    /// A detached requester: nothing reads it, because there is no capture
+    /// thread on this platform. Exists so `crates/app` can wire the header
+    /// dropdown's "Restart packet capture" item unconditionally, exactly as
+    /// it calls `start_capture` unconditionally.
+    pub fn restart_requester(&self) -> CaptureRestart {
+        CaptureRestart::new()
+    }
 
     /// No-op: there is no running capture thread to stop.
     pub fn stop(self) {}
@@ -58,6 +67,10 @@ mod tests {
     fn handle_methods_are_no_ops() {
         let handle = CaptureHandle;
         handle.request_restart();
+        assert!(
+            !handle.restart_requester().take_requested(),
+            "the stub's requester is detached: nothing reads it and nothing sets it"
+        );
         handle.stop();
     }
 }
