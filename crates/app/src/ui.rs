@@ -858,10 +858,10 @@ impl OverlayApp {
     /// header dropdown happens to be closed is still there the moment it's
     /// reopened, rather than dropped or leaving the dropdown stuck showing
     /// "Checking…" forever.
-    fn poll_update_check(&mut self) {
+    fn poll_update_check(&mut self, ctx: &egui::Context) {
         let landed = match &self.update_check {
             UpdateCheckState::Checking { rx } => match rx.try_recv() {
-                Ok(outcome) => Some(outcome),
+                Ok(outcome) => Some(LandedUpdate::Check(outcome)),
                 // Still in flight — keep rendering "Checking…".
                 Err(TryRecvError::Empty) => None,
                 // The sender is gone without ever having sent: the
@@ -873,15 +873,89 @@ impl OverlayApp {
                 // short of restarting the app. Resolve it as a failure
                 // instead, which the dropdown renders and which leaves the
                 // button clickable again.
-                Err(TryRecvError::Disconnected) => Some(Err(
+                Err(TryRecvError::Disconnected) => Some(LandedUpdate::Check(Err(
                     "the update-check thread stopped without reporting a result".to_string(),
-                )),
+                ))),
+            },
+            // Issue #250: the same drain, for the thread that downloads and
+            // swaps in the new executable. Same `Disconnected` reasoning as
+            // above — a thread that dies mid-download must resolve to a
+            // visible failure, not leave the dropdown stuck on
+            // "Downloading…" with no way back.
+            UpdateCheckState::Installing { available, rx } => match rx.try_recv() {
+                Ok(result) => Some(LandedUpdate::Install {
+                    available: available.clone(),
+                    result,
+                }),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(LandedUpdate::Install {
+                    available: available.clone(),
+                    result: Err(
+                        "the update-install thread stopped without reporting a result".to_string(),
+                    ),
+                }),
             },
             _ => None,
         };
-        if let Some(outcome) = landed {
-            self.update_check = UpdateCheckState::Done(outcome);
+        match landed {
+            None => {}
+            Some(LandedUpdate::Check(outcome)) => {
+                self.update_check = UpdateCheckState::Done(outcome);
+            }
+            Some(LandedUpdate::Install { available, result }) => {
+                self.update_check = self.finish_update_install(ctx, available, result);
+            }
         }
+    }
+
+    /// Issue #250: what to do the frame an in-place update finishes.
+    ///
+    /// The download and the file swap already happened on the install
+    /// thread (`update_check::install_update`); everything left is process
+    /// lifecycle, which has to happen here because only the UI thread may
+    /// send a viewport command. On success: start the new executable, tell
+    /// the pipeline to stop, and ask the window to close — in that order,
+    /// so a relaunch that fails leaves the current session running rather
+    /// than closing the app over a build the user now has to start by hand.
+    ///
+    /// Returns the state to store rather than assigning it, so the borrow
+    /// of `self.update_check` in `poll_update_check`'s match is already
+    /// over by the time it is replaced.
+    fn finish_update_install(
+        &self,
+        ctx: &egui::Context,
+        available: CheckOutcome,
+        result: Result<PathBuf, String>,
+    ) -> UpdateCheckState {
+        let installed = match result {
+            Ok(installed) => installed,
+            Err(err) => {
+                return UpdateCheckState::InstallFailed {
+                    available,
+                    error: err,
+                };
+            }
+        };
+        if let Err(err) = update_check::relaunch(&installed) {
+            // The swap succeeded, so the executable on disk *is* the new
+            // build — only starting it failed. Say so explicitly: telling
+            // the user the update failed would be wrong, and re-running the
+            // download would be pointless work.
+            log::error!("installed the update but couldn't relaunch: {err}");
+            return UpdateCheckState::InstallFailed {
+                available,
+                error: format!(
+                    "the update was installed but couldn't be started ({err}) — close the meter and open it again"
+                ),
+            };
+        }
+        log::info!(
+            "installed an in-place update at {} and relaunched; closing this instance",
+            installed.display()
+        );
+        let _ = self.tx_command.try_send(UiCommand::Quit);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        UpdateCheckState::Restarting
     }
 
     /// Issue #220 (PR #227 review): picks up whatever the "Export logs"
@@ -921,7 +995,7 @@ impl eframe::App for OverlayApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_snapshots();
-        self.poll_update_check();
+        self.poll_update_check(ui.ctx());
         // Issue #39: drained unconditionally, regardless of whether the
         // history view is open — see `poll_history`'s doc comment.
         self.poll_history();
@@ -4085,14 +4159,28 @@ fn draw_header_menu(
             // let them re-check right before actually upgrading; it is only
             // disabled while one is already in flight, so a click can't pile up a
             // second thread racing the first to the same channel.
-            let checking = matches!(update_check, UpdateCheckState::Checking { .. });
+            //
+            // Issue #250: the button is also disabled while an install is
+            // running or the app is on its way out — re-checking mid-swap
+            // would only race the state machine, and a `Restarting` app has
+            // nothing left to check.
+            let busy = matches!(
+                update_check,
+                UpdateCheckState::Checking { .. }
+                    | UpdateCheckState::Installing { .. }
+                    | UpdateCheckState::Restarting
+            );
             let clicked_check_for_updates = ui
-                .add_enabled(!checking, egui::Button::new("Check for updates"))
+                .add_enabled(!busy, egui::Button::new("Check for updates"))
                 .clicked();
             if clicked_check_for_updates {
                 *update_check = start_update_check();
             }
-            match update_check {
+            // Issue #250: an "Update now" click can't assign `*update_check`
+            // from inside the match below, which borrows it — so the click
+            // is collected here and acted on once the match has ended.
+            let mut clicked_install: Option<CheckOutcome> = None;
+            match &*update_check {
                 UpdateCheckState::Idle => {}
                 UpdateCheckState::Checking { .. } => {
                     ui.label("Checking…");
@@ -4100,20 +4188,36 @@ fn draw_header_menu(
                 UpdateCheckState::Done(Ok(CheckOutcome::UpToDate)) => {
                     ui.label(format!("Up to date (v{})", env!("CARGO_PKG_VERSION")));
                 }
-                UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable { tag, url })) => {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Update available: {tag}"));
-                        // Issue #171 scopes auto-download/apply out — this link to
-                        // the release's own GitHub page is the whole "get it"
-                        // affordance. `egui::OpenUrl` (what `hyperlink_to` sends
-                        // through `ctx.output_mut`) is what eframe's native
-                        // backend turns into an actual browser launch.
-                        ui.hyperlink_to("Download", url.as_str());
-                    });
+                UpdateCheckState::Done(Ok(available @ CheckOutcome::UpdateAvailable { .. })) => {
+                    draw_update_available(ui, available, &mut clicked_install);
                 }
                 UpdateCheckState::Done(Err(err)) => {
                     ui.label(format!("Update check failed: {err}"));
                 }
+                UpdateCheckState::Installing { available, .. } => {
+                    let tag = update_tag(available);
+                    ui.label(format!("Downloading {tag}…"));
+                    // The install thread reports once, at the end — WinHTTP's
+                    // read loop has no progress callback wired through
+                    // `platform::http_get_bytes` — so this is a spinner, not a
+                    // percentage. Claiming a percentage it cannot know would be
+                    // worse than not showing one.
+                    ui.spinner();
+                }
+                UpdateCheckState::Restarting => {
+                    ui.label("Restarting…");
+                }
+                UpdateCheckState::InstallFailed { available, error } => {
+                    // The offer is redrawn above the error on purpose: a
+                    // failed download is usually transient (a dropped
+                    // connection, a proxy hiccup), so the retry has to be one
+                    // click away rather than behind a fresh check.
+                    draw_update_available(ui, available, &mut clicked_install);
+                    ui.label(format!("Update failed: {error}"));
+                }
+            }
+            if let Some(available) = clicked_install {
+                *update_check = start_update_install(available);
             }
 
             ui.separator();
@@ -4155,6 +4259,103 @@ enum UpdateCheckState {
     },
     /// The most recent request has resolved, successfully or not.
     Done(Result<CheckOutcome, String>),
+    /// Issue #250: the user clicked "Update now" and a spawned thread is
+    /// downloading the release asset and swapping it in. `available` is the
+    /// `CheckOutcome::UpdateAvailable` that offer came from, kept so the
+    /// dropdown can keep naming the tag and can re-offer the same install
+    /// if this one fails; `rx` carries the installed executable's path (to
+    /// relaunch) or the reason it didn't get that far.
+    Installing {
+        available: CheckOutcome,
+        rx: Receiver<Result<PathBuf, String>>,
+    },
+    /// Issue #250: the new build is on disk and has been started; this
+    /// instance has already asked its viewport to close. A terminal state —
+    /// the window is going away, and the only thing left to draw is a line
+    /// saying why.
+    Restarting,
+    /// Issue #250: the download, the swap or the relaunch failed. Carries
+    /// the original offer so the dropdown can redraw the "Update now"
+    /// button beside the error and a retry costs one click.
+    InstallFailed {
+        available: CheckOutcome,
+        error: String,
+    },
+}
+
+/// What one `poll_update_check` drain found, before the borrow of
+/// `OverlayApp::update_check` it was read through has ended. Exists purely
+/// so the two channels (`Checking`'s and `Installing`'s) can be drained in
+/// one match and acted on in another — assigning `self.update_check` inside
+/// the first match would still be borrowing it.
+enum LandedUpdate {
+    Check(Result<CheckOutcome, String>),
+    Install {
+        available: CheckOutcome,
+        result: Result<PathBuf, String>,
+    },
+}
+
+/// The tag out of a `CheckOutcome::UpdateAvailable`, for the states that
+/// carry one purely to name it. `UpToDate` has no tag and never reaches any
+/// of those states, so it degrades to a neutral word rather than widening
+/// every call site into a match.
+fn update_tag(available: &CheckOutcome) -> &str {
+    match available {
+        CheckOutcome::UpdateAvailable { tag, .. } => tag,
+        CheckOutcome::UpToDate => "the update",
+    }
+}
+
+/// Draws the "an update exists, here's how to get it" row (issues #171 and
+/// #250). Shared by the fresh-result state and the failed-install state so
+/// a retry offers exactly the same affordances the first attempt did.
+///
+/// Two shapes, decided by whether the release actually published a
+/// downloadable executable:
+///
+/// - With an asset (every release since issue #249): an "Update now" button
+///   that downloads it, swaps it over this executable and relaunches, plus
+///   a link to the release page for anyone who wants to read the notes
+///   first.
+/// - Without one — a release tagged before #249, which published a `.zip`,
+///   or one whose upload never finished: the plain "Download" link that was
+///   the whole affordance before #250. Offering an install button that
+///   cannot work would be worse than offering the browser.
+///
+/// `egui::OpenUrl` (what `hyperlink_to` sends through `ctx.output_mut`) is
+/// what eframe's native backend turns into an actual browser launch.
+///
+/// A click is reported through `clicked_install` rather than acted on here:
+/// the caller holds the `&mut UpdateCheckState` this row was rendered from,
+/// so the state change has to happen after this borrow ends.
+fn draw_update_available(
+    ui: &mut egui::Ui,
+    available: &CheckOutcome,
+    clicked_install: &mut Option<CheckOutcome>,
+) {
+    let CheckOutcome::UpdateAvailable {
+        tag,
+        url,
+        asset_url,
+    } = available
+    else {
+        return;
+    };
+    ui.horizontal(|ui| {
+        ui.label(format!("Update available: {tag}"));
+        match asset_url {
+            Some(_) => {
+                if ui.button("Update now").clicked() {
+                    *clicked_install = Some(available.clone());
+                }
+                ui.hyperlink_to("Release notes", url.as_str());
+            }
+            None => {
+                ui.hyperlink_to("Download", url.as_str());
+            }
+        }
+    });
 }
 
 /// Starts a manual update check (issue #171): spawns a one-shot
@@ -4180,6 +4381,53 @@ fn start_update_check() -> UpdateCheckState {
         })
         .expect("failed to spawn the update-check thread");
     UpdateCheckState::Checking { rx }
+}
+
+/// Starts an in-place update (issue #250): spawns a one-shot `std::thread`
+/// that calls `update_check::install_update` — the download, the "is this
+/// really an executable" check, and the rename dance that puts it over the
+/// running build — and sends the installed executable's path (or the
+/// failure) back over a fresh `crossbeam_channel`. Returns the `Installing`
+/// state `draw_header_menu`'s click handler stores on `OverlayApp` so
+/// `poll_update_check` knows to start draining it.
+///
+/// Off the UI thread for a stronger reason than `start_update_check`'s: this
+/// one pulls tens of megabytes over WinHTTP, so running it inline would
+/// freeze the overlay — on top of the game, always visible — for the entire
+/// download rather than for one request round-trip.
+///
+/// The thread deliberately stops at "the new file is in place". Relaunching
+/// and closing the window are the UI thread's job
+/// (`OverlayApp::finish_update_install`), since only it may send a viewport
+/// command, and a background thread calling `std::process::exit` would tear
+/// the app down mid-frame.
+fn start_update_install(available: CheckOutcome) -> UpdateCheckState {
+    let CheckOutcome::UpdateAvailable {
+        asset_url: Some(asset_url),
+        ..
+    } = &available
+    else {
+        // Unreachable through the UI: `draw_update_available` only draws the
+        // "Update now" button when there *is* an asset. Reported as a failed
+        // install rather than panicked on, because an overlay that dies on a
+        // menu click is worse than one that says it cannot do the thing.
+        return UpdateCheckState::InstallFailed {
+            available,
+            error: "that release doesn't publish a downloadable executable".to_string(),
+        };
+    };
+    let url = asset_url.clone();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    std::thread::Builder::new()
+        .name("update-install".to_string())
+        .spawn(move || {
+            let _ = tx.send(update_check::install_update(
+                &url,
+                env!("CARGO_PKG_VERSION"),
+            ));
+        })
+        .expect("failed to spawn the update-install thread");
+    UpdateCheckState::Installing { available, rx }
 }
 
 /// What one "Export logs" thread reports back (issue #220): the
@@ -14066,7 +14314,7 @@ mod tests {
         app.update_check = UpdateCheckState::Checking { rx };
         tx.send(Ok(CheckOutcome::UpToDate)).unwrap();
 
-        app.poll_update_check();
+        app.poll_update_check(&egui::Context::default());
 
         assert!(matches!(
             app.update_check,
@@ -14093,7 +14341,7 @@ mod tests {
         let (_tx, rx) = crossbeam_channel::unbounded();
         app.update_check = UpdateCheckState::Checking { rx };
 
-        app.poll_update_check();
+        app.poll_update_check(&egui::Context::default());
 
         assert!(matches!(
             app.update_check,
@@ -14125,7 +14373,7 @@ mod tests {
         app.update_check = UpdateCheckState::Checking { rx };
         drop(tx);
 
-        app.poll_update_check();
+        app.poll_update_check(&egui::Context::default());
 
         assert!(
             matches!(app.update_check, UpdateCheckState::Done(Err(_))),
@@ -14278,13 +14526,16 @@ mod tests {
         );
     }
 
-    /// Same shape as the test above, but for the update-available branch:
-    /// both the tag and the "Download" hyperlink's own label must be
-    /// painted — the actual `href` isn't a painted string at all (it's a
-    /// `ViewportCommand::OpenUrl` queued on click, not text), so this only
-    /// covers what a render test can see.
+    /// Same shape as the test above, but for the update-available branch
+    /// of a release that publishes no downloadable executable — every
+    /// release tagged before issue #249 shipped a `.zip`, and issue #250's
+    /// installer has nothing to install for one. That case must keep the
+    /// pre-#250 affordance exactly: the tag, and a plain "Download" link to
+    /// the release page. The actual `href` isn't a painted string at all
+    /// (it's a `ViewportCommand::OpenUrl` queued on click, not text), so
+    /// this only covers what a render test can see.
     #[test]
-    fn draw_header_menu_shows_update_available_with_the_tag_and_a_download_link() {
+    fn draw_header_menu_falls_back_to_a_download_link_when_the_release_has_no_asset() {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
@@ -14294,6 +14545,7 @@ mod tests {
         let mut update_check = UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable {
             tag: "v0.3.0".to_string(),
             url: "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/tag/v0.3.0".to_string(),
+            asset_url: None,
         }));
 
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -14324,6 +14576,241 @@ mod tests {
             texts.contains(&"Download".to_string()),
             "expected the Download hyperlink's label among the painted text, got {texts:?}"
         );
+        assert!(
+            !texts.contains(&"Update now".to_string()),
+            "an install button must not be offered for a release with no asset, got {texts:?}"
+        );
+    }
+
+    /// Renders `draw_header_menu` with `update_check` in `state` and
+    /// returns every string it painted. Issue #250 added three more states
+    /// to that dropdown, and each of them is a line the user has to be able
+    /// to read — asserting on the painted text is the only way to check
+    /// that from a headless host.
+    fn header_menu_texts(state: UpdateCheckState) -> Vec<String> {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let mut update_check = state;
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut update_check,
+                &unused_log_export_sender(),
+            );
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text_shapes(&clipped.shape, &mut texts);
+        }
+        output.drop_without_applying_deltas();
+        texts
+    }
+
+    fn update_available(asset_url: Option<&str>) -> CheckOutcome {
+        CheckOutcome::UpdateAvailable {
+            tag: "v0.3.0".to_string(),
+            url: "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/tag/v0.3.0".to_string(),
+            asset_url: asset_url.map(str::to_string),
+        }
+    }
+
+    /// Issue #250's headline change: a release that publishes an executable
+    /// offers to install it, and demotes the browser link to "Release
+    /// notes" rather than dropping it — reading the notes before updating
+    /// has to stay possible.
+    #[test]
+    fn draw_header_menu_offers_an_install_button_when_the_release_has_an_asset() {
+        let texts = header_menu_texts(UpdateCheckState::Done(Ok(update_available(Some(
+            "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/ShinraMeter-BPSR-v0.3.0-windows-x64.exe",
+        )))));
+        assert!(
+            texts.contains(&"Update available: v0.3.0".to_string()),
+            "expected the update-available line, got {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Update now".to_string()),
+            "expected the install button, got {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Release notes".to_string()),
+            "expected the release-notes link, got {texts:?}"
+        );
+    }
+
+    /// The in-flight state has to name what it is doing; a dropdown that
+    /// went blank mid-download would read as a crash.
+    #[test]
+    fn draw_header_menu_shows_the_download_in_progress() {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let texts = header_menu_texts(UpdateCheckState::Installing {
+            available: update_available(Some("https://github.com/x/y.exe")),
+            rx,
+        });
+        assert!(
+            texts.contains(&"Downloading v0.3.0…".to_string()),
+            "expected the downloading line, got {texts:?}"
+        );
+    }
+
+    #[test]
+    fn draw_header_menu_shows_the_restart() {
+        let texts = header_menu_texts(UpdateCheckState::Restarting);
+        assert!(
+            texts.contains(&"Restarting…".to_string()),
+            "expected the restarting line, got {texts:?}"
+        );
+    }
+
+    /// A failed install must say what went wrong *and* leave the retry one
+    /// click away — a dropped connection is the common case, and making the
+    /// user re-run the whole check first would be gratuitous.
+    #[test]
+    fn draw_header_menu_shows_a_failed_install_and_re_offers_it() {
+        let texts = header_menu_texts(UpdateCheckState::InstallFailed {
+            available: update_available(Some("https://github.com/x/y.exe")),
+            error: "the connection was reset".to_string(),
+        });
+        assert!(
+            texts.contains(&"Update failed: the connection was reset".to_string()),
+            "expected the failure line, got {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Update now".to_string()),
+            "expected the retry button, got {texts:?}"
+        );
+    }
+
+    /// The "Check for updates" button is disabled while a check is in
+    /// flight (issue #171); issue #250 extends that to the install and the
+    /// restart, so a click cannot race the swap. `add_enabled(false, ..)`
+    /// is not observable in painted text, so this drives the state machine
+    /// instead: `start_update_install` on an offer with an asset must land
+    /// in `Installing`, never `Done`.
+    #[test]
+    fn start_update_install_begins_in_the_installing_state() {
+        assert!(matches!(
+            start_update_install(update_available(Some(
+                "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/app.exe"
+            ))),
+            UpdateCheckState::Installing { .. }
+        ));
+    }
+
+    /// Defence in depth for the branch the UI never draws: an offer with no
+    /// asset resolves to a stated failure rather than spawning a thread
+    /// with nothing to download (or panicking on a menu click).
+    #[test]
+    fn start_update_install_refuses_an_offer_with_no_asset() {
+        assert!(matches!(
+            start_update_install(update_available(None)),
+            UpdateCheckState::InstallFailed { .. }
+        ));
+    }
+
+    /// The install thread's counterpart to
+    /// `poll_update_check_reports_a_dead_thread_instead_of_hanging`: a
+    /// dropped sender must resolve to a visible failure rather than leaving
+    /// the dropdown on "Downloading…" with the button disabled forever.
+    #[test]
+    fn poll_update_check_reports_a_dead_install_thread() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+        let (tx, rx) = crossbeam_channel::unbounded::<Result<PathBuf, String>>();
+        app.update_check = UpdateCheckState::Installing {
+            available: update_available(Some("https://github.com/x/y.exe")),
+            rx,
+        };
+        drop(tx);
+
+        app.poll_update_check(&egui::Context::default());
+
+        assert!(
+            matches!(app.update_check, UpdateCheckState::InstallFailed { .. }),
+            "a dead install thread must resolve to a failure, got {:?}",
+            app.update_check
+        );
+    }
+
+    /// A failed install keeps the offer it came from, so the retry button
+    /// has the same asset URL the first attempt used.
+    #[test]
+    fn poll_update_check_keeps_the_offer_when_an_install_fails() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+        let offer = update_available(Some("https://github.com/x/y.exe"));
+        let (tx, rx) = crossbeam_channel::unbounded::<Result<PathBuf, String>>();
+        app.update_check = UpdateCheckState::Installing {
+            available: offer.clone(),
+            rx,
+        };
+        tx.send(Err("the connection was reset".to_string()))
+            .unwrap();
+
+        app.poll_update_check(&egui::Context::default());
+
+        match &app.update_check {
+            UpdateCheckState::InstallFailed { available, error } => {
+                assert_eq!(available, &offer);
+                assert_eq!(error, "the connection was reset");
+            }
+            other => panic!("expected InstallFailed, got {other:?}"),
+        }
+    }
+
+    /// An install still in flight must stay `Installing` — the same
+    /// "don't silently resolve to nothing" guarantee the check has.
+    #[test]
+    fn poll_update_check_leaves_an_in_flight_install_alone() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+        let (_tx, rx) = crossbeam_channel::unbounded::<Result<PathBuf, String>>();
+        app.update_check = UpdateCheckState::Installing {
+            available: update_available(Some("https://github.com/x/y.exe")),
+            rx,
+        };
+
+        app.poll_update_check(&egui::Context::default());
+
+        assert!(matches!(
+            app.update_check,
+            UpdateCheckState::Installing { .. }
+        ));
     }
 
     /// Reset moved out of this menu into the toggle cluster (issue #82;

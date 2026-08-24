@@ -2871,18 +2871,27 @@ pub fn choose_log_export_path(_default_filename: &str) -> Option<std::path::Path
 /// (`INTERNET_DEFAULT_HTTPS_PORT`) — this function has no plain-HTTP path,
 /// on purpose, since its one caller only ever talks to `api.github.com`.
 ///
-/// Synchronous and blocking by design: `update_check::check_for_update`
-/// (the sole caller) is itself only ever run from a spawned
-/// `std::thread`, never the UI thread, so there is nothing here for a
-/// blocking call to stall — see that function's doc comment.
+/// Returns the raw response body. `http_get` below is the UTF-8-decoding
+/// wrapper `update_check::check_for_update` uses for the JSON API response;
+/// this byte-level entry point exists for issue #250's release-asset
+/// download, which is a PE image and must not be pushed through
+/// `String::from_utf8`.
+///
+/// Synchronous and blocking by design: both callers
+/// (`update_check::check_for_update` and `update_check::install_update`)
+/// are themselves only ever run from a spawned `std::thread`, never the UI
+/// thread, so there is nothing here for a blocking call to stall — see
+/// those functions' doc comments.
 #[cfg(windows)]
-pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, String> {
+pub fn http_get_bytes(host: &str, path: &str, user_agent: &str) -> Result<Vec<u8>, String> {
     use windows::Win32::Foundation::GetLastError;
     use windows::Win32::Networking::WinHttp::{
         INTERNET_DEFAULT_HTTPS_PORT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+        WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP,
         WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect,
         WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable, WinHttpQueryHeaders,
-        WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
+        WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
+        WinHttpSetTimeouts,
     };
     use windows::core::PCWSTR;
 
@@ -2930,13 +2939,43 @@ pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, Stri
     // name resolution on 0, which WinHTTP documents as "infinite", so a
     // stalled resolver, a captive portal or a firewall that drops rather
     // than refuses would block this thread — and, with it, the header
-    // dropdown's "Checking…" state — forever. This is a user-triggered
-    // check against a single small JSON endpoint, so a few seconds each is
-    // plenty: 5s to resolve, 5s to connect, 10s to send and 10s to receive.
-    // Set on the session handle, before `WinHttpConnect`, so every handle
-    // derived from it inherits them.
-    unsafe { WinHttpSetTimeouts(session.0, 5_000, 5_000, 10_000, 10_000) }
+    // dropdown's "Checking…"/"Downloading…" state — forever. Both callers
+    // are user-triggered, so a few seconds each is plenty: 5s to resolve,
+    // 5s to connect, 10s to send and 30s to receive. Set on the session
+    // handle, before `WinHttpConnect`, so every handle derived from it
+    // inherits them.
+    //
+    // The receive timeout is *per read operation*, not for the whole
+    // response — WinHTTP restarts it for each `WinHttpQueryDataAvailable` /
+    // `WinHttpReadData` pair — so 30s does not cap how long a multi-megabyte
+    // release-asset download (issue #250) may take in total; it only says
+    // how long a single stalled chunk is tolerated. The JSON check (issue
+    // #171) never comes close to it either way.
+    unsafe { WinHttpSetTimeouts(session.0, 5_000, 5_000, 10_000, 30_000) }
         .map_err(|err| format!("WinHttpSetTimeouts failed: {err}"))?;
+
+    // Issue #250: a release asset's `browser_download_url` is not the file —
+    // `github.com/.../releases/download/...` answers 302 and points at
+    // `objects.githubusercontent.com`, so a client that does not follow
+    // redirects downloads a few hundred bytes of nothing. WinHTTP follows
+    // redirects by default, but that default is left implicit, and it is
+    // exactly the kind of default a future hardening pass flips without
+    // realising a download depends on it. Set it explicitly, and set it to
+    // the *guarded* policy rather than `ALWAYS`: HTTPS→HTTP is refused, so a
+    // hijacked or misconfigured redirect cannot silently downgrade the
+    // transport for a binary this process is about to run as Administrator.
+    let policy: u32 = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+    unsafe {
+        WinHttpSetOption(
+            Some(session.0),
+            WINHTTP_OPTION_REDIRECT_POLICY,
+            Some(std::slice::from_raw_parts(
+                std::ptr::from_ref(&policy).cast::<u8>(),
+                std::mem::size_of::<u32>(),
+            )),
+        )
+    }
+    .map_err(|err| format!("WinHttpSetOption(REDIRECT_POLICY) failed: {err}"))?;
 
     let host_w = wide(host);
     let connect = unsafe {
@@ -2995,7 +3034,9 @@ pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, Stri
     }
     .map_err(|err| format!("WinHttpQueryHeaders failed: {err}"))?;
     if status != 200 {
-        return Err(format!("GitHub releases API returned HTTP {status}"));
+        // Reached only after redirects have already been followed, so this is
+        // the status of the response that actually carries the body.
+        return Err(format!("https://{host}{path} returned HTTP {status}"));
     }
 
     // Drained in a loop, per WinHTTP's own documented pattern:
@@ -3025,16 +3066,31 @@ pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, Stri
         body.extend_from_slice(&chunk);
     }
 
-    String::from_utf8(body).map_err(|err| format!("response was not valid UTF-8: {err}"))
+    Ok(body)
 }
 
-/// Non-Windows stub — see `http_get`'s doc comment. Dev/CI hosts for this
-/// crate are Linux, so `update_check`'s tests exercise only the pure
-/// parsing/comparison logic and never call this at all; a real "is an
-/// update available" answer needs a real Windows build.
+/// Non-Windows stub — see `http_get_bytes`'s doc comment. Dev/CI hosts for
+/// this crate are Linux, so `update_check`'s tests exercise only the pure
+/// parsing/comparison/path logic and never call this at all; a real "is an
+/// update available" answer, or a real download, needs a real Windows build.
 #[cfg(not(windows))]
-pub fn http_get(_host: &str, _path: &str, _user_agent: &str) -> Result<String, String> {
+pub fn http_get_bytes(_host: &str, _path: &str, _user_agent: &str) -> Result<Vec<u8>, String> {
     Err("update checks are only supported on Windows builds".to_string())
+}
+
+/// Text flavour of `http_get_bytes`: the same single request, with the body
+/// decoded as UTF-8. `update_check::check_for_update`'s JSON response goes
+/// through here; the binary release-asset download (issue #250) calls
+/// `http_get_bytes` directly, since a PE image is not text and
+/// `String::from_utf8` would reject it outright.
+///
+/// Deliberately a wrapper rather than a second request path — issue #250
+/// asks for exactly one HTTP implementation in this crate, and everything
+/// that makes the WinHTTP call correct (timeouts, the redirect policy, the
+/// status check, the chunked drain) stays in one place because of it.
+pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, String> {
+    let body = http_get_bytes(host, path, user_agent)?;
+    String::from_utf8(body).map_err(|err| format!("response was not valid UTF-8: {err}"))
 }
 
 #[cfg(test)]
