@@ -36,7 +36,9 @@ pub enum FightEndCause {
     BossDeath,
     /// [`FightConfig::idle_timeout_ms`] elapsed with no player damage.
     IdleTimeout,
-    /// Every known party member was down (issue #154).
+    /// The party was down and the pull was over — every known member down
+    /// at a player death (issue #154), or most of the roster down at the
+    /// moment the boss's HP bar rolled back to full (issue #259).
     Wipe,
     /// The server session changed under a running fight — a reconnect, or
     /// a transition that re-issues uids (issue #138).
