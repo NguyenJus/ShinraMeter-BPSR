@@ -88,6 +88,11 @@ pub fn map_event(
     imagine_tiers: Option<[Option<i32>; 2]>,
 ) -> meter::ProtocolEvent {
     match ev {
+        ProtocolEvent::Cast(c) => meter::ProtocolEvent::Cast(meter::CastEvent {
+            caster_uid: c.caster_uid,
+            skill_id: c.skill_id,
+            timestamp_ms: c.timestamp_ms,
+        }),
         ProtocolEvent::Damage(d) => meter::ProtocolEvent::Damage(meter::DamageEvent {
             attacker_uid: d.attacker_uid,
             attacker_kind: map_kind(d.attacker_kind),

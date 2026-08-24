@@ -12,7 +12,7 @@ pub mod tables;
 
 pub use encounter::{Meter, skill_row_from_stats};
 pub use event::{
-    Class, DamageEvent, DisappearReason, EDungeonState, EnemyHp, EntityKind, PlayerInfo,
+    CastEvent, Class, DamageEvent, DisappearReason, EDungeonState, EnemyHp, EntityKind, PlayerInfo,
     ProtocolEvent, Role,
 };
 pub use fight::{FightConfig, FightEndCause, FightState};

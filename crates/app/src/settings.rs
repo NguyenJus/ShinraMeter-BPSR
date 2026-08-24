@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use egui::Color32;
 
+use crate::custom_image::ImageSlot;
 use crate::ui::{
     CRIT_PCT_RGB, DEATH_COUNT_RGB, LUCKY_PCT_RGB, STAT_TEXT_RGB, StatColumn, fmt_pct0, fmt_share,
     fmt_short,
@@ -358,6 +359,31 @@ pub struct Settings {
     /// than the intended 5-second floor.
     #[serde(default = "default_history_min_duration_ms")]
     pub history_min_duration_ms: u64,
+    /// Issue #121: an arbitrary local image file to paint behind the header
+    /// band instead of the compiled-in gradient wash and oversized emblem
+    /// (`ui::draw_header_wash`), or `None` for the default artwork. Loaded,
+    /// cover-cropped and cached at runtime by `custom_image`; painted at
+    /// `.gamma_multiply(opacity)` like every other background surface, so
+    /// the existing opacity slider fades it exactly as it fades
+    /// `ui::PANEL_FILL`.
+    ///
+    /// Absolute, as the native picker hands it over. Nothing validates it
+    /// here — a path that has since been moved, deleted or replaced with a
+    /// non-image degrades to the default artwork and surfaces the reason in
+    /// the settings dropdown (`custom_image::CustomImages::error`), which is
+    /// deliberately the *only* consequence: a bad path must never keep the
+    /// overlay from starting.
+    ///
+    /// `#[serde(default)]` gives a settings.json written before this field
+    /// `None` — the same back-compat guarantee `window_position` documents.
+    #[serde(default)]
+    pub header_image: Option<PathBuf>,
+    /// Issue #253: the sister of `header_image` for the player-row list
+    /// below the header band. Independent of it by design — the issue is
+    /// explicit that a user may want one, the other, or both — and subject
+    /// to the same loading, opacity and failure rules. See `header_image`.
+    #[serde(default)]
+    pub backdrop_image: Option<PathBuf>,
 }
 
 /// The `opacity` default (issue #233): restores the panel to the ~78%
@@ -439,6 +465,11 @@ impl Default for Settings {
             history_max_encounters: default_history_max_encounters(),
             history_max_age_days: default_history_max_age_days(),
             history_min_duration_ms: default_history_min_duration_ms(),
+            // Issues #121/#253: no custom artwork out of the box — the
+            // compiled-in header wash and the bare panel fill are the
+            // defaults, and `reset_to_defaults` puts them back.
+            header_image: None,
+            backdrop_image: None,
         }
     }
 }
@@ -570,6 +601,56 @@ impl Settings {
     /// `Settings::default().opacity` or hardcoding `1.0`.
     pub fn default_opacity() -> f32 {
         default_opacity()
+    }
+
+    /// The image configured for `slot` (issues #121, #253), or `None` for
+    /// "paint the default artwork". One accessor over the two fields rather
+    /// than two call-site `match`es: `ui.rs` builds the settings dropdown's
+    /// two rows, and paints the two regions, from the same code
+    /// parameterized by `ImageSlot`.
+    pub fn background_image(&self, slot: ImageSlot) -> Option<&Path> {
+        match slot {
+            ImageSlot::Header => self.header_image.as_deref(),
+            ImageSlot::Backdrop => self.backdrop_image.as_deref(),
+        }
+    }
+
+    /// Points `slot` at `path`, or clears it with `None`. In-place, then
+    /// the caller clones and sends — the same shape `toggle_click_through`
+    /// uses, and for the same reason: this only ever changes on a deliberate
+    /// click in the settings dropdown, so there is no per-frame jitter for a
+    /// `with_..._if_changed` idiom to gate against.
+    ///
+    /// Deliberately does no validation. Whether the file exists, is
+    /// readable, or decodes is `custom_image`'s question, answered at paint
+    /// time and reported back through the dropdown; answering it here would
+    /// only mean answering it twice and disagreeing whenever the file
+    /// changed between the two.
+    pub fn set_background_image(&mut self, slot: ImageSlot, path: Option<PathBuf>) {
+        match slot {
+            ImageSlot::Header => self.header_image = path,
+            ImageSlot::Backdrop => self.backdrop_image = path,
+        }
+    }
+
+    /// Issue #121: restores every user customization this struct carries.
+    ///
+    /// Literally `*self = Settings::default()`, and that is the point — the
+    /// header dropdown's "Reset to defaults" item (issue #203) previously
+    /// reset only `opacity` (plus a viewport resize command that never
+    /// touched this struct at all), so each field added since then silently
+    /// escaped the reset. Assigning the whole struct means a field added
+    /// tomorrow is covered the day it lands, with no list here to keep in
+    /// sync; `reset_to_defaults_restores_every_field` is what holds that.
+    ///
+    /// That includes `window_position`/`window_size`: both go back to
+    /// `None`, i.e. "nothing saved". The live window is not moved by this
+    /// (the caller sends its own `ViewportCommand::InnerSize`), and the very
+    /// next frame's position/size report repopulates them — which is
+    /// correct, since what the user asked to discard is the *customization*,
+    /// not the window they are looking at.
+    pub fn reset_to_defaults(&mut self) {
+        *self = Self::default();
     }
 
     /// Clamps `value` into `OPACITY_MIN..=OPACITY_MAX`. Handles non-finite
@@ -1373,6 +1454,154 @@ mod tests {
         assert_eq!(Settings::default_opacity(), Settings::default().opacity);
     }
 
+    // -- custom background images (issues #121, #253) ---------------------
+
+    /// Both new fields survive a save/load cycle, and survive it
+    /// *independently*: #253 is explicit that a user may configure one
+    /// region, the other, or both, so a round trip that only ever carried
+    /// them together would not prove what the feature promises.
+    #[test]
+    fn round_trip_preserves_background_images() {
+        let path = temp_settings_path("background-images-roundtrip");
+        let mut settings = Settings::default();
+        settings.set_background_image(ImageSlot::Header, Some(PathBuf::from("C:/art/header.png")));
+        settings.set_background_image(ImageSlot::Backdrop, Some(PathBuf::from("C:/art/rows.jpg")));
+        save_to(&path, &settings);
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded, settings);
+        assert_eq!(
+            loaded.background_image(ImageSlot::Header),
+            Some(Path::new("C:/art/header.png"))
+        );
+        assert_eq!(
+            loaded.background_image(ImageSlot::Backdrop),
+            Some(Path::new("C:/art/rows.jpg"))
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn round_trip_preserves_one_background_image_without_the_other() {
+        let path = temp_settings_path("background-image-header-only");
+        let mut settings = Settings::default();
+        settings.set_background_image(ImageSlot::Backdrop, Some(PathBuf::from("rows.webp")));
+        save_to(&path, &settings);
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded.background_image(ImageSlot::Header), None);
+        assert_eq!(
+            loaded.background_image(ImageSlot::Backdrop),
+            Some(Path::new("rows.webp"))
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A settings.json written before issues #121/#253 has neither key and
+    /// must still deserialize — the `#[serde(default)]` back-compat
+    /// guarantee `window_position` documents.
+    #[test]
+    fn settings_json_without_image_keys_falls_back_to_no_custom_images() {
+        let path = temp_settings_path("no-image-keys");
+        fs::write(&path, br#"{"visible_columns":["Damage","Dps"]}"#).expect("write fixture");
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded.header_image, None);
+        assert_eq!(loaded.backdrop_image, None);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clearing_a_background_image_leaves_the_other_slot_alone() {
+        let mut settings = Settings::default();
+        settings.set_background_image(ImageSlot::Header, Some(PathBuf::from("a.png")));
+        settings.set_background_image(ImageSlot::Backdrop, Some(PathBuf::from("b.png")));
+
+        settings.set_background_image(ImageSlot::Header, None);
+
+        assert_eq!(settings.background_image(ImageSlot::Header), None);
+        assert_eq!(
+            settings.background_image(ImageSlot::Backdrop),
+            Some(Path::new("b.png"))
+        );
+    }
+
+    // -- reset to defaults (issue #121) -----------------------------------
+
+    /// Issue #121 asks for a reset that covers "the custom header image,
+    /// display/visible columns, window size, etc." — so this mutates
+    /// *every* field away from its default and requires the whole struct
+    /// back, rather than spot-checking the three the issue happens to name.
+    /// That is also what keeps a field added tomorrow from silently
+    /// escaping the reset.
+    #[test]
+    fn reset_to_defaults_restores_every_field() {
+        let mut settings = Settings {
+            visible_columns: vec![ColumnKind::Hits],
+            window_position: Some([12.0, 34.0]),
+            window_size: Some([640.0, 480.0]),
+            click_through: !Settings::default().click_through,
+            always_on_top: !Settings::default().always_on_top,
+            history_enabled: !Settings::default().history_enabled,
+            history_max_encounters: 1,
+            history_max_age_days: 1,
+            history_min_duration_ms: 1,
+            ..Settings::default()
+        };
+        settings.set_opacity(0.25);
+        settings.set_background_image(ImageSlot::Header, Some(PathBuf::from("header.png")));
+        settings.set_background_image(ImageSlot::Backdrop, Some(PathBuf::from("rows.png")));
+        assert_ne!(settings, Settings::default(), "the fixture must differ");
+
+        settings.reset_to_defaults();
+
+        assert_eq!(settings, Settings::default());
+    }
+
+    /// The three the issue names, asserted by name as well, so a future
+    /// change that narrowed the reset would fail with a message that says
+    /// which promise it broke rather than just "structs differ".
+    #[test]
+    fn reset_to_defaults_clears_the_customizations_issue_121_names() {
+        let mut settings = Settings {
+            visible_columns: vec![ColumnKind::SharePct],
+            window_size: Some([1234.0, 567.0]),
+            ..Settings::default()
+        };
+        settings.set_background_image(ImageSlot::Header, Some(PathBuf::from("header.png")));
+        settings.set_background_image(ImageSlot::Backdrop, Some(PathBuf::from("rows.png")));
+
+        settings.reset_to_defaults();
+
+        assert_eq!(
+            settings.visible_columns,
+            Settings::default().visible_columns
+        );
+        assert_eq!(settings.window_size, None);
+        assert_eq!(settings.background_image(ImageSlot::Header), None);
+        assert_eq!(settings.background_image(ImageSlot::Backdrop), None);
+        assert_eq!(settings.opacity, Settings::default_opacity());
+    }
+
+    /// The reset is what a user reaches for after breaking something, so it
+    /// has to survive round-tripping through the file the app actually
+    /// reads back on the next launch.
+    #[test]
+    fn reset_to_defaults_round_trips_as_a_fresh_settings_file() {
+        let path = temp_settings_path("reset-roundtrip");
+        let mut settings = Settings::default();
+        settings.set_background_image(ImageSlot::Header, Some(PathBuf::from("header.png")));
+        settings.set_opacity(0.1);
+        settings.reset_to_defaults();
+        save_to(&path, &settings);
+
+        assert_eq!(load_from(&path), Settings::default());
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn round_trip_preserves_opacity() {
         let path = temp_settings_path("opacity-roundtrip");
@@ -1663,11 +1892,16 @@ mod tests {
             lucky_pct: 0.0,
             hits: 0,
             deaths: 12,
+            dead_ms: Some(0),
             ability_score: None,
             season_strength: None,
             imagines: [None, None],
             imagine_tiers: [None, None],
             skills: Vec::new(),
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
         };
         assert_eq!((ColumnKind::Deaths.spec().text)(&row), "12");
     }

@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::event::{
-    Class, DamageEvent, DisappearReason, EDungeonState, EnemyHp, EntityKind, PlayerInfo,
+    CastEvent, Class, DamageEvent, DisappearReason, EDungeonState, EnemyHp, EntityKind, PlayerInfo,
     ProtocolEvent,
 };
 use crate::fight::{FightConfig, FightEndCause, FightState};
@@ -100,6 +100,39 @@ const BOSS_ENGAGEMENT_WINDOW_MS: u64 = 60_000;
 /// wedge this exists to bound.
 const WIPE_HOLD_RELEASE_MS: u64 = 60_000;
 
+/// Fraction of the roster that must be down *at the instant a boss's HP bar
+/// rolls back* for that rollback to be read as a wipe rather than as a bare
+/// reset (issue #259).
+///
+/// The damage-event wipe path ([`Meter::party_is_wiped`]) demands the whole
+/// roster be down, and has to: a death packet on its own says nothing about
+/// whether the pull is over, so anything short of unanimity there would
+/// freeze the meter mid-fight. The rollback path carries that second signal
+/// itself — the boss the party burned below `hp_drop_below_pct` is back at
+/// `hp_rollback_at_pct` or above, which is the server resetting the
+/// encounter, i.e. the pull is over as a matter of fact rather than of
+/// inference. With that in hand the roster no longer has to be unanimous,
+/// and demanding that it be is what made issue #259's outcome a coin flip:
+/// whether the attempt was recorded depended on whether the last death
+/// packet happened to land before the HP sync did.
+///
+/// Four in five — 12 of a 15-player raid — because the roster is not
+/// exactly "the party still fighting": it can hold a straggler who is
+/// genuinely up (a healer out of range of whatever finished the group, a
+/// player battle-rezzed seconds before the server gave up on the pull, or
+/// a row `apply_damage` opened for someone outside the party), and each of
+/// those alone must not veto the wipe. Three such rows in a fifteen-player
+/// raid is the headroom this buys.
+///
+/// Deliberately measured against `players.len()` rather than a party size
+/// from the roster packet: `players` is the only roster this crate has, and
+/// it is what both wipe paths already read. Note that the `party_down=N/M`
+/// figure in the `reset`/issue #151 log lines counts players with
+/// `deaths > 0` — cumulative, per issue #212 — so it is an upper bound on
+/// how many were down at any one instant and cannot be used to calibrate
+/// this constant directly.
+const WIPE_PARTY_DOWN_FRACTION: f64 = 0.8;
+
 /// The most health an enemy may have been last seen with for its despawn to
 /// be readable as a death (issue #215), as a percentage of its pool.
 ///
@@ -161,7 +194,7 @@ fn engaged_within_window(last_damaged_ms: Option<u64>, engaged_at: Option<u64>) 
 /// has actually engaged this fight and that is not known to be dead.
 ///
 /// The identity half of the question every boss-liveness guard asks —
-/// [`Meter::engaged_boss_still_up`], [`Meter::has_other_living_boss`] and
+/// [`Meter::engaged_boss_still_up`], [`Meter::other_living_boss`] and
 /// [`Meter::apply_enemy_gone`] all start here. `took_damage` is what scopes
 /// it to the current encounter (a boss standing in a room the party walked
 /// past was never part of one), and "not known to be dead" is
@@ -169,7 +202,7 @@ fn engaged_within_window(last_damaged_ms: Option<u64>, engaged_at: Option<u64>) 
 ///
 /// Deliberately says nothing about *recency*: the callers disagree there.
 /// Two of them always require [`engaged_within_window`] on top (see
-/// [`is_engaged_recognized_boss`]); `has_other_living_boss` requires it only
+/// [`is_engaged_recognized_boss`]); `other_living_boss` requires it only
 /// inside a boss-select scene, where a sequential next selection must not
 /// hold the current one's death open.
 fn is_damaged_living_boss(e: &EnemyState) -> bool {
@@ -628,7 +661,7 @@ impl Meter {
     /// back to the idle timeout — which, being derived rather than stored,
     /// then ends it retroactively at the last hit.
     ///
-    /// Deliberately scoped by `took_damage`, like `has_other_living_boss`:
+    /// Deliberately scoped by `took_damage`, like `other_living_boss`:
     /// a boss standing in the room the party walked past is not a pull in
     /// progress.
     ///
@@ -709,6 +742,10 @@ impl Meter {
     pub fn apply(&mut self, ev: &ProtocolEvent) -> Option<ResetReason> {
         match ev {
             ProtocolEvent::Damage(d) => self.apply_damage(d),
+            ProtocolEvent::Cast(c) => {
+                self.apply_cast(c);
+                None
+            }
             ProtocolEvent::Player(p) => {
                 self.apply_player(p);
                 None
@@ -1331,8 +1368,16 @@ impl Meter {
             }
         }
 
-        // Healing view is a non-goal: heal events never touch damage totals
-        // or fight timing.
+        // issue #245: the per-tab breakdowns the skill window's Heal,
+        // "Skill dealt" and "Skill received" tabs read. Recorded here, and
+        // deliberately above both of the early returns that follow: the
+        // `is_heal` return below drops the events the Heal tab is entirely
+        // about, and the `attacker_kind != Player` return further down
+        // drops the monster damage the received tab is mostly about.
+        self.record_breakdowns(d);
+
+        // Healing never touches damage totals or fight timing — it reaches
+        // the UI only through the Heal / dealt tabs recorded just above.
         if d.is_heal {
             return reason;
         }
@@ -1467,7 +1512,7 @@ impl Meter {
     /// timeout still ends the fight.
     ///
     /// issue #210/#211: *not* a raid boss pulled alongside another that the
-    /// party has genuinely moved on from, though — `has_other_living_boss`
+    /// party has genuinely moved on from, though — `other_living_boss`
     /// is scene-aware. In a boss-select scene a sequential next selection
     /// (untouched, or touched long enough ago to fall outside
     /// `BOSS_ENGAGEMENT_WINDOW_MS`) does not count, so killing the
@@ -1496,19 +1541,52 @@ impl Meter {
         // objective tracking says the instance is still running and its
         // current objective is not yet complete, this boss's death is a
         // phase of the instance, not the end of the fight —
-        // `has_other_living_boss` cannot catch this on its own, since it
+        // `other_living_boss` cannot catch this on its own, since it
         // only sees enemies the party has actually `took_damage` on, and a
         // raid's next boss standing unengaged nearby is invisible to it
         // until the party's first hit lands.
-        if recognized
-            && self.fight_start_ms.is_some()
-            && self.fight_end_ms.is_none()
-            && !self.has_other_living_boss(uid, now_ms)
-            && !self.dungeon_objective_still_running()
-        {
+        if !recognized || self.fight_start_ms.is_none() || self.fight_end_ms.is_some() {
+            return;
+        }
+        let other_boss = self.other_living_boss(uid, now_ms);
+        // issue #256: computed unconditionally rather than short-circuited
+        // behind `other_boss.is_none()` — the diagnostic log line below
+        // reports `dungeon_objective_still_running={objective_holds}` on
+        // every path that falls through here, including when `other_boss`
+        // alone is why the fight didn't end, so the value is needed either
+        // way. Don't restore the `&&`'s short-circuit; it would silently
+        // break that field.
+        let objective_holds = self.dungeon_objective_still_running();
+        if other_boss.is_none() && !objective_holds {
             self.latch_fight_end(FightEndCause::BossDeath, now_ms, monster_id);
             self.fight_end_boss_id = monster_id;
+            return;
         }
+        // issue #256: the two guards above are the *only* way a recognized
+        // boss's death fails to end a running fight, and until now a refusal
+        // was invisible — the fight simply fell through to the idle timeout a
+        // minute later and the log said `cause=idle_timeout`, with nothing to
+        // say which guard had dropped the signal or on what. Sparse by
+        // construction (issue #69): a recognized boss dies at most a handful
+        // of times per instance, so this is one line per boss death that did
+        // not end its fight, never a per-packet flood. Both guards and every
+        // input either of them read are named, so one capture is enough to
+        // decide the next case without another round of guessing.
+        log::info!(
+            "encounter: boss death of uid={uid} monster_id={} did not end the fight: \
+             other_living_boss={} dungeon_objective_still_running={objective_holds} \
+             scene={} boss_select={} dungeon_state={:?} current_objective={:?} \
+             objective_complete={:?} (issue #256)",
+            monster_id.map_or(-1i64, i64::from),
+            other_boss.unwrap_or(-1),
+            self.scene_id.map_or(-1i64, i64::from),
+            self.scene_id.is_some_and(phase::is_boss_select_scene),
+            self.dungeon_state,
+            self.current_objective_id,
+            self.current_objective_id
+                .and_then(|id| self.objectives.get(&id))
+                .and_then(|obj| obj.complete),
+        );
     }
 
     /// True while the dungeon's own tracking says a boss death alone must
@@ -1519,6 +1597,26 @@ impl Meter {
     /// session on a build that never sends `0x17`/`0x18` never gates
     /// `end_fight_on_boss_death` here at all.
     fn dungeon_objective_still_running(&self) -> bool {
+        // issue #256: never inside a boss-select raid. §8's premise is that
+        // a boss dying while the instance's own objective is unfinished is a
+        // *phase* of one fight rather than the end of it — true of an
+        // ordinary dungeon, where the objective advances with the run, and
+        // false of a raid, where the objective tracks the whole raid ("defeat
+        // the Remnants") and stays incomplete across every selection's death
+        // but the last. Gating there suppressed **every** boss-death end in
+        // scene 13023 — six days of logs hold zero `cause=boss_death` for any
+        // 103xxx boss — and reinstated, from the dungeon side, exactly the
+        // hold that issue #210/#211 had just removed from
+        // `other_living_boss`: a raid's next selection standing unengaged
+        // must not keep the current selection's death from ending the fight.
+        // The unengaged-neighbour case §8 was reaching for is therefore
+        // conceded here on purpose; killing a selection *is* the end of a
+        // pull, and a genuinely concurrent pair (Dreambloom Ruins' Caprahorn
+        // twins) is still held open by `other_living_boss`'s co-engagement
+        // rule, which sees them because the party is hitting both.
+        if self.scene_id.is_some_and(phase::is_boss_select_scene) {
+            return false;
+        }
         if !self.dungeon_state.is_some_and(|s| s != EDungeonState::Null) {
             return false;
         }
@@ -1615,7 +1713,7 @@ impl Meter {
     ///    fight by vanishing, however low its health.
     /// 4. It took damage from the party. A boss standing in a room the party
     ///    walked past and streamed out again was never part of an encounter —
-    ///    the same scoping `has_other_living_boss` and `engaged_boss_still_up`
+    ///    the same scoping `other_living_boss` and `engaged_boss_still_up`
     ///    use.
     /// 5. It is a *recognized* boss (`tables::is_boss_monster`). Without this
     ///    the biggest trash mob in a pull ends the fight every time the AOI
@@ -1667,7 +1765,7 @@ impl Meter {
     /// When the rule does fire the despawn is routed through exactly the same
     /// machinery a death packet is: `mark_enemy_dead`, then `recompute_boss`,
     /// then `end_fight_on_boss_death` — which keeps its own guards
-    /// (`has_other_living_boss`, `dungeon_objective_still_running`), so a
+    /// (`other_living_boss`, `dungeon_objective_still_running`), so a
     /// multi-part boss or an instance whose own objective tracking says the
     /// run is still going still holds the pull open. The end is stamped at
     /// `last_event_ms`, the last real player damage, not at the despawn
@@ -1768,13 +1866,24 @@ impl Meter {
     /// boss-select scene the check stays unconditional, as it always has —
     /// an ordinary dungeon's multi-phase/multi-part pull (the Dragonbane
     /// Golem cannons, say) has no "next selection" to distinguish from.
-    fn has_other_living_boss(&self, dying_uid: i64, now_ms: u64) -> bool {
+    ///
+    /// Returns the offending uid rather than a bare `bool` (issue #256) so
+    /// `end_fight_on_boss_death`'s refusal diagnostic can name *which* enemy
+    /// it thinks is still up — the single fact that separates a genuine
+    /// concurrent pair from a stale row, and the one the log could not
+    /// previously supply. Which uid is reported when several qualify is
+    /// unspecified (`enemies` is a `HashMap`) — the guard's answer is the
+    /// yes/no, and the uid is a diagnostic hint, not a contract.
+    fn other_living_boss(&self, dying_uid: i64, now_ms: u64) -> Option<i64> {
         let boss_select = self.scene_id.is_some_and(phase::is_boss_select_scene);
-        self.enemies.iter().any(|(uid, e)| {
-            *uid != dying_uid
-                && is_damaged_living_boss(e)
-                && (!boss_select || engaged_within_window(e.last_damaged_ms, Some(now_ms)))
-        })
+        self.enemies
+            .iter()
+            .find(|(uid, e)| {
+                **uid != dying_uid
+                    && is_damaged_living_boss(e)
+                    && (!boss_select || engaged_within_window(e.last_damaged_ms, Some(now_ms)))
+            })
+            .map(|(uid, _)| *uid)
     }
 
     /// Whether every party member the meter knows about is down *right
@@ -1806,6 +1915,32 @@ impl Meter {
             && self.fight_end_ms.is_none()
             && !self.players.is_empty()
             && self.players.values().all(|p| !p.alive)
+    }
+
+    /// The looser sibling of [`Self::party_is_wiped`], for the one caller
+    /// that already holds independent proof the pull is over: at least
+    /// [`WIPE_PARTY_DOWN_FRACTION`] of the roster is down *right now*
+    /// (issue #259).
+    ///
+    /// Same `alive`-not-`deaths` reading as `party_is_wiped`, and for the
+    /// same issue #212 reason — a cumulative death counter would make this
+    /// creep true through any long pull with battle rezzes. The only
+    /// difference is unanimity, which the rollback path can afford to drop
+    /// (see [`WIPE_PARTY_DOWN_FRACTION`]) and the death path cannot.
+    ///
+    /// `party_is_wiped` implies this: everyone down is at least four in
+    /// five down, for any non-empty roster.
+    fn party_mostly_down(&self) -> bool {
+        if self.fight_start_ms.is_none() || self.fight_end_ms.is_some() || self.players.is_empty() {
+            return false;
+        }
+        let down = self.players.values().filter(|p| !p.alive).count();
+        // Multiply rather than divide: no division by zero to reason about
+        // (the empty roster is already refused above) and no rounding rule
+        // to pick — a 15-player raid needs 12 down, a 4-player dungeon 4
+        // (3.2 rounded up by the `>=`), which is the strict reading for a
+        // roster too small to have room for a straggler.
+        down as f64 >= self.players.len() as f64 * WIPE_PARTY_DOWN_FRACTION
     }
 
     /// Whether the wipe hold forbids reading `d` as the first hit of the
@@ -1959,6 +2094,60 @@ impl Meter {
     /// ever having attacked (e.g. a healer or a fresh join), so this cannot
     /// rely on an entry the attacker-side path in `apply_damage` already
     /// made.
+    /// Counts one skill activation against its caster (issue #245).
+    ///
+    /// Deliberately inert beyond that count. A cast does not start the
+    /// fight clock, does not advance `last_event_ms`, does not end a hold,
+    /// and is not evidence of a revive — the attr it is decoded from rides
+    /// every delta a player's client sends, in town as much as in a
+    /// dungeon, so treating it as combat activity would keep the meter
+    /// permanently "in a fight" and dilute every DPS figure with the walk
+    /// back to the vendor.
+    ///
+    /// `get_mut`, not `entry`: same rule the breakdowns below follow. A
+    /// stranger casting past the player must not open a row in a fight
+    /// they are no part of, and a cast carries no damage to justify one.
+    /// A cast that arrives while a finished fight is held on screen is
+    /// dropped, for the same reason every other event is.
+    fn apply_cast(&mut self, c: &CastEvent) {
+        if self.fight_end_ms.is_some() {
+            return;
+        }
+        if let Some(stats) = self.players.get_mut(&c.caster_uid) {
+            *stats.casts.entry(c.skill_id).or_insert(0) += 1;
+        }
+    }
+
+    /// Accumulates one event into issue #245's per-tab breakdowns: the
+    /// attacker's outgoing healing, and the target's incoming everything
+    /// (damage taken and healing received alike).
+    ///
+    /// `get_mut`, never the `entry` API the outgoing-damage path uses —
+    /// the same rule the revive detection in `apply_damage` follows. These
+    /// views may enrich a row the roster already holds, but must never
+    /// *open* one: a stranger healing their way past the player in town,
+    /// or a field mob swinging at a passer-by, is not a participant in
+    /// this encounter and must not appear as a row in it.
+    fn record_breakdowns(&mut self, d: &DamageEvent) {
+        if d.is_heal
+            && d.attacker_kind == EntityKind::Player
+            && let Some(stats) = self.players.get_mut(&d.attacker_uid)
+        {
+            accumulate_skill(stats.heals.entry(d.skill_id).or_default(), d);
+            if !d.is_miss {
+                stats.total_heal += d.value;
+            }
+        }
+        if d.target_kind == EntityKind::Player
+            && let Some(stats) = self.players.get_mut(&d.target_uid)
+        {
+            accumulate_skill(stats.incoming.entry(d.skill_id).or_default(), d);
+            if !d.is_miss {
+                stats.total_incoming += d.value;
+            }
+        }
+    }
+
     fn record_death(&mut self, target_uid: i64, timestamp_ms: u64) {
         let stats = self
             .players
@@ -2171,12 +2360,49 @@ impl Meter {
                 enemy.monster_id.is_some_and(tables::is_boss_monster)
                     && check_hp_rollback(enemy, &self.reset_cfg)
             };
-            // issue #78: while the last fight's stats are held, a boss HP bar
-            // refilling (the corpse resyncing, or the next party pulling it)
-            // must not clear them. The hold is only ever ended by combat the
-            // *user* is part of, or by an explicit reset.
-            let held = self.fight_ended_at(e.timestamp_ms).is_some();
             if should_reset {
+                // issue #259: a rollback with the party on the floor is a
+                // *wipe*, and a wipe is a fight end — the attempt is worth
+                // keeping and worth recording. Ordered ahead of the reset
+                // rather than left to race it: previously whichever path
+                // happened to fire first decided whether the pull reached
+                // the history database at all, so the same boss in the same
+                // scene ended `cause=wipe` on one raid night and vanished as
+                // `reset reason=BossHpRollback` on the next. The two are not
+                // alternatives — the wipe describes the attempt that just
+                // ended, the reset clears the slate for the next one — so
+                // this latches the end and lets the `held` test below do the
+                // deferring, which is the same mechanism the `Scene` arm
+                // already relies on: a fight frozen in this very call has not
+                // had one tick to be observed as `Ended` and recorded, and
+                // resetting it here would erase it before anything outside
+                // this crate ever saw it. The next pull's first hit on a
+                // recognized boss clears the hold through `NewFight`.
+                //
+                // `party_mostly_down`, not `party_is_wiped`: the rollback is
+                // itself the proof the pull is over, so the roster does not
+                // have to be unanimous (see `WIPE_PARTY_DOWN_FRACTION`).
+                // No `engaged_boss_still_up` gate either, the way the
+                // death-packet path needs one — `should_reset` has already
+                // established that the enemy this is measured off is a
+                // recognized boss whose bar the party burned down and the
+                // server put back, which is a stronger statement of the same
+                // fact.
+                if self.party_mostly_down() {
+                    self.latch_fight_end(
+                        FightEndCause::Wipe,
+                        e.timestamp_ms,
+                        self.boss_monster_id(),
+                    );
+                    self.wipe_hold = true;
+                }
+                // issue #78: while the last fight's stats are held, a boss HP
+                // bar refilling (the corpse resyncing, or the next party
+                // pulling it) must not clear them. The hold is only ever
+                // ended by combat the *user* is part of, or by an explicit
+                // reset. Read *after* the wipe latch above, so a wipe this
+                // same sync just latched is one of the holds it honours.
+                let held = self.fight_ended_at(e.timestamp_ms).is_some();
                 if cooldown_ok && !held {
                     self.reset(ResetReason::BossHpRollback, e.timestamp_ms);
                     return Some(ResetReason::BossHpRollback);
@@ -2435,6 +2661,32 @@ impl Meter {
     }
 
     pub fn snapshot(&self, now_ms: u64) -> Snapshot {
+        self.snapshot_focused(now_ms, None)
+    }
+
+    /// Same as [`Meter::snapshot`], but skips the four breakdown-tab
+    /// vectors (`heals`, `dealt`, `received`, `casts`) for any player not
+    /// named in `focus` — building only `skills`, which every row needs for
+    /// the always-visible Dps bar.
+    ///
+    /// `focus` is the set of player uids with an open skill-breakdown
+    /// window (`crates/app/src/ui.rs`'s `skill_windows` keys), threaded in
+    /// from the UI via `UiCommand::SkillFocus`
+    /// (`crates/app/src/pipeline.rs`'s live publish loop). `None` means
+    /// "build every breakdown for every player" — [`Meter::snapshot`]'s own
+    /// behavior, and every non-live caller (tests, replay/history, the
+    /// sanitizer) goes through that path unchanged.
+    ///
+    /// This exists because the live pipeline (`crates/app/src/pipeline.rs`)
+    /// publishes a snapshot ~10x/second regardless of whether any skill
+    /// window is even open, and a skill window is closed almost all the
+    /// time (PR #268 review, finding 2): sorting four extra `Vec<SkillRow>`
+    /// per player on every tick for tabs nobody is looking at is pure
+    /// waste. Gating by player rather than by (player, tab) keeps this
+    /// crate ignorant of `bpsr-app`'s `SkillTab` type, and means flipping
+    /// tabs on an already-open window never has to wait a tick for data
+    /// that was already being built for that player.
+    pub fn snapshot_focused(&self, now_ms: u64, focus: Option<&[i64]>) -> Snapshot {
         let total_damage: i64 = self.players.values().map(|p| p.total_damage).sum();
 
         // issue #78: once the fight has ended the snapshot is rendered as of
@@ -2465,6 +2717,26 @@ impl Meter {
                     0.0
                 };
                 let skills = skill_rows(p, dps_duration_ms);
+                // issue #245, gated per PR #268 review finding 2: one
+                // vector per breakdown tab, built here rather than lazily on
+                // the UI side because every one of them needs
+                // `dps_duration_ms`, which is snapshot-local. `focus` limits
+                // this real work to players whose skill window is actually
+                // open (see `snapshot_focused`'s doc comment) — everyone
+                // else gets the same empty vectors `SkillTab::rows` already
+                // returns for `Buff`, which is indistinguishable from "no
+                // events yet" to every consumer since none is looking.
+                let wants_breakdowns = focus.is_none_or(|uids| uids.contains(&p.uid));
+                let (heals, dealt, received, casts) = if wants_breakdowns {
+                    (
+                        breakdown_rows(&p.heals, p.total_heal, dps_duration_ms),
+                        dealt_rows(p, dps_duration_ms),
+                        breakdown_rows(&p.incoming, p.total_incoming, dps_duration_ms),
+                        cast_rows(p, dps_duration_ms),
+                    )
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                };
                 PlayerRow {
                     uid: p.uid,
                     name: p
@@ -2483,7 +2755,15 @@ impl Meter {
                     lucky_pct: p.lucky_pct(),
                     hits: p.hits,
                     deaths: p.deaths,
+                    // Issue #254: `effective_now_ms`, not `now_ms` — an
+                    // ended fight's rows are frozen as of its end, and a
+                    // death still open then stops accruing with them.
+                    dead_ms: Some(p.dead_ms_as_of(effective_now_ms)),
                     skills,
+                    heals,
+                    dealt,
+                    received,
+                    casts,
                 }
             })
             .collect();
@@ -2639,15 +2919,90 @@ pub fn skill_row_from_stats(
 /// function so the per-skill arithmetic sits beside its own unit tests
 /// rather than buried in the row-building closure.
 fn skill_rows(stats: &PlayerStats, dps_duration_ms: u64) -> Vec<SkillRow> {
-    let mut rows: Vec<SkillRow> = stats
-        .skills
+    breakdown_rows(&stats.skills, stats.total_damage, dps_duration_ms)
+}
+
+/// Folds one event's amount/crit/lucky facts into a per-skill accumulator
+/// (issue #245), mirroring `Meter::apply_damage`'s own outgoing-damage
+/// bookkeeping exactly: `hits` counts the swing whether or not it landed
+/// (a miss is a use of the skill, not a non-event), while every amount is
+/// gated on `!is_miss`.
+fn accumulate_skill(skill: &mut SkillStats, d: &DamageEvent) {
+    skill.hits += 1;
+    if d.is_miss {
+        return;
+    }
+    skill.total_damage += d.value;
+    if d.crit {
+        skill.crit_hits += 1;
+        skill.crit_damage += d.value;
+        skill.max_crit = skill.max_crit.max(d.value);
+    }
+    if d.lucky {
+        skill.lucky_hits += 1;
+        skill.lucky_damage += d.value;
+    }
+}
+
+/// Turns any per-skill accumulator map into display rows, amount-descending
+/// (issue #245). The generalisation of the original `skill_rows`: `total`
+/// is whichever player total that map's `% ` column divides by — damage
+/// dealt, healing done, or amount received — so the four breakdown tabs
+/// share one arithmetic path (`skill_row_from_stats`) and can never drift
+/// apart in how a share, an average or a hit rate is computed.
+fn breakdown_rows(
+    skills: &HashMap<i32, SkillStats>,
+    total: i64,
+    dps_duration_ms: u64,
+) -> Vec<SkillRow> {
+    let mut rows: Vec<SkillRow> = skills
         .iter()
-        .map(|(&skill_id, skill)| {
-            skill_row_from_stats(skill_id, skill, stats.total_damage, dps_duration_ms)
-        })
+        .map(|(&skill_id, skill)| skill_row_from_stats(skill_id, skill, total, dps_duration_ms))
         .collect();
     rows.sort_by_key(|s| std::cmp::Reverse(s.damage));
     rows
+}
+
+/// The Skill casts tab's rows (issue #245): one row per skill this player
+/// has begun, cast-count-descending.
+///
+/// Goes through `skill_row_from_stats` like every other breakdown so the
+/// per-minute rate shares the Dps tab's denominator exactly — a cast rate
+/// and a hit rate that disagreed about how long the fight was would be
+/// worse than either alone. Every amount-shaped field falls out as `0`
+/// from an all-zero `SkillStats`, which is correct: a cast has no amount,
+/// and the tab shows no amount column.
+fn cast_rows(stats: &PlayerStats, dps_duration_ms: u64) -> Vec<SkillRow> {
+    let mut rows: Vec<SkillRow> = stats
+        .casts
+        .iter()
+        .map(|(&skill_id, &count)| {
+            let stats = SkillStats {
+                hits: count,
+                ..Default::default()
+            };
+            skill_row_from_stats(skill_id, &stats, 0, dps_duration_ms)
+        })
+        .collect();
+    rows.sort_by_key(|s| std::cmp::Reverse(s.hits));
+    rows
+}
+
+/// The "Skill dealt" tab's rows (issue #245): everything this player put
+/// out, damage and healing merged under one skill id. A skill that both
+/// damages and heals lands in both accumulators and is summed here, which
+/// is what "amount dealt" means for it — `SkillStats::merge` maxes
+/// `max_crit` rather than summing it, being a running max.
+fn dealt_rows(stats: &PlayerStats, dps_duration_ms: u64) -> Vec<SkillRow> {
+    let mut merged = stats.skills.clone();
+    for (&skill_id, heal) in &stats.heals {
+        merged.entry(skill_id).or_default().merge(heal);
+    }
+    breakdown_rows(
+        &merged,
+        stats.total_damage + stats.total_heal,
+        dps_duration_ms,
+    )
 }
 
 /// Builds the "scene changed" diagnostic line (issue #69), or `None` when
@@ -2776,6 +3131,296 @@ mod tests {
             timestamp_ms: ts,
             ..Default::default()
         })
+    }
+
+    // -- issue #245: Heal / Skill dealt / Skill received breakdowns -------
+
+    fn heal(
+        attacker_uid: i64,
+        target_uid: i64,
+        skill_id: i32,
+        value: i64,
+        ts: u64,
+    ) -> ProtocolEvent {
+        ProtocolEvent::Damage(DamageEvent {
+            attacker_uid,
+            attacker_kind: EntityKind::Player,
+            target_uid,
+            target_kind: EntityKind::Player,
+            skill_id,
+            value,
+            is_heal: true,
+            timestamp_ms: ts,
+            ..Default::default()
+        })
+    }
+
+    fn hit_on_player(
+        attacker_uid: i64,
+        attacker_kind: EntityKind,
+        target_uid: i64,
+        skill_id: i32,
+        value: i64,
+        ts: u64,
+    ) -> ProtocolEvent {
+        ProtocolEvent::Damage(DamageEvent {
+            attacker_uid,
+            attacker_kind,
+            target_uid,
+            target_kind: EntityKind::Player,
+            skill_id,
+            value,
+            timestamp_ms: ts,
+            ..Default::default()
+        })
+    }
+
+    fn cast(caster_uid: i64, skill_id: i32, ts: u64) -> ProtocolEvent {
+        ProtocolEvent::Cast(CastEvent {
+            caster_uid,
+            skill_id,
+            timestamp_ms: ts,
+        })
+    }
+
+    #[test]
+    fn casts_are_counted_per_skill_for_a_player_in_the_roster() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 1000));
+        m.apply(&cast(1, 1550, 1100));
+        m.apply(&cast(1, 1550, 1200));
+        m.apply(&cast(1, 1551, 1300));
+        let snap = m.snapshot(2000);
+        let row = &snap.rows[0];
+        assert_eq!(row.casts.len(), 2);
+        // Cast-count-descending, like every other breakdown's amount.
+        assert_eq!(row.casts[0].skill_id, 1550);
+        assert_eq!(row.casts[0].hits, 2);
+        assert_eq!(row.casts[1].skill_id, 1551);
+        assert_eq!(row.casts[1].hits, 1);
+        // A cast has no amount, and the tab shows no amount column.
+        assert_eq!(row.casts[0].damage, 0);
+        assert_eq!(row.casts[0].share_pct, 0.0);
+    }
+
+    /// A cast rides every delta a player's client sends, in town as much
+    /// as in a dungeon — so it must not open a row, start the fight clock,
+    /// or advance the idle deadline.
+    #[test]
+    fn a_cast_alone_never_opens_a_row_or_starts_a_fight() {
+        let mut m = Meter::new();
+        m.apply(&cast(1, 1550, 1000));
+        assert!(m.snapshot(2000).rows.is_empty());
+        assert!(!m.is_active());
+    }
+
+    #[test]
+    fn casts_share_the_dps_windows_per_minute_denominator() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0));
+        m.apply(&dmg(1, 100, 5_000));
+        for ts in 0..6 {
+            m.apply(&cast(1, 1550, ts * 1_000));
+        }
+        let snap = m.snapshot(5_000);
+        let row = &snap.rows[0];
+        // Two hits and six casts over the same window, so the cast rate is
+        // exactly three times the Dps tab's hit rate for the same skill —
+        // an assertion that pins the shared denominator without restating
+        // how `snapshot` computes it.
+        assert_eq!(row.skills[0].hits, 2);
+        assert_eq!(row.casts[0].hits, 6);
+        assert!(
+            (row.casts[0].hits_per_min - 3.0 * row.skills[0].hits_per_min).abs() < 0.01,
+            "cast rate {} vs hit rate {}",
+            row.casts[0].hits_per_min,
+            row.skills[0].hits_per_min
+        );
+    }
+
+    #[test]
+    fn healing_lands_on_the_heal_tab_for_a_player_already_in_the_roster() {
+        let mut m = Meter::new();
+        // Open the row with real damage first — healing alone must not.
+        m.apply(&dmg(1, 100, 1000));
+        m.apply(&heal(1, 2, 55, 400, 1100));
+        m.apply(&heal(1, 2, 55, 600, 1200));
+        let snap = m.snapshot(2000);
+        let row = &snap.rows[0];
+        assert_eq!(row.heals.len(), 1);
+        assert_eq!(row.heals[0].skill_id, 55);
+        assert_eq!(row.heals[0].damage, 1000);
+        assert_eq!(row.heals[0].hits, 2);
+        // The share column divides by healing done, not damage done.
+        assert!((row.heals[0].share_pct - 100.0).abs() < 0.01);
+        // ...and none of it leaks into the damage view.
+        assert_eq!(row.damage, 100);
+        assert_eq!(row.skills.len(), 1);
+    }
+
+    #[test]
+    fn healing_alone_never_opens_a_row() {
+        let mut m = Meter::new();
+        m.apply(&heal(1, 2, 55, 400, 1000));
+        assert!(m.snapshot(2000).rows.is_empty());
+    }
+
+    #[test]
+    fn damage_taken_lands_on_the_received_tab() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 1000));
+        // A monster hitting the player: dropped by the damage pipeline's
+        // `attacker_kind != Player` return, but it is exactly what the
+        // received tab exists to show.
+        m.apply(&hit_on_player(9, EntityKind::Monster, 1, 77, 250, 1100));
+        m.apply(&hit_on_player(9, EntityKind::Monster, 1, 77, 250, 1200));
+        let snap = m.snapshot(2000);
+        let row = &snap.rows[0];
+        assert_eq!(row.received.len(), 1);
+        assert_eq!(row.received[0].skill_id, 77);
+        assert_eq!(row.received[0].damage, 500);
+        assert_eq!(row.received[0].hits, 2);
+        assert!((row.received[0].share_pct - 100.0).abs() < 0.01);
+        // The attacker was a monster, so no second row was opened for it.
+        assert_eq!(snap.rows.len(), 1);
+    }
+
+    #[test]
+    fn healing_received_lands_on_the_received_tab_too() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 1000));
+        m.apply(&dmg(2, 100, 1000));
+        m.apply(&heal(2, 1, 55, 300, 1100));
+        let snap = m.snapshot(2000);
+        let healed = snap.rows.iter().find(|r| r.uid == 1).expect("uid 1");
+        assert_eq!(healed.received.len(), 1);
+        assert_eq!(healed.received[0].skill_id, 55);
+        assert_eq!(healed.received[0].damage, 300);
+        // ...and the healer's own received tab stays empty.
+        let healer = snap.rows.iter().find(|r| r.uid == 2).expect("uid 2");
+        assert!(healer.received.is_empty());
+    }
+
+    #[test]
+    fn the_dealt_tab_merges_outgoing_damage_and_healing() {
+        let mut m = Meter::new();
+        // Skill 10 damages, skill 55 heals, skill 20 does both.
+        m.apply(&ProtocolEvent::Damage(DamageEvent {
+            attacker_uid: 1,
+            attacker_kind: EntityKind::Player,
+            target_uid: 9,
+            target_kind: EntityKind::Monster,
+            skill_id: 10,
+            value: 700,
+            timestamp_ms: 1000,
+            ..Default::default()
+        }));
+        m.apply(&ProtocolEvent::Damage(DamageEvent {
+            attacker_uid: 1,
+            attacker_kind: EntityKind::Player,
+            target_uid: 9,
+            target_kind: EntityKind::Monster,
+            skill_id: 20,
+            value: 100,
+            timestamp_ms: 1100,
+            ..Default::default()
+        }));
+        m.apply(&heal(1, 2, 20, 200, 1200));
+        m.apply(&heal(1, 2, 55, 50, 1300));
+        let snap = m.snapshot(2000);
+        let row = &snap.rows[0];
+
+        let dealt: HashMap<i32, &SkillRow> = row.dealt.iter().map(|r| (r.skill_id, r)).collect();
+        assert_eq!(dealt.len(), 3);
+        assert_eq!(dealt[&10].damage, 700);
+        assert_eq!(dealt[&20].damage, 300);
+        assert_eq!(dealt[&20].hits, 2);
+        assert_eq!(dealt[&55].damage, 50);
+        // Shares divide by everything dealt: 700 + 300 + 50 = 1050.
+        assert!((dealt[&10].share_pct - 700.0 / 1050.0 * 100.0).abs() < 0.01);
+        // Rows arrive amount-descending, like every other breakdown.
+        assert_eq!(
+            row.dealt.iter().map(|r| r.skill_id).collect::<Vec<_>>(),
+            vec![10, 20, 55]
+        );
+        // The Dps tab is untouched by the merge.
+        assert_eq!(row.skills.len(), 2);
+    }
+
+    #[test]
+    fn a_missed_heal_counts_as_a_use_but_adds_no_amount() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 1000));
+        m.apply(&ProtocolEvent::Damage(DamageEvent {
+            attacker_uid: 1,
+            attacker_kind: EntityKind::Player,
+            target_uid: 2,
+            target_kind: EntityKind::Player,
+            skill_id: 55,
+            value: 400,
+            is_heal: true,
+            is_miss: true,
+            timestamp_ms: 1100,
+            ..Default::default()
+        }));
+        let snap = m.snapshot(2000);
+        let row = &snap.rows[0];
+        assert_eq!(row.heals.len(), 1);
+        assert_eq!(row.heals[0].hits, 1);
+        assert_eq!(row.heals[0].damage, 0);
+    }
+
+    #[test]
+    fn a_crit_heal_feeds_the_heal_tabs_crit_columns() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 1000));
+        m.apply(&ProtocolEvent::Damage(DamageEvent {
+            attacker_uid: 1,
+            attacker_kind: EntityKind::Player,
+            target_uid: 2,
+            target_kind: EntityKind::Player,
+            skill_id: 55,
+            value: 900,
+            is_heal: true,
+            crit: true,
+            timestamp_ms: 1100,
+            ..Default::default()
+        }));
+        m.apply(&heal(1, 2, 55, 100, 1200));
+        let snap = m.snapshot(2000);
+        let heal_row = &snap.rows[0].heals[0];
+        assert_eq!(heal_row.crit_hits, 1);
+        assert_eq!(heal_row.max_crit, 900);
+        assert!((heal_row.crit_pct - 50.0).abs() < 0.01);
+        assert!((heal_row.avg_crit - 900.0).abs() < 0.01);
+        assert!((heal_row.avg_white - 100.0).abs() < 0.01);
+        assert!((heal_row.avg - 500.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn merging_skill_stats_maxes_the_crit_rather_than_summing_it() {
+        let mut a = SkillStats {
+            total_damage: 100,
+            hits: 1,
+            crit_hits: 1,
+            crit_damage: 100,
+            max_crit: 100,
+            ..Default::default()
+        };
+        let b = SkillStats {
+            total_damage: 40,
+            hits: 1,
+            crit_hits: 1,
+            crit_damage: 40,
+            max_crit: 40,
+            ..Default::default()
+        };
+        a.merge(&b);
+        assert_eq!(a.total_damage, 140);
+        assert_eq!(a.hits, 2);
+        assert_eq!(a.crit_hits, 2);
+        assert_eq!(a.crit_damage, 140);
+        assert_eq!(a.max_crit, 100);
     }
 
     #[test]
@@ -3651,6 +4296,106 @@ mod tests {
             assert_eq!(row.deaths, 1);
             assert_eq!(row.damage, 0);
             assert_eq!(row.hits, 0);
+        }
+
+        /// Issue #254: the death packet's timestamp opens the interval and
+        /// this player's next acted event closes it — the only revive
+        /// evidence this decoder gets (`PlayerStats::alive`).
+        #[test]
+        fn a_death_and_the_next_action_bound_one_dead_interval() {
+            let mut m = Meter::new();
+            m.apply(&dmg(2, 100, 1_000));
+            m.apply(&death_hit(1, 2, 2_000));
+            m.apply(&dmg(2, 100, 9_000));
+            let snap = m.snapshot(10_000);
+            let row = snap.rows.iter().find(|r| r.uid == 2).unwrap();
+            assert_eq!(row.dead_ms, Some(7_000));
+        }
+
+        /// Two deaths in one pull sum, rather than the second overwriting
+        /// the first.
+        #[test]
+        fn multiple_deaths_in_one_encounter_sum_their_intervals() {
+            let mut m = Meter::new();
+            m.apply(&dmg(2, 100, 1_000));
+            m.apply(&death_hit(1, 2, 2_000));
+            m.apply(&dmg(2, 100, 5_000));
+            m.apply(&death_hit(1, 2, 10_000));
+            m.apply(&dmg(2, 100, 12_500));
+            let snap = m.snapshot(13_000);
+            let row = snap.rows.iter().find(|r| r.uid == 2).unwrap();
+            assert_eq!(row.deaths, 2);
+            assert_eq!(row.dead_ms, Some(3_000 + 2_500));
+        }
+
+        /// A player still down when the snapshot is taken accrues up to the
+        /// snapshot's clock — the live half of the "open death" rule (the
+        /// frozen half is `a_death_open_at_the_wipe_counts_up_to_the_freeze`
+        /// in the wipe tests).
+        #[test]
+        fn a_death_with_no_revive_yet_counts_up_to_the_snapshot_clock() {
+            let mut m = Meter::new();
+            m.apply(&dmg(2, 100, 1_000));
+            m.apply(&death_hit(1, 2, 2_000));
+            let row = |snap: &Snapshot| snap.rows.iter().find(|r| r.uid == 2).unwrap().dead_ms;
+            assert_eq!(row(&m.snapshot(6_000)), Some(4_000));
+            assert_eq!(
+                row(&m.snapshot(9_000)),
+                Some(7_000),
+                "an open death ticks with the clock, like the fight timer"
+            );
+        }
+
+        /// A retransmitted death packet is debounced out of the *count*;
+        /// it must not quietly move the open interval's start forward
+        /// either (`PlayerStats::dead_since_ms`).
+        #[test]
+        fn a_duplicate_death_packet_does_not_shorten_the_dead_interval() {
+            let mut m = Meter::new();
+            m.apply(&death_hit(1, 2, 2_000));
+            m.apply(&death_hit(1, 2, 2_000 + DEATH_DEBOUNCE_MS - 1));
+            m.apply(&dmg(2, 100, 9_000));
+            let snap = m.snapshot(10_000);
+            let row = snap.rows.iter().find(|r| r.uid == 2).unwrap();
+            assert_eq!(row.deaths, 1);
+            assert_eq!(row.dead_ms, Some(7_000));
+        }
+
+        /// `set_alive`'s clamp: a hit retransmitted *behind* the death it
+        /// preceded is not a battle rez, so it neither ends the interval
+        /// nor rewinds it.
+        #[test]
+        fn an_action_older_than_the_death_does_not_end_the_dead_interval() {
+            let mut m = Meter::new();
+            m.apply(&death_hit(1, 2, 5_000));
+            m.apply(&dmg(2, 100, 4_000));
+            let snap = m.snapshot(9_000);
+            let row = snap.rows.iter().find(|r| r.uid == 2).unwrap();
+            assert_eq!(row.dead_ms, Some(4_000), "still down, counting from 5_000");
+        }
+
+        /// Zero, not "unmeasured": the meter watched this player the whole
+        /// pull and they never hit the floor. `None` is reserved for rows
+        /// replayed out of the history database.
+        #[test]
+        fn a_player_who_never_died_reports_zero_dead_time() {
+            let mut m = Meter::new();
+            m.apply(&dmg(2, 100, 1_000));
+            let snap = m.snapshot(9_000);
+            assert_eq!(snap.rows[0].dead_ms, Some(0));
+        }
+
+        #[test]
+        fn reset_clears_dead_time() {
+            let mut m = Meter::new();
+            m.apply(&death_hit(1, 2, 1_000));
+            m.reset(ResetReason::Manual, 2_000);
+            m.apply(&dmg(2, 50, 3_000));
+            let snap = m.snapshot(9_000);
+            assert_eq!(
+                snap.rows.iter().find(|r| r.uid == 2).unwrap().dead_ms,
+                Some(0)
+            );
         }
 
         #[test]
@@ -5478,6 +6223,27 @@ mod tests {
             assert_eq!(m.fight_state(6_500), FightState::Active);
         }
 
+        /// Issue #254: nobody revives after a wipe, so the last death of
+        /// the pull stays open forever. It is counted up to the fight's
+        /// *end*, not to the caller's clock, so a held attempt's death time
+        /// freezes with the rest of its numbers.
+        #[test]
+        fn a_death_open_at_the_wipe_counts_up_to_the_freeze() {
+            let m = wiped();
+            let dead = |snap: &Snapshot, uid: i64| {
+                snap.rows.iter().find(|r| r.uid == uid).unwrap().dead_ms
+            };
+            let snap = m.snapshot(66_000);
+            assert_eq!(dead(&snap, 1), Some(1_000), "down at 5_000, wipe at 6_000");
+            assert_eq!(dead(&snap, 2), Some(0), "fell as the fight ended");
+            let later = m.snapshot(120_000);
+            assert_eq!(
+                dead(&later, 1),
+                Some(1_000),
+                "a frozen attempt's death time must not keep ticking"
+            );
+        }
+
         #[test]
         fn monster_damage_during_the_wipe_hold_does_not_restart_the_clock() {
             let mut m = wiped();
@@ -5929,6 +6695,96 @@ mod tests {
                 "a hit older than the death it preceded cannot revive a corpse"
             );
         }
+
+        /// A five-player instance roster, the boss burned to 20% — far
+        /// enough below `hp_drop_below_pct` to arm the rollback detector —
+        /// and 10_000 damage on the board (issue #259).
+        fn five_player_pull() -> Meter {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: RAID_SCENE,
+            });
+            for uid in 1..=5 {
+                m.apply(&player_info(uid, "Party"));
+            }
+            m.apply(&enemy_hp(BOSS_UID, 1_000_000, BOSS, 0));
+            m.apply(&hit(1, BOSS_UID, 5_000, 1_000));
+            m.apply(&hit(2, BOSS_UID, 5_000, 1_500));
+            m.apply(&enemy_hp(BOSS_UID, 200_000, BOSS, 4_000));
+            m
+        }
+
+        /// The boss's bar snapping back to full — the server giving up on
+        /// the pull.
+        fn rollback(ts: u64) -> ProtocolEvent {
+            enemy_hp(BOSS_UID, 1_000_000, BOSS, ts)
+        }
+
+        /// Issue #259: whether a failed attempt reached the history
+        /// database was luck. The two paths that can claim a lost pull —
+        /// the death packet's wipe latch and the HP-rollback reset — were
+        /// unordered, so the same boss in the same scene ended `cause=wipe`
+        /// ten times on one raid night and vanished as
+        /// `reset reason=BossHpRollback` 31 times on the next.
+        ///
+        /// The shape that loses the race: the roster is not unanimously
+        /// down when the bar refills — here one of five is a straggler who
+        /// never produced a death packet at all — so the death path's
+        /// `party_is_wiped` never fires, and the rollback arrives to find a
+        /// live fight it is entitled to throw away. `party_mostly_down`
+        /// (four of five, the `WIPE_PARTY_DOWN_FRACTION` threshold) is what
+        /// claims it as a wipe first, and the `held` test then defers the
+        /// reset so the ended attempt survives long enough to be recorded.
+        #[test]
+        fn a_rollback_with_the_party_down_ends_as_a_wipe_instead_of_discarding_the_attempt() {
+            let mut m = five_player_pull();
+            for uid in 1..=4 {
+                m.apply(&killing_blow(uid, 5_000 + uid as u64 * 100));
+            }
+            assert_eq!(
+                m.fight_end_ms, None,
+                "four of five down is not the unanimous wipe the death path demands, \
+                 which is exactly why this case used to be lost"
+            );
+
+            let reason = m.apply(&rollback(6_000));
+
+            assert_eq!(
+                reason, None,
+                "the attempt is ended and kept, not thrown away as a reset"
+            );
+            assert_eq!(
+                m.fight_end_ms,
+                Some(6_000),
+                "latched as a wipe at the rollback"
+            );
+            assert!(m.wipe_hold, "held for review like any other wipe");
+            assert_eq!(m.fight_state(6_500), FightState::Ended);
+            assert_eq!(
+                m.snapshot(6_500).total_damage,
+                10_000,
+                "the wiped attempt's rows survive for the history recorder to see"
+            );
+        }
+
+        /// The control (issue #259): a rollback with the party still
+        /// standing is not a wipe — it is the boss being abandoned,
+        /// de-aggroed or re-pulled by someone else, which is the case the
+        /// reset heuristic exists for. Two of five down is below
+        /// `WIPE_PARTY_DOWN_FRACTION`, so nothing about the old behaviour
+        /// changes here.
+        #[test]
+        fn a_rollback_with_most_of_the_party_still_up_still_resets() {
+            let mut m = five_player_pull();
+            m.apply(&killing_blow(1, 5_000));
+            m.apply(&killing_blow(2, 5_100));
+
+            let reason = m.apply(&rollback(6_000));
+
+            assert_eq!(reason, Some(ResetReason::BossHpRollback));
+            assert_eq!(m.fight_end_ms, None, "a reset, not a fight end");
+            assert_eq!(m.snapshot(6_500).total_damage, 0);
+        }
     }
 
     /// Issue #210/#211: a boss-select raid scene lets the party pick which
@@ -6057,7 +6913,7 @@ mod tests {
             // *before* the `boss_uid == target_uid` guard below is checked
             // — unless that fact is captured first.
             //
-            // Defect 3: even with the ordering fixed, `has_other_living_boss`
+            // Defect 3: even with the ordering fixed, `other_living_boss`
             // must not read Continuation as "another living boss" holding
             // the pull open just because it is the raid's other selection —
             // sequential play, issue #150/#210's raid shape, not Caprahorn's
@@ -6105,7 +6961,7 @@ mod tests {
             // its Caprahorn selection spawns *two* equal-HP bosses fought
             // *concurrently* rather than sequentially
             // (`phase::BOSS_SELECT_SCENES`'s own doc comment). A blanket
-            // "boss-select scene disables `has_other_living_boss`" fix would
+            // "boss-select scene disables `other_living_boss`" fix would
             // end the fight the instant the first twin falls even though its
             // partner is still being actively hit — exactly the bug
             // `the_second_of_a_boss_pair_holds_the_pull_open_after_the_first_dies`
@@ -6171,6 +7027,33 @@ mod tests {
                 level_map_id: RAID_SCENE,
             });
             m
+        }
+
+        /// An ordinary dungeon: a `tables::is_dungeon_scene` id that is
+        /// *not* in `phase::BOSS_SELECT_SCENES`, so issue #139 §8's
+        /// objective gate still applies to it (issue #256).
+        const DUNGEON_SCENE: u32 = 1_001;
+
+        fn in_dungeon() -> Meter {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: DUNGEON_SCENE,
+            });
+            m
+        }
+
+        /// The instance reporting a run in progress with one objective open
+        /// and unfinished — the state issue #139 §8's gate reads.
+        fn objective_running(m: &mut Meter) {
+            m.apply(&ProtocolEvent::DungeonState {
+                state: EDungeonState::Active,
+                scene_uuid: None,
+            });
+            m.apply(&ProtocolEvent::DungeonObjective {
+                target_id: 100,
+                nums: Some(0),
+                complete: Some(false),
+            });
         }
 
         fn hp(uid: i64, curr: u64, max: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
@@ -6370,7 +7253,7 @@ mod tests {
             // few minutes on trash. The boss finally streams out of AOI.
             // `BOSS_ENGAGEMENT_WINDOW_MS` is what separates that from a
             // corpse being removed mid-pull, exactly as it does for
-            // `engaged_boss_still_up` and `has_other_living_boss`.
+            // `engaged_boss_still_up` and `other_living_boss`.
             let mut m = pull();
             m.apply(&hp(OTHER_UID, 50_000, 50_000, TRASH, 1_600));
             let step = idle() - 1_000;
@@ -6442,7 +7325,7 @@ mod tests {
         }
 
         /// PR #239 review, finding 2: the despawn death is routed through
-        /// `end_fight_on_boss_death`, so `has_other_living_boss` still
+        /// `end_fight_on_boss_death`, so `other_living_boss` still
         /// governs it — Dreambloom Ruins' Caprahorn pair is fought
         /// concurrently in a boss-select scene, and one twin's corpse
         /// vanishing must not freeze the meter while the other is still
@@ -6476,18 +7359,16 @@ mod tests {
         /// objective is incomplete, this boss was a phase of it. The
         /// damage-death path's equivalent is
         /// `dungeon::a_boss_death_does_not_end_the_fight_while_the_objective_is_still_incomplete`.
+        ///
+        /// In an *ordinary* dungeon since issue #256: the gate no longer
+        /// applies inside a boss-select raid, where the objective tracks the
+        /// whole raid rather than the pull. See
+        /// `a_raid_selections_death_ends_the_fight_despite_the_raids_own_objective`
+        /// for that half.
         #[test]
         fn a_despawn_does_not_end_the_fight_while_the_objective_is_still_running() {
-            let mut m = in_raid();
-            m.apply(&ProtocolEvent::DungeonState {
-                state: EDungeonState::Active,
-                scene_uuid: None,
-            });
-            m.apply(&ProtocolEvent::DungeonObjective {
-                target_id: 100,
-                nums: Some(0),
-                complete: Some(false),
-            });
+            let mut m = in_dungeon();
+            objective_running(&mut m);
             m.apply(&hp(BOSS_UID, 1_000_000, 1_000_000, ORIGIN, 0));
             m.apply(&hit(BOSS_UID, 1_000));
             m.apply(&hp(BOSS_UID, 30_000, 1_000_000, ORIGIN, 1_500));
@@ -6512,16 +7393,8 @@ mod tests {
         /// would pass just as happily if the despawn rule stopped working.
         #[test]
         fn a_despawn_ends_the_fight_once_the_objective_completes() {
-            let mut m = in_raid();
-            m.apply(&ProtocolEvent::DungeonState {
-                state: EDungeonState::Active,
-                scene_uuid: None,
-            });
-            m.apply(&ProtocolEvent::DungeonObjective {
-                target_id: 100,
-                nums: Some(0),
-                complete: Some(false),
-            });
+            let mut m = in_dungeon();
+            objective_running(&mut m);
             m.apply(&ProtocolEvent::DungeonObjective {
                 target_id: 100,
                 nums: None,
@@ -6709,6 +7582,89 @@ mod tests {
                 "full bar, no reason given: still a range-out"
             );
         }
+
+        /// Issue #256, the whole of it: scene 13023's despawn-as-death rule
+        /// fired on every logged clear and the fight *still* ended
+        /// `cause=idle_timeout` in the same second, three times out of three
+        /// — six days of logs hold no `cause=boss_death` for any 103xxx boss
+        /// at all. Both of `end_fight_on_boss_death`'s guards are reproduced
+        /// here at once, in the shape the raid actually presents them:
+        ///
+        /// * the raid's *next* selection is standing there recognized and
+        ///   alive but never engaged, which is `other_living_boss`'s case
+        ///   (it must not count — issue #210/#211); and
+        /// * the instance is streaming its own objective, which stays
+        ///   incomplete until the last of the three Remnants falls, which
+        ///   is issue #139 §8's gate — the one that actually refused, since
+        ///   `other_living_boss` had already been taught to let a sequential
+        ///   selection through.
+        ///
+        /// A boss-select raid's objective describes the raid, not the pull,
+        /// so it must not gate a selection's death. `Some(1_000)` rather
+        /// than any later value is the other half of the fix being real:
+        /// the end is stamped at the last hit, not a minute later when the
+        /// idle timeout would otherwise have reclaimed it.
+        #[test]
+        fn a_raid_selections_death_ends_the_fight_despite_the_raids_own_objective() {
+            let mut m = in_raid();
+            objective_running(&mut m);
+            // The next selection: recognized, alive, and never touched.
+            m.apply(&hp(OTHER_UID, 1_000_000, 1_000_000, CONTINUATION, 0));
+            m.apply(&hp(BOSS_UID, 2_000_000, 2_000_000, ORIGIN, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            m.apply(&hp(BOSS_UID, 60_000, 2_000_000, ORIGIN, 1_500));
+            assert_eq!(m.boss_uid, Some(BOSS_UID), "the engaged selection");
+
+            m.apply(&gone(BOSS_UID));
+
+            assert_eq!(
+                m.fight_end_ms,
+                Some(1_000),
+                "the selection's death ends the fight at the last hit"
+            );
+            assert_eq!(
+                m.fight_end_boss_id,
+                Some(ORIGIN),
+                "a boss-death end -- only `end_fight_on_boss_death` sets this, \
+                 so an idle-timeout end would leave it `None`"
+            );
+            assert_eq!(m.fight_state(1_600), FightState::Ended);
+            assert!(
+                m.enemies[&OTHER_UID].is_alive(),
+                "the untouched next selection is still standing -- it simply \
+                 has no say in whether this pull ended"
+            );
+        }
+
+        /// The counterweight to the test above: dropping the objective gate
+        /// in a boss-select scene must not drop `other_living_boss` with it.
+        /// Dreambloom Ruins is a boss-select scene too, and its Caprahorn
+        /// selection spawns two bosses fought *concurrently* — with the
+        /// instance's objective open exactly as above, the surviving twin
+        /// still has to hold the pull open.
+        #[test]
+        fn a_co_engaged_twin_still_holds_the_pull_open_with_the_objective_running() {
+            const DREAMBLOOM_SCENE: u32 = 13_011;
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: DREAMBLOOM_SCENE,
+            });
+            objective_running(&mut m);
+            m.apply(&hp(BOSS_UID, 2_000_000, 2_000_000, ORIGIN, 0));
+            m.apply(&hp(OTHER_UID, 1_000_000, 1_000_000, CONTINUATION, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            m.apply(&hit(OTHER_UID, 1_100));
+            m.apply(&hp(BOSS_UID, 30_000, 2_000_000, ORIGIN, 1_200));
+
+            m.apply(&gone(BOSS_UID));
+
+            assert!(
+                !m.enemies[&BOSS_UID].is_alive(),
+                "the despawn itself was still read as a death"
+            );
+            assert_eq!(m.fight_end_ms, None, "the twin is still being fought");
+            assert_eq!(m.fight_state(1_300), FightState::Active);
+        }
     }
 
     /// Issue #124: a dungeon's final boss may fight through several phases,
@@ -6816,7 +7772,7 @@ mod tests {
 
         #[test]
         fn a_damaged_boss_with_no_hp_at_all_counts_as_living() {
-            // Pins `has_other_living_boss` on its own, without help from the
+            // Pins `other_living_boss` on its own, without help from the
             // ranking key: an enemy with neither `max_hp` nor `curr_hp` is
             // unrankable, so `recompute_boss` cannot move `boss_uid` off the
             // dying phase and the guard is the only thing standing between
@@ -7208,7 +8164,7 @@ mod tests {
             // The `took_damage` gate on that respawn signal. Inside a fight a
             // dead phase's HP resyncing above zero is an artefact, and the
             // death latch must survive it — otherwise the corpse re-enters
-            // `has_other_living_boss` and blocks the living phase's own end.
+            // `other_living_boss` and blocks the living phase's own end.
             let mut m = Meter::new();
             m.apply(&hp(10, 2_000, 2_000, ORIGIN, 0));
             m.apply(&hp(11, 500, 500, CONTINUATION, 0));
@@ -7656,6 +8612,76 @@ mod tests {
             assert!(
                 logged(&format!("cause=server_changed boss_monster_id={DIAG_BOSS}")),
                 "the fight-end line must still name the boss the fight was on"
+            );
+        }
+
+        /// issue #256: pins every field of the new "boss death did not end
+        /// the fight" diagnostic itself, so a typo swapping
+        /// `other_living_boss` and `dungeon_objective_still_running` (or
+        /// any other field) in the format string fails a test instead of
+        /// only being caught by someone reading the log later.
+        #[test]
+        fn boss_death_that_does_not_end_the_fight_logs_every_guard_input() {
+            install_capture();
+
+            const DIAG_UID: i64 = 20;
+            let mut m = Meter::new();
+
+            // A dungeon whose own objective is still running holds the
+            // gate open (issue #139 §8) even though no other living boss
+            // exists — so this death falls through to the log rather than
+            // ending the fight.
+            m.apply(&ProtocolEvent::DungeonState {
+                state: EDungeonState::Active,
+                scene_uuid: None,
+            });
+            m.apply(&ProtocolEvent::DungeonObjective {
+                target_id: 700,
+                nums: Some(0),
+                complete: Some(false),
+            });
+
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                uid: DIAG_UID,
+                curr_hp: Some(100),
+                max_hp: Some(100),
+                monster_id: Some(DIAG_BOSS),
+                timestamp_ms: 0,
+            }));
+            m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: DIAG_UID,
+                target_kind: EntityKind::Monster,
+                value: 100,
+                timestamp_ms: 1_000,
+                ..Default::default()
+            }));
+            assert_eq!(m.boss_uid, Some(DIAG_UID));
+
+            m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: DIAG_UID,
+                target_kind: EntityKind::Monster,
+                value: 100,
+                is_dead: true,
+                timestamp_ms: 2_000,
+                ..Default::default()
+            }));
+
+            assert_eq!(
+                m.fight_end_ms, None,
+                "the still-running objective must hold the fight open"
+            );
+            assert!(
+                logged(&format!(
+                    "encounter: boss death of uid={DIAG_UID} monster_id={DIAG_BOSS} did not end the fight: \
+                     other_living_boss=-1 dungeon_objective_still_running=true \
+                     scene=-1 boss_select=false dungeon_state=Some(Active) current_objective=Some(700) \
+                     objective_complete=Some(false)"
+                )),
+                "the diagnostic line must name every guard input, not just say a boss death was dropped"
             );
         }
 

@@ -9,11 +9,13 @@ use prost::Message;
 
 use std::sync::Arc;
 
-use crate::attrs::{enemy_hp_from_attrs, player_info_from_attrs, scene_id_from_attrs};
+use crate::attrs::{
+    cast_skill_id_from_attrs, enemy_hp_from_attrs, player_info_from_attrs, scene_id_from_attrs,
+};
 use crate::blob;
 use crate::event::{
-    DamageEvent, DisappearReason, EDungeonState, EntityKind, PlayerInfo, ProtocolEvent, kind_of,
-    uid_of,
+    CastEvent, DamageEvent, DisappearReason, EDungeonState, EntityKind, PlayerInfo, ProtocolEvent,
+    kind_of, uid_of,
 };
 use crate::frame::{
     Desync, MAX_TAIL_LEN, Notify, SERVICE_UUID, TEAM_NTF_SERVICE_UUID, parse_frame, split_frames,
@@ -250,6 +252,19 @@ fn on_aoi_sync_delta(
                     &attrs.attrs,
                     sink,
                 )));
+                // Issue #245: the same attr channel reports a cast by
+                // changing `AttrSkillId` on the caster. Emitted as its own
+                // event rather than folded into `PlayerInfo`, because a
+                // cast is a *thing that happened at a time*, while every
+                // other field on `PlayerInfo` is a standing property the
+                // meter merges rather than counts.
+                if let Some(skill_id) = cast_skill_id_from_attrs(&attrs.attrs) {
+                    out.push(ProtocolEvent::Cast(CastEvent {
+                        caster_uid: target_uid,
+                        skill_id,
+                        timestamp_ms: now_ms,
+                    }));
+                }
             }
             EntityKind::Monster => {
                 out.push(ProtocolEvent::EnemyHp(enemy_hp_from_attrs(
@@ -854,6 +869,81 @@ mod tests {
             }
             other => panic!("expected Player, got {other:?}"),
         }
+    }
+
+    /// Issue #245: `AttrSkillId` on a player's delta is how BPSR reports a
+    /// cast — there is no dedicated cast notify. See
+    /// `attrs::attr_id::SKILL_ID` for the evidence.
+    fn skill_attr_notify(uuid: i64, skill_id: u64) -> Notify {
+        let mut raw_data = Vec::new();
+        prost::encoding::encode_varint(skill_id, &mut raw_data);
+        let delta = AoiSyncDelta {
+            uuid,
+            attrs: Some(AttrCollection {
+                uuid,
+                attrs: vec![pb::Attr {
+                    id: crate::attrs::attr_id::SKILL_ID,
+                    raw_data,
+                }],
+            }),
+            skill_effects: None,
+        };
+        let msg = SyncNearDeltaInfo {
+            delta_infos: vec![delta],
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id: opcode::SYNC_NEAR_DELTA_INFO,
+            payload,
+        }
+    }
+
+    #[test]
+    fn a_skill_id_attr_on_a_player_emits_a_cast() {
+        let mut out = Vec::new();
+        decode_notify(
+            &skill_attr_notify(ATTACKER_UUID, 1550),
+            4242,
+            &mut out,
+            None,
+        );
+        let cast = out
+            .iter()
+            .find_map(|ev| match ev {
+                ProtocolEvent::Cast(c) => Some(c),
+                _ => None,
+            })
+            .expect("expected a Cast event");
+        assert_eq!(cast.caster_uid, uid_of(ATTACKER_UUID));
+        assert_eq!(cast.skill_id, 1550);
+        assert_eq!(cast.timestamp_ms, 4242);
+    }
+
+    /// The attr rides every entity's deltas, monsters included, but a
+    /// monster has no per-skill breakdown to count into — see
+    /// `ProtocolEvent::Cast`.
+    #[test]
+    fn a_skill_id_attr_on_a_monster_emits_no_cast() {
+        let mut out = Vec::new();
+        decode_notify(&skill_attr_notify(TARGET_UUID, 1550), 0, &mut out, None);
+        assert!(
+            !out.iter().any(|ev| matches!(ev, ProtocolEvent::Cast(_))),
+            "a monster's casts are not tracked: {out:?}"
+        );
+    }
+
+    /// `0` is the attr channel's "no skill" value, not a skill whose id
+    /// happens to be zero.
+    #[test]
+    fn a_zero_skill_id_attr_emits_no_cast() {
+        let mut out = Vec::new();
+        decode_notify(&skill_attr_notify(ATTACKER_UUID, 0), 0, &mut out, None);
+        assert!(
+            !out.iter().any(|ev| matches!(ev, ProtocolEvent::Cast(_))),
+            "zero means no skill: {out:?}"
+        );
     }
 
     fn to_me_notify(outer_uuid: i64, base_uuid: i64) -> Notify {

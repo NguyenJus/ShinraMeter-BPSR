@@ -189,10 +189,25 @@ impl PlayerRecord {
             lucky_pct: self.lucky_pct,
             hits: self.hits,
             deaths: self.deaths,
+            // Issue #254: the schema has no death-time column, so a
+            // replayed row reports the total as unmeasured rather than as
+            // zero. See `PlayerRow::dead_ms`.
+            dead_ms: None,
             // Issue #222: persisted since schema v2, so a historical row
             // opens the same breakdown a live one does. Encounters saved
             // before v2 have no skill rows and land here empty.
             skills: self.skills.iter().map(SkillRecord::to_skill_row).collect(),
+            // Issue #245: the Heal / Skill dealt / Skill received
+            // breakdowns are live-only. The saved-fight schema persists
+            // one per-skill list — the damage one — and widening it would
+            // be a fourth schema revision for data the window already has
+            // an honest empty state for ("No per-skill data recorded for
+            // this fight", `skill_window_empty_message`). Left as a
+            // follow-up rather than smuggled into this change.
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
         }
     }
 }
@@ -373,7 +388,12 @@ mod tests {
             lucky_pct: 5.0,
             hits: 20,
             deaths: 1,
+            dead_ms: None,
             skills: Vec::new(),
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
         }
     }
 

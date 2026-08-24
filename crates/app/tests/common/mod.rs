@@ -119,8 +119,7 @@ impl Rig {
                 }
                 Step::Tick { at_ms } => {
                     self.fight_state = self.pipeline.tick(*at_ms);
-                    let snapshot = self.pipeline.snapshot(*at_ms);
-                    self.pipeline.record_fight_end(self.fight_state, &snapshot);
+                    self.pipeline.record_fight_end(self.fight_state, *at_ms);
                 }
                 Step::Capture { at_ms, label } => {
                     captures.push(Capture {
@@ -168,8 +167,7 @@ impl Rig {
     /// `feed_notify`-driven tests, which don't go through `Scenario`/`run`.
     pub fn tick(&mut self, now_ms: u64) -> FightState {
         self.fight_state = self.pipeline.tick(now_ms);
-        let snapshot = self.pipeline.snapshot(now_ms);
-        self.pipeline.record_fight_end(self.fight_state, &snapshot);
+        self.pipeline.record_fight_end(self.fight_state, now_ms);
         self.fight_state
     }
 

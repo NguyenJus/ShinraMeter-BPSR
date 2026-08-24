@@ -20,6 +20,11 @@ docs/reference/
 # rather than on Windows.
 /ShinraMeter-BPSR-scene-bosses.json
 
+# The single-instance lock `single_instance.rs` falls back to when there is no
+# %APPDATA% (issue #277) — i.e. any time the overlay is run on a dev box
+# rather than on Windows.
+/ShinraMeter-BPSR-instance.lock
+
 # The log file `logging.rs` falls back to when there is no %APPDATA% (issue
 # #69), plus its startup-rotation copy.
 /ShinraMeter-BPSR.log

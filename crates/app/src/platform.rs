@@ -298,6 +298,38 @@ pub fn force_frame_recompute() {
 #[cfg(not(windows))]
 pub fn force_frame_recompute() {}
 
+/// Tells the user why this launch did nothing (issue #277).
+///
+/// The binary carries `windows_subsystem = "windows"`, so a second instance
+/// that just logs and exits is indistinguishable from a broken shortcut —
+/// and the instance it lost to is minimized to the notification area, which
+/// is exactly the state that makes a user launch a second copy in the first
+/// place. A modal box is the only channel that reaches them here.
+///
+/// Blocks until dismissed, which is fine: the caller exits straight after.
+#[cfg(windows)]
+pub fn warn_already_running(message: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW};
+    use windows::core::HSTRING;
+
+    let text = HSTRING::from(message);
+    let caption = HSTRING::from("ShinraMeter-BPSR");
+    // SAFETY: both strings are NUL-terminated UTF-16 owned by `HSTRING`s
+    // that outlive the call, and a null owner window is valid for an
+    // application-modal box.
+    unsafe {
+        MessageBoxW(
+            None,
+            windows::core::PCWSTR(text.as_ptr()),
+            windows::core::PCWSTR(caption.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn warn_already_running(_message: &str) {}
+
 /// A monitor's or window's rectangle in physical pixels / virtual-screen
 /// coordinates — so a monitor to the left of or above the primary one has
 /// negative `left`/`top`, never remapped to `[0, size]`. Left/top are
@@ -794,14 +826,20 @@ const MAX_WINDOW_EXTENT_PX: i32 = 8192;
 /// `None` when it already fits inside `MAX_WINDOW_EXTENT_PX` and should be
 /// passed through untouched.
 ///
-/// `window_proc` applies this to every proposal that isn't `SWP_NOSIZE`,
-/// whoever raised it — the overlay's own resize gesture, winit, the shell, or
-/// an external `MoveWindow`/`SetWindowPos` from another process (which is how
-/// the 32767 in the doc comment above was actually reached: Win32 clamps a
-/// window's width/height to `SHRT_MAX`, so an oversize external request comes
-/// back through `WM_SIZE` as exactly 32767 and eframe feeds that straight into
-/// `Surface::configure`). `WM_WINDOWPOSCHANGING` is the one seam this process
-/// owns that every one of those paths passes through.
+/// `window_proc` consults this — through `oversize_response`, which decides
+/// whether to refuse the proposal outright or fall back to this clamp — for
+/// every proposal that isn't `SWP_NOSIZE`, whoever raised it: the overlay's
+/// own resize gesture, winit, the shell, or an external `MoveWindow`/
+/// `SetWindowPos` from another process (which is how the 32767 in the doc
+/// comment above was actually reached: Win32 saturates a window's
+/// width/height at `SHRT_MAX`, so an oversize external request comes back as
+/// exactly 32767 and eframe feeds that straight into `Surface::configure`).
+/// `WM_WINDOWPOSCHANGING` is the one seam this process owns that every one of
+/// those paths passes through.
+///
+/// Issue #257: this is a *ceiling*, not an answer. Applying it silently
+/// swapped a crash for an 8192px-tall overlay, so `oversize_response` reaches
+/// for it only when refusing isn't possible.
 ///
 /// Pure integer geometry, no windows-crate types, so it is unit-testable off
 /// Windows like the rest of this module's helpers.
@@ -809,6 +847,142 @@ const MAX_WINDOW_EXTENT_PX: i32 = 8192;
 fn clamped_window_extent(cx: i32, cy: i32) -> Option<(i32, i32)> {
     let clamped = (cx.min(MAX_WINDOW_EXTENT_PX), cy.min(MAX_WINDOW_EXTENT_PX));
     (clamped != (cx, cy)).then_some(clamped)
+}
+
+/// What `window_proc` does about a `WM_WINDOWPOSCHANGING` proposal the
+/// renderer cannot present (issue #257).
+///
+/// The distinction matters because clamping is not a neutral act: the
+/// 32767px proposals in #257 were clamped to 8192 and *applied*, which is
+/// how a stray external `MoveWindow` ended up deciding the overlay's
+/// height. An 8192px-tall overlay is not a smaller bug than a crash, it is
+/// a different one — nothing usable on screen, and every follow-up proposal
+/// reporting `current_window=377x8192`.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OversizeResponse {
+    /// Refuse the resize outright — pin `SWP_NOSIZE` and let the window
+    /// keep the size it already has. The preferred answer: nobody with a
+    /// legitimate reason to resize this overlay asks for more than
+    /// `MAX_WINDOW_EXTENT_PX` (8192 clears an 8K panel), so an oversize
+    /// proposal is a bug at the caller, and the honest response is to
+    /// decline it rather than to invent a size of our own.
+    Refuse,
+    /// Clamp to these extents — the fallback for when refusing would leave
+    /// the window at a size the renderer *also* cannot present (no current
+    /// rect to fall back on, or a current rect that is itself oversize).
+    /// This is the pre-#257 behaviour, now reached only when it is the
+    /// lesser evil.
+    Clamp(i32, i32),
+}
+
+/// Decides what to do with a sizing proposal of `cx`x`cy`, given the
+/// window's `current` rect (`None` when `GetWindowRect` failed).
+///
+/// `None` means the proposal is presentable and must pass through
+/// untouched — the overwhelmingly common case.
+///
+/// Pure integer geometry, no windows-crate types, so it is unit-testable
+/// off Windows like the rest of this module's helpers.
+#[cfg(any(windows, test))]
+fn oversize_response(cx: i32, cy: i32, current: Option<Rect>) -> Option<OversizeResponse> {
+    let (clamped_cx, clamped_cy) = clamped_window_extent(cx, cy)?;
+    match current {
+        // Refusing only helps if what the window falls back to is itself
+        // presentable. A non-positive or already-oversize current rect (a
+        // window mid-creation, or one that somehow got past this guard)
+        // would have `SWP_NOSIZE` preserve the very thing that panics
+        // `Surface::configure`, so those fall through to the clamp.
+        Some(rect)
+            if rect.width() > 0
+                && rect.height() > 0
+                && clamped_window_extent(rect.width(), rect.height()).is_none() =>
+        {
+            Some(OversizeResponse::Refuse)
+        }
+        _ => Some(OversizeResponse::Clamp(clamped_cx, clamped_cy)),
+    }
+}
+
+/// The mutation `window_proc` applies to a `WM_WINDOWPOSCHANGING`
+/// proposal's `WINDOWPOS` for a given [`OversizeResponse`], expressed over
+/// plain values instead of `windows`-crate types so it is unit-testable
+/// without a window — `window_proc` applies this verbatim, so testing it
+/// here is exactly as good as testing `window_proc` itself for the one
+/// thing that matters: a `Refuse` response must carry `size: None`. Under
+/// `Refuse` the window is meant to keep whatever size it already has, and
+/// a regression that starts writing `cx`/`cy` unconditionally (the pre-#257
+/// clamp-always behaviour) is exactly what let a stray external
+/// `MoveWindow` decide the overlay's height in the first place.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OversizeWindowPosPatch {
+    /// Whether to OR `SWP_NOSIZE` into the proposal's flags.
+    set_no_size: bool,
+    /// `Some((cx, cy))` to overwrite the proposal's `cx`/`cy`; `None` to
+    /// leave them untouched.
+    size: Option<(i32, i32)>,
+}
+
+#[cfg(any(windows, test))]
+fn oversize_windowpos_patch(response: OversizeResponse) -> OversizeWindowPosPatch {
+    match response {
+        OversizeResponse::Refuse => OversizeWindowPosPatch {
+            set_no_size: true,
+            size: None,
+        },
+        OversizeResponse::Clamp(cx, cy) => OversizeWindowPosPatch {
+            set_no_size: false,
+            size: Some((cx, cy)),
+        },
+    }
+}
+
+/// Best guess at who sent an oversize proposal, from the only evidence
+/// `WM_WINDOWPOSCHANGING` carries (issue #257): the `SWP_*` flags and
+/// whether one of this crate's own repositions is in flight.
+///
+/// This is the field #257 was missing. The three senders that can resize
+/// this window are distinguishable:
+///
+/// - anything this crate does itself goes through `app_driven_reposition`
+///   (enforced by `SetWindowPos`'s doc comment), so `gesture_active` names
+///   it outright;
+/// - winit — which is what every `ViewportCommand::InnerSize`/
+///   `OuterPosition` from `ui.rs` becomes — always sets
+///   `SWP_ASYNCWINDOWPOS`, and always pins one of `SWP_NOMOVE`/
+///   `SWP_NOSIZE`, since it never moves and resizes in one call;
+/// - `MoveWindow` expands to `SetWindowPos` with exactly
+///   `SWP_NOZORDER | SWP_NOACTIVATE` (plus `SWP_NOREDRAW` when `bRepaint`
+///   is false) and moves and resizes together — the shape both #257
+///   sightings carried, and the shape `scripts/uidbg/lib.ps1`'s
+///   `Set-AppRect` sends.
+///
+/// A guess, deliberately hedged in the wording: an external tool is free to
+/// call `SetWindowPos` with any flags it likes, MoveWindow's included.
+#[cfg(any(windows, test))]
+fn proposal_origin_hint(flags: u32, gesture_active: bool) -> &'static str {
+    const SWP_NOSIZE_BIT: u32 = 0x0001;
+    const SWP_NOMOVE_BIT: u32 = 0x0002;
+    const SWP_NOZORDER_BIT: u32 = 0x0004;
+    const SWP_NOREDRAW_BIT: u32 = 0x0008;
+    const SWP_NOACTIVATE_BIT: u32 = 0x0010;
+    const SWP_ASYNCWINDOWPOS_BIT: u32 = 0x4000;
+
+    if gesture_active {
+        return "this process (an app_driven_reposition is in flight)";
+    }
+    if flags & SWP_ASYNCWINDOWPOS_BIT != 0 {
+        return "winit (SWP_ASYNCWINDOWPOS), i.e. an egui ViewportCommand from ui.rs";
+    }
+    let moves_and_resizes = flags & (SWP_NOMOVE_BIT | SWP_NOSIZE_BIT) == 0;
+    let move_window_shape = flags & !SWP_NOREDRAW_BIT == SWP_NOZORDER_BIT | SWP_NOACTIVATE_BIT;
+    if moves_and_resizes && move_window_shape {
+        return "an external MoveWindow/SetWindowPos call (another process; this is the flag \
+                shape a plain move+resize sends, e.g. NOZORDER|NOACTIVATE with neither NOMOVE \
+                nor NOSIZE set)";
+    }
+    "unknown (neither an app_driven_reposition nor winit's SWP_ASYNCWINDOWPOS shape)"
 }
 
 /// Human-readable names for the `SWP_*` bits set in a `WM_WINDOWPOSCHANGING`
@@ -870,41 +1044,59 @@ struct ProposedWindowPos {
 }
 
 /// Builds the diagnostic line for an oversize `WM_WINDOWPOSCHANGING`
-/// proposal (issue #119). The raw `warn!` this replaced logged only the
-/// proposed `cx`x`cy` — exactly the information the #119 crash already
-/// proved insufficient (`460x32767` says nothing about who asked or in what
-/// state). `window_proc` gathers the impure Win32 state (current rect, DPI,
-/// gesture flag) and hands it here so the formatting itself stays
-/// unit-testable without a window; see `boss_transition_log`/
+/// proposal (issue #119, extended for #257). The raw `warn!` this replaced
+/// logged only the proposed `cx`x`cy` — exactly the information the #119
+/// crash already proved insufficient (`460x32767` says nothing about who
+/// asked or in what state). `window_proc` gathers the impure Win32 state
+/// (current rect, DPI, gesture flag) and hands it here so the formatting
+/// itself stays unit-testable without a window; see `boss_transition_log`/
 /// `scene_transition_log` in `meter::encounter` for the same pure-formatter
 /// register this follows.
+///
+/// Two fields exist because #257 could not be pinned on a caller from the
+/// #119 line alone: `likely_origin` (see `proposal_origin_hint`) names the
+/// suspected sender, and `resolution` says what actually happened to the
+/// window rather than leaving a reader to assume the clamp was applied.
 #[cfg(any(windows, test))]
 fn oversize_proposal_log(
     proposed: ProposedWindowPos,
-    clamped: (i32, i32),
+    response: OversizeResponse,
     flags: u32,
     current: Option<Rect>,
     dpi: Option<u32>,
     gesture_active: bool,
 ) -> String {
     let ProposedWindowPos { x, y, cx, cy } = proposed;
-    let (clamped_cx, clamped_cy) = clamped;
+    let (verb, resolution) = match response {
+        OversizeResponse::Refuse => (
+            "refusing",
+            "resolution=refused (SWP_NOSIZE pinned; the window keeps its current size)".to_string(),
+        ),
+        OversizeResponse::Clamp(clamped_cx, clamped_cy) => (
+            "clamping",
+            format!(
+                "resolution=clamped_to={clamped_cx}x{clamped_cy} (no presentable current size to \
+                 refuse back to)"
+            ),
+        ),
+    };
     let current = current.map_or_else(
         || "<unavailable>".to_string(),
         |r| format!("{}x{} at ({}, {})", r.width(), r.height(), r.left, r.top),
     );
     let dpi = dpi.map_or_else(|| "<unavailable>".to_string(), |d| d.to_string());
     format!(
-        "clamping an oversize window proposal: proposed=(x={x}, y={y}, {cx}x{cy}) \
-         clamped_to={clamped_cx}x{clamped_cy} flags={} current_window={current} dpi={dpi} \
+        "{verb} an oversize window proposal: proposed=(x={x}, y={y}, {cx}x{cy}) {resolution} \
+         flags={} likely_origin={} current_window={current} dpi={dpi} \
          app_driven_reposition_active={gesture_active}; the renderer cannot present a surface \
          larger than {MAX_WINDOW_EXTENT_PX}px",
-        decode_swp_flags(flags)
+        decode_swp_flags(flags),
+        proposal_origin_hint(flags, gesture_active),
     )
 }
 
-/// Last oversize `WM_WINDOWPOSCHANGING` proposal `window_proc` clamped this
-/// session, paired with the `Instant` it was stored at — `None` until the
+/// Last oversize `WM_WINDOWPOSCHANGING` proposal `window_proc` countermanded
+/// this session — refused or clamped, whichever `oversize_response` chose —, paired with the `Instant` it was stored at — `None` until the
 /// first one happens. `install_panic_hook` in `logging.rs` reads this
 /// through [`last_oversize_proposal`] so a `Surface::configure` panic can
 /// still show the context that led to it: the clamp is not the only path to
@@ -1434,13 +1626,13 @@ unsafe extern "system" fn window_proc(
                 bottom: current_rect.bottom,
             });
 
-        // Cap the proposed size before anything else looks at
-        // it. Unlike the Snap veto below this runs for *every* proposal,
-        // app-driven ones included, because the renderer's limit is not a
-        // policy about who asked — a swapchain wider or taller than
-        // `MAX_WINDOW_EXTENT_PX` is fatal whatever moved the window.
+        // Deal with an unpresentable proposed size before anything else
+        // looks at it. Unlike the Snap veto below this runs for *every*
+        // proposal, app-driven ones included, because the renderer's limit
+        // is not a policy about who asked — a swapchain wider or taller
+        // than `MAX_WINDOW_EXTENT_PX` is fatal whatever moved the window.
         if (windowpos.flags & SWP_NOSIZE).0 == 0
-            && let Some((cx, cy)) = clamped_window_extent(windowpos.cx, windowpos.cy)
+            && let Some(response) = oversize_response(windowpos.cx, windowpos.cy, current_rect)
         {
             // Issue #119: this proposal is the crash's only lead, so gather
             // everything the next occurrence might need before it's gone.
@@ -1459,7 +1651,7 @@ unsafe extern "system" fn window_proc(
                     cx: windowpos.cx,
                     cy: windowpos.cy,
                 },
-                (cx, cy),
+                response,
                 windowpos.flags.0,
                 current_rect,
                 dpi,
@@ -1467,8 +1659,27 @@ unsafe extern "system" fn window_proc(
             );
             log::warn!("{message}");
             store_last_oversize_proposal(message);
-            windowpos.cx = cx;
-            windowpos.cy = cy;
+            // Issue #257: refusing, not clamping, is what stops this
+            // guard from being the thing that decides the window's
+            // height. Pinning `SWP_NOSIZE` also makes `already_pinned`
+            // below true, so the Snap veto skips a proposal whose size
+            // half has already been countermanded — correct, and not
+            // a loss: the move half of an oversize proposal is
+            // harmless, and `MAX_WINDOW_EXTENT_PX` is far beyond any
+            // Snap shape.
+            //
+            // The decision of what to apply is `oversize_windowpos_patch`
+            // (unit-tested), kept pure so a regression that starts writing
+            // `cx`/`cy` under `Refuse` fails a test instead of only
+            // showing up live.
+            let patch = oversize_windowpos_patch(response);
+            if patch.set_no_size {
+                windowpos.flags |= SWP_NOSIZE;
+            }
+            if let Some((cx, cy)) = patch.size {
+                windowpos.cx = cx;
+                windowpos.cy = cy;
+            }
         }
 
         // If the proposal is already pinned on move and/or size, it isn't
@@ -2853,6 +3064,143 @@ pub fn choose_log_export_path(_default_filename: &str) -> Option<std::path::Path
     None
 }
 
+/// Maps the "the network is the problem" family of WinHTTP HRESULTs to a
+/// short plain-language reason. WinHTTP surfaces every failure as a bare
+/// HRESULT (`WinHttpSendRequest failed: 0x80072EE2`), which tells a user
+/// nothing unless they already know Win32 error codes — but this handful
+/// of codes covers the vast majority of what actually goes wrong for a
+/// `GET` to `api.github.com` (no internet, DNS down, a firewall or proxy
+/// blocking the connection). Mapping them to a sentence here, at the point
+/// every `http_get_bytes` error is formatted, means the raw code is never
+/// the *only* thing the user sees, without the UI layer needing to know
+/// anything about WinHTTP. Codes outside this set return `None`, so the
+/// caller falls back to the raw HRESULT — nothing becomes less
+/// diagnosable, it just doesn't get a friendlier headline.
+///
+/// Pure and free of the (Windows-only) `windows` crate on purpose: it is
+/// the one piece of the update-check HTTP path this dev/CI host (Linux)
+/// can actually unit-test — see `http_get_bytes`'s doc comment below on
+/// why nothing else here can be.
+///
+/// `cfg(any(windows, test))`: on a plain non-Windows build this has no
+/// caller at all (`http_get_bytes`'s only non-Windows variant is the stub
+/// below, which never touches WinHTTP), so without `test` in the cfg it
+/// would be flat-out dead code on the Linux dev/CI host — compiled in for
+/// `cfg(test)` so the unit tests below can still exercise it there.
+#[cfg(any(windows, test))]
+fn winhttp_reachability_reason(hresult: u32) -> Option<&'static str> {
+    match hresult {
+        // ERROR_WINHTTP_TIMEOUT: the connect or send/receive ran past
+        // WinHTTP's own timeout — see the `WinHttpSetTimeouts` call below.
+        0x8007_2EE2 => Some("couldn't reach GitHub (timed out)"),
+        // ERROR_WINHTTP_NAME_NOT_RESOLVED: DNS couldn't resolve
+        // api.github.com — typically no internet connection at all.
+        0x8007_2EE7 => Some("couldn't reach GitHub (DNS lookup failed)"),
+        // ERROR_WINHTTP_CANNOT_CONNECT: DNS resolved but the TCP connect
+        // itself was refused — a firewall or proxy blocking the request.
+        0x8007_2EFD => Some("couldn't reach GitHub (connection refused)"),
+        _ => None,
+    }
+}
+
+/// Opens the native "Open" common dialog so the user picks the image file
+/// the settings dropdown's "Header image"/"Row backdrop" rows point at
+/// (issues #121 and #253). `title` names the region being customized, so
+/// the same dialog serves both rows without either having to guess which
+/// one it is looking at.
+///
+/// A native picker rather than a text field in the dropdown: an overlay
+/// with no keyboard focus of its own is a poor place to type a Windows
+/// path, and the dialog costs nothing new — `GetOpenFileNameW` lives in the
+/// same `Win32_UI_Controls_Dialogs` feature `choose_log_export_path`
+/// already pulls in, needs no COM initialization, and needs no new crate.
+/// The settings.json field stays a plain string either way, so hand-editing
+/// remains available for anyone who prefers it.
+///
+/// `OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST` only stops the *dialog* from
+/// returning something that was not there when it closed. It is not a
+/// validity guarantee the caller may lean on: the file can still be
+/// deleted, replaced, or turn out not to be a decodable image, all of which
+/// `custom_image` handles on its own (see its module doc's failure
+/// section).
+///
+/// Synchronous, blocking, owner-window and cancellation behavior are all
+/// identical to `choose_log_export_path` — see its doc comment for why a
+/// modal the OS is already blocking on needs no thread of its own. Unlike
+/// that one there is no follow-on file copy here: the caller just stores
+/// the path.
+#[cfg(windows)]
+pub fn choose_background_image_path(title: &str) -> Option<std::path::PathBuf> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    let raw = OVERLAY_HWND.load(std::sync::atomic::Ordering::SeqCst);
+    // Same cast/guard as `choose_log_export_path` — a zero raw value means
+    // "not cached yet", not a literal null HWND worth passing through.
+    let owner = if raw == 0 {
+        HWND(std::ptr::null_mut())
+    } else {
+        HWND(raw as *mut std::ffi::c_void)
+    };
+
+    // In/out, same as the save dialog's, but seeded empty: there is no
+    // sensible default file name for "pick any image on this machine".
+    let mut file_buf = vec![0u16; 32767];
+
+    // Built from `custom_image::SUPPORTED_EXTENSIONS` rather than a literal
+    // list, so the dialog can never offer a format this binary was not
+    // compiled to decode (or omit one it was). The `\0`-separated,
+    // double-`\0`-terminated shape is `lpstrFilter`'s, not a string
+    // convention: pairs of (label, pattern).
+    let patterns = crate::custom_image::SUPPORTED_EXTENSIONS
+        .iter()
+        .map(|ext| format!("*.{ext}"))
+        .collect::<Vec<_>>()
+        .join(";");
+    let filter = wide(&format!("Images\0{patterns}\0All files\0*.*\0"));
+    let title = wide(title);
+
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(file_buf.as_mut_ptr()),
+        nMaxFile: file_buf.len() as u32,
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
+        ..Default::default()
+    };
+
+    // SAFETY: identical to `choose_log_export_path`'s call — every pointer
+    // field is backed by a `Vec<u16>` that outlives this call, `lpstrFile`
+    // is sized past anything the dialog can write back, and `hwndOwner` is
+    // either a still-live cached handle or the null default.
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) };
+    if !ok.as_bool() {
+        return None;
+    }
+
+    let end = file_buf.iter().position(|&unit| unit == 0).unwrap_or(0);
+    if end == 0 {
+        return None;
+    }
+    Some(std::path::PathBuf::from(String::from_utf16_lossy(
+        &file_buf[..end],
+    )))
+}
+
+/// Non-Windows stub — see `choose_background_image_path`'s doc comment, and
+/// `choose_log_export_path`'s stub for the same reasoning: dev/CI hosts are
+/// Linux, and the caller already treats `None` as "the user picked
+/// nothing", which is the correct behavior here too.
+#[cfg(not(windows))]
+pub fn choose_background_image_path(_title: &str) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Issue #171: the manual "Check for updates" header-menu item needs an
 /// HTTPS GET to GitHub's releases API, and — same reasoning as every other
 /// function in this module — egui/eframe expose no HTTP client at all, so
@@ -2871,20 +3219,41 @@ pub fn choose_log_export_path(_default_filename: &str) -> Option<std::path::Path
 /// (`INTERNET_DEFAULT_HTTPS_PORT`) — this function has no plain-HTTP path,
 /// on purpose, since its one caller only ever talks to `api.github.com`.
 ///
-/// Synchronous and blocking by design: `update_check::check_for_update`
-/// (the sole caller) is itself only ever run from a spawned
-/// `std::thread`, never the UI thread, so there is nothing here for a
-/// blocking call to stall — see that function's doc comment.
+/// Returns the raw response body. `http_get` below is the UTF-8-decoding
+/// wrapper `update_check::check_for_update` uses for the JSON API response;
+/// this byte-level entry point exists for issue #250's release-asset
+/// download, which is a PE image and must not be pushed through
+/// `String::from_utf8`.
+///
+/// Synchronous and blocking by design: both callers
+/// (`update_check::check_for_update` and `update_check::install_update`)
+/// are themselves only ever run from a spawned `std::thread`, never the UI
+/// thread, so there is nothing here for a blocking call to stall — see
+/// those functions' doc comments.
 #[cfg(windows)]
-pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, String> {
+pub fn http_get_bytes(host: &str, path: &str, user_agent: &str) -> Result<Vec<u8>, String> {
     use windows::Win32::Foundation::GetLastError;
     use windows::Win32::Networking::WinHttp::{
         INTERNET_DEFAULT_HTTPS_PORT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+        WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP,
         WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect,
         WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable, WinHttpQueryHeaders,
-        WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
+        WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
+        WinHttpSetTimeouts,
     };
     use windows::core::PCWSTR;
+
+    /// Formats a WinHTTP call failure, leading with
+    /// `winhttp_reachability_reason`'s plain-language sentence when the
+    /// error's HRESULT is one of the network-reachability codes, and
+    /// always keeping the raw `{call} failed: {err}` detail afterwards so
+    /// the failure stays as diagnosable as it was before.
+    fn describe(call: &str, err: windows::core::Error) -> String {
+        match winhttp_reachability_reason(err.code().0 as u32) {
+            Some(reason) => format!("{reason} — {call} failed: {err}"),
+            None => format!("{call} failed: {err}"),
+        }
+    }
 
     /// Closes a WinHTTP handle (session, connection or request — the same
     /// `WinHttpCloseHandle` closes all three) when dropped, so every early
@@ -2930,13 +3299,43 @@ pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, Stri
     // name resolution on 0, which WinHTTP documents as "infinite", so a
     // stalled resolver, a captive portal or a firewall that drops rather
     // than refuses would block this thread — and, with it, the header
-    // dropdown's "Checking…" state — forever. This is a user-triggered
-    // check against a single small JSON endpoint, so a few seconds each is
-    // plenty: 5s to resolve, 5s to connect, 10s to send and 10s to receive.
-    // Set on the session handle, before `WinHttpConnect`, so every handle
-    // derived from it inherits them.
-    unsafe { WinHttpSetTimeouts(session.0, 5_000, 5_000, 10_000, 10_000) }
-        .map_err(|err| format!("WinHttpSetTimeouts failed: {err}"))?;
+    // dropdown's "Checking…"/"Downloading…" state — forever. Both callers
+    // are user-triggered, so a few seconds each is plenty: 5s to resolve,
+    // 5s to connect, 10s to send and 30s to receive. Set on the session
+    // handle, before `WinHttpConnect`, so every handle derived from it
+    // inherits them.
+    //
+    // The receive timeout is *per read operation*, not for the whole
+    // response — WinHTTP restarts it for each `WinHttpQueryDataAvailable` /
+    // `WinHttpReadData` pair — so 30s does not cap how long a multi-megabyte
+    // release-asset download (issue #250) may take in total; it only says
+    // how long a single stalled chunk is tolerated. The JSON check (issue
+    // #171) never comes close to it either way.
+    unsafe { WinHttpSetTimeouts(session.0, 5_000, 5_000, 10_000, 30_000) }
+        .map_err(|err| describe("WinHttpSetTimeouts", err))?;
+
+    // Issue #250: a release asset's `browser_download_url` is not the file —
+    // `github.com/.../releases/download/...` answers 302 and points at
+    // `objects.githubusercontent.com`, so a client that does not follow
+    // redirects downloads a few hundred bytes of nothing. WinHTTP follows
+    // redirects by default, but that default is left implicit, and it is
+    // exactly the kind of default a future hardening pass flips without
+    // realising a download depends on it. Set it explicitly, and set it to
+    // the *guarded* policy rather than `ALWAYS`: HTTPS→HTTP is refused, so a
+    // hijacked or misconfigured redirect cannot silently downgrade the
+    // transport for a binary this process is about to run as Administrator.
+    let policy: u32 = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+    unsafe {
+        WinHttpSetOption(
+            Some(session.0),
+            WINHTTP_OPTION_REDIRECT_POLICY,
+            Some(std::slice::from_raw_parts(
+                std::ptr::from_ref(&policy).cast::<u8>(),
+                std::mem::size_of::<u32>(),
+            )),
+        )
+    }
+    .map_err(|err| describe("WinHttpSetOption(REDIRECT_POLICY)", err))?;
 
     let host_w = wide(host);
     let connect = unsafe {
@@ -2977,9 +3376,9 @@ pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, Stri
     let request = WinHttpHandle(request);
 
     unsafe { WinHttpSendRequest(request.0, None, None, 0, 0, 0) }
-        .map_err(|err| format!("WinHttpSendRequest failed: {err}"))?;
+        .map_err(|err| describe("WinHttpSendRequest", err))?;
     unsafe { WinHttpReceiveResponse(request.0, std::ptr::null_mut()) }
-        .map_err(|err| format!("WinHttpReceiveResponse failed: {err}"))?;
+        .map_err(|err| describe("WinHttpReceiveResponse", err))?;
 
     let mut status: u32 = 0;
     let mut status_len = std::mem::size_of::<u32>() as u32;
@@ -2993,9 +3392,11 @@ pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, Stri
             std::ptr::null_mut(),
         )
     }
-    .map_err(|err| format!("WinHttpQueryHeaders failed: {err}"))?;
+    .map_err(|err| describe("WinHttpQueryHeaders", err))?;
     if status != 200 {
-        return Err(format!("GitHub releases API returned HTTP {status}"));
+        // Reached only after redirects have already been followed, so this is
+        // the status of the response that actually carries the body.
+        return Err(format!("https://{host}{path} returned HTTP {status}"));
     }
 
     // Drained in a loop, per WinHTTP's own documented pattern:
@@ -3006,7 +3407,7 @@ pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, Stri
     loop {
         let mut available: u32 = 0;
         unsafe { WinHttpQueryDataAvailable(request.0, &mut available) }
-            .map_err(|err| format!("WinHttpQueryDataAvailable failed: {err}"))?;
+            .map_err(|err| describe("WinHttpQueryDataAvailable", err))?;
         if available == 0 {
             break;
         }
@@ -3020,26 +3421,65 @@ pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, Stri
                 &mut read,
             )
         }
-        .map_err(|err| format!("WinHttpReadData failed: {err}"))?;
+        .map_err(|err| describe("WinHttpReadData", err))?;
         chunk.truncate(read as usize);
         body.extend_from_slice(&chunk);
     }
 
-    String::from_utf8(body).map_err(|err| format!("response was not valid UTF-8: {err}"))
+    Ok(body)
 }
 
-/// Non-Windows stub — see `http_get`'s doc comment. Dev/CI hosts for this
-/// crate are Linux, so `update_check`'s tests exercise only the pure
-/// parsing/comparison logic and never call this at all; a real "is an
-/// update available" answer needs a real Windows build.
+/// Non-Windows stub — see `http_get_bytes`'s doc comment. Dev/CI hosts for
+/// this crate are Linux, so `update_check`'s tests exercise only the pure
+/// parsing/comparison/path logic and never call this at all; a real "is an
+/// update available" answer, or a real download, needs a real Windows build.
 #[cfg(not(windows))]
-pub fn http_get(_host: &str, _path: &str, _user_agent: &str) -> Result<String, String> {
+pub fn http_get_bytes(_host: &str, _path: &str, _user_agent: &str) -> Result<Vec<u8>, String> {
     Err("update checks are only supported on Windows builds".to_string())
+}
+
+/// Text flavour of `http_get_bytes`: the same single request, with the body
+/// decoded as UTF-8. `update_check::check_for_update`'s JSON response goes
+/// through here; the binary release-asset download (issue #250) calls
+/// `http_get_bytes` directly, since a PE image is not text and
+/// `String::from_utf8` would reject it outright.
+///
+/// Deliberately a wrapper rather than a second request path — issue #250
+/// asks for exactly one HTTP implementation in this crate, and everything
+/// that makes the WinHTTP call correct (timeouts, the redirect policy, the
+/// status check, the chunked drain) stays in one place because of it.
+pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, String> {
+    let body = http_get_bytes(host, path, user_agent)?;
+    String::from_utf8(body).map_err(|err| format!("response was not valid UTF-8: {err}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_the_reachability_family_to_plain_language() {
+        assert_eq!(
+            winhttp_reachability_reason(0x8007_2EE2),
+            Some("couldn't reach GitHub (timed out)")
+        );
+        assert_eq!(
+            winhttp_reachability_reason(0x8007_2EE7),
+            Some("couldn't reach GitHub (DNS lookup failed)")
+        );
+        assert_eq!(
+            winhttp_reachability_reason(0x8007_2EFD),
+            Some("couldn't reach GitHub (connection refused)")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_none_for_an_unmapped_code_so_the_raw_hresult_survives() {
+        // Some other WinHTTP/Win32 HRESULT this mapping doesn't recognize —
+        // callers must fall back to the raw `{err}` Display rather than
+        // inventing a reason, so nothing becomes less diagnosable.
+        assert_eq!(winhttp_reachability_reason(0x8007_2EE8), None);
+    }
 
     // Real GWL_STYLE bits, used to build realistic test fixtures without
     // depending on the (Windows-only) `windows` crate constants.
@@ -3144,6 +3584,160 @@ mod tests {
         assert_eq!(clamped_window_extent(0, -1), None);
     }
 
+    // -- oversize_response / proposal_origin_hint (issue #257) ------------
+
+    /// The whole point of #257: the 32767 proposal must not be allowed to
+    /// pick the window's height. With a perfectly presentable 377x386
+    /// window on screen — the exact `current_window` the first #257 WARN
+    /// recorded — the answer is to refuse, leaving the user's own size
+    /// alone, not to hand back 8192.
+    #[test]
+    fn an_i16_max_height_proposal_is_refused_rather_than_applied_at_the_clamp() {
+        assert_eq!(
+            oversize_response(377, i32::from(i16::MAX), Some(rect(60, 80, 437, 466))),
+            Some(OversizeResponse::Refuse)
+        );
+    }
+
+    /// The pre-#257 behaviour survives exactly where refusing cannot help:
+    /// with no current rect, `SWP_NOSIZE` would preserve an unknown size,
+    /// and an unknown size might be the unpresentable one.
+    #[test]
+    fn an_oversize_proposal_falls_back_to_the_clamp_without_a_current_rect() {
+        assert_eq!(
+            oversize_response(377, i32::from(i16::MAX), None),
+            Some(OversizeResponse::Clamp(377, MAX_WINDOW_EXTENT_PX))
+        );
+    }
+
+    /// The state the old clamp left behind (`current_window=377x8192`, and
+    /// worse if it had ever been bigger): refusing back into an oversize
+    /// window would keep feeding `Surface::configure` something it panics
+    /// on, so this case clamps.
+    #[test]
+    fn an_oversize_proposal_clamps_when_the_window_is_already_oversize() {
+        let already_too_tall = rect(0, 0, 377, MAX_WINDOW_EXTENT_PX + 1);
+        assert_eq!(
+            oversize_response(377, i32::from(i16::MAX), Some(already_too_tall)),
+            Some(OversizeResponse::Clamp(377, MAX_WINDOW_EXTENT_PX))
+        );
+    }
+
+    /// A zero-area current rect (a window mid-creation) is no better a
+    /// fallback than none at all.
+    #[test]
+    fn an_oversize_proposal_clamps_when_the_window_has_no_area_yet() {
+        assert_eq!(
+            oversize_response(460, i32::from(i16::MAX), Some(rect(0, 0, 0, 0))),
+            Some(OversizeResponse::Clamp(460, MAX_WINDOW_EXTENT_PX))
+        );
+    }
+
+    /// The boundary, from both sides: a window exactly at the renderer's
+    /// limit is presentable and must pass through untouched, and one pixel
+    /// past it must not.
+    #[test]
+    fn the_renderer_limit_itself_is_presentable_and_one_pixel_past_it_is_not() {
+        let current = Some(rect(0, 0, 460, 420));
+        assert_eq!(
+            oversize_response(MAX_WINDOW_EXTENT_PX, MAX_WINDOW_EXTENT_PX, current),
+            None
+        );
+        assert_eq!(
+            oversize_response(MAX_WINDOW_EXTENT_PX, MAX_WINDOW_EXTENT_PX + 1, current),
+            Some(OversizeResponse::Refuse)
+        );
+    }
+
+    // -- oversize_windowpos_patch (test-coverage gap on window_proc's
+    // applied side effect) -------------------------------------------
+
+    /// The regression this exists to catch: a `Refuse` response must never
+    /// carry a size to write. `window_proc` has no test of its own (it
+    /// can't be called off a real `HWND`), so this is the only thing
+    /// standing between a change here and `windowpos.cx`/`cy` going back
+    /// to being written unconditionally — the exact pre-#257 behaviour
+    /// that let a stray external `MoveWindow` decide the overlay's height.
+    #[test]
+    fn refuse_pins_no_size_and_does_not_touch_the_proposed_size() {
+        let patch = oversize_windowpos_patch(OversizeResponse::Refuse);
+        assert!(patch.set_no_size);
+        assert_eq!(patch.size, None);
+    }
+
+    /// `Clamp` is the mirror image: it must not pin `SWP_NOSIZE` (the
+    /// clamped size still needs to be applied), and it must carry exactly
+    /// the clamped extents through untouched.
+    #[test]
+    fn clamp_does_not_pin_no_size_and_carries_the_clamped_extents() {
+        let patch = oversize_windowpos_patch(OversizeResponse::Clamp(800, 600));
+        assert!(!patch.set_no_size);
+        assert_eq!(patch.size, Some((800, 600)));
+    }
+
+    /// A refusal has to *say* it refused — the #257 report could only tell
+    /// the clamp had been applied by noticing `current_window=377x8192` on
+    /// the next line.
+    #[test]
+    fn a_refusal_is_logged_as_a_refusal_not_as_a_clamp() {
+        let message = oversize_proposal_log(
+            ProposedWindowPos {
+                x: 60,
+                y: 80,
+                cx: 377,
+                cy: i32::from(i16::MAX),
+            },
+            OversizeResponse::Refuse,
+            0,
+            Some(rect(60, 80, 437, 466)),
+            Some(96),
+            false,
+        );
+        assert!(message.contains("refusing an oversize window"), "{message}");
+        assert!(message.contains("resolution=refused"), "{message}");
+        assert!(!message.contains("clamped_to"), "{message}");
+    }
+
+    /// The exact flag pair both #257 sightings carried
+    /// (`NOZORDER|NOACTIVATE`, moving and resizing at once) is
+    /// `MoveWindow`'s signature, and no in-process path can produce it.
+    #[test]
+    fn the_issue_257_flag_shape_is_attributed_to_an_external_move_window() {
+        let hint = proposal_origin_hint(0x0004 | 0x0010, false);
+        assert!(hint.contains("external MoveWindow"), "{hint}");
+        // `bRepaint = FALSE` adds SWP_NOREDRAW and is still MoveWindow.
+        let hint = proposal_origin_hint(0x0004 | 0x0010 | 0x0008, false);
+        assert!(hint.contains("external MoveWindow"), "{hint}");
+    }
+
+    /// winit stamps `SWP_ASYNCWINDOWPOS` on every `SetWindowPos` it makes
+    /// (`window.rs`'s `set_outer_position`, `window_state.rs`'s
+    /// `set_size`), which is what separates an egui `ViewportCommand` from
+    /// an external caller.
+    #[test]
+    fn an_async_window_pos_proposal_is_attributed_to_winit() {
+        let hint = proposal_origin_hint(0x4000 | 0x0004 | 0x0002 | 0x0010, false);
+        assert!(hint.contains("winit"), "{hint}");
+    }
+
+    /// This crate's own repositions are all wrapped in
+    /// `app_driven_reposition`, so that flag outranks any flag shape.
+    #[test]
+    fn a_gesture_in_flight_is_attributed_to_this_process() {
+        let hint = proposal_origin_hint(0x0004 | 0x0010, true);
+        assert!(hint.contains("this process"), "{hint}");
+    }
+
+    /// A shape nobody recognises must say so rather than guess, so a future
+    /// reader doesn't chase a caller that was never involved.
+    #[test]
+    fn an_unrecognized_flag_shape_is_reported_as_unknown() {
+        // NOMOVE with no ASYNCWINDOWPOS: a pure resize from something that
+        // isn't winit and isn't MoveWindow.
+        let hint = proposal_origin_hint(0x0002, false);
+        assert!(hint.starts_with("unknown"), "{hint}");
+    }
+
     // -- decode_swp_flags / oversize_proposal_log (issue #119) ------------
 
     #[test]
@@ -3185,7 +3779,7 @@ mod tests {
                 cx: 460,
                 cy: i32::from(i16::MAX),
             },
-            (460, MAX_WINDOW_EXTENT_PX),
+            OversizeResponse::Clamp(460, MAX_WINDOW_EXTENT_PX),
             0,
             Some(rect(10, 20, 470, 420)),
             Some(96),
@@ -3196,7 +3790,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains(&format!("clamped_to=460x{MAX_WINDOW_EXTENT_PX}")),
+            message.contains(&format!("resolution=clamped_to=460x{MAX_WINDOW_EXTENT_PX}")),
             "{message}"
         );
         assert!(message.contains("flags=NONE"), "{message}");
@@ -3220,7 +3814,7 @@ mod tests {
                 cx: 9000,
                 cy: 9000,
             },
-            (MAX_WINDOW_EXTENT_PX, MAX_WINDOW_EXTENT_PX),
+            OversizeResponse::Clamp(MAX_WINDOW_EXTENT_PX, MAX_WINDOW_EXTENT_PX),
             0x0002,
             Some(rect(0, 0, 9000, 9000)),
             Some(96),
@@ -3242,7 +3836,7 @@ mod tests {
                 cx: 9000,
                 cy: 9000,
             },
-            (MAX_WINDOW_EXTENT_PX, MAX_WINDOW_EXTENT_PX),
+            OversizeResponse::Clamp(MAX_WINDOW_EXTENT_PX, MAX_WINDOW_EXTENT_PX),
             0,
             None,
             None,
