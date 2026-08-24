@@ -295,6 +295,18 @@ Each of these cost real time to find; they are commented at the site in
   shrink tests. `Set-AppRect` re-reads the rect afterwards and prints
   `MISMATCH` when what stuck differs from what was asked for; never assume a
   move landed.
+- **There is a ceiling too, and Win32 hides it from you.** A window extent is
+  saturated at `SHRT_MAX`, so `Set-AppRect -H 100000` never fails — it reaches
+  the app as `32767`, which is past the renderer's 8192 limit and used to panic
+  it inside `Surface::configure` (issue #257). `Set-AppRect` now refuses
+  anything over 8192 on either axis with `ERR out-of-range`; the app refuses it
+  independently (`platform::oversize_response` pins `SWP_NOSIZE` and keeps the
+  size it had), so an oversize request is a no-op at both ends rather than a
+  silently different window. To deliberately manufacture a live oversize
+  proposal — e.g. to reproduce issue #257 or exercise `window_proc`'s
+  Refuse/Clamp handling — pass `-AllowOversize` to bypass the guard:
+  `Set-AppRect -H 100000 -AllowOversize` sends the request unclamped. The
+  default (no switch) keeps refusing out-of-range values; this is opt-in only.
 - **Deploying over a running exe fails.** Windows locks a running image;
   `Copy-AppExe` kills the app first and retries the copy, because `Stop-Process`
   returns before the kernel has finished tearing the process down.

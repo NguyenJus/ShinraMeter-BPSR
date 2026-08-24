@@ -133,10 +133,64 @@ pub struct Entity {
     pub attrs: Option<AttrCollection>,
 }
 
+/// Why an entity left the client's area of interest, carried on
+/// [`DisappearEntity`]'s tag 2 (issue #276).
+///
+/// Two independent references model this field identically: `resonance-logs`'
+/// `src-tauri/.../blueprotobuf_package.rs:5843`
+/// (`#[prost(enumeration = "EDisappearType", optional, tag = "2")]`), and
+/// BPSR-ZDPS' `BPSR-ZDPSLib/protos/EnumEDisappearType.cs`, the game's own
+/// generated descriptor for `enum_e_disappear_type.proto`. The variant names
+/// here drop the reference sources' `EDisappear` prefix, exactly as
+/// [`EDamageType`] drops `EDamage`.
+///
+/// **Live-capture evidence** (house rule for a decoded field, see
+/// `docs/packet-inspection.md`), re-derived over every non-empty
+/// `inspect/dump-*.jsonl` on disk — 6 files, 32,260 records, 983
+/// `SyncNearEntities`, **851 disappear entries**. Tag 2 was present on 469 of
+/// them and absent on 382; the observed behaviour matches the reference names
+/// exactly, with "reappeared" meaning the same uuid turned up again in a later
+/// `appear` list of the same capture:
+///
+/// ```text
+/// tag 2                monsters (ent_type 1)          other entity types
+/// -------------------- ------------------------------ -----------------------------
+/// absent               23, 43% reappeared (med 2.5s)   359, 61% reappeared
+/// 1 Dead               58,  14% reappeared (med 14.9s) 329 (types 3/6/11/14), 0%
+/// 2 Destroy            50,   0% reappeared             24, 1 reappear (one type 3)
+/// 3 TransferLeave       0                              8, characters only, 0%
+/// 0 Normal / 4 …Line…   never observed in these captures
+/// ```
+///
+/// The absent column is a classic AOI range-out: high reappear rate, median
+/// 2.5s. `Dead` and `Destroy` are both terminal for monsters; the only 8
+/// `Dead` monsters that came back are six trash uids sharing one despawn
+/// timestamp, returning after 14.9s on uids spaced at exact 65536 boundaries
+/// — spawn-slot reuse on respawn, not a wipe. `TransferLeave` was seen on
+/// characters only: a player zoning out.
+///
+/// This is what lets `bpsr_meter` stop inferring death from an HP threshold —
+/// see `bpsr_meter::Meter::apply_enemy_gone`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum EDisappearType {
+    Normal = 0,
+    Dead = 1,
+    Destroy = 2,
+    TransferLeave = 3,
+    TransferPassLineLeave = 4,
+}
+
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DisappearEntity {
     #[prost(int64, tag = "1")]
     pub uuid: i64,
+    /// The reason the entity vanished — see [`EDisappearType`] for the
+    /// reference sourcing and the capture evidence. Genuinely optional on
+    /// the wire (382 of 851 observed entries carry no tag 2 at all), so a
+    /// `None` here means "the server did not say", not "normal".
+    #[prost(enumeration = "EDisappearType", optional, tag = "2")]
+    pub disappear_type: Option<i32>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]

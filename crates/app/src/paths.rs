@@ -7,7 +7,8 @@
 //! dev host, CI) it lands in the working directory and the caller says so.
 //! That shape lives here once rather than in three near-identical copies.
 
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 /// Resolves one such path.
 ///
@@ -42,6 +43,21 @@ pub fn resolve(
         ),
         _ => (PathBuf::from(fallback), Some(warning.to_string())),
     }
+}
+
+/// Creates `path`'s parent directory (and any missing ancestors), if it has
+/// a non-empty one. Shared by [`crate::single_instance::acquire_at`] and
+/// `crate::logging::open_log_file`, which both open a file that may be the
+/// first thing written under a not-yet-existing
+/// `%APPDATA%\ShinraMeter-BPSR\` — each maps the `io::Error` to its own
+/// error type rather than propagating this one directly.
+pub fn ensure_parent_dir(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

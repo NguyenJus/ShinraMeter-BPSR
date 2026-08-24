@@ -304,6 +304,16 @@ impl Pipeline {
         self.meter.snapshot(now_ms)
     }
 
+    /// The live publish loop's snapshot call (PR #268 review, finding 2):
+    /// only the players named in `skill_focus` get their heals/dealt/
+    /// received/casts breakdowns built, since a skill window is closed
+    /// almost all the time. See `Meter::snapshot_focused`'s doc comment.
+    /// Every other caller (tests, replay/history, the sanitizer) keeps
+    /// using `snapshot` above, unaffected.
+    fn snapshot_focused(&self, now_ms: u64, skill_focus: &[i64]) -> meter::Snapshot {
+        self.meter.snapshot_focused(now_ms, Some(skill_focus))
+    }
+
     /// Advances the meter's wall-clock-driven fight state (issue #78) —
     /// specifically, the idle timeout that ends a fight and freezes its
     /// stats on screen. Called once per publish tick, immediately before
@@ -326,7 +336,16 @@ impl Pipeline {
     /// Cheap on this thread: it clones the snapshot's rows into owned DTOs and
     /// enqueues them on an unbounded channel, then returns. Every failure past
     /// that point is the history thread's to log and swallow.
-    pub fn record_fight_end(&mut self, state: meter::FightState, snapshot: &meter::Snapshot) {
+    ///
+    /// Builds its own full (never `skill_focus`-gated) snapshot internally
+    /// rather than taking one from the caller (PR #268 review, finding 2):
+    /// the live publish loop's own snapshot may have skipped the
+    /// heals/dealt/received/casts breakdown for players with no skill
+    /// window open, and a saved history record must never carry that gap.
+    /// This only runs the extra `Meter::snapshot` once per fight — the
+    /// `fight_end_recorded` latch just above turns every other tick's call
+    /// into an early return before reaching it.
+    pub fn record_fight_end(&mut self, state: meter::FightState, now_ms: u64) {
         if state != meter::FightState::Ended {
             self.fight_end_recorded = false;
             return;
@@ -341,9 +360,10 @@ impl Pipeline {
         let Some(ended_at_ms) = self.meter.fight_end_ms() else {
             return;
         };
+        let snapshot = self.meter.snapshot(now_ms);
         let title = encounter_title(&snapshot.encounter);
         let subtitle = encounter_subtitle(&snapshot.encounter);
-        if let Some(record) = history::record_from_snapshot(snapshot, ended_at_ms, title, subtitle)
+        if let Some(record) = history::record_from_snapshot(&snapshot, ended_at_ms, title, subtitle)
         {
             history.record(record);
         }
@@ -424,6 +444,12 @@ fn run(
     // not spin the select loop.
     let mut events = events;
     let ticker = tick(TICK_INTERVAL);
+    // Which players have a skill-breakdown window open right now, per the
+    // overlay's latest `UiCommand::SkillFocus` (PR #268 review, finding 2).
+    // Read by `publish` below; empty until the UI has sent one, which just
+    // means the first tick or two after startup builds no breakdowns —
+    // corrected within one 100ms tick once the UI's first frame runs.
+    let mut skill_focus: Vec<i64> = Vec::new();
 
     loop {
         select! {
@@ -438,6 +464,7 @@ fn run(
             },
             recv(commands) -> msg => match msg {
                 Ok(UiCommand::Reset) => pipeline.reset(now_ms()),
+                Ok(UiCommand::SkillFocus(uids)) => skill_focus = uids,
                 // Issue #214. Logged unconditionally: knowing the user had
                 // to reach for this — and when — is exactly the context
                 // #211's silent log was missing, and it is what makes the
@@ -455,7 +482,7 @@ fn run(
                 Ok(UiCommand::Quit) => break,
                 Err(_) => break,
             },
-            recv(ticker) -> _ => publish(&mut pipeline, &tx_snapshot, &stale),
+            recv(ticker) -> _ => publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus),
         }
     }
 
@@ -473,16 +500,17 @@ fn publish(
     pipeline: &mut Pipeline,
     tx_snapshot: &Sender<meter::Snapshot>,
     stale: &Receiver<meter::Snapshot>,
+    skill_focus: &[i64],
 ) {
     // One `now` for the whole tick: the fight-state advance and the snapshot
     // it feeds must agree on what time it is.
     let now = now_ms();
     let state = pipeline.tick(now);
-    let snap = pipeline.snapshot(now);
-    pipeline.record_fight_end(state, &snap);
+    let snap = pipeline.snapshot_focused(now, skill_focus);
+    pipeline.record_fight_end(state, now);
     if tx_snapshot.try_send(snap).is_err() {
         let _ = stale.try_recv();
-        let _ = tx_snapshot.try_send(pipeline.snapshot(now));
+        let _ = tx_snapshot.try_send(pipeline.snapshot_focused(now, skill_focus));
     }
 }
 
@@ -1121,12 +1149,11 @@ mod tests {
         /// Drives one damage hit, then ticks past the idle timeout so the
         /// fight latches `FightState::Ended` — the edge `record_fight_end`
         /// is looking for.
-        fn ended_snapshot(pipeline: &mut Pipeline) -> (meter::FightState, meter::Snapshot) {
+        fn ended_snapshot(pipeline: &mut Pipeline) -> (meter::FightState, u64) {
             pipeline.step(proto::ProtocolEvent::Damage(damage(1, 100, 1_000)), 1_000);
             let idle = meter::FightConfig::default().idle_timeout_ms;
             let state = pipeline.tick(1_000 + idle);
-            let snap = pipeline.snapshot(1_000 + idle);
-            (state, snap)
+            (state, 1_000 + idle)
         }
 
         /// A `RetentionPolicy` with no duration floor: `ended_snapshot`'s
@@ -1157,10 +1184,10 @@ mod tests {
             let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
             let mut pipeline = Pipeline::new().with_history(handle.clone());
 
-            let (state, snap) = ended_snapshot(&mut pipeline);
-            pipeline.record_fight_end(state, &snap);
-            pipeline.record_fight_end(state, &snap);
-            pipeline.record_fight_end(state, &snap);
+            let (state, now) = ended_snapshot(&mut pipeline);
+            pipeline.record_fight_end(state, now);
+            pipeline.record_fight_end(state, now);
+            pipeline.record_fight_end(state, now);
 
             let count = row_count(&handle);
             drop(handle);
@@ -1177,10 +1204,10 @@ mod tests {
             let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
             let mut pipeline = Pipeline::new().with_history(handle.clone());
 
-            let (state, snap) = ended_snapshot(&mut pipeline);
-            pipeline.record_fight_end(state, &snap);
-            pipeline.record_fight_end(meter::FightState::Active, &snap);
-            pipeline.record_fight_end(state, &snap);
+            let (state, now) = ended_snapshot(&mut pipeline);
+            pipeline.record_fight_end(state, now);
+            pipeline.record_fight_end(meter::FightState::Active, now);
+            pipeline.record_fight_end(state, now);
 
             let count = row_count(&handle);
             drop(handle);
@@ -1197,9 +1224,8 @@ mod tests {
             let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
             let mut pipeline = Pipeline::new().with_history(handle.clone());
 
-            let snap = pipeline.snapshot(0);
-            pipeline.record_fight_end(meter::FightState::Idle, &snap);
-            pipeline.record_fight_end(meter::FightState::Active, &snap);
+            pipeline.record_fight_end(meter::FightState::Idle, 0);
+            pipeline.record_fight_end(meter::FightState::Active, 0);
 
             let count = row_count(&handle);
             drop(handle);
@@ -1213,8 +1239,7 @@ mod tests {
         #[test]
         fn a_pipeline_without_history_never_panics() {
             let mut pipeline = Pipeline::new();
-            let snap = pipeline.snapshot(0);
-            pipeline.record_fight_end(meter::FightState::Ended, &snap);
+            pipeline.record_fight_end(meter::FightState::Ended, 0);
         }
     }
 

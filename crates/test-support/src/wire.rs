@@ -272,13 +272,29 @@ pub fn sync_near_entities_payload(entities: Vec<pb::Entity>) -> Vec<u8> {
 }
 
 /// Prost-encodes a `SyncNearEntities` payload whose `disappear` list retires
-/// `uuids` (issue #215), with no `appear` entities.
+/// `uuids` (issue #215), with no `appear` entities and no tag-2 reason on any
+/// entry — see [`sync_near_entities_disappear_typed_payload`] for the latter.
 pub fn sync_near_entities_disappear_payload(uuids: &[i64]) -> Vec<u8> {
+    sync_near_entities_disappear_typed_payload(
+        &uuids.iter().map(|uuid| (*uuid, None)).collect::<Vec<_>>(),
+    )
+}
+
+/// Prost-encodes a `SyncNearEntities` payload whose `disappear` list retires
+/// each `(uuid, disappear_type)` pair (issue #276), with no `appear`
+/// entities. A `None` type omits tag 2 entirely, which is what 382 of the
+/// 851 disappear entries in our captures look like.
+pub fn sync_near_entities_disappear_typed_payload(
+    entries: &[(i64, Option<pb::EDisappearType>)],
+) -> Vec<u8> {
     let msg = pb::SyncNearEntities {
         appear: Vec::new(),
-        disappear: uuids
+        disappear: entries
             .iter()
-            .map(|uuid| pb::DisappearEntity { uuid: *uuid })
+            .map(|(uuid, disappear_type)| pb::DisappearEntity {
+                uuid: *uuid,
+                disappear_type: disappear_type.map(|t| t as i32),
+            })
             .collect(),
     };
     let mut buf = Vec::new();

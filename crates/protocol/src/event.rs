@@ -84,6 +84,17 @@ pub struct DamageEvent {
     pub is_dead: bool,
 }
 
+/// One skill activation (issue #245). Carries no amount of any kind: a
+/// cast is a use of a skill, whether or not anything came of it, which is
+/// exactly what makes the Skill casts tab different from the Dps tab's hit
+/// counts.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CastEvent {
+    pub caster_uid: i64,
+    pub skill_id: i32,
+    pub timestamp_ms: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlayerInfo {
     pub uid: i64,
@@ -168,9 +179,51 @@ impl From<i32> for EDungeonState {
     }
 }
 
+/// Why an entity left the client's area of interest, mirroring
+/// [`crate::pb::EDisappearType`] (issue #276) — see that type's doc comment
+/// for the reference sourcing and the live-capture evidence behind each
+/// variant.
+///
+/// `Unknown` is an explicit variant for the same reason [`EDungeonState`]'s
+/// is: a future value must not be silently folded into a named one. Every
+/// consumer treats it as "no usable reason", which is the conservative
+/// reading here — see `bpsr_meter::Meter::apply_enemy_gone`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DisappearReason {
+    Normal,
+    Dead,
+    Destroy,
+    TransferLeave,
+    TransferPassLineLeave,
+    Unknown(i32),
+}
+
+impl From<i32> for DisappearReason {
+    fn from(v: i32) -> Self {
+        match v {
+            0 => DisappearReason::Normal,
+            1 => DisappearReason::Dead,
+            2 => DisappearReason::Destroy,
+            3 => DisappearReason::TransferLeave,
+            4 => DisappearReason::TransferPassLineLeave,
+            other => DisappearReason::Unknown(other),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolEvent {
     Damage(DamageEvent),
+    /// One entity began casting one skill (issue #245), decoded from
+    /// `AttrSkillId` on `AoiSyncDelta`'s attr channel — see
+    /// `attrs::attr_id::SKILL_ID` for the wire evidence, and
+    /// `decode::on_aoi_sync_delta` for the emit site.
+    ///
+    /// Emitted for players only. The attr rides every entity's deltas, but
+    /// a monster's cast count has nowhere to go: `bpsr-meter` keeps no
+    /// per-monster skill breakdown, and the breakdown window is opened from
+    /// a player row.
+    Cast(CastEvent),
     Player(PlayerInfo),
     EnemyHp(EnemyHp),
     /// The dungeon/instance id (issue #9 slice 2), decoded from
@@ -237,16 +290,24 @@ pub enum ProtocolEvent {
     /// `appear` list that produces `Player`/`EnemyHp`. Emitted for monsters
     /// only: a player walking out of range says nothing this meter tracks.
     ///
-    /// **This is not a death signal.** `pb::DisappearEntity` carries a bare
-    /// `uuid` and no reason code whatsoever, so the wire cannot distinguish
-    /// "died and the corpse was despawned" from "the player walked out of
-    /// AOI range" or an ordinary streaming eviction. This crate therefore
-    /// reports the fact and nothing more; deciding whether a particular
-    /// despawn may stand in for a missed death is the meter's job, under
-    /// the deliberately narrow rule documented on
+    /// `reason` is the server's own statement of *why* (issue #276), decoded
+    /// from `pb::DisappearEntity`'s optional tag 2 — see
+    /// [`crate::pb::EDisappearType`] for its sourcing and capture evidence.
+    /// It is genuinely optional: 382 of 851 observed disappear entries carry
+    /// no tag 2 at all, so `None` means "the server did not say", never
+    /// "nothing happened".
+    ///
+    /// **A despawn is still not, by itself, a death.** Only
+    /// [`DisappearReason::Dead`] says the entity died; `Destroy`,
+    /// `TransferLeave` and `Normal` are evictions, zone-outs and ordinary
+    /// streaming churn, and a `None` says nothing either way. This crate
+    /// therefore reports the fact and the server's reason and nothing more;
+    /// deciding whether a particular despawn ends a fight is the meter's
+    /// job, under the rule documented on
     /// `bpsr_meter::Meter::apply_enemy_gone`.
     EnemyGone {
         uid: i64,
+        reason: Option<DisappearReason>,
     },
 }
 
