@@ -309,4 +309,43 @@ mod tests {
     fn decide_errors_on_a_malformed_current_version() {
         assert!(decide("garbage", "v0.2.0", "https://example.com").is_err());
     }
+
+    // -- issue #234 regression: a running build must never be told an
+    // identical version is available -------------------------------------
+    //
+    // The reported symptom was v0.2.4 reporting "update available: v0.2.4"
+    // against itself. Investigating this module found the comparison
+    // already correct on both counts the issue called out — the `v`
+    // prefix (`parse_version_tag` strips it before comparing) and the
+    // equal-version case (`is_newer` requires strictly greater) — so these
+    // pin the exact reported version numbers as a named regression rather
+    // than changing any comparison behavior. The actual bug was tag/version
+    // drift: the `v0.2.4` tag was pushed without a matching
+    // `crates/app/Cargo.toml` version bump, so the running build's
+    // `env!("CARGO_PKG_VERSION")` was still `"0.2.3"` when it fetched a
+    // `"v0.2.4"` release tag — a real, older-than-remote case this module
+    // correctly reports as `UpdateAvailable`. `.github/workflows/release.yml`
+    // now refuses to publish a release when the pushed tag and the crate
+    // version disagree, closing off that drift at the source.
+    #[test]
+    fn decide_reports_up_to_date_for_the_issue_234_matching_versions() {
+        assert_eq!(
+            decide("0.2.4", "v0.2.4", "https://example.com"),
+            Ok(CheckOutcome::UpToDate)
+        );
+    }
+
+    #[test]
+    fn decide_reports_update_available_when_the_crate_version_was_not_bumped_for_the_tag() {
+        // The actual failure mode behind issue #234: the crate version
+        // (what `current_version` is here) lagged the pushed tag, so this
+        // is correctly `UpdateAvailable`, not a bug in this comparison.
+        assert_eq!(
+            decide("0.2.3", "v0.2.4", "https://example.com/releases/tag/v0.2.4"),
+            Ok(CheckOutcome::UpdateAvailable {
+                tag: "v0.2.4".to_string(),
+                url: "https://example.com/releases/tag/v0.2.4".to_string(),
+            })
+        );
+    }
 }
