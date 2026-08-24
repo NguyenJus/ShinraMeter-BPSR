@@ -207,6 +207,7 @@ impl PlayerRecord {
             heals: Vec::new(),
             dealt: Vec::new(),
             received: Vec::new(),
+            casts: Vec::new(),
         }
     }
 }
@@ -392,6 +393,7 @@ mod tests {
             heals: Vec::new(),
             dealt: Vec::new(),
             received: Vec::new(),
+            casts: Vec::new(),
         }
     }
 

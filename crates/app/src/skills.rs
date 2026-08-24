@@ -349,7 +349,8 @@ impl SkillTab {
             SkillTab::Heal => &row.heals,
             SkillTab::Dealt => &row.dealt,
             SkillTab::Received => &row.received,
-            SkillTab::Buff | SkillTab::Casts => &[],
+            SkillTab::Casts => &row.casts,
+            SkillTab::Buff => &[],
         }
     }
 
@@ -359,7 +360,7 @@ impl SkillTab {
     /// this build doesn't — but it is painted muted and says why when
     /// opened.
     pub fn is_tracked(self) -> bool {
-        !matches!(self, SkillTab::Buff | SkillTab::Casts)
+        !matches!(self, SkillTab::Buff)
     }
 
     /// What an empty body says. An untracked tab explains the gap rather
@@ -368,7 +369,6 @@ impl SkillTab {
     pub fn untracked_message(self) -> Option<&'static str> {
         match self {
             SkillTab::Buff => Some("Buff uptime is not tracked yet (needs buff packet decoding)"),
-            SkillTab::Casts => Some("Skill casts are not tracked yet (needs cast packet decoding)"),
             _ => None,
         }
     }
@@ -605,6 +605,7 @@ mod tests {
             heals: Vec::new(),
             dealt: Vec::new(),
             received: Vec::new(),
+            casts: Vec::new(),
         }
     }
 
@@ -740,14 +741,13 @@ mod tests {
     #[test]
     fn untracked_tabs_say_so_and_tracked_ones_do_not() {
         assert!(!SkillTab::Buff.is_tracked());
-        assert!(!SkillTab::Casts.is_tracked());
         assert!(SkillTab::Buff.untracked_message().is_some());
-        assert!(SkillTab::Casts.untracked_message().is_some());
         for tab in [
             SkillTab::Dps,
             SkillTab::Heal,
             SkillTab::Dealt,
             SkillTab::Received,
+            SkillTab::Casts,
         ] {
             assert!(tab.is_tracked(), "{tab:?}");
             assert_eq!(tab.untracked_message(), None, "{tab:?}");
@@ -765,8 +765,9 @@ mod tests {
         assert_eq!(SkillTab::Heal.rows(&row)[1].skill_id, 3);
         assert_eq!(SkillTab::Dealt.rows(&row)[0].skill_id, 4);
         assert_eq!(SkillTab::Received.rows(&row)[0].skill_id, 5);
+        row.casts = vec![skill_row(6, 0)];
+        assert_eq!(SkillTab::Casts.rows(&row)[0].skill_id, 6);
         assert!(SkillTab::Buff.rows(&row).is_empty());
-        assert!(SkillTab::Casts.rows(&row).is_empty());
     }
 
     #[test]

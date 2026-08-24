@@ -937,6 +937,26 @@ fn demo_received_total() -> i64 {
     DEMO_RECEIVED.iter().map(|&(_, amount, ..)| amount).sum()
 }
 
+/// The Skill casts tab's demo fixture (issue #245): one cast per three
+/// recorded hits of each damaging skill, floored at one. A real cast count
+/// is never derivable from a hit count — that is exactly why the tab needs
+/// its own packet source — but the demo only has to look like a plausible
+/// pull, and a ratio keeps the two columns telling a consistent story.
+fn demo_cast_rows(skills: &[DemoSkill], duration_ms: u64) -> Vec<SkillRow> {
+    let mut rows: Vec<SkillRow> = skills
+        .iter()
+        .map(|&(skill_id, _, hits, ..)| {
+            let stats = SkillStats {
+                hits: (hits / 3).max(1),
+                ..Default::default()
+            };
+            skill_row_from_stats(skill_id, &stats, 0, duration_ms)
+        })
+        .collect();
+    rows.sort_by_key(|s| std::cmp::Reverse(s.hits));
+    rows
+}
+
 /// The synthetic snapshot `demo_enabled` seeds the overlay with. The header's
 /// `total_damage`/`total_dps` are derived from `DEMO_ROWS` rather than a
 /// separate literal (issue #148), so the two can never disagree the way they
@@ -1007,6 +1027,11 @@ fn demo_snapshot() -> Snapshot {
                         ))
                         .collect(),
                     received: demo_skill_rows(DEMO_RECEIVED, demo_received_total(), duration_ms),
+                    // A cast count per damaging skill, deliberately a
+                    // little above its hit count — most BPSR skills land
+                    // more than one hit per cast, so equal figures would
+                    // be the odd-looking ones.
+                    casts: demo_cast_rows(demo_skills, duration_ms),
                 }
             },
         )
@@ -7538,7 +7563,8 @@ fn skill_window_empty_message(
             skills::SkillTab::Heal => "No healing recorded yet",
             skills::SkillTab::Dealt => "Nothing dealt yet",
             skills::SkillTab::Received => "Nothing received yet",
-            skills::SkillTab::Buff | skills::SkillTab::Casts => "Nothing recorded yet",
+            skills::SkillTab::Casts => "Nothing cast yet",
+            skills::SkillTab::Buff => "Nothing recorded yet",
         },
         SkillWindowSource::History(_) => "No per-skill data recorded for this fight",
     })
@@ -12589,6 +12615,7 @@ mod tests {
             heals: Vec::new(),
             dealt: Vec::new(),
             received: Vec::new(),
+            casts: Vec::new(),
         }
     }
 
@@ -13597,6 +13624,7 @@ mod tests {
             heals: Vec::new(),
             dealt: Vec::new(),
             received: Vec::new(),
+            casts: Vec::new(),
         };
 
         for (kind, column) in ColumnKind::ALL
@@ -14480,6 +14508,7 @@ mod tests {
             heals: Vec::new(),
             dealt: Vec::new(),
             received: Vec::new(),
+            casts: Vec::new(),
             ..sample_row(None)
         };
         let ctx = egui::Context::default();
@@ -18485,6 +18514,7 @@ mod tests {
             heals: Vec::new(),
             dealt: Vec::new(),
             received: Vec::new(),
+            casts: Vec::new(),
             ..sample_row(None)
         };
         let mut tabs = SkillTabs::default();
@@ -18793,6 +18823,7 @@ mod tests {
             heals: Vec::new(),
             dealt: Vec::new(),
             received: Vec::new(),
+            casts: Vec::new(),
             ..sample_row(None)
         };
         let mut tabs = SkillTabs::default();

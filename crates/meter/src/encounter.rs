@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::event::{
-    Class, DamageEvent, EDungeonState, EnemyHp, EntityKind, PlayerInfo, ProtocolEvent,
+    CastEvent, Class, DamageEvent, EDungeonState, EnemyHp, EntityKind, PlayerInfo, ProtocolEvent,
 };
 use crate::fight::{FightConfig, FightEndCause, FightState};
 use crate::phase;
@@ -705,6 +705,10 @@ impl Meter {
     pub fn apply(&mut self, ev: &ProtocolEvent) -> Option<ResetReason> {
         match ev {
             ProtocolEvent::Damage(d) => self.apply_damage(d),
+            ProtocolEvent::Cast(c) => {
+                self.apply_cast(c);
+                None
+            }
             ProtocolEvent::Player(p) => {
                 self.apply_player(p);
                 None
@@ -1923,6 +1927,30 @@ impl Meter {
     /// ever having attacked (e.g. a healer or a fresh join), so this cannot
     /// rely on an entry the attacker-side path in `apply_damage` already
     /// made.
+    /// Counts one skill activation against its caster (issue #245).
+    ///
+    /// Deliberately inert beyond that count. A cast does not start the
+    /// fight clock, does not advance `last_event_ms`, does not end a hold,
+    /// and is not evidence of a revive — the attr it is decoded from rides
+    /// every delta a player's client sends, in town as much as in a
+    /// dungeon, so treating it as combat activity would keep the meter
+    /// permanently "in a fight" and dilute every DPS figure with the walk
+    /// back to the vendor.
+    ///
+    /// `get_mut`, not `entry`: same rule the breakdowns below follow. A
+    /// stranger casting past the player must not open a row in a fight
+    /// they are no part of, and a cast carries no damage to justify one.
+    /// A cast that arrives while a finished fight is held on screen is
+    /// dropped, for the same reason every other event is.
+    fn apply_cast(&mut self, c: &CastEvent) {
+        if self.fight_end_ms.is_some() {
+            return;
+        }
+        if let Some(stats) = self.players.get_mut(&c.caster_uid) {
+            *stats.casts.entry(c.skill_id).or_insert(0) += 1;
+        }
+    }
+
     /// Accumulates one event into issue #245's per-tab breakdowns: the
     /// attacker's outgoing healing, and the target's incoming everything
     /// (damage taken and healing received alike).
@@ -2465,6 +2493,7 @@ impl Meter {
                 let heals = breakdown_rows(&p.heals, p.total_heal, dps_duration_ms);
                 let dealt = dealt_rows(p, dps_duration_ms);
                 let received = breakdown_rows(&p.incoming, p.total_incoming, dps_duration_ms);
+                let casts = cast_rows(p, dps_duration_ms);
                 PlayerRow {
                     uid: p.uid,
                     name: p
@@ -2491,6 +2520,7 @@ impl Meter {
                     heals,
                     dealt,
                     received,
+                    casts,
                 }
             })
             .collect();
@@ -2690,6 +2720,31 @@ fn breakdown_rows(
     rows
 }
 
+/// The Skill casts tab's rows (issue #245): one row per skill this player
+/// has begun, cast-count-descending.
+///
+/// Goes through `skill_row_from_stats` like every other breakdown so the
+/// per-minute rate shares the Dps tab's denominator exactly — a cast rate
+/// and a hit rate that disagreed about how long the fight was would be
+/// worse than either alone. Every amount-shaped field falls out as `0`
+/// from an all-zero `SkillStats`, which is correct: a cast has no amount,
+/// and the tab shows no amount column.
+fn cast_rows(stats: &PlayerStats, dps_duration_ms: u64) -> Vec<SkillRow> {
+    let mut rows: Vec<SkillRow> = stats
+        .casts
+        .iter()
+        .map(|(&skill_id, &count)| {
+            let stats = SkillStats {
+                hits: count,
+                ..Default::default()
+            };
+            skill_row_from_stats(skill_id, &stats, 0, dps_duration_ms)
+        })
+        .collect();
+    rows.sort_by_key(|s| std::cmp::Reverse(s.hits));
+    rows
+}
+
 /// The "Skill dealt" tab's rows (issue #245): everything this player put
 /// out, damage and healing merged under one skill id. A skill that both
 /// damages and heals lands in both accumulators and is summed here, which
@@ -2875,6 +2930,69 @@ mod tests {
             timestamp_ms: ts,
             ..Default::default()
         })
+    }
+
+    fn cast(caster_uid: i64, skill_id: i32, ts: u64) -> ProtocolEvent {
+        ProtocolEvent::Cast(CastEvent {
+            caster_uid,
+            skill_id,
+            timestamp_ms: ts,
+        })
+    }
+
+    #[test]
+    fn casts_are_counted_per_skill_for_a_player_in_the_roster() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 1000));
+        m.apply(&cast(1, 1550, 1100));
+        m.apply(&cast(1, 1550, 1200));
+        m.apply(&cast(1, 1551, 1300));
+        let snap = m.snapshot(2000);
+        let row = &snap.rows[0];
+        assert_eq!(row.casts.len(), 2);
+        // Cast-count-descending, like every other breakdown's amount.
+        assert_eq!(row.casts[0].skill_id, 1550);
+        assert_eq!(row.casts[0].hits, 2);
+        assert_eq!(row.casts[1].skill_id, 1551);
+        assert_eq!(row.casts[1].hits, 1);
+        // A cast has no amount, and the tab shows no amount column.
+        assert_eq!(row.casts[0].damage, 0);
+        assert_eq!(row.casts[0].share_pct, 0.0);
+    }
+
+    /// A cast rides every delta a player's client sends, in town as much
+    /// as in a dungeon — so it must not open a row, start the fight clock,
+    /// or advance the idle deadline.
+    #[test]
+    fn a_cast_alone_never_opens_a_row_or_starts_a_fight() {
+        let mut m = Meter::new();
+        m.apply(&cast(1, 1550, 1000));
+        assert!(m.snapshot(2000).rows.is_empty());
+        assert!(!m.is_active());
+    }
+
+    #[test]
+    fn casts_share_the_dps_windows_per_minute_denominator() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0));
+        m.apply(&dmg(1, 100, 5_000));
+        for ts in 0..6 {
+            m.apply(&cast(1, 1550, ts * 1_000));
+        }
+        let snap = m.snapshot(5_000);
+        let row = &snap.rows[0];
+        // Two hits and six casts over the same window, so the cast rate is
+        // exactly three times the Dps tab's hit rate for the same skill —
+        // an assertion that pins the shared denominator without restating
+        // how `snapshot` computes it.
+        assert_eq!(row.skills[0].hits, 2);
+        assert_eq!(row.casts[0].hits, 6);
+        assert!(
+            (row.casts[0].hits_per_min - 3.0 * row.skills[0].hits_per_min).abs() < 0.01,
+            "cast rate {} vs hit rate {}",
+            row.casts[0].hits_per_min,
+            row.skills[0].hits_per_min
+        );
     }
 
     #[test]

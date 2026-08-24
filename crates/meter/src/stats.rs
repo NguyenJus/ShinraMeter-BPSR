@@ -108,6 +108,11 @@ pub struct PlayerStats {
     /// of the effect that landed on them. This is the one accumulator keyed
     /// off `DamageEvent::target_uid` rather than `attacker_uid`.
     pub incoming: HashMap<i32, SkillStats>,
+    /// How many times this player has *begun* each skill (issue #245),
+    /// keyed by raw skill id — the Skill casts tab. A count, not a
+    /// `SkillStats`: a cast carries no amount, no crit bit and no target,
+    /// so there is nothing else about it to accumulate.
+    pub casts: HashMap<i32, u64>,
     /// Sum of `heals`' amounts, i.e. the denominator for the Heal tab's
     /// `% Heal` column. Tracked alongside the map for the same reason
     /// `total_damage` is: the share column needs a player total that does
@@ -175,6 +180,7 @@ impl PlayerStats {
             skills: HashMap::new(),
             heals: HashMap::new(),
             incoming: HashMap::new(),
+            casts: HashMap::new(),
             total_heal: 0,
             total_incoming: 0,
             last_death_ms: None,
@@ -321,6 +327,13 @@ pub struct PlayerRow {
     /// *on* this player, damage taken and healing received alike,
     /// amount-descending.
     pub received: Vec<SkillRow>,
+    /// The Skill casts tab's rows (issue #245): how often this player began
+    /// each skill, cast-count-descending. Reuses `SkillRow` like every
+    /// other breakdown — `hits` is the cast count and `hits_per_min` the
+    /// rate; every amount-shaped field stays `0`, because a cast has no
+    /// amount and the tab shows no amount column
+    /// (`skills::SkillTab::columns`).
+    pub casts: Vec<SkillRow>,
 }
 
 /// One row of a player's skill breakdown (issue #16). This is the contract

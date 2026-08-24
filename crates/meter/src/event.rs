@@ -152,6 +152,15 @@ pub struct DamageEvent {
     pub is_dead: bool,
 }
 
+/// Mirrors `bpsr_protocol::event::CastEvent` (issue #245): one skill
+/// activation, with no amount attached. See that type for the wire source.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CastEvent {
+    pub caster_uid: i64,
+    pub skill_id: i32,
+    pub timestamp_ms: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PlayerInfo {
     pub uid: i64,
@@ -212,6 +221,11 @@ pub enum EDungeonState {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolEvent {
     Damage(DamageEvent),
+    /// Mirrors `bpsr_protocol::ProtocolEvent::Cast` (issue #245). See
+    /// `Meter::apply_cast` for what the meter does with it — notably, a
+    /// cast never starts the fight clock, opens a row, or counts as
+    /// evidence of a revive.
+    Cast(CastEvent),
     Player(PlayerInfo),
     EnemyHp(EnemyHp),
     /// The dungeon/instance id, mirrors `bpsr_protocol::ProtocolEvent::Scene`
