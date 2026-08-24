@@ -370,6 +370,17 @@ pub struct Settings {
 /// (`PANEL_FILL`'s 200/255 times opacity's 1.0) now that `opacity` is the
 /// only place transparency lives, matching
 /// `docs/reference/new-shinra-ex.webp`.
+///
+/// This restored default only reaches a fresh install (no settings.json
+/// yet) or an explicit "Reset to defaults" — the same scope
+/// `Settings::default`'s `visible_columns` comment documents. An existing
+/// settings.json written during the post-#182/pre-#233 window already has
+/// an `"opacity": 1.0` key on disk (the whole struct gets re-serialized on
+/// any window move/resize), so `#[serde(default = "default_opacity")]`
+/// never fires for it and that install stays at the 1.0 it last had —
+/// intended, since a `1.0` on disk is indistinguishable from someone
+/// deliberately choosing full opacity, and silently overriding it would be
+/// wrong just as often as it would be right.
 fn default_opacity() -> f32 {
     200.0 / 255.0
 }

@@ -14358,7 +14358,7 @@ mod tests {
         assert_eq!(
             settings.opacity,
             Settings::default_opacity(),
-            "Reset to defaults must restore full opacity"
+            "Reset to defaults must restore the default opacity"
         );
         let sent = rx_settings
             .try_recv()
