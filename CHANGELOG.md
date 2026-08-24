@@ -4,6 +4,100 @@ All notable changes to ShinraMeter-BPSR are documented here. This project is
 a fan-made, unofficial tool for Blue Protocol: Star Resonance and is not
 affiliated with the game's publisher.
 
+## v0.2.5
+
+### Added
+
+- The header dropdown gains a "Restart packet capture" item. When the meter
+  stops updating while the game is still running, it re-anchors capture in
+  place, so relaunching the app or re-entering the instance is no longer the
+  only way out.
+- A saved fight now has the same per-skill breakdown a live one does.
+  Right-clicking a player row in a historical encounter lists that player's
+  skills instead of reporting that none were recorded. Encounters already on
+  disk are kept as they are and simply have no skill rows.
+
+### Changed
+
+- The overlay's default opacity is translucent again. A fresh install, and
+  "Reset to defaults", had been coming up fully opaque ever since
+  transparency moved onto the opacity slider.
+- Pinning the overlay now locks resizing as well as moving. A pinned window
+  can no longer be pulled out of shape by its edges or corners.
+- The meter watches its own throughput and warns in the log when packets keep
+  arriving but nothing reaches it, then re-anchors capture by itself after
+  three minutes of that. A capture pipeline that has died outright now raises
+  an error banner instead of looking like a quiet fight.
+
+### Fixed
+
+- Making the skill breakdown window narrow collided its column headers into
+  unreadable text. It can no longer be sized below the width every column's
+  full label needs.
+- A boss that simply vanished — no death packet, no zero-HP sync — left the
+  fight running on into the next pull. A tracked boss that disappears at low
+  health shortly after being hit now ends the fight, timed at the last damage
+  rather than at the moment it vanished.
+- The opacity slider in the settings dropdown was a fixed narrow width; it
+  now fills its row like the items around it.
+- The settings dropdown scrolls when an expanded Columns list makes it taller
+  than the screen, instead of clipping and getting stuck.
+
+## v0.2.4
+
+### Added
+
+- The header dropdown gains a "Reset to defaults" item. It sizes the overlay
+  back to five player rows and puts the opacity back to its default. The
+  tray's own window reset is unchanged.
+- The header dropdown gains an "Export logs" item, which opens a Save As
+  dialog and writes the current and previous log files out as a single file
+  — one less thing to hunt for in AppData when reporting a bug.
+- Right-clicking a player row in a saved encounter now opens the skill
+  breakdown window, the same as a live row does.
+
+### Changed
+
+- Encounter boundaries now follow the game's own dungeon state and objective
+  progress wherever the server reports them, rather than being inferred from
+  the damage stream alone. Entering a dungeon starts a fresh fight, reaching
+  the end screen ends one, and clearing one boss of a multi-boss raid starts
+  the next fight in place. A session that never receives any of it behaves
+  exactly as before.
+- A dungeon's boss is named before the pull from a built-in list of
+  single-boss dungeons, instead of being learned from whatever was last
+  fought there and remembered on disk. A dungeon that isn't on the list shows
+  no name until a boss is actually hit, and the "Forget learned bosses"
+  dropdown item is gone along with the guessing it existed to undo.
+- The skill breakdown window was measured against the reference and now
+  matches it: a taller header with a larger class icon, its own column-header
+  band, larger skill icons, roomier rows, and a selected tab that hugs its
+  label rather than filling the whole strip.
+
+### Fixed
+
+- The meter could stop updating partway through a raid and stay that way
+  until the instance was left and re-entered. A packet the game never resends
+  made reassembly throw away the very data it had just recovered onto, so
+  nothing reached the meter again for the rest of the session.
+- Killing one boss of a multi-boss raid left the timer running, the encounter
+  unsaved, and the next boss's damage piling into the dead boss's rows.
+- In a long pull with battle rezzes the meter would freeze for about a minute
+  and then zero itself, because it counted anyone who had died at any point
+  as still being down. It now asks whether the party is down right now.
+- Wiping and then re-pulling something the meter doesn't recognize as a boss
+  left the timer frozen and everything after it dropped, with no way back
+  short of zoning or resetting by hand. The hold now lifts a minute after the
+  wipe.
+- Being bounced to a checkpoint or lobby immediately after a wipe cleared the
+  wiped attempt's rows and death counts before they could be read.
+- The skill breakdown window could not be resized, its list stopped scrolling
+  after any drag inside it, and its close button drew as an empty square. All
+  three work now, and the list has a visible scroll bar.
+- The Share button captured the historical encounter list when that was the
+  view on screen, rather than any DPS rows; it is greyed out there now. With
+  a saved encounter open, the screenshot also cut off the last row or two.
+
 ## v0.2.3
 
 ### Added
