@@ -589,31 +589,74 @@ function Set-AppRect {
       "reproduced" bug at a size the window never actually had. Always compare
       requested vs actual -- this function prints both, and says MISMATCH when
       they differ so the difference cannot be skimmed past.
+
+      GOTCHA (issue #257): there is a ceiling as well as a floor, and asking
+      past it used to take the app down with it. Win32 saturates a window
+      extent at SHRT_MAX, so `-H 100000` does not fail -- it arrives at the
+      app as a 32767px proposal, and a 32767px swapchain is past egui-wgpu's
+      8192 `max_texture_dimension_2d`, which `Surface::configure` treats as a
+      fatal validation error. This function therefore refuses an out-of-range
+      request outright rather than sending a number the OS will quietly turn
+      into a different one. The app refuses it a second time
+      (`platform::oversize_response`), but a harness whose own arguments
+      depend on that backstop is testing the backstop, not the app.
+
+      -AllowOversize bypasses this guard on purpose: it is the only
+      documented way (docs/ui-debugging.md) to manufacture a live oversize
+      `WM_WINDOWPOSCHANGING` proposal and exercise `platform::window_proc`'s
+      Refuse/Clamp handling end to end. Without it the harness cannot
+      reproduce issue #257 at all; the default (unswitched) call keeps
+      refusing, since that is this function's intended everyday behaviour.
     #>
     param(
         [int]$X = [int]::MinValue,
         [int]$Y = [int]::MinValue,
         [int]$W = 0,
         [int]$H = 0,
-        [int]$SettleMs = 500
+        [int]$SettleMs = 500,
+        [switch]$AllowOversize
     )
 
-    $h = Get-AppHwnd
-    if ($h -eq [IntPtr]::Zero) { Write-Output 'ERR no-window'; return }
-    $before = Get-AppRect -Hwnd $h
+    # Mirrors `MAX_WINDOW_EXTENT_PX` in crates/app/src/platform.rs -- the
+    # renderer's hard limit, not a taste decision (8192 clears an 8K panel).
+    $maxExtent = 8192
+
+    # NOT named $h: PowerShell variable names are case-insensitive, so $h
+    # would be the *same variable* as the [int]$H parameter above and would
+    # silently overwrite every -H the caller passed (issue #88's $Rows hazard,
+    # again). Get-AppScreenBitmap's $ht is a related but distinct case: that
+    # function has no $H parameter to clash with -- $ht there only avoids
+    # colliding with its own $h local.
+    $hwnd = Get-AppHwnd
+    if ($hwnd -eq [IntPtr]::Zero) { Write-Output 'ERR no-window'; return }
+    $before = Get-AppRect -Hwnd $hwnd
 
     $nx = if ($X -eq [int]::MinValue) { $before.Left } else { $X }
     $ny = if ($Y -eq [int]::MinValue) { $before.Top } else { $Y }
     $nw = if ($W -gt 0) { $W } else { $before.Right - $before.Left }
     $nh = if ($H -gt 0) { $H } else { $before.Bottom - $before.Top }
 
+    if (-not $AllowOversize -and ($nw -gt $maxExtent -or $nh -gt $maxExtent)) {
+        # Built in two steps on purpose: mixing `+` and `-f` in one expression
+        # is a precedence trap, and this line only ever gets read when
+        # something has already gone wrong.
+        $fmt = 'ERR out-of-range requested={0}x{1} max={2}x{2} -- the renderer cannot present ' +
+            'a surface larger than {2}px on either axis. Below 32767 the number would arrive ' +
+            'at the app intact and get refused there instead (platform::oversize_response); ' +
+            'at or above 32767 Win32 saturates the window extent first, so the app never sees ' +
+            'the number typed (issue #257). Pass -AllowOversize to send it anyway (e.g. to ' +
+            'reproduce issue #257 on purpose).'
+        Write-Output ($fmt -f $nw, $nh, $maxExtent)
+        return
+    }
+
     Invoke-UidbgWin32 -What 'MoveWindow' -Call {
-        [ShinraUidbgNativeV1]::MoveWindow($h, $nx, $ny, $nw, $nh, $true)
+        [ShinraUidbgNativeV1]::MoveWindow($hwnd, $nx, $ny, $nw, $nh, $true)
     }
     $moveOk = $script:UidbgLastCallOk
     Start-Sleep -Milliseconds $SettleMs
 
-    $after = Get-AppRect -Hwnd $h
+    $after = Get-AppRect -Hwnd $hwnd
     $actualW = $after.Right - $after.Left
     $actualH = $after.Bottom - $after.Top
     $verdict = if ($after.Left -eq $nx -and $after.Top -eq $ny -and $actualW -eq $nw -and $actualH -eq $nh) {
