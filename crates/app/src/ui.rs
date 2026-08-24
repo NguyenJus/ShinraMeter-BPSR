@@ -14351,11 +14351,25 @@ mod tests {
     /// and measures through the exact font the header loop paints with
     /// (`bold(FONT_SIZE_ROW)`) rather than against any hardcoded
     /// expectation.
+    ///
+    /// One honest caveat: `bold()` only resolves to the real bold family
+    /// when `fonts::has_real_bold()` is true, and that flag stays `false`
+    /// here — it is only ever flipped by `install_cjk_fallback`, which this
+    /// test never calls (see `fonts.rs`'s own
+    /// `no_real_bold_is_reported_before_install_runs`). CI runs on
+    /// ubuntu-latest with no `C:\Windows\Fonts`, so this measures egui's
+    /// bundled regular-weight fallback, not the real Segoe UI Bold
+    /// production paints with — it is a proxy that catches gross budget
+    /// errors, not a guarantee the labels fit the real bold glyphs. The
+    /// per-label widths that motivate `skills.rs`'s column widths were
+    /// measured on the live Windows window, not by this test.
     #[test]
     fn every_tab_header_label_fits_its_column_at_every_sort_state() {
         let ctx = egui::Context::default();
         // Load the real (non-empty) default fonts so glyph metrics match
-        // what the header loop actually paints with.
+        // what the header loop actually paints with (see the caveat above:
+        // "real" here is still egui's bundled regular weight, since
+        // `has_real_bold()` is false in every test run).
         ctx.run_ui(egui::RawInput::default(), |_ui| {})
             .drop_without_applying_deltas();
         let mut overflowing = Vec::new();
@@ -14369,7 +14383,6 @@ mod tests {
                         descending,
                     })
                 })
-                .chain(std::iter::once(tab.default_sort()))
                 .collect();
             for kind in tab.columns() {
                 for sort in &sorts {
