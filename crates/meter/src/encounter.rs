@@ -153,6 +153,34 @@ fn engaged_within_window(last_damaged_ms: Option<u64>, engaged_at: Option<u64>) 
     }
 }
 
+/// Whether `e` is a recognized boss (`tables::is_boss_monster`) the party
+/// has actually engaged this fight and that is not known to be dead.
+///
+/// The identity half of the question every boss-liveness guard asks —
+/// [`Meter::engaged_boss_still_up`], [`Meter::has_other_living_boss`] and
+/// [`Meter::apply_enemy_gone`] all start here. `took_damage` is what scopes
+/// it to the current encounter (a boss standing in a room the party walked
+/// past was never part of one), and "not known to be dead" is
+/// [`EnemyState::is_alive`], which reads never-observed health as alive.
+///
+/// Deliberately says nothing about *recency*: the callers disagree there.
+/// Two of them always require [`engaged_within_window`] on top (see
+/// [`is_engaged_recognized_boss`]); `has_other_living_boss` requires it only
+/// inside a boss-select scene, where a sequential next selection must not
+/// hold the current one's death open.
+fn is_damaged_living_boss(e: &EnemyState) -> bool {
+    e.took_damage && e.is_alive() && e.monster_id.is_some_and(tables::is_boss_monster)
+}
+
+/// [`is_damaged_living_boss`] plus the recency half: the party was hitting
+/// `e` within [`BOSS_ENGAGEMENT_WINDOW_MS`] of `now_ms` (issue #210/#211),
+/// so it is a pull genuinely in progress rather than one abandoned — or a
+/// boss whose death signal was simply never delivered, which
+/// `EnemyState::is_alive` would otherwise read as alive forever.
+fn is_engaged_recognized_boss(e: &EnemyState, now_ms: u64) -> bool {
+    is_damaged_living_boss(e) && engaged_within_window(e.last_damaged_ms, Some(now_ms))
+}
+
 /// One player-identity cache entry. `seq` is a monotonic touch counter (set
 /// on both read and write) used purely to order entries by recency for
 /// [`Meter::names_for_save`] — it is never persisted itself, only the
@@ -618,12 +646,10 @@ impl Meter {
     /// ever touched already is.
     fn engaged_boss_still_up(&self, now_ms: u64) -> bool {
         self.in_dungeon_scene()
-            && self.enemies.values().any(|e| {
-                e.took_damage
-                    && e.is_alive()
-                    && e.monster_id.is_some_and(tables::is_boss_monster)
-                    && engaged_within_window(e.last_damaged_ms, Some(now_ms))
-            })
+            && self
+                .enemies
+                .values()
+                .any(|e| is_engaged_recognized_boss(e, now_ms))
     }
 
     /// Where the meter is in the fight lifecycle as of `now_ms`.
@@ -1641,10 +1667,7 @@ impl Meter {
         let Some(enemy) = self.enemies.get(&uid) else {
             return;
         };
-        let plausibly_dead = enemy.took_damage
-            && enemy.is_alive()
-            && enemy.monster_id.is_some_and(tables::is_boss_monster)
-            && engaged_within_window(enemy.last_damaged_ms, Some(now_ms))
+        let plausibly_dead = is_engaged_recognized_boss(enemy, now_ms)
             && enemy
                 .pct()
                 .is_some_and(|pct| pct <= DESPAWN_DEATH_MAX_HP_PCT);
@@ -1705,9 +1728,7 @@ impl Meter {
         let boss_select = self.scene_id.is_some_and(phase::is_boss_select_scene);
         self.enemies.iter().any(|(uid, e)| {
             *uid != dying_uid
-                && e.took_damage
-                && e.is_alive()
-                && e.monster_id.is_some_and(tables::is_boss_monster)
+                && is_damaged_living_boss(e)
                 && (!boss_select || engaged_within_window(e.last_damaged_ms, Some(now_ms)))
         })
     }
@@ -6364,6 +6385,102 @@ mod tests {
 
             assert_eq!(m.fight_end_ms, None);
             assert!(m.enemies[&BOSS_UID].is_alive());
+        }
+
+        /// PR #239 review, finding 2: the despawn death is routed through
+        /// `end_fight_on_boss_death`, so `has_other_living_boss` still
+        /// governs it — Dreambloom Ruins' Caprahorn pair is fought
+        /// concurrently in a boss-select scene, and one twin's corpse
+        /// vanishing must not freeze the meter while the other is still
+        /// being hit. The damage-death path's equivalent is
+        /// `multi_phase_boss::an_earlier_phase_dying_does_not_end_the_fight_while_a_later_one_lives`.
+        #[test]
+        fn a_despawn_does_not_end_the_fight_while_a_co_engaged_boss_lives() {
+            let mut m = in_raid();
+            m.apply(&hp(BOSS_UID, 2_000_000, 2_000_000, ORIGIN, 0));
+            m.apply(&hp(OTHER_UID, 1_000_000, 1_000_000, CONTINUATION, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            m.apply(&hit(OTHER_UID, 1_100));
+            m.apply(&hp(BOSS_UID, 30_000, 2_000_000, ORIGIN, 1_200));
+            assert_eq!(m.boss_uid, Some(BOSS_UID), "Origin, the larger pool");
+
+            m.apply(&gone(BOSS_UID));
+
+            assert!(
+                !m.enemies[&BOSS_UID].is_alive(),
+                "the despawn itself was read as a death -- this test is about \
+                 the guard downstream of that, not about refusing the despawn"
+            );
+            assert!(m.enemies[&OTHER_UID].is_alive());
+            assert_eq!(m.fight_end_ms, None, "the twin is still being fought");
+            assert_eq!(m.fight_state(1_200), FightState::Active);
+        }
+
+        /// PR #239 review, finding 2, the other guard
+        /// `end_fight_on_boss_death` keeps (issue #139 section 8): while the
+        /// instance's own tracking says the run is going and the current
+        /// objective is incomplete, this boss was a phase of it. The
+        /// damage-death path's equivalent is
+        /// `dungeon::a_boss_death_does_not_end_the_fight_while_the_objective_is_still_incomplete`.
+        #[test]
+        fn a_despawn_does_not_end_the_fight_while_the_objective_is_still_running() {
+            let mut m = in_raid();
+            m.apply(&ProtocolEvent::DungeonState {
+                state: EDungeonState::Active,
+                scene_uuid: None,
+            });
+            m.apply(&ProtocolEvent::DungeonObjective {
+                target_id: 100,
+                nums: Some(0),
+                complete: Some(false),
+            });
+            m.apply(&hp(BOSS_UID, 1_000_000, 1_000_000, ORIGIN, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            m.apply(&hp(BOSS_UID, 30_000, 1_000_000, ORIGIN, 1_500));
+
+            m.apply(&gone(BOSS_UID));
+
+            assert!(
+                !m.enemies[&BOSS_UID].is_alive(),
+                "the despawn itself was read as a death -- this test is about \
+                 the guard downstream of that, not about refusing the despawn"
+            );
+            assert_eq!(
+                m.fight_end_ms, None,
+                "the instance's own objective says the run is still going"
+            );
+            assert_eq!(m.fight_state(1_600), FightState::Active);
+        }
+
+        /// The control for both guards above: same despawn, but the
+        /// objective is complete and nothing else is up, so the ordinary
+        /// despawn-death end still fires. Without this, the two tests above
+        /// would pass just as happily if the despawn rule stopped working.
+        #[test]
+        fn a_despawn_ends_the_fight_once_the_objective_completes() {
+            let mut m = in_raid();
+            m.apply(&ProtocolEvent::DungeonState {
+                state: EDungeonState::Active,
+                scene_uuid: None,
+            });
+            m.apply(&ProtocolEvent::DungeonObjective {
+                target_id: 100,
+                nums: Some(0),
+                complete: Some(false),
+            });
+            m.apply(&ProtocolEvent::DungeonObjective {
+                target_id: 100,
+                nums: None,
+                complete: Some(true),
+            });
+            m.apply(&hp(BOSS_UID, 1_000_000, 1_000_000, ORIGIN, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            m.apply(&hp(BOSS_UID, 30_000, 1_000_000, ORIGIN, 1_500));
+
+            m.apply(&gone(BOSS_UID));
+
+            assert_eq!(m.fight_end_ms, Some(1_000));
+            assert_eq!(m.fight_state(1_600), FightState::Ended);
         }
     }
 
