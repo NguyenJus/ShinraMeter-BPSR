@@ -144,11 +144,107 @@ fn paint_bold_text(
     paint_text(painter, pos, anchor, text, bold(size), color, true)
 }
 
+/// Deterministic 32-bit FNV-1a — routes a skill id to a
+/// `SKILL_PLACEHOLDER_PALETTE` swatch (issue #275). Picked over
+/// `std::hash::DefaultHasher`/`RandomState` specifically because those are
+/// *not* guaranteed stable across Rust versions or process runs, which
+/// would break "the same id looks the same every time" — the one property
+/// this hash exists to provide. Not used for anything else; not a general
+/// hashing utility.
+fn fnv1a_u32(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for &byte in bytes {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Placeholder disc swatches for issue #275: twelve vivid, mid-dark solid
+/// hues, chosen for two things at once. First, distance from the row
+/// chrome's near-black neutrals (`SKILL_CHROME_FILL` 0x11/0x11/0x17,
+/// `SKILL_PANEL_FILL` 0x21/0x21/0x27, `SKILL_COLUMN_HEADER_FILL`
+/// 0x2a/0x2a/0x30) so a placeholder never reads as "nothing painted" the
+/// way the old `SKILL_ICON_EMPTY` (0x33/0x33/0x3B, barely lighter than
+/// that chrome) could. Second, being flat and saturated rather than
+/// gradients or texture, so a placeholder never reads as photographic
+/// game-art either — a user glancing at the row list should be able to
+/// tell which rows have real vendored icons and which don't.
+const SKILL_PLACEHOLDER_PALETTE: [(u8, u8, u8); 12] = [
+    (0xB0, 0x3A, 0x2E), // brick red
+    (0xC5, 0x6A, 0x1E), // burnt orange
+    (0xD8, 0xB0, 0x2A), // gold
+    (0x4C, 0x8C, 0x2B), // moss green
+    (0x1E, 0x8A, 0x74), // teal
+    (0x1E, 0x6F, 0x9E), // steel blue
+    (0x3A, 0x4E, 0xB0), // indigo
+    (0x6A, 0x3A, 0xB0), // violet
+    (0xA5, 0x2E, 0x8C), // magenta
+    (0x8C, 0x4A, 0x2E), // umber
+    (0x4A, 0x5A, 0x6A), // slate
+    (0xC0, 0x4A, 0x6A), // rose
+];
+
+/// WCAG relative luminance of an sRGB triple (0-255 channels) — used only
+/// to pick a legible glyph color over a placeholder swatch (issue #275).
+fn relative_luminance((r, g, b): (u8, u8, u8)) -> f32 {
+    fn channel(c: u8) -> f32 {
+        let c = f32::from(c) / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+}
+
+/// Background and glyph color for `skill_id`'s placeholder icon (issue
+/// #275), as `(background, glyph)`. The background is `skill_id` — not the
+/// name — routed through `fnv1a_u32` into `SKILL_PLACEHOLDER_PALETTE`: id,
+/// because two ids that resolve to the same `skills::skill_monogram` (e.g.
+/// every Lucky Strike weapon variant, all "LS") still need their own disc
+/// color to stay told apart in a row list, which a name-derived color
+/// could not give them.
+///
+/// The glyph color is whichever of near-black (`#1A1A1A`, matched to this
+/// window's dark theme rather than a pure `#000`) or white gives the
+/// higher WCAG contrast ratio against that background. `0.2017` is not a
+/// round-number guess: it is the relative luminance at which the two
+/// ratios cross, solved from `(l + 0.05)^2 = 1.05 * (l_black + 0.05)` where
+/// `l_black` is `#1A1A1A`'s own luminance. Every current palette entry
+/// clears 3:1 (WCAG AA's minimum for large text, which this glyph's ~15pt
+/// bold weight qualifies as) against its chosen color; most clear 4.5+.
+///
+/// Lives here rather than in `skills.rs` (moved in the issue #281 review
+/// pass): `skills.rs`'s module doc says this file owns skill-name/sort
+/// view-model logic and that "`ui.rs` (T4) owns painting this; it must not
+/// be touched here" — a WCAG contrast decision producing `egui::Color32`
+/// paint values is exactly the painting decision that line rules out, so
+/// it belongs beside `paint_skill_icon_placeholder`, the only caller.
+fn skill_placeholder_colors(skill_id: i32) -> (egui::Color32, egui::Color32) {
+    let idx = (fnv1a_u32(&skill_id.to_le_bytes()) as usize) % SKILL_PLACEHOLDER_PALETTE.len();
+    let bg = SKILL_PLACEHOLDER_PALETTE[idx];
+    let fg = if relative_luminance(bg) > 0.2017 {
+        (0x1A, 0x1A, 0x1A)
+    } else {
+        (0xFF, 0xFF, 0xFF)
+    };
+    (
+        egui::Color32::from_rgb(bg.0, bg.1, bg.2),
+        egui::Color32::from_rgb(fg.0, fg.1, fg.2),
+    )
+}
+
 /// Paints the issue #275 monogram placeholder that fills the skill-icon
 /// column for an id with no upstream art: a flat disc in
-/// `skills::skill_placeholder_colors(skill_id)`'s background, with the 1-2
-/// character monogram `skills::skill_monogram` derives from the skill's
-/// resolved display name centered on top in the matching foreground.
+/// `skill_placeholder_colors(skill_id)`'s background, with the 1-2
+/// character monogram `skills::skill_monogram` derives from `name` centered
+/// on top in the matching foreground. `name` is the skill's already
+/// resolved display name (`skills::skill_display_name`), passed in rather
+/// than re-resolved here, since the caller's per-row column loop also needs
+/// it for the Name column cell and resolving it twice would repeat the
+/// table lookup and its allocation for no reason.
 ///
 /// Falls back to the original flat `SKILL_ICON_EMPTY` disc for the one case
 /// `skill_monogram` returns `None` — a name with no derivable glyph at all
@@ -171,14 +267,14 @@ fn paint_skill_icon_placeholder(
     painter: &egui::Painter,
     center: egui::Pos2,
     skill_id: i32,
+    name: &str,
     opacity: f32,
 ) {
-    let name = skills::skill_display_name(skill_id);
-    let Some(glyph) = skills::skill_monogram(&name) else {
+    let Some(glyph) = skills::skill_monogram(name) else {
         painter.circle_filled(center, SKILL_ICON_SIZE / 2.0, SKILL_ICON_EMPTY);
         return;
     };
-    let (bg, fg) = skills::skill_placeholder_colors(skill_id);
+    let (bg, fg) = skill_placeholder_colors(skill_id);
     painter.circle_filled(center, SKILL_ICON_SIZE / 2.0, bg.gamma_multiply(opacity));
     paint_bold_text(
         painter,
@@ -7032,6 +7128,10 @@ fn draw_skill_window(
         .show(&mut rows_ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for skill in &skill_rows {
+                // Resolved once per row (table lookup + allocation) and
+                // reused below for both the icon column's monogram and the
+                // Name column's cell text, rather than resolving it twice.
+                let display_name = skills::skill_display_name(skill.skill_id);
                 let (skill_rect, response) = ui.allocate_exact_size(
                     egui::vec2(rows_content_rect.width(), SKILL_ROW_HEIGHT),
                     egui::Sense::hover(),
@@ -7064,10 +7164,11 @@ fn draw_skill_window(
                     // `SKILL_ICON_EMPTY` disc for every such id, painting the
                     // capture's single largest damage source identically to
                     // a 0.01% tick three rows below it. It now paints a
-                    // monogram placeholder — see `skill_monogram_glyph` —
-                    // keyed off the *name* every one of those ids already
-                    // resolves to, and only falls through to the old blank
-                    // disc for a name with no derivable glyph at all (see
+                    // monogram placeholder — see `skills::skill_monogram`
+                    // and `paint_skill_icon_placeholder` — keyed off the
+                    // *name* every one of those ids already resolves to,
+                    // and only falls through to the old blank disc for a
+                    // name with no derivable glyph at all (see
                     // `skills::skill_monogram`'s doc comment).
                     if *kind == skills::SkillColumn::Icon {
                         let center =
@@ -7090,6 +7191,7 @@ fn draw_skill_window(
                                 &cell_painter,
                                 center,
                                 skill.skill_id,
+                                &display_name,
                                 opacity,
                             ),
                         }
@@ -7100,11 +7202,16 @@ fn draw_skill_window(
                     } else {
                         (egui::Align2::RIGHT_CENTER, clip.right_center())
                     };
+                    let text = if *kind == skills::SkillColumn::Name {
+                        display_name.clone()
+                    } else {
+                        kind.text(skill)
+                    };
                     paint_text(
                         &cell_painter,
                         pos,
                         align,
-                        &kind.text(skill),
+                        &text,
                         regular(FONT_SIZE_ROW),
                         egui::Color32::WHITE,
                         false,
@@ -7643,6 +7750,62 @@ mod tests {
     use super::*;
     use crate::settings::{ColumnKind, Settings};
     use bpsr_meter::Class;
+
+    // -- Skill-icon monogram placeholder colors (issue #275) ----------------
+
+    #[test]
+    fn placeholder_colors_are_deterministic_per_id() {
+        for id in [2031103, 2203291, 35107, -5, 0] {
+            assert_eq!(skill_placeholder_colors(id), skill_placeholder_colors(id));
+        }
+    }
+
+    #[test]
+    fn different_ids_sharing_a_monogram_can_still_land_on_different_swatches() {
+        // Every Lucky Strike weapon variant collapses to the same "LS"
+        // glyph (they are literally the same base skill), so the id-keyed
+        // background is the only thing that can still tell the rows apart.
+        let ids = [2031101, 2031102, 2031103, 2031105];
+        let colors: std::collections::HashSet<_> = ids
+            .iter()
+            .map(|&id| {
+                let (bg, _fg) = skill_placeholder_colors(id);
+                (bg.r(), bg.g(), bg.b())
+            })
+            .collect();
+        assert!(
+            colors.len() > 1,
+            "expected the four Lucky Strike variants to spread across more than one swatch"
+        );
+    }
+
+    #[test]
+    fn every_placeholder_swatch_clears_wcag_large_text_contrast_with_its_chosen_glyph_color() {
+        // Exercises the legibility rule this placeholder encodes: whichever
+        // of near-black or white `skill_placeholder_colors` picks must clear
+        // WCAG AA's 3:1 minimum for large text against every swatch in the
+        // palette, not just the ones a spot check happens to hit.
+        for &(r, g, b) in &SKILL_PLACEHOLDER_PALETTE {
+            let bg_lum = relative_luminance((r, g, b));
+            let fg = if bg_lum > 0.2017 {
+                (0x1A, 0x1A, 0x1A)
+            } else {
+                (0xFF, 0xFF, 0xFF)
+            };
+            let fg_lum = relative_luminance(fg);
+            let (hi, lo) = if bg_lum > fg_lum {
+                (bg_lum, fg_lum)
+            } else {
+                (fg_lum, bg_lum)
+            };
+            let ratio = (hi + 0.05) / (lo + 0.05);
+            assert!(
+                ratio >= 3.0,
+                "swatch {:?} only reaches a {ratio:.2}:1 contrast ratio",
+                (r, g, b)
+            );
+        }
+    }
 
     // -- Imagine tier hover text / gold ring (issues #169/#170) -------------
 
