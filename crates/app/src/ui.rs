@@ -8871,7 +8871,7 @@ mod tests {
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_SIZE);
-        let mut sort = skills::SkillSort::default();
+        let mut tabs_state = SkillTabs::default();
 
         let output = ctx.run_ui(
             egui::RawInput {
@@ -8882,7 +8882,7 @@ mod tests {
                 draw_skill_window(
                     ui,
                     &row,
-                    &mut sort,
+                    &mut tabs_state,
                     SkillWindowSource::Live,
                     &icons,
                     1.0,
@@ -8900,7 +8900,10 @@ mod tests {
         // center from (issue #200's `skill_header_rect`/
         // `skill_column_header_rect`/`skill_rows_rect`, and the shared
         // column `anchors` the row loop reuses from the column-header
-        // row) — replicated here rather than pulled into a shared helper,
+        // row — over issue #245's `skills::column_widths`, which hands the
+        // content's slack to `Name` alone, so replicating the layout with
+        // the raw `SkillColumn::width`s would land the icon elsewhere)
+        // — replicated here rather than pulled into a shared helper,
         // since nothing else needs "where does the icon column sit"
         // outside this one check.
         let header = skill_header_rect(screen_rect);
@@ -8908,22 +8911,21 @@ mod tests {
             egui::pos2(screen_rect.left(), header.bottom()),
             egui::vec2(screen_rect.width(), SKILL_TAB_HEIGHT),
         );
-        let col_header = skill_column_header_rect(screen_rect, tabs);
+        // The default tab (`SkillTabs::default`) is the one the frame above
+        // painted, and issue #245 made each tab's column list its own.
+        let columns = skills::SkillTab::Dps.columns();
+        let col_header = skill_column_header_rect(screen_rect, tabs, columns);
         let rows_rect = skill_rows_rect(screen_rect, col_header);
-        let widths: Vec<f32> = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).collect();
-        let anchors = column_anchors_from_widths(
-            col_header.left() + SKILL_HEADER_PAD_X,
-            col_header.right() - SKILL_HEADER_PAD_X,
-            &widths,
-            0.0,
-        );
-        let icon_index = SKILL_COLUMN_ORDER
+        let content_left = col_header.left() + SKILL_HEADER_PAD_X;
+        let content_right = col_header.right() - SKILL_HEADER_PAD_X;
+        let widths = skills::column_widths(columns, content_right - content_left);
+        let anchors = column_anchors_from_widths(content_left, content_right, &widths, 0.0);
+        let icon_index = columns
             .iter()
             .position(|k| *k == skills::SkillColumn::Icon)
             .expect("skill columns always include Icon");
-        let icon_width = skills::SkillColumn::Icon.width();
         let expected_center = egui::pos2(
-            anchors[icon_index] - icon_width + SKILL_ICON_SIZE / 2.0,
+            anchors[icon_index] - widths[icon_index] + SKILL_ICON_SIZE / 2.0,
             rows_rect.top() + SKILL_ROW_HEIGHT / 2.0,
         );
 
@@ -14739,7 +14741,7 @@ mod tests {
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_MIN_SIZE);
-        let mut sort = skills::SkillSort::default();
+        let mut tabs_state = SkillTabs::default();
 
         let output = ctx.run_ui(
             egui::RawInput {
@@ -14750,7 +14752,7 @@ mod tests {
                 draw_skill_window(
                     ui,
                     &row,
-                    &mut sort,
+                    &mut tabs_state,
                     SkillWindowSource::Live,
                     &icons,
                     1.0,
