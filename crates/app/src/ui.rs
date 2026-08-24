@@ -6114,8 +6114,7 @@ const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 572.0);
 /// Floor on the skill breakdown viewport's inner size (issue #181) so a
 /// resize can't shrink it into uselessness — tall enough for the header, tab
 /// strip and column-header row plus a couple of rows before the list
-/// scrolls, wide enough to keep the columns legible once
-/// `column_anchors_from_widths` scales them down.
+/// scrolls, wide enough to fit every column at its stated width.
 ///
 /// Issue #228: the width used to be a flat 360.0, far narrower than the sum
 /// of `SkillColumn::width`s (728.0) plus the column header row's left/right
