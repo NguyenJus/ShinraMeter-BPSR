@@ -218,6 +218,25 @@ pub enum EDungeonState {
     Unknown(i32),
 }
 
+/// Mirrors `bpsr_protocol::event::DisappearReason` exactly (issue #276),
+/// which in turn mirrors `bpsr_protocol::pb::EDisappearType` — see those
+/// types' doc comments for the reference sourcing and the live-capture
+/// evidence behind each variant.
+///
+/// Only [`DisappearReason::Dead`] is a death; everything else is an
+/// eviction, a zone-out or ordinary streaming churn. `Unknown` is explicit
+/// for the same reason [`EDungeonState`]'s is, and is treated as "no usable
+/// reason" — see `Meter::apply_enemy_gone`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DisappearReason {
+    Normal,
+    Dead,
+    Destroy,
+    TransferLeave,
+    TransferPassLineLeave,
+    Unknown(i32),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolEvent {
     Damage(DamageEvent),
@@ -266,12 +285,19 @@ pub enum ProtocolEvent {
         value: i32,
     },
     /// Mirrors `bpsr_protocol::ProtocolEvent::EnemyGone` (issue #215): a
-    /// monster left the client's area of interest. Emphatically *not* a
-    /// death — see `Meter::apply_enemy_gone` for the narrow rule under
-    /// which one is nonetheless allowed to stand in for a missed death
-    /// signal.
+    /// monster left the client's area of interest.
+    ///
+    /// `reason` is the server's own statement of why (issue #276), from
+    /// `pb::DisappearEntity`'s optional tag 2. `None` means the packet
+    /// carried no tag 2 at all — 382 of 851 observed disappear entries —
+    /// not that nothing happened.
+    ///
+    /// A despawn is still not a death by itself: only
+    /// [`DisappearReason::Dead`] says the enemy died, and a `None` falls
+    /// back to the HP/engagement heuristic. See `Meter::apply_enemy_gone`.
     EnemyGone {
         uid: i64,
+        reason: Option<DisappearReason>,
     },
 }
 

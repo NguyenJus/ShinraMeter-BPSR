@@ -4,7 +4,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::event::{
-    CastEvent, Class, DamageEvent, EDungeonState, EnemyHp, EntityKind, PlayerInfo, ProtocolEvent,
+    CastEvent, Class, DamageEvent, DisappearReason, EDungeonState, EnemyHp, EntityKind, PlayerInfo,
+    ProtocolEvent,
 };
 use crate::fight::{FightConfig, FightEndCause, FightState};
 use crate::phase;
@@ -135,13 +136,16 @@ const WIPE_PARTY_DOWN_FRACTION: f64 = 0.8;
 /// The most health an enemy may have been last seen with for its despawn to
 /// be readable as a death (issue #215), as a percentage of its pool.
 ///
-/// `pb::DisappearEntity` carries a bare `uuid` and no reason code at all, so
-/// "the corpse was removed" and "the player walked out of AOI range" arrive
-/// on the wire as literally the same bytes. Everything else the rule tests
-/// (see [`Meter::apply_enemy_gone`]) is about *which* enemy vanished; this is
-/// the only condition that speaks to whether it plausibly *died*. A boss at
-/// 3% of its bar that stops being mentioned is the tail of a kill whose death
-/// packet went missing; the same boss at 80% is a party that ran away.
+/// **The fallback, since issue #276.** A `pb::DisappearEntity` that carries
+/// tag 2 states its own reason and this threshold is never consulted — see
+/// [`Meter::apply_enemy_gone`]. But tag 2 is optional and 382 of 851 captured
+/// disappear entries (23 of them monsters) carry none at all, and for those
+/// "the corpse was removed" and "the player walked out of AOI range" still
+/// arrive on the wire as literally the same bytes. Everything else the rule
+/// tests is about *which* enemy vanished; this is the only condition left
+/// that speaks to whether it plausibly *died*. A boss at 3% of its bar that
+/// stops being mentioned is the tail of a kill whose death packet went
+/// missing; the same boss at 80% is a party that ran away.
 ///
 /// 10% rather than something looser because the two error directions are not
 /// symmetric — the same asymmetry `EnemyState::is_alive` is built on, pointed
@@ -1034,10 +1038,11 @@ impl Meter {
                 None
             }
             // issue #215: an entity left AOI. Almost always nothing to do —
-            // see `apply_enemy_gone` for the one case where it is allowed to
-            // stand in for a death signal that never arrived.
-            ProtocolEvent::EnemyGone { uid } => {
-                self.apply_enemy_gone(*uid);
+            // see `apply_enemy_gone` for the cases where it is allowed to
+            // stand in for a death signal that never arrived, including the
+            // server's own `DisappearReason::Dead` (issue #276).
+            ProtocolEvent::EnemyGone { uid, reason } => {
+                self.apply_enemy_gone(*uid, *reason);
                 None
             }
             ProtocolEvent::DungeonVar { name, value } => {
@@ -1668,12 +1673,16 @@ impl Meter {
 
     /// Reacts to `uid` leaving the client's area of interest (issue #215).
     ///
-    /// The wire fact is deliberately thin: `pb::SyncNearEntities.disappear`
-    /// carries a bare `uuid` and **no reason code**, so a corpse being
-    /// despawned, the player walking out of AOI range, and an ordinary
-    /// streaming eviction are indistinguishable at this layer. A despawn is
-    /// therefore not a death signal, and this function's default answer is to
-    /// do nothing at all.
+    /// A despawn is not a death signal, and this function's default answer is
+    /// to do nothing at all. What it *can* have is the server's own reason
+    /// for the despawn (`reason`, issue #276): `pb::DisappearEntity`'s
+    /// optional tag 2, decoded into [`DisappearReason`]. Only
+    /// [`DisappearReason::Dead`] states a death; `Destroy` (an eviction),
+    /// `TransferLeave` (a zone-out), `Normal` (ordinary streaming churn) and
+    /// an unrecognized future value all state the opposite or nothing. And
+    /// tag 2 is genuinely optional — 382 of 851 captured disappear entries,
+    /// 23 of them monsters, carry none — so a `None` leaves this exactly
+    /// where issue #215 left it: inferring from health and engagement.
     ///
     /// It exists because the meter's two real death signals can both go
     /// missing. Issue #210: across every logged clear of scene 13023 the
@@ -1715,13 +1724,36 @@ impl Meter {
     /// 7. The party was hitting it within `BOSS_ENGAGEMENT_WINDOW_MS` of the
     ///    last combat event. A boss burned low, abandoned, and evicted from
     ///    AOI minutes later is a range-out; a corpse removed mid-pull is not.
-    /// 8. Its last observed health was at or below
-    ///    [`DESPAWN_DEATH_MAX_HP_PCT`], and was observed *at all*. This is
-    ///    the only clause that speaks to dying rather than to identity, and
-    ///    the never-observed case is refused on purpose: with no health to
-    ///    check there is no evidence, and `EnemyState::is_alive`'s
-    ///    conservative "unknown means alive" must not be flipped by a packet
-    ///    that carries a uuid and nothing else.
+    /// 8. The despawn is plausibly a death. Clauses 1-7 are all about
+    ///    *which* enemy vanished; this is the only one that speaks to
+    ///    whether it *died*, and since issue #276 it is answered in one of
+    ///    three ways:
+    ///
+    ///    - **`reason == Some(Dead)`** — the server said so. Sufficient on
+    ///      its own: no health threshold is consulted, which is the whole
+    ///      point. The threshold is a proxy — correctly *sized* per issue
+    ///      #243, but a proxy: it refuses a boss whose last HP sync landed
+    ///      above 10% before a burst finished it, and it cannot tell a
+    ///      corpse from a near-dead enemy that vanished for some other
+    ///      reason. `Dead` answers both directly. It is
+    ///      corroborated as well as sourced: across the captured monster
+    ///      despawns, `Dead` entries never came back except as six trash
+    ///      uids reusing spawn slots on respawn (see
+    ///      `pb::EDisappearType`'s evidence table).
+    ///    - **`reason == Some(anything else)`** — refused outright, *even
+    ///      when the health threshold would have been satisfied*. This is
+    ///      the false-positive class issue #243 flagged: `Destroy` is the
+    ///      mass-eviction reason, and an evicted boss that happened to be
+    ///      burned low would otherwise end a live pull. The server's "not a
+    ///      death" outranks our inference, in both directions.
+    ///    - **`reason == None`** — no tag 2 on the packet, so fall back to
+    ///      issue #215's heuristic unchanged: last observed health at or
+    ///      below [`DESPAWN_DEATH_MAX_HP_PCT`], and observed *at all*. The
+    ///      never-observed case stays refused on purpose: with neither a
+    ///      reason nor health there is no evidence, and
+    ///      `EnemyState::is_alive`'s conservative "unknown means alive"
+    ///      must not be flipped by a packet carrying a uuid and nothing
+    ///      else.
     ///
     /// Getting this wrong in the permissive direction is worse than the
     /// status quo: a range-out mid-pull would freeze the meter, save a
@@ -1747,13 +1779,15 @@ impl Meter {
     /// held fight. Only a `ProtocolEvent::ServerChanged` clears that map.
     ///
     /// **Verification status:** the decode side is exercised by unit tests
-    /// against synthesized `SyncNearEntities` payloads, but no live
-    /// `SHINRA_INSPECT=1` capture of a real raid-boss despawn has been taken
-    /// yet (issue #215 asks for one, on the evidence bar issues #35 and #111
-    /// set). Until it has, this rule's field behaviour on scene 13023 is
-    /// argued, not observed — which is the other reason it is written this
-    /// tightly.
-    fn apply_enemy_gone(&mut self, uid: i64) {
+    /// against synthesized `SyncNearEntities` payloads. Tag 2 itself is
+    /// verified — two independent reference sources plus 851 disappear
+    /// entries across our own captures, tabulated on `pb::EDisappearType` —
+    /// but no live `SHINRA_INSPECT=1` capture of a real *raid-boss* despawn
+    /// has been taken yet (issue #215 asks for one, on the evidence bar
+    /// issues #35 and #111 set). Until it has, this rule's field behaviour on
+    /// scene 13023 is argued, not observed — which is the other reason it is
+    /// written this tightly.
+    fn apply_enemy_gone(&mut self, uid: i64, reason: Option<DisappearReason>) {
         if !self.fight_cfg.end_on_boss_death
             || self.fight_start_ms.is_none()
             || self.fight_end_ms.is_some()
@@ -1765,15 +1799,25 @@ impl Meter {
         let Some(enemy) = self.enemies.get(&uid) else {
             return;
         };
-        let plausibly_dead = is_engaged_recognized_boss(enemy, now_ms)
-            && enemy
+        if !is_engaged_recognized_boss(enemy, now_ms) {
+            return;
+        }
+        // Clause 8, issue #276: the server's own reason wins in both
+        // directions, and only its absence falls back to issue #215's
+        // health heuristic. `Some(_)` other than `Dead` is a deliberate
+        // refusal, not a gap — see this function's doc comment.
+        let plausibly_dead = match reason {
+            Some(DisappearReason::Dead) => true,
+            Some(_) => false,
+            None => enemy
                 .pct()
-                .is_some_and(|pct| pct <= DESPAWN_DEATH_MAX_HP_PCT);
+                .is_some_and(|pct| pct <= DESPAWN_DEATH_MAX_HP_PCT),
+        };
         if !plausibly_dead {
             return;
         }
         log::info!(
-            "encounter: treating despawn of uid={uid} monster_id={} as a death (issue #215)",
+            "encounter: treating despawn of uid={uid} monster_id={} reason={reason:?} as a death (issues #215/#276)",
             enemy.monster_id.map_or(-1i64, i64::from)
         );
         self.mark_enemy_dead(uid);
@@ -7046,8 +7090,18 @@ mod tests {
             })
         }
 
+        /// A despawn carrying no tag 2 at all — the fallback path, and what
+        /// every pre-#276 test in this module means by "gone".
         fn gone(uid: i64) -> ProtocolEvent {
-            ProtocolEvent::EnemyGone { uid }
+            ProtocolEvent::EnemyGone { uid, reason: None }
+        }
+
+        /// A despawn carrying the server's own reason (issue #276).
+        fn gone_because(uid: i64, reason: DisappearReason) -> ProtocolEvent {
+            ProtocolEvent::EnemyGone {
+                uid,
+                reason: Some(reason),
+            }
         }
 
         /// The raid boss burned to 3% of its bar and hit a moment ago —
@@ -7354,6 +7408,179 @@ mod tests {
 
             assert_eq!(m.fight_end_ms, Some(1_000));
             assert_eq!(m.fight_state(1_600), FightState::Ended);
+        }
+
+        // -- The server's own reason, `DisappearEntity` tag 2 (issue #276) --
+        //
+        // `Dead` replaces the health threshold outright; every other stated
+        // reason refuses the despawn *even when* the threshold would have
+        // been satisfied; and a despawn with no tag 2 keeps issue #215's
+        // heuristic exactly as it was.
+
+        /// The whole point of issue #276: the server said the boss died, so
+        /// no health inference is needed — and here there is none available,
+        /// the boss was last seen at a full bar.
+        #[test]
+        fn a_dead_reason_ends_the_fight_without_the_hp_threshold() {
+            let mut m = in_raid();
+            m.apply(&hp(BOSS_UID, 1_000_000, 1_000_000, ORIGIN, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            assert_eq!(m.boss_uid, Some(BOSS_UID));
+
+            let reason = m.apply(&gone_because(BOSS_UID, DisappearReason::Dead));
+
+            assert_eq!(reason, None, "a despawn never reports a reset itself");
+            assert_eq!(
+                m.fight_end_ms,
+                Some(1_000),
+                "stamped at the last real damage, exactly as the #215 path is"
+            );
+            assert_eq!(m.fight_end_boss_id, Some(ORIGIN));
+            assert_eq!(m.fight_state(2_000), FightState::Ended);
+            assert!(!m.enemies[&BOSS_UID].is_alive());
+        }
+
+        /// `Dead` replaces clause 8, not clause 3. An enemy whose health was
+        /// never observed at all is unrankable (`rank_boss` drops a
+        /// `(None, None)` HP pair outright), so it is never `boss_uid` and
+        /// the despawn never reaches the reason check — the server saying it
+        /// died does not change that. Pinned so a later widening of the rule
+        /// has to be done deliberately.
+        #[test]
+        fn a_dead_reason_on_a_never_ranked_boss_is_still_not_a_death() {
+            let mut m = in_raid();
+            m.apply(&hp_unknown(BOSS_UID, ORIGIN, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            assert_ne!(m.boss_uid, Some(BOSS_UID), "no HP ever synced: unrankable");
+
+            m.apply(&gone_because(BOSS_UID, DisappearReason::Dead));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert!(m.enemies[&BOSS_UID].is_alive());
+        }
+
+        /// **The regression that matters most** (issue #243's false-positive
+        /// class): `Destroy` is the mass-eviction reason, and the boss it
+        /// evicts may well have been burned low. The health threshold is
+        /// satisfied here — `pull()` leaves the boss at 3% — and the fight
+        /// must still not end.
+        #[test]
+        fn a_destroy_reason_does_not_end_the_fight_even_at_low_health() {
+            let mut m = pull();
+            assert_eq!(m.boss_uid, Some(BOSS_UID));
+
+            m.apply(&gone_because(BOSS_UID, DisappearReason::Destroy));
+
+            assert_eq!(
+                m.fight_end_ms, None,
+                "the server said eviction, which outranks our HP inference"
+            );
+            assert!(m.enemies[&BOSS_UID].is_alive());
+            assert_eq!(m.fight_state(2_000), FightState::Active);
+        }
+
+        /// Same shape as `Destroy`, for the zone-out reason — observed on
+        /// characters only in our captures, but nothing on the wire promises
+        /// a monster can never carry it.
+        #[test]
+        fn a_transfer_leave_reason_does_not_end_the_fight_even_at_low_health() {
+            let mut m = pull();
+
+            m.apply(&gone_because(BOSS_UID, DisappearReason::TransferLeave));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert!(m.enemies[&BOSS_UID].is_alive());
+        }
+
+        #[test]
+        fn a_transfer_pass_line_leave_reason_does_not_end_the_fight_even_at_low_health() {
+            let mut m = pull();
+
+            m.apply(&gone_because(
+                BOSS_UID,
+                DisappearReason::TransferPassLineLeave,
+            ));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert!(m.enemies[&BOSS_UID].is_alive());
+        }
+
+        /// An explicit `Normal` is ordinary streaming churn, and is *not*
+        /// the same as no tag 2 at all: the server stated a reason, and the
+        /// reason was "nothing happened".
+        #[test]
+        fn a_normal_reason_does_not_end_the_fight_even_at_low_health() {
+            let mut m = pull();
+
+            m.apply(&gone_because(BOSS_UID, DisappearReason::Normal));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert!(m.enemies[&BOSS_UID].is_alive());
+        }
+
+        /// A future value nobody has decoded yet is refused rather than
+        /// guessed at, in the same conservative direction as everything else
+        /// in this rule.
+        #[test]
+        fn an_unrecognized_reason_does_not_end_the_fight_even_at_low_health() {
+            let mut m = pull();
+
+            m.apply(&gone_because(BOSS_UID, DisappearReason::Unknown(99)));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert!(m.enemies[&BOSS_UID].is_alive());
+        }
+
+        /// `Dead` replaces clause 8 only. The identity clauses still stand:
+        /// a trash mob the game says died cannot end a boss fight.
+        #[test]
+        fn a_dead_reason_on_an_unrecognized_monster_is_still_not_a_death() {
+            let mut m = in_raid();
+            m.apply(&hp(OTHER_UID, 100, 100_000, TRASH, 0));
+            m.apply(&hit(OTHER_UID, 1_000));
+
+            m.apply(&gone_because(OTHER_UID, DisappearReason::Dead));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert!(m.enemies[&OTHER_UID].is_alive());
+        }
+
+        /// Likewise for a boss nobody engaged: the party walked past it and
+        /// something else killed it.
+        #[test]
+        fn a_dead_reason_on_an_undamaged_boss_is_still_not_a_death() {
+            let mut m = in_raid();
+            m.apply(&hp(BOSS_UID, 1_000, 1_000_000, ORIGIN, 0));
+            m.apply(&hit(OTHER_UID, 1_000));
+
+            m.apply(&gone_because(BOSS_UID, DisappearReason::Dead));
+
+            assert_eq!(m.fight_end_ms, None);
+            assert!(m.enemies[&BOSS_UID].is_alive());
+        }
+
+        /// The retained fallback, stated once explicitly rather than only
+        /// implied by every `gone()` test above it: with no tag 2 on the
+        /// packet the decision is still issue #215's health heuristic, in
+        /// both directions.
+        #[test]
+        fn a_despawn_with_no_reason_still_uses_the_hp_fallback() {
+            let mut low = pull();
+            low.apply(&gone(BOSS_UID));
+            assert_eq!(
+                low.fight_end_ms,
+                Some(1_000),
+                "3% of the bar, no reason given: the heuristic still fires"
+            );
+
+            let mut full = in_raid();
+            full.apply(&hp(BOSS_UID, 1_000_000, 1_000_000, ORIGIN, 0));
+            full.apply(&hit(BOSS_UID, 1_000));
+            full.apply(&gone(BOSS_UID));
+            assert_eq!(
+                full.fight_end_ms, None,
+                "full bar, no reason given: still a range-out"
+            );
         }
 
         /// Issue #256, the whole of it: scene 13023's despawn-as-death rule

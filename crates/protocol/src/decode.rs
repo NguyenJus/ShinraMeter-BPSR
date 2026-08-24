@@ -14,7 +14,8 @@ use crate::attrs::{
 };
 use crate::blob;
 use crate::event::{
-    CastEvent, DamageEvent, EDungeonState, EntityKind, PlayerInfo, ProtocolEvent, kind_of, uid_of,
+    CastEvent, DamageEvent, DisappearReason, EDungeonState, EntityKind, PlayerInfo, ProtocolEvent,
+    kind_of, uid_of,
 };
 use crate::frame::{
     Desync, MAX_TAIL_LEN, Notify, SERVICE_UUID, TEAM_NTF_SERVICE_UUID, parse_frame, split_frames,
@@ -216,12 +217,16 @@ fn on_sync_near_entities(
     // packet's events stay in wire-field order. Monsters only — a player
     // leaving AOI range is not something the meter models, and an entity
     // type it has no model for is dropped here exactly as it is above.
-    // See `ProtocolEvent::EnemyGone` for why this is emitted as a bare
-    // "gone" fact rather than as a death.
+    // See `ProtocolEvent::EnemyGone` for why this is emitted as a "gone"
+    // fact plus the server's own reason rather than as a death: tag 2
+    // (issue #276) says *why* the entity vanished, but only
+    // `DisappearReason::Dead` says it died, and it is absent entirely on
+    // 382 of the 851 disappear entries in our captures.
     for entity in &msg.disappear {
         if kind_of(entity.uuid) == EntityKind::Monster {
             out.push(ProtocolEvent::EnemyGone {
                 uid: uid_of(entity.uuid),
+                reason: entity.disappear_type.map(DisappearReason::from),
             });
         }
     }
@@ -1801,7 +1806,10 @@ mod tests {
             appear,
             disappear: disappear
                 .into_iter()
-                .map(|uuid| pb::DisappearEntity { uuid })
+                .map(|uuid| pb::DisappearEntity {
+                    uuid,
+                    disappear_type: None,
+                })
                 .collect(),
         };
         let mut payload = Vec::new();
@@ -1820,7 +1828,13 @@ mod tests {
         decode_notify(&n, 0, &mut out, None);
         assert_eq!(out.len(), 1);
         match &out[0] {
-            ProtocolEvent::EnemyGone { uid } => assert_eq!(*uid, uid_of(TARGET_UUID)),
+            ProtocolEvent::EnemyGone { uid, reason } => {
+                assert_eq!(*uid, uid_of(TARGET_UUID));
+                assert_eq!(
+                    *reason, None,
+                    "no tag 2 on the wire must decode as no reason at all"
+                );
+            }
             other => panic!("expected EnemyGone, got {other:?}"),
         }
     }
@@ -1864,7 +1878,7 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(matches!(&out[0], ProtocolEvent::EnemyHp(e) if e.uid == 31));
         assert!(
-            matches!(&out[1], ProtocolEvent::EnemyGone { uid } if *uid == uid_of(TARGET_UUID)),
+            matches!(&out[1], ProtocolEvent::EnemyGone { uid, .. } if *uid == uid_of(TARGET_UUID)),
             "expected EnemyGone second, got {:?}",
             out[1]
         );
@@ -1877,7 +1891,133 @@ mod tests {
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
         assert_eq!(out.len(), 2);
-        assert!(matches!(&out[0], ProtocolEvent::EnemyGone { uid } if *uid == 30));
-        assert!(matches!(&out[1], ProtocolEvent::EnemyGone { uid } if *uid == 31));
+        assert!(matches!(&out[0], ProtocolEvent::EnemyGone { uid, .. } if *uid == 30));
+        assert!(matches!(&out[1], ProtocolEvent::EnemyGone { uid, .. } if *uid == 31));
+    }
+
+    // -- DisappearEntity tag 2 / EDisappearType (issue #276) ---------------
+
+    /// Same as [`near_entities_notify`], but each disappearing uuid carries
+    /// an explicit tag-2 value — the wire shape the two reference sources
+    /// and 469 of our 851 captured disappear entries actually use.
+    fn disappear_notify(entries: Vec<(i64, i32)>) -> Notify {
+        let msg = pb::SyncNearEntities {
+            appear: vec![],
+            disappear: entries
+                .into_iter()
+                .map(|(uuid, disappear_type)| pb::DisappearEntity {
+                    uuid,
+                    disappear_type: Some(disappear_type),
+                })
+                .collect(),
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id: opcode::SYNC_NEAR_ENTITIES,
+            payload,
+        }
+    }
+
+    /// Every named `EDisappearType` value round-trips through the wire into
+    /// its `DisappearReason`. Asserted variant by variant rather than by
+    /// `from(i as i32)` so a renumbering can't pass by matching its own bug.
+    #[test]
+    fn each_disappear_type_decodes_to_its_reason() {
+        let cases = [
+            (pb::EDisappearType::Normal, DisappearReason::Normal),
+            (pb::EDisappearType::Dead, DisappearReason::Dead),
+            (pb::EDisappearType::Destroy, DisappearReason::Destroy),
+            (
+                pb::EDisappearType::TransferLeave,
+                DisappearReason::TransferLeave,
+            ),
+            (
+                pb::EDisappearType::TransferPassLineLeave,
+                DisappearReason::TransferPassLineLeave,
+            ),
+        ];
+        for (wire, expected) in cases {
+            let n = disappear_notify(vec![(TARGET_UUID, wire as i32)]);
+            let mut out = Vec::new();
+            decode_notify(&n, 0, &mut out, None);
+            assert_eq!(out.len(), 1, "{wire:?}");
+            match &out[0] {
+                ProtocolEvent::EnemyGone { uid, reason } => {
+                    assert_eq!(*uid, uid_of(TARGET_UUID), "{wire:?}");
+                    assert_eq!(*reason, Some(expected), "{wire:?}");
+                }
+                other => panic!("expected EnemyGone for {wire:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A value this build has never seen must stay distinguishable rather
+    /// than collapsing into `Normal` — the same reason `EDungeonState` keeps
+    /// an explicit `Unknown`.
+    #[test]
+    fn unrecognized_disappear_type_decodes_to_unknown() {
+        let n = disappear_notify(vec![(TARGET_UUID, 99)]);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(matches!(
+            &out[0],
+            ProtocolEvent::EnemyGone {
+                reason: Some(DisappearReason::Unknown(99)),
+                ..
+            }
+        ));
+    }
+
+    /// Tag 2 rides along per entry, not per packet: one batch can mix a
+    /// killed monster with an ordinary eviction and an untyped disappear.
+    #[test]
+    fn one_batch_can_mix_disappear_reasons() {
+        let msg = pb::SyncNearEntities {
+            appear: vec![],
+            disappear: vec![
+                pb::DisappearEntity {
+                    uuid: TARGET_UUID,
+                    disappear_type: Some(pb::EDisappearType::Dead as i32),
+                },
+                pb::DisappearEntity {
+                    uuid: (31i64 << 16) | 64,
+                    disappear_type: Some(pb::EDisappearType::Destroy as i32),
+                },
+                pb::DisappearEntity {
+                    uuid: (32i64 << 16) | 64,
+                    disappear_type: None,
+                },
+            ],
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let n = Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id: opcode::SYNC_NEAR_ENTITIES,
+            payload,
+        };
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 3);
+        assert!(matches!(
+            &out[0],
+            ProtocolEvent::EnemyGone {
+                reason: Some(DisappearReason::Dead),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &out[1],
+            ProtocolEvent::EnemyGone {
+                reason: Some(DisappearReason::Destroy),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &out[2],
+            ProtocolEvent::EnemyGone { reason: None, .. }
+        ));
     }
 }

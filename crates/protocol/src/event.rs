@@ -179,6 +179,38 @@ impl From<i32> for EDungeonState {
     }
 }
 
+/// Why an entity left the client's area of interest, mirroring
+/// [`crate::pb::EDisappearType`] (issue #276) — see that type's doc comment
+/// for the reference sourcing and the live-capture evidence behind each
+/// variant.
+///
+/// `Unknown` is an explicit variant for the same reason [`EDungeonState`]'s
+/// is: a future value must not be silently folded into a named one. Every
+/// consumer treats it as "no usable reason", which is the conservative
+/// reading here — see `bpsr_meter::Meter::apply_enemy_gone`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DisappearReason {
+    Normal,
+    Dead,
+    Destroy,
+    TransferLeave,
+    TransferPassLineLeave,
+    Unknown(i32),
+}
+
+impl From<i32> for DisappearReason {
+    fn from(v: i32) -> Self {
+        match v {
+            0 => DisappearReason::Normal,
+            1 => DisappearReason::Dead,
+            2 => DisappearReason::Destroy,
+            3 => DisappearReason::TransferLeave,
+            4 => DisappearReason::TransferPassLineLeave,
+            other => DisappearReason::Unknown(other),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolEvent {
     Damage(DamageEvent),
@@ -258,16 +290,24 @@ pub enum ProtocolEvent {
     /// `appear` list that produces `Player`/`EnemyHp`. Emitted for monsters
     /// only: a player walking out of range says nothing this meter tracks.
     ///
-    /// **This is not a death signal.** `pb::DisappearEntity` carries a bare
-    /// `uuid` and no reason code whatsoever, so the wire cannot distinguish
-    /// "died and the corpse was despawned" from "the player walked out of
-    /// AOI range" or an ordinary streaming eviction. This crate therefore
-    /// reports the fact and nothing more; deciding whether a particular
-    /// despawn may stand in for a missed death is the meter's job, under
-    /// the deliberately narrow rule documented on
+    /// `reason` is the server's own statement of *why* (issue #276), decoded
+    /// from `pb::DisappearEntity`'s optional tag 2 — see
+    /// [`crate::pb::EDisappearType`] for its sourcing and capture evidence.
+    /// It is genuinely optional: 382 of 851 observed disappear entries carry
+    /// no tag 2 at all, so `None` means "the server did not say", never
+    /// "nothing happened".
+    ///
+    /// **A despawn is still not, by itself, a death.** Only
+    /// [`DisappearReason::Dead`] says the entity died; `Destroy`,
+    /// `TransferLeave` and `Normal` are evictions, zone-outs and ordinary
+    /// streaming churn, and a `None` says nothing either way. This crate
+    /// therefore reports the fact and the server's reason and nothing more;
+    /// deciding whether a particular despawn ends a fight is the meter's
+    /// job, under the rule documented on
     /// `bpsr_meter::Meter::apply_enemy_gone`.
     EnemyGone {
         uid: i64,
+        reason: Option<DisappearReason>,
     },
 }
 
