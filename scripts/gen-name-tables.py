@@ -99,8 +99,21 @@ FILTERED_SOURCES = {
 # via `scripts/gen-skill-icons.py`; an id whose basename has no committed PNG
 # degrades to a blank placeholder at draw time, so this table is deliberately
 # allowed to name icons that are not shipped.
+#
+# Issue #247: `SkillOverrides.en.json` is *curated*, and only 328 of its 1487
+# rows carry an `Icon` at all — so keying the row list off it alone left the
+# majority of skill ids seen in real play with no icon and a blank placeholder.
+# The full client `SkillTable.json` carries the same `Icon` field for 1089 of
+# its 4796 rows (441 distinct basenames), and is the same authoritative-table
+# backfill relationship `MonsterTableNames.json` already has with the community
+# monster files. It is merged *under* the overrides in `render()`, so a curated
+# icon still wins wherever both name one. Neither table names an icon for every
+# id: an id both leave iconless (a proc/DoT damage source such as 2031103
+# "Lucky Strike (Battle Axe)", which lives in `BuffTable.json` with `Icon: ""`)
+# still degrades to the blank placeholder — there is nothing upstream to draw.
 ICON_SOURCES = {
     "SkillOverridesIcons.json": f"{_ZDPS}/SkillOverrides.en.json",
+    "SkillTableIcons.json": f"{_ZDPS}/SkillTable.json",
 }
 
 # Issue #112: the same `MonsterTable.json` also carries `MonsterType`, an enum
@@ -446,10 +459,11 @@ _ICON_BASENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def filter_id_icons(raw: dict) -> dict[str, str]:
-    """Project BPSR-ZDPS's `SkillOverrides.en.json` down to `{id: icon basename}`.
+    """Project a BPSR-ZDPS skill table down to `{id: icon basename}`.
 
     The inverse projection of `filter_id_names` over the same rows (issue
-    #192). Upstream `Icon` is a client atlas path
+    #192), applied to both `SkillOverrides.en.json` and, since issue #247, the
+    full `SkillTable.json`. Upstream `Icon` is a client atlas path
     (`ui/atlas/skill_weapon_mz/weapon_mz-01_kx06`); only the last path segment
     is kept, since that is what the vendored PNGs are named. Rows whose `Icon`
     is missing, non-string, blank, or not a plausible asset basename are
@@ -688,16 +702,21 @@ def emit(out: io.StringIO, doc: str, fn: str, table: dict) -> None:
     out.write("        _ => return None,\n    })\n}\n")
 
 
-SKILL_ICON_DOC = """/// Icon basename for a skill id (issue #192), if BPSR-ZDPS\'s curated
-/// `SkillOverrides.en.json` names one for it. The basename keys
-/// `crates/app/assets/skills/<basename>.png`, but this table is deliberately
-/// wider than that directory: it names every icon upstream references, and
-/// `crates/app/src/skill_icons.rs` only compiles in the ones actually
-/// committed here. A basename with no committed PNG resolves to `None` at the
-/// texture lookup and the row paints a blank placeholder — never a panic.
+SKILL_ICON_DOC = """/// Icon basename for a skill id (issue #192), if BPSR-ZDPS names one for it.
+/// The basename keys `crates/app/assets/skills/<basename>.png`, but this table
+/// is deliberately wider than that directory: it names every icon upstream
+/// references, and `crates/app/src/skill_icons.rs` only compiles in the ones
+/// whose art is actually shipped upstream and therefore committed here. A
+/// basename with no committed PNG resolves to `None` at the texture lookup and
+/// the row paints a blank placeholder — never a panic.
 ///
-/// Generated from `crates/meter/data/SkillOverridesIcons.json`, the `Icon`
-/// half of the same rows `skill_name`\'s curated layer comes from."""
+/// Generated from two vendored layers, same precedence as `skill_name`\'s
+/// (issue #247): `crates/meter/data/SkillTableIcons.json`, the `Icon` column of
+/// the full client `SkillTable.json`, backfills
+/// `crates/meter/data/SkillOverridesIcons.json`, the `Icon` half of the same
+/// curated rows `skill_name`\'s hand-checked layer comes from. Neither names an
+/// icon for every id — a proc/DoT damage source that lives only in
+/// `BuffTable.json` with a blank `Icon` yields `None` here."""
 
 BOSS_IDS_DOC = """/// Boss-monster template ids (issue #42): the top-bar encounter name should
 /// only ever appear for a genuine boss fight. `Meter::recompute_boss`
@@ -990,10 +1009,15 @@ def render() -> str:
         _keyed(load("SkillName.json")),
         _keyed(load("SkillOverridesNames.json")),
     )
-    # Issue #192: the icon half of the same curated rows. Not merged with
-    # anything — `SkillName.json` carries no icon reference, so BPSR-ZDPS's
-    # overrides are the only layer there is.
-    skill_icons = _keyed(load("SkillOverridesIcons.json"))
+    # Issue #192: the icon half of the same curated rows, backfilled from the
+    # full client table by issue #247. Same precedence as `skills` above and
+    # for the same reason: `SkillTableIcons.json` is the bulk layer, the
+    # curated `SkillOverridesIcons.json` is hand-checked, so it goes last and
+    # wins where both name an icon for an id.
+    skill_icons = merge_names(
+        _keyed(load("SkillTableIcons.json")),
+        _keyed(load("SkillOverridesIcons.json")),
+    )
 
     out = io.StringIO()
     out.write(HEADER)
