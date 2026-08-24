@@ -2226,6 +2226,14 @@ fn draw_header(
     // and keeps the two derivations from ever drifting apart again. Never a
     // literal.
     let wash_height = first_player_row_top_offset(band_height) - HEADER_WASH_INSET;
+    // Issue #252: `settings` carries the overlay-opacity slider the wash's
+    // own fills and emblem fade with, so it stays at its baked-in alpha no
+    // longer — the same threading the header background image (issue #121)
+    // already needed the whole `Settings` for. The gutter emblem below is
+    // painted from this same slider, matching the `PANEL_FILL`/
+    // `PANEL_BORDER_COLOR` gamma-multiply above and the skill window's own
+    // opacity threading (issue #184).
+    let opacity = settings.settings.opacity;
     draw_header_wash(ui, panel, icons, wash_height, settings.settings);
 
     // Issue #183: pinning the overlay locks its *position* as well as its
@@ -2274,7 +2282,7 @@ fn draw_header(
             emblem.id(),
             header_emblem_rect(title_row, text_band_height),
             UV_FULL,
-            HEADER_EMBLEM_COLOR,
+            HEADER_EMBLEM_COLOR.gamma_multiply(opacity),
         );
     }
     for (segment_rect, color) in title_separator_segments(title_separator_rect(title_row)) {
@@ -2436,12 +2444,16 @@ fn draw_header(
 // (`platform::install_tray`) exists only as a belt-and-braces fallback for
 // the case that carve-out ever fails or the window ends up off-screen.
 
-/// Tint a toggle-cluster button paints with while its state is "off" — the
-/// source's `OffBrush="#1fff"`, originally the still-inert queue ring's
-/// stroke color, now `toggle_state_tint`'s off case for the click-through
-/// and always-on-top buttons (issue #167).
+/// Tint a toggle-cluster button paints with while its state is "off" —
+/// white at half of `TOGGLE_ACTIVE_COLOR`'s alpha (issue #251). The
+/// previous value (`0x11`, the still-inert queue ring's borrowed stroke
+/// color, source `OffBrush="#1fff"`) read as ~7% opacity and made the
+/// click-through/always-on-top buttons nearly invisible when off. `0x40` —
+/// exactly half of `TOGGLE_ACTIVE_COLOR`'s `0x80` — keeps the glyph clearly
+/// legible as a button while staying visibly dimmer than the "on" tint, so
+/// the two states stay distinguishable at a glance.
 const TOGGLE_OFF_COLOR: egui::Color32 =
-    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x11);
+    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x40);
 /// Tint the toggle cluster's buttons are painted with while active — the
 /// same half-white `TOOLBAR_ICON_TINT` every other clickable icon in this
 /// module uses. Share and Reset (one-shot actions, not on/off state) always
@@ -2617,8 +2629,8 @@ fn toggle_button(
 
 /// Which tint a toggle-cluster on/off button paints its glyph with (issue
 /// #167): `TOGGLE_ACTIVE_COLOR` — the same half-white every clickable icon
-/// in this cluster uses — while the state is on, `TOGGLE_OFF_COLOR` — the
-/// near-invisible tint the old inert queue ring painted with — while off.
+/// in this cluster uses — while the state is on, `TOGGLE_OFF_COLOR` — a
+/// dimmer but still clearly legible white (issue #251) — while off.
 /// Pure so the state -> color mapping is unit-testable without a live
 /// `egui::Context`; `toggle_cluster` is the only caller.
 fn toggle_state_tint(active: bool) -> egui::Color32 {
@@ -4067,8 +4079,18 @@ const HEADER_EMBLEM_LEFT_BLEED: f32 = -26.0;
 /// the centering from the text band it is actually given instead of baking
 /// the source's one case in.
 const HEADER_EMBLEM_BOTTOM_BLEED: f32 = 8.0;
-/// `Fill="SlateGray"`.
-const HEADER_EMBLEM_COLOR: egui::Color32 = egui::Color32::from_rgb(0x70, 0x80, 0x90);
+/// `Fill="SlateGray"`. The source's gutter placement
+/// (`DamageMeter.UI/HUD/Controls/MainView.xaml`, the `Width="60" Height="60"
+/// Margin="-26 0 0 -8"` `Path` that `header_emblem_rect`'s constants are
+/// measured off) carries no `Opacity` attribute of its own — only the wash's
+/// separate blown-up copy does (`Opacity=".05"`, already encoded as
+/// `HEADER_WASH_EMBLEM_COLOR`'s alpha `13`). So there is no reference number
+/// to port here (issue #252); `0x80` (half alpha) is a chosen value, not a
+/// measured one — it matches this module's own established "dimmed but
+/// legible" idiom (`TOOLBAR_ICON_TINT`'s half-white) rather than painting
+/// the mark fully opaque as a bare `Color32::from_rgb` implied.
+const HEADER_EMBLEM_COLOR: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0x70, 0x80, 0x90, 0x80);
 
 /// Where the header emblem's 60x60 box sits: bled off the left of the title
 /// row `row`, and vertically centered on the header's text band
@@ -4207,6 +4229,13 @@ fn header_wash_emblem_rect(wash: egui::Rect) -> egui::Rect {
 /// title rows rather than background artwork, and the title's own indent is
 /// sized for it, so it stays. Anything that fails to load falls straight
 /// through to the default artwork below.
+///
+/// That default artwork fades with the same `settings.opacity` (issue #252):
+/// every fill and the emblem image is `.gamma_multiply`'d by it, the same
+/// pattern `PANEL_FILL`/`PANEL_BORDER_COLOR` use at the `Frame` level and
+/// the skill window uses throughout (issue #184), so the wash tracks the
+/// rest of the window's chrome instead of staying at its fixed baked-in
+/// alpha — and so the two paths agree on what the slider means.
 fn draw_header_wash(
     ui: &egui::Ui,
     panel: egui::Rect,
@@ -4221,10 +4250,15 @@ fn draw_header_wash(
         return;
     }
 
+    // Issue #252: the default artwork fades with the same slider the header
+    // image above is already painted at.
+    let opacity = settings.opacity;
+
     // Top-left brightest, fading to zero at the bottom-right — the source's
     // `LinearGradientBrush` with no explicit start/end points defaults to
     // that diagonal.
-    let slate = |a: u8| egui::Color32::from_rgba_unmultiplied(0x70, 0x80, 0x90, a);
+    let slate =
+        |a: u8| egui::Color32::from_rgba_unmultiplied(0x70, 0x80, 0x90, a).gamma_multiply(opacity);
     let mid_alpha = HEADER_WASH_TOP_ALPHA / 2;
     painter.add(egui::Shape::mesh(gradient_mesh(
         wash_rect,
@@ -4236,7 +4270,12 @@ fn draw_header_wash(
 
     if let Some(emblem) = icons.glyphs.get(GlyphIcon::Emblem) {
         let emblem_rect = header_wash_emblem_rect(wash_rect);
-        painter.image(emblem.id(), emblem_rect, UV_FULL, HEADER_WASH_EMBLEM_COLOR);
+        painter.image(
+            emblem.id(),
+            emblem_rect,
+            UV_FULL,
+            HEADER_WASH_EMBLEM_COLOR.gamma_multiply(opacity),
+        );
     }
 }
 
@@ -14233,6 +14272,45 @@ mod tests {
             PANEL_FILL.gamma_multiply(Settings::OPACITY_MIN).a(),
             0,
             "0% must paint no panel at all"
+        );
+    }
+
+    /// Issue #252: the header gutter emblem and wash (both its gradient
+    /// fill and its own oversized emblem copy) must fade with the app's
+    /// opacity slider exactly like the rest of the window's chrome —
+    /// unchanged at the slider's top end, fully gone at its bottom end.
+    /// Same shape as `panel_opacity_endpoints_are_solid_and_gone` above.
+    #[test]
+    fn header_emblem_and_wash_fade_with_the_opacity_slider() {
+        for (name, color) in [
+            ("gutter emblem", HEADER_EMBLEM_COLOR),
+            ("wash emblem", HEADER_WASH_EMBLEM_COLOR),
+            (
+                "wash gradient top stop",
+                egui::Color32::from_rgba_unmultiplied(0x70, 0x80, 0x90, HEADER_WASH_TOP_ALPHA),
+            ),
+        ] {
+            assert_eq!(
+                color.gamma_multiply(Settings::OPACITY_MAX).a(),
+                color.a(),
+                "{name} at 100% must keep its baked-in alpha"
+            );
+            assert_eq!(
+                color.gamma_multiply(Settings::OPACITY_MIN).a(),
+                0,
+                "{name} at 0% must paint nothing"
+            );
+        }
+    }
+
+    /// Issue #252: the gutter emblem's own baked-in alpha must be strictly
+    /// translucent — a bare `Color32::from_rgb` (implicit `0xFF`) painted
+    /// the mark fully opaque, which is the bug this issue fixes.
+    #[test]
+    fn header_emblem_color_is_not_fully_opaque() {
+        assert!(
+            HEADER_EMBLEM_COLOR.a() < 255,
+            "HEADER_EMBLEM_COLOR must carry a real alpha, not implicit full opacity"
         );
     }
 
