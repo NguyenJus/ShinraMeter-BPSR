@@ -2853,6 +2853,38 @@ pub fn choose_log_export_path(_default_filename: &str) -> Option<std::path::Path
     None
 }
 
+/// Maps the "the network is the problem" family of WinHTTP HRESULTs to a
+/// short plain-language reason. WinHTTP surfaces every failure as a bare
+/// HRESULT (`WinHttpSendRequest failed: 0x80072EE2`), which tells a user
+/// nothing unless they already know Win32 error codes — but this handful
+/// of codes covers the vast majority of what actually goes wrong for a
+/// `GET` to `api.github.com` (no internet, DNS down, a firewall or proxy
+/// blocking the connection). Mapping them to a sentence here, at the point
+/// every `http_get_bytes` error is formatted, means the raw code is never
+/// the *only* thing the user sees, without the UI layer needing to know
+/// anything about WinHTTP. Codes outside this set return `None`, so the
+/// caller falls back to the raw HRESULT — nothing becomes less
+/// diagnosable, it just doesn't get a friendlier headline.
+///
+/// Pure and free of the (Windows-only) `windows` crate on purpose: it is
+/// the one piece of the update-check HTTP path this dev/CI host (Linux)
+/// can actually unit-test — see `http_get_bytes`'s doc comment below on
+/// why nothing else here can be.
+fn winhttp_reachability_reason(hresult: u32) -> Option<&'static str> {
+    match hresult {
+        // ERROR_WINHTTP_TIMEOUT: the connect or send/receive ran past
+        // WinHTTP's own timeout — see the `WinHttpSetTimeouts` call below.
+        0x8007_2EE2 => Some("couldn't reach GitHub (timed out)"),
+        // ERROR_WINHTTP_NAME_NOT_RESOLVED: DNS couldn't resolve
+        // api.github.com — typically no internet connection at all.
+        0x8007_2EE7 => Some("couldn't reach GitHub (DNS lookup failed)"),
+        // ERROR_WINHTTP_CANNOT_CONNECT: DNS resolved but the TCP connect
+        // itself was refused — a firewall or proxy blocking the request.
+        0x8007_2EFD => Some("couldn't reach GitHub (connection refused)"),
+        _ => None,
+    }
+}
+
 /// Issue #171: the manual "Check for updates" header-menu item needs an
 /// HTTPS GET to GitHub's releases API, and — same reasoning as every other
 /// function in this module — egui/eframe expose no HTTP client at all, so
@@ -2894,6 +2926,18 @@ pub fn http_get_bytes(host: &str, path: &str, user_agent: &str) -> Result<Vec<u8
         WinHttpSetTimeouts,
     };
     use windows::core::PCWSTR;
+
+    /// Formats a WinHTTP call failure, leading with
+    /// `winhttp_reachability_reason`'s plain-language sentence when the
+    /// error's HRESULT is one of the network-reachability codes, and
+    /// always keeping the raw `{call} failed: {err}` detail afterwards so
+    /// the failure stays as diagnosable as it was before.
+    fn describe(call: &str, err: windows::core::Error) -> String {
+        match winhttp_reachability_reason(err.code().0 as u32) {
+            Some(reason) => format!("{reason} — {call} failed: {err}"),
+            None => format!("{call} failed: {err}"),
+        }
+    }
 
     /// Closes a WinHTTP handle (session, connection or request — the same
     /// `WinHttpCloseHandle` closes all three) when dropped, so every early
@@ -2952,7 +2996,7 @@ pub fn http_get_bytes(host: &str, path: &str, user_agent: &str) -> Result<Vec<u8
     // how long a single stalled chunk is tolerated. The JSON check (issue
     // #171) never comes close to it either way.
     unsafe { WinHttpSetTimeouts(session.0, 5_000, 5_000, 10_000, 30_000) }
-        .map_err(|err| format!("WinHttpSetTimeouts failed: {err}"))?;
+        .map_err(|err| describe("WinHttpSetTimeouts", err))?;
 
     // Issue #250: a release asset's `browser_download_url` is not the file —
     // `github.com/.../releases/download/...` answers 302 and points at
@@ -2975,7 +3019,7 @@ pub fn http_get_bytes(host: &str, path: &str, user_agent: &str) -> Result<Vec<u8
             )),
         )
     }
-    .map_err(|err| format!("WinHttpSetOption(REDIRECT_POLICY) failed: {err}"))?;
+    .map_err(|err| describe("WinHttpSetOption(REDIRECT_POLICY)", err))?;
 
     let host_w = wide(host);
     let connect = unsafe {
@@ -3016,9 +3060,9 @@ pub fn http_get_bytes(host: &str, path: &str, user_agent: &str) -> Result<Vec<u8
     let request = WinHttpHandle(request);
 
     unsafe { WinHttpSendRequest(request.0, None, None, 0, 0, 0) }
-        .map_err(|err| format!("WinHttpSendRequest failed: {err}"))?;
+        .map_err(|err| describe("WinHttpSendRequest", err))?;
     unsafe { WinHttpReceiveResponse(request.0, std::ptr::null_mut()) }
-        .map_err(|err| format!("WinHttpReceiveResponse failed: {err}"))?;
+        .map_err(|err| describe("WinHttpReceiveResponse", err))?;
 
     let mut status: u32 = 0;
     let mut status_len = std::mem::size_of::<u32>() as u32;
@@ -3032,7 +3076,7 @@ pub fn http_get_bytes(host: &str, path: &str, user_agent: &str) -> Result<Vec<u8
             std::ptr::null_mut(),
         )
     }
-    .map_err(|err| format!("WinHttpQueryHeaders failed: {err}"))?;
+    .map_err(|err| describe("WinHttpQueryHeaders", err))?;
     if status != 200 {
         // Reached only after redirects have already been followed, so this is
         // the status of the response that actually carries the body.
@@ -3047,7 +3091,7 @@ pub fn http_get_bytes(host: &str, path: &str, user_agent: &str) -> Result<Vec<u8
     loop {
         let mut available: u32 = 0;
         unsafe { WinHttpQueryDataAvailable(request.0, &mut available) }
-            .map_err(|err| format!("WinHttpQueryDataAvailable failed: {err}"))?;
+            .map_err(|err| describe("WinHttpQueryDataAvailable", err))?;
         if available == 0 {
             break;
         }
@@ -3061,7 +3105,7 @@ pub fn http_get_bytes(host: &str, path: &str, user_agent: &str) -> Result<Vec<u8
                 &mut read,
             )
         }
-        .map_err(|err| format!("WinHttpReadData failed: {err}"))?;
+        .map_err(|err| describe("WinHttpReadData", err))?;
         chunk.truncate(read as usize);
         body.extend_from_slice(&chunk);
     }
@@ -3096,6 +3140,30 @@ pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_the_reachability_family_to_plain_language() {
+        assert_eq!(
+            winhttp_reachability_reason(0x8007_2EE2),
+            Some("couldn't reach GitHub (timed out)")
+        );
+        assert_eq!(
+            winhttp_reachability_reason(0x8007_2EE7),
+            Some("couldn't reach GitHub (DNS lookup failed)")
+        );
+        assert_eq!(
+            winhttp_reachability_reason(0x8007_2EFD),
+            Some("couldn't reach GitHub (connection refused)")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_none_for_an_unmapped_code_so_the_raw_hresult_survives() {
+        // Some other WinHTTP/Win32 HRESULT this mapping doesn't recognize —
+        // callers must fall back to the raw `{err}` Display rather than
+        // inventing a reason, so nothing becomes less diagnosable.
+        assert_eq!(winhttp_reachability_reason(0x8007_2EE8), None);
+    }
 
     // Real GWL_STYLE bits, used to build realistic test fixtures without
     // depending on the (Windows-only) `windows` crate constants.
