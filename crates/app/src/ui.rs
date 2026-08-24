@@ -6114,9 +6114,23 @@ const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 572.0);
 /// Floor on the skill breakdown viewport's inner size (issue #181) so a
 /// resize can't shrink it into uselessness — tall enough for the header, tab
 /// strip and column-header row plus a couple of rows before the list
-/// scrolls, wide enough to keep the columns legible once
-/// `column_anchors_from_widths` scales them down.
-const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(360.0, 220.0);
+/// scrolls, wide enough to fit every column at its stated width.
+///
+/// Issue #228: the width used to be a flat 360.0, far narrower than the sum
+/// of `SkillColumn::width`s (728.0) plus the column header row's left/right
+/// `SKILL_HEADER_PAD_X` inset (24.0) — so dragging the window down toward
+/// this floor pushed `column_anchors_from_widths` into its proportional
+/// shrink path (see its doc comment) while the header labels stayed
+/// unclipped at full size, colliding them into unreadable text (e.g.
+/// `Damag%Dmg%Max cr…`). Of the fixes the issue lists — eliding column
+/// text, progressively dropping columns, or raising this floor — raising
+/// the floor is the one taken: it's the smallest change, and every column
+/// stays fully legible at every reachable size rather than switching to a
+/// second, narrower text-rendering mode. The floor is now exactly that
+/// budget, so `column_anchors_from_widths` can still scale a fraction of a
+/// point for rounding but never enough to visibly compress a label. See
+/// `skill_window_min_width_fits_every_column_at_its_stated_width`.
+const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(752.0, 220.0);
 
 /// One open breakdown window's own state (issue #16, D9): its sort column/
 /// direction, the screen position it was placed at when opened, and the
@@ -12184,6 +12198,35 @@ mod tests {
         assert!(
             total <= SKILL_WINDOW_SIZE.x - 2.0 * SKILL_HEADER_PAD_X,
             "columns total {total}"
+        );
+    }
+
+    /// Issue #228: dragging the window down to `SKILL_WINDOW_MIN_SIZE`
+    /// used to be reachable at a width far narrower than the columns'
+    /// combined budget. `column_anchors_from_widths` scales every column's
+    /// *slot* down to fit at that point, but the header labels
+    /// (`draw_skill_window`'s column-header loop) are painted unclipped at
+    /// fixed size — they don't shrink or elide with their slot — so a
+    /// too-narrow floor collided them into unreadable text (e.g.
+    /// `Damag%Dmg%Max cr…`). The fix keeps the floor itself wide enough
+    /// that no column is ever below the width its label needs: the sum of
+    /// every `SkillColumn::width` plus the column header row's left/right
+    /// `SKILL_HEADER_PAD_X` inset (the same margin
+    /// `skill_columns_fit_the_initial_window_at_their_stated_widths`
+    /// checks against for the *initial* size). This is the "raise the
+    /// floor" fix from the alternatives the issue lists (eliding text or
+    /// progressively dropping columns): it is the smallest change that
+    /// removes the collision, and it keeps every column's full label
+    /// legible at every reachable size instead of introducing a second,
+    /// narrower text-rendering mode.
+    #[test]
+    fn skill_window_min_width_fits_every_column_at_its_stated_width() {
+        let total: f32 = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).sum();
+        assert!(
+            SKILL_WINDOW_MIN_SIZE.x >= total + 2.0 * SKILL_HEADER_PAD_X,
+            "min width {} is narrower than the columns' {total} + padding, \
+             so a resize down to it collides their header text",
+            SKILL_WINDOW_MIN_SIZE.x
         );
     }
 
