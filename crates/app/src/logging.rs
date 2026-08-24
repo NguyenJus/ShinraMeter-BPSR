@@ -170,11 +170,7 @@ fn lock_rotation() -> MutexGuard<'static, ()> {
 
 /// Opens `path` for appending, creating its parent directories as needed.
 fn open_log_file(path: &Path) -> io::Result<File> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
+    crate::paths::ensure_parent_dir(path)?;
     OpenOptions::new().create(true).append(true).open(path)
 }
 

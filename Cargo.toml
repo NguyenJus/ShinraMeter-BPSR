@@ -30,7 +30,21 @@ egui-winit = { version = "0.36", default-features = false }
 # dependency graph via eframe, so this costs no extra compilation.
 pollster = "1"
 arboard = { version = "3.6", features = ["image-data"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+# `png` for the compiled-in icon set (`crates/app/src/icons.rs`); the other
+# four for the user-supplied header/backdrop images issues #121 and #253 load
+# off disk at runtime (`crates/app/src/custom_image.rs`) — a user pointing at
+# their own wallpaper is far likelier to hand over a JPEG or a WebP than a
+# PNG. All five are pure-Rust decoders with no system dependency, so they
+# cross-compile to `x86_64-pc-windows-gnu` unchanged; `default-features =
+# false` still keeps the rest of the format list (TIFF, EXR, DDS, …) out of
+# the build.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "bmp",
+    "gif",
+    "webp",
+] }
 crossbeam-channel = "0.5"
 log = "0.4"
 env_logger = "0.11"

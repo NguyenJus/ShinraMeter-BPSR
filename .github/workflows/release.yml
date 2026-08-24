@@ -1,8 +1,9 @@
 name: Release
 
-# Tagged versions publish a zip containing the Windows executable — every
-# icon set (including the class and Imagine icons) is compiled in via
-# `include_bytes!` (issue #123), so there is no separate asset tree to ship.
+# Tagged versions publish the Windows executable itself as the release
+# asset — every icon set (including the class and Imagine icons) is compiled
+# in via `include_bytes!` (issue #123), so there is no separate asset tree to
+# ship and (issue #249) no zip to wrap the one file in.
 # The build mirrors the `build-windows` job in ci.yml — same cross-toolchain,
 # same checks — so a tag can never ship a binary CI would have rejected.
 on:
@@ -93,14 +94,23 @@ jobs:
             exit 1
           fi
 
-      # A version in the asset name keeps downloads distinguishable once a
-      # user has several of them in one folder.
+      # Issue #249: the asset is the bare executable — every icon set is
+      # compiled in via `include_bytes!` (issue #123), so a zip around one
+      # .exe only ever bought the user an extract step.
+      #
+      # The version therefore has to live in the *executable's* own filename,
+      # which is what this rename is for: `cargo build` emits a plain
+      # `ShinraMeter-BPSR.exe`, and several of those downloaded into one
+      # folder are indistinguishable. It is also what `update_check`'s
+      # in-place updater (issue #250) matches on when it picks the asset to
+      # download out of the `/releases/latest` response, so the `.exe`
+      # extension here is load-bearing, not cosmetic.
       - name: Stage the release asset
         run: |
           set -euo pipefail
           scripts/package-release.sh \
             target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe \
-            "ShinraMeter-BPSR-${GITHUB_REF_NAME}-windows-x64.zip"
+            "ShinraMeter-BPSR-${GITHUB_REF_NAME}-windows-x64.exe"
 
       # Tags carrying a pre-release suffix (v0.2.0-rc1) publish as pre-releases
       # so they stay off the repository's "latest release" link.
@@ -112,7 +122,7 @@ jobs:
           prerelease=""
           case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" \
-            "ShinraMeter-BPSR-${GITHUB_REF_NAME}-windows-x64.zip" \
+            "ShinraMeter-BPSR-${GITHUB_REF_NAME}-windows-x64.exe" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
             $prerelease

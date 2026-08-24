@@ -29,9 +29,7 @@ use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use windows::Win32::Foundation::HANDLE;
 
 use crate::backoff::recv_error_backoff;
-use crate::detect::{
-    Conn, ConnStreamRole, ServerDetector, classify_connection, is_teardown_of_known,
-};
+use crate::detect::{Conn, ServerDetector, decide_packet};
 use crate::driver::{Api, WinDivertAddress};
 use crate::error::CaptureError;
 use crate::restart::CaptureRestart;
@@ -322,43 +320,48 @@ fn recv_loop(
         let payload = tcp.payload();
         let seq = tcp.sequence_number();
 
-        let role = classify_connection(&conn, known_server.as_ref());
+        // Role classification, teardown detection, and the adopt/emit
+        // decision all live in `decide_packet` (crate::detect) so that
+        // sequence — the exact class of bug 6363e90 fixed — is
+        // host-tested; this loop only acts on what it returns.
+        let decision = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &conn,
+            payload,
+            tcp.fin(),
+            tcp.rst(),
+        );
         // A FIN or RST on either direction of the tracked flow means it is
-        // tearing down naturally. Clearing `known_server` here (rather than
-        // only on an explicit `request_restart`) lets the subnet-reconnect
-        // fallback re-arm on its own for the connection that replaces it —
-        // otherwise only a user-initiated restart ever re-enables it.
-        if is_teardown_of_known(role, tcp.fin(), tcp.rst()) {
+        // tearing down naturally. `decide_packet` already cleared
+        // `known_server` (rather than only on an explicit `request_restart`),
+        // which lets the subnet-reconnect fallback re-arm on its own for the
+        // connection that replaces it — otherwise only a user-initiated
+        // restart ever re-enables it.
+        if decision.torn_down {
             log::info!(
                 "capture: tracked connection {conn} torn down (fin={} rst={}); re-arming server detection",
                 tcp.fin(),
                 tcp.rst(),
             );
-            known_server = None;
         }
-
-        match role {
-            // The client→server half of the adopted connection: recognized,
-            // so detection/adoption does not ping-pong on it, but its bytes
-            // belong to that direction's own sequence space and must never
-            // reach the server-stream reassembler.
-            ConnStreamRole::Reverse => continue,
-            ConnStreamRole::Adopted => {}
-            ConnStreamRole::Unrelated => {
-                if !detector.detects(&conn, payload, known_server.is_some()) {
-                    continue;
-                }
-                log::info!(
-                    "capture: adopted game-server connection {conn} at seq={seq} ({} payload bytes)",
-                    payload.len(),
-                );
-                known_server = Some(conn);
-                detector.adopt(&conn);
-                reassembler.resync(seq);
-                decoder.reset();
-                if tx.send(ProtocolEvent::ServerChanged).is_err() {
-                    break;
-                }
+        if decision.skip {
+            // Either the client→server half of the adopted connection
+            // (recognized, so detection/adoption does not ping-pong on it,
+            // but its bytes belong to that direction's own sequence space
+            // and must never reach the server-stream reassembler), or an
+            // unrelated connection that detection declined to adopt.
+            continue;
+        }
+        if decision.newly_adopted {
+            log::info!(
+                "capture: adopted game-server connection {conn} at seq={seq} ({} payload bytes)",
+                payload.len(),
+            );
+            reassembler.resync(seq);
+            decoder.reset();
+            if tx.send(ProtocolEvent::ServerChanged).is_err() {
+                break;
             }
         }
 

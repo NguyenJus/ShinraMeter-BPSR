@@ -84,6 +84,17 @@ pub struct DamageEvent {
     pub is_dead: bool,
 }
 
+/// One skill activation (issue #245). Carries no amount of any kind: a
+/// cast is a use of a skill, whether or not anything came of it, which is
+/// exactly what makes the Skill casts tab different from the Dps tab's hit
+/// counts.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CastEvent {
+    pub caster_uid: i64,
+    pub skill_id: i32,
+    pub timestamp_ms: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlayerInfo {
     pub uid: i64,
@@ -171,6 +182,16 @@ impl From<i32> for EDungeonState {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolEvent {
     Damage(DamageEvent),
+    /// One entity began casting one skill (issue #245), decoded from
+    /// `AttrSkillId` on `AoiSyncDelta`'s attr channel — see
+    /// `attrs::attr_id::SKILL_ID` for the wire evidence, and
+    /// `decode::on_aoi_sync_delta` for the emit site.
+    ///
+    /// Emitted for players only. The attr rides every entity's deltas, but
+    /// a monster's cast count has nowhere to go: `bpsr-meter` keeps no
+    /// per-monster skill breakdown, and the breakdown window is opened from
+    /// a player row.
+    Cast(CastEvent),
     Player(PlayerInfo),
     EnemyHp(EnemyHp),
     /// The dungeon/instance id (issue #9 slice 2), decoded from

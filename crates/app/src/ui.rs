@@ -12,7 +12,8 @@
 //! because the app layer has no channel of its own suited to a single
 //! manual, UI-triggered request/reply.
 
-use std::path::PathBuf;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bpsr_meter::{
@@ -21,6 +22,7 @@ use bpsr_meter::{
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui;
 
+use crate::custom_image::{CustomImages, ImageError, ImageSlot};
 use crate::fonts;
 use crate::history;
 use crate::icons::{
@@ -144,8 +146,160 @@ fn paint_bold_text(
     paint_text(painter, pos, anchor, text, bold(size), color, true)
 }
 
+/// Deterministic 32-bit FNV-1a — routes a skill id to a
+/// `SKILL_PLACEHOLDER_PALETTE` swatch (issue #275). Picked over
+/// `std::hash::DefaultHasher`/`RandomState` specifically because those are
+/// *not* guaranteed stable across Rust versions or process runs, which
+/// would break "the same id looks the same every time" — the one property
+/// this hash exists to provide. Not used for anything else; not a general
+/// hashing utility.
+fn fnv1a_u32(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for &byte in bytes {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Placeholder disc swatches for issue #275: twelve vivid, mid-dark solid
+/// hues, chosen for two things at once. First, distance from the row
+/// chrome's near-black neutrals (`SKILL_CHROME_FILL` 0x11/0x11/0x17,
+/// `SKILL_PANEL_FILL` 0x21/0x21/0x27, `SKILL_COLUMN_HEADER_FILL`
+/// 0x2a/0x2a/0x30) so a placeholder never reads as "nothing painted" the
+/// way the old `SKILL_ICON_EMPTY` (0x33/0x33/0x3B, barely lighter than
+/// that chrome) could. Second, being flat and saturated rather than
+/// gradients or texture, so a placeholder never reads as photographic
+/// game-art either — a user glancing at the row list should be able to
+/// tell which rows have real vendored icons and which don't.
+const SKILL_PLACEHOLDER_PALETTE: [(u8, u8, u8); 12] = [
+    (0xB0, 0x3A, 0x2E), // brick red
+    (0xC5, 0x6A, 0x1E), // burnt orange
+    (0xD8, 0xB0, 0x2A), // gold
+    (0x52, 0x97, 0x2E), // moss green
+    (0x1C, 0x80, 0x6C), // teal
+    (0x1E, 0x6F, 0x9E), // steel blue
+    (0x3A, 0x4E, 0xB0), // indigo
+    (0x6A, 0x3A, 0xB0), // violet
+    (0xA5, 0x2E, 0x8C), // magenta
+    (0x8C, 0x4A, 0x2E), // umber
+    (0x4A, 0x5A, 0x6A), // slate
+    (0xC0, 0x4A, 0x6A), // rose
+];
+
+/// WCAG relative luminance of an sRGB triple (0-255 channels) — used only
+/// to pick a legible glyph color over a placeholder swatch (issue #275).
+fn relative_luminance((r, g, b): (u8, u8, u8)) -> f32 {
+    fn channel(c: u8) -> f32 {
+        let c = f32::from(c) / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+}
+
+/// Background and glyph color for `skill_id`'s placeholder icon (issue
+/// #275), as `(background, glyph)`. The background is `skill_id` — not the
+/// name — routed through `fnv1a_u32` into `SKILL_PLACEHOLDER_PALETTE`: id,
+/// because two ids that resolve to the same `skills::skill_monogram` (e.g.
+/// every Lucky Strike weapon variant, all "LS") still need their own disc
+/// color to stay told apart in a row list, which a name-derived color
+/// could not give them.
+///
+/// The glyph color is whichever of near-black (`#1A1A1A`, matched to this
+/// window's dark theme rather than a pure `#000`) or white gives the
+/// higher WCAG contrast ratio against that background. `0.2017` is not a
+/// round-number guess: it is the relative luminance at which the two
+/// ratios cross, solved from `(l + 0.05)^2 = 1.05 * (l_black + 0.05)` where
+/// `l_black` is `#1A1A1A`'s own luminance. Every current palette entry
+/// clears 4.5:1 (WCAG AA's minimum for *normal* text, stricter than the
+/// 3:1 large-text floor this glyph's ~15pt bold weight would otherwise
+/// only need to clear) against its chosen glyph color — issue #281's
+/// live-window pass found the original teal (4.25:1 against white) and
+/// moss green (4.23:1 against black) both fell short of 4.5 despite
+/// clearing 3:1, so both were darkened/lightened respectively until they
+/// cleared 4.5 with a small margin, without changing which glyph color
+/// either one picks.
+///
+/// Lives here rather than in `skills.rs` (moved in the issue #281 review
+/// pass): `skills.rs`'s module doc says this file owns skill-name/sort
+/// view-model logic and that "`ui.rs` (T4) owns painting this; it must not
+/// be touched here" — a WCAG contrast decision producing `egui::Color32`
+/// paint values is exactly the painting decision that line rules out, so
+/// it belongs beside `paint_skill_icon_placeholder`, the only caller.
+fn skill_placeholder_colors(skill_id: i32) -> (egui::Color32, egui::Color32) {
+    let idx = (fnv1a_u32(&skill_id.to_le_bytes()) as usize) % SKILL_PLACEHOLDER_PALETTE.len();
+    let bg = SKILL_PLACEHOLDER_PALETTE[idx];
+    let fg = if relative_luminance(bg) > 0.2017 {
+        (0x1A, 0x1A, 0x1A)
+    } else {
+        (0xFF, 0xFF, 0xFF)
+    };
+    (
+        egui::Color32::from_rgb(bg.0, bg.1, bg.2),
+        egui::Color32::from_rgb(fg.0, fg.1, fg.2),
+    )
+}
+
+/// Paints the issue #275 monogram placeholder that fills the skill-icon
+/// column for an id with no upstream art: a flat disc in
+/// `skill_placeholder_colors(skill_id)`'s background, with the 1-2
+/// character monogram `skills::skill_monogram` derives from `name` centered
+/// on top in the matching foreground. `name` is the skill's already
+/// resolved display name (`skills::skill_display_name`), passed in rather
+/// than re-resolved here, since the caller's per-row column loop also needs
+/// it for the Name column cell and resolving it twice would repeat the
+/// table lookup and its allocation for no reason.
+///
+/// Falls back to the original flat `SKILL_ICON_EMPTY` disc for the one case
+/// `skill_monogram` returns `None` — a name with no derivable glyph at all
+/// (blank, or pure punctuation) — since #275 found every id actually
+/// observed in capture resolves to a real name (down to the `Skill #<id>`
+/// fallback), so `SKILL_ICON_EMPTY` still exists for a hypothetical
+/// genuinely-nameless id rather than for the 65 ids this issue is about.
+///
+/// Both the placeholder disc and its glyph are `.gamma_multiply(opacity)`'d.
+/// That is a deliberate divergence from the real-icon branch beside this one
+/// (`CLASS_ICON_TINT`, painted at full alpha per issue #166's row-content
+/// rule) and from the old `SKILL_ICON_EMPTY` fallback this replaces (also
+/// never faded) — but this content is new and *generated*, not real
+/// content or chrome, and #252/#253 established that every visible surface
+/// should track the opacity slider. A solid, saturated placeholder disc
+/// pinned at full alpha while the rest of a low-opacity window fades would
+/// make it the loudest element in the row list, which is the opposite of
+/// reading as a fallback for missing art.
+fn paint_skill_icon_placeholder(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    skill_id: i32,
+    name: &str,
+    opacity: f32,
+) {
+    let Some(glyph) = skills::skill_monogram(name) else {
+        painter.circle_filled(center, SKILL_ICON_PLACEHOLDER_RADIUS, SKILL_ICON_EMPTY);
+        return;
+    };
+    let (bg, fg) = skill_placeholder_colors(skill_id);
+    painter.circle_filled(
+        center,
+        SKILL_ICON_PLACEHOLDER_RADIUS,
+        bg.gamma_multiply(opacity),
+    );
+    paint_bold_text(
+        painter,
+        center,
+        egui::Align2::CENTER_CENTER,
+        &glyph,
+        SKILL_ICON_MONOGRAM_FONT_SIZE,
+        fg.gamma_multiply(opacity),
+    );
+}
+
 /// Commands the overlay emits for the app layer to consume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
     Reset,
     Quit,
@@ -158,6 +312,14 @@ pub enum UiCommand {
     /// `pipeline::run` holds the `Send`-able half (`CaptureRestart`) and
     /// makes the request on this command's behalf.
     RestartCapture,
+    /// The uids of every player with an open skill-breakdown window, sent
+    /// whenever `OverlayApp::skill_windows`' key set changes (PR #268
+    /// review, finding 2). `pipeline::run` keeps the latest one and uses it
+    /// to skip building the heals/dealt/received/casts breakdowns
+    /// (`bpsr_meter::Meter::snapshot_focused`) for every other player on
+    /// the live ~10Hz publish tick — a skill window is closed almost all
+    /// the time, so that work is otherwise wasted on every tick.
+    SkillFocus(Vec<i64>),
 }
 
 /// Non-fatal status banner shown above the player rows.
@@ -333,6 +495,12 @@ pub struct OverlayApp {
     /// `BTreeMap` so several open windows keep a stable draw order across
     /// frames.
     skill_windows: std::collections::BTreeMap<i64, SkillWindowState>,
+    /// The `skill_windows` key set as of the last `UiCommand::SkillFocus`
+    /// sent to the pipeline thread (PR #268 review, finding 2). Compared
+    /// against `skill_windows.keys()` each frame so the command only goes
+    /// out on an actual open/close, not on every frame a window happens to
+    /// be open.
+    last_sent_skill_focus: Vec<i64>,
     /// Issue #39: the history thread's handle, or `None` when history is
     /// disabled or its database could not be opened — every history control is
     /// then simply absent, and nothing else changes.
@@ -363,6 +531,23 @@ struct Icons {
     imagines: ImagineIcons,
     /// Per-skill row icons for the breakdown window (issue #192).
     skills: SkillIcons,
+    /// Issues #121/#253: the one exception to this struct's doc comment —
+    /// the user's own header background and row backdrop, read off disk at
+    /// runtime rather than `include_bytes!`-ed, and therefore loaded lazily
+    /// (and re-loaded when the path or the region size changes) instead of
+    /// once in `Icons::load`. See `custom_image` for the cache's shape.
+    ///
+    /// Behind a `RefCell` because every painter in this module holds
+    /// `&Icons`, not `&mut Icons`: `draw_header`, `draw_header_wash`,
+    /// `draw_header_menu` and `draw_rows` between them have some two dozen
+    /// call sites, and threading a fresh `&mut` parameter through all of
+    /// them to reach one lazily-populated cache would be a far larger and
+    /// more merge-hostile change than confining the mutation here. The
+    /// overlay's UI is single-threaded (one `eframe` frame callback), and
+    /// every borrow taken in this module is released before the next —
+    /// `custom_image_texture` in particular drops its guard before it
+    /// paints — so the runtime check never actually fires.
+    custom: RefCell<CustomImages>,
 }
 
 impl Icons {
@@ -377,8 +562,130 @@ impl Icons {
             glyphs: GlyphIcons::load(ctx),
             imagines: ImagineIcons::load(ctx),
             skills: SkillIcons::load(ctx),
+            // Issues #121/#253: nothing to load here — the user's images
+            // are resolved on the first frame that paints a region they
+            // are configured for, at the size that region turns out to be.
+            custom: RefCell::new(CustomImages::default()),
         }
     }
+}
+
+/// Alpha of the scrim painted over a user's background image, before rows
+/// or header text go on top of it (issues #121, #253).
+///
+/// #253 asks for "a dimming scrim or minimum-contrast rule … the way
+/// `SKILL_ROW_HOVER_FILL` already layers over chrome rather than content".
+/// This is that rule, and it is the whole legibility story: a user can
+/// point either region at an arbitrary photograph, which may be white,
+/// high-contrast, or busy exactly where the DPS numbers land, and no choice
+/// of text color survives all of those. Compositing the image ~55% of the
+/// way back towards `PANEL_FILL` bounds how bright the brightest possible
+/// backdrop can get, so the row text keeps its contrast against *any*
+/// image while the artwork is still plainly visible.
+///
+/// Deliberately a scrim over the image rather than a cap on the image's own
+/// alpha: fading the image toward the panel fill by lowering its alpha
+/// would make it disappear entirely as the opacity slider comes down (the
+/// panel fill is fading too), whereas a scrim painted at the *same*
+/// multiplied opacity keeps the image/scrim ratio — and so the contrast
+/// guarantee — constant at every slider position.
+const BACKGROUND_IMAGE_SCRIM_ALPHA: u8 = 0x8C;
+
+/// The scrim itself: `PANEL_FILL`'s color at `BACKGROUND_IMAGE_SCRIM_ALPHA`,
+/// so a dimmed custom image tends towards the same near-black the default
+/// panel already is rather than towards some second, unrelated tone.
+/// Spelled out rather than derived from `PANEL_FILL` because `Color32`'s
+/// channel accessors are not `const fn`; the
+/// `background_image_scrim_matches_the_panel_fill_color` test is what keeps
+/// the two from drifting apart.
+const BACKGROUND_IMAGE_SCRIM: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(18, 18, 22, BACKGROUND_IMAGE_SCRIM_ALPHA);
+
+/// The tint a user's background image is blitted with: white (i.e. the
+/// image's own colors, untouched) scaled by the overlay's opacity setting.
+///
+/// This is the rule issue #253 makes a hard requirement — the same
+/// `.gamma_multiply(settings.opacity)` `PANEL_FILL` and every other
+/// background surface already uses — hoisted into one pure function so both
+/// regions get it and neither can quietly stop applying it. `Color32`
+/// stores channels premultiplied, so scaling white this way scales the
+/// blit's alpha, which is exactly "fade the image with the slider".
+fn background_image_tint(opacity: f32) -> egui::Color32 {
+    egui::Color32::WHITE.gamma_multiply(opacity)
+}
+
+/// Resolves the texture to paint for `slot` over `rect` — together with
+/// the source rectangle it holds, which `custom_image::cover_uv` needs to
+/// build the blit's UV — or `None` for "paint the default artwork": no
+/// path configured, or the configured one did not load (issues #121,
+/// #253).
+///
+/// The size handed to the cache is the region's *true* pixel size. The
+/// bucketing that keeps a resize drag from re-decoding happens inside the
+/// cache, on the key alone; letting it reach the crop geometry is what
+/// stretched the image on both regions before this returned a second
+/// value.
+///
+/// Also the cache's eviction point: a slot with no path clears its entry,
+/// so an image the user just removed stops holding GPU memory immediately
+/// rather than until the process exits.
+///
+/// The `RefCell` guard is dropped before this returns (a `TextureId` is
+/// `Copy`), so no caller can still be holding it while painting — see
+/// `Icons::custom` for why that matters.
+fn custom_image_texture(
+    ctx: &egui::Context,
+    icons: &Icons,
+    slot: ImageSlot,
+    settings: &Settings,
+    rect: egui::Rect,
+) -> Option<(egui::TextureId, [u32; 2])> {
+    let mut cache = icons.custom.borrow_mut();
+    let Some(path) = settings.background_image(slot) else {
+        cache.clear(slot);
+        return None;
+    };
+    let region = crate::custom_image::region_pixels(rect.size(), ctx.pixels_per_point());
+    cache.texture(ctx, slot, path, region)
+}
+
+/// Paints a user's background image over `rect` — the image itself at the
+/// overlay's opacity, then the legibility scrim at the same opacity —
+/// returning whether anything was painted. `false` means the caller should
+/// fall back to its compiled-in artwork.
+///
+/// One function for both regions so the opacity rule and the scrim rule are
+/// written once: #253 is explicit that the backdrop must not ship at a
+/// fixed opacity, and #121's header image is held to the same rule.
+fn paint_background_image(
+    painter: &egui::Painter,
+    icons: &Icons,
+    slot: ImageSlot,
+    settings: &Settings,
+    rect: egui::Rect,
+) -> bool {
+    let Some((texture, content)) = custom_image_texture(painter.ctx(), icons, slot, settings, rect)
+    else {
+        return false;
+    };
+    // Not a full-UV blit: the texture's own size is rounded up to
+    // `custom_image`'s cache bucket, so its aspect ratio is not this rect's
+    // and painting all of it into `rect` would scale the two axes by
+    // different factors — the stretch this parameter exists to undo (see
+    // `custom_image::cover_uv`). Computed from the live rect every frame,
+    // since the cached texture deliberately outlives small size changes.
+    painter.image(
+        texture,
+        rect,
+        crate::custom_image::cover_uv(content, rect.size()),
+        background_image_tint(settings.opacity),
+    );
+    painter.rect_filled(
+        rect,
+        0.0,
+        BACKGROUND_IMAGE_SCRIM.gamma_multiply(settings.opacity),
+    );
+    true
 }
 
 /// The overlay only ever renders real data when the game is running on
@@ -605,6 +912,101 @@ fn demo_skill_rows(skills: &[DemoSkill], player_damage: i64, duration_ms: u64) -
     rows
 }
 
+/// The healing a demo row's class puts out (issue #245), in the same
+/// `DemoSkill` shape the damage fixtures use. Only the two healer classes
+/// have any — a `Marksman` healing for a third of their damage would be a
+/// prettier demo and a less honest one.
+fn demo_heals(class: Class) -> &'static [DemoSkill] {
+    match class {
+        // "Life Bloom" / "Verdant Grace" — ids from `tables::skill_name`.
+        Class::VerdantOracle => &[
+            (2_003, 41_200_000, 210, 62, 16_800_000, 402_000),
+            (2_001, 18_900_000, 96, 25, 6_200_000, 331_000),
+        ],
+        Class::BeatPerformer => &[(2_401, 27_400_000, 158, 44, 9_900_000, 288_000)],
+        _ => &[],
+    }
+}
+
+/// That fixture list's total, i.e. the Heal tab's `% Heal` denominator.
+fn heal_total(class: Class) -> i64 {
+    demo_heals(class)
+        .iter()
+        .map(|&(_, amount, ..)| amount)
+        .sum()
+}
+
+/// The "Skill dealt" tab's demo fixture (issue #245, PR #268 review finding
+/// 3): `skills` and `heals` merged by skill id via `SkillStats::merge`,
+/// exactly like the real `dealt_rows` (`crates/meter/src/encounter.rs`)
+/// merges `stats.skills` and `stats.heals` — not concatenated, which would
+/// leave two rows standing for one skill id that happens to appear in both
+/// fixture lists rather than summing them into one. `total` is the row's
+/// combined damage+heal total, the same "% Dealt" denominator the real
+/// `dealt_rows` passes through from `stats.total_damage + stats.total_heal`.
+fn demo_dealt_rows(
+    skills: &[DemoSkill],
+    heals: &[DemoSkill],
+    total: i64,
+    duration_ms: u64,
+) -> Vec<SkillRow> {
+    let mut merged: std::collections::HashMap<i32, SkillStats> = std::collections::HashMap::new();
+    for &(skill_id, damage, hits, crit_hits, crit_damage, max_crit) in
+        skills.iter().chain(heals.iter())
+    {
+        let entry = SkillStats {
+            total_damage: damage,
+            hits,
+            crit_hits,
+            crit_damage,
+            max_crit,
+            ..Default::default()
+        };
+        merged.entry(skill_id).or_default().merge(&entry);
+    }
+    let mut rows: Vec<SkillRow> = merged
+        .iter()
+        .map(|(&skill_id, stats)| skill_row_from_stats(skill_id, stats, total, duration_ms))
+        .collect();
+    rows.sort_by_key(|s| std::cmp::Reverse(s.damage));
+    rows
+}
+
+/// What the demo's boss lands on each row (issue #245) — the Skill
+/// received tab's fixture. Three monster abilities, one of them a
+/// heavy-hitting crit, which is the shape a tank's received breakdown has.
+const DEMO_RECEIVED: &[DemoSkill] = &[
+    (1_120_101, 4_820_000, 34, 6, 1_640_000, 412_000),
+    (1_120_104, 2_310_000, 12, 3, 980_000, 388_000),
+    (1_120_107, 640_000, 4, 0, 0, 0),
+];
+
+/// `DEMO_RECEIVED`'s total, i.e. the Skill received tab's `% Amt`
+/// denominator.
+fn demo_received_total() -> i64 {
+    DEMO_RECEIVED.iter().map(|&(_, amount, ..)| amount).sum()
+}
+
+/// The Skill casts tab's demo fixture (issue #245): one cast per three
+/// recorded hits of each damaging skill, floored at one. A real cast count
+/// is never derivable from a hit count — that is exactly why the tab needs
+/// its own packet source — but the demo only has to look like a plausible
+/// pull, and a ratio keeps the two columns telling a consistent story.
+fn demo_cast_rows(skills: &[DemoSkill], duration_ms: u64) -> Vec<SkillRow> {
+    let mut rows: Vec<SkillRow> = skills
+        .iter()
+        .map(|&(skill_id, _, hits, ..)| {
+            let stats = SkillStats {
+                hits: (hits / 3).max(1),
+                ..Default::default()
+            };
+            skill_row_from_stats(skill_id, &stats, 0, duration_ms)
+        })
+        .collect();
+    rows.sort_by_key(|s| std::cmp::Reverse(s.hits));
+    rows
+}
+
 /// The synthetic snapshot `demo_enabled` seeds the overlay with. The header's
 /// `total_damage`/`total_dps` are derived from `DEMO_ROWS` rather than a
 /// separate literal (issue #148), so the two can never disagree the way they
@@ -651,7 +1053,33 @@ fn demo_snapshot() -> Snapshot {
                     lucky_pct,
                     hits,
                     deaths,
+                    // A plausible corpse run per death (issue #254): the
+                    // demo snapshot exists to show the chrome, and a
+                    // death-time pill reading 00:00 next to a nonzero
+                    // Deaths count would show the wrong chrome.
+                    dead_ms: Some(u64::from(deaths) * 12_000),
                     skills: demo_skill_rows(demo_skills, damage, duration_ms),
+                    // Issue #245: the demo seed exercises the breakdown
+                    // window's other tabs too, so `--demo` shows a
+                    // populated tab strip rather than five empty ones.
+                    // Healing is only seeded for the two healer classes,
+                    // which is the shape a real pull has; "dealt" is
+                    // damage plus that healing, exactly as the meter's
+                    // `dealt_rows` merges them, and "received" is the
+                    // boss's swings landing back on the row.
+                    heals: demo_skill_rows(demo_heals(class), heal_total(class), duration_ms),
+                    dealt: demo_dealt_rows(
+                        demo_skills,
+                        demo_heals(class),
+                        damage + heal_total(class),
+                        duration_ms,
+                    ),
+                    received: demo_skill_rows(DEMO_RECEIVED, demo_received_total(), duration_ms),
+                    // A cast count per damaging skill, deliberately a
+                    // little above its hit count — most BPSR skills land
+                    // more than one hit per cast, so equal figures would
+                    // be the odd-looking ones.
+                    casts: demo_cast_rows(demo_skills, duration_ms),
                 }
             },
         )
@@ -739,6 +1167,7 @@ impl OverlayApp {
             demo_mode,
             startup_toggles_applied: false,
             skill_windows: std::collections::BTreeMap::new(),
+            last_sent_skill_focus: Vec::new(),
             history,
             rx_history,
             tx_history,
@@ -858,10 +1287,10 @@ impl OverlayApp {
     /// header dropdown happens to be closed is still there the moment it's
     /// reopened, rather than dropped or leaving the dropdown stuck showing
     /// "Checking…" forever.
-    fn poll_update_check(&mut self) {
+    fn poll_update_check(&mut self, ctx: &egui::Context) {
         let landed = match &self.update_check {
             UpdateCheckState::Checking { rx } => match rx.try_recv() {
-                Ok(outcome) => Some(outcome),
+                Ok(outcome) => Some(LandedUpdate::Check(outcome)),
                 // Still in flight — keep rendering "Checking…".
                 Err(TryRecvError::Empty) => None,
                 // The sender is gone without ever having sent: the
@@ -873,15 +1302,105 @@ impl OverlayApp {
                 // short of restarting the app. Resolve it as a failure
                 // instead, which the dropdown renders and which leaves the
                 // button clickable again.
-                Err(TryRecvError::Disconnected) => Some(Err(
+                Err(TryRecvError::Disconnected) => Some(LandedUpdate::Check(Err(
                     "the update-check thread stopped without reporting a result".to_string(),
-                )),
+                ))),
+            },
+            // Issue #250: the same drain, for the thread that downloads and
+            // swaps in the new executable. Same `Disconnected` reasoning as
+            // above — a thread that dies mid-download must resolve to a
+            // visible failure, not leave the dropdown stuck on
+            // "Downloading…" with no way back.
+            UpdateCheckState::Installing { available, rx } => match rx.try_recv() {
+                Ok(result) => Some(LandedUpdate::Install {
+                    available: available.clone(),
+                    result,
+                }),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(LandedUpdate::Install {
+                    available: available.clone(),
+                    result: Err(
+                        "the update-install thread stopped without reporting a result".to_string(),
+                    ),
+                }),
             },
             _ => None,
         };
-        if let Some(outcome) = landed {
-            self.update_check = UpdateCheckState::Done(outcome);
+        match landed {
+            None => {}
+            Some(LandedUpdate::Check(outcome)) => {
+                self.update_check = UpdateCheckState::Done(outcome);
+            }
+            Some(LandedUpdate::Install { available, result }) => {
+                self.update_check = self.finish_update_install(ctx, available, result);
+            }
         }
+    }
+
+    /// Issue #250: what to do the frame an in-place update finishes.
+    ///
+    /// The download and the file swap already happened on the install
+    /// thread (`update_check::install_update`); everything left is process
+    /// lifecycle, which has to happen here because only the UI thread may
+    /// send a viewport command. On success: start the new executable, tell
+    /// the pipeline to stop, and ask the window to close — in that order,
+    /// so a relaunch that fails leaves the current session running rather
+    /// than closing the app over a build the user now has to start by hand.
+    ///
+    /// Returns the state to store rather than assigning it, so the borrow
+    /// of `self.update_check` in `poll_update_check`'s match is already
+    /// over by the time it is replaced.
+    fn finish_update_install(
+        &self,
+        ctx: &egui::Context,
+        available: CheckOutcome,
+        result: Result<PathBuf, String>,
+    ) -> UpdateCheckState {
+        self.finish_update_install_with(ctx, available, result, update_check::relaunch)
+    }
+
+    /// The body of `finish_update_install`, with the actual relaunch call
+    /// taken as a parameter instead of hard-coded to `update_check::relaunch`.
+    /// `finish_update_install` is the only production caller and always
+    /// passes `update_check::relaunch`, so behavior is unchanged; tests use
+    /// this seam to drive the success branch without spawning a real
+    /// process.
+    fn finish_update_install_with(
+        &self,
+        ctx: &egui::Context,
+        available: CheckOutcome,
+        result: Result<PathBuf, String>,
+        relaunch: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> UpdateCheckState {
+        let installed = match result {
+            Ok(installed) => installed,
+            Err(err) => {
+                return UpdateCheckState::InstallFailed {
+                    available,
+                    error: err,
+                };
+            }
+        };
+        if let Err(err) = relaunch(&installed) {
+            // The swap succeeded, so the executable on disk *is* the new
+            // build — only starting it failed. Say so explicitly: telling
+            // the user the update failed would be wrong, and re-running the
+            // download would be pointless work.
+            log::error!("installed the update but couldn't relaunch: {err}");
+            return UpdateCheckState::InstallFailed {
+                available,
+                error: format!(
+                    "the update was installed but couldn't be started ({err}) — close the meter and open it again"
+                ),
+            };
+        }
+        log::info!(
+            "installed an in-place update at {} and relaunched; closing this instance",
+            installed.display()
+        );
+        let _ = self.tx_command.try_send(UiCommand::Quit);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        UpdateCheckState::Restarting
     }
 
     /// Issue #220 (PR #227 review): picks up whatever the "Export logs"
@@ -921,7 +1440,7 @@ impl eframe::App for OverlayApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_snapshots();
-        self.poll_update_check();
+        self.poll_update_check(ui.ctx());
         // Issue #39: drained unconditionally, regardless of whether the
         // history view is open — see `poll_history`'s doc comment.
         self.poll_history();
@@ -1247,6 +1766,25 @@ impl eframe::App for OverlayApp {
                 // checked right after, once the `&mut self.view` borrow the
                 // match below needed has ended.
                 let mut back_to_live = false;
+                // Issue #253: the user's own artwork behind whichever of
+                // the two row surfaces paints next. Deliberately here and
+                // not inside `draw_rows`/`draw_history`: painting first is
+                // what puts it *behind* every row, hover fill and share
+                // bar, and it keeps both of their signatures (and every
+                // test that calls them) untouched. `ui.max_rect()` is the
+                // central panel's own rect — the same `panel` `draw_header`
+                // captured for the header wash — while
+                // `available_rect_before_wrap` is the strip left under the
+                // header, so `row_backdrop_rect` can clip the image to the
+                // rows' area without letting it reach the panel's rounded
+                // border.
+                draw_row_backdrop(
+                    ui,
+                    ui.max_rect(),
+                    ui.available_rect_before_wrap(),
+                    icons,
+                    &self.settings,
+                );
                 match &mut self.view {
                     OverlayView::Live => {
                         draw_rows(
@@ -1337,7 +1875,7 @@ impl eframe::App for OverlayApp {
                 });
             let already_open =
                 open_skill_window(&mut self.skill_windows, uid, source, || SkillWindowState {
-                    sort: skills::SkillSort::default(),
+                    tabs: SkillTabs::default(),
                     pos: skills::place_window(main_outer, monitor, SKILL_WINDOW_SIZE),
                     size: SKILL_WINDOW_SIZE,
                     source,
@@ -1407,7 +1945,7 @@ impl eframe::App for OverlayApp {
                     let x_clicked = draw_skill_window(
                         ui,
                         row,
-                        &mut state.sort,
+                        &mut state.tabs,
                         state.source,
                         icons,
                         opacity,
@@ -1433,6 +1971,27 @@ impl eframe::App for OverlayApp {
         }
         for uid in closed_skill_windows {
             close_skill_window(&mut self.skill_windows, uid);
+        }
+
+        // PR #268 review, finding 2: tell the pipeline thread which players
+        // it can skip the heals/dealt/received/casts breakdowns for. Only
+        // `Live`-sourced windows count — a `History`-sourced one draws from
+        // `history_open`'s own already-fully-populated snapshot above, never
+        // from the live one the pipeline thread builds, so naming its uid
+        // here would cost real work for nothing. Sent only when the set
+        // actually changed, so an open (or already-focused) window doesn't
+        // resend it every frame.
+        let live_skill_focus: Vec<i64> = self
+            .skill_windows
+            .iter()
+            .filter(|(_, state)| state.source == SkillWindowSource::Live)
+            .map(|(&uid, _)| uid)
+            .collect();
+        if live_skill_focus != self.last_sent_skill_focus {
+            let _ = self
+                .tx_command
+                .try_send(UiCommand::SkillFocus(live_skill_focus.clone()));
+            self.last_sent_skill_focus = live_skill_focus;
         }
 
         // ~10 Hz.
@@ -1667,7 +2226,15 @@ fn draw_header(
     // and keeps the two derivations from ever drifting apart again. Never a
     // literal.
     let wash_height = first_player_row_top_offset(band_height) - HEADER_WASH_INSET;
-    draw_header_wash(ui, panel, icons, wash_height);
+    // Issue #252: `settings` carries the overlay-opacity slider the wash's
+    // own fills and emblem fade with, so it stays at its baked-in alpha no
+    // longer — the same threading the header background image (issue #121)
+    // already needed the whole `Settings` for. The gutter emblem below is
+    // painted from this same slider, matching the `PANEL_FILL`/
+    // `PANEL_BORDER_COLOR` gamma-multiply above and the skill window's own
+    // opacity threading (issue #184).
+    let opacity = settings.settings.opacity;
+    draw_header_wash(ui, panel, icons, wash_height, settings.settings);
 
     // Issue #183: pinning the overlay locks its *position* as well as its
     // Z-order, so the drag band refuses to start a move while
@@ -1715,7 +2282,7 @@ fn draw_header(
             emblem.id(),
             header_emblem_rect(title_row, text_band_height),
             UV_FULL,
-            HEADER_EMBLEM_COLOR,
+            HEADER_EMBLEM_COLOR.gamma_multiply(opacity),
         );
     }
     for (segment_rect, color) in title_separator_segments(title_separator_rect(title_row)) {
@@ -1877,12 +2444,25 @@ fn draw_header(
 // (`platform::install_tray`) exists only as a belt-and-braces fallback for
 // the case that carve-out ever fails or the window ends up off-screen.
 
-/// Tint a toggle-cluster button paints with while its state is "off" — the
-/// source's `OffBrush="#1fff"`, originally the still-inert queue ring's
-/// stroke color, now `toggle_state_tint`'s off case for the click-through
-/// and always-on-top buttons (issue #167).
+/// Tint a toggle-cluster button paints with while its state is "off" —
+/// white at a fraction of `TOGGLE_ACTIVE_COLOR`'s alpha (issue #251, raised
+/// again by issue #255's live-window pass). The original value (`0x11`, the
+/// still-inert queue ring's borrowed stroke color, source `OffBrush=
+/// "#1fff"`) read as ~7% opacity and made the click-through/always-on-top
+/// buttons nearly invisible when off. `0x40` — exactly half of
+/// `TOGGLE_ACTIVE_COLOR`'s `0x80` — fixed that but, against the header
+/// chrome's `#25282f`, still landed under the 3:1 WCAG minimum for a
+/// non-text UI component (the "on" tint measures 4.7-5.4:1). `0x50`, this
+/// constant's next value, was assumed to clear 3:1 and does not: composited
+/// over the real backgrounds this pill paints on — bare `PANEL_FILL`
+/// rgb(18, 18, 22) and the header wash blended over it, at full opacity and
+/// at the shipped 200/255 default alike — it measures 2.65-2.84:1. `0x58` is
+/// the first alpha over 3:1 in every one of those cases; `0x60` measures
+/// 3.30-3.53:1, clearing the minimum with margin to spare while staying
+/// visibly dimmer than the "on" tint's `0x80`, so the two states stay
+/// distinguishable at a glance.
 const TOGGLE_OFF_COLOR: egui::Color32 =
-    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x11);
+    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x60);
 /// Tint the toggle cluster's buttons are painted with while active — the
 /// same half-white `TOOLBAR_ICON_TINT` every other clickable icon in this
 /// module uses. Share and Reset (one-shot actions, not on/off state) always
@@ -2058,8 +2638,8 @@ fn toggle_button(
 
 /// Which tint a toggle-cluster on/off button paints its glyph with (issue
 /// #167): `TOGGLE_ACTIVE_COLOR` — the same half-white every clickable icon
-/// in this cluster uses — while the state is on, `TOGGLE_OFF_COLOR` — the
-/// near-invisible tint the old inert queue ring painted with — while off.
+/// in this cluster uses — while the state is on, `TOGGLE_OFF_COLOR` — a
+/// dimmer but still clearly legible white (issue #251) — while off.
 /// Pure so the state -> color mapping is unit-testable without a live
 /// `egui::Context`; `toggle_cluster` is the only caller.
 fn toggle_state_tint(active: bool) -> egui::Color32 {
@@ -3508,8 +4088,18 @@ const HEADER_EMBLEM_LEFT_BLEED: f32 = -26.0;
 /// the centering from the text band it is actually given instead of baking
 /// the source's one case in.
 const HEADER_EMBLEM_BOTTOM_BLEED: f32 = 8.0;
-/// `Fill="SlateGray"`.
-const HEADER_EMBLEM_COLOR: egui::Color32 = egui::Color32::from_rgb(0x70, 0x80, 0x90);
+/// `Fill="SlateGray"`. The source's gutter placement
+/// (`DamageMeter.UI/HUD/Controls/MainView.xaml`, the `Width="60" Height="60"
+/// Margin="-26 0 0 -8"` `Path` that `header_emblem_rect`'s constants are
+/// measured off) carries no `Opacity` attribute of its own — only the wash's
+/// separate blown-up copy does (`Opacity=".05"`, already encoded as
+/// `HEADER_WASH_EMBLEM_COLOR`'s alpha `13`). So there is no reference number
+/// to port here (issue #252); `0x80` (half alpha) is a chosen value, not a
+/// measured one — it matches this module's own established "dimmed but
+/// legible" idiom (`TOOLBAR_ICON_TINT`'s half-white) rather than painting
+/// the mark fully opaque as a bare `Color32::from_rgb` implied.
+const HEADER_EMBLEM_COLOR: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0x70, 0x80, 0x90, 0x80);
 
 /// Where the header emblem's 60x60 box sits: bled off the left of the title
 /// row `row`, and vertically centered on the header's text band
@@ -3590,7 +4180,16 @@ const HEADER_WASH_EMBLEM_SIZE: f32 = 200.0;
 /// in points: the source right-aligns the wash `Svg.HPBar` with a `-25` right
 /// margin, so its last 25pt hang off the panel and the wash's clip rect cuts
 /// them away — the mirror of the gutter emblem's `HEADER_EMBLEM_LEFT_BLEED`.
-const HEADER_WASH_EMBLEM_BLEED: f32 = 25.0;
+///
+/// Nudged in from the source's literal `25` to `17` (issue #255's
+/// live-window pass): at `25` the emblem's circular arc edge sat almost
+/// dead-center under the title row's toggle pill (`title_toggle_pill_rect`),
+/// cutting through the click-through glyph's box and locally lifting the
+/// background behind it. Shrinking the overhang slides the whole square —
+/// and the visible arc inside it — further from the panel's right edge,
+/// clearing the toggle glyph boxes without touching the wash's size, alpha
+/// or the toggle cluster's own layout.
+const HEADER_WASH_EMBLEM_BLEED: f32 = 17.0;
 /// `Opacity=".05"` on a SlateGray fill.
 const HEADER_WASH_EMBLEM_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(0x70, 0x80, 0x90, 13);
@@ -3638,14 +4237,46 @@ fn header_wash_emblem_rect(wash: egui::Rect) -> egui::Rect {
 /// cannot clip to a rounded rect this cheaply, so the wash keeps square
 /// corners — at alpha `0x50` under the panel's own 8pt-rounded, 1pt border
 /// the difference is sub-pixel.
-fn draw_header_wash(ui: &egui::Ui, panel: egui::Rect, icons: &Icons, height: f32) {
+///
+/// Issue #121: when `settings.header_image` names a loadable file, that
+/// image replaces both layers below — the gradient *and* the oversized
+/// emblem — cover-cropped to this same rect and painted at
+/// `settings.opacity`, with the legibility scrim over it. It replaces the
+/// wash only; the small gutter emblem beside the title (`header_emblem_rect`,
+/// painted by `draw_header` after this returns) is a foreground mark on the
+/// title rows rather than background artwork, and the title's own indent is
+/// sized for it, so it stays. Anything that fails to load falls straight
+/// through to the default artwork below.
+///
+/// That default artwork fades with the same `settings.opacity` (issue #252):
+/// every fill and the emblem image is `.gamma_multiply`'d by it, the same
+/// pattern `PANEL_FILL`/`PANEL_BORDER_COLOR` use at the `Frame` level and
+/// the skill window uses throughout (issue #184), so the wash tracks the
+/// rest of the window's chrome instead of staying at its fixed baked-in
+/// alpha — and so the two paths agree on what the slider means.
+fn draw_header_wash(
+    ui: &egui::Ui,
+    panel: egui::Rect,
+    icons: &Icons,
+    height: f32,
+    settings: &Settings,
+) {
     let wash_rect = header_wash_rect(panel, height);
     let painter = ui.painter().with_clip_rect(wash_rect);
+
+    if paint_background_image(&painter, icons, ImageSlot::Header, settings, wash_rect) {
+        return;
+    }
+
+    // Issue #252: the default artwork fades with the same slider the header
+    // image above is already painted at.
+    let opacity = settings.opacity;
 
     // Top-left brightest, fading to zero at the bottom-right — the source's
     // `LinearGradientBrush` with no explicit start/end points defaults to
     // that diagonal.
-    let slate = |a: u8| egui::Color32::from_rgba_unmultiplied(0x70, 0x80, 0x90, a);
+    let slate =
+        |a: u8| egui::Color32::from_rgba_unmultiplied(0x70, 0x80, 0x90, a).gamma_multiply(opacity);
     let mid_alpha = HEADER_WASH_TOP_ALPHA / 2;
     painter.add(egui::Shape::mesh(gradient_mesh(
         wash_rect,
@@ -3657,8 +4288,64 @@ fn draw_header_wash(ui: &egui::Ui, panel: egui::Rect, icons: &Icons, height: f32
 
     if let Some(emblem) = icons.glyphs.get(GlyphIcon::Emblem) {
         let emblem_rect = header_wash_emblem_rect(wash_rect);
-        painter.image(emblem.id(), emblem_rect, UV_FULL, HEADER_WASH_EMBLEM_COLOR);
+        painter.image(
+            emblem.id(),
+            emblem_rect,
+            UV_FULL,
+            HEADER_WASH_EMBLEM_COLOR.gamma_multiply(opacity),
+        );
     }
+}
+
+// -- row-list backdrop (issue #253) --------------------------------------
+
+/// Where the user's row-list backdrop is painted, for a row area of
+/// `available` inside a central panel of `panel`.
+///
+/// `available` is what `OverlayApp::ui`'s layout cursor has left once the
+/// header band and its separator are behind it — i.e. exactly the strip
+/// `draw_rows`/`draw_history` are about to fill — so the backdrop always
+/// starts flush under the header wash and never overlaps it, whatever the
+/// header's height works out to this frame.
+///
+/// The intersection with the inset panel is what keeps the image's square
+/// corners off the panel's own `PANEL_CORNER_RADIUS`-rounded,
+/// `PANEL_BORDER_WIDTH`-thick border along the bottom and sides — the same
+/// job, and the same `HEADER_WASH_INSET`, that `header_wash_rect` does at
+/// the top. Pure geometry, so both properties are unit-testable without a
+/// painter, the same factoring as `header_wash_rect`/`header_emblem_rect`.
+fn row_backdrop_rect(available: egui::Rect, panel: egui::Rect) -> egui::Rect {
+    available.intersect(panel.shrink(HEADER_WASH_INSET))
+}
+
+/// Paints the user's backdrop image behind the player-row list (issue
+/// #253), or nothing at all when none is configured or it failed to load —
+/// in which case the panel's own `PANEL_FILL` shows through exactly as it
+/// always has.
+///
+/// Called from `OverlayApp::ui` *before* `draw_rows`/`draw_history` rather
+/// than from inside them, which is what puts it behind every row: egui
+/// paints in call order, so the row hover fills, the accent lines, the
+/// share bar and all the text land on top of this without any of them
+/// needing to know it exists. That also means it costs nothing on the
+/// (default) path where no image is configured, and it needs no change to
+/// `draw_rows`' signature or its half-dozen call sites.
+///
+/// The scrim `paint_background_image` lays over the image is what keeps the
+/// rows legible over arbitrary artwork — see `BACKGROUND_IMAGE_SCRIM_ALPHA`.
+fn draw_row_backdrop(
+    ui: &egui::Ui,
+    panel: egui::Rect,
+    available: egui::Rect,
+    icons: &Icons,
+    settings: &Settings,
+) {
+    let rect = row_backdrop_rect(available, panel);
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(rect);
+    paint_background_image(&painter, icons, ImageSlot::Backdrop, settings, rect);
 }
 
 /// Color of the fading separator line painted under the header title
@@ -3853,6 +4540,112 @@ fn header_menu_scroll_max_height(screen_height: f32, margin: f32) -> f32 {
 // Issue #39: same reasoning as `draw_header`'s identical allow just above —
 // one more history-view parameter tips this over clippy's default limit.
 #[allow(clippy::too_many_arguments)]
+/// The status line under one background-image row in the settings dropdown
+/// (issues #121, #253): the chosen file's name, or — when `error` says the
+/// load failed — that name prefixed with a warning and followed by the
+/// reason.
+///
+/// This is the "surface something to the user rather than failing silently"
+/// half of the failure story. Without it a mistyped path in a hand-edited
+/// settings.json, or artwork the user has since moved, simply looks like
+/// the feature does not work: the overlay would keep painting its default
+/// artwork with nothing anywhere saying why.
+///
+/// Shows the file name rather than the full path — the dropdown is a narrow
+/// popover over a game, and a full Windows path wraps into several lines of
+/// it — with the full path on the row's hover tooltip instead (see
+/// `background_image_row`). Pure, and split out for the same reason
+/// `title_separator_segments` is: unit-testable without a live `egui::Ui`.
+fn background_image_status(path: &Path, error: Option<&ImageError>) -> String {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        // A path ending in `..` or a bare root has no file name; showing
+        // the whole thing beats showing an empty label.
+        .unwrap_or_else(|| path.display().to_string());
+    match error {
+        Some(err) => format!("⚠ {name} {err}"),
+        None => name,
+    }
+}
+
+/// One row of the settings dropdown's "Background images" section: the
+/// region's name, a button that opens the native picker, a button that
+/// clears it, and the status line below (issues #121, #253).
+///
+/// Both buttons clear this slot's cache entry before sending: the path is
+/// the cache key, so a *different* path would invalidate on its own, but
+/// re-picking the *same* path is precisely how a user says "I have replaced
+/// that file, load it again", and clearing here is what makes that work.
+///
+/// That `clear` happens after this frame's status label is already drawn
+/// below, though: a re-pick still leaves one frame where `settings` reports
+/// the new path but the cache entry is the old one's. Rather than relying
+/// on draw order to dodge that window, `CustomImages::error` itself refuses
+/// to hand back a cached failure whose `Entry.path` doesn't match the path
+/// being asked about — see its doc comment — so a stale error can never be
+/// attributed to a different file no matter which order things repaint in.
+fn background_image_row(
+    ui: &mut egui::Ui,
+    slot: ImageSlot,
+    settings: &mut Settings,
+    tx_settings: &Sender<Settings>,
+    icons: &Icons,
+) {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(slot.label());
+        if ui.button("Choose…").clicked() {
+            // Inline on this thread, like "Export logs"' save dialog — see
+            // `platform::choose_log_export_path`'s doc comment for why a modal
+            // the OS is already blocking on needs no thread of its own. `None`
+            // means the user cancelled, which must leave the current choice
+            // alone rather than clearing it.
+            if let Some(path) = crate::platform::choose_background_image_path(slot.label()) {
+                settings.set_background_image(slot, Some(path));
+                changed = true;
+            }
+        }
+        let configured = settings.background_image(slot).is_some();
+        if ui
+            .add_enabled(configured, egui::Button::new("Clear"))
+            .clicked()
+        {
+            settings.set_background_image(slot, None);
+            changed = true;
+        }
+    });
+    if let Some(path) = settings.background_image(slot) {
+        let error = icons.custom.borrow().error(slot, path);
+        // Inset from the right before the label wraps. Every other row in
+        // this dropdown is a `ui.horizontal` strip of intrinsically sized
+        // widgets, so nothing else here ever reaches the popup's right
+        // content edge; the `⚠ …` status is the one label long enough to
+        // wrap, and egui wraps it at the full content width — which the
+        // `ScrollArea`'s *floating* scrollbar overlays rather than reserves
+        // space for (`ScrollStyle::floating` allocates no width), so the
+        // message ran hard into the panel edge and under the bar. Taking
+        // the scrollbar's own width plus its inner margin back gives the
+        // wrapped text the same breathing room the rest of the section has.
+        let inset = {
+            let scroll = &ui.spacing().scroll;
+            scroll.bar_width + scroll.bar_inner_margin
+        };
+        let wrap_width = (ui.available_width() - inset).max(1.0);
+        ui.scope(|ui| {
+            ui.set_max_width(wrap_width);
+            ui.label(background_image_status(path, error.as_ref()))
+                .on_hover_text(path.display().to_string());
+        });
+    }
+    if changed {
+        icons.custom.borrow_mut().clear(slot);
+        // Same persistence path as the Columns checkboxes and the opacity
+        // slider: blocking file IO stays off this render thread.
+        let _ = tx_settings.send(settings.clone());
+    }
+}
+
 fn draw_header_menu(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -4001,6 +4794,19 @@ fn draw_header_menu(
 
             ui.separator();
 
+            // Issues #121 and #253: one labelled section owning both custom
+            // background regions. Its own section rather than a nesting inside
+            // Columns (which is a per-column list) and rather than two scattered
+            // items, because the two rows are the same control twice and read as a
+            // pair — and because it sits directly under the Opacity slider that
+            // fades both of them, which is the relationship #253 is about.
+            ui.label("Background images");
+            for slot in ImageSlot::ALL {
+                background_image_row(ui, slot, settings, tx_settings, icons);
+            }
+
+            ui.separator();
+
             // Issue #53: this minimize goes to the notification area, not the
             // taskbar. `platform::install_tray`'s subclass intercepts the
             // `WM_SIZE`/`SIZE_MINIMIZED` this command produces, adds a tray icon
@@ -4021,12 +4827,30 @@ fn draw_header_menu(
             // same column set `default_inner_width` already sizes for, and puts
             // opacity back to `Settings::default_opacity()` through the same
             // `set_opacity` + `tx_settings` path the slider above uses.
+            //
+            // Issue #121 widens what "defaults" means here: this used to put back
+            // `opacity` and nothing else, so every field added since issue #203 —
+            // the visible-column set, the click-through and pin toggles, the
+            // history retention values, and now both custom images — quietly
+            // escaped the reset the button's own label promised.
+            // `Settings::reset_to_defaults` covers the whole struct, and the image
+            // cache is dropped alongside it so the textures for images that are no
+            // longer configured are released the same frame rather than lingering
+            // until the next paint notices.
+            //
+            // Still distinct from the header toggle cluster's Reset *icon*, which
+            // resets encounter data (`UiCommand::Reset`) and touches no settings at
+            // all — issue #121 is explicit that the two must not be confused, which
+            // is why this one lives here in the dropdown and says "to defaults".
             if ui.button("Reset to defaults").clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     default_inner_width(),
                     reset_to_defaults_inner_height(),
                 )));
-                settings.set_opacity(Settings::default_opacity());
+                settings.reset_to_defaults();
+                for slot in ImageSlot::ALL {
+                    icons.custom.borrow_mut().clear(slot);
+                }
                 let _ = tx_settings.send(settings.clone());
                 ui.close();
             }
@@ -4085,14 +4909,28 @@ fn draw_header_menu(
             // let them re-check right before actually upgrading; it is only
             // disabled while one is already in flight, so a click can't pile up a
             // second thread racing the first to the same channel.
-            let checking = matches!(update_check, UpdateCheckState::Checking { .. });
+            //
+            // Issue #250: the button is also disabled while an install is
+            // running or the app is on its way out — re-checking mid-swap
+            // would only race the state machine, and a `Restarting` app has
+            // nothing left to check.
+            let busy = matches!(
+                update_check,
+                UpdateCheckState::Checking { .. }
+                    | UpdateCheckState::Installing { .. }
+                    | UpdateCheckState::Restarting
+            );
             let clicked_check_for_updates = ui
-                .add_enabled(!checking, egui::Button::new("Check for updates"))
+                .add_enabled(!busy, egui::Button::new("Check for updates"))
                 .clicked();
             if clicked_check_for_updates {
                 *update_check = start_update_check();
             }
-            match update_check {
+            // Issue #250: an "Update now" click can't assign `*update_check`
+            // from inside the match below, which borrows it — so the click
+            // is collected here and acted on once the match has ended.
+            let mut clicked_install: Option<CheckOutcome> = None;
+            match &*update_check {
                 UpdateCheckState::Idle => {}
                 UpdateCheckState::Checking { .. } => {
                     ui.label("Checking…");
@@ -4100,20 +4938,36 @@ fn draw_header_menu(
                 UpdateCheckState::Done(Ok(CheckOutcome::UpToDate)) => {
                     ui.label(format!("Up to date (v{})", env!("CARGO_PKG_VERSION")));
                 }
-                UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable { tag, url })) => {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Update available: {tag}"));
-                        // Issue #171 scopes auto-download/apply out — this link to
-                        // the release's own GitHub page is the whole "get it"
-                        // affordance. `egui::OpenUrl` (what `hyperlink_to` sends
-                        // through `ctx.output_mut`) is what eframe's native
-                        // backend turns into an actual browser launch.
-                        ui.hyperlink_to("Download", url.as_str());
-                    });
+                UpdateCheckState::Done(Ok(available @ CheckOutcome::UpdateAvailable { .. })) => {
+                    draw_update_available(ui, available, &mut clicked_install);
                 }
                 UpdateCheckState::Done(Err(err)) => {
                     ui.label(format!("Update check failed: {err}"));
                 }
+                UpdateCheckState::Installing { available, .. } => {
+                    let tag = update_tag(available);
+                    ui.label(format!("Downloading {tag}…"));
+                    // The install thread reports once, at the end — WinHTTP's
+                    // read loop has no progress callback wired through
+                    // `platform::http_get_bytes` — so this is a spinner, not a
+                    // percentage. Claiming a percentage it cannot know would be
+                    // worse than not showing one.
+                    ui.spinner();
+                }
+                UpdateCheckState::Restarting => {
+                    ui.label("Restarting…");
+                }
+                UpdateCheckState::InstallFailed { available, error } => {
+                    // The offer is redrawn above the error on purpose: a
+                    // failed download is usually transient (a dropped
+                    // connection, a proxy hiccup), so the retry has to be one
+                    // click away rather than behind a fresh check.
+                    draw_update_available(ui, available, &mut clicked_install);
+                    ui.label(format!("Update failed: {error}"));
+                }
+            }
+            if let Some(available) = clicked_install {
+                *update_check = start_update_install(available);
             }
 
             ui.separator();
@@ -4155,6 +5009,103 @@ enum UpdateCheckState {
     },
     /// The most recent request has resolved, successfully or not.
     Done(Result<CheckOutcome, String>),
+    /// Issue #250: the user clicked "Update now" and a spawned thread is
+    /// downloading the release asset and swapping it in. `available` is the
+    /// `CheckOutcome::UpdateAvailable` that offer came from, kept so the
+    /// dropdown can keep naming the tag and can re-offer the same install
+    /// if this one fails; `rx` carries the installed executable's path (to
+    /// relaunch) or the reason it didn't get that far.
+    Installing {
+        available: CheckOutcome,
+        rx: Receiver<Result<PathBuf, String>>,
+    },
+    /// Issue #250: the new build is on disk and has been started; this
+    /// instance has already asked its viewport to close. A terminal state —
+    /// the window is going away, and the only thing left to draw is a line
+    /// saying why.
+    Restarting,
+    /// Issue #250: the download, the swap or the relaunch failed. Carries
+    /// the original offer so the dropdown can redraw the "Update now"
+    /// button beside the error and a retry costs one click.
+    InstallFailed {
+        available: CheckOutcome,
+        error: String,
+    },
+}
+
+/// What one `poll_update_check` drain found, before the borrow of
+/// `OverlayApp::update_check` it was read through has ended. Exists purely
+/// so the two channels (`Checking`'s and `Installing`'s) can be drained in
+/// one match and acted on in another — assigning `self.update_check` inside
+/// the first match would still be borrowing it.
+enum LandedUpdate {
+    Check(Result<CheckOutcome, String>),
+    Install {
+        available: CheckOutcome,
+        result: Result<PathBuf, String>,
+    },
+}
+
+/// The tag out of a `CheckOutcome::UpdateAvailable`, for the states that
+/// carry one purely to name it. `UpToDate` has no tag and never reaches any
+/// of those states, so it degrades to a neutral word rather than widening
+/// every call site into a match.
+fn update_tag(available: &CheckOutcome) -> &str {
+    match available {
+        CheckOutcome::UpdateAvailable { tag, .. } => tag,
+        CheckOutcome::UpToDate => "the update",
+    }
+}
+
+/// Draws the "an update exists, here's how to get it" row (issues #171 and
+/// #250). Shared by the fresh-result state and the failed-install state so
+/// a retry offers exactly the same affordances the first attempt did.
+///
+/// Two shapes, decided by whether the release actually published a
+/// downloadable executable:
+///
+/// - With an asset (every release since issue #249): an "Update now" button
+///   that downloads it, swaps it over this executable and relaunches, plus
+///   a link to the release page for anyone who wants to read the notes
+///   first.
+/// - Without one — a release tagged before #249, which published a `.zip`,
+///   or one whose upload never finished: the plain "Download" link that was
+///   the whole affordance before #250. Offering an install button that
+///   cannot work would be worse than offering the browser.
+///
+/// `egui::OpenUrl` (what `hyperlink_to` sends through `ctx.output_mut`) is
+/// what eframe's native backend turns into an actual browser launch.
+///
+/// A click is reported through `clicked_install` rather than acted on here:
+/// the caller holds the `&mut UpdateCheckState` this row was rendered from,
+/// so the state change has to happen after this borrow ends.
+fn draw_update_available(
+    ui: &mut egui::Ui,
+    available: &CheckOutcome,
+    clicked_install: &mut Option<CheckOutcome>,
+) {
+    let CheckOutcome::UpdateAvailable {
+        tag,
+        url,
+        asset_url,
+    } = available
+    else {
+        return;
+    };
+    ui.horizontal(|ui| {
+        ui.label(format!("Update available: {tag}"));
+        match asset_url {
+            Some(_) => {
+                if ui.button("Update now").clicked() {
+                    *clicked_install = Some(available.clone());
+                }
+                ui.hyperlink_to("Release notes", url.as_str());
+            }
+            None => {
+                ui.hyperlink_to("Download", url.as_str());
+            }
+        }
+    });
 }
 
 /// Starts a manual update check (issue #171): spawns a one-shot
@@ -4180,6 +5131,53 @@ fn start_update_check() -> UpdateCheckState {
         })
         .expect("failed to spawn the update-check thread");
     UpdateCheckState::Checking { rx }
+}
+
+/// Starts an in-place update (issue #250): spawns a one-shot `std::thread`
+/// that calls `update_check::install_update` — the download, the "is this
+/// really an executable" check, and the rename dance that puts it over the
+/// running build — and sends the installed executable's path (or the
+/// failure) back over a fresh `crossbeam_channel`. Returns the `Installing`
+/// state `draw_header_menu`'s click handler stores on `OverlayApp` so
+/// `poll_update_check` knows to start draining it.
+///
+/// Off the UI thread for a stronger reason than `start_update_check`'s: this
+/// one pulls tens of megabytes over WinHTTP, so running it inline would
+/// freeze the overlay — on top of the game, always visible — for the entire
+/// download rather than for one request round-trip.
+///
+/// The thread deliberately stops at "the new file is in place". Relaunching
+/// and closing the window are the UI thread's job
+/// (`OverlayApp::finish_update_install`), since only it may send a viewport
+/// command, and a background thread calling `std::process::exit` would tear
+/// the app down mid-frame.
+fn start_update_install(available: CheckOutcome) -> UpdateCheckState {
+    let CheckOutcome::UpdateAvailable {
+        asset_url: Some(asset_url),
+        ..
+    } = &available
+    else {
+        // Unreachable through the UI: `draw_update_available` only draws the
+        // "Update now" button when there *is* an asset. Reported as a failed
+        // install rather than panicked on, because an overlay that dies on a
+        // menu click is worse than one that says it cannot do the thing.
+        return UpdateCheckState::InstallFailed {
+            available,
+            error: "that release doesn't publish a downloadable executable".to_string(),
+        };
+    };
+    let url = asset_url.clone();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    std::thread::Builder::new()
+        .name("update-install".to_string())
+        .spawn(move || {
+            let _ = tx.send(update_check::install_update(
+                &url,
+                env!("CARGO_PKG_VERSION"),
+            ));
+        })
+        .expect("failed to spawn the update-install thread");
+    UpdateCheckState::Installing { available, rx }
 }
 
 /// What one "Export logs" thread reports back (issue #220): the
@@ -6185,6 +7183,15 @@ const SKILL_CHROME_FILL: egui::Color32 = egui::Color32::from_rgb(0x11, 0x11, 0x1
 const SKILL_PANEL_FILL: egui::Color32 = egui::Color32::from_rgb(0x21, 0x21, 0x27);
 /// Dps column-header text — the reference's `#ef5350`.
 const SKILL_HEADER_RGB: egui::Color32 = egui::Color32::from_rgb(0xef, 0x53, 0x50);
+/// An unselected tab's label (issue #245). The reference's tab strip
+/// leaves unselected headers on the header band with dimmer text; this is
+/// the same read at egui's flat alpha — bright enough to be obviously
+/// clickable, clearly behind the selected tab's pure white.
+const SKILL_TAB_IDLE_RGB: egui::Color32 = egui::Color32::from_rgb(0x9a, 0x9a, 0xa4);
+/// A tab this build cannot fill (issue #245: Buff). Dimmer
+/// again than `SKILL_TAB_IDLE_RGB`, so the strip reads honestly at a
+/// glance, but still selectable — the body explains the gap.
+const SKILL_TAB_UNTRACKED_RGB: egui::Color32 = egui::Color32::from_rgb(0x5e, 0x5e, 0x68);
 /// Close glyph — the reference's `LightRed #ff5555`.
 const SKILL_CLOSE_RGB: egui::Color32 = egui::Color32::from_rgb(0xff, 0x55, 0x55);
 /// Translucent-white row hover — the reference's `#10FFFFFF`. Its alpha is
@@ -6232,10 +7239,40 @@ const SKILL_ROW_HEIGHT: f32 = 44.0;
 /// (`scripts/prep-skill-icons.py`), so this is still a downscale at 100%
 /// display scaling.
 const SKILL_ICON_SIZE: f32 = 38.0;
-/// Fill for a row whose skill has no icon to paint. Deliberately the same
-/// flat disc the Imagine slots degrade to, so an empty slot reads as a
-/// deliberate blank rather than a rendering failure.
+/// Per-side inset the issue #275 monogram placeholder disc (and the
+/// `SKILL_ICON_EMPTY` fallback beside it) is drawn at, versus the full
+/// `SKILL_ICON_SIZE / 2.0` radius vendored skill-icon PNGs occupy in code.
+/// Issue #281's live-window pass found the placeholder disc painted at the
+/// full 38x38 slot while real vendored art's own baked-in transparent
+/// padding gives it a visible footprint of only ~26x28 within that same
+/// slot — in a mixed row list, the placeholder read noticeably heavier
+/// than its neighbors. `2.5` isn't a reproduction of that rectangle (a
+/// circle can't match a rectangle's two different margins); it is a small
+/// uniform inset that closes the weight gap without shrinking the disc so
+/// far it stops looking like it belongs in the same size class as the
+/// other 38px slot content.
+const SKILL_ICON_PLACEHOLDER_INSET: f32 = 2.5;
+/// Radius the issue #275 monogram placeholder disc and the
+/// `SKILL_ICON_EMPTY` fallback are painted at — see
+/// `SKILL_ICON_PLACEHOLDER_INSET`.
+const SKILL_ICON_PLACEHOLDER_RADIUS: f32 = SKILL_ICON_SIZE / 2.0 - SKILL_ICON_PLACEHOLDER_INSET;
+/// Fill for a row whose skill has no icon to paint *and* no name to derive
+/// a monogram placeholder from (issue #275 — see
+/// `paint_skill_icon_placeholder`). Deliberately the same flat disc the
+/// Imagine slots degrade to, so an empty slot reads as a deliberate blank
+/// rather than a rendering failure. In practice every observed skill id
+/// resolves to at least the `Skill #<id>` fallback name
+/// (`skills::skill_display_name`), so this now only fires for a
+/// hypothetically blank/punctuation-only name — kept rather than removed,
+/// since "no derivable glyph" is still a real (if unobserved) case.
 const SKILL_ICON_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x3B);
+/// Font size of the issue #275 monogram placeholder's 1-2 character glyph,
+/// centered on the `SKILL_ICON_PLACEHOLDER_RADIUS` disc (33pt across, since
+/// issue #281 inset it off the full `SKILL_ICON_SIZE` slot) — large enough
+/// to read at a glance as a letterform rather than a texture artifact,
+/// small enough that two characters ("LS", "FF") stay clear of the disc's
+/// edge.
+const SKILL_ICON_MONOGRAM_FONT_SIZE: f32 = 15.0;
 /// `Skills.xaml:151-154` draws the class icon at 50x50. Issue #190 could
 /// only fit 40 of that, because `SKILL_HEADER_HEIGHT` was a made-up 56 and
 /// 50 would have overflowed its padded content area. Issue #200 measured
@@ -6291,27 +7328,55 @@ const SKILL_PILL_CORNER_RADIUS: u8 = 17;
 /// be derived from the header band instead, which made it 40 tall against a
 /// 17 radius: a rounded rectangle with flat sides, not the reference's pill.
 const SKILL_PILL_HEIGHT: f32 = 34.0;
+/// Gap between two adjacent header pills (issue #254) — the reference's
+/// `Margin="0,0,10,0"` on every `Border` in the header's pill `StackPanel`
+/// (`Skills.xaml`), which is what separates its Deaths, death-time, aggro
+/// and aggro-time capsules.
+const SKILL_HEADER_PILL_GAP: f32 = 10.0;
 /// The reference's 24pt player name — the one size in this window with no
 /// equivalent in the main row scale (`FONT_SIZE_ROW` tops out at 13.0).
 const FONT_SIZE_SKILL_HEADER_NAME: f32 = 24.0;
 
-/// D5's column order, as a fixed array so the header row and every data
-/// row iterate it identically — a column can never appear in one but not
-/// the other.
-const SKILL_COLUMN_ORDER: [skills::SkillColumn; 12] = [
-    skills::SkillColumn::Icon,
-    skills::SkillColumn::Name,
-    skills::SkillColumn::Damage,
-    skills::SkillColumn::DmgPct,
-    skills::SkillColumn::CritPct,
-    skills::SkillColumn::MaxCrit,
-    skills::SkillColumn::AvgCrit,
-    skills::SkillColumn::AvgWhite,
-    skills::SkillColumn::Avg,
-    skills::SkillColumn::Hits,
-    skills::SkillColumn::Crits,
-    skills::SkillColumn::HitPerMin,
-];
+/// Per-tab selection and sort state for one breakdown window (issue #245).
+///
+/// The sort is kept *per tab*, not per window: the Dps tab's columns and
+/// the Heal tab's are largely different, so one shared `SkillSort` would
+/// either be reset on every tab switch (losing the ordering the user chose)
+/// or left pointing at a column the newly-selected tab does not show. An
+/// array indexed by tab makes both impossible — every entry starts on its
+/// own tab's `default_sort`, and `sort_mut` can only ever hand back the
+/// selected tab's own entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SkillTabs {
+    selected: skills::SkillTab,
+    sorts: [skills::SkillSort; skills::SKILL_TABS.len()],
+}
+
+impl Default for SkillTabs {
+    fn default() -> Self {
+        Self {
+            selected: skills::SkillTab::Dps,
+            sorts: skills::SKILL_TABS.map(|tab| tab.default_sort()),
+        }
+    }
+}
+
+impl SkillTabs {
+    /// This tab's index into `sorts`. `SKILL_TABS` is the single source of
+    /// tab order, so the array and the strip can never disagree.
+    fn index(tab: skills::SkillTab) -> usize {
+        skills::SKILL_TABS
+            .iter()
+            .position(|t| *t == tab)
+            .expect("every SkillTab is listed in SKILL_TABS")
+    }
+
+    /// The selected tab's own sort state.
+    fn sort_mut(&mut self) -> &mut skills::SkillSort {
+        let index = Self::index(self.selected);
+        &mut self.sorts[index]
+    }
+}
 
 /// Initial inner size for a skill breakdown window (issue #181: the viewport
 /// is resizable, so this is only the size a newly opened one starts at —
@@ -6331,7 +7396,21 @@ const SKILL_COLUMN_ORDER: [skills::SkillColumn; 12] = [
 // breaking the "roughly ten rows" promise above. 572 is also the reference
 // capture's own content height (928x574 minus its 2px border), where ten
 // 44px rows fill y=133..573 exactly.
-const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 572.0);
+// Issue #245's live-window pass then measured the *header labels* against
+// their columns for the first time and found nine of them overflowing (see
+// `SkillColumn::width`), so their widths grew too: the widest tab's sum,
+// Dps, went 728 -> 832, and this with it, 760 -> 864 — still 8pt of slack
+// over the floor below. It stays inside the reference capture's own
+// 928x574 content box, so the window this is modelled on is still the
+// wider of the two.
+//
+// Issue #248 widened it once more, 864 -> 888: re-measuring `SkillColumn::
+// Name`'s width off the app's own font (156.9pt for the widest real skill
+// name found, see that column's doc comment) raised the widest tab's sum
+// again, 832 -> 856, which 864 no longer clears by the required 2 *
+// `SKILL_HEADER_PAD_X`. 888 keeps the same 8pt of slack over the new sum
+// that 864 kept over the old one, and is still inside that 928x574 box.
+const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(888.0, 572.0);
 /// Floor on the skill breakdown viewport's inner size (issue #181) so a
 /// resize can't shrink it into uselessness — tall enough for the header, tab
 /// strip and column-header row plus a couple of rows before the list
@@ -6351,7 +7430,19 @@ const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 572.0);
 /// budget, so `column_anchors_from_widths` can still scale a fraction of a
 /// point for rounding but never enough to visibly compress a label. See
 /// `skill_window_min_width_fits_every_column_at_its_stated_width`.
-const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(752.0, 220.0);
+///
+/// Issue #245 widened that budget twice over: first with five more tabs,
+/// whose column sets this floor has to clear too (the widest, `Dps`, is
+/// what sets it), and then by measuring the header labels themselves — the
+/// widths were only ever sized to their columns' *values*, so the labels
+/// overlapped even at the initial width. The widest tab's sum went 728 ->
+/// 832 and this floor with it, 752 -> 856.
+///
+/// Issue #248 raised it once more, 856 -> 880, in step with
+/// `SKILL_WINDOW_SIZE`: re-measuring the `Name` column grew the widest
+/// tab's sum 832 -> 856, and this floor — that sum plus the same 24.0
+/// inset — grows with it.
+const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(880.0, 220.0);
 
 /// One open breakdown window's own state (issue #16, D9): its sort column/
 /// direction, the screen position it was placed at when opened, and the
@@ -6370,7 +7461,8 @@ const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(752.0, 220.0);
 /// (and back again) as the user moves between the two surfaces, for any uid
 /// that happens to exist in both.
 struct SkillWindowState {
-    sort: skills::SkillSort,
+    /// Issue #245: which breakdown tab is showing, and each tab's own sort.
+    tabs: SkillTabs,
     pos: egui::Pos2,
     size: egui::Vec2,
     source: SkillWindowSource,
@@ -6552,20 +7644,46 @@ fn skill_windows_to_draw<'a>(
 /// `SKILL_PANEL_FILL`, in a box flush with the window's left edge that hugs
 /// the label with one `SKILL_HEADER_PAD_X` of padding on each side — the
 /// measured `Dps` box runs x 2..51 against a label starting at x≈17.
-fn skill_selected_tab_rect(tabs_rect: egui::Rect, text_width: f32) -> egui::Rect {
-    egui::Rect::from_min_size(
-        tabs_rect.min,
-        egui::vec2(text_width + 2.0 * SKILL_HEADER_PAD_X, tabs_rect.height()),
-    )
+fn skill_tab_rects(tabs_rect: egui::Rect, text_widths: &[f32]) -> Vec<egui::Rect> {
+    let mut x = tabs_rect.left();
+    text_widths
+        .iter()
+        .map(|text_width| {
+            let width = text_width + 2.0 * SKILL_HEADER_PAD_X;
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(x, tabs_rect.top()),
+                egui::vec2(width, tabs_rect.height()),
+            );
+            x += width;
+            rect
+        })
+        .collect()
 }
 
 /// The column-header band's rect (issue #200): flush with the window's
 /// left/right edges, directly beneath the tab strip, `SKILL_COLUMN_HEADER_
 /// HEIGHT` tall. Painted with `SKILL_COLUMN_HEADER_FILL`.
-fn skill_column_header_rect(rect: egui::Rect, tabs_rect: egui::Rect) -> egui::Rect {
+///
+/// A tab with no columns (issue #245: `Buff`, which has nothing behind it
+/// to tabulate) gets a zero-height band instead of an empty one. The live
+/// window painted the full 40pt of `SKILL_COLUMN_HEADER_FILL` there with
+/// no labels in it, which read as a stray lighter strip above the
+/// explanatory text rather than as a header. Collapsing the rect — rather
+/// than special-casing the paint — also lifts `skill_rows_rect`, so the
+/// explanation sits where the rows would, directly under the tab strip.
+fn skill_column_header_rect(
+    rect: egui::Rect,
+    tabs_rect: egui::Rect,
+    columns: &[skills::SkillColumn],
+) -> egui::Rect {
+    let height = if columns.is_empty() {
+        0.0
+    } else {
+        SKILL_COLUMN_HEADER_HEIGHT
+    };
     egui::Rect::from_min_size(
         egui::pos2(rect.left(), tabs_rect.bottom()),
-        egui::vec2(rect.width(), SKILL_COLUMN_HEADER_HEIGHT),
+        egui::vec2(rect.width(), height),
     )
 }
 
@@ -6593,13 +7711,31 @@ fn skill_rows_rect(rect: egui::Rect, col_header_rect: egui::Rect) -> egui::Rect 
 /// running, so the live wording promises the rows are coming.
 fn skill_window_empty_message(
     source: SkillWindowSource,
+    tab: skills::SkillTab,
     skill_row_count: usize,
 ) -> Option<&'static str> {
     if skill_row_count > 0 {
         return None;
     }
+    // Issue #245: a tab nothing feeds says so, whatever the window's
+    // source — "No damage recorded yet" would read as "this fight had
+    // none", when the truth is that this build never looks.
+    if let Some(untracked) = tab.untracked_message() {
+        return Some(untracked);
+    }
     Some(match source {
-        SkillWindowSource::Live => "No damage recorded yet",
+        // The breakdowns issue #245 adds are live-only: the on-disk fight
+        // history serialises `PlayerRow::skills` and nothing else, so a
+        // saved fight has no heal/dealt/received rows to hand back and the
+        // existing history wording covers all four alike.
+        SkillWindowSource::Live => match tab {
+            skills::SkillTab::Dps => "No damage recorded yet",
+            skills::SkillTab::Heal => "No healing recorded yet",
+            skills::SkillTab::Dealt => "Nothing dealt yet",
+            skills::SkillTab::Received => "Nothing received yet",
+            skills::SkillTab::Casts => "Nothing cast yet",
+            skills::SkillTab::Buff => "Nothing recorded yet",
+        },
         SkillWindowSource::History(_) => "No per-skill data recorded for this fight",
     })
 }
@@ -6707,22 +7843,89 @@ fn skill_scroll_thumb(
     ))
 }
 
-/// Where the Deaths pill's left edge lands: right-aligned into the header,
-/// one `SKILL_HEADER_PAD_X` clear of the close button. Shares
-/// `SKILL_CLOSE_HIT_SIZE` with `skill_close_rect` so growing that button
-/// (issue #218) pushes the pill left instead of letting the two overlap.
-fn skill_deaths_pill_left(header_rect: egui::Rect, pill_width: f32) -> f32 {
-    header_rect.right()
-        - SKILL_HEADER_PAD_X
-        - SKILL_CLOSE_HIT_SIZE
-        - SKILL_HEADER_PAD_X
-        - pill_width
+/// Gap between the player name's right edge and the Deaths pill's left edge
+/// (issue #246). Measured directly off `docs/reference/shinra-skills-ex.webp`:
+/// scanning the header row (y=36) for `"Ranmori"`'s last glyph stroke and
+/// the pill's rounded-rect fill finds the name ending at x=156 and the pill
+/// starting at x=182, a 26px gap. That lines up with `Skills.xaml`'s own
+/// source: the pill cluster's `StackPanel` (`Skills.xaml:172-176`) carries
+/// `Margin="20,0"` inside the header's flexible middle grid column, right
+/// after the name — the 6px difference from the pixel read is font-metric
+/// slop between the reference's rendered text and the raw XAML number, not
+/// a second, disagreeing source.
+const SKILL_DEATHS_PILL_GAP: f32 = 26.0;
+
+/// Where the header's pill cluster starts — the Deaths pill's left edge,
+/// and with it every pill that follows it: immediately after the player
+/// name (issue #246), not right-aligned against the close button. The old
+/// close-relative placement tucked the cluster under the close button; the
+/// reference (`Skills.xaml:172-176`) instead sits its whole pill cluster in
+/// the header's flexible middle column, directly following the name — see
+/// `SKILL_DEATHS_PILL_GAP` for the sourcing.
+///
+/// `PlayerRow::name` is an unbounded, network-decoded string (never
+/// truncated — the same "paint it in full" decision the row list's own name
+/// column makes at issue #168), so a long enough name can push
+/// `name_right + SKILL_DEATHS_PILL_GAP` past the close button entirely.
+/// Clamped so `left + cluster_width` never crosses `close_left -
+/// SKILL_HEADER_PAD_X` — which is exactly where the pre-#246 close-relative
+/// formula put the cluster by construction, so that placement survives as
+/// this one's ceiling: the gap-after-name position is only ever the
+/// *preferred* one, never unconditional.
+///
+/// Takes the *cluster's* width, not the Deaths pill's alone (issue #254):
+/// the death-time pill sits to the Deaths pill's right, so clamping on the
+/// first pill only would push the last one under the close button.
+fn skill_deaths_pill_left(name_right: f32, close_left: f32, cluster_width: f32) -> f32 {
+    let preferred = name_right + SKILL_DEATHS_PILL_GAP;
+    let max_left = close_left - SKILL_HEADER_PAD_X - cluster_width;
+    preferred.min(max_left)
+}
+
+/// Total width of the header's pill cluster: the Deaths pill, plus the
+/// death-time pill and the gap before it when there is one to draw (issue
+/// #254). One helper so the cluster is measured in exactly one place
+/// whether it holds one pill or two.
+fn skill_header_pill_cluster_width(deaths_width: f32, death_time_width: Option<f32>) -> f32 {
+    deaths_width + death_time_width.map_or(0.0, |w| SKILL_HEADER_PILL_GAP + w)
+}
+
+/// The death-time pill's text (issue #254), or `None` when there is no pill
+/// to draw at all.
+///
+/// - `None` in, `None` out: a history row carries no death time (see
+///   `PlayerRow::dead_ms`), and an empty capsule would read as "nobody was
+///   on the floor" rather than "not recorded".
+/// - Zero renders as a bare `00:00`. Nobody died, so the figure is exact,
+///   and marking it as an estimate would be the lie — the tilde below is
+///   reserved for numbers that actually are estimated.
+/// - Anything else takes a `~` prefix: `~00:12`. The revive edge feeding
+///   this total is *inferred* from the player's next action, not observed
+///   (`PlayerStats::dead_ms`), so the number is real but biased high, and
+///   it sits one pill away from the exact Deaths counter. The tilde is the
+///   cheapest honest marker available here: these header capsules are bare
+///   painted ovals with no widget behind them — the header's whole width is
+///   a drag band — so a tooltip would mean carving a hover region out of
+///   that band, and a dimmer tint would read as "less important" rather
+///   than "less certain", on top of being invisible to anyone who never
+///   sees the two side by side.
+///
+/// Formatted `mm:ss` through `fmt_duration`, matching the reference's
+/// `interval.ToString(@"mm\:ss")` (`Skills.xaml.cs`) and the fight timer in
+/// the main window's header.
+fn skill_death_time_text(dead_ms: Option<u64>) -> Option<String> {
+    let ms = dead_ms?;
+    Some(if ms == 0 {
+        fmt_duration(0)
+    } else {
+        format!("~{}", fmt_duration(ms))
+    })
 }
 
 fn draw_skill_window(
     ui: &mut egui::Ui,
     row: &PlayerRow,
-    sort: &mut skills::SkillSort,
+    tabs: &mut SkillTabs,
     source: SkillWindowSource,
     icons: &Icons,
     opacity: f32,
@@ -6743,7 +7946,7 @@ fn draw_skill_window(
     // main-window setting — so its resize handles are never locked here.
     draw_resize_handles(ui, &ctx, gesture, ("skill", row.uid), false);
 
-    // -- header: class icon, player name, one Deaths pill (D10) ----------
+    // -- header: class icon, player name, the pill cluster (D10) ---------
     let header_rect = skill_header_rect(rect);
 
     // Dragging the header moves the window (the child viewport has no OS
@@ -6776,24 +7979,32 @@ fn draw_skill_window(
     if let Some(texture) = row.class.and_then(|class| icons.classes.get(class)) {
         painter.image(texture.id(), icon_rect, UV_FULL, CLASS_ICON_TINT);
     }
-    paint_text(
-        &painter,
-        egui::pos2(
-            icon_rect.right() + SKILL_HEADER_PAD_X,
-            header_rect.center().y,
-        ),
-        egui::Align2::LEFT_CENTER,
-        &row.name,
-        regular(FONT_SIZE_SKILL_HEADER_NAME),
-        egui::Color32::WHITE,
-        false,
-    );
+    // Issue #246 anchors the pill cluster on the player name's right edge,
+    // so the name has to be *measured* before the cluster can be placed —
+    // while issue #270's clip below bounds the name against that cluster.
+    // Laying the galley out here, rather than reading the rect
+    // `paint_text` hands back, is what breaks the circle between the two.
+    let name_left = icon_rect.right() + SKILL_HEADER_PAD_X;
+    let name_right = name_left
+        + painter
+            .layout_no_wrap(
+                row.name.clone(),
+                regular(FONT_SIZE_SKILL_HEADER_NAME),
+                egui::Color32::WHITE,
+            )
+            .rect
+            .width();
 
-    // D10: only the Deaths pill. The reference's other three header pills
-    // (death time, aggro count, aggro time) need revive-timing and threat/
-    // aggro data this decoder never captures — rendering them would be
-    // inventing numbers rather than reporting them. Follow-up candidate,
-    // noted in the PR body.
+    // D10: the Deaths pill, and beside it issue #254's death-time pill —
+    // the first two of the reference's four-capsule cluster
+    // (`Skills.xaml`), in its order and with its 10pt gap. The remaining
+    // two (aggro count, aggro time) need threat data this decoder never
+    // captures, so they stay out: rendering them would be inventing
+    // numbers rather than reporting them.
+    //
+    // Sized and placed *before* the name is painted (issue #270 follow-up)
+    // so `cluster_left` exists in time to clip the name against it — see
+    // below.
     let deaths_text = row.deaths.to_string();
     let deaths_pill = StatPill {
         value: &deaths_text,
@@ -6810,16 +8021,89 @@ fn draw_skill_window(
         fill: SKILL_PANEL_FILL.gamma_multiply(opacity),
         stroke: None,
     };
+    // Issue #254: the same chrome as the Deaths pill — one cluster, one
+    // look — led by the stopwatch the main header's fight timer already
+    // uses, since neither vendored icon set has the reference's dedicated
+    // death-time mark and a second clock reads as "time" on sight. Absent
+    // (not empty) when the row carries no measured death time; see
+    // `skill_death_time_text` for the `~` on an estimated total.
+    let death_time_text = skill_death_time_text(row.dead_ms);
+    let death_time_pill = death_time_text.as_ref().map(|value| StatPill {
+        value,
+        icon: icons.glyphs.get(GlyphIcon::Timer).map(|t| t.id()),
+        ..deaths_pill
+    });
+
     let deaths_text_size = pill_text_size(&painter, &deaths_pill);
     let deaths_pill_size = pill_size(deaths_text_size, deaths_pill.icon_side, SKILL_PILL_HEIGHT);
+    let death_time_sizes = death_time_pill.as_ref().map(|pill| {
+        let text_size = pill_text_size(&painter, pill);
+        (
+            text_size,
+            pill_size(text_size, pill.icon_side, SKILL_PILL_HEIGHT),
+        )
+    });
+    // The close button's rect is derived here, ahead of its own paint
+    // below, so the cluster can be clamped clear of it — see
+    // `skill_deaths_pill_left`.
+    let close_rect = skill_close_rect(rect);
+    let cluster_left = skill_deaths_pill_left(
+        name_right,
+        close_rect.left(),
+        skill_header_pill_cluster_width(
+            deaths_pill_size.x,
+            death_time_sizes.map(|(_, size)| size.x),
+        ),
+    );
+
+    // Issue #270 follow-up: the name used to paint with no clip, max-width
+    // or elision at all, so a long enough player name ran underneath the
+    // pill cluster — pre-existing, but #270 made it materially worse
+    // (the new death-time pill costs another `SKILL_HEADER_PILL_GAP` +
+    // pill width of cluster real estate, moving `cluster_left` further
+    // left on every row that carries one). Clipped, not elided: the same
+    // "cut off, never truncated to `…`" choice `column_clip_rect` makes for
+    // the main meter's stat columns (an overlong value there is bounded by
+    // its slot rather than losing characters to an ellipsis), rather than
+    // the "leave it unclipped" call issues #26/#168 made for the main
+    // meter's *name* column — that one gets away with it because the stat
+    // columns painted after it are opaque at every opacity setting, while
+    // this cluster's pill fill is `opacity`-scaled and would otherwise let
+    // an overrun name bleed through it. One `SKILL_HEADER_PAD_X` of gap
+    // before the cluster, matching the pad already used everywhere else in
+    // this header.
+    let name_painter = painter.with_clip_rect(egui::Rect::from_min_max(
+        header_rect.left_top(),
+        egui::pos2(cluster_left - SKILL_HEADER_PAD_X, header_rect.bottom()),
+    ));
+    paint_text(
+        &name_painter,
+        egui::pos2(name_left, header_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        &row.name,
+        regular(FONT_SIZE_SKILL_HEADER_NAME),
+        egui::Color32::WHITE,
+        false,
+    );
+
     let deaths_pill_rect = egui::Rect::from_min_size(
         egui::pos2(
-            skill_deaths_pill_left(header_rect, deaths_pill_size.x),
+            cluster_left,
             header_rect.center().y - deaths_pill_size.y / 2.0,
         ),
         deaths_pill_size,
     );
     paint_stat_pill(&painter, deaths_pill_rect, deaths_text_size, &deaths_pill);
+    if let (Some(pill), Some((text_size, size))) = (&death_time_pill, death_time_sizes) {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(
+                deaths_pill_rect.right() + SKILL_HEADER_PILL_GAP,
+                header_rect.center().y - size.y / 2.0,
+            ),
+            size,
+        );
+        paint_stat_pill(&painter, rect, text_size, pill);
+    }
 
     // -- close glyph (D2): the only in-window way to close ---------------
     // Issue #218: interacted *before* it is painted, because the hover wash
@@ -6828,7 +8112,6 @@ fn draw_skill_window(
     // half the side) — and a pointing-hand cursor. The glyph itself used to
     // be the whole button: a 20pt square with no radius, no hover feedback
     // and no cursor change, so nothing about it read as clickable.
-    let close_rect = skill_close_rect(rect);
     let close = ui.interact(
         close_rect,
         ui.id().with(("skill_close", row.uid)),
@@ -6852,10 +8135,10 @@ fn draw_skill_window(
     }
     let close_clicked = close.clicked();
 
-    // -- tab strip: `Dps` only, styled selected (D11) ---------------------
-    // The reference's other six tabs (Heal, Mana, Buff, Counter,
-    // SkillDealt, SkillReceived) are explicitly out of scope per the issue
-    // — drawing six dead tabs would be clutter, not fidelity.
+    // -- tab strip (D11, issue #245) --------------------------------------
+    // The reference's seven tabs (`Skills.xaml:227-236`) minus `Mana`,
+    // which BPSR's packet stream has no resource to fill — see
+    // `skills::SkillTab`. Clicking one selects it; each keeps its own sort.
     let tabs_rect = egui::Rect::from_min_size(
         egui::pos2(rect.left(), header_rect.bottom()),
         egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
@@ -6865,43 +8148,85 @@ fn draw_skill_window(
     // header band exactly, while only the selected `Dps` tab (x 2..51)
     // carries the lighter `#212127` box. Filling the whole strip made the
     // window read as a two-tone sandwich instead of a tab row.
-    let tab_label = "Dps";
     let tab_font = bold(FONT_SIZE_ROW);
-    let tab_text_width = painter
-        .layout_no_wrap(tab_label.to_owned(), tab_font.clone(), egui::Color32::WHITE)
-        .size()
-        .x;
-    painter.rect_filled(
-        skill_selected_tab_rect(tabs_rect, tab_text_width),
-        0.0,
-        SKILL_PANEL_FILL.gamma_multiply(opacity),
-    );
-    paint_text(
-        &painter,
-        tabs_rect.left_center() + egui::vec2(SKILL_HEADER_PAD_X, 0.0),
-        egui::Align2::LEFT_CENTER,
-        tab_label,
-        tab_font,
-        egui::Color32::WHITE,
-        true,
-    );
+    let tab_text_widths: Vec<f32> = skills::SKILL_TABS
+        .iter()
+        .map(|tab| {
+            painter
+                .layout_no_wrap(
+                    tab.label().to_owned(),
+                    tab_font.clone(),
+                    egui::Color32::WHITE,
+                )
+                .size()
+                .x
+        })
+        .collect();
+    for (i, (tab, tab_rect)) in skills::SKILL_TABS
+        .iter()
+        .zip(skill_tab_rects(tabs_rect, &tab_text_widths))
+        .enumerate()
+    {
+        let selected = tabs.selected == *tab;
+        let response = ui.interact(
+            tab_rect,
+            ui.id().with(("skill_tab", row.uid, i)),
+            egui::Sense::click(),
+        );
+        if response.clicked() {
+            tabs.selected = *tab;
+        }
+        if response.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if selected || response.hovered() {
+            painter.rect_filled(tab_rect, 0.0, SKILL_PANEL_FILL.gamma_multiply(opacity));
+        }
+        // An untracked tab (issue #245: Buff) is drawn muted
+        // rather than hidden — the reference has it, this build cannot
+        // fill it, and the body says why once it is opened. Hiding it
+        // would leave the gap unexplained; greying it out of clicking
+        // would leave the explanation unreachable.
+        let color = match (selected, tab.is_tracked()) {
+            (true, true) => egui::Color32::WHITE,
+            (false, true) => SKILL_TAB_IDLE_RGB,
+            (true, false) => SKILL_TAB_IDLE_RGB,
+            (false, false) => SKILL_TAB_UNTRACKED_RGB,
+        };
+        paint_text(
+            &painter,
+            tab_rect.left_center() + egui::vec2(SKILL_HEADER_PAD_X, 0.0),
+            egui::Align2::LEFT_CENTER,
+            tab.label(),
+            tab_font.clone(),
+            color,
+            true,
+        );
+    }
+    let tab = tabs.selected;
+    let columns = tab.columns();
+    let sort = tabs.sort_mut();
 
     // -- column header row: click (either button, D9) toggles sort -------
-    let col_header_rect = skill_column_header_rect(rect, tabs_rect);
+    let col_header_rect = skill_column_header_rect(rect, tabs_rect, columns);
     painter.rect_filled(
         col_header_rect,
         0.0,
         SKILL_COLUMN_HEADER_FILL.gamma_multiply(opacity),
     );
-    let widths: Vec<f32> = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).collect();
-    let anchors = column_anchors_from_widths(
-        col_header_rect.left() + SKILL_HEADER_PAD_X,
-        col_header_rect.right() - SKILL_HEADER_PAD_X,
-        &widths,
-        0.0,
-    );
-    for (i, (&anchor_x, kind)) in anchors.iter().zip(SKILL_COLUMN_ORDER.iter()).enumerate() {
-        let width = kind.width();
+    // Issue #245: the narrower tabs would otherwise pack against the
+    // window's right edge (`column_anchors_from_widths` lays out
+    // right-to-left), so any slack goes to the `Name` column.
+    let content_left = col_header_rect.left() + SKILL_HEADER_PAD_X;
+    let content_right = col_header_rect.right() - SKILL_HEADER_PAD_X;
+    let widths = skills::column_widths(columns, content_right - content_left);
+    let anchors = column_anchors_from_widths(content_left, content_right, &widths, 0.0);
+    for (i, ((&anchor_x, kind), &width)) in anchors
+        .iter()
+        .zip(columns.iter())
+        .zip(widths.iter())
+        .enumerate()
+    {
         let cell = egui::Rect::from_min_max(
             egui::pos2(anchor_x - width, col_header_rect.top()),
             egui::pos2(anchor_x, col_header_rect.bottom()),
@@ -6915,7 +8240,7 @@ fn draw_skill_window(
             sort.toggle(*kind);
         }
         let label = sort.header_label(*kind);
-        let (align, pos) = if *kind == skills::SkillColumn::Name {
+        let (align, pos) = if kind.left_aligned() {
             (egui::Align2::LEFT_CENTER, cell.left_center())
         } else {
             (egui::Align2::RIGHT_CENTER, cell.right_center())
@@ -6941,14 +8266,14 @@ fn draw_skill_window(
     // `SKILL_PANEL_FILL - SKILL_CHROME_FILL` (16 per channel) brighter than
     // the header above it.
     painter.rect_filled(rows_rect, 0.0, SKILL_PANEL_FILL.gamma_multiply(opacity));
-    let mut skill_rows = row.skills.clone();
+    let mut skill_rows = tab.rows(row).to_vec();
     skills::sort_rows(&mut skill_rows, *sort);
 
     // Issue #216: an empty row list gets a message in place of the rows,
     // worded for where the window's data comes from — a historical fight
     // never has per-skill rows at all, a live one just doesn't have them
     // yet (see `skill_window_empty_message`).
-    if let Some(message) = skill_window_empty_message(source, skill_rows.len()) {
+    if let Some(message) = skill_window_empty_message(source, tab, skill_rows.len()) {
         paint_text(
             &painter,
             rows_rect.center(),
@@ -6975,6 +8300,10 @@ fn draw_skill_window(
         .show(&mut rows_ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for skill in &skill_rows {
+                // Resolved once per row (table lookup + allocation) and
+                // reused below for both the icon column's monogram and the
+                // Name column's cell text, rather than resolving it twice.
+                let display_name = skills::skill_display_name(skill.skill_id);
                 let (skill_rect, response) = ui.allocate_exact_size(
                     egui::vec2(rows_content_rect.width(), SKILL_ROW_HEIGHT),
                     egui::Sense::hover(),
@@ -6988,8 +8317,9 @@ fn draw_skill_window(
                         SKILL_ROW_HOVER_FILL.gamma_multiply(opacity),
                     );
                 }
-                for (&anchor_x, kind) in anchors.iter().zip(SKILL_COLUMN_ORDER.iter()) {
-                    let width = kind.width();
+                for ((&anchor_x, kind), &width) in
+                    anchors.iter().zip(columns.iter()).zip(widths.iter())
+                {
                     let clip = egui::Rect::from_min_max(
                         egui::pos2(anchor_x - width, skill_rect.top()),
                         egui::pos2(anchor_x, skill_rect.bottom()),
@@ -7001,42 +8331,60 @@ fn draw_skill_window(
                     // skill name, exactly as in the reference. A skill the
                     // name tables know no icon for, an icon whose PNG is not
                     // vendored here, and one that failed to decode all land
-                    // on the same blank-disc branch — one degrade path,
+                    // on the same no-texture branch — one degrade path,
                     // never a panic, the same shape `ImagineIcons`' empty
-                    // slot uses.
+                    // slot uses. Issue #275: that branch used to be one flat
+                    // `SKILL_ICON_EMPTY` disc for every such id, painting the
+                    // capture's single largest damage source identically to
+                    // a 0.01% tick three rows below it. It now paints a
+                    // monogram placeholder — see `skills::skill_monogram`
+                    // and `paint_skill_icon_placeholder` — keyed off the
+                    // *name* every one of those ids already resolves to,
+                    // and only falls through to the old blank disc for a
+                    // name with no derivable glyph at all (see
+                    // `skills::skill_monogram`'s doc comment).
                     if *kind == skills::SkillColumn::Icon {
                         let center =
                             egui::pos2(clip.left() + SKILL_ICON_SIZE / 2.0, clip.center().y);
                         match skills::skill_icon_basename(skill.skill_id)
                             .and_then(|basename| icons.skills.get(basename))
                         {
-                            Some(texture) => cell_painter.image(
-                                texture.id(),
-                                egui::Rect::from_center_size(
-                                    center,
-                                    egui::Vec2::splat(SKILL_ICON_SIZE),
-                                ),
-                                UV_FULL,
-                                CLASS_ICON_TINT,
-                            ),
-                            None => cell_painter.circle_filled(
+                            Some(texture) => {
+                                cell_painter.image(
+                                    texture.id(),
+                                    egui::Rect::from_center_size(
+                                        center,
+                                        egui::Vec2::splat(SKILL_ICON_SIZE),
+                                    ),
+                                    UV_FULL,
+                                    CLASS_ICON_TINT,
+                                );
+                            }
+                            None => paint_skill_icon_placeholder(
+                                &cell_painter,
                                 center,
-                                SKILL_ICON_SIZE / 2.0,
-                                SKILL_ICON_EMPTY,
+                                skill.skill_id,
+                                &display_name,
+                                opacity,
                             ),
-                        };
+                        }
                         continue;
                     }
-                    let (align, pos) = if *kind == skills::SkillColumn::Name {
+                    let (align, pos) = if kind.left_aligned() {
                         (egui::Align2::LEFT_CENTER, clip.left_center())
                     } else {
                         (egui::Align2::RIGHT_CENTER, clip.right_center())
+                    };
+                    let text = if *kind == skills::SkillColumn::Name {
+                        display_name.clone()
+                    } else {
+                        kind.text(skill)
                     };
                     paint_text(
                         &cell_painter,
                         pos,
                         align,
-                        &kind.text(skill),
+                        &text,
                         regular(FONT_SIZE_ROW),
                         egui::Color32::WHITE,
                         false,
@@ -7576,6 +8924,185 @@ mod tests {
     use crate::settings::{ColumnKind, Settings};
     use bpsr_meter::Class;
 
+    // -- Skill-icon monogram placeholder colors (issue #275) ----------------
+
+    #[test]
+    fn placeholder_colors_are_deterministic_per_id() {
+        for id in [2031103, 2203291, 35107, -5, 0] {
+            assert_eq!(skill_placeholder_colors(id), skill_placeholder_colors(id));
+        }
+    }
+
+    /// Const-only regression pin for `SKILL_ICON_PLACEHOLDER_INSET`'s
+    /// relationship to `SKILL_ICON_SIZE` — it does not touch anything
+    /// `paint_skill_icon_placeholder` paints (see
+    /// `placeholder_disc_paints_at_the_inset_radius_inside_the_icon_slot`
+    /// for that). Issue #281: the placeholder disc used to fill the full
+    /// `SKILL_ICON_SIZE` slot, reading heavier than real vendored art's
+    /// ~26x28 visible footprint (its own transparent padding) in the same
+    /// 38x38 slot. Pins the inset to the small "~2-3px" range that closes
+    /// that gap without shrinking the disc out of the same size class as
+    /// real icon art, and pins `SKILL_ICON_PLACEHOLDER_RADIUS`'s formula so
+    /// a hand-edit of either constant is caught here first.
+    #[test]
+    fn placeholder_disc_inset_pins_the_slot_relationship() {
+        const { assert!(SKILL_ICON_PLACEHOLDER_INSET >= 2.0 && SKILL_ICON_PLACEHOLDER_INSET <= 3.0) };
+        const {
+            assert!(
+                SKILL_ICON_PLACEHOLDER_RADIUS
+                    == SKILL_ICON_SIZE / 2.0 - SKILL_ICON_PLACEHOLDER_INSET
+            )
+        };
+        const { assert!(SKILL_ICON_PLACEHOLDER_RADIUS < SKILL_ICON_SIZE / 2.0) };
+    }
+
+    /// Renders a real skill row through `draw_skill_window` and reads the
+    /// disc `paint_skill_icon_placeholder` actually painted back out of the
+    /// frame's `Shape::Circle`s — `placeholder_disc_inset_pins_the_slot_
+    /// relationship` only checks the constants' own arithmetic against each
+    /// other, which can't catch either of `paint_skill_icon_placeholder`'s
+    /// two `circle_filled` call sites drifting from
+    /// `SKILL_ICON_PLACEHOLDER_RADIUS` (e.g. a copy-pasted literal).
+    #[test]
+    fn placeholder_disc_paints_at_the_inset_radius_inside_the_icon_slot() {
+        let row = PlayerRow {
+            // A negative id: `skill_icon_basename` is keyed by `u32`, so a
+            // negative one can never resolve to a vendored icon and always
+            // takes the placeholder branch — unlike a real id, which could
+            // start shipping an icon later and silently switch this test
+            // onto the textured branch instead.
+            skills: vec![sample_skill_row(-1)],
+            ..sample_row(None)
+        };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_SIZE);
+        let mut tabs_state = SkillTabs::default();
+
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_skill_window(
+                    ui,
+                    &row,
+                    &mut tabs_state,
+                    SkillWindowSource::Live,
+                    &icons,
+                    1.0,
+                    &mut WindowGesture::default(),
+                );
+            },
+        );
+        let mut circles = Vec::new();
+        for clipped in &output.shapes {
+            collect_circle_geometry(&clipped.shape, &mut circles);
+        }
+        output.drop_without_applying_deltas();
+
+        // The same geometry `draw_skill_window` derives the icon cell's
+        // center from (issue #200's `skill_header_rect`/
+        // `skill_column_header_rect`/`skill_rows_rect`, and the shared
+        // column `anchors` the row loop reuses from the column-header
+        // row — over issue #245's `skills::column_widths`, which hands the
+        // content's slack to `Name` alone, so replicating the layout with
+        // the raw `SkillColumn::width`s would land the icon elsewhere)
+        // — replicated here rather than pulled into a shared helper,
+        // since nothing else needs "where does the icon column sit"
+        // outside this one check.
+        let header = skill_header_rect(screen_rect);
+        let tabs = egui::Rect::from_min_size(
+            egui::pos2(screen_rect.left(), header.bottom()),
+            egui::vec2(screen_rect.width(), SKILL_TAB_HEIGHT),
+        );
+        // The default tab (`SkillTabs::default`) is the one the frame above
+        // painted, and issue #245 made each tab's column list its own.
+        let columns = skills::SkillTab::Dps.columns();
+        let col_header = skill_column_header_rect(screen_rect, tabs, columns);
+        let rows_rect = skill_rows_rect(screen_rect, col_header);
+        let content_left = col_header.left() + SKILL_HEADER_PAD_X;
+        let content_right = col_header.right() - SKILL_HEADER_PAD_X;
+        let widths = skills::column_widths(columns, content_right - content_left);
+        let anchors = column_anchors_from_widths(content_left, content_right, &widths, 0.0);
+        let icon_index = columns
+            .iter()
+            .position(|k| *k == skills::SkillColumn::Icon)
+            .expect("skill columns always include Icon");
+        let expected_center = egui::pos2(
+            anchors[icon_index] - widths[icon_index] + SKILL_ICON_SIZE / 2.0,
+            rows_rect.top() + SKILL_ROW_HEIGHT / 2.0,
+        );
+
+        let mut found_radius = None;
+        for &(center, radius) in &circles {
+            if (center - expected_center).length() < 0.01 {
+                found_radius = Some(radius);
+                break;
+            }
+        }
+        let radius = found_radius.unwrap_or_else(|| {
+            panic!("no circle painted at the icon slot's center {expected_center:?}: {circles:?}")
+        });
+        assert_eq!(
+            radius, SKILL_ICON_PLACEHOLDER_RADIUS,
+            "the painted disc must use SKILL_ICON_PLACEHOLDER_RADIUS, not the full SKILL_ICON_SIZE/2.0 slot"
+        );
+    }
+
+    #[test]
+    fn different_ids_sharing_a_monogram_can_still_land_on_different_swatches() {
+        // Every Lucky Strike weapon variant collapses to the same "LS"
+        // glyph (they are literally the same base skill), so the id-keyed
+        // background is the only thing that can still tell the rows apart.
+        let ids = [2031101, 2031102, 2031103, 2031105];
+        let colors: std::collections::HashSet<_> = ids
+            .iter()
+            .map(|&id| {
+                let (bg, _fg) = skill_placeholder_colors(id);
+                (bg.r(), bg.g(), bg.b())
+            })
+            .collect();
+        assert!(
+            colors.len() > 1,
+            "expected the four Lucky Strike variants to spread across more than one swatch"
+        );
+    }
+
+    #[test]
+    fn every_placeholder_swatch_clears_wcag_normal_text_contrast_with_its_chosen_glyph_color() {
+        // Exercises the legibility rule this placeholder encodes: whichever
+        // of near-black or white `skill_placeholder_colors` picks must clear
+        // WCAG AA's 4.5:1 minimum for normal text against every swatch in
+        // the palette, not just the ones a spot check happens to hit.
+        // Issue #281's live-window pass found two swatches (teal, moss
+        // green) that cleared the looser 3:1 large-text floor but fell
+        // short of 4.5 — this asserts the stricter bound so that class of
+        // regression can't land unnoticed again.
+        for &(r, g, b) in &SKILL_PLACEHOLDER_PALETTE {
+            let bg_lum = relative_luminance((r, g, b));
+            let fg = if bg_lum > 0.2017 {
+                (0x1A, 0x1A, 0x1A)
+            } else {
+                (0xFF, 0xFF, 0xFF)
+            };
+            let fg_lum = relative_luminance(fg);
+            let (hi, lo) = if bg_lum > fg_lum {
+                (bg_lum, fg_lum)
+            } else {
+                (fg_lum, bg_lum)
+            };
+            let ratio = (hi + 0.05) / (lo + 0.05);
+            assert!(
+                ratio >= 4.5,
+                "swatch {:?} only reaches a {ratio:.2}:1 contrast ratio",
+                (r, g, b)
+            );
+        }
+    }
+
     // -- Imagine tier hover text / gold ring (issues #169/#170) -------------
 
     #[test]
@@ -7904,6 +9431,191 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- heals/dealt/received/casts demo fixtures (PR #268 review, finding
+    // 3) --------------------------------------------------------------
+    //
+    // Every test above this point only ever looks at `row.skills`; nothing
+    // in this file asserted the other four tabs `demo_snapshot` claims to
+    // populate (issue #245) actually are. These mirror the `skills` tests'
+    // shape for each of `heals`/`dealt`/`received`/`casts`.
+
+    /// Only the demo party's healer class (`VerdantOracle`/`Fizz`) has any
+    /// healing fixture (`demo_heals`) — every other row must come through
+    /// with an empty `heals`, and the healer's own must be non-empty and
+    /// sum to `heal_total`'s declared denominator, its shares summing to
+    /// ~100% the same way `demo_snapshot_header_and_rows_are_internally_
+    /// consistent` checks the damage rows.
+    #[test]
+    fn demo_heal_breakdown_is_populated_only_for_the_healer_role_and_sums_correctly() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            let class = row.class.expect("every demo row has a class");
+            let total = heal_total(class);
+            if total == 0 {
+                assert!(
+                    row.heals.is_empty(),
+                    "row {} ({class:?}) has no heal fixture and must have an empty heals tab",
+                    row.name
+                );
+                continue;
+            }
+            assert!(
+                !row.heals.is_empty(),
+                "row {} ({class:?}) must have a non-empty heals tab",
+                row.name
+            );
+            let heal_sum: i64 = row.heals.iter().map(|s| s.damage).sum();
+            assert_eq!(
+                heal_sum, total,
+                "row {}'s heal breakdown must sum to heal_total",
+                row.name
+            );
+            let share_sum: f32 = row.heals.iter().map(|s| s.share_pct).sum();
+            assert!(
+                (share_sum - 100.0).abs() < 0.1,
+                "row {}'s heal shares must sum to ~100%, got {share_sum}",
+                row.name
+            );
+        }
+    }
+
+    /// The boss's swings (`DEMO_RECEIVED`) land on every row identically —
+    /// there is no per-class variation the way heals has — so every row's
+    /// `received` must be non-empty and sum to `demo_received_total`.
+    #[test]
+    fn demo_received_breakdown_is_populated_for_every_row_and_sums_to_its_total() {
+        let snapshot = demo_snapshot();
+        let total = demo_received_total();
+        for row in &snapshot.rows {
+            assert!(
+                !row.received.is_empty(),
+                "row {} must have a non-empty received tab",
+                row.name
+            );
+            let received_sum: i64 = row.received.iter().map(|s| s.damage).sum();
+            assert_eq!(
+                received_sum, total,
+                "row {}'s received breakdown must sum to demo_received_total",
+                row.name
+            );
+        }
+    }
+
+    /// `demo_cast_rows` is built 1:1 from `demo_skills` (issue #245): same
+    /// skill ids, hits floored at one third of the damage row's own hit
+    /// count. Every row's casts must be non-empty and match that exactly —
+    /// this is the "populated" half of finding 3's coverage gap for the
+    /// Skill casts tab.
+    #[test]
+    fn demo_cast_breakdown_is_populated_and_derives_from_the_skill_hits() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            assert!(
+                !row.casts.is_empty(),
+                "row {} must have a non-empty casts tab",
+                row.name
+            );
+            assert_eq!(
+                row.casts.len(),
+                row.skills.len(),
+                "row {}'s casts must have one entry per skill",
+                row.name
+            );
+            for skill in &row.skills {
+                let cast = row
+                    .casts
+                    .iter()
+                    .find(|c| c.skill_id == skill.skill_id)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "row {}'s casts is missing skill id {}",
+                            row.name, skill.skill_id
+                        )
+                    });
+                assert_eq!(
+                    cast.hits,
+                    (skill.hits / 3).max(1),
+                    "row {}'s cast count for skill {} must be its hit count / 3, floored at 1",
+                    row.name,
+                    skill.skill_id
+                );
+            }
+        }
+    }
+
+    /// The "Skill dealt" tab is damage and healing merged under one skill
+    /// id (issue #245) — for the current, non-colliding fixtures that's
+    /// equivalent to a plain concatenation, so this only pins the *sum*:
+    /// `demo_dealt_rows_merges_a_shared_skill_id_instead_of_duplicating_it`
+    /// below is what actually exercises the merge itself.
+    #[test]
+    fn demo_dealt_breakdown_sums_to_damage_plus_heals() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            let heal_sum: i64 = row.heals.iter().map(|s| s.damage).sum();
+            let dealt_sum: i64 = row.dealt.iter().map(|s| s.damage).sum();
+            assert_eq!(
+                dealt_sum,
+                row.damage + heal_sum,
+                "row {}'s dealt breakdown must sum to damage + heals",
+                row.name
+            );
+            assert!(
+                !row.dealt.is_empty(),
+                "row {} must have a non-empty dealt tab",
+                row.name
+            );
+        }
+    }
+
+    /// PR #268 review, finding 3: the "Skill dealt" tab used to be built by
+    /// chaining `demo_skill_rows(demo_skills, ...)` and
+    /// `demo_skill_rows(demo_heals(class), ...)` end to end, with no merge
+    /// step — so a skill id that happened to appear in *both* fixture lists
+    /// would silently show up as two separate rows instead of one summed
+    /// row, unlike the real meter's `dealt_rows`
+    /// (`crates/meter/src/encounter.rs`), which merges by skill id via
+    /// `SkillStats::merge`. None of today's `DEMO_ROWS` fixtures happen to
+    /// collide, so that bug shipped invisibly; this drives `demo_dealt_rows`
+    /// directly with two synthetic lists sharing a skill id and would fail
+    /// against the old chain-based implementation (two rows, wrong per-row
+    /// damage) the same way it would against a real collision.
+    #[test]
+    fn demo_dealt_rows_merges_a_shared_skill_id_instead_of_duplicating_it() {
+        let skills: &[DemoSkill] = &[
+            (9001, 1_000, 10, 2, 400, 200), // shared id
+            (9002, 500, 5, 1, 200, 150),
+        ];
+        let heals: &[DemoSkill] = &[
+            (9001, 300, 3, 1, 150, 100), // same id as skills[0]
+        ];
+        let rows = demo_dealt_rows(skills, heals, 1_800, 60_000);
+
+        assert_eq!(
+            rows.iter().filter(|r| r.skill_id == 9001).count(),
+            1,
+            "a skill id shared between skills and heals must merge into one dealt row, not two"
+        );
+        let merged = rows
+            .iter()
+            .find(|r| r.skill_id == 9001)
+            .expect("the merged 9001 row must be present");
+        assert_eq!(
+            merged.damage, 1_300,
+            "the merged row's damage must be the sum of both sources' damage"
+        );
+        assert_eq!(
+            merged.hits, 13,
+            "the merged row's hits must be the sum of both sources' hits"
+        );
+
+        let untouched = rows
+            .iter()
+            .find(|r| r.skill_id == 9002)
+            .expect("a non-colliding skill id must still come through");
+        assert_eq!(untouched.damage, 500);
     }
 
     /// The regression this guards: a future refactor that deletes or
@@ -8255,6 +9967,22 @@ mod tests {
             egui::Shape::Vec(shapes) => {
                 for s in shapes {
                     collect_circle_fills(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Walks a painted `Shape`, collecting every `Shape::Circle`'s
+    /// `(center, radius)` — like `collect_circle_fills` but keeping the
+    /// geometry instead of the fill, for a caller that needs to check
+    /// *where* and *how big* a circle painted, not just what color.
+    fn collect_circle_geometry(shape: &egui::Shape, out: &mut Vec<(egui::Pos2, f32)>) {
+        match shape {
+            egui::Shape::Circle(circle) => out.push((circle.center, circle.radius)),
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_circle_geometry(s, out);
                 }
             }
             _ => {}
@@ -11273,11 +13001,16 @@ mod tests {
             lucky_pct: 0.0,
             hits: 0,
             deaths: 0,
+            dead_ms: Some(0),
             ability_score,
             season_strength: None,
             imagines: [None, None],
             imagine_tiers: [None, None],
             skills: Vec::new(),
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
         }
     }
 
@@ -11665,6 +13398,251 @@ mod tests {
         egui::Rect::from_min_size(egui::pos2(12.0, 30.0), egui::vec2(400.0, 300.0))
     }
 
+    // -- custom background images (issues #121, #253) ---------------------
+
+    /// #253's hard requirement, and #121's by extension: the image is
+    /// painted at `.gamma_multiply(settings.opacity)`, so the existing
+    /// slider fades it exactly as it fades `PANEL_FILL`. A backdrop that
+    /// painted at a fixed opacity regardless of the slider is precisely the
+    /// defect the issue exists to prevent, so the tint's dependence on the
+    /// slider is asserted at both endpoints and in between rather than
+    /// assumed.
+    #[test]
+    fn background_image_tint_tracks_the_opacity_slider() {
+        assert_eq!(
+            background_image_tint(1.0),
+            egui::Color32::WHITE,
+            "a full-opacity overlay must paint the image untouched"
+        );
+        assert_eq!(
+            background_image_tint(Settings::OPACITY_MIN).a(),
+            0,
+            "a zero-opacity overlay must paint no image at all"
+        );
+        let half = background_image_tint(0.5).a();
+        assert!(
+            half > 0 && half < 255,
+            "a mid-slider overlay must paint a partly-faded image, got alpha {half}"
+        );
+        assert!(
+            background_image_tint(0.25).a() < half,
+            "dragging the slider down must fade the image further"
+        );
+    }
+
+    /// The scrim fades with the image rather than staying put, so the
+    /// contrast guarantee it provides holds at every slider position — and
+    /// so a 0% overlay is genuinely empty rather than showing a dark
+    /// rectangle where the artwork was.
+    #[test]
+    fn background_image_scrim_tracks_the_opacity_slider() {
+        assert_eq!(
+            BACKGROUND_IMAGE_SCRIM.gamma_multiply(1.0),
+            BACKGROUND_IMAGE_SCRIM
+        );
+        assert_eq!(
+            BACKGROUND_IMAGE_SCRIM
+                .gamma_multiply(Settings::OPACITY_MIN)
+                .a(),
+            0
+        );
+        assert!(
+            BACKGROUND_IMAGE_SCRIM.gamma_multiply(0.5).a() < BACKGROUND_IMAGE_SCRIM.a(),
+            "the scrim must fade along with the image it dims"
+        );
+    }
+
+    /// The scrim exists to pull a bright image back towards the panel's own
+    /// tone, so it has to *be* that tone — and it has to be partial, since a
+    /// fully opaque scrim would hide the artwork entirely and a fully
+    /// transparent one would guarantee nothing.
+    #[test]
+    fn background_image_scrim_matches_the_panel_fill_color() {
+        // Unmultiplied on both sides: `Color32` stores premultiplied
+        // channels, so the scrim's raw `.r()` is already scaled by its own
+        // alpha and would never equal the opaque `PANEL_FILL`'s.
+        let scrim = BACKGROUND_IMAGE_SCRIM.to_srgba_unmultiplied();
+        assert_eq!(
+            [scrim[0], scrim[1], scrim[2]],
+            [PANEL_FILL.r(), PANEL_FILL.g(), PANEL_FILL.b()],
+        );
+        assert_eq!(scrim[3], BACKGROUND_IMAGE_SCRIM_ALPHA);
+        assert!(
+            (1..255).contains(&BACKGROUND_IMAGE_SCRIM_ALPHA),
+            "the scrim must dim the image without hiding it"
+        );
+    }
+
+    /// The backdrop fills the row strip it is given — it is the rows'
+    /// background, so anything less would leave bare panel fill showing
+    /// beside the artwork.
+    #[test]
+    fn row_backdrop_covers_the_whole_row_area_it_is_given() {
+        let panel = wash_test_panel();
+        let available = egui::Rect::from_min_max(egui::pos2(panel.left() + 20.0, 120.0), panel.max);
+
+        let backdrop = row_backdrop_rect(available, panel);
+
+        assert_eq!(
+            backdrop.top(),
+            available.top(),
+            "the backdrop must start where the rows do, under the header"
+        );
+        assert_eq!(backdrop.left(), available.left());
+    }
+
+    /// …but never past the panel's own rounded, stroked border: the image
+    /// has square corners, so an un-inset backdrop would poke out of the
+    /// overlay's bottom corners. Same guarantee, and same inset, as
+    /// `header_wash_rect`'s at the top.
+    #[test]
+    fn row_backdrop_stays_inside_the_panels_rounded_border() {
+        let panel = wash_test_panel();
+        // A row area that (as the real one does) runs to the panel's own
+        // bottom and side edges.
+        let available = egui::Rect::from_min_max(egui::pos2(panel.left(), 120.0), panel.max);
+
+        let backdrop = row_backdrop_rect(available, panel);
+
+        assert!(
+            backdrop.left() >= panel.left() + HEADER_WASH_INSET,
+            "{} pokes past the panel's left border",
+            backdrop.left()
+        );
+        assert!(
+            backdrop.right() <= panel.right() - HEADER_WASH_INSET,
+            "{} pokes past the panel's right border",
+            backdrop.right()
+        );
+        assert!(
+            backdrop.bottom() <= panel.bottom() - HEADER_WASH_INSET,
+            "{} pokes past the panel's bottom border",
+            backdrop.bottom()
+        );
+    }
+
+    /// The header wash and the row backdrop are two independent images
+    /// (#253: "a user may want one, the other, or both"), so they must not
+    /// overlap — the header's artwork ending mid-row, or the rows' artwork
+    /// riding up over the title, would read as a rendering bug either way.
+    #[test]
+    fn row_backdrop_starts_below_the_header_wash() {
+        let panel = wash_test_panel();
+        let wash = header_wash_rect(panel, WASH_TEST_HEIGHT);
+        // What `OverlayApp::ui`'s layout cursor has left once the header
+        // band and its separator are behind it.
+        let available =
+            egui::Rect::from_min_max(egui::pos2(panel.left(), wash.bottom()), panel.max);
+
+        let backdrop = row_backdrop_rect(available, panel);
+
+        assert!(
+            backdrop.top() >= wash.bottom(),
+            "the row backdrop ({}) overlaps the header wash ({})",
+            backdrop.top(),
+            wash.bottom()
+        );
+    }
+
+    /// A collapsed window can hand the layout a degenerate strip; that must
+    /// produce an empty rect the painter skips, not a negative-size one.
+    #[test]
+    fn row_backdrop_of_an_empty_row_area_is_empty() {
+        let panel = wash_test_panel();
+        let available = egui::Rect::from_min_max(panel.max, panel.max);
+
+        let backdrop = row_backdrop_rect(available, panel);
+
+        assert!(backdrop.width() <= 0.0 || backdrop.height() <= 0.0);
+    }
+
+    // -- background-image status line (issues #121, #253) -----------------
+
+    #[test]
+    fn background_image_status_shows_the_file_name_when_it_loaded() {
+        assert_eq!(
+            background_image_status(Path::new("C:/Users/x/Pictures/wallpaper.png"), None),
+            "wallpaper.png"
+        );
+    }
+
+    /// The whole point of the status line: a path that does not load has to
+    /// say so, and say *why*, or the feature just looks broken.
+    #[test]
+    fn background_image_status_names_the_failure_when_it_did_not_load() {
+        let status = background_image_status(
+            Path::new("C:/gone.png"),
+            Some(&ImageError::Unreadable("os error 2".to_string())),
+        );
+        assert!(status.contains("gone.png"), "{status}");
+        assert!(status.contains("could not be read"), "{status}");
+        assert!(status.contains("os error 2"), "{status}");
+        assert!(status.starts_with('⚠'), "{status}");
+
+        let status = background_image_status(
+            Path::new("notes.txt"),
+            Some(&ImageError::Undecodable("unsupported".to_string())),
+        );
+        assert!(status.contains("not a readable image"), "{status}");
+    }
+
+    /// A path with no file-name component (a bare root, or one ending in
+    /// `..`) must still produce a label rather than an empty one.
+    #[test]
+    fn background_image_status_falls_back_to_the_whole_path_without_a_file_name() {
+        assert!(!background_image_status(Path::new("/"), None).is_empty());
+        assert!(!background_image_status(Path::new("../.."), None).is_empty());
+    }
+
+    /// Regression test for the stale-error mixup this PR fixes: pick a
+    /// path that fails to load, then re-pick a *different*, valid path.
+    /// The status line for the new path must never carry the old path's
+    /// failure — `CustomImages::error` is what `background_image_row`
+    /// reads to build that line, and it must reject a cached entry whose
+    /// own `path` no longer matches the one being asked about, exactly as
+    /// happens for one frame between a re-pick and the next `texture()`
+    /// call re-keying the cache.
+    #[test]
+    fn background_image_status_never_attributes_a_stale_error_to_a_different_path() {
+        let ctx = egui::Context::default();
+        let mut cache = CustomImages::default();
+        let bad = std::env::temp_dir().join("shinra-ui-status-mismatch-missing.png");
+        let _ = std::fs::remove_file(&bad);
+
+        // First pick: a path that fails to load. This caches an `Err` entry
+        // keyed on `bad`, exactly like a real failed pick.
+        assert!(
+            cache
+                .texture(&ctx, ImageSlot::Header, &bad, [64, 32])
+                .is_none()
+        );
+        let status = background_image_status(&bad, cache.error(ImageSlot::Header, &bad).as_ref());
+        assert!(status.starts_with('⚠'), "{status}");
+        assert!(
+            status.contains("shinra-ui-status-mismatch-missing.png"),
+            "{status}"
+        );
+
+        // Second pick: a different, valid path. Settings now reports the
+        // new path, but nothing has called `texture()` for it yet (that
+        // only happens once the header/backdrop is actually painted) — so
+        // the row's very next frame reads `error` against a cache entry
+        // that is still keyed on `bad`. That must not surface as an error
+        // for `good`.
+        let good = std::env::temp_dir().join("shinra-ui-status-mismatch-good.png");
+        let error = cache.error(ImageSlot::Header, &good);
+        assert!(
+            error.is_none(),
+            "a stale entry for a different path must not be reported: {error:?}"
+        );
+        let status = background_image_status(&good, error.as_ref());
+        assert_eq!(
+            status, "shinra-ui-status-mismatch-good.png",
+            "the new path's status must not mention the old path's failure"
+        );
+        assert!(!status.contains('⚠'), "{status}");
+    }
+
     /// A stand-in wash height for the geometry tests below — issue #81 made
     /// this the caller's to choose (`draw_header` derives it from
     /// `header_text_band_height`) rather than a fixed constant, so these
@@ -11701,6 +13679,55 @@ mod tests {
         assert_eq!(emblem.center().y, wash.center().y);
         assert_eq!(emblem.width(), HEADER_WASH_EMBLEM_SIZE);
         assert_eq!(emblem.height(), HEADER_WASH_EMBLEM_SIZE);
+    }
+
+    /// Issue #255's live-window pass shrank `HEADER_WASH_EMBLEM_BLEED` from
+    /// the source's literal `25` to `17` so the wash emblem stopped painting
+    /// through the title row's toggle pill. Nothing tested that: the bleed's
+    /// only other test compares the emblem's overhang against the very
+    /// constant `header_wash_emblem_rect` computed it from, so it holds for
+    /// any value — `25` included.
+    ///
+    /// The overlap that mattered is not a box overlap and cannot be tested
+    /// as one. The emblem is a 200pt square blitted over a header band a
+    /// quarter that tall, so its *box* swallows the pill whole at any bleed
+    /// (asserted below, so nobody replaces this with a `!intersects` check
+    /// that can only ever fail). What the user sees is the emblem's ink,
+    /// which is a diamond symmetric about the square's vertical axis — the
+    /// line the top chevron's vertex and both diamond apexes sit on, and the
+    /// strongest edge anywhere in the mark. That axis is what has to clear
+    /// the pill, and shrinking the overhang is what slides it left.
+    #[test]
+    fn the_wash_emblem_axis_clears_the_title_row_toggle_pill() {
+        let panel = wash_test_panel();
+        let wash = header_wash_rect(panel, WASH_TEST_HEIGHT);
+        let emblem = header_wash_emblem_rect(wash);
+        // The title row spans the panel's own width, the same stand-in
+        // `the_gutter_emblem_clears_the_stat_row_horizontally_not_by_clipping`
+        // builds from a painted frame's wash.
+        let row = egui::Rect::from_min_size(panel.min, egui::vec2(wash.width(), TITLE_LINE_HEIGHT));
+        let pill = title_toggle_pill_rect(row, 18.0);
+
+        assert!(
+            emblem.intersects(pill),
+            "the emblem box {emblem:?} no longer covers the pill {pill:?} —              if that is now true by geometry, this test is testing nothing"
+        );
+        assert!(
+            emblem.center().x < pill.left(),
+            "the emblem's axis sits at {}, inside the toggle pill's {:?} —              its strongest edge is painting through the glyphs again",
+            emblem.center().x,
+            pill.x_range()
+        );
+
+        // …and it is the nudge that buys that, not the layout: at the
+        // source's literal `25` the axis lands inside the pill.
+        const SOURCE_BLEED: f32 = 25.0;
+        let unnudged = emblem.center().x + SOURCE_BLEED - HEADER_WASH_EMBLEM_BLEED;
+        assert!(
+            unnudged > pill.left() && unnudged < pill.right(),
+            "at the source's {SOURCE_BLEED}pt overhang the emblem's axis would              sit at {unnudged}, already clear of the pill's {:?} — the bleed no              longer drives this, so tighten or drop the assertion above",
+            pill.x_range()
+        );
     }
 
     /// The wash emblem is drawn far larger than the band it decorates, so it
@@ -12030,11 +14057,18 @@ mod tests {
             // widest plausible one, not `u32::MAX`, same reasoning as the
             // in-game ceilings above.
             deaths: 99,
+            // `fmt_duration`'s documented worst case, `120:00` — the pill
+            // is not a column, so this only keeps the fixture honest.
+            dead_ms: Some(120 * 60 * 1000),
             ability_score: Some(99_999),
             season_strength: Some(9_999),
             imagines: [Some(99_999), Some(99_999)],
             imagine_tiers: [Some(IMAGINE_MAX_TIER), Some(IMAGINE_MAX_TIER)],
             skills: Vec::new(),
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
         };
 
         for (kind, column) in ColumnKind::ALL
@@ -12358,6 +14392,45 @@ mod tests {
         );
     }
 
+    /// Issue #252: the header gutter emblem and wash (both its gradient
+    /// fill and its own oversized emblem copy) must fade with the app's
+    /// opacity slider exactly like the rest of the window's chrome —
+    /// unchanged at the slider's top end, fully gone at its bottom end.
+    /// Same shape as `panel_opacity_endpoints_are_solid_and_gone` above.
+    #[test]
+    fn header_emblem_and_wash_fade_with_the_opacity_slider() {
+        for (name, color) in [
+            ("gutter emblem", HEADER_EMBLEM_COLOR),
+            ("wash emblem", HEADER_WASH_EMBLEM_COLOR),
+            (
+                "wash gradient top stop",
+                egui::Color32::from_rgba_unmultiplied(0x70, 0x80, 0x90, HEADER_WASH_TOP_ALPHA),
+            ),
+        ] {
+            assert_eq!(
+                color.gamma_multiply(Settings::OPACITY_MAX).a(),
+                color.a(),
+                "{name} at 100% must keep its baked-in alpha"
+            );
+            assert_eq!(
+                color.gamma_multiply(Settings::OPACITY_MIN).a(),
+                0,
+                "{name} at 0% must paint nothing"
+            );
+        }
+    }
+
+    /// Issue #252: the gutter emblem's own baked-in alpha must be strictly
+    /// translucent — a bare `Color32::from_rgb` (implicit `0xFF`) painted
+    /// the mark fully opaque, which is the bug this issue fixes.
+    #[test]
+    fn header_emblem_color_is_not_fully_opaque() {
+        assert!(
+            HEADER_EMBLEM_COLOR.a() < 255,
+            "HEADER_EMBLEM_COLOR must carry a real alpha, not implicit full opacity"
+        );
+    }
+
     /// Issue #184: the skill window tracks the main panel because its fills
     /// share the main panel's opaque baseline — same slider value, same
     /// perceived transparency, however different the colors underneath.
@@ -12440,16 +14513,238 @@ mod tests {
         );
     }
 
+    /// Issue #248: `Name` used to be a flat 160.0 guess, narrow enough that
+    /// a real, generously-long skill name clipped against the next column
+    /// with almost no trailing gap. This renders the widest real name found
+    /// (`shinra-skills-ex.webp`'s "Harmonious Fire Avalanche") through the
+    /// exact font `draw_skill_window`'s row loop paints `Name` cells with
+    /// (`regular(FONT_SIZE_ROW)`) and checks the column's stated width
+    /// clears it by at least the reference's own tightest inter-column
+    /// header gap (16px, measured between "Avg crit" and "Avg white").
+    #[test]
+    fn skill_name_column_clears_the_widest_real_skill_name_before_the_next_column() {
+        let ctx = egui::Context::default();
+        // Load the real (non-empty) default fonts so glyph metrics match
+        // what the row loop actually paints with.
+        ctx.run_ui(egui::RawInput::default(), |_ui| {})
+            .drop_without_applying_deltas();
+        let widest = "Harmonious Fire Avalanche";
+        let text_width = ctx.fonts_mut(|f| {
+            f.layout_no_wrap(
+                widest.to_owned(),
+                regular(FONT_SIZE_ROW),
+                egui::Color32::WHITE,
+            )
+            .rect
+            .size()
+            .x
+        });
+        let gap = skills::SkillColumn::Name.width() - text_width;
+        assert!(
+            gap >= 16.0,
+            "Name's width must clear \"{widest}\" ({text_width}pt) by at least the \
+             reference's tightest column gap (16px), got {gap}"
+        );
+    }
+
     /// Widening the icon column must not push the column set past the
     /// initial window's content width — `column_anchors_from_widths` would
     /// silently shrink every column to fit (the trap issue #192 hit).
     #[test]
     fn skill_columns_fit_the_initial_window_at_their_stated_widths() {
-        let total: f32 = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).sum();
+        // Issue #245: every tab, not just `Dps` — each one lays its own
+        // column set out in the same window.
+        for tab in skills::SKILL_TABS {
+            let total: f32 = tab.columns().iter().map(|c| c.width()).sum();
+            assert!(
+                total <= SKILL_WINDOW_SIZE.x - 2.0 * SKILL_HEADER_PAD_X,
+                "{tab:?} columns total {total}"
+            );
+        }
+    }
+
+    /// Every column header label must fit the width its column reserves,
+    /// on every tab and in every sort state. None of them were measured
+    /// before: the widths were eyeballed off `fmt_short`'s longest *value*
+    /// only, and `draw_skill_window`'s header loop paints labels
+    /// right-aligned on each column's anchor at fixed size, so a label
+    /// wider than its own slot spills *left* over its neighbour. Four of
+    /// the six tabs shipped overlapping header rows at both the initial
+    /// and the minimum width — Dps and Heal read `Avg criAvg white`, the
+    /// two amount tabs read `Amount ↓% Amt`.
+    ///
+    /// The sort state is half the bug: `SkillSort::header_label` appends
+    /// its direction arrow to the active column's label *after* the widths
+    /// were chosen, so sorting could push a label out of a slot that fit
+    /// it bare (Heal sorted by `% Crit` degraded to `Hea% Hea% Crit ↑`).
+    /// So this walks every column of every tab against every sort state
+    /// that tab can reach — each of its own columns, both directions —
+    /// and measures through the exact font the header loop paints with
+    /// (`bold(FONT_SIZE_ROW)`) rather than against any hardcoded
+    /// expectation.
+    ///
+    /// One honest caveat: `bold()` only resolves to the real bold family
+    /// when `fonts::has_real_bold()` is true, and that flag stays `false`
+    /// here — it is only ever flipped by `install_cjk_fallback`, which this
+    /// test never calls (see `fonts.rs`'s own
+    /// `no_real_bold_is_reported_before_install_runs`). CI runs on
+    /// ubuntu-latest with no `C:\Windows\Fonts`, so this measures egui's
+    /// bundled regular-weight fallback, not the real Segoe UI Bold
+    /// production paints with — it is a proxy that catches gross budget
+    /// errors, not a guarantee the labels fit the real bold glyphs. The
+    /// per-label widths that motivate `skills.rs`'s column widths were
+    /// measured on the live Windows window, not by this test.
+    #[test]
+    fn every_tab_header_label_fits_its_column_at_every_sort_state() {
+        let ctx = egui::Context::default();
+        // Load the real (non-empty) default fonts so glyph metrics match
+        // what the header loop actually paints with (see the caveat above:
+        // "real" here is still egui's bundled regular weight, since
+        // `has_real_bold()` is false in every test run).
+        ctx.run_ui(egui::RawInput::default(), |_ui| {})
+            .drop_without_applying_deltas();
+        let mut overflowing = Vec::new();
+        for tab in skills::SKILL_TABS {
+            let sorts: Vec<skills::SkillSort> = tab
+                .columns()
+                .iter()
+                .flat_map(|column| {
+                    [true, false].map(|descending| skills::SkillSort {
+                        column: *column,
+                        descending,
+                    })
+                })
+                .collect();
+            for kind in tab.columns() {
+                for sort in &sorts {
+                    let label = sort.header_label(*kind);
+                    let text_width = ctx.fonts_mut(|f| {
+                        f.layout_no_wrap(label.clone(), bold(FONT_SIZE_ROW), egui::Color32::WHITE)
+                            .rect
+                            .size()
+                            .x
+                    });
+                    let complaint = format!(
+                        "{tab:?}/{kind:?}: \"{label}\" is {text_width}pt in a {}pt column",
+                        kind.width()
+                    );
+                    // The same label recurs once per sort state that
+                    // leaves it bare, so report each distinct overflow
+                    // once rather than n times.
+                    if text_width > kind.width() && !overflowing.contains(&complaint) {
+                        overflowing.push(complaint);
+                    }
+                }
+            }
+        }
         assert!(
-            total <= SKILL_WINDOW_SIZE.x - 2.0 * SKILL_HEADER_PAD_X,
-            "columns total {total}"
+            overflowing.is_empty(),
+            "header labels overflow their columns and overdraw their \
+             neighbours: {overflowing:?}"
         );
+    }
+
+    /// Issue #245: `Buff` has no columns, and painted a full 40pt band of
+    /// `SKILL_COLUMN_HEADER_FILL` with nothing in it — a stray lighter
+    /// strip above the explanatory text. A tab with no columns gets no
+    /// band at all, so its rows area (and the explanation in it) starts
+    /// straight under the tab strip.
+    #[test]
+    fn a_tab_with_no_columns_gets_no_column_header_band() {
+        let rect = egui::Rect::from_min_size(egui::pos2(5.0, 5.0), egui::vec2(800.0, 600.0));
+        let tabs_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), 75.0),
+            egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
+        );
+        assert!(skills::SkillTab::Buff.columns().is_empty());
+        let col_header_rect =
+            skill_column_header_rect(rect, tabs_rect, skills::SkillTab::Buff.columns());
+        assert_eq!(col_header_rect.height(), 0.0);
+        assert_eq!(
+            skill_rows_rect(rect, col_header_rect).top(),
+            tabs_rect.bottom()
+        );
+    }
+
+    /// Issue #248: the skill table used to be laid out right-to-left from
+    /// the window's right inset against fixed column widths, so all surplus
+    /// width landed in the *left* gutter — measured at 60px at the minimum
+    /// width, 68px at the initial one and ~290px at 1074 wide, i.e.
+    /// widening the window shoved the whole table right, behind a growing
+    /// empty band.
+    ///
+    /// Issue #245's `skills::column_widths` is what closes that gap, and it
+    /// is the reading the main meter window already has: the leftover goes
+    /// to `Name` — the one column with no bounded formatter — so the widths
+    /// sum to the content width exactly and `column_anchors_from_widths`'
+    /// right-to-left walk lands the leading column on the content's left
+    /// edge at every size, the same way `draw_rows` starts the main meter's
+    /// anchors from `avail.left()`. Checked end to end here, through the
+    /// same two calls `draw_skill_window` makes.
+    #[test]
+    fn skill_columns_stay_left_inset_at_every_window_width() {
+        let columns = skills::SkillTab::Dps.columns();
+        let layout_at = |window_width: f32| {
+            let left = SKILL_HEADER_PAD_X;
+            let right = window_width - SKILL_HEADER_PAD_X;
+            let widths = skills::column_widths(columns, right - left);
+            (
+                column_anchors_from_widths(left, right, &widths, 0.0),
+                widths,
+            )
+        };
+        let surplus = 300.0;
+        let (narrow, narrow_widths) = layout_at(SKILL_WINDOW_MIN_SIZE.x);
+        let (wide, wide_widths) = layout_at(SKILL_WINDOW_MIN_SIZE.x + surplus);
+
+        // The leading column's left edge sits one pad in from the window at
+        // both sizes: no dead left gutter opens up as the window grows.
+        assert_eq!(narrow[0] - narrow_widths[0], SKILL_HEADER_PAD_X);
+        assert_eq!(wide[0] - wide_widths[0], SKILL_HEADER_PAD_X);
+        // The surplus went to `Name` rather than to a gutter at either end
+        // — every other column keeps its stated width, and the trailing
+        // column stays pinned one pad in from the window's right edge.
+        let name = columns
+            .iter()
+            .position(|c| *c == skills::SkillColumn::Name)
+            .expect("every tab shows the Name column");
+        assert_eq!(wide_widths[name] - narrow_widths[name], surplus);
+        for (i, column) in columns.iter().enumerate() {
+            if i != name {
+                assert_eq!(wide_widths[i], column.width(), "{column:?} was resized");
+            }
+        }
+        assert_eq!(
+            *wide.last().unwrap(),
+            SKILL_WINDOW_MIN_SIZE.x + surplus - SKILL_HEADER_PAD_X
+        );
+    }
+
+    /// Below the columns' own sum there is no leftover for
+    /// `skills::column_widths` to hand `Name`, so the pre-existing
+    /// proportional shrink (`column_anchors_from_widths`) still takes the
+    /// full inset width — the table spans the window rather than
+    /// left-aligning inside a slot it no longer fits.
+    #[test]
+    fn skill_columns_still_span_the_window_when_it_is_too_narrow() {
+        let columns = skills::SkillTab::Dps.columns();
+        let window_width = SKILL_WINDOW_MIN_SIZE.x / 2.0;
+        let left = SKILL_HEADER_PAD_X;
+        let right = window_width - SKILL_HEADER_PAD_X;
+        let widths = skills::column_widths(columns, right - left);
+        // Nothing to give away, so the shrink is the anchors' job alone.
+        for (width, column) in widths.iter().zip(columns) {
+            assert_eq!(*width, column.width());
+        }
+        let anchors = column_anchors_from_widths(left, right, &widths, 0.0);
+        assert_eq!(*anchors.last().unwrap(), right);
+        // Same graceful degradation `column_anchors_degrade_gracefully_in_
+        // a_narrow_window` pins for the main meter: scaled slots, still
+        // ordered, still inside the window.
+        assert!(anchors[0] >= 0.0, "columns spilled past the left edge");
+        for pair in anchors.windows(2) {
+            assert!(pair[0] < pair[1]);
+        }
     }
 
     /// Issue #228: dragging the window down to `SKILL_WINDOW_MIN_SIZE`
@@ -12472,7 +14767,13 @@ mod tests {
     /// narrower text-rendering mode.
     #[test]
     fn skill_window_min_width_fits_every_column_at_its_stated_width() {
-        let total: f32 = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).sum();
+        // Issue #245: the widest tab, not just `Dps` — every tab's header
+        // row is painted unclipped at fixed size, so all of them have to
+        // clear the floor.
+        let total: f32 = skills::SKILL_TABS
+            .iter()
+            .map(|tab| tab.columns().iter().map(|c| c.width()).sum::<f32>())
+            .fold(0.0_f32, f32::max);
         assert!(
             SKILL_WINDOW_MIN_SIZE.x >= total + 2.0 * SKILL_HEADER_PAD_X,
             "min width {} is narrower than the columns' {total} + padding, \
@@ -12500,7 +14801,8 @@ mod tests {
     fn selected_tab_fill_hugs_its_label_instead_of_the_whole_strip() {
         let tabs =
             egui::Rect::from_min_size(egui::pos2(10.0, 60.0), egui::vec2(760.0, SKILL_TAB_HEIGHT));
-        let fill = skill_selected_tab_rect(tabs, 26.0);
+        let rects = skill_tab_rects(tabs, &[26.0, 40.0]);
+        let fill = rects[0];
         assert_eq!(fill.left(), tabs.left());
         assert_eq!(fill.top(), tabs.top());
         assert_eq!(fill.height(), tabs.height());
@@ -12508,6 +14810,60 @@ mod tests {
         assert!(
             fill.right() < tabs.right(),
             "the rest of the strip must stay window fill"
+        );
+        // Issue #245: the next tab starts exactly where this one ends —
+        // the strip is a row of abutting boxes, not one filled band.
+        assert_eq!(rects[1].left(), fill.right());
+        assert_eq!(rects[1].width(), 40.0 + 2.0 * SKILL_HEADER_PAD_X);
+    }
+
+    /// Issue #245: every tab's box is sized to its own label, so a click
+    /// lands on the tab whose text is under the pointer.
+    #[test]
+    fn tab_rects_tile_the_strip_left_to_right_without_gaps() {
+        let tabs =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(760.0, SKILL_TAB_HEIGHT));
+        let rects = skill_tab_rects(tabs, &[10.0, 20.0, 30.0]);
+        assert_eq!(rects.len(), 3);
+        for pair in rects.windows(2) {
+            assert_eq!(pair[0].right(), pair[1].left());
+        }
+        assert!(rects.last().expect("three tabs").right() <= tabs.right());
+    }
+
+    /// Issue #245: each tab keeps its own sort, so switching away and back
+    /// returns to the ordering the user chose rather than resetting.
+    #[test]
+    fn every_tab_starts_on_its_own_default_sort_and_keeps_it() {
+        let mut tabs = SkillTabs::default();
+        assert_eq!(tabs.selected, skills::SkillTab::Dps);
+        assert_eq!(tabs.sort_mut().column, skills::SkillColumn::Damage);
+
+        tabs.selected = skills::SkillTab::Heal;
+        assert_eq!(tabs.sort_mut().column, skills::SkillColumn::Heal);
+        tabs.sort_mut().toggle(skills::SkillColumn::Hits);
+
+        tabs.selected = skills::SkillTab::Dps;
+        assert_eq!(tabs.sort_mut().column, skills::SkillColumn::Damage);
+        tabs.selected = skills::SkillTab::Heal;
+        assert_eq!(tabs.sort_mut().column, skills::SkillColumn::Hits);
+    }
+
+    /// Issue #245: an untracked tab explains itself instead of implying
+    /// the fight simply had none of that.
+    #[test]
+    fn an_untracked_tab_says_why_it_is_empty() {
+        assert_eq!(
+            skill_window_empty_message(SkillWindowSource::Live, skills::SkillTab::Buff, 0),
+            skills::SkillTab::Buff.untracked_message()
+        );
+        assert_eq!(
+            skill_window_empty_message(SkillWindowSource::Live, skills::SkillTab::Heal, 0),
+            Some("No healing recorded yet")
+        );
+        assert_eq!(
+            skill_window_empty_message(SkillWindowSource::Live, skills::SkillTab::Heal, 3),
+            None
         );
     }
 
@@ -12521,7 +14877,8 @@ mod tests {
             egui::pos2(rect.left(), 75.0),
             egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
         );
-        let col_header_rect = skill_column_header_rect(rect, tabs_rect);
+        let col_header_rect =
+            skill_column_header_rect(rect, tabs_rect, skills::SkillTab::Dps.columns());
         assert_eq!(col_header_rect.left(), rect.left());
         assert_eq!(col_header_rect.right(), rect.right());
         assert_eq!(col_header_rect.top(), tabs_rect.bottom());
@@ -12595,7 +14952,10 @@ mod tests {
             egui::pos2(rect.left(), header.bottom()),
             egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
         );
-        let rows = skill_rows_rect(rect, skill_column_header_rect(rect, tabs));
+        let rows = skill_rows_rect(
+            rect,
+            skill_column_header_rect(rect, tabs, skills::SkillTab::Dps.columns()),
+        );
         assert!(!skill_drag_band(header).intersects(rows));
     }
 
@@ -12620,18 +14980,247 @@ mod tests {
         assert_eq!(close.top(), rect.top() + SKILL_HEADER_PAD_Y);
     }
 
-    /// The deaths pill reserves its room off the close button's *hit* size,
-    /// so growing that button (issue #218) pushes the pill left instead of
-    /// letting the two overlap.
+    /// Issue #246: the Deaths pill sits `SKILL_DEATHS_PILL_GAP` after the
+    /// player name's right edge, not right-aligned against the close
+    /// button — the reference (`Skills.xaml:172-176`) places its whole pill
+    /// cluster in the header's flexible middle column, right after the
+    /// name. That preferred placement only applies while the cluster still
+    /// clears the close button — a typical name (well short of the
+    /// window's width) does.
     #[test]
-    fn deaths_pill_clears_the_close_button_by_one_header_pad() {
+    fn deaths_pill_sits_one_reference_gap_after_a_typical_name() {
         let rect = skill_window_rect();
         let header = skill_header_rect(rect);
-        let pill_width = 64.0;
-        let left = skill_deaths_pill_left(header, pill_width);
+        let close_left = skill_close_rect(rect).left();
+        let cluster_width = 64.0;
+        let name_right = header.left() + 200.0;
+
+        let left = skill_deaths_pill_left(name_right, close_left, cluster_width);
+
+        assert_eq!(left, name_right + SKILL_DEATHS_PILL_GAP);
+        assert!(
+            left + cluster_width < close_left,
+            "a typical name plus a typical cluster width must clear the close button"
+        );
+    }
+
+    /// `PlayerRow::name` is an unbounded, network-decoded string
+    /// (`crates/meter/src/stats.rs`), so a long enough name would push the
+    /// gap-after-name placement's cluster past the close button outright.
+    /// Uses a name wide enough that the unclamped formula would have landed
+    /// the cluster's *left* edge past the close button's left edge, to
+    /// prove this is more than a last-pixel clamp.
+    #[test]
+    fn deaths_pill_stays_left_of_the_close_button_for_a_long_name() {
+        let rect = skill_window_rect();
+        let close_rect = skill_close_rect(rect);
+        let cluster_width = 64.0;
+        let name_right = close_rect.left() + 500.0;
+
+        let left = skill_deaths_pill_left(name_right, close_rect.left(), cluster_width);
+
+        // The unclamped gap-after-name formula would have placed the
+        // cluster well past the close button; the clamp must have
+        // overridden it.
+        assert!(left < name_right + SKILL_DEATHS_PILL_GAP);
+        assert!(
+            left + cluster_width <= close_rect.left() - SKILL_HEADER_PAD_X,
+            "the cluster must stay clear of the close button no matter how wide the name is"
+        );
+        assert!(
+            left + cluster_width <= rect.right(),
+            "the cluster must also stay inside the window"
+        );
+    }
+
+    /// Issue #254: the death-time pill follows the Deaths pill by one
+    /// reference gap, and it is the *cluster* — not its first pill — that
+    /// keeps one header pad clear of the close button.
+    #[test]
+    fn the_death_time_pill_follows_the_deaths_pill_by_one_gap() {
+        let rect = skill_window_rect();
+        let close_left = skill_close_rect(rect).left();
+        let deaths_width = 64.0;
+        let death_time_width = 96.0;
+
+        let cluster = skill_header_pill_cluster_width(deaths_width, Some(death_time_width));
         assert_eq!(
-            left + pill_width + SKILL_HEADER_PAD_X,
-            skill_close_rect(rect).left()
+            cluster,
+            deaths_width + SKILL_HEADER_PILL_GAP + death_time_width
+        );
+
+        // A name that already reaches the close button, so it is
+        // `skill_deaths_pill_left`'s clamp — not issue #246's
+        // after-the-name preference — placing the cluster here: the clamp
+        // is the branch that owes the close button its clearance.
+        let deaths_left = skill_deaths_pill_left(close_left, close_left, cluster);
+        let death_time_left = deaths_left + deaths_width + SKILL_HEADER_PILL_GAP;
+        assert!(
+            death_time_left >= deaths_left + deaths_width,
+            "the two pills must not overlap"
+        );
+        assert_eq!(
+            death_time_left + death_time_width + SKILL_HEADER_PAD_X,
+            close_left,
+            "the last pill in the cluster is the one that clears the close button"
+        );
+    }
+
+    /// A row with no death-time pill lays out exactly as it did before
+    /// issue #254 — the gap is part of the pill, not of the Deaths pill.
+    #[test]
+    fn a_cluster_with_one_pill_is_just_that_pill() {
+        assert_eq!(skill_header_pill_cluster_width(64.0, None), 64.0);
+    }
+
+    /// Issue #270 follow-up: the header used to paint the player name with
+    /// no clip, max-width or elision at all, so a long enough name ran
+    /// underneath the pill cluster — and #254's death-time pill widened the
+    /// cluster, cutting the safe name length further. Renders a real frame
+    /// (through the real font, not a hardcoded pixel budget) with both
+    /// pills present — the worst-case cluster width — at the window's
+    /// narrowest allowed size, and asserts the painted name never reaches
+    /// past one `SKILL_HEADER_PAD_X` short of the cluster.
+    #[test]
+    fn an_overlong_name_stays_clear_of_the_pill_cluster() {
+        let row = PlayerRow {
+            // Issue #246 moved the cluster to just after the name, so a
+            // merely long name no longer runs under it — the cluster
+            // follows. Only a name long enough to hit
+            // `skill_deaths_pill_left`'s clamp can still collide, so this
+            // is one.
+            name: "A Name So Long It Would Otherwise Run Under The Header Pills"
+                .repeat(3)
+                .to_string(),
+            deaths: 3,
+            dead_ms: Some(12_400),
+            ..sample_row(None)
+        };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_MIN_SIZE);
+        let mut tabs_state = SkillTabs::default();
+
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_skill_window(
+                    ui,
+                    &row,
+                    &mut tabs_state,
+                    SkillWindowSource::Live,
+                    &icons,
+                    1.0,
+                    &mut WindowGesture::default(),
+                );
+            },
+        );
+
+        let mut name_rect: Option<egui::Rect> = None;
+        for clipped in &output.shapes {
+            collect_name_text_boxes(&clipped.shape, clipped.clip_rect, &row.name, &mut name_rect);
+        }
+        output.drop_without_applying_deltas();
+
+        let name_rect = name_rect.expect("the header never painted the player name");
+        let deaths_pill = StatPill {
+            value: "3",
+            icon: None,
+            icon_side: COUNTER_GLYPH_SIDE,
+            size: FONT_SIZE_PILL_VALUE,
+            value_color: egui::Color32::WHITE,
+            icon_color: COUNTER_ICON_COLOR,
+            icon_first: true,
+            corner_radius: egui::CornerRadius::same(SKILL_PILL_CORNER_RADIUS),
+            fill: SKILL_PANEL_FILL,
+            stroke: None,
+        };
+        let death_time_text = skill_death_time_text(row.dead_ms).unwrap();
+        let painter = egui::Painter::new(ctx.clone(), egui::LayerId::debug(), screen_rect);
+        let deaths_width = pill_size(
+            pill_text_size(&painter, &deaths_pill),
+            deaths_pill.icon_side,
+            SKILL_PILL_HEIGHT,
+        )
+        .x;
+        let death_time_pill = StatPill {
+            value: &death_time_text,
+            ..deaths_pill
+        };
+        let death_time_width = pill_size(
+            pill_text_size(&painter, &death_time_pill),
+            death_time_pill.icon_side,
+            SKILL_PILL_HEIGHT,
+        )
+        .x;
+        // The name runs far past the space before the cluster, so issue
+        // #246's preference gives way to `skill_deaths_pill_left`'s clamp
+        // and the cluster sits one header pad clear of the close button —
+        // exactly where it sat before that preference existed.
+        let cluster_left = skill_close_rect(screen_rect).left()
+            - SKILL_HEADER_PAD_X
+            - skill_header_pill_cluster_width(deaths_width, Some(death_time_width));
+
+        // Equality, not just "clear of": the clip is what stops the name,
+        // so its painted right edge lands *on* the cluster's pad. A name
+        // that stopped short of it would mean the clamp never engaged and
+        // this test had lost its teeth.
+        assert!(
+            (name_rect.right() - (cluster_left - SKILL_HEADER_PAD_X)).abs() <= 0.5,
+            "name right edge {} must be clipped exactly one SKILL_HEADER_PAD_X \
+             short of the cluster (cluster_left {cluster_left}, pad {SKILL_HEADER_PAD_X})",
+            name_rect.right()
+        );
+    }
+
+    /// Collects the painted (and clip-intersected) rect of every `Text`
+    /// shape whose galley text is exactly `name` — the same clip-aware
+    /// extraction `collect_painted_boxes` does for the main header's tests,
+    /// scoped down to just the one string this test cares about.
+    fn collect_name_text_boxes(
+        shape: &egui::Shape,
+        clip: egui::Rect,
+        name: &str,
+        out: &mut Option<egui::Rect>,
+    ) {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == name => {
+                let rect = egui::Rect::from_min_size(text.pos, text.galley.size()).intersect(clip);
+                *out = Some(out.map_or(rect, |existing| existing.union(rect)));
+            }
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_name_text_boxes(s, clip, name, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Issue #254: the total is an estimate (the revive edge is inferred
+    /// from the player's next action), so it wears a `~` — except at zero,
+    /// which is exact, and except for a history row, which has no measured
+    /// total at all and gets no pill rather than a misleading `00:00`.
+    #[test]
+    fn death_time_text_marks_the_estimate_but_not_an_exact_zero() {
+        assert_eq!(skill_death_time_text(None), None);
+        assert_eq!(skill_death_time_text(Some(0)).as_deref(), Some("00:00"));
+        assert_eq!(
+            skill_death_time_text(Some(12_400)).as_deref(),
+            Some("~00:12")
+        );
+        assert_eq!(
+            skill_death_time_text(Some(159_000)).as_deref(),
+            Some("~02:39")
+        );
+        assert_eq!(
+            skill_death_time_text(Some(120 * 60 * 1000)).as_deref(),
+            Some("~120:00"),
+            "minutes keep counting up rather than rolling over, like fmt_duration"
         );
     }
 
@@ -12676,13 +15265,17 @@ mod tests {
     fn the_close_button_paints_its_hover_wash_only_while_hovered() {
         let row = PlayerRow {
             skills: vec![sample_skill_row(1550)],
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
             ..sample_row(None)
         };
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_MIN_SIZE);
-        let mut sort = skills::SkillSort::default();
+        let mut tabs = SkillTabs::default();
 
         // Two frames per probe: egui resolves hover against the widgets the
         // *previous* frame registered, so a single frame would report the
@@ -12700,7 +15293,7 @@ mod tests {
                         draw_skill_window(
                             ui,
                             &row,
-                            &mut sort,
+                            &mut tabs,
                             SkillWindowSource::Live,
                             &icons,
                             1.0,
@@ -12763,7 +15356,7 @@ mod tests {
         // Deliberately at the window's floor: 40 rows cannot fit, so a bar
         // is needed.
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_MIN_SIZE);
-        let mut sort = skills::SkillSort::default();
+        let mut tabs = SkillTabs::default();
         // Two frames: egui animates a scroll bar in, so the first frame's
         // `show_factor` is still 0 and paints nothing either way.
         for _ in 0..2 {
@@ -12776,7 +15369,7 @@ mod tests {
                     draw_skill_window(
                         ui,
                         &row,
-                        &mut sort,
+                        &mut tabs,
                         SkillWindowSource::Live,
                         &icons,
                         1.0,
@@ -12795,7 +15388,7 @@ mod tests {
                 draw_skill_window(
                     ui,
                     &row,
-                    &mut sort,
+                    &mut tabs,
                     SkillWindowSource::Live,
                     &icons,
                     1.0,
@@ -12814,7 +15407,10 @@ mod tests {
             egui::pos2(screen_rect.left(), header.bottom()),
             egui::vec2(screen_rect.width(), SKILL_TAB_HEIGHT),
         );
-        let rows = skill_rows_rect(screen_rect, skill_column_header_rect(screen_rect, tabs));
+        let rows = skill_rows_rect(
+            screen_rect,
+            skill_column_header_rect(screen_rect, tabs, skills::SkillTab::Dps.columns()),
+        );
         let bar = rects.iter().find(|r| {
             r.right() == rows.right()
                 && r.width() == SKILL_SCROLL_BAR_WIDTH
@@ -14066,7 +16662,7 @@ mod tests {
         app.update_check = UpdateCheckState::Checking { rx };
         tx.send(Ok(CheckOutcome::UpToDate)).unwrap();
 
-        app.poll_update_check();
+        app.poll_update_check(&egui::Context::default());
 
         assert!(matches!(
             app.update_check,
@@ -14093,7 +16689,7 @@ mod tests {
         let (_tx, rx) = crossbeam_channel::unbounded();
         app.update_check = UpdateCheckState::Checking { rx };
 
-        app.poll_update_check();
+        app.poll_update_check(&egui::Context::default());
 
         assert!(matches!(
             app.update_check,
@@ -14125,7 +16721,7 @@ mod tests {
         app.update_check = UpdateCheckState::Checking { rx };
         drop(tx);
 
-        app.poll_update_check();
+        app.poll_update_check(&egui::Context::default());
 
         assert!(
             matches!(app.update_check, UpdateCheckState::Done(Err(_))),
@@ -14278,13 +16874,16 @@ mod tests {
         );
     }
 
-    /// Same shape as the test above, but for the update-available branch:
-    /// both the tag and the "Download" hyperlink's own label must be
-    /// painted — the actual `href` isn't a painted string at all (it's a
-    /// `ViewportCommand::OpenUrl` queued on click, not text), so this only
-    /// covers what a render test can see.
+    /// Same shape as the test above, but for the update-available branch
+    /// of a release that publishes no downloadable executable — every
+    /// release tagged before issue #249 shipped a `.zip`, and issue #250's
+    /// installer has nothing to install for one. That case must keep the
+    /// pre-#250 affordance exactly: the tag, and a plain "Download" link to
+    /// the release page. The actual `href` isn't a painted string at all
+    /// (it's a `ViewportCommand::OpenUrl` queued on click, not text), so
+    /// this only covers what a render test can see.
     #[test]
-    fn draw_header_menu_shows_update_available_with_the_tag_and_a_download_link() {
+    fn draw_header_menu_falls_back_to_a_download_link_when_the_release_has_no_asset() {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
@@ -14294,6 +16893,7 @@ mod tests {
         let mut update_check = UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable {
             tag: "v0.3.0".to_string(),
             url: "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/tag/v0.3.0".to_string(),
+            asset_url: None,
         }));
 
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -14324,6 +16924,340 @@ mod tests {
             texts.contains(&"Download".to_string()),
             "expected the Download hyperlink's label among the painted text, got {texts:?}"
         );
+        assert!(
+            !texts.contains(&"Update now".to_string()),
+            "an install button must not be offered for a release with no asset, got {texts:?}"
+        );
+    }
+
+    /// Renders `draw_header_menu` with `update_check` in `state` and
+    /// returns every string it painted. Issue #250 added three more states
+    /// to that dropdown, and each of them is a line the user has to be able
+    /// to read — asserting on the painted text is the only way to check
+    /// that from a headless host.
+    fn header_menu_texts(state: UpdateCheckState) -> Vec<String> {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let mut update_check = state;
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut update_check,
+                &unused_log_export_sender(),
+            );
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text_shapes(&clipped.shape, &mut texts);
+        }
+        output.drop_without_applying_deltas();
+        texts
+    }
+
+    fn update_available(asset_url: Option<&str>) -> CheckOutcome {
+        CheckOutcome::UpdateAvailable {
+            tag: "v0.3.0".to_string(),
+            url: "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/tag/v0.3.0".to_string(),
+            asset_url: asset_url.map(str::to_string),
+        }
+    }
+
+    /// Issue #250's headline change: a release that publishes an executable
+    /// offers to install it, and demotes the browser link to "Release
+    /// notes" rather than dropping it — reading the notes before updating
+    /// has to stay possible.
+    #[test]
+    fn draw_header_menu_offers_an_install_button_when_the_release_has_an_asset() {
+        let texts = header_menu_texts(UpdateCheckState::Done(Ok(update_available(Some(
+            "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/ShinraMeter-BPSR-v0.3.0-windows-x64.exe",
+        )))));
+        assert!(
+            texts.contains(&"Update available: v0.3.0".to_string()),
+            "expected the update-available line, got {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Update now".to_string()),
+            "expected the install button, got {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Release notes".to_string()),
+            "expected the release-notes link, got {texts:?}"
+        );
+    }
+
+    /// The in-flight state has to name what it is doing; a dropdown that
+    /// went blank mid-download would read as a crash.
+    #[test]
+    fn draw_header_menu_shows_the_download_in_progress() {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let texts = header_menu_texts(UpdateCheckState::Installing {
+            available: update_available(Some("https://github.com/x/y.exe")),
+            rx,
+        });
+        assert!(
+            texts.contains(&"Downloading v0.3.0…".to_string()),
+            "expected the downloading line, got {texts:?}"
+        );
+    }
+
+    #[test]
+    fn draw_header_menu_shows_the_restart() {
+        let texts = header_menu_texts(UpdateCheckState::Restarting);
+        assert!(
+            texts.contains(&"Restarting…".to_string()),
+            "expected the restarting line, got {texts:?}"
+        );
+    }
+
+    /// A failed install must say what went wrong *and* leave the retry one
+    /// click away — a dropped connection is the common case, and making the
+    /// user re-run the whole check first would be gratuitous.
+    #[test]
+    fn draw_header_menu_shows_a_failed_install_and_re_offers_it() {
+        let texts = header_menu_texts(UpdateCheckState::InstallFailed {
+            available: update_available(Some("https://github.com/x/y.exe")),
+            error: "the connection was reset".to_string(),
+        });
+        assert!(
+            texts.contains(&"Update failed: the connection was reset".to_string()),
+            "expected the failure line, got {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Update now".to_string()),
+            "expected the retry button, got {texts:?}"
+        );
+    }
+
+    /// The "Check for updates" button is disabled while a check is in
+    /// flight (issue #171); issue #250 extends that to the install and the
+    /// restart, so a click cannot race the swap. `add_enabled(false, ..)`
+    /// is not observable in painted text, so this drives the state machine
+    /// instead: `start_update_install` on an offer with an asset must land
+    /// in `Installing`, never `Done`.
+    #[test]
+    fn start_update_install_begins_in_the_installing_state() {
+        assert!(matches!(
+            start_update_install(update_available(Some(
+                "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/app.exe"
+            ))),
+            UpdateCheckState::Installing { .. }
+        ));
+    }
+
+    /// Defence in depth for the branch the UI never draws: an offer with no
+    /// asset resolves to a stated failure rather than spawning a thread
+    /// with nothing to download (or panicking on a menu click).
+    #[test]
+    fn start_update_install_refuses_an_offer_with_no_asset() {
+        assert!(matches!(
+            start_update_install(update_available(None)),
+            UpdateCheckState::InstallFailed { .. }
+        ));
+    }
+
+    /// The install thread's counterpart to
+    /// `poll_update_check_reports_a_dead_thread_instead_of_hanging`: a
+    /// dropped sender must resolve to a visible failure rather than leaving
+    /// the dropdown on "Downloading…" with the button disabled forever.
+    #[test]
+    fn poll_update_check_reports_a_dead_install_thread() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+        let (tx, rx) = crossbeam_channel::unbounded::<Result<PathBuf, String>>();
+        app.update_check = UpdateCheckState::Installing {
+            available: update_available(Some("https://github.com/x/y.exe")),
+            rx,
+        };
+        drop(tx);
+
+        app.poll_update_check(&egui::Context::default());
+
+        assert!(
+            matches!(app.update_check, UpdateCheckState::InstallFailed { .. }),
+            "a dead install thread must resolve to a failure, got {:?}",
+            app.update_check
+        );
+    }
+
+    /// A failed install keeps the offer it came from, so the retry button
+    /// has the same asset URL the first attempt used.
+    #[test]
+    fn poll_update_check_keeps_the_offer_when_an_install_fails() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+        let offer = update_available(Some("https://github.com/x/y.exe"));
+        let (tx, rx) = crossbeam_channel::unbounded::<Result<PathBuf, String>>();
+        app.update_check = UpdateCheckState::Installing {
+            available: offer.clone(),
+            rx,
+        };
+        tx.send(Err("the connection was reset".to_string()))
+            .unwrap();
+
+        app.poll_update_check(&egui::Context::default());
+
+        match &app.update_check {
+            UpdateCheckState::InstallFailed { available, error } => {
+                assert_eq!(available, &offer);
+                assert_eq!(error, "the connection was reset");
+            }
+            other => panic!("expected InstallFailed, got {other:?}"),
+        }
+    }
+
+    /// An install still in flight must stay `Installing` — the same
+    /// "don't silently resolve to nothing" guarantee the check has.
+    #[test]
+    fn poll_update_check_leaves_an_in_flight_install_alone() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+        let (_tx, rx) = crossbeam_channel::unbounded::<Result<PathBuf, String>>();
+        app.update_check = UpdateCheckState::Installing {
+            available: update_available(Some("https://github.com/x/y.exe")),
+            rx,
+        };
+
+        app.poll_update_check(&egui::Context::default());
+
+        assert!(matches!(
+            app.update_check,
+            UpdateCheckState::Installing { .. }
+        ));
+    }
+
+    /// `finish_update_install`'s relaunch-failure branch, exercised through
+    /// `poll_update_check` exactly as production hits it: the install
+    /// thread reports `Ok(path)`, and starting that path fails. A
+    /// nonexistent path makes `Command::spawn` fail deterministically on
+    /// any OS, so no seam is needed here — unlike the success branch below,
+    /// which must not spawn a real process.
+    #[test]
+    fn poll_update_check_reports_a_relaunch_failure_after_a_successful_install() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+        let offer = update_available(Some("https://github.com/x/y.exe"));
+        let (tx, rx) = crossbeam_channel::unbounded::<Result<PathBuf, String>>();
+        app.update_check = UpdateCheckState::Installing {
+            available: offer.clone(),
+            rx,
+        };
+        tx.send(Ok(PathBuf::from(
+            "/definitely/does/not/exist/ShinraMeter-BPSR.exe",
+        )))
+        .unwrap();
+
+        app.poll_update_check(&egui::Context::default());
+
+        match &app.update_check {
+            UpdateCheckState::InstallFailed { available, error } => {
+                assert_eq!(available, &offer);
+                assert!(
+                    error.contains("installed") && error.contains("couldn't be started"),
+                    "expected a relaunch-failure message, got {error:?}"
+                );
+            }
+            other => panic!("expected InstallFailed, got {other:?}"),
+        }
+        assert!(
+            rx_command.try_recv().is_err(),
+            "a relaunch failure must not tell the pipeline to quit — the old \
+             process is still what's running"
+        );
+    }
+
+    /// `finish_update_install`'s success branch: quit the pipeline, ask the
+    /// viewport to close, and land on `Restarting`. Goes through
+    /// `finish_update_install_with` (the seam added alongside this test)
+    /// rather than `poll_update_check`, so the relaunch itself never spawns
+    /// a real process — `poll_update_check`'s own plumbing into
+    /// `finish_update_install` is unchanged production code and is not
+    /// what's under test here.
+    #[test]
+    fn update_check_finish_install_relaunches_quits_and_closes_on_success() {
+        let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+        let offer = update_available(Some("https://github.com/x/y.exe"));
+        let installed = PathBuf::from("/fake/relaunched/ShinraMeter-BPSR.exe");
+        let ctx = egui::Context::default();
+
+        let state = app.finish_update_install_with(&ctx, offer, Ok(installed.clone()), |exe| {
+            assert_eq!(exe, installed.as_path());
+            Ok(())
+        });
+
+        assert!(
+            matches!(state, UpdateCheckState::Restarting),
+            "expected Restarting, got {state:?}"
+        );
+        assert_eq!(
+            rx_command
+                .try_recv()
+                .expect("a successful relaunch must send a command"),
+            UiCommand::Quit
+        );
+        let output = ctx.run_ui(egui::RawInput::default(), |_ui| {});
+        let close_commands = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default();
+        assert!(
+            close_commands.contains(&egui::ViewportCommand::Close),
+            "a successful relaunch must also ask the viewport to close: {close_commands:?}"
+        );
+        output.drop_without_applying_deltas();
     }
 
     /// Reset moved out of this menu into the toggle cluster (issue #82;
@@ -14661,6 +17595,144 @@ mod tests {
             viewport_commands.contains(&egui::ViewportCommand::InnerSize(expected_size)),
             "Reset to defaults must resize to fit {RESET_TO_DEFAULTS_VISIBLE_ROWS} rows: \
              {viewport_commands:?}"
+        );
+    }
+
+    /// Issue #121: the same button must now put back *every* customization,
+    /// not just the opacity the test above covers — the custom header and
+    /// backdrop images the issue names first, plus the visible-column set
+    /// and the window size it names alongside them. Driven through the real
+    /// `draw_header_menu` (not `Settings::reset_to_defaults` directly) so
+    /// this also proves the button is wired to the wider reset at all, and
+    /// that the persisted copy on `tx_settings` carries it.
+    #[test]
+    fn draw_header_menu_reset_to_defaults_clears_every_customization() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, rx_settings) = crossbeam_channel::unbounded();
+        // Every field issue #121 names, moved off its default first.
+        let mut settings = Settings {
+            visible_columns: vec![ColumnKind::Hits],
+            window_size: Some([1234.0, 567.0]),
+            ..Settings::default()
+        };
+        settings.set_background_image(ImageSlot::Header, Some(PathBuf::from("header.png")));
+        settings.set_background_image(ImageSlot::Backdrop, Some(PathBuf::from("rows.png")));
+
+        // Frame 1: lay the menu out and find where the button painted.
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
+            );
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let reset_pos = accessible_rect_for_label(&update, "Reset to defaults").center();
+        layout.drop_without_applying_deltas();
+
+        // Frame 2: click it.
+        let output = ctx.run_ui(click_at(reset_pos), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
+            );
+        });
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            settings,
+            Settings::default(),
+            "Reset to defaults must restore every user customization"
+        );
+        let sent = rx_settings
+            .try_recv()
+            .expect("Reset to defaults must send the updated settings on tx_settings");
+        assert_eq!(
+            sent,
+            Settings::default(),
+            "the persisted copy must carry the reset too"
+        );
+    }
+
+    /// Issues #121/#253: the dropdown grows one Choose/Clear pair per
+    /// customizable region, so a user can point the two at different files
+    /// (or configure only one, which the issue is explicit about). Asserted
+    /// on the *buttons* rather than the region labels beside them because
+    /// egui puts only interactive widgets into the AccessKit tree — the
+    /// plain `ui.label` rows, like the "Opacity" label above them, are not
+    /// in it to look for.
+    #[test]
+    fn draw_header_menu_offers_a_row_for_every_background_image_slot() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
+            );
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let labels: Vec<String> = update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().map(str::to_owned))
+            .collect();
+        layout.drop_without_applying_deltas();
+
+        let expected = ImageSlot::ALL.len();
+        for button in ["Choose…", "Clear"] {
+            let found = labels.iter().filter(|label| *label == button).count();
+            assert_eq!(
+                found, expected,
+                "expected one \"{button}\" per background-image slot, found {found}: {labels:?}"
+            );
+        }
+        // The rows are told apart by their labels, so those must differ.
+        assert_ne!(
+            ImageSlot::Header.label(),
+            ImageSlot::Backdrop.label(),
+            "the two rows would be indistinguishable"
         );
     }
 
@@ -15835,7 +18907,7 @@ mod tests {
 
     fn skill_window_state(pos: egui::Pos2) -> SkillWindowState {
         SkillWindowState {
-            sort: skills::SkillSort::default(),
+            tabs: SkillTabs::default(),
             pos,
             size: SKILL_WINDOW_SIZE,
             source: SkillWindowSource::Live,
@@ -16088,19 +19160,23 @@ mod tests {
     /// totals (issue #222) — settled either way, not still arriving.
     #[test]
     fn skill_window_empty_message_is_worded_for_the_window_s_source() {
+        let dps = skills::SkillTab::Dps;
         assert_eq!(
-            skill_window_empty_message(SkillWindowSource::History(7), 0),
+            skill_window_empty_message(SkillWindowSource::History(7), dps, 0),
             Some("No per-skill data recorded for this fight")
         );
         assert_eq!(
-            skill_window_empty_message(SkillWindowSource::Live, 0),
+            skill_window_empty_message(SkillWindowSource::Live, dps, 0),
             Some("No damage recorded yet"),
             "an ongoing fight's rows are still coming — claiming nothing was \
              recorded for it would be wrong"
         );
-        assert_eq!(skill_window_empty_message(SkillWindowSource::Live, 3), None);
         assert_eq!(
-            skill_window_empty_message(SkillWindowSource::History(7), 3),
+            skill_window_empty_message(SkillWindowSource::Live, dps, 3),
+            None
+        );
+        assert_eq!(
+            skill_window_empty_message(SkillWindowSource::History(7), dps, 3),
             None
         );
     }
@@ -16128,8 +19204,8 @@ mod tests {
     /// ids line up) sends a synthesized left click there and returns
     /// whatever this run reports the `X` glyph did, leaving `sort` mutated
     /// in place for the caller to inspect.
-    fn click_skill_window_at(row: &PlayerRow, sort: &mut skills::SkillSort, value: &str) -> bool {
-        click_skill_window(row, sort, |frame| frame.text_box(value).center())
+    fn click_skill_window_at(row: &PlayerRow, tabs: &mut SkillTabs, value: &str) -> bool {
+        click_skill_window(row, tabs, |frame| frame.text_box(value).center())
     }
 
     /// The same two-frame harness, aimed by an arbitrary `locate` instead of
@@ -16137,7 +19213,7 @@ mod tests {
     /// issue #218 turned its `\u{2715}` into two line segments.
     fn click_skill_window(
         row: &PlayerRow,
-        sort: &mut skills::SkillSort,
+        tabs: &mut SkillTabs,
         locate: impl FnOnce(&RowFrame) -> egui::Pos2,
     ) -> bool {
         let ctx = egui::Context::default();
@@ -16154,7 +19230,7 @@ mod tests {
                 draw_skill_window(
                     ui,
                     row,
-                    sort,
+                    tabs,
                     SkillWindowSource::Live,
                     &icons,
                     1.0,
@@ -16182,7 +19258,7 @@ mod tests {
                 clicked = draw_skill_window(
                     ui,
                     row,
-                    sort,
+                    tabs,
                     SkillWindowSource::Live,
                     &icons,
                     1.0,
@@ -16198,19 +19274,23 @@ mod tests {
     fn clicking_a_column_header_toggles_its_sort() {
         let row = PlayerRow {
             skills: vec![sample_skill_row(1550), sample_skill_row(1551)],
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
             ..sample_row(None)
         };
-        let mut sort = skills::SkillSort::default();
-        assert_eq!(sort.column, skills::SkillColumn::Damage);
+        let mut tabs = SkillTabs::default();
+        assert_eq!(tabs.sort_mut().column, skills::SkillColumn::Damage);
 
         // "Skill name" is the `Name` header's plain (unselected) label —
         // the default sort is `Damage`, so this is never the active-sort
         // text `header_label` would instead paint.
-        click_skill_window_at(&row, &mut sort, "Skill name");
+        click_skill_window_at(&row, &mut tabs, "Skill name");
 
-        assert_eq!(sort.column, skills::SkillColumn::Name);
+        assert_eq!(tabs.sort_mut().column, skills::SkillColumn::Name);
         assert!(
-            sort.descending,
+            tabs.sort_mut().descending,
             "a newly-clicked column always starts descending (D9)"
         );
     }
@@ -16503,13 +19583,17 @@ mod tests {
     fn clicking_the_close_glyph_closes_the_window() {
         let row = PlayerRow {
             skills: vec![sample_skill_row(1550)],
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
             ..sample_row(None)
         };
-        let mut sort = skills::SkillSort::default();
+        let mut tabs = SkillTabs::default();
 
         // The close button is aimed at geometrically: it paints two line
         // segments now, not a glyph (issue #218).
-        let closed = click_skill_window(&row, &mut sort, |_| {
+        let closed = click_skill_window(&row, &mut tabs, |_| {
             skill_close_rect(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 SKILL_WINDOW_SIZE,

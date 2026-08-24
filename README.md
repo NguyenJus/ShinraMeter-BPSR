@@ -17,11 +17,12 @@ encounter — the names and figures shown are not from a real parse.*
 ## Download
 
 1. Go to the [latest release](https://github.com/NguyenJus/ShinraMeter-BPSR/releases/latest).
-2. Download the `.zip` asset and extract it somewhere on your PC. The zip
-   contains the executable only — every icon set, including the class and
-   Imagine icons, is compiled into the executable, so there is nothing else
-   to extract or keep beside it.
-3. Double-click `ShinraMeter-BPSR.exe`.
+2. Download the `.exe` asset (`ShinraMeter-BPSR-<version>-windows-x64.exe`)
+   and put it somewhere on your PC. That single file is the whole
+   application — every icon set, including the class and Imagine icons, is
+   compiled into the executable, so there is nothing to extract and nothing
+   else to keep beside it.
+3. Double-click it.
 4. Windows will show a UAC prompt asking to run as Administrator. Accept it
    — the meter needs elevation to install its packet-capture driver (see
    [Prerequisites](#prerequisites)).
@@ -78,6 +79,15 @@ game, always on top. A few things to know:
   in `settings.json` (`history_max_encounters`, `history_max_age_days`,
   `history_min_duration_ms`), and `history_enabled: false` turns the whole
   feature off.
+- **Updating**: the gear dropdown's "Check for updates" item asks GitHub
+  whether a newer release is tagged. If there is one, "Update now"
+  downloads it, replaces this executable with it and restarts the meter —
+  no manual download, and no second UAC prompt (the new process inherits
+  the elevation this one already has). The build it replaced is left beside
+  it as `ShinraMeter-BPSR.exe.old` and deleted the next time the meter
+  starts. Releases tagged before this in-place-update feature shipped used a
+  `.zip` instead of a bare `.exe`, so for those the item still just offers a
+  download link.
 - All icons — class, Imagine, and toolbar — are compiled into the
   executable, so there's no `assets` folder shipped alongside it to lose,
   delete, or otherwise manage.

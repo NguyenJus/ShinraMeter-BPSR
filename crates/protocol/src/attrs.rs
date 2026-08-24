@@ -82,6 +82,31 @@ pub mod attr_id {
     /// and `pb::IMAGINE_PROFESSION_IDS`. Re-verify against a real capture if
     /// one ever becomes available.
     pub const SKILL_LEVEL_ID_LIST: i32 = 0x74;
+    /// `AttrSkillId` (100, `0x64`) — the skill an entity has just begun
+    /// casting (issue #245). BPSR reports a cast by *changing this attr* on
+    /// the caster rather than by sending a dedicated cast notify: BPSR-ZDPS
+    /// fires `OnSkillActivated` straight off this attr's delta
+    /// (`Managers/EncounterManager.cs:716`) and counts it as one cast
+    /// (`EncounterManager.cs:1780`), which is the same thing its Skill Cast
+    /// Timeline window is drawn from
+    /// (`Windows/SkillCastTimelineWindow.cs:91-127`). The id itself is
+    /// BPSR-ZDPS's decompiled `EnumEAttrType.cs:835` (`AttrSkillId = 100`).
+    ///
+    /// The obvious-looking alternative is not usable: `SyncClientUseSkill`
+    /// (`0x43`) is a **client -> server** call, so it only ever describes
+    /// the local player, and neither resonance-logs nor BPSR-ZDPS wires it
+    /// into its dispatch table at all.
+    ///
+    /// Confirmed against this project's own captures: across four
+    /// `inspect/dump-*.jsonl` files (53,371 parsed `AoiSyncDelta`
+    /// messages), attr ids 100, 101, 103, 106, 108 and 111 — BPSR-ZDPS's
+    /// `AttrSkillId`/`SkillStage`/`SkillLevel`/`SkillBeginTime`/
+    /// `SkillStageNum`/`SkillUuid` cluster — each occur exactly 1,612
+    /// times, i.e. they ride together as one skill-activation bundle at
+    /// ~3% of all deltas. Only `SKILL_ID` is read here; the rest of the
+    /// bundle is decoded by nobody and would add nothing the cast count
+    /// needs.
+    pub const SKILL_ID: i32 = 0x64;
     /// `AttrSceneBasicId` (341, `0x155`) — the scene id `tables::scene_name`
     /// is keyed by (issue #35, resolving its first item). Recovered by
     /// parsing BPSR-ZDPS's `EAttrType` enum out of the reference tool's
@@ -231,6 +256,23 @@ pub fn decode_name(raw: &[u8]) -> Option<String> {
 /// known ids (the five above) as well as unknown ones, each tagged with
 /// whether we decode it, instead of only unknown ids reaching the sink
 /// (slice B widened this from an unknowns-only hook).
+/// The skill id an attr delta says this entity has begun casting (issue
+/// #245), or `None` when the delta carries no [`attr_id::SKILL_ID`] — which
+/// is the overwhelmingly common case, since most deltas are HP or position.
+///
+/// Non-panicking like everything else in this module: an empty `raw_data`,
+/// an `id == 0` entry, a malformed varint, or a value outside `i32` are all
+/// skipped rather than propagated. A zero skill id is rejected too — the
+/// attr channel uses `0` for "no skill", and `bpsr_meter`'s per-skill maps
+/// are keyed by real ids.
+pub fn cast_skill_id_from_attrs(attrs: &[pb::Attr]) -> Option<i32> {
+    attrs
+        .iter()
+        .find(|attr| attr.id == attr_id::SKILL_ID && !attr.raw_data.is_empty())
+        .and_then(|attr| decode_varint_i32(&attr.raw_data))
+        .filter(|id| *id != 0)
+}
+
 pub fn player_info_from_attrs(
     uid: i64,
     attrs: &[pb::Attr],
@@ -423,6 +465,40 @@ mod tests {
         let mut buf = Vec::new();
         prost::encoding::encode_varint(123456u64, &mut buf);
         assert_eq!(decode_varint_i64(&buf), Some(123456));
+    }
+
+    /// Issue #245: the cast attr is absent from the overwhelming majority
+    /// of deltas (HP and position changes), so the common answer is `None`
+    /// and it must not be an error.
+    #[test]
+    fn a_delta_without_the_skill_attr_reports_no_cast() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::HP,
+            raw_data: vec![0x01],
+        }];
+        assert_eq!(cast_skill_id_from_attrs(&attrs), None);
+        assert_eq!(cast_skill_id_from_attrs(&[]), None);
+    }
+
+    #[test]
+    fn an_empty_or_malformed_skill_attr_reports_no_cast() {
+        assert_eq!(
+            cast_skill_id_from_attrs(&[pb::Attr {
+                id: attr_id::SKILL_ID,
+                raw_data: Vec::new(),
+            }]),
+            None
+        );
+        // A varint past `i32` is rejected outright, not truncated.
+        let mut raw_data = Vec::new();
+        prost::encoding::encode_varint(0x1_0000_0001, &mut raw_data);
+        assert_eq!(
+            cast_skill_id_from_attrs(&[pb::Attr {
+                id: attr_id::SKILL_ID,
+                raw_data,
+            }]),
+            None
+        );
     }
 
     #[test]
