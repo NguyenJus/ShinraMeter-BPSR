@@ -7403,7 +7403,14 @@ impl SkillTabs {
 // over the floor below. It stays inside the reference capture's own
 // 928x574 content box, so the window this is modelled on is still the
 // wider of the two.
-const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(864.0, 572.0);
+//
+// Issue #248 widened it once more, 864 -> 888: re-measuring `SkillColumn::
+// Name`'s width off the app's own font (156.9pt for the widest real skill
+// name found, see that column's doc comment) raised the widest tab's sum
+// again, 832 -> 856, which 864 no longer clears by the required 2 *
+// `SKILL_HEADER_PAD_X`. 888 keeps the same 8pt of slack over the new sum
+// that 864 kept over the old one, and is still inside that 928x574 box.
+const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(888.0, 572.0);
 /// Floor on the skill breakdown viewport's inner size (issue #181) so a
 /// resize can't shrink it into uselessness — tall enough for the header, tab
 /// strip and column-header row plus a couple of rows before the list
@@ -7430,7 +7437,12 @@ const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(864.0, 572.0);
 /// widths were only ever sized to their columns' *values*, so the labels
 /// overlapped even at the initial width. The widest tab's sum went 728 ->
 /// 832 and this floor with it, 752 -> 856.
-const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(856.0, 220.0);
+///
+/// Issue #248 raised it once more, 856 -> 880, in step with
+/// `SKILL_WINDOW_SIZE`: re-measuring the `Name` column grew the widest
+/// tab's sum 832 -> 856, and this floor — that sum plus the same 24.0
+/// inset — grows with it.
+const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(880.0, 220.0);
 
 /// One open breakdown window's own state (issue #16, D9): its sort column/
 /// direction, the screen position it was placed at when opened, and the
@@ -7831,21 +7843,43 @@ fn skill_scroll_thumb(
     ))
 }
 
+/// Gap between the player name's right edge and the Deaths pill's left edge
+/// (issue #246). Measured directly off `docs/reference/shinra-skills-ex.webp`:
+/// scanning the header row (y=36) for `"Ranmori"`'s last glyph stroke and
+/// the pill's rounded-rect fill finds the name ending at x=156 and the pill
+/// starting at x=182, a 26px gap. That lines up with `Skills.xaml`'s own
+/// source: the pill cluster's `StackPanel` (`Skills.xaml:172-176`) carries
+/// `Margin="20,0"` inside the header's flexible middle grid column, right
+/// after the name — the 6px difference from the pixel read is font-metric
+/// slop between the reference's rendered text and the raw XAML number, not
+/// a second, disagreeing source.
+const SKILL_DEATHS_PILL_GAP: f32 = 26.0;
+
 /// Where the header's pill cluster starts — the Deaths pill's left edge,
-/// and with it every pill that follows it: right-aligned into the header,
-/// one `SKILL_HEADER_PAD_X` clear of the close button. Shares
-/// `SKILL_CLOSE_HIT_SIZE` with `skill_close_rect` so growing that button
-/// (issue #218) pushes the cluster left instead of letting the two overlap.
+/// and with it every pill that follows it: immediately after the player
+/// name (issue #246), not right-aligned against the close button. The old
+/// close-relative placement tucked the cluster under the close button; the
+/// reference (`Skills.xaml:172-176`) instead sits its whole pill cluster in
+/// the header's flexible middle column, directly following the name — see
+/// `SKILL_DEATHS_PILL_GAP` for the sourcing.
+///
+/// `PlayerRow::name` is an unbounded, network-decoded string (never
+/// truncated — the same "paint it in full" decision the row list's own name
+/// column makes at issue #168), so a long enough name can push
+/// `name_right + SKILL_DEATHS_PILL_GAP` past the close button entirely.
+/// Clamped so `left + cluster_width` never crosses `close_left -
+/// SKILL_HEADER_PAD_X` — which is exactly where the pre-#246 close-relative
+/// formula put the cluster by construction, so that placement survives as
+/// this one's ceiling: the gap-after-name position is only ever the
+/// *preferred* one, never unconditional.
 ///
 /// Takes the *cluster's* width, not the Deaths pill's alone (issue #254):
-/// the death-time pill sits to the Deaths pill's right, so right-aligning
-/// on the first pill only would push the last one under the close button.
-fn skill_deaths_pill_left(header_rect: egui::Rect, cluster_width: f32) -> f32 {
-    header_rect.right()
-        - SKILL_HEADER_PAD_X
-        - SKILL_CLOSE_HIT_SIZE
-        - SKILL_HEADER_PAD_X
-        - cluster_width
+/// the death-time pill sits to the Deaths pill's right, so clamping on the
+/// first pill only would push the last one under the close button.
+fn skill_deaths_pill_left(name_right: f32, close_left: f32, cluster_width: f32) -> f32 {
+    let preferred = name_right + SKILL_DEATHS_PILL_GAP;
+    let max_left = close_left - SKILL_HEADER_PAD_X - cluster_width;
+    preferred.min(max_left)
 }
 
 /// Total width of the header's pill cluster: the Deaths pill, plus the
@@ -7945,6 +7979,21 @@ fn draw_skill_window(
     if let Some(texture) = row.class.and_then(|class| icons.classes.get(class)) {
         painter.image(texture.id(), icon_rect, UV_FULL, CLASS_ICON_TINT);
     }
+    // Issue #246 anchors the pill cluster on the player name's right edge,
+    // so the name has to be *measured* before the cluster can be placed —
+    // while issue #270's clip below bounds the name against that cluster.
+    // Laying the galley out here, rather than reading the rect
+    // `paint_text` hands back, is what breaks the circle between the two.
+    let name_left = icon_rect.right() + SKILL_HEADER_PAD_X;
+    let name_right = name_left
+        + painter
+            .layout_no_wrap(
+                row.name.clone(),
+                regular(FONT_SIZE_SKILL_HEADER_NAME),
+                egui::Color32::WHITE,
+            )
+            .rect
+            .width();
 
     // D10: the Deaths pill, and beside it issue #254's death-time pill —
     // the first two of the reference's four-capsule cluster
@@ -7994,8 +8043,13 @@ fn draw_skill_window(
             pill_size(text_size, pill.icon_side, SKILL_PILL_HEIGHT),
         )
     });
+    // The close button's rect is derived here, ahead of its own paint
+    // below, so the cluster can be clamped clear of it — see
+    // `skill_deaths_pill_left`.
+    let close_rect = skill_close_rect(rect);
     let cluster_left = skill_deaths_pill_left(
-        header_rect,
+        name_right,
+        close_rect.left(),
         skill_header_pill_cluster_width(
             deaths_pill_size.x,
             death_time_sizes.map(|(_, size)| size.x),
@@ -8024,10 +8078,7 @@ fn draw_skill_window(
     ));
     paint_text(
         &name_painter,
-        egui::pos2(
-            icon_rect.right() + SKILL_HEADER_PAD_X,
-            header_rect.center().y,
-        ),
+        egui::pos2(name_left, header_rect.center().y),
         egui::Align2::LEFT_CENTER,
         &row.name,
         regular(FONT_SIZE_SKILL_HEADER_NAME),
@@ -8061,7 +8112,6 @@ fn draw_skill_window(
     // half the side) — and a pointing-hand cursor. The glyph itself used to
     // be the whole button: a 20pt square with no radius, no hover feedback
     // and no cursor change, so nothing about it read as clickable.
-    let close_rect = skill_close_rect(rect);
     let close = ui.interact(
         close_rect,
         ui.id().with(("skill_close", row.uid)),
@@ -14463,6 +14513,40 @@ mod tests {
         );
     }
 
+    /// Issue #248: `Name` used to be a flat 160.0 guess, narrow enough that
+    /// a real, generously-long skill name clipped against the next column
+    /// with almost no trailing gap. This renders the widest real name found
+    /// (`shinra-skills-ex.webp`'s "Harmonious Fire Avalanche") through the
+    /// exact font `draw_skill_window`'s row loop paints `Name` cells with
+    /// (`regular(FONT_SIZE_ROW)`) and checks the column's stated width
+    /// clears it by at least the reference's own tightest inter-column
+    /// header gap (16px, measured between "Avg crit" and "Avg white").
+    #[test]
+    fn skill_name_column_clears_the_widest_real_skill_name_before_the_next_column() {
+        let ctx = egui::Context::default();
+        // Load the real (non-empty) default fonts so glyph metrics match
+        // what the row loop actually paints with.
+        ctx.run_ui(egui::RawInput::default(), |_ui| {})
+            .drop_without_applying_deltas();
+        let widest = "Harmonious Fire Avalanche";
+        let text_width = ctx.fonts_mut(|f| {
+            f.layout_no_wrap(
+                widest.to_owned(),
+                regular(FONT_SIZE_ROW),
+                egui::Color32::WHITE,
+            )
+            .rect
+            .size()
+            .x
+        });
+        let gap = skills::SkillColumn::Name.width() - text_width;
+        assert!(
+            gap >= 16.0,
+            "Name's width must clear \"{widest}\" ({text_width}pt) by at least the \
+             reference's tightest column gap (16px), got {gap}"
+        );
+    }
+
     /// Widening the icon column must not push the column set past the
     /// initial window's content width — `column_anchors_from_widths` would
     /// silently shrink every column to fit (the trap issue #192 hit).
@@ -14580,6 +14664,87 @@ mod tests {
             skill_rows_rect(rect, col_header_rect).top(),
             tabs_rect.bottom()
         );
+    }
+
+    /// Issue #248: the skill table used to be laid out right-to-left from
+    /// the window's right inset against fixed column widths, so all surplus
+    /// width landed in the *left* gutter — measured at 60px at the minimum
+    /// width, 68px at the initial one and ~290px at 1074 wide, i.e.
+    /// widening the window shoved the whole table right, behind a growing
+    /// empty band.
+    ///
+    /// Issue #245's `skills::column_widths` is what closes that gap, and it
+    /// is the reading the main meter window already has: the leftover goes
+    /// to `Name` — the one column with no bounded formatter — so the widths
+    /// sum to the content width exactly and `column_anchors_from_widths`'
+    /// right-to-left walk lands the leading column on the content's left
+    /// edge at every size, the same way `draw_rows` starts the main meter's
+    /// anchors from `avail.left()`. Checked end to end here, through the
+    /// same two calls `draw_skill_window` makes.
+    #[test]
+    fn skill_columns_stay_left_inset_at_every_window_width() {
+        let columns = skills::SkillTab::Dps.columns();
+        let layout_at = |window_width: f32| {
+            let left = SKILL_HEADER_PAD_X;
+            let right = window_width - SKILL_HEADER_PAD_X;
+            let widths = skills::column_widths(columns, right - left);
+            (
+                column_anchors_from_widths(left, right, &widths, 0.0),
+                widths,
+            )
+        };
+        let surplus = 300.0;
+        let (narrow, narrow_widths) = layout_at(SKILL_WINDOW_MIN_SIZE.x);
+        let (wide, wide_widths) = layout_at(SKILL_WINDOW_MIN_SIZE.x + surplus);
+
+        // The leading column's left edge sits one pad in from the window at
+        // both sizes: no dead left gutter opens up as the window grows.
+        assert_eq!(narrow[0] - narrow_widths[0], SKILL_HEADER_PAD_X);
+        assert_eq!(wide[0] - wide_widths[0], SKILL_HEADER_PAD_X);
+        // The surplus went to `Name` rather than to a gutter at either end
+        // — every other column keeps its stated width, and the trailing
+        // column stays pinned one pad in from the window's right edge.
+        let name = columns
+            .iter()
+            .position(|c| *c == skills::SkillColumn::Name)
+            .expect("every tab shows the Name column");
+        assert_eq!(wide_widths[name] - narrow_widths[name], surplus);
+        for (i, column) in columns.iter().enumerate() {
+            if i != name {
+                assert_eq!(wide_widths[i], column.width(), "{column:?} was resized");
+            }
+        }
+        assert_eq!(
+            *wide.last().unwrap(),
+            SKILL_WINDOW_MIN_SIZE.x + surplus - SKILL_HEADER_PAD_X
+        );
+    }
+
+    /// Below the columns' own sum there is no leftover for
+    /// `skills::column_widths` to hand `Name`, so the pre-existing
+    /// proportional shrink (`column_anchors_from_widths`) still takes the
+    /// full inset width — the table spans the window rather than
+    /// left-aligning inside a slot it no longer fits.
+    #[test]
+    fn skill_columns_still_span_the_window_when_it_is_too_narrow() {
+        let columns = skills::SkillTab::Dps.columns();
+        let window_width = SKILL_WINDOW_MIN_SIZE.x / 2.0;
+        let left = SKILL_HEADER_PAD_X;
+        let right = window_width - SKILL_HEADER_PAD_X;
+        let widths = skills::column_widths(columns, right - left);
+        // Nothing to give away, so the shrink is the anchors' job alone.
+        for (width, column) in widths.iter().zip(columns) {
+            assert_eq!(*width, column.width());
+        }
+        let anchors = column_anchors_from_widths(left, right, &widths, 0.0);
+        assert_eq!(*anchors.last().unwrap(), right);
+        // Same graceful degradation `column_anchors_degrade_gracefully_in_
+        // a_narrow_window` pins for the main meter: scaled slots, still
+        // ordered, still inside the window.
+        assert!(anchors[0] >= 0.0, "columns spilled past the left edge");
+        for pair in anchors.windows(2) {
+            assert!(pair[0] < pair[1]);
+        }
     }
 
     /// Issue #228: dragging the window down to `SKILL_WINDOW_MIN_SIZE`
@@ -14815,18 +14980,56 @@ mod tests {
         assert_eq!(close.top(), rect.top() + SKILL_HEADER_PAD_Y);
     }
 
-    /// The deaths pill reserves its room off the close button's *hit* size,
-    /// so growing that button (issue #218) pushes the pill left instead of
-    /// letting the two overlap.
+    /// Issue #246: the Deaths pill sits `SKILL_DEATHS_PILL_GAP` after the
+    /// player name's right edge, not right-aligned against the close
+    /// button — the reference (`Skills.xaml:172-176`) places its whole pill
+    /// cluster in the header's flexible middle column, right after the
+    /// name. That preferred placement only applies while the cluster still
+    /// clears the close button — a typical name (well short of the
+    /// window's width) does.
     #[test]
-    fn deaths_pill_clears_the_close_button_by_one_header_pad() {
+    fn deaths_pill_sits_one_reference_gap_after_a_typical_name() {
         let rect = skill_window_rect();
         let header = skill_header_rect(rect);
-        let pill_width = 64.0;
-        let left = skill_deaths_pill_left(header, pill_width);
-        assert_eq!(
-            left + pill_width + SKILL_HEADER_PAD_X,
-            skill_close_rect(rect).left()
+        let close_left = skill_close_rect(rect).left();
+        let cluster_width = 64.0;
+        let name_right = header.left() + 200.0;
+
+        let left = skill_deaths_pill_left(name_right, close_left, cluster_width);
+
+        assert_eq!(left, name_right + SKILL_DEATHS_PILL_GAP);
+        assert!(
+            left + cluster_width < close_left,
+            "a typical name plus a typical cluster width must clear the close button"
+        );
+    }
+
+    /// `PlayerRow::name` is an unbounded, network-decoded string
+    /// (`crates/meter/src/stats.rs`), so a long enough name would push the
+    /// gap-after-name placement's cluster past the close button outright.
+    /// Uses a name wide enough that the unclamped formula would have landed
+    /// the cluster's *left* edge past the close button's left edge, to
+    /// prove this is more than a last-pixel clamp.
+    #[test]
+    fn deaths_pill_stays_left_of_the_close_button_for_a_long_name() {
+        let rect = skill_window_rect();
+        let close_rect = skill_close_rect(rect);
+        let cluster_width = 64.0;
+        let name_right = close_rect.left() + 500.0;
+
+        let left = skill_deaths_pill_left(name_right, close_rect.left(), cluster_width);
+
+        // The unclamped gap-after-name formula would have placed the
+        // cluster well past the close button; the clamp must have
+        // overridden it.
+        assert!(left < name_right + SKILL_DEATHS_PILL_GAP);
+        assert!(
+            left + cluster_width <= close_rect.left() - SKILL_HEADER_PAD_X,
+            "the cluster must stay clear of the close button no matter how wide the name is"
+        );
+        assert!(
+            left + cluster_width <= rect.right(),
+            "the cluster must also stay inside the window"
         );
     }
 
@@ -14836,7 +15039,7 @@ mod tests {
     #[test]
     fn the_death_time_pill_follows_the_deaths_pill_by_one_gap() {
         let rect = skill_window_rect();
-        let header = skill_header_rect(rect);
+        let close_left = skill_close_rect(rect).left();
         let deaths_width = 64.0;
         let death_time_width = 96.0;
 
@@ -14846,7 +15049,11 @@ mod tests {
             deaths_width + SKILL_HEADER_PILL_GAP + death_time_width
         );
 
-        let deaths_left = skill_deaths_pill_left(header, cluster);
+        // A name that already reaches the close button, so it is
+        // `skill_deaths_pill_left`'s clamp — not issue #246's
+        // after-the-name preference — placing the cluster here: the clamp
+        // is the branch that owes the close button its clearance.
+        let deaths_left = skill_deaths_pill_left(close_left, close_left, cluster);
         let death_time_left = deaths_left + deaths_width + SKILL_HEADER_PILL_GAP;
         assert!(
             death_time_left >= deaths_left + deaths_width,
@@ -14854,7 +15061,7 @@ mod tests {
         );
         assert_eq!(
             death_time_left + death_time_width + SKILL_HEADER_PAD_X,
-            skill_close_rect(rect).left(),
+            close_left,
             "the last pill in the cluster is the one that clears the close button"
         );
     }
@@ -14877,7 +15084,14 @@ mod tests {
     #[test]
     fn an_overlong_name_stays_clear_of_the_pill_cluster() {
         let row = PlayerRow {
-            name: "A Name So Long It Would Otherwise Run Under The Header Pills".to_string(),
+            // Issue #246 moved the cluster to just after the name, so a
+            // merely long name no longer runs under it — the cluster
+            // follows. Only a name long enough to hit
+            // `skill_deaths_pill_left`'s clamp can still collide, so this
+            // is one.
+            name: "A Name So Long It Would Otherwise Run Under The Header Pills"
+                .repeat(3)
+                .to_string(),
             deaths: 3,
             dead_ms: Some(12_400),
             ..sample_row(None)
@@ -14913,7 +15127,6 @@ mod tests {
         output.drop_without_applying_deltas();
 
         let name_rect = name_rect.expect("the header never painted the player name");
-        let header = skill_header_rect(screen_rect);
         let deaths_pill = StatPill {
             value: "3",
             icon: None,
@@ -14944,15 +15157,22 @@ mod tests {
             SKILL_PILL_HEIGHT,
         )
         .x;
-        let cluster_left = skill_deaths_pill_left(
-            header,
-            skill_header_pill_cluster_width(deaths_width, Some(death_time_width)),
-        );
+        // The name runs far past the space before the cluster, so issue
+        // #246's preference gives way to `skill_deaths_pill_left`'s clamp
+        // and the cluster sits one header pad clear of the close button —
+        // exactly where it sat before that preference existed.
+        let cluster_left = skill_close_rect(screen_rect).left()
+            - SKILL_HEADER_PAD_X
+            - skill_header_pill_cluster_width(deaths_width, Some(death_time_width));
 
+        // Equality, not just "clear of": the clip is what stops the name,
+        // so its painted right edge lands *on* the cluster's pad. A name
+        // that stopped short of it would mean the clamp never engaged and
+        // this test had lost its teeth.
         assert!(
-            name_rect.right() <= cluster_left - SKILL_HEADER_PAD_X + 0.5,
-            "name right edge {} must stay clear of the cluster by SKILL_HEADER_PAD_X \
-             (cluster_left {cluster_left}, pad {SKILL_HEADER_PAD_X})",
+            (name_rect.right() - (cluster_left - SKILL_HEADER_PAD_X)).abs() <= 0.5,
+            "name right edge {} must be clipped exactly one SKILL_HEADER_PAD_X \
+             short of the cluster (cluster_left {cluster_left}, pad {SKILL_HEADER_PAD_X})",
             name_rect.right()
         );
     }

@@ -118,7 +118,32 @@ impl SkillColumn {
             // measured the reference's row icon at 38px across, clearing
             // the name text (which starts at x=78) by ~9px.
             SkillColumn::Icon => 48.0,
-            SkillColumn::Name => 160.0,
+            // Issue #248: the old 160.0 was a flat, undocumented guess —
+            // narrow enough that "Harmonious Fire Avalanche" ("Skill name"
+            // column, row 6 of `shinra-skills-ex.webp` — a real skill name
+            // from the reference's own capture, not something this
+            // project's `skill_name` table happens to carry, since the
+            // reference is a different build/decoder of the same game)
+            // measures 156.9pt through this app's own `regular
+            // (FONT_SIZE_ROW)` font (`ui.rs`'s `skill_name_column_clears_
+            // the_widest_real_skill_name_before_the_next_column` test),
+            // leaving under 4pt of trailing room before the `Damage`
+            // column starts.
+            //
+            // The reference itself does not pin an exact trailing gap here:
+            // `Skills.xaml`'s row template has no fixed `Name`-column width
+            // for us to read off, and the capture's own gap after a long
+            // name is inflated by a per-skill "loadout set" watermark
+            // (e.g. "Balder's Seal") this app doesn't render. Absent a
+            // pinned number, this reuses `ui.rs`'s `SKILL_HEADER_PAD_X`
+            // (12.0) doubled — 24.0 — as the trailing gap: it is the same
+            // "breathing room" unit the header already uses twice over
+            // (icon-to-name, and now name-to-pill via `SKILL_DEATHS_PILL_
+            // GAP`'s derivation), and it comfortably clears the reference's
+            // *tightest* measured inter-column header gaps (16-18px, e.g.
+            // "Avg crit" -> "Avg white"). 156.9 + 24.0 = 180.9, rounded up
+            // to the next multiple of 8 = 184.0.
+            SkillColumn::Name => 184.0,
             // `fmt_short` bounds every damage/count figure to ~7 chars,
             // same budget `ColumnKind::Damage`/`Hits` use in settings.rs —
             // and these five keep it, their labels being the short ones:
@@ -771,17 +796,19 @@ mod tests {
 
     #[test]
     fn every_tabs_columns_fit_the_windows_minimum_content_width() {
-        // `SKILL_WINDOW_MIN_SIZE.x` (856) minus the column header row's
+        // `SKILL_WINDOW_MIN_SIZE.x` (880) minus the column header row's
         // two `SKILL_HEADER_PAD_X` insets (24) — the budget `ui.rs`'s
         // `skill_window_min_width_fits_every_column_at_its_stated_width`
         // pins for the widest tab, applied to all of them. It grew with
         // the widths themselves when issue #245's live-window pass found
         // the header labels overflowing their columns (`SkillColumn::
-        // width`); `ui.rs` owns that constant, so this is the mirror of
-        // it that this `egui`-free module can assert.
+        // width`), and again at issue #248's `Name` re-measure (184.0, up
+        // from 160.0), which took the widest tab's sum 832 -> 856 and the
+        // floor 856 -> 880 with it; `ui.rs` owns that constant, so this is
+        // the mirror of it that this `egui`-free module can assert.
         for tab in SKILL_TABS {
             let total: f32 = tab.columns().iter().map(|c| c.width()).sum();
-            assert!(total <= 832.0, "{tab:?} needs {total}pt of column width");
+            assert!(total <= 856.0, "{tab:?} needs {total}pt of column width");
         }
     }
 
