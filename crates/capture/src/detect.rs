@@ -20,6 +20,21 @@ pub const LOGIN_RETURN_SIGNATURE_SIZE: usize = 0x62;
 /// cannot spin the scan indefinitely.
 const MAX_SCAN_FRAGMENTS: usize = 1000;
 
+/// Payload-size ceiling for the subnet-reconnect path (issue #258).
+///
+/// The subnet path has no protocol evidence at all — "same /16, some
+/// payload" is all it requires — so it is otherwise wide open to adopting
+/// the first thing that sends *any* bytes from the known datacenter after a
+/// teardown, including an unrelated, co-located service (CDN, patch server)
+/// racing the real reconnect. Every legitimate reconnect in the field logs
+/// that prompted this issue arrived at 98 bytes ([`LOGIN_RETURN_SIGNATURE_SIZE`])
+/// or smaller (real handshake/control fragments); the one mis-adopt carried
+/// a full 1400-byte MTU payload — bulk data, not a handshake. This cap sits
+/// well above the largest size ever seen from a genuine reconnect and well
+/// below the smallest observed false positive, so it closes the race
+/// instead of merely papering over it.
+pub const SUBNET_ADOPTION_MAX_PAYLOAD: usize = 512;
+
 /// A TCP 4-tuple identifying one connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Conn {
@@ -165,7 +180,7 @@ fn is_private(addr: [u8; 4]) -> bool {
 /// Whether a packet may be adopted as the game-server stream purely because
 /// it sits in the known /16 subnet.
 ///
-/// Two requirements beyond the subnet match, both load-bearing:
+/// Three requirements beyond the subnet match, all load-bearing:
 ///
 /// * **Direction.** The packet's *source* must be the non-RFC1918 endpoint
 ///   whose /16 is `known_subnet`, i.e. it is a server→client packet. The
@@ -177,8 +192,15 @@ fn is_private(addr: [u8; 4]) -> bool {
 ///   bytes and their raw sequence number is one below the first data byte
 ///   (SYN consumes a sequence number), so resyncing the reassembler onto one
 ///   opens a phantom 1-byte gap that stalls the stream.
+/// * **Size.** Capped at [`SUBNET_ADOPTION_MAX_PAYLOAD`] (issue #258): a
+///   full-MTU-sized payload on a brand-new connection is bulk data from an
+///   unrelated, co-located service, not the small handshake fragment a real
+///   reconnect sends first.
 pub fn subnet_adoption_eligible(conn: &Conn, payload: &[u8], known_subnet: [u8; 2]) -> bool {
-    !payload.is_empty() && !is_private(conn.src) && [conn.src[0], conn.src[1]] == known_subnet
+    !payload.is_empty()
+        && payload.len() <= SUBNET_ADOPTION_MAX_PAYLOAD
+        && !is_private(conn.src)
+        && [conn.src[0], conn.src[1]] == known_subnet
 }
 
 /// Whether the signature-scan paths (`looks_like_game_server`,
@@ -654,6 +676,60 @@ mod tests {
         assert!(d.detects(&second, b"payload", false));
         d.adopt(&second);
         assert!(!d.detects(&first, b"payload", false));
+    }
+
+    // --- subnet-path payload-size ceiling (issue #258) ---
+
+    #[test]
+    fn subnet_path_rejects_a_full_mtu_payload_even_with_matching_subnet_and_direction() {
+        // Regression for issue #258: a co-located non-game connection in the
+        // known subnet (e.g. a CDN/patch server sharing the datacenter's
+        // /16) can race the real reconnect and win purely because it sent
+        // *some* payload first. Every legitimate reconnect observed in the
+        // field logs came in at 98 bytes or smaller; the mis-adopt that
+        // prompted this issue carried a full 1400-byte MTU payload. Capping
+        // the subnet path's payload size keeps it from ever winning that
+        // race, rather than merely cleaning up after it wins.
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        let big_payload = vec![0u8; SUBNET_ADOPTION_MAX_PAYLOAD + 1];
+        assert!(!d.detects(
+            &server_to_client([203, 0, 113, 9], 5001),
+            &big_payload,
+            false
+        ));
+    }
+
+    #[test]
+    fn subnet_path_accepts_a_payload_at_the_size_cap() {
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        let payload = vec![0u8; SUBNET_ADOPTION_MAX_PAYLOAD];
+        assert!(d.detects(&server_to_client([203, 0, 113, 9], 5001), &payload, false));
+    }
+
+    #[test]
+    fn subnet_path_rejects_a_full_mtu_decoy_ahead_of_the_real_login_return() {
+        // The exact issue #258 shape: a teardown re-arms detection
+        // (`server_adopted = false`), a decoy connection in the known
+        // subnet arrives first with a full-MTU payload, and the real
+        // reconnect's login-return packet follows immediately after. Only
+        // the second call may return `true` — win.rs sends
+        // `ProtocolEvent::ServerChanged` exactly once per `true` result, so
+        // this is the host-testable equivalent of "exactly one
+        // ServerChanged is emitted, and it adopts the real flow."
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+
+        let decoy = server_to_client([203, 0, 113, 200], 5003);
+        let decoy_payload = vec![0xABu8; 1400];
+        assert!(
+            !d.detects(&decoy, &decoy_payload, false),
+            "a full-MTU payload from a brand-new subnet connection must not win the reconnect race"
+        );
+
+        let mut real_payload = vec![0u8; LOGIN_RETURN_SIGNATURE_SIZE];
+        real_payload[0..10].copy_from_slice(&LOGIN_RETURN_SIGNATURE_1);
+        real_payload[14..20].copy_from_slice(&LOGIN_RETURN_SIGNATURE_2);
+        let real = server_to_client([203, 0, 113, 201], 10137);
+        assert!(d.detects(&real, &real_payload, false));
     }
 
     #[test]
