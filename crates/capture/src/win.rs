@@ -37,7 +37,7 @@ use crate::error::CaptureError;
 use crate::restart::CaptureRestart;
 use crate::tcp::TcpReassembler;
 use crate::throughput::{
-    self, Heartbeat, HeartbeatKind, SharedMonitor, Tick, WATCHDOG_TICK, run_watchdog,
+    self, Heartbeat, HeartbeatKind, PacketRecord, SharedMonitor, Tick, WATCHDOG_TICK, run_watchdog,
 };
 
 /// WinDivert filter: every non-loopback TCP/IP packet, in either direction.
@@ -266,11 +266,15 @@ fn heartbeat_loop(monitor: &SharedMonitor, stop: &AtomicBool, restart: &CaptureR
         // decoder for minutes, which no amount of further sniffing fixes —
         // only re-anchoring does.
         if tick.restart {
+            // The connection is named from the tick rather than from a local:
+            // this thread has no `known_server`, and a session with several
+            // zone changes needs the log to say *which* flow stalled.
             log::error!(
                 "capture: nothing has reached the decoder in {:?} while packets kept arriving on \
-                 the tracked connection; re-running server detection and reassembly from scratch \
-                 (issue #214)",
+                 the tracked connection {}; re-running server detection and reassembly from \
+                 scratch (issue #214)",
                 throughput::STALL_RESTART_AFTER,
+                describe(tick.tracked.as_ref()),
             );
             restart.request();
         }
@@ -295,6 +299,31 @@ fn recv_packet(api: &Api, handle: HANDLE, buffer: &mut [u8]) -> Result<usize, st
     unsafe { api.recv(handle, buffer, addr.as_mut_ptr()) }
 }
 
+/// Sets the shared stop flag when the packet loop leaves `recv_loop` by any
+/// route at all.
+///
+/// Only [`CaptureHandle::shutdown_and_close`] used to set it, so a
+/// `recv_loop` that gave up on its own — a handle dead for
+/// [`MAX_CONSECUTIVE_RECV_ERRORS`] receives in a row, or an event channel
+/// whose pipeline thread is gone — left [`heartbeat_loop`]'s watchdog awake
+/// for the rest of the session, waking every [`WATCHDOG_TICK`] to warn about
+/// a capture subsystem that is permanently dead. A `Drop` guard rather than a
+/// store at each `break`/`return` so a future exit path cannot forget to do
+/// it.
+struct StopOnExit(Arc<AtomicBool>);
+
+impl StopOnExit {
+    fn is_set(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for StopOnExit {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 fn recv_loop(
     api: &Api,
     handle: HANDLE,
@@ -304,6 +333,7 @@ fn recv_loop(
     inspect_sink: Option<Arc<dyn InspectSink>>,
     monitor: SharedMonitor,
 ) {
+    let stop = StopOnExit(stop);
     let mut buffer = vec![0u8; RECV_BUFFER_SIZE];
     let mut known_server: Option<Conn> = None;
     let mut detector = ServerDetector::new();
@@ -316,7 +346,7 @@ fn recv_loop(
 
     log::info!("capture: WinDivert sniff loop started on filter {FILTER:?}");
 
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.is_set() {
         if restart.take_requested() {
             log::info!(
                 "capture: restart requested; dropping the tracked connection {} and re-running server detection",
@@ -346,7 +376,7 @@ fn recv_loop(
                 // `CaptureHandle::stop` sets the flag *before* calling
                 // `WinDivertShutdown`, so an expected shutdown wakeup always
                 // finds it set: this is the normal exit, not a failure.
-                if stop.load(Ordering::Relaxed) {
+                if stop.is_set() {
                     break;
                 }
                 consecutive_errors += 1;
@@ -430,16 +460,14 @@ fn recv_loop(
                 detector.adopt(&conn);
                 reassembler.resync(seq);
                 decoder.reset();
-                monitor.note_adopted();
+                monitor.note_adopted(conn);
                 if tx.send(ProtocolEvent::ServerChanged).is_err() {
                     break;
                 }
             }
         }
 
-        if !payload.is_empty() {
-            monitor.record_packet(now);
-        }
+        let payload_packet = !payload.is_empty();
         reassembler.push(seq, payload);
         if reassembler.take_loss() {
             log::info!(
@@ -449,12 +477,19 @@ fn recv_loop(
         }
         let stream = reassembler.take_stream();
 
-        if !stream.is_empty() {
-            monitor.record_delivered(stream.len(), now);
-        }
-        // Published rather than read back at heartbeat time: the watchdog
-        // thread decides when to log and cannot reach the reassembler.
-        monitor.record_gap_cache(reassembler.gap_segments(), reassembler.gap_bytes());
+        // One lock for the whole packet's accounting rather than one per
+        // counter. The gap cache is published here rather than read back at
+        // heartbeat time: the watchdog thread decides when to log and cannot
+        // reach the reassembler.
+        monitor.record(
+            PacketRecord {
+                payload_packet,
+                delivered: stream.len(),
+                gap_segments: reassembler.gap_segments(),
+                gap_bytes: reassembler.gap_bytes(),
+            },
+            now,
+        );
 
         if stream.is_empty() {
             continue;

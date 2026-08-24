@@ -26,6 +26,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::detect::Conn;
+
 /// How often a throughput line is emitted. Long enough that a busy capture
 /// adds one line a minute to a log a user might have to hand over, short
 /// enough that a wedge is visible well inside a single raid.
@@ -128,6 +130,35 @@ pub struct Tick {
     pub beat: Option<Heartbeat>,
     /// Whether capture should re-anchor itself now (#214).
     pub restart: bool,
+    /// The connection capture currently tracks. Carried so the watchdog
+    /// thread — which has no `known_server` local of its own — can name the
+    /// stalled flow in the #214 restart line, the way the inline branch it
+    /// replaced did.
+    pub tracked: Option<Conn>,
+}
+
+/// One packet's worth of hot-path accounting, applied in a single
+/// [`SharedMonitor::record`] call.
+///
+/// The recording side used to call `record_packet`, `record_delivered` and
+/// `record_gap_cache` one at a time, which is three separate lock
+/// acquisitions per delivering packet on top of
+/// [`SharedMonitor::record_observed`]'s. Batching them is what makes the
+/// "once or twice per packet" claim on [`SharedMonitor`] true.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PacketRecord {
+    /// The packet carried payload on the adopted connection.
+    pub payload_packet: bool,
+    /// Bytes reassembly handed to the decoder because of this packet.
+    ///
+    /// Zero means nothing came out, which must *not* be recorded as a
+    /// delivery: a delivery clears the stall timer, so a zero-byte one would
+    /// mask exactly the wedge #214 exists to catch. The guard lives here
+    /// rather than at the (Windows-only, untestable) call site.
+    pub delivered: usize,
+    /// Reassembly's out-of-order cache after the packet.
+    pub gap_segments: usize,
+    pub gap_bytes: usize,
 }
 
 /// Rate-limited accounting of bytes reaching the decoder, plus the verdict
@@ -156,8 +187,10 @@ pub struct ThroughputMonitor {
     /// clock rather than only when a packet happens to reach the bottom of
     /// the loop (#271), that claim has to be checked rather than assumed.
     last_packet: Option<Instant>,
-    /// Whether a game connection is currently adopted, for the log line.
-    adopted: bool,
+    /// The adopted game connection, or `None` when detection has not
+    /// adopted one. Kept as the connection rather than a bare "adopted"
+    /// flag so the watchdog can name it (#214).
+    tracked: Option<Conn>,
     /// Reassembly's out-of-order cache, republished by the capture thread
     /// so the watchdog can report it without touching the reassembler.
     gap_segments: usize,
@@ -182,7 +215,7 @@ impl ThroughputMonitor {
             last_delivery: start,
             packets_since_delivery: 0,
             last_packet: None,
-            adopted: false,
+            tracked: None,
             gap_segments: 0,
             gap_bytes: 0,
         }
@@ -218,9 +251,25 @@ impl ThroughputMonitor {
         self.gap_bytes = bytes;
     }
 
-    /// Notes that capture has adopted a game connection.
-    pub fn note_adopted(&mut self) {
-        self.adopted = true;
+    /// Notes that capture has adopted the game connection `conn`.
+    pub fn note_adopted(&mut self, conn: Conn) {
+        self.tracked = Some(conn);
+    }
+
+    /// Applies one packet's accounting.
+    ///
+    /// The order is load-bearing: the payload packet is counted before the
+    /// delivery, because a delivery clears the packets-since-delivery
+    /// counter the restart verdict reads — swapping them would leave a
+    /// delivering packet looking like the start of a stall.
+    pub fn record(&mut self, packet: PacketRecord, now: Instant) {
+        if packet.payload_packet {
+            self.record_packet(now);
+        }
+        if packet.delivered > 0 {
+            self.record_delivered(packet.delivered, now);
+        }
+        self.record_gap_cache(packet.gap_segments, packet.gap_bytes);
     }
 
     /// Notes that the tracked connection is gone — torn down, or dropped by
@@ -230,7 +279,7 @@ impl ThroughputMonitor {
     /// `last_delivery` alone, so the heartbeat can still say how long it has
     /// been since the last byte.
     pub fn note_detached(&mut self) {
-        self.adopted = false;
+        self.tracked = None;
         self.packets_since_delivery = 0;
         self.last_packet = None;
     }
@@ -250,7 +299,7 @@ impl ThroughputMonitor {
             observed: self.window_observed,
             window,
             silent_for: now.saturating_duration_since(self.last_delivery),
-            adopted: self.adopted,
+            adopted: self.tracked.is_some(),
             gap_segments: self.gap_segments,
             gap_bytes: self.gap_bytes,
         };
@@ -295,9 +344,12 @@ impl ThroughputMonitor {
 /// A [`ThroughputMonitor`] the capture thread writes to and the watchdog
 /// thread reads from.
 ///
-/// The lock is taken once or twice per packet on the recording side and
-/// once per [`WATCHDOG_TICK`] on the deciding side; it is never held across
-/// a `log::` call, a `recv`, or anything else that can block.
+/// The lock is taken once or twice per packet on the recording side — once
+/// to count the packet the driver handed over, and once more, batched behind
+/// a single [`PacketRecord`], for a packet that survives classification and
+/// reaches reassembly — and once per [`WATCHDOG_TICK`] on the deciding side.
+/// It is never held across a `log::` call, a `recv`, or anything else that
+/// can block.
 #[derive(Clone)]
 pub struct SharedMonitor(Arc<Mutex<ThroughputMonitor>>);
 
@@ -327,20 +379,17 @@ impl SharedMonitor {
         self.lock().record_observed();
     }
 
-    pub fn record_packet(&self, now: Instant) {
-        self.lock().record_packet(now);
-    }
-
-    pub fn record_delivered(&self, bytes: usize, now: Instant) {
-        self.lock().record_delivered(bytes, now);
+    /// One packet's whole accounting under one lock; see [`PacketRecord`].
+    pub fn record(&self, packet: PacketRecord, now: Instant) {
+        self.lock().record(packet, now);
     }
 
     pub fn record_gap_cache(&self, segments: usize, bytes: usize) {
         self.lock().record_gap_cache(segments, bytes);
     }
 
-    pub fn note_adopted(&self) {
-        self.lock().note_adopted();
+    pub fn note_adopted(&self, conn: Conn) {
+        self.lock().note_adopted(conn);
     }
 
     pub fn note_detached(&self) {
@@ -353,6 +402,7 @@ impl SharedMonitor {
         Tick {
             beat: monitor.poll(now),
             restart: monitor.restart_due(now),
+            tracked: monitor.tracked,
         }
     }
 }
@@ -390,6 +440,25 @@ mod tests {
 
     fn monitor(start: Instant) -> ThroughputMonitor {
         ThroughputMonitor::with_limits(start, INTERVAL, STALL_AFTER)
+    }
+
+    fn conn() -> Conn {
+        Conn {
+            src: [10, 0, 0, 1],
+            src_port: 443,
+            dst: [192, 168, 1, 7],
+            dst_port: 51_000,
+        }
+    }
+
+    /// One delivering packet, the way the capture loop records it.
+    fn delivering(bytes: usize) -> PacketRecord {
+        PacketRecord {
+            payload_packet: true,
+            delivered: bytes,
+            gap_segments: 0,
+            gap_bytes: 0,
+        }
     }
 
     /// A flow that is still live: one adopted-flow packet every `step`
@@ -530,11 +599,85 @@ mod tests {
     fn a_heartbeat_reports_whether_a_connection_is_adopted() {
         let start = Instant::now();
         let mut m = monitor(start);
-        m.note_adopted();
+        m.note_adopted(conn());
         assert!(m.poll(start + INTERVAL).expect("first window").adopted);
 
         m.note_detached();
         assert!(!m.poll(start + INTERVAL * 2).expect("second window").adopted);
+    }
+
+    /// A tick has to name the connection it is talking about: the watchdog
+    /// thread logs #214's restart line and cannot reach the packet loop's
+    /// `known_server`.
+    #[test]
+    fn a_tick_names_the_tracked_connection() {
+        let start = Instant::now();
+        let shared = SharedMonitor::with_limits(start, INTERVAL, STALL_AFTER);
+        assert_eq!(shared.tick(start).tracked, None, "nothing adopted yet");
+
+        shared.note_adopted(conn());
+        assert_eq!(shared.tick(start).tracked, Some(conn()));
+
+        shared.note_detached();
+        assert_eq!(shared.tick(start).tracked, None, "the flow is gone");
+    }
+
+    /// The batched hot path has to land the same state the four separate
+    /// calls it replaced did.
+    #[test]
+    fn one_batched_record_accounts_the_whole_packet() {
+        let start = Instant::now();
+        let mut m = monitor(start);
+        m.record_observed();
+        m.record(
+            PacketRecord {
+                payload_packet: true,
+                delivered: 1_400,
+                gap_segments: 3,
+                gap_bytes: 700,
+            },
+            start,
+        );
+
+        let beat = m.poll(start + INTERVAL).expect("the interval elapsed");
+        assert_eq!(beat.bytes, 1_400);
+        assert_eq!(beat.packets, 1);
+        assert_eq!(beat.observed, 1);
+        assert_eq!(beat.gap_segments, 3);
+        assert_eq!(beat.gap_bytes, 700);
+        assert_eq!(beat.kind(), HeartbeatKind::Delivering);
+    }
+
+    /// A packet that reaches reassembly and yields nothing is the wedge
+    /// itself: recording it as a zero-byte delivery would keep clearing the
+    /// stall timer and #214 could never fire.
+    #[test]
+    fn a_packet_that_delivers_nothing_does_not_clear_the_stall_timer() {
+        let start = Instant::now();
+        let mut m = monitor(start);
+        let mut elapsed = 0;
+        while elapsed <= STALL_AFTER.as_secs() {
+            m.record(delivering(0), start + Duration::from_secs(elapsed));
+            elapsed += 10;
+        }
+        assert!(
+            m.restart_due(start + STALL_AFTER),
+            "packets arriving with nothing coming out is exactly #214's wedge"
+        );
+    }
+
+    /// The mirror image: bytes actually came out, so the timer is clear and
+    /// the packet must not count towards a stall.
+    #[test]
+    fn a_batched_delivery_clears_the_stall_timer() {
+        let start = Instant::now();
+        let mut m = monitor(start);
+        let mut elapsed = 0;
+        while elapsed <= STALL_AFTER.as_secs() {
+            m.record(delivering(1_400), start + Duration::from_secs(elapsed));
+            elapsed += 10;
+        }
+        assert!(!m.restart_due(start + STALL_AFTER));
     }
 
     #[test]
@@ -673,12 +816,18 @@ mod tests {
     fn a_wedge_reaches_the_restart_verdict_through_a_tick() {
         let start = Instant::now();
         let shared = SharedMonitor::with_limits(start, INTERVAL, STALL_AFTER);
+        shared.note_adopted(conn());
         for second in 0..=STALL_AFTER.as_secs() {
             shared.record_observed();
-            shared.record_packet(start + Duration::from_secs(second));
+            shared.record(delivering(0), start + Duration::from_secs(second));
         }
         let tick = shared.tick(start + STALL_AFTER);
         assert!(tick.restart, "packets arriving, nothing delivered: #214");
+        assert_eq!(
+            tick.tracked,
+            Some(conn()),
+            "the restart line has to be able to name the stalled flow"
+        );
         assert_eq!(
             tick.beat.expect("the interval elapsed").kind(),
             HeartbeatKind::Wedged
