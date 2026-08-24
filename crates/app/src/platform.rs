@@ -1214,11 +1214,13 @@ fn click_through_hit_test(
 
 /// Real Win32 `WM_NCHITTEST` result codes (issue #232), mirrored as plain
 /// literals rather than imported from the `windows` crate — see
-/// `resize_lock_hit_test`'s doc comment for why. `window_proc`
+/// `resize_lock_hit_test`'s doc comment for why. `install_snap_blocker`
 /// `debug_assert`s each of these against the real
-/// `windows::Win32::UI::WindowsAndMessaging` constants once, the same
-/// belt-and-braces `disable_aero_snap` already does for
-/// `WS_MAXIMIZEBOX_BIT`.
+/// `windows::Win32::UI::WindowsAndMessaging` constants once, at install
+/// time, the same belt-and-braces `disable_aero_snap` already does for
+/// `WS_MAXIMIZEBOX_BIT` — never inside `window_proc` itself, which would
+/// re-run them on every `WM_NCHITTEST` message while the overlay is
+/// pinned.
 #[cfg(any(windows, test))]
 const HT_CLIENT: i32 = 1;
 #[cfg(any(windows, test))]
@@ -1332,6 +1334,25 @@ pub fn install_snap_blocker(cc: &eframe::CreationContext<'_>) {
     use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Shell::SetWindowSubclass;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT,
+        HTTOPRIGHT,
+    };
+
+    // Belt-and-braces, the same as `disable_aero_snap`'s single
+    // `WS_MAXIMIZEBOX_BIT` assertion above: run once here, at install
+    // time, rather than inside `window_proc`'s `WM_NCHITTEST` branch,
+    // which re-runs on every mouse-moved hit test while the overlay is
+    // pinned.
+    debug_assert_eq!(HT_LEFT, HTLEFT as i32);
+    debug_assert_eq!(HT_RIGHT, HTRIGHT as i32);
+    debug_assert_eq!(HT_TOP, HTTOP as i32);
+    debug_assert_eq!(HT_BOTTOM, HTBOTTOM as i32);
+    debug_assert_eq!(HT_TOP_LEFT, HTTOPLEFT as i32);
+    debug_assert_eq!(HT_TOP_RIGHT, HTTOPRIGHT as i32);
+    debug_assert_eq!(HT_BOTTOM_LEFT, HTBOTTOMLEFT as i32);
+    debug_assert_eq!(HT_BOTTOM_RIGHT, HTBOTTOMRIGHT as i32);
+    debug_assert_eq!(HT_CLIENT, HTCLIENT as i32);
 
     let handle = match cc.window_handle() {
         Ok(handle) => handle,
@@ -1381,8 +1402,7 @@ unsafe extern "system" fn window_proc(
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Shell::DefSubclassProc;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP,
-        HTTOPLEFT, HTTOPRIGHT, HTTRANSPARENT, SC_MAXIMIZE, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS,
+        GetWindowRect, HTTRANSPARENT, SC_MAXIMIZE, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS,
         WM_DPICHANGED, WM_NCHITTEST, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING,
     };
 
@@ -1554,16 +1574,6 @@ unsafe extern "system" fn window_proc(
         // gets the next look, before falling through to `DefSubclassProc`
         // unchanged.
         if RESIZE_LOCKED.load(std::sync::atomic::Ordering::SeqCst) {
-            debug_assert_eq!(HT_LEFT, HTLEFT as i32);
-            debug_assert_eq!(HT_RIGHT, HTRIGHT as i32);
-            debug_assert_eq!(HT_TOP, HTTOP as i32);
-            debug_assert_eq!(HT_BOTTOM, HTBOTTOM as i32);
-            debug_assert_eq!(HT_TOP_LEFT, HTTOPLEFT as i32);
-            debug_assert_eq!(HT_TOP_RIGHT, HTTOPRIGHT as i32);
-            debug_assert_eq!(HT_BOTTOM_LEFT, HTBOTTOMLEFT as i32);
-            debug_assert_eq!(HT_BOTTOM_RIGHT, HTBOTTOMRIGHT as i32);
-            debug_assert_eq!(HT_CLIENT, HTCLIENT as i32);
-
             // SAFETY: `hwnd`/`msg`/`wparam`/`lparam` are exactly what this
             // subclass procedure was called with. Forwarding them to
             // `DefSubclassProc` here — rather than only at the bottom of

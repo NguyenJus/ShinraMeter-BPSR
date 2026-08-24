@@ -3691,11 +3691,14 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
     );
 }
 
-/// Issue #231: reserved off the top and bottom of the full screen height
-/// when capping how tall the header dropdown's `ScrollArea` may grow — see
-/// `header_menu_scroll_max_height`. Keeps the menu from ever claiming
-/// literally every pixel of a display it happens to fit inside, the same
-/// margin the popup already keeps clear of a screen edge horizontally.
+/// Issue #231: the total clearance kept between the header dropdown's
+/// capped `ScrollArea` height and the full screen height — see
+/// `header_menu_scroll_max_height`, which subtracts this once from
+/// `screen_height`. Keeps the menu from ever claiming literally every
+/// pixel of a display it happens to fit inside; since the popup already
+/// opens below the header rather than at the very top of the screen, this
+/// margin's practical effect is clearance at the bottom, the same margin
+/// the popup already keeps clear of a screen edge horizontally.
 const HEADER_MENU_SCROLL_MARGIN: f32 = 48.0;
 
 /// Issue #231: caps how tall the header dropdown's `ScrollArea` (wrapped
@@ -14621,6 +14624,198 @@ mod tests {
         assert!(
             !is_open(&update),
             "Close must actually dismiss the popup by the following frame"
+        );
+    }
+
+    /// Regression coverage for issue #231's actual fix
+    /// (`ui.set_max_height(scroll_max_height)` in `draw_header_menu`, just
+    /// above the `ScrollArea`), which no purely-arithmetic test on
+    /// `header_menu_scroll_max_height` can see: the bug it fixes is a
+    /// cross-frame feedback loop in `egui::Popup`'s underlying `Area`,
+    /// which remembers its previous rendered rect and hands that back as
+    /// next frame's available size (see `draw_header_menu`'s doc comment
+    /// on `set_max_height`). That loop only exists across multiple frames
+    /// of the *same* `Area` state, so — like
+    /// `header_menu_popup_stays_open_for_a_column_checkbox_but_closes_for_close`
+    /// just above — this drives the real `draw_header` (chevron, popup
+    /// wiring, and all) rather than calling `draw_header_menu` directly.
+    ///
+    /// The popup's actual on-screen rect is read back via
+    /// `egui::Memory::area_rect`, keyed by the same
+    /// `Popup::default_response_id(&chevron_response)` id production code
+    /// uses — reconstructed here from the chevron's accesskit `NodeId`
+    /// (`Id::accesskit_id` is a direct, unhashed wrap of `Id::value()`, so
+    /// `Id::from_high_entropy_bits` undoes it exactly; that round trip is
+    /// the documented purpose of that method) since `draw_header` has no
+    /// other way to hand a private `Response` out to a test.
+    ///
+    /// A screen with plenty of headroom is used deliberately (rather than
+    /// one short enough to force scrolling): without the fix, removing
+    /// `ui.set_max_height` doesn't make the popup overflow the cap — it
+    /// makes it get stuck at its pre-expansion (Columns collapsed) height
+    /// forever, since the `Area`'s remembered small rect keeps being fed
+    /// back as this `Ui`'s `max_rect` on every later frame and the
+    /// `ScrollArea`'s own `max_height` can't grow a `Ui` past what it was
+    /// given. A generous screen isolates that stuck-small failure from the
+    /// cap itself, which this test also checks holds regardless.
+    #[test]
+    fn header_menu_popup_grows_to_fit_columns_once_expanded() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        // Same reasoning as
+        // `header_menu_popup_stays_open_for_a_column_checkbox_but_closes_for_close`:
+        // a zero animation time makes the Columns disclosure arrow (and
+        // its checkboxes) snap straight to fully open within the same
+        // frame as the click, instead of animating in over several.
+        ctx.global_style_mut(|style| style.animation_time = 0.0);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(0);
+        let mut gesture = WindowGesture::default();
+        let mut update_check = UpdateCheckState::default();
+
+        // Tall enough that the fully expanded menu (all nine of
+        // `ColumnKind::ALL`'s checkboxes) fits with room to spare — see
+        // the doc comment above for why a generous screen, not a short
+        // one, is what actually isolates this regression.
+        let screen_height = 1000.0;
+        let scroll_max_height =
+            header_menu_scroll_max_height(screen_height, HEADER_MENU_SCROLL_MARGIN);
+
+        let mut frame = |mut input: egui::RawInput| -> egui::accesskit::TreeUpdate {
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(default_inner_width(), screen_height),
+            ));
+            let output = ctx.run_ui(input, |ui| {
+                draw_header(
+                    ui,
+                    &ctx,
+                    &snapshot,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    &mut gesture,
+                    false,
+                    true,
+                    &mut update_check,
+                    &unused_log_export_sender(),
+                    false,
+                    &mut false,
+                    None,
+                );
+            });
+            let update = output
+                .platform_output
+                .accesskit_update
+                .clone()
+                .expect("accesskit was enabled for this frame");
+            output.drop_without_applying_deltas();
+            update
+        };
+        let popup_height = |popup_id: egui::Id| {
+            ctx.memory(|mem| mem.area_rect(popup_id))
+                .expect("the header menu popup must have a recorded Area rect by now")
+                .height()
+        };
+
+        // Frame 1: closed header, find the chevron and its accesskit id.
+        let update = frame(egui::RawInput::default());
+        let chevron_node_id = update
+            .nodes
+            .iter()
+            .find_map(|(node_id, node)| {
+                node.label()
+                    .is_some_and(|s| s == "Menu")
+                    .then_some(*node_id)
+            })
+            .expect("no accessible node labeled \"Menu\" painted");
+        let chevron_pos = accessible_rect_for_label(&update, "Menu").center();
+        // SAFETY: `chevron_node_id.0` is exactly the `u64` `Id::value()`
+        // this node's accesskit id was derived from (`Id::accesskit_id`
+        // performs no hashing, only a direct wrap) — recovering that same
+        // `Id` from it is `Id::from_high_entropy_bits`'s documented use
+        // case, not a hash collision gamble.
+        let chevron_id = unsafe { egui::Id::from_high_entropy_bits(chevron_node_id.0) };
+        // Matches `Popup::default_response_id`, which is exactly what
+        // `Popup::menu(&chevron_response)` (via `draw_header`) keys its
+        // `Area`'s remembered rect under.
+        let popup_id = chevron_id.with("popup");
+
+        // Frame 2: open the menu. Its *position* isn't trustworthy yet —
+        // same reasoning as
+        // `header_menu_popup_stays_open_for_a_column_checkbox_but_closes_for_close`
+        // — so this only checks that it opened at all, via "Close" (always
+        // present, regardless of Columns' collapsed/expanded state).
+        let update = frame(click_at(chevron_pos));
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Close")),
+            "clicking the chevron must open the menu"
+        );
+
+        // Frame 3: let the just-opened popup settle out of its first,
+        // sizing-only pass into a stable position — same reasoning as
+        // `header_menu_popup_stays_open_for_a_column_checkbox_but_closes_for_close`.
+        let update = frame(egui::RawInput::default());
+        let columns_pos = accessible_rect_for_label(&update, "Columns").center();
+        let collapsed_height = popup_height(popup_id);
+        assert!(
+            collapsed_height <= scroll_max_height,
+            "collapsed height {collapsed_height} must already be within the \
+             {scroll_max_height} cap"
+        );
+
+        // Frame 4: expand Columns — every one of its nine checkboxes now
+        // needs somewhere to go.
+        let _ = frame(click_at(columns_pos));
+
+        // Several more settle frames with no further input: this is
+        // exactly where issue #231's feedback loop lived. Without
+        // `ui.set_max_height`, the `Area`'s remembered pre-expansion rect
+        // kept being handed straight back to this `Ui` as its `max_rect`
+        // on every one of these frames, and the newly expanded content
+        // never had room to register as taller — the popup stayed frozen
+        // at `collapsed_height` no matter how many frames passed.
+        let mut heights = Vec::new();
+        for _ in 0..5 {
+            let _ = frame(egui::RawInput::default());
+            heights.push(popup_height(popup_id));
+        }
+
+        for (frame_index, height) in heights.iter().enumerate() {
+            assert!(
+                *height <= scroll_max_height,
+                "settle frame {frame_index}: popup height {height} exceeded the \
+                 {scroll_max_height} cap across all settle frames {heights:?}"
+            );
+        }
+        // The actual regression: with the bug, every one of these stays
+        // pinned at `collapsed_height` (a ~7px difference, just the
+        // Columns arrow's own rotation) instead of growing to fit nine
+        // freshly revealed checkboxes.
+        let expanded_height = *heights.last().unwrap();
+        assert!(
+            expanded_height > collapsed_height + 50.0,
+            "expanding Columns must grow the popup well past its collapsed \
+             height {collapsed_height} to fit all nine checkboxes, got \
+             {heights:?}"
+        );
+        // And it must reach that size promptly, not keep climbing frame
+        // after frame once the popup has had several frames to settle.
+        let peak = heights.iter().copied().fold(f32::MIN, f32::max);
+        assert!(
+            expanded_height >= peak - 1.0,
+            "popup height must not still be growing after several settle \
+             frames: {heights:?}"
         );
     }
 
