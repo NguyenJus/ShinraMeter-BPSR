@@ -251,6 +251,14 @@ pub enum ProtocolEvent {
         name: String,
         value: i32,
     },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::EnemyGone` (issue #215): a
+    /// monster left the client's area of interest. Emphatically *not* a
+    /// death — see `Meter::apply_enemy_gone` for the narrow rule under
+    /// which one is nonetheless allowed to stand in for a missed death
+    /// signal.
+    EnemyGone {
+        uid: i64,
+    },
 }
 
 #[cfg(test)]
