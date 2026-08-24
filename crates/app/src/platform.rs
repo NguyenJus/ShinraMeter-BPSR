@@ -1212,6 +1212,80 @@ fn click_through_hit_test(
     }
 }
 
+/// Real Win32 `WM_NCHITTEST` result codes (issue #232), mirrored as plain
+/// literals rather than imported from the `windows` crate — see
+/// `resize_lock_hit_test`'s doc comment for why. `install_snap_blocker`
+/// `debug_assert`s each of these against the real
+/// `windows::Win32::UI::WindowsAndMessaging` constants once, at install
+/// time, the same belt-and-braces `disable_aero_snap` already does for
+/// `WS_MAXIMIZEBOX_BIT` — never inside `window_proc` itself, which would
+/// re-run them on every `WM_NCHITTEST` message while the overlay is
+/// pinned.
+#[cfg(any(windows, test))]
+const HT_CLIENT: i32 = 1;
+#[cfg(any(windows, test))]
+const HT_LEFT: i32 = 10;
+#[cfg(any(windows, test))]
+const HT_RIGHT: i32 = 11;
+#[cfg(any(windows, test))]
+const HT_TOP: i32 = 12;
+#[cfg(any(windows, test))]
+const HT_TOP_LEFT: i32 = 13;
+#[cfg(any(windows, test))]
+const HT_TOP_RIGHT: i32 = 14;
+#[cfg(any(windows, test))]
+const HT_BOTTOM: i32 = 15;
+#[cfg(any(windows, test))]
+const HT_BOTTOM_LEFT: i32 = 16;
+#[cfg(any(windows, test))]
+const HT_BOTTOM_RIGHT: i32 = 17;
+
+/// The eight `WM_NCHITTEST` codes that denote one of the resize-border
+/// regions — the only codes `resize_lock_hit_test` ever overrides.
+#[cfg(any(windows, test))]
+const RESIZE_BORDER_HIT_TESTS: [i32; 8] = [
+    HT_LEFT,
+    HT_RIGHT,
+    HT_TOP,
+    HT_BOTTOM,
+    HT_TOP_LEFT,
+    HT_TOP_RIGHT,
+    HT_BOTTOM_LEFT,
+    HT_BOTTOM_RIGHT,
+];
+
+/// Issue #232: overrides a resize-border `WM_NCHITTEST` result to plain
+/// client area while the overlay is pinned, so Windows' own edge-drag
+/// resize — driven by `WS_THICKFRAME`, entirely independent of `ui.rs`'s
+/// manual `draw_resize_handles` gesture — can't resize a locked window
+/// either. Pinning already locked the manual gesture (`ui::
+/// resize_locked_by_pin`); without this, that lock was only half real,
+/// since the invisible native resize border sitting right underneath the
+/// same edges was never touched by it.
+///
+/// `default_hit_test` is whatever `DefSubclassProc` would have answered —
+/// `window_proc`'s `WM_NCHITTEST` branch computes it first (by forwarding
+/// the message down before deciding what to return) and passes it through
+/// here rather than re-deriving the point/border math itself, so this
+/// stays a plain lookup with nothing platform-specific to test. Anything
+/// other than one of the eight resize-border codes — `HT_CLIENT`,
+/// `HTCAPTION`, `HTNOWHERE`, etc — passes through unchanged even while
+/// locked, since none of those grow or shrink the window.
+///
+/// Kept off the real `windows` crate constants — plain literals instead —
+/// so this stays unit-testable on this (Linux, cross-compiling) dev host,
+/// where `windows` is a Windows-only dependency
+/// (`[target.'cfg(windows)'.dependencies]`) unavailable to a plain `cargo
+/// test`.
+#[cfg(any(windows, test))]
+fn resize_lock_hit_test(default_hit_test: i32, resize_locked: bool) -> i32 {
+    if resize_locked && RESIZE_BORDER_HIT_TESTS.contains(&default_hit_test) {
+        HT_CLIENT
+    } else {
+        default_hit_test
+    }
+}
+
 /// Subclass ID passed to `SetWindowSubclass`; unique among any subclasses
 /// this crate installs on the same `HWND` (there's currently only this
 /// one).
@@ -1244,16 +1318,41 @@ const SNAP_BLOCKER_SUBCLASS_ID: usize = 1;
 ///   (`set_click_through_button_rect`) out of an otherwise fully
 ///   click-through window — `click_through_hit_test` is the pure decision,
 ///   see its doc comment for why this replaced `ViewportCommand::
-///   MousePassthrough` and the `Ctrl+Alt+P` hotkey that came with it.
+///   MousePassthrough` and the `Ctrl+Alt+P` hotkey that came with it. Issue
+///   #232 added a second, independent job to the same branch: while
+///   `Settings::always_on_top` (the pin) is on, every resize-border result
+///   `DefSubclassProc` would otherwise return is overridden to plain
+///   client area (`resize_lock_hit_test`), so the native `WS_THICKFRAME`
+///   edge-drag resize can't move a locked window's size either.
 ///
-/// Neither the Snap handlers nor the click-through one touch focus or
-/// z-order, so always-on-top and the game keeping focus are unaffected;
-/// every other message falls through to `DefSubclassProc` unchanged.
+/// Neither the Snap handlers nor the click-through/resize-lock one touch
+/// focus or z-order, so always-on-top and the game keeping focus are
+/// unaffected; every other message falls through to `DefSubclassProc`
+/// unchanged.
 #[cfg(windows)]
 pub fn install_snap_blocker(cc: &eframe::CreationContext<'_>) {
     use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Shell::SetWindowSubclass;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT,
+        HTTOPRIGHT,
+    };
+
+    // Belt-and-braces, the same as `disable_aero_snap`'s single
+    // `WS_MAXIMIZEBOX_BIT` assertion above: run once here, at install
+    // time, rather than inside `window_proc`'s `WM_NCHITTEST` branch,
+    // which re-runs on every mouse-moved hit test while the overlay is
+    // pinned.
+    debug_assert_eq!(HT_LEFT, HTLEFT as i32);
+    debug_assert_eq!(HT_RIGHT, HTRIGHT as i32);
+    debug_assert_eq!(HT_TOP, HTTOP as i32);
+    debug_assert_eq!(HT_BOTTOM, HTBOTTOM as i32);
+    debug_assert_eq!(HT_TOP_LEFT, HTTOPLEFT as i32);
+    debug_assert_eq!(HT_TOP_RIGHT, HTTOPRIGHT as i32);
+    debug_assert_eq!(HT_BOTTOM_LEFT, HTBOTTOMLEFT as i32);
+    debug_assert_eq!(HT_BOTTOM_RIGHT, HTBOTTOMRIGHT as i32);
+    debug_assert_eq!(HT_CLIENT, HTCLIENT as i32);
 
     let handle = match cc.window_handle() {
         Ok(handle) => handle,
@@ -1434,7 +1533,9 @@ unsafe extern "system" fn window_proc(
             suggested.right - suggested.left,
             suggested.bottom - suggested.top
         );
-    } else if msg == WM_NCHITTEST && CLICK_THROUGH_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+    } else if msg == WM_NCHITTEST
+        && (CLICK_THROUGH_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+            || RESIZE_LOCKED.load(std::sync::atomic::Ordering::SeqCst))
     {
         // `WM_NCHITTEST`'s `lParam` packs the point as two signed 16-bit
         // words in *screen* coordinates (never a pointer, unlike the
@@ -1456,14 +1557,38 @@ unsafe extern "system" fn window_proc(
         // (`Client`) — rather than guessing at a point that might be
         // wrong, which could otherwise carve out the wrong region.
         let button_rect = converted.then(click_through_button_rect).flatten();
+        // `click_through_on` is read explicitly (rather than the branch
+        // condition's combined gate) because issue #232 added a second,
+        // independent reason for this branch to run: a locked window with
+        // click-through off must still fall through to
+        // `click_through_hit_test`'s `false` — `PassThrough` — arm, not
+        // skip the call outright.
+        let click_through_on = CLICK_THROUGH_ENABLED.load(std::sync::atomic::Ordering::SeqCst);
         if let ClickThroughHitTest::Transparent =
-            click_through_hit_test((point.x, point.y), button_rect, true)
+            click_through_hit_test((point.x, point.y), button_rect, click_through_on)
         {
             return windows::Win32::Foundation::LRESULT(HTTRANSPARENT as isize);
         }
-        // `Client` (inside the button, or no rect published yet) falls
-        // through to `DefSubclassProc` below unchanged, same as a normal
-        // hit test on a borderless window.
+        // Click-through didn't claim this point (off entirely, inside the
+        // button, or no rect published yet) — issue #232's resize lock
+        // gets the next look, before falling through to `DefSubclassProc`
+        // unchanged.
+        if RESIZE_LOCKED.load(std::sync::atomic::Ordering::SeqCst) {
+            // SAFETY: `hwnd`/`msg`/`wparam`/`lparam` are exactly what this
+            // subclass procedure was called with. Forwarding them to
+            // `DefSubclassProc` here — rather than only at the bottom of
+            // this function — just computes the default hit test early so
+            // `resize_lock_hit_test` can override it below; winit's own
+            // handling underneath never sees this message a second time,
+            // since this branch returns instead of falling through once it
+            // takes this path.
+            let default = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+            let overridden = resize_lock_hit_test(default.0 as i32, true);
+            return windows::Win32::Foundation::LRESULT(overridden as isize);
+        }
+        // Resize isn't locked either: falls through to `DefSubclassProc`
+        // below unchanged, same as a normal hit test on a borderless
+        // window.
     }
 
     // SAFETY: `hwnd`/`msg`/`wparam`/`lparam` are exactly what this
@@ -1486,6 +1611,18 @@ unsafe extern "system" fn window_proc(
 #[cfg(windows)]
 static CLICK_THROUGH_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Issue #232: whether `window_proc`'s `WM_NCHITTEST` branch should
+/// override every resize-border hit test to plain client area
+/// (`resize_lock_hit_test`). Mirrors `Settings::always_on_top` — `ui.rs`
+/// calls `set_resize_locked` every time that field changes: on the
+/// toggle-cluster pin button's own click, and when `OverlayApp::ui`
+/// re-applies a saved setting on its first frame. Same plain-atomic
+/// reasoning as `CLICK_THROUGH_ENABLED`: this crate's Win32 message pump
+/// and `ui()` both run on the single UI thread, so this is a way to read a
+/// value written from a different call stack, not real concurrency.
+#[cfg(windows)]
+static RESIZE_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The click-through button's current hit box, in physical-pixel
 /// client-area coordinates — the same space `ScreenToClient` converts a
@@ -1536,6 +1673,16 @@ pub fn set_click_through(enabled: bool) {
 
 #[cfg(not(windows))]
 pub fn set_click_through(_enabled: bool) {}
+
+/// Turns the `WM_NCHITTEST` resize-border override on or off (issue #232).
+/// See `RESIZE_LOCKED`'s doc comment for the call sites.
+#[cfg(windows)]
+pub fn set_resize_locked(locked: bool) {
+    RESIZE_LOCKED.store(locked, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(not(windows))]
+pub fn set_resize_locked(_locked: bool) {}
 
 /// Publishes the click-through button's current hit box, in physical
 /// pixels, client-area-relative (issue #167 rehash) — see
@@ -3523,6 +3670,37 @@ mod tests {
             click_through_hit_test((99999, 99999), None, true),
             ClickThroughHitTest::Client
         );
+    }
+
+    /// Issue #232: while the overlay is pinned, Windows' own edge-drag
+    /// resize (driven by `WS_THICKFRAME`, entirely independent of `ui.rs`'s
+    /// manual resize gesture) must not be able to resize the window either
+    /// — every one of the eight resize-border hit-test codes is overridden
+    /// to plain client area.
+    #[test]
+    fn resize_lock_hit_test_overrides_every_resize_border_when_locked() {
+        for code in RESIZE_BORDER_HIT_TESTS {
+            assert_eq!(resize_lock_hit_test(code, true), HT_CLIENT);
+        }
+    }
+
+    #[test]
+    fn resize_lock_hit_test_leaves_resize_borders_alone_when_unlocked() {
+        for code in RESIZE_BORDER_HIT_TESTS {
+            assert_eq!(resize_lock_hit_test(code, false), code);
+        }
+    }
+
+    /// Anything that isn't one of the eight resize-border codes — plain
+    /// client area, and (stood in for by `2`) `HTCAPTION`, which this
+    /// borderless window never actually produces but which must stay inert
+    /// too if it ever did — passes through unchanged even while locked,
+    /// since none of those grow or shrink the window.
+    #[test]
+    fn resize_lock_hit_test_never_touches_non_resize_codes() {
+        for code in [HT_CLIENT, 0, 2] {
+            assert_eq!(resize_lock_hit_test(code, true), code);
+        }
     }
 
     #[test]

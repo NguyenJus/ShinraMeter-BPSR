@@ -940,6 +940,12 @@ impl eframe::App for OverlayApp {
         if !self.startup_toggles_applied {
             self.startup_toggles_applied = true;
             crate::platform::set_click_through(self.settings.click_through);
+            // Issue #232: same one-shot re-apply as click-through above,
+            // for the native resize-border override — a returning user
+            // whose last session left the pin locked otherwise gets a
+            // window whose OS-level edge-drag resize is live again until
+            // the next pin click re-syncs it.
+            crate::platform::set_resize_locked(self.settings.always_on_top);
             let level = if self.settings.always_on_top {
                 egui::WindowLevel::AlwaysOnTop
             } else {
@@ -1141,7 +1147,13 @@ impl eframe::App for OverlayApp {
             .show(ui, |ui| {
                 // First, so the header buttons drawn afterwards stay on top of
                 // the corner zones they overlap.
-                draw_resize_handles(ui, &ctx, &mut self.window_gesture, "root");
+                draw_resize_handles(
+                    ui,
+                    &ctx,
+                    &mut self.window_gesture,
+                    "root",
+                    resize_locked_by_pin(self.settings.always_on_top),
+                );
                 // Issue #39: what the header and rows paint this frame — the
                 // live snapshot, or the open historical one (`history_open`,
                 // cloned above before this closure existed). Computed here,
@@ -2339,6 +2351,10 @@ fn title_row_toggles(
         };
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        // Issue #232: pinning now locks the native resize border the same
+        // frame it locks Z-order and (via `drag_locked_by_pin`/
+        // `resize_locked_by_pin`) the manual move/resize gestures.
+        crate::platform::set_resize_locked(settings.always_on_top);
         let _ = tx_settings.send(settings.clone());
     }
     if let Some(pin) = icons.glyphs.get(GlyphIcon::Pin) {
@@ -3744,11 +3760,51 @@ fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
     );
 }
 
+/// Issue #231: the total clearance kept between the header dropdown's
+/// capped `ScrollArea` height and the full screen height — see
+/// `header_menu_scroll_max_height`, which subtracts this once from
+/// `screen_height`. Keeps the menu from ever claiming literally every
+/// pixel of a display it happens to fit inside; since the popup already
+/// opens below the header rather than at the very top of the screen, this
+/// margin's practical effect is clearance at the bottom, the same margin
+/// the popup already keeps clear of a screen edge horizontally.
+const HEADER_MENU_SCROLL_MARGIN: f32 = 48.0;
+
+/// Issue #231: caps how tall the header dropdown's `ScrollArea` (wrapped
+/// around `draw_header_menu`'s body) may grow, so a long Columns list
+/// scrolls instead of pushing the menu — and whatever's below the
+/// overflow, like Close — past the bottom of the screen where nothing
+/// could reach it.
+///
+/// `screen_height` is `egui::Context::viewport_rect().height()` — this
+/// overlay is a single, undecorated viewport with no OS chrome around it,
+/// so its viewport rect *is* the full on-screen area the popup has to fit
+/// inside. Pure and separate from the `Ui`/`Context` that actually draws
+/// the menu, the same way this module's other pixel-math helpers
+/// (`pill_size`, `row_content_width`, …) stay unit-testable without a live
+/// egui frame.
+fn header_menu_scroll_max_height(screen_height: f32, margin: f32) -> f32 {
+    (screen_height - margin).max(0.0)
+}
+
 /// The header dropdown (issue #54, #71): opened from `menu_chevron` via
 /// `egui::Popup::menu`, replacing the old row of window-control icon
 /// buttons. Built from plain `Ui` menu widgets rather than one bespoke
 /// helper per item, since egui's own `menu_button`/`CollapsingHeader`
 /// already give every item free open/close state management.
+///
+/// Issue #231: the whole body below is wrapped in a vertical `ScrollArea`
+/// capped at `header_menu_scroll_max_height` — before this, an expanded
+/// Columns section could make the menu taller than the screen, and with no
+/// scrollbar of its own the items past the bottom edge were simply
+/// unreachable (the popup itself isn't a native window, so there's no OS
+/// chrome to scroll it either). The cap uses the full screen height rather
+/// than the popup's actual on-screen headroom (distance from its top to
+/// the screen bottom) because egui doesn't expose that until *after* the
+/// popup has already been laid out once — using the coarser, always-
+/// available screen height instead means the menu can scroll a little
+/// sooner than strictly necessary near the very top of a display, which is
+/// a harmless trade against the alternative of a one-frame-stale bound.
 ///
 /// Order matches the spec: a Columns disclosure section (issue #13's stat
 /// column toggles, unchanged in behavior — just relocated), a separator,
@@ -3815,236 +3871,265 @@ fn draw_header_menu(
         tx_settings,
     } = settings;
 
-    let columns_id = ui.make_persistent_id("header_menu_columns");
-    let mut columns_state =
-        egui::collapsing_header::CollapsingState::load_with_default_open(ctx, columns_id, false);
-    // Built from `CollapsingState` directly, rather than the plain
-    // `egui::CollapsingHeader::new(...).show(...)` shorthand this replaced,
-    // so the header can carry `ToolbarIcon::Settings` beside the "Columns"
-    // label. `show_toggle_button`'s own click target is only the small
-    // disclosure-arrow box, unlike `CollapsingHeader::show`'s whole clickable
-    // row — so the icon+label response is unioned and toggled by hand below,
-    // to keep the same full-row click target rather than shrinking it down
-    // to the arrow alone.
-    let header_response = ui.horizontal(|ui| {
-        columns_state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
-        // A bare `ui.label` only senses hover, never clicks — `Sense::click()`
-        // is what actually lets the union below toggle on a label/icon click
-        // rather than doing nothing.
-        let mut header_response = ui.add(egui::Label::new("Columns").sense(egui::Sense::click()));
-        if let Some(handle) = icons.toolbar.get(ToolbarIcon::Settings) {
-            // Same reasoning as the label above: `toolbar_icon_image` builds
-            // a plain `egui::Image`, hover-sensing only by default, so it
-            // needs an explicit click sense to actually contribute to the
-            // unioned header-row click target.
-            header_response |= ui.add(toolbar_icon_image(handle).sense(egui::Sense::click()));
-        }
-        header_response
-    });
-    if header_response.inner.clicked() {
-        columns_state.toggle(ui);
-    }
-    columns_state.show_body_indented(&header_response.response, ui, |ui| {
-        let mut changed = false;
-        for col in ColumnKind::ALL {
-            let is_visible = settings.is_visible(col);
-            // Disabling the last remaining column would leave the row
-            // with nothing to show, so its checkbox is greyed out and
-            // inert rather than letting the click land (issue #13's
-            // "keep the UI usable" guard).
-            let would_disable_last = is_visible && settings.visible_columns.len() <= 1;
-            let mut checked = is_visible;
-            let resp = ui.add_enabled(
-                !would_disable_last,
-                egui::Checkbox::new(&mut checked, col.label()),
-            );
-            if resp.changed() {
-                settings.toggle(col);
-                changed = true;
-            }
-        }
-        if changed {
-            // Persisting is blocking file IO (`fs::write` + `fs::rename`),
-            // so it must not run on this render thread — hand the new
-            // value to the dedicated settings-writer thread instead,
-            // same as `pipeline::spawn` owns the meter off this thread.
-            // A disconnected receiver (writer thread gone) is not
-            // fatal: the in-memory `settings` the UI already mutated
-            // stays correct for the rest of this session.
-            let _ = tx_settings.send(settings.clone());
-        }
-    });
-
-    ui.separator();
-
-    // Issue #166: its own labelled section (not nested inside the Columns
-    // disclosure above) since it toggles a single overlay-wide value rather
-    // than a per-column list — a `CollapsingHeader` would just be an extra
-    // click for something that's already only one control. Placed in the
-    // header's settings dropdown, alongside Columns, rather than the
-    // header's toggle-cluster pill (a separate, unrelated header surface —
-    // see `toggle_cluster` — that a different issue is changing in
-    // parallel).
-    ui.label("Opacity");
-    // Issue #182: the rail spans the full 0%-100%, floor included. Nothing
-    // here has to guard the bottom end — `Settings::OPACITY_MIN` documents
-    // why a fully transparent backdrop stays recoverable.
-    let mut opacity = settings.opacity;
-    // Issue #235: `Slider` has no width-builder of its own — its rail is
-    // sized entirely off `Spacing::slider_width` (a fixed ~100pt default),
-    // unlike the Columns checkboxes and buttons below, which already stretch
-    // to the row's available width. This is the only `Slider` in the whole
-    // overlay, so widening the shared spacing setting here can't affect
-    // anything painted after it.
-    ui.spacing_mut().slider_width = ui.available_width();
-    let opacity_response = ui.add(
-        egui::Slider::new(&mut opacity, Settings::OPACITY_MIN..=Settings::OPACITY_MAX)
-            .show_value(false),
-    );
-    if opacity_response.changed() {
-        // Applied immediately (same frame): `draw_header_menu` mutates the
-        // caller's `&mut Settings` in place, and `OverlayApp::ui` reads
-        // `self.settings.opacity` fresh when it builds the panel `Frame`
-        // right after `draw_header` returns — no extra repaint request
-        // needed, unlike an async round trip such as the Share screenshot's.
-        settings.set_opacity(opacity);
-        // Same persistence path as the Columns checkboxes just above:
-        // blocking file IO stays off this render thread, and a dropped
-        // writer thread just leaves the in-memory value correct for the
-        // rest of this session.
-        let _ = tx_settings.send(settings.clone());
-    }
-
-    ui.separator();
-
-    // Issue #53: this minimize goes to the notification area, not the
-    // taskbar. `platform::install_tray`'s subclass intercepts the
-    // `WM_SIZE`/`SIZE_MINIMIZED` this command produces, adds a tray icon
-    // and hides the window, so no call-site change is needed here — but the
-    // tray icon is now the *only* way back, so don't route this through
-    // anything that bypasses a real minimize.
-    if ui.button("Minimize to tray").clicked() {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-        ui.close();
-    }
-
-    ui.separator();
-
-    // Issue #203: a UI-settings reset (window size + opacity), distinct
-    // from the tray's own OS-level `TrayCommand::ResetWindow` (which
-    // recenters/resizes back to the full 20-row raid default and never
-    // touches opacity). This resizes to a 5-row sample instead, using the
-    // same column set `default_inner_width` already sizes for, and puts
-    // opacity back to `Settings::default_opacity()` through the same
-    // `set_opacity` + `tx_settings` path the slider above uses.
-    if ui.button("Reset to defaults").clicked() {
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            default_inner_width(),
-            reset_to_defaults_inner_height(),
-        )));
-        settings.set_opacity(Settings::default_opacity());
-        let _ = tx_settings.send(settings.clone());
-        ui.close();
-    }
-
-    // Issue #220: a user hitting a bug has no in-app way to hand over the
-    // logs `logging::init` already writes for exactly this purpose. Never a
-    // fixed or hidden path — the save dialog is what lets the user pick the
-    // destination themselves, per the issue.
-    //
-    // The dialog itself is called inline, on this thread:
-    // `platform::choose_log_export_path`'s own doc comment explains why a
-    // modal the OS is already blocking on needs no thread. The copy that
-    // follows is a different matter — up to two files of
-    // `logging::MAX_LOG_BYTES` — so it goes to a spawned thread (PR #227
-    // review), the "Check for updates" shape.
-    if ui.button("Export logs").clicked() {
-        if let Some(dest) =
-            crate::platform::choose_log_export_path(crate::logging::EXPORT_DEFAULT_FILENAME)
-        {
-            start_log_export(dest, tx_log_export.clone());
-        }
-        ui.close();
-    }
-
-    // Issue #214: the only in-process recovery from a capture wedge that no
-    // new TCP connection happens to clear. Before this, `request_restart`
-    // had no caller anywhere and #211's 24-minute stall could only be
-    // escaped by leaving the instance (which opens a fresh connection) or
-    // relaunching the app. `bpsr-logs` ships the same escape hatch, worded
-    // almost identically — upstream evidently concluded that not every
-    // stall condition is automatically detectable.
-    //
-    // Deliberately unconfirmed and never disabled: the request is a
-    // latching flag rather than a queue, so clicking twice is one restart;
-    // the cost is a fraction of a second of missed packets plus a decoder
-    // reset; and anyone reaching for it is already looking at a meter that
-    // has stopped moving.
-    if ui.button("Restart packet capture").clicked() {
-        let _ = tx_command.try_send(UiCommand::RestartCapture);
-        ui.close();
-    }
-
-    ui.separator();
-
-    // Issue #171: manual-only, per the issue — there is no automatic or
-    // background check anywhere in this crate, only this button. The
-    // request itself never touches this thread: clicking spawns a
-    // dedicated `std::thread` that calls `update_check::check_for_update`
-    // and reports back over a fresh `crossbeam_channel`, the same
-    // one-shot-thread shape `settings::spawn_writer` uses for its own
-    // (longer-lived) writer thread — see `UpdateCheckState`'s doc comment
-    // for why the state lives on `OverlayApp` rather than here.
-    //
-    // The button stays enabled (and re-clickable) once a check is done,
-    // both to let the user retry after a transient network error and to
-    // let them re-check right before actually upgrading; it is only
-    // disabled while one is already in flight, so a click can't pile up a
-    // second thread racing the first to the same channel.
-    let checking = matches!(update_check, UpdateCheckState::Checking { .. });
-    let clicked_check_for_updates = ui
-        .add_enabled(!checking, egui::Button::new("Check for updates"))
-        .clicked();
-    if clicked_check_for_updates {
-        *update_check = start_update_check();
-    }
-    match update_check {
-        UpdateCheckState::Idle => {}
-        UpdateCheckState::Checking { .. } => {
-            ui.label("Checking…");
-        }
-        UpdateCheckState::Done(Ok(CheckOutcome::UpToDate)) => {
-            ui.label(format!("Up to date (v{})", env!("CARGO_PKG_VERSION")));
-        }
-        UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable { tag, url })) => {
-            ui.horizontal(|ui| {
-                ui.label(format!("Update available: {tag}"));
-                // Issue #171 scopes auto-download/apply out — this link to
-                // the release's own GitHub page is the whole "get it"
-                // affordance. `egui::OpenUrl` (what `hyperlink_to` sends
-                // through `ctx.output_mut`) is what eframe's native
-                // backend turns into an actual browser launch.
-                ui.hyperlink_to("Download", url.as_str());
+    let scroll_max_height =
+        header_menu_scroll_max_height(ctx.viewport_rect().height(), HEADER_MENU_SCROLL_MARGIN);
+    // `egui::Popup`'s `Area` remembers its content size across frames and
+    // hands the *same* remembered height back to this `Ui` as its
+    // `max_rect` next frame (that's how a popup "grows to fit content" at
+    // all). A plain `ScrollArea::max_height` alone can't override that: its
+    // own footprint is capped by whatever height this `Ui` was *given*, not
+    // by the argument passed here — so once an early frame (Columns still
+    // collapsed) commits a small remembered size, the `ScrollArea` always
+    // reports back "I fit", and the `Area` never learns it could grow
+    // further, even on a screen with plenty of room. `set_max_height`
+    // overrides that stale, self-referential ceiling with the freshly
+    // computed cap on every frame, breaking the feedback loop; the
+    // `ScrollArea` below still shrinks to true content when that is
+    // smaller, so a short/collapsed menu paints exactly as before.
+    ui.set_max_height(scroll_max_height);
+    egui::ScrollArea::vertical()
+        .max_height(scroll_max_height)
+        // Shrinks to the content's actual height whenever that's under the
+        // cap, so a short menu (the common case — Columns collapsed) keeps
+        // painting pixel-identically to before this issue, with no
+        // reserved scrollbar gutter and no extra bottom padding.
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            let columns_id = ui.make_persistent_id("header_menu_columns");
+            let mut columns_state =
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ctx, columns_id, false,
+                );
+            // Built from `CollapsingState` directly, rather than the plain
+            // `egui::CollapsingHeader::new(...).show(...)` shorthand this replaced,
+            // so the header can carry `ToolbarIcon::Settings` beside the "Columns"
+            // label. `show_toggle_button`'s own click target is only the small
+            // disclosure-arrow box, unlike `CollapsingHeader::show`'s whole clickable
+            // row — so the icon+label response is unioned and toggled by hand below,
+            // to keep the same full-row click target rather than shrinking it down
+            // to the arrow alone.
+            let header_response = ui.horizontal(|ui| {
+                columns_state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+                // A bare `ui.label` only senses hover, never clicks — `Sense::click()`
+                // is what actually lets the union below toggle on a label/icon click
+                // rather than doing nothing.
+                let mut header_response =
+                    ui.add(egui::Label::new("Columns").sense(egui::Sense::click()));
+                if let Some(handle) = icons.toolbar.get(ToolbarIcon::Settings) {
+                    // Same reasoning as the label above: `toolbar_icon_image` builds
+                    // a plain `egui::Image`, hover-sensing only by default, so it
+                    // needs an explicit click sense to actually contribute to the
+                    // unioned header-row click target.
+                    header_response |=
+                        ui.add(toolbar_icon_image(handle).sense(egui::Sense::click()));
+                }
+                header_response
             });
-        }
-        UpdateCheckState::Done(Err(err)) => {
-            ui.label(format!("Update check failed: {err}"));
-        }
-    }
+            if header_response.inner.clicked() {
+                columns_state.toggle(ui);
+            }
+            columns_state.show_body_indented(&header_response.response, ui, |ui| {
+                let mut changed = false;
+                for col in ColumnKind::ALL {
+                    let is_visible = settings.is_visible(col);
+                    // Disabling the last remaining column would leave the row
+                    // with nothing to show, so its checkbox is greyed out and
+                    // inert rather than letting the click land (issue #13's
+                    // "keep the UI usable" guard).
+                    let would_disable_last = is_visible && settings.visible_columns.len() <= 1;
+                    let mut checked = is_visible;
+                    let resp = ui.add_enabled(
+                        !would_disable_last,
+                        egui::Checkbox::new(&mut checked, col.label()),
+                    );
+                    if resp.changed() {
+                        settings.toggle(col);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    // Persisting is blocking file IO (`fs::write` + `fs::rename`),
+                    // so it must not run on this render thread — hand the new
+                    // value to the dedicated settings-writer thread instead,
+                    // same as `pipeline::spawn` owns the meter off this thread.
+                    // A disconnected receiver (writer thread gone) is not
+                    // fatal: the in-memory `settings` the UI already mutated
+                    // stays correct for the rest of this session.
+                    let _ = tx_settings.send(settings.clone());
+                }
+            });
 
-    ui.separator();
+            ui.separator();
 
-    if ui
-        .add(menu_item_button(
-            icons.toolbar.get(ToolbarIcon::Close),
-            "Close",
-        ))
-        .clicked()
-    {
-        let _ = tx_command.try_send(UiCommand::Quit);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        ui.close();
-    }
+            // Issue #166: its own labelled section (not nested inside the Columns
+            // disclosure above) since it toggles a single overlay-wide value rather
+            // than a per-column list — a `CollapsingHeader` would just be an extra
+            // click for something that's already only one control. Placed in the
+            // header's settings dropdown, alongside Columns, rather than the
+            // header's toggle-cluster pill (a separate, unrelated header surface —
+            // see `toggle_cluster` — that a different issue is changing in
+            // parallel).
+            ui.label("Opacity");
+            // Issue #182: the rail spans the full 0%-100%, floor included. Nothing
+            // here has to guard the bottom end — `Settings::OPACITY_MIN` documents
+            // why a fully transparent backdrop stays recoverable.
+            let mut opacity = settings.opacity;
+            // Issue #235: `Slider` has no width-builder of its own — its rail is
+            // sized entirely off `Spacing::slider_width` (a fixed ~100pt default),
+            // unlike the Columns checkboxes and buttons below, which already stretch
+            // to the row's available width. This is the only `Slider` in the whole
+            // overlay, so widening the shared spacing setting here can't affect
+            // anything painted after it.
+            ui.spacing_mut().slider_width = ui.available_width();
+            let opacity_response = ui.add(
+                egui::Slider::new(&mut opacity, Settings::OPACITY_MIN..=Settings::OPACITY_MAX)
+                    .show_value(false),
+            );
+            if opacity_response.changed() {
+                // Applied immediately (same frame): `draw_header_menu` mutates the
+                // caller's `&mut Settings` in place, and `OverlayApp::ui` reads
+                // `self.settings.opacity` fresh when it builds the panel `Frame`
+                // right after `draw_header` returns — no extra repaint request
+                // needed, unlike an async round trip such as the Share screenshot's.
+                settings.set_opacity(opacity);
+                // Same persistence path as the Columns checkboxes just above:
+                // blocking file IO stays off this render thread, and a dropped
+                // writer thread just leaves the in-memory value correct for the
+                // rest of this session.
+                let _ = tx_settings.send(settings.clone());
+            }
+
+            ui.separator();
+
+            // Issue #53: this minimize goes to the notification area, not the
+            // taskbar. `platform::install_tray`'s subclass intercepts the
+            // `WM_SIZE`/`SIZE_MINIMIZED` this command produces, adds a tray icon
+            // and hides the window, so no call-site change is needed here — but the
+            // tray icon is now the *only* way back, so don't route this through
+            // anything that bypasses a real minimize.
+            if ui.button("Minimize to tray").clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                ui.close();
+            }
+
+            ui.separator();
+
+            // Issue #203: a UI-settings reset (window size + opacity), distinct
+            // from the tray's own OS-level `TrayCommand::ResetWindow` (which
+            // recenters/resizes back to the full 20-row raid default and never
+            // touches opacity). This resizes to a 5-row sample instead, using the
+            // same column set `default_inner_width` already sizes for, and puts
+            // opacity back to `Settings::default_opacity()` through the same
+            // `set_opacity` + `tx_settings` path the slider above uses.
+            if ui.button("Reset to defaults").clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    default_inner_width(),
+                    reset_to_defaults_inner_height(),
+                )));
+                settings.set_opacity(Settings::default_opacity());
+                let _ = tx_settings.send(settings.clone());
+                ui.close();
+            }
+
+            // Issue #220: a user hitting a bug has no in-app way to hand over the
+            // logs `logging::init` already writes for exactly this purpose. Never a
+            // fixed or hidden path — the save dialog is what lets the user pick the
+            // destination themselves, per the issue.
+            //
+            // The dialog itself is called inline, on this thread:
+            // `platform::choose_log_export_path`'s own doc comment explains why a
+            // modal the OS is already blocking on needs no thread. The copy that
+            // follows is a different matter — up to two files of
+            // `logging::MAX_LOG_BYTES` — so it goes to a spawned thread (PR #227
+            // review), the "Check for updates" shape.
+            if ui.button("Export logs").clicked() {
+                if let Some(dest) =
+                    crate::platform::choose_log_export_path(crate::logging::EXPORT_DEFAULT_FILENAME)
+                {
+                    start_log_export(dest, tx_log_export.clone());
+                }
+                ui.close();
+            }
+
+            // Issue #214: the only in-process recovery from a capture wedge that no
+            // new TCP connection happens to clear. Before this, `request_restart`
+            // had no caller anywhere and #211's 24-minute stall could only be
+            // escaped by leaving the instance (which opens a fresh connection) or
+            // relaunching the app. `bpsr-logs` ships the same escape hatch, worded
+            // almost identically — upstream evidently concluded that not every
+            // stall condition is automatically detectable.
+            //
+            // Deliberately unconfirmed and never disabled: the request is a
+            // latching flag rather than a queue, so clicking twice is one restart;
+            // the cost is a fraction of a second of missed packets plus a decoder
+            // reset; and anyone reaching for it is already looking at a meter that
+            // has stopped moving.
+            if ui.button("Restart packet capture").clicked() {
+                let _ = tx_command.try_send(UiCommand::RestartCapture);
+                ui.close();
+            }
+
+            ui.separator();
+
+            // Issue #171: manual-only, per the issue — there is no automatic or
+            // background check anywhere in this crate, only this button. The
+            // request itself never touches this thread: clicking spawns a
+            // dedicated `std::thread` that calls `update_check::check_for_update`
+            // and reports back over a fresh `crossbeam_channel`, the same
+            // one-shot-thread shape `settings::spawn_writer` uses for its own
+            // (longer-lived) writer thread — see `UpdateCheckState`'s doc comment
+            // for why the state lives on `OverlayApp` rather than here.
+            //
+            // The button stays enabled (and re-clickable) once a check is done,
+            // both to let the user retry after a transient network error and to
+            // let them re-check right before actually upgrading; it is only
+            // disabled while one is already in flight, so a click can't pile up a
+            // second thread racing the first to the same channel.
+            let checking = matches!(update_check, UpdateCheckState::Checking { .. });
+            let clicked_check_for_updates = ui
+                .add_enabled(!checking, egui::Button::new("Check for updates"))
+                .clicked();
+            if clicked_check_for_updates {
+                *update_check = start_update_check();
+            }
+            match update_check {
+                UpdateCheckState::Idle => {}
+                UpdateCheckState::Checking { .. } => {
+                    ui.label("Checking…");
+                }
+                UpdateCheckState::Done(Ok(CheckOutcome::UpToDate)) => {
+                    ui.label(format!("Up to date (v{})", env!("CARGO_PKG_VERSION")));
+                }
+                UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable { tag, url })) => {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Update available: {tag}"));
+                        // Issue #171 scopes auto-download/apply out — this link to
+                        // the release's own GitHub page is the whole "get it"
+                        // affordance. `egui::OpenUrl` (what `hyperlink_to` sends
+                        // through `ctx.output_mut`) is what eframe's native
+                        // backend turns into an actual browser launch.
+                        ui.hyperlink_to("Download", url.as_str());
+                    });
+                }
+                UpdateCheckState::Done(Err(err)) => {
+                    ui.label(format!("Update check failed: {err}"));
+                }
+            }
+
+            ui.separator();
+
+            if ui
+                .add(menu_item_button(
+                    icons.toolbar.get(ToolbarIcon::Close),
+                    "Close",
+                ))
+                .clicked()
+            {
+                let _ = tx_command.try_send(UiCommand::Quit);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                ui.close();
+            }
+        });
 }
 
 /// State of a manual "Check for updates" request from the header dropdown
@@ -4330,10 +4415,16 @@ fn gesture_end_needs_frame_recompute(kind: GestureKind, viewport: egui::Viewport
 /// by an accidental drag of its header — which is the opposite of what a
 /// pushpin means to anyone who clicks it. Pinning now locks both.
 ///
-/// Deliberately only `GestureKind::Move`: the eight `resize_zones` stay
-/// live, because "pinned" is about the overlay staying put, not about
-/// freezing its size, and a pinned overlay the user can't resize would be a
-/// second surprise rather than a fix for the first.
+/// Deliberately only `GestureKind::Move` — the eight `resize_zones` have
+/// their own gate, `resize_locked_by_pin`, checked separately at
+/// `draw_resize_handles`. Issue #183 originally left resize live here on
+/// purpose ("pinned" meant staying put, not frozen in size); issue #232
+/// reversed that call, since a lock a user can still resize through reads
+/// as only half a lock. The two gates stay separate functions rather than
+/// one shared check because their call sites want different things: this
+/// one gates a gesture *start*, `resize_locked_by_pin` gates eight of them
+/// plus (via `platform::resize_lock_hit_test`) Windows' own native
+/// edge-drag resize.
 ///
 /// Trivial enough to inline, spelled as a function anyway so the rule has
 /// one name and one doc comment shared by the drag band and
@@ -4360,6 +4451,29 @@ fn cancel_move_gesture_when_pinned(gesture: &mut WindowGesture, always_on_top: b
     if drag_locked_by_pin(always_on_top) && gesture.kind() == Some(GestureKind::Move) {
         gesture.end();
     }
+}
+
+/// Issue #232: whether `draw_resize_handles`' eight resize zones must
+/// refuse to *start* a new resize gesture, because the overlay is pinned
+/// (`Settings::always_on_top`).
+///
+/// No in-flight-cancel counterpart is needed here the way
+/// `cancel_move_gesture_when_pinned` exists for `drag_locked_by_pin`: the
+/// pin button lives in the header band, physically separate from every
+/// resize handle, and only one pointer-drag gesture can be held at a time
+/// — so pinning can never land mid-resize the way it can land mid-move.
+/// Gating the start is therefore the whole fix on the egui side.
+/// `platform::resize_lock_hit_test` is the matching gate for Windows' own
+/// native edge-drag resize, which `WS_THICKFRAME` allows independently of
+/// any of this module's gesture code.
+///
+/// Same trivial `always_on_top` body as `drag_locked_by_pin` — kept as its
+/// own named function (rather than reusing that one under a
+/// resize-flavored call) so each call site's intent reads directly off the
+/// function name, and so the two stay independently unit-testable if the
+/// policies these two gates express are ever split again.
+fn resize_locked_by_pin(always_on_top: bool) -> bool {
+    always_on_top
 }
 
 /// Starts `kind` from wherever the pointer and window are right now.
@@ -4570,6 +4684,14 @@ fn resize_zones(rect: egui::Rect) -> [(egui::Rect, egui::ResizeDirection, egui::
 /// now serves the root window and every open breakdown viewport, and both
 /// are drawn from a root `Ui` whose own id is the same in each — without a
 /// salt, two windows' north handles would be one widget.
+///
+/// `locked` (issue #232) is `resize_locked_by_pin(settings.always_on_top)`
+/// at the root call site — the breakdown viewport call site always passes
+/// `false`, since a skill window has no pin of its own to lock against.
+/// While locked, the handles stay hovered/drawn (so the invisible strip is
+/// still there to hit-test against, matching the header drag band's own
+/// choice to keep sensing hover) but never start a gesture, and the cursor
+/// says so with `NotAllowed` instead of the usual resize glyph.
 fn draw_resize_handles(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -4579,6 +4701,7 @@ fn draw_resize_handles(
     // salt's `Debug` rendering in `id_source` so an id clash names the
     // widgets that collided. Not ours to drop.
     id_salt: impl std::hash::Hash + std::fmt::Debug,
+    locked: bool,
 ) {
     // The viewport this `Ui` belongs to — the root window, or, inside
     // `show_viewport_immediate`'s callback, the child. Either way it is the
@@ -4593,11 +4716,15 @@ fn draw_resize_handles(
             egui::Sense::drag(),
         );
         if handle.hovered() {
-            ctx.set_cursor_icon(cursor);
+            ctx.set_cursor_icon(if locked {
+                egui::CursorIcon::NotAllowed
+            } else {
+                cursor
+            });
         }
         // Same as the title-bar drag: the anchor is captured once, then
         // `drive_window_gesture` does the per-frame work.
-        if handle.drag_started_by(egui::PointerButton::Primary) {
+        if !locked && handle.drag_started_by(egui::PointerButton::Primary) {
             begin_window_gesture(ctx, gesture, GestureKind::Resize(direction));
         }
     }
@@ -6612,7 +6739,9 @@ fn draw_skill_window(
     // grips exactly as the root window does. Registered first so the header
     // widgets below win the pixels they overlap; egui gives interaction
     // priority to whatever was registered later.
-    draw_resize_handles(ui, &ctx, gesture, ("skill", row.uid));
+    // A breakdown viewport has no pin of its own — issue #232's lock is a
+    // main-window setting — so its resize handles are never locked here.
+    draw_resize_handles(ui, &ctx, gesture, ("skill", row.uid), false);
 
     // -- header: class icon, player name, one Deaths pill (D10) ----------
     let header_rect = skill_header_rect(rect);
@@ -10686,6 +10815,34 @@ mod tests {
         );
     }
 
+    /// Issue #232: pinning now locks size the same way it already locks
+    /// position — reversing the #183 call above that deliberately left
+    /// resize live. `draw_resize_handles` reads this before starting a new
+    /// resize gesture, the same way the drag band reads `drag_locked_by_
+    /// pin` before starting a move.
+    #[test]
+    fn resize_locked_by_pin_mirrors_the_move_lock() {
+        assert!(resize_locked_by_pin(true));
+        assert!(!resize_locked_by_pin(false));
+    }
+
+    /// Issue #231: the header dropdown's Columns list can grow taller than
+    /// the screen it opens on, so the scroll area wrapping the menu body is
+    /// capped at the available screen height (minus a fixed margin) rather
+    /// than left unbounded.
+    #[test]
+    fn header_menu_scroll_max_height_reserves_a_margin_off_the_full_screen() {
+        assert_eq!(header_menu_scroll_max_height(800.0, 24.0), 776.0);
+    }
+
+    /// A display shorter than the margin still gets a non-negative cap —
+    /// egui's `ScrollArea::max_height` on a negative value would otherwise
+    /// invert the scroll area rather than just shrinking it to nothing.
+    #[test]
+    fn header_menu_scroll_max_height_never_goes_negative() {
+        assert_eq!(header_menu_scroll_max_height(10.0, 24.0), 0.0);
+    }
+
     /// Issue #183: a capture of the transparent overlay is flattened to
     /// fully opaque before the clipboard write — the premultiplied RGB is
     /// left exactly as it is, only the alpha byte changes — while an
@@ -14671,6 +14828,198 @@ mod tests {
         assert!(
             !is_open(&update),
             "Close must actually dismiss the popup by the following frame"
+        );
+    }
+
+    /// Regression coverage for issue #231's actual fix
+    /// (`ui.set_max_height(scroll_max_height)` in `draw_header_menu`, just
+    /// above the `ScrollArea`), which no purely-arithmetic test on
+    /// `header_menu_scroll_max_height` can see: the bug it fixes is a
+    /// cross-frame feedback loop in `egui::Popup`'s underlying `Area`,
+    /// which remembers its previous rendered rect and hands that back as
+    /// next frame's available size (see `draw_header_menu`'s doc comment
+    /// on `set_max_height`). That loop only exists across multiple frames
+    /// of the *same* `Area` state, so — like
+    /// `header_menu_popup_stays_open_for_a_column_checkbox_but_closes_for_close`
+    /// just above — this drives the real `draw_header` (chevron, popup
+    /// wiring, and all) rather than calling `draw_header_menu` directly.
+    ///
+    /// The popup's actual on-screen rect is read back via
+    /// `egui::Memory::area_rect`, keyed by the same
+    /// `Popup::default_response_id(&chevron_response)` id production code
+    /// uses — reconstructed here from the chevron's accesskit `NodeId`
+    /// (`Id::accesskit_id` is a direct, unhashed wrap of `Id::value()`, so
+    /// `Id::from_high_entropy_bits` undoes it exactly; that round trip is
+    /// the documented purpose of that method) since `draw_header` has no
+    /// other way to hand a private `Response` out to a test.
+    ///
+    /// A screen with plenty of headroom is used deliberately (rather than
+    /// one short enough to force scrolling): without the fix, removing
+    /// `ui.set_max_height` doesn't make the popup overflow the cap — it
+    /// makes it get stuck at its pre-expansion (Columns collapsed) height
+    /// forever, since the `Area`'s remembered small rect keeps being fed
+    /// back as this `Ui`'s `max_rect` on every later frame and the
+    /// `ScrollArea`'s own `max_height` can't grow a `Ui` past what it was
+    /// given. A generous screen isolates that stuck-small failure from the
+    /// cap itself, which this test also checks holds regardless.
+    #[test]
+    fn header_menu_popup_grows_to_fit_columns_once_expanded() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        // Same reasoning as
+        // `header_menu_popup_stays_open_for_a_column_checkbox_but_closes_for_close`:
+        // a zero animation time makes the Columns disclosure arrow (and
+        // its checkboxes) snap straight to fully open within the same
+        // frame as the click, instead of animating in over several.
+        ctx.global_style_mut(|style| style.animation_time = 0.0);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(0);
+        let mut gesture = WindowGesture::default();
+        let mut update_check = UpdateCheckState::default();
+
+        // Tall enough that the fully expanded menu (all nine of
+        // `ColumnKind::ALL`'s checkboxes) fits with room to spare — see
+        // the doc comment above for why a generous screen, not a short
+        // one, is what actually isolates this regression.
+        let screen_height = 1000.0;
+        let scroll_max_height =
+            header_menu_scroll_max_height(screen_height, HEADER_MENU_SCROLL_MARGIN);
+
+        let mut frame = |mut input: egui::RawInput| -> egui::accesskit::TreeUpdate {
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(default_inner_width(), screen_height),
+            ));
+            let output = ctx.run_ui(input, |ui| {
+                draw_header(
+                    ui,
+                    &ctx,
+                    &snapshot,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    &mut gesture,
+                    false,
+                    true,
+                    &mut update_check,
+                    &unused_log_export_sender(),
+                    false,
+                    &mut false,
+                    None,
+                );
+            });
+            let update = output
+                .platform_output
+                .accesskit_update
+                .clone()
+                .expect("accesskit was enabled for this frame");
+            output.drop_without_applying_deltas();
+            update
+        };
+        let popup_height = |popup_id: egui::Id| {
+            ctx.memory(|mem| mem.area_rect(popup_id))
+                .expect("the header menu popup must have a recorded Area rect by now")
+                .height()
+        };
+
+        // Frame 1: closed header, find the chevron and its accesskit id.
+        let update = frame(egui::RawInput::default());
+        let chevron_node_id = update
+            .nodes
+            .iter()
+            .find_map(|(node_id, node)| {
+                node.label()
+                    .is_some_and(|s| s == "Menu")
+                    .then_some(*node_id)
+            })
+            .expect("no accessible node labeled \"Menu\" painted");
+        let chevron_pos = accessible_rect_for_label(&update, "Menu").center();
+        // SAFETY: `chevron_node_id.0` is exactly the `u64` `Id::value()`
+        // this node's accesskit id was derived from (`Id::accesskit_id`
+        // performs no hashing, only a direct wrap) — recovering that same
+        // `Id` from it is `Id::from_high_entropy_bits`'s documented use
+        // case, not a hash collision gamble.
+        let chevron_id = unsafe { egui::Id::from_high_entropy_bits(chevron_node_id.0) };
+        // Matches `Popup::default_response_id`, which is exactly what
+        // `Popup::menu(&chevron_response)` (via `draw_header`) keys its
+        // `Area`'s remembered rect under.
+        let popup_id = chevron_id.with("popup");
+
+        // Frame 2: open the menu. Its *position* isn't trustworthy yet —
+        // same reasoning as
+        // `header_menu_popup_stays_open_for_a_column_checkbox_but_closes_for_close`
+        // — so this only checks that it opened at all, via "Close" (always
+        // present, regardless of Columns' collapsed/expanded state).
+        let update = frame(click_at(chevron_pos));
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Close")),
+            "clicking the chevron must open the menu"
+        );
+
+        // Frame 3: let the just-opened popup settle out of its first,
+        // sizing-only pass into a stable position — same reasoning as
+        // `header_menu_popup_stays_open_for_a_column_checkbox_but_closes_for_close`.
+        let update = frame(egui::RawInput::default());
+        let columns_pos = accessible_rect_for_label(&update, "Columns").center();
+        let collapsed_height = popup_height(popup_id);
+        assert!(
+            collapsed_height <= scroll_max_height,
+            "collapsed height {collapsed_height} must already be within the \
+             {scroll_max_height} cap"
+        );
+
+        // Frame 4: expand Columns — every one of its nine checkboxes now
+        // needs somewhere to go.
+        let _ = frame(click_at(columns_pos));
+
+        // Several more settle frames with no further input: this is
+        // exactly where issue #231's feedback loop lived. Without
+        // `ui.set_max_height`, the `Area`'s remembered pre-expansion rect
+        // kept being handed straight back to this `Ui` as its `max_rect`
+        // on every one of these frames, and the newly expanded content
+        // never had room to register as taller — the popup stayed frozen
+        // at `collapsed_height` no matter how many frames passed.
+        let mut heights = Vec::new();
+        for _ in 0..5 {
+            let _ = frame(egui::RawInput::default());
+            heights.push(popup_height(popup_id));
+        }
+
+        for (frame_index, height) in heights.iter().enumerate() {
+            assert!(
+                *height <= scroll_max_height,
+                "settle frame {frame_index}: popup height {height} exceeded the \
+                 {scroll_max_height} cap across all settle frames {heights:?}"
+            );
+        }
+        // The actual regression: with the bug, every one of these stays
+        // pinned at `collapsed_height` (a ~7px difference, just the
+        // Columns arrow's own rotation) instead of growing to fit nine
+        // freshly revealed checkboxes.
+        let expanded_height = *heights.last().unwrap();
+        assert!(
+            expanded_height > collapsed_height + 50.0,
+            "expanding Columns must grow the popup well past its collapsed \
+             height {collapsed_height} to fit all nine checkboxes, got \
+             {heights:?}"
+        );
+        // And it must reach that size promptly, not keep climbing frame
+        // after frame once the popup has had several frames to settle.
+        let peak = heights.iter().copied().fold(f32::MIN, f32::max);
+        assert!(
+            expanded_height >= peak - 1.0,
+            "popup height must not still be growing after several settle \
+             frames: {heights:?}"
         );
     }
 
