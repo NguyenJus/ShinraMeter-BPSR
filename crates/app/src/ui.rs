@@ -2452,11 +2452,17 @@ fn draw_header(
 /// buttons nearly invisible when off. `0x40` — exactly half of
 /// `TOGGLE_ACTIVE_COLOR`'s `0x80` — fixed that but, against the header
 /// chrome's `#25282f`, still landed under the 3:1 WCAG minimum for a
-/// non-text UI component (the "on" tint clears it at ~5:1). `0x50` clears
-/// 3:1 while staying visibly dimmer than the "on" tint, so the two states
-/// stay distinguishable at a glance.
+/// non-text UI component (the "on" tint measures 4.7-5.4:1). `0x50`, this
+/// constant's next value, was assumed to clear 3:1 and does not: composited
+/// over the real backgrounds this pill paints on — bare `PANEL_FILL`
+/// rgb(18, 18, 22) and the header wash blended over it, at full opacity and
+/// at the shipped 200/255 default alike — it measures 2.65-2.84:1. `0x58` is
+/// the first alpha over 3:1 in every one of those cases; `0x60` measures
+/// 3.30-3.53:1, clearing the minimum with margin to spare while staying
+/// visibly dimmer than the "on" tint's `0x80`, so the two states stay
+/// distinguishable at a glance.
 const TOGGLE_OFF_COLOR: egui::Color32 =
-    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x50);
+    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x60);
 /// Tint the toggle cluster's buttons are painted with while active — the
 /// same half-white `TOOLBAR_ICON_TINT` every other clickable icon in this
 /// module uses. Share and Reset (one-shot actions, not on/off state) always
@@ -13623,6 +13629,55 @@ mod tests {
         assert_eq!(emblem.center().y, wash.center().y);
         assert_eq!(emblem.width(), HEADER_WASH_EMBLEM_SIZE);
         assert_eq!(emblem.height(), HEADER_WASH_EMBLEM_SIZE);
+    }
+
+    /// Issue #255's live-window pass shrank `HEADER_WASH_EMBLEM_BLEED` from
+    /// the source's literal `25` to `17` so the wash emblem stopped painting
+    /// through the title row's toggle pill. Nothing tested that: the bleed's
+    /// only other test compares the emblem's overhang against the very
+    /// constant `header_wash_emblem_rect` computed it from, so it holds for
+    /// any value — `25` included.
+    ///
+    /// The overlap that mattered is not a box overlap and cannot be tested
+    /// as one. The emblem is a 200pt square blitted over a header band a
+    /// quarter that tall, so its *box* swallows the pill whole at any bleed
+    /// (asserted below, so nobody replaces this with a `!intersects` check
+    /// that can only ever fail). What the user sees is the emblem's ink,
+    /// which is a diamond symmetric about the square's vertical axis — the
+    /// line the top chevron's vertex and both diamond apexes sit on, and the
+    /// strongest edge anywhere in the mark. That axis is what has to clear
+    /// the pill, and shrinking the overhang is what slides it left.
+    #[test]
+    fn the_wash_emblem_axis_clears_the_title_row_toggle_pill() {
+        let panel = wash_test_panel();
+        let wash = header_wash_rect(panel, WASH_TEST_HEIGHT);
+        let emblem = header_wash_emblem_rect(wash);
+        // The title row spans the panel's own width, the same stand-in
+        // `the_gutter_emblem_clears_the_stat_row_horizontally_not_by_clipping`
+        // builds from a painted frame's wash.
+        let row = egui::Rect::from_min_size(panel.min, egui::vec2(wash.width(), TITLE_LINE_HEIGHT));
+        let pill = title_toggle_pill_rect(row, 18.0);
+
+        assert!(
+            emblem.intersects(pill),
+            "the emblem box {emblem:?} no longer covers the pill {pill:?} —              if that is now true by geometry, this test is testing nothing"
+        );
+        assert!(
+            emblem.center().x < pill.left(),
+            "the emblem's axis sits at {}, inside the toggle pill's {:?} —              its strongest edge is painting through the glyphs again",
+            emblem.center().x,
+            pill.x_range()
+        );
+
+        // …and it is the nudge that buys that, not the layout: at the
+        // source's literal `25` the axis lands inside the pill.
+        const SOURCE_BLEED: f32 = 25.0;
+        let unnudged = emblem.center().x + SOURCE_BLEED - HEADER_WASH_EMBLEM_BLEED;
+        assert!(
+            unnudged > pill.left() && unnudged < pill.right(),
+            "at the source's {SOURCE_BLEED}pt overhang the emblem's axis would              sit at {unnudged}, already clear of the pill's {:?} — the bleed no              longer drives this, so tighten or drop the assertion above",
+            pill.x_range()
+        );
     }
 
     /// The wash emblem is drawn far larger than the band it decorates, so it
