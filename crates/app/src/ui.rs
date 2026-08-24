@@ -299,7 +299,7 @@ fn paint_skill_icon_placeholder(
 }
 
 /// Commands the overlay emits for the app layer to consume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
     Reset,
     Quit,
@@ -312,6 +312,14 @@ pub enum UiCommand {
     /// `pipeline::run` holds the `Send`-able half (`CaptureRestart`) and
     /// makes the request on this command's behalf.
     RestartCapture,
+    /// The uids of every player with an open skill-breakdown window, sent
+    /// whenever `OverlayApp::skill_windows`' key set changes (PR #268
+    /// review, finding 2). `pipeline::run` keeps the latest one and uses it
+    /// to skip building the heals/dealt/received/casts breakdowns
+    /// (`bpsr_meter::Meter::snapshot_focused`) for every other player on
+    /// the live ~10Hz publish tick — a skill window is closed almost all
+    /// the time, so that work is otherwise wasted on every tick.
+    SkillFocus(Vec<i64>),
 }
 
 /// Non-fatal status banner shown above the player rows.
@@ -487,6 +495,12 @@ pub struct OverlayApp {
     /// `BTreeMap` so several open windows keep a stable draw order across
     /// frames.
     skill_windows: std::collections::BTreeMap<i64, SkillWindowState>,
+    /// The `skill_windows` key set as of the last `UiCommand::SkillFocus`
+    /// sent to the pipeline thread (PR #268 review, finding 2). Compared
+    /// against `skill_windows.keys()` each frame so the command only goes
+    /// out on an actual open/close, not on every frame a window happens to
+    /// be open.
+    last_sent_skill_focus: Vec<i64>,
     /// Issue #39: the history thread's handle, or `None` when history is
     /// disabled or its database could not be opened — every history control is
     /// then simply absent, and nothing else changes.
@@ -922,6 +936,42 @@ fn heal_total(class: Class) -> i64 {
         .sum()
 }
 
+/// The "Skill dealt" tab's demo fixture (issue #245, PR #268 review finding
+/// 3): `skills` and `heals` merged by skill id via `SkillStats::merge`,
+/// exactly like the real `dealt_rows` (`crates/meter/src/encounter.rs`)
+/// merges `stats.skills` and `stats.heals` — not concatenated, which would
+/// leave two rows standing for one skill id that happens to appear in both
+/// fixture lists rather than summing them into one. `total` is the row's
+/// combined damage+heal total, the same "% Dealt" denominator the real
+/// `dealt_rows` passes through from `stats.total_damage + stats.total_heal`.
+fn demo_dealt_rows(
+    skills: &[DemoSkill],
+    heals: &[DemoSkill],
+    total: i64,
+    duration_ms: u64,
+) -> Vec<SkillRow> {
+    let mut merged: std::collections::HashMap<i32, SkillStats> = std::collections::HashMap::new();
+    for &(skill_id, damage, hits, crit_hits, crit_damage, max_crit) in
+        skills.iter().chain(heals.iter())
+    {
+        let entry = SkillStats {
+            total_damage: damage,
+            hits,
+            crit_hits,
+            crit_damage,
+            max_crit,
+            ..Default::default()
+        };
+        merged.entry(skill_id).or_default().merge(&entry);
+    }
+    let mut rows: Vec<SkillRow> = merged
+        .iter()
+        .map(|(&skill_id, stats)| skill_row_from_stats(skill_id, stats, total, duration_ms))
+        .collect();
+    rows.sort_by_key(|s| std::cmp::Reverse(s.damage));
+    rows
+}
+
 /// What the demo's boss lands on each row (issue #245) — the Skill
 /// received tab's fixture. Three monster abilities, one of them a
 /// heavy-hitting crit, which is the shape a tank's received breakdown has.
@@ -1018,14 +1068,12 @@ fn demo_snapshot() -> Snapshot {
                     // `dealt_rows` merges them, and "received" is the
                     // boss's swings landing back on the row.
                     heals: demo_skill_rows(demo_heals(class), heal_total(class), duration_ms),
-                    dealt: demo_skill_rows(demo_skills, damage + heal_total(class), duration_ms)
-                        .into_iter()
-                        .chain(demo_skill_rows(
-                            demo_heals(class),
-                            damage + heal_total(class),
-                            duration_ms,
-                        ))
-                        .collect(),
+                    dealt: demo_dealt_rows(
+                        demo_skills,
+                        demo_heals(class),
+                        damage + heal_total(class),
+                        duration_ms,
+                    ),
                     received: demo_skill_rows(DEMO_RECEIVED, demo_received_total(), duration_ms),
                     // A cast count per damaging skill, deliberately a
                     // little above its hit count — most BPSR skills land
@@ -1119,6 +1167,7 @@ impl OverlayApp {
             demo_mode,
             startup_toggles_applied: false,
             skill_windows: std::collections::BTreeMap::new(),
+            last_sent_skill_focus: Vec::new(),
             history,
             rx_history,
             tx_history,
@@ -1922,6 +1971,27 @@ impl eframe::App for OverlayApp {
         }
         for uid in closed_skill_windows {
             close_skill_window(&mut self.skill_windows, uid);
+        }
+
+        // PR #268 review, finding 2: tell the pipeline thread which players
+        // it can skip the heals/dealt/received/casts breakdowns for. Only
+        // `Live`-sourced windows count — a `History`-sourced one draws from
+        // `history_open`'s own already-fully-populated snapshot above, never
+        // from the live one the pipeline thread builds, so naming its uid
+        // here would cost real work for nothing. Sent only when the set
+        // actually changed, so an open (or already-focused) window doesn't
+        // resend it every frame.
+        let live_skill_focus: Vec<i64> = self
+            .skill_windows
+            .iter()
+            .filter(|(_, state)| state.source == SkillWindowSource::Live)
+            .map(|(&uid, _)| uid)
+            .collect();
+        if live_skill_focus != self.last_sent_skill_focus {
+            let _ = self
+                .tx_command
+                .try_send(UiCommand::SkillFocus(live_skill_focus.clone()));
+            self.last_sent_skill_focus = live_skill_focus;
         }
 
         // ~10 Hz.
@@ -7061,7 +7131,7 @@ const SKILL_HEADER_RGB: egui::Color32 = egui::Color32::from_rgb(0xef, 0x53, 0x50
 /// the same read at egui's flat alpha — bright enough to be obviously
 /// clickable, clearly behind the selected tab's pure white.
 const SKILL_TAB_IDLE_RGB: egui::Color32 = egui::Color32::from_rgb(0x9a, 0x9a, 0xa4);
-/// A tab this build cannot fill (issue #245: Buff, Skill casts). Dimmer
+/// A tab this build cannot fill (issue #245: Buff). Dimmer
 /// again than `SKILL_TAB_IDLE_RGB`, so the strip reads honestly at a
 /// glance, but still selectable — the body explains the gap.
 const SKILL_TAB_UNTRACKED_RGB: egui::Color32 = egui::Color32::from_rgb(0x5e, 0x5e, 0x68);
@@ -7974,7 +8044,7 @@ fn draw_skill_window(
         if selected || response.hovered() {
             painter.rect_filled(tab_rect, 0.0, SKILL_PANEL_FILL.gamma_multiply(opacity));
         }
-        // An untracked tab (issue #245: Buff, Skill casts) is drawn muted
+        // An untracked tab (issue #245: Buff) is drawn muted
         // rather than hidden — the reference has it, this build cannot
         // fill it, and the body says why once it is opened. Hiding it
         // would leave the gap unexplained; greying it out of clicking
@@ -9221,6 +9291,191 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- heals/dealt/received/casts demo fixtures (PR #268 review, finding
+    // 3) --------------------------------------------------------------
+    //
+    // Every test above this point only ever looks at `row.skills`; nothing
+    // in this file asserted the other four tabs `demo_snapshot` claims to
+    // populate (issue #245) actually are. These mirror the `skills` tests'
+    // shape for each of `heals`/`dealt`/`received`/`casts`.
+
+    /// Only the demo party's healer class (`VerdantOracle`/`Fizz`) has any
+    /// healing fixture (`demo_heals`) — every other row must come through
+    /// with an empty `heals`, and the healer's own must be non-empty and
+    /// sum to `heal_total`'s declared denominator, its shares summing to
+    /// ~100% the same way `demo_snapshot_header_and_rows_are_internally_
+    /// consistent` checks the damage rows.
+    #[test]
+    fn demo_heal_breakdown_is_populated_only_for_the_healer_role_and_sums_correctly() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            let class = row.class.expect("every demo row has a class");
+            let total = heal_total(class);
+            if total == 0 {
+                assert!(
+                    row.heals.is_empty(),
+                    "row {} ({class:?}) has no heal fixture and must have an empty heals tab",
+                    row.name
+                );
+                continue;
+            }
+            assert!(
+                !row.heals.is_empty(),
+                "row {} ({class:?}) must have a non-empty heals tab",
+                row.name
+            );
+            let heal_sum: i64 = row.heals.iter().map(|s| s.damage).sum();
+            assert_eq!(
+                heal_sum, total,
+                "row {}'s heal breakdown must sum to heal_total",
+                row.name
+            );
+            let share_sum: f32 = row.heals.iter().map(|s| s.share_pct).sum();
+            assert!(
+                (share_sum - 100.0).abs() < 0.1,
+                "row {}'s heal shares must sum to ~100%, got {share_sum}",
+                row.name
+            );
+        }
+    }
+
+    /// The boss's swings (`DEMO_RECEIVED`) land on every row identically —
+    /// there is no per-class variation the way heals has — so every row's
+    /// `received` must be non-empty and sum to `demo_received_total`.
+    #[test]
+    fn demo_received_breakdown_is_populated_for_every_row_and_sums_to_its_total() {
+        let snapshot = demo_snapshot();
+        let total = demo_received_total();
+        for row in &snapshot.rows {
+            assert!(
+                !row.received.is_empty(),
+                "row {} must have a non-empty received tab",
+                row.name
+            );
+            let received_sum: i64 = row.received.iter().map(|s| s.damage).sum();
+            assert_eq!(
+                received_sum, total,
+                "row {}'s received breakdown must sum to demo_received_total",
+                row.name
+            );
+        }
+    }
+
+    /// `demo_cast_rows` is built 1:1 from `demo_skills` (issue #245): same
+    /// skill ids, hits floored at one third of the damage row's own hit
+    /// count. Every row's casts must be non-empty and match that exactly —
+    /// this is the "populated" half of finding 3's coverage gap for the
+    /// Skill casts tab.
+    #[test]
+    fn demo_cast_breakdown_is_populated_and_derives_from_the_skill_hits() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            assert!(
+                !row.casts.is_empty(),
+                "row {} must have a non-empty casts tab",
+                row.name
+            );
+            assert_eq!(
+                row.casts.len(),
+                row.skills.len(),
+                "row {}'s casts must have one entry per skill",
+                row.name
+            );
+            for skill in &row.skills {
+                let cast = row
+                    .casts
+                    .iter()
+                    .find(|c| c.skill_id == skill.skill_id)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "row {}'s casts is missing skill id {}",
+                            row.name, skill.skill_id
+                        )
+                    });
+                assert_eq!(
+                    cast.hits,
+                    (skill.hits / 3).max(1),
+                    "row {}'s cast count for skill {} must be its hit count / 3, floored at 1",
+                    row.name,
+                    skill.skill_id
+                );
+            }
+        }
+    }
+
+    /// The "Skill dealt" tab is damage and healing merged under one skill
+    /// id (issue #245) — for the current, non-colliding fixtures that's
+    /// equivalent to a plain concatenation, so this only pins the *sum*:
+    /// `demo_dealt_rows_merges_a_shared_skill_id_instead_of_duplicating_it`
+    /// below is what actually exercises the merge itself.
+    #[test]
+    fn demo_dealt_breakdown_sums_to_damage_plus_heals() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            let heal_sum: i64 = row.heals.iter().map(|s| s.damage).sum();
+            let dealt_sum: i64 = row.dealt.iter().map(|s| s.damage).sum();
+            assert_eq!(
+                dealt_sum,
+                row.damage + heal_sum,
+                "row {}'s dealt breakdown must sum to damage + heals",
+                row.name
+            );
+            assert!(
+                !row.dealt.is_empty(),
+                "row {} must have a non-empty dealt tab",
+                row.name
+            );
+        }
+    }
+
+    /// PR #268 review, finding 3: the "Skill dealt" tab used to be built by
+    /// chaining `demo_skill_rows(demo_skills, ...)` and
+    /// `demo_skill_rows(demo_heals(class), ...)` end to end, with no merge
+    /// step — so a skill id that happened to appear in *both* fixture lists
+    /// would silently show up as two separate rows instead of one summed
+    /// row, unlike the real meter's `dealt_rows`
+    /// (`crates/meter/src/encounter.rs`), which merges by skill id via
+    /// `SkillStats::merge`. None of today's `DEMO_ROWS` fixtures happen to
+    /// collide, so that bug shipped invisibly; this drives `demo_dealt_rows`
+    /// directly with two synthetic lists sharing a skill id and would fail
+    /// against the old chain-based implementation (two rows, wrong per-row
+    /// damage) the same way it would against a real collision.
+    #[test]
+    fn demo_dealt_rows_merges_a_shared_skill_id_instead_of_duplicating_it() {
+        let skills: &[DemoSkill] = &[
+            (9001, 1_000, 10, 2, 400, 200), // shared id
+            (9002, 500, 5, 1, 200, 150),
+        ];
+        let heals: &[DemoSkill] = &[
+            (9001, 300, 3, 1, 150, 100), // same id as skills[0]
+        ];
+        let rows = demo_dealt_rows(skills, heals, 1_800, 60_000);
+
+        assert_eq!(
+            rows.iter().filter(|r| r.skill_id == 9001).count(),
+            1,
+            "a skill id shared between skills and heals must merge into one dealt row, not two"
+        );
+        let merged = rows
+            .iter()
+            .find(|r| r.skill_id == 9001)
+            .expect("the merged 9001 row must be present");
+        assert_eq!(
+            merged.damage, 1_300,
+            "the merged row's damage must be the sum of both sources' damage"
+        );
+        assert_eq!(
+            merged.hits, 13,
+            "the merged row's hits must be the sum of both sources' hits"
+        );
+
+        let untouched = rows
+            .iter()
+            .find(|r| r.skill_id == 9002)
+            .expect("a non-colliding skill id must still come through");
+        assert_eq!(untouched.damage, 500);
     }
 
     /// The regression this guards: a future refactor that deletes or

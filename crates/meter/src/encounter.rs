@@ -2457,6 +2457,32 @@ impl Meter {
     }
 
     pub fn snapshot(&self, now_ms: u64) -> Snapshot {
+        self.snapshot_focused(now_ms, None)
+    }
+
+    /// Same as [`Meter::snapshot`], but skips the four breakdown-tab
+    /// vectors (`heals`, `dealt`, `received`, `casts`) for any player not
+    /// named in `focus` — building only `skills`, which every row needs for
+    /// the always-visible Dps bar.
+    ///
+    /// `focus` is the set of player uids with an open skill-breakdown
+    /// window (`crates/app/src/ui.rs`'s `skill_windows` keys), threaded in
+    /// from the UI via `UiCommand::SkillFocus`
+    /// (`crates/app/src/pipeline.rs`'s live publish loop). `None` means
+    /// "build every breakdown for every player" — [`Meter::snapshot`]'s own
+    /// behavior, and every non-live caller (tests, replay/history, the
+    /// sanitizer) goes through that path unchanged.
+    ///
+    /// This exists because the live pipeline (`crates/app/src/pipeline.rs`)
+    /// publishes a snapshot ~10x/second regardless of whether any skill
+    /// window is even open, and a skill window is closed almost all the
+    /// time (PR #268 review, finding 2): sorting four extra `Vec<SkillRow>`
+    /// per player on every tick for tabs nobody is looking at is pure
+    /// waste. Gating by player rather than by (player, tab) keeps this
+    /// crate ignorant of `bpsr-app`'s `SkillTab` type, and means flipping
+    /// tabs on an already-open window never has to wait a tick for data
+    /// that was already being built for that player.
+    pub fn snapshot_focused(&self, now_ms: u64, focus: Option<&[i64]>) -> Snapshot {
         let total_damage: i64 = self.players.values().map(|p| p.total_damage).sum();
 
         // issue #78: once the fight has ended the snapshot is rendered as of
@@ -2487,13 +2513,26 @@ impl Meter {
                     0.0
                 };
                 let skills = skill_rows(p, dps_duration_ms);
-                // issue #245: one vector per breakdown tab. Built here
-                // rather than lazily on the UI side because every one of
-                // them needs `dps_duration_ms`, which is snapshot-local.
-                let heals = breakdown_rows(&p.heals, p.total_heal, dps_duration_ms);
-                let dealt = dealt_rows(p, dps_duration_ms);
-                let received = breakdown_rows(&p.incoming, p.total_incoming, dps_duration_ms);
-                let casts = cast_rows(p, dps_duration_ms);
+                // issue #245, gated per PR #268 review finding 2: one
+                // vector per breakdown tab, built here rather than lazily on
+                // the UI side because every one of them needs
+                // `dps_duration_ms`, which is snapshot-local. `focus` limits
+                // this real work to players whose skill window is actually
+                // open (see `snapshot_focused`'s doc comment) — everyone
+                // else gets the same empty vectors `SkillTab::rows` already
+                // returns for `Buff`, which is indistinguishable from "no
+                // events yet" to every consumer since none is looking.
+                let wants_breakdowns = focus.is_none_or(|uids| uids.contains(&p.uid));
+                let (heals, dealt, received, casts) = if wants_breakdowns {
+                    (
+                        breakdown_rows(&p.heals, p.total_heal, dps_duration_ms),
+                        dealt_rows(p, dps_duration_ms),
+                        breakdown_rows(&p.incoming, p.total_incoming, dps_duration_ms),
+                        cast_rows(p, dps_duration_ms),
+                    )
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                };
                 PlayerRow {
                     uid: p.uid,
                     name: p
