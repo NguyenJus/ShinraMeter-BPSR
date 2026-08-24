@@ -20,14 +20,18 @@ pub mod writer;
 
 use std::path::PathBuf;
 
-use bpsr_meter::{Class, EncounterInfo, PlayerRow, Snapshot};
+use bpsr_meter::{Class, EncounterInfo, PlayerRow, SkillRow, Snapshot};
 
 /// Schema version this build writes and reads (spec §5.4). Bumped whenever
-/// the DDL in `sqlite::init_schema` changes; an on-disk file stamped with any
-/// other `PRAGMA user_version` is renamed aside and replaced with a fresh one
-/// rather than migrated (DECISION D11 — there is exactly one schema and zero
-/// shipped users of it).
-pub const SCHEMA_VERSION: i32 = 1;
+/// the DDL in `sqlite::init_schema` changes.
+///
+/// v1 → v2 (issue #222) added `encounter_player_skills`. A file stamped with
+/// an *older* known version is migrated forward in place by
+/// `sqlite::migrate`, so an existing history survives the upgrade with its
+/// pre-v2 encounters simply carrying no skill rows. Only a version this build
+/// has never heard of (a downgrade, or a hand-edited file) is still renamed
+/// aside and replaced, since there is nothing to migrate *from*.
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// Retention rules, applied inside every `HistoryStore::insert` (spec §5.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +51,70 @@ impl Default for RetentionPolicy {
             max_encounters: 500,
             max_age_days: 90,
             min_duration_ms: 5_000,
+        }
+    }
+}
+
+/// One saved row of a player's skill breakdown (issue #222) — the owned
+/// twin of `bpsr_meter::SkillRow`, kept as its own type for the same reason
+/// [`PlayerRecord`] is: the meter's hot-path types must not grow a
+/// persistence contract. Field for field identical to `SkillRow`, whose
+/// fields are all already owned, so the two conversions below are plain
+/// copies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillRecord {
+    pub skill_id: i32,
+    pub damage: i64,
+    /// Share of this *player's* damage, not the encounter's — same meaning
+    /// as `SkillRow::share_pct`, stored as-computed rather than re-derived
+    /// on load so a historical breakdown can never disagree with what the
+    /// live window showed.
+    pub share_pct: f32,
+    pub crit_pct: f32,
+    pub max_crit: i64,
+    pub avg_crit: f64,
+    pub avg_white: f64,
+    pub avg: f64,
+    pub hits: u64,
+    pub crit_hits: u64,
+    pub hits_per_min: f64,
+}
+
+impl From<&SkillRow> for SkillRecord {
+    fn from(row: &SkillRow) -> Self {
+        Self {
+            skill_id: row.skill_id,
+            damage: row.damage,
+            share_pct: row.share_pct,
+            crit_pct: row.crit_pct,
+            max_crit: row.max_crit,
+            avg_crit: row.avg_crit,
+            avg_white: row.avg_white,
+            avg: row.avg,
+            hits: row.hits,
+            crit_hits: row.crit_hits,
+            hits_per_min: row.hits_per_min,
+        }
+    }
+}
+
+impl SkillRecord {
+    /// The other direction, used by [`PlayerRecord::to_row`] so a historical
+    /// breakdown window draws through the exact same `SkillRow` path a live
+    /// one does.
+    fn to_skill_row(&self) -> SkillRow {
+        SkillRow {
+            skill_id: self.skill_id,
+            damage: self.damage,
+            share_pct: self.share_pct,
+            crit_pct: self.crit_pct,
+            max_crit: self.max_crit,
+            avg_crit: self.avg_crit,
+            avg_white: self.avg_white,
+            avg: self.avg,
+            hits: self.hits,
+            crit_hits: self.crit_hits,
+            hits_per_min: self.hits_per_min,
         }
     }
 }
@@ -72,6 +140,11 @@ pub struct PlayerRecord {
     pub lucky_pct: f32,
     pub hits: u64,
     pub deaths: u32,
+    /// This player's per-skill breakdown (issue #222), damage-descending —
+    /// the order `SkillRow` arrives in and the order the breakdown window
+    /// draws, preserved verbatim through the `slot` column rather than
+    /// re-sorted on load.
+    pub skills: Vec<SkillRecord>,
 }
 
 impl From<&PlayerRow> for PlayerRecord {
@@ -91,6 +164,7 @@ impl From<&PlayerRow> for PlayerRecord {
             lucky_pct: row.lucky_pct,
             hits: row.hits,
             deaths: row.deaths,
+            skills: row.skills.iter().map(SkillRecord::from).collect(),
         }
     }
 }
@@ -115,9 +189,10 @@ impl PlayerRecord {
             lucky_pct: self.lucky_pct,
             hits: self.hits,
             deaths: self.deaths,
-            // Not persisted (issue #39's schema stores per-player totals
-            // only), so a rebuilt historical row has no breakdown.
-            skills: Vec::new(),
+            // Issue #222: persisted since schema v2, so a historical row
+            // opens the same breakdown a live one does. Encounters saved
+            // before v2 have no skill rows and land here empty.
+            skills: self.skills.iter().map(SkillRecord::to_skill_row).collect(),
         }
     }
 }
@@ -409,6 +484,76 @@ mod tests {
                 rebuilt.encounter.scene_id
             ),
             (Some(42), Some(7))
+        );
+    }
+
+    fn sample_skill(skill_id: i32, damage: i64) -> SkillRow {
+        SkillRow {
+            skill_id,
+            damage,
+            share_pct: 60.0,
+            crit_pct: 25.0,
+            max_crit: damage / 2,
+            avg_crit: 1_500.5,
+            avg_white: 900.25,
+            avg: 1_200.75,
+            hits: 8,
+            crit_hits: 2,
+            hits_per_min: 40.5,
+        }
+    }
+
+    #[test]
+    fn record_from_snapshot_carries_the_per_skill_breakdown() {
+        let mut row = sample_row(1, "Alice");
+        row.skills = vec![sample_skill(101, 700), sample_skill(102, 300)];
+        let snapshot = sample_snapshot(vec![row], 1_000);
+
+        let record = record_from_snapshot(&snapshot, 1_000, "Title".to_string(), None).unwrap();
+
+        assert_eq!(
+            record.players[0]
+                .skills
+                .iter()
+                .map(|s| (s.skill_id, s.damage))
+                .collect::<Vec<_>>(),
+            vec![(101, 700), (102, 300)]
+        );
+    }
+
+    /// Issue #222: the breakdown window opened from a historical row draws
+    /// `PlayerRow::skills`, so a saved fight has to hand those back field for
+    /// field — not just the ids.
+    #[test]
+    fn to_row_hydrates_the_saved_skill_breakdown() {
+        let mut row = sample_row(1, "Alice");
+        row.skills = vec![sample_skill(101, 700)];
+        let snapshot = sample_snapshot(vec![row], 1_000);
+        let record = record_from_snapshot(&snapshot, 1_000, "Title".to_string(), None).unwrap();
+
+        let rebuilt = record.to_snapshot();
+
+        let skill = &rebuilt.rows[0].skills[0];
+        assert_eq!(
+            (
+                skill.skill_id,
+                skill.damage,
+                skill.max_crit,
+                skill.hits,
+                skill.crit_hits
+            ),
+            (101, 700, 350, 8, 2)
+        );
+        assert_eq!(
+            (
+                skill.share_pct,
+                skill.crit_pct,
+                skill.avg_crit,
+                skill.avg_white,
+                skill.avg,
+                skill.hits_per_min
+            ),
+            (60.0, 25.0, 1_500.5, 900.25, 1_200.75, 40.5)
         );
     }
 

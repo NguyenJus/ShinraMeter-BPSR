@@ -232,6 +232,22 @@ pub enum ProtocolEvent {
         name: String,
         value: i32,
     },
+    /// An entity left the client's area of interest (issue #215), decoded
+    /// from `pb::SyncNearEntities.disappear` — the counterpart of the
+    /// `appear` list that produces `Player`/`EnemyHp`. Emitted for monsters
+    /// only: a player walking out of range says nothing this meter tracks.
+    ///
+    /// **This is not a death signal.** `pb::DisappearEntity` carries a bare
+    /// `uuid` and no reason code whatsoever, so the wire cannot distinguish
+    /// "died and the corpse was despawned" from "the player walked out of
+    /// AOI range" or an ordinary streaming eviction. This crate therefore
+    /// reports the fact and nothing more; deciding whether a particular
+    /// despawn may stand in for a missed death is the meter's job, under
+    /// the deliberately narrow rule documented on
+    /// `bpsr_meter::Meter::apply_enemy_gone`.
+    EnemyGone {
+        uid: i64,
+    },
 }
 
 #[cfg(test)]

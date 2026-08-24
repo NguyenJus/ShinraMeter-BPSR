@@ -6121,9 +6121,23 @@ const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 572.0);
 /// Floor on the skill breakdown viewport's inner size (issue #181) so a
 /// resize can't shrink it into uselessness — tall enough for the header, tab
 /// strip and column-header row plus a couple of rows before the list
-/// scrolls, wide enough to keep the columns legible once
-/// `column_anchors_from_widths` scales them down.
-const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(360.0, 220.0);
+/// scrolls, wide enough to fit every column at its stated width.
+///
+/// Issue #228: the width used to be a flat 360.0, far narrower than the sum
+/// of `SkillColumn::width`s (728.0) plus the column header row's left/right
+/// `SKILL_HEADER_PAD_X` inset (24.0) — so dragging the window down toward
+/// this floor pushed `column_anchors_from_widths` into its proportional
+/// shrink path (see its doc comment) while the header labels stayed
+/// unclipped at full size, colliding them into unreadable text (e.g.
+/// `Damag%Dmg%Max cr…`). Of the fixes the issue lists — eliding column
+/// text, progressively dropping columns, or raising this floor — raising
+/// the floor is the one taken: it's the smallest change, and every column
+/// stays fully legible at every reachable size rather than switching to a
+/// second, narrower text-rendering mode. The floor is now exactly that
+/// budget, so `column_anchors_from_widths` can still scale a fraction of a
+/// point for rounding but never enough to visibly compress a label. See
+/// `skill_window_min_width_fits_every_column_at_its_stated_width`.
+const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(752.0, 220.0);
 
 /// One open breakdown window's own state (issue #16, D9): its sort column/
 /// direction, the screen position it was placed at when opened, and the
@@ -6352,11 +6366,12 @@ fn skill_rows_rect(rect: egui::Rect, col_header_rect: egui::Rect) -> egui::Rect 
 /// has nothing to show (issue #216) — which of the two it is depends on the
 /// window's source, not just on the row count (PR #221 review).
 ///
-/// A historical fight's `PlayerRow::skills` is empty *permanently*: the
-/// history schema doesn't persist per-skill totals (see
-/// `history::PlayerRecord::to_row`), so nothing will ever populate it and
-/// naming that limitation is what keeps the window from reading as silent
-/// breakage. A live row's empty `skills` means only "not yet": the dungeon
+/// A historical fight's `PlayerRow::skills` is empty *for good*: schema v2
+/// persists per-skill totals (issue #222), so a fight recorded by this build
+/// has its breakdown, and an empty one is a fight saved before v2 or a player
+/// who never landed a hit — either way nothing will ever populate it now, and
+/// naming that is what keeps the window from reading as silent breakage. A
+/// live row's empty `skills` means only "not yet": the dungeon
 /// roster preload (`encounter::apply_player`) puts a party member in the
 /// snapshot with an empty skill map before their first hit lands, and a
 /// healer can sit there for a whole fight — telling that user "nothing was
@@ -12193,6 +12208,35 @@ mod tests {
         );
     }
 
+    /// Issue #228: dragging the window down to `SKILL_WINDOW_MIN_SIZE`
+    /// used to be reachable at a width far narrower than the columns'
+    /// combined budget. `column_anchors_from_widths` scales every column's
+    /// *slot* down to fit at that point, but the header labels
+    /// (`draw_skill_window`'s column-header loop) are painted unclipped at
+    /// fixed size — they don't shrink or elide with their slot — so a
+    /// too-narrow floor collided them into unreadable text (e.g.
+    /// `Damag%Dmg%Max cr…`). The fix keeps the floor itself wide enough
+    /// that no column is ever below the width its label needs: the sum of
+    /// every `SkillColumn::width` plus the column header row's left/right
+    /// `SKILL_HEADER_PAD_X` inset (the same margin
+    /// `skill_columns_fit_the_initial_window_at_their_stated_widths`
+    /// checks against for the *initial* size). This is the "raise the
+    /// floor" fix from the alternatives the issue lists (eliding text or
+    /// progressively dropping columns): it is the smallest change that
+    /// removes the collision, and it keeps every column's full label
+    /// legible at every reachable size instead of introducing a second,
+    /// narrower text-rendering mode.
+    #[test]
+    fn skill_window_min_width_fits_every_column_at_its_stated_width() {
+        let total: f32 = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).sum();
+        assert!(
+            SKILL_WINDOW_MIN_SIZE.x >= total + 2.0 * SKILL_HEADER_PAD_X,
+            "min width {} is narrower than the columns' {total} + padding, \
+             so a resize down to it collides their header text",
+            SKILL_WINDOW_MIN_SIZE.x
+        );
+    }
+
     /// Measured off the reference at x=860, where the game background
     /// behind the window is continuous across all three band edges:
     /// header/tabs (29,28,33), rows (45,44,49), column header (51,50,55).
@@ -15604,7 +15648,8 @@ mod tests {
 
     /// A zero-skill row means two different things (PR #221 review): a live
     /// row is a roster-preloaded or not-yet-hitting player mid-fight, a
-    /// historical one is the history schema never storing per-skill totals.
+    /// historical one is a fight saved before schema v2 stored per-skill
+    /// totals (issue #222) — settled either way, not still arriving.
     #[test]
     fn skill_window_empty_message_is_worded_for_the_window_s_source() {
         assert_eq!(
