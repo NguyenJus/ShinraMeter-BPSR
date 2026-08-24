@@ -7795,12 +7795,14 @@ mod tests {
         // same 38x38 slot. Pins the inset to the small "~2-3px" range that
         // closes that gap without shrinking the disc out of the same size
         // class as real icon art.
-        assert!((2.0..=3.0).contains(&SKILL_ICON_PLACEHOLDER_INSET));
-        assert_eq!(
-            SKILL_ICON_PLACEHOLDER_RADIUS,
-            SKILL_ICON_SIZE / 2.0 - SKILL_ICON_PLACEHOLDER_INSET
-        );
-        assert!(SKILL_ICON_PLACEHOLDER_RADIUS < SKILL_ICON_SIZE / 2.0);
+        const { assert!(SKILL_ICON_PLACEHOLDER_INSET >= 2.0 && SKILL_ICON_PLACEHOLDER_INSET <= 3.0) };
+        const {
+            assert!(
+                SKILL_ICON_PLACEHOLDER_RADIUS
+                    == SKILL_ICON_SIZE / 2.0 - SKILL_ICON_PLACEHOLDER_INSET
+            )
+        };
+        const { assert!(SKILL_ICON_PLACEHOLDER_RADIUS < SKILL_ICON_SIZE / 2.0) };
     }
 
     #[test]
