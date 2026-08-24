@@ -226,6 +226,7 @@ mod tests {
                 lucky_pct: 0.0,
                 hits: 10,
                 deaths: 0,
+                dead_ms: Some(0),
                 skills: Vec::new(),
             }],
             encounter: EncounterInfo::default(),

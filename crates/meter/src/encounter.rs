@@ -2439,6 +2439,10 @@ impl Meter {
                     lucky_pct: p.lucky_pct(),
                     hits: p.hits,
                     deaths: p.deaths,
+                    // Issue #254: `effective_now_ms`, not `now_ms` — an
+                    // ended fight's rows are frozen as of its end, and a
+                    // death still open then stops accruing with them.
+                    dead_ms: Some(p.dead_ms_as_of(effective_now_ms)),
                     skills,
                 }
             })
@@ -3607,6 +3611,106 @@ mod tests {
             assert_eq!(row.deaths, 1);
             assert_eq!(row.damage, 0);
             assert_eq!(row.hits, 0);
+        }
+
+        /// Issue #254: the death packet's timestamp opens the interval and
+        /// this player's next acted event closes it — the only revive
+        /// evidence this decoder gets (`PlayerStats::alive`).
+        #[test]
+        fn a_death_and_the_next_action_bound_one_dead_interval() {
+            let mut m = Meter::new();
+            m.apply(&dmg(2, 100, 1_000));
+            m.apply(&death_hit(1, 2, 2_000));
+            m.apply(&dmg(2, 100, 9_000));
+            let snap = m.snapshot(10_000);
+            let row = snap.rows.iter().find(|r| r.uid == 2).unwrap();
+            assert_eq!(row.dead_ms, Some(7_000));
+        }
+
+        /// Two deaths in one pull sum, rather than the second overwriting
+        /// the first.
+        #[test]
+        fn multiple_deaths_in_one_encounter_sum_their_intervals() {
+            let mut m = Meter::new();
+            m.apply(&dmg(2, 100, 1_000));
+            m.apply(&death_hit(1, 2, 2_000));
+            m.apply(&dmg(2, 100, 5_000));
+            m.apply(&death_hit(1, 2, 10_000));
+            m.apply(&dmg(2, 100, 12_500));
+            let snap = m.snapshot(13_000);
+            let row = snap.rows.iter().find(|r| r.uid == 2).unwrap();
+            assert_eq!(row.deaths, 2);
+            assert_eq!(row.dead_ms, Some(3_000 + 2_500));
+        }
+
+        /// A player still down when the snapshot is taken accrues up to the
+        /// snapshot's clock — the live half of the "open death" rule (the
+        /// frozen half is `a_death_open_at_the_wipe_counts_up_to_the_freeze`
+        /// in the wipe tests).
+        #[test]
+        fn a_death_with_no_revive_yet_counts_up_to_the_snapshot_clock() {
+            let mut m = Meter::new();
+            m.apply(&dmg(2, 100, 1_000));
+            m.apply(&death_hit(1, 2, 2_000));
+            let row = |snap: &Snapshot| snap.rows.iter().find(|r| r.uid == 2).unwrap().dead_ms;
+            assert_eq!(row(&m.snapshot(6_000)), Some(4_000));
+            assert_eq!(
+                row(&m.snapshot(9_000)),
+                Some(7_000),
+                "an open death ticks with the clock, like the fight timer"
+            );
+        }
+
+        /// A retransmitted death packet is debounced out of the *count*;
+        /// it must not quietly move the open interval's start forward
+        /// either (`PlayerStats::dead_since_ms`).
+        #[test]
+        fn a_duplicate_death_packet_does_not_shorten_the_dead_interval() {
+            let mut m = Meter::new();
+            m.apply(&death_hit(1, 2, 2_000));
+            m.apply(&death_hit(1, 2, 2_000 + DEATH_DEBOUNCE_MS - 1));
+            m.apply(&dmg(2, 100, 9_000));
+            let snap = m.snapshot(10_000);
+            let row = snap.rows.iter().find(|r| r.uid == 2).unwrap();
+            assert_eq!(row.deaths, 1);
+            assert_eq!(row.dead_ms, Some(7_000));
+        }
+
+        /// `set_alive`'s clamp: a hit retransmitted *behind* the death it
+        /// preceded is not a battle rez, so it neither ends the interval
+        /// nor rewinds it.
+        #[test]
+        fn an_action_older_than_the_death_does_not_end_the_dead_interval() {
+            let mut m = Meter::new();
+            m.apply(&death_hit(1, 2, 5_000));
+            m.apply(&dmg(2, 100, 4_000));
+            let snap = m.snapshot(9_000);
+            let row = snap.rows.iter().find(|r| r.uid == 2).unwrap();
+            assert_eq!(row.dead_ms, Some(4_000), "still down, counting from 5_000");
+        }
+
+        /// Zero, not "unmeasured": the meter watched this player the whole
+        /// pull and they never hit the floor. `None` is reserved for rows
+        /// replayed out of the history database.
+        #[test]
+        fn a_player_who_never_died_reports_zero_dead_time() {
+            let mut m = Meter::new();
+            m.apply(&dmg(2, 100, 1_000));
+            let snap = m.snapshot(9_000);
+            assert_eq!(snap.rows[0].dead_ms, Some(0));
+        }
+
+        #[test]
+        fn reset_clears_dead_time() {
+            let mut m = Meter::new();
+            m.apply(&death_hit(1, 2, 1_000));
+            m.reset(ResetReason::Manual, 2_000);
+            m.apply(&dmg(2, 50, 3_000));
+            let snap = m.snapshot(9_000);
+            assert_eq!(
+                snap.rows.iter().find(|r| r.uid == 2).unwrap().dead_ms,
+                Some(0)
+            );
         }
 
         #[test]
@@ -5432,6 +5536,27 @@ mod tests {
             m.apply(&killing_blow(1, 5_000));
             m.apply(&killing_blow(2, 6_000));
             assert_eq!(m.fight_state(6_500), FightState::Active);
+        }
+
+        /// Issue #254: nobody revives after a wipe, so the last death of
+        /// the pull stays open forever. It is counted up to the fight's
+        /// *end*, not to the caller's clock, so a held attempt's death time
+        /// freezes with the rest of its numbers.
+        #[test]
+        fn a_death_open_at_the_wipe_counts_up_to_the_freeze() {
+            let m = wiped();
+            let dead = |snap: &Snapshot, uid: i64| {
+                snap.rows.iter().find(|r| r.uid == uid).unwrap().dead_ms
+            };
+            let snap = m.snapshot(66_000);
+            assert_eq!(dead(&snap, 1), Some(1_000), "down at 5_000, wipe at 6_000");
+            assert_eq!(dead(&snap, 2), Some(0), "fell as the fight ended");
+            let later = m.snapshot(120_000);
+            assert_eq!(
+                dead(&later, 1),
+                Some(1_000),
+                "a frozen attempt's death time must not keep ticking"
+            );
         }
 
         #[test]
