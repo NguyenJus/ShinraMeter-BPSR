@@ -228,6 +228,10 @@ mod tests {
                 deaths: 0,
                 dead_ms: Some(0),
                 skills: Vec::new(),
+                heals: Vec::new(),
+                dealt: Vec::new(),
+                received: Vec::new(),
+                casts: Vec::new(),
             }],
             encounter: EncounterInfo::default(),
         };

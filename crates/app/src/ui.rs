@@ -299,7 +299,7 @@ fn paint_skill_icon_placeholder(
 }
 
 /// Commands the overlay emits for the app layer to consume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
     Reset,
     Quit,
@@ -312,6 +312,14 @@ pub enum UiCommand {
     /// `pipeline::run` holds the `Send`-able half (`CaptureRestart`) and
     /// makes the request on this command's behalf.
     RestartCapture,
+    /// The uids of every player with an open skill-breakdown window, sent
+    /// whenever `OverlayApp::skill_windows`' key set changes (PR #268
+    /// review, finding 2). `pipeline::run` keeps the latest one and uses it
+    /// to skip building the heals/dealt/received/casts breakdowns
+    /// (`bpsr_meter::Meter::snapshot_focused`) for every other player on
+    /// the live ~10Hz publish tick — a skill window is closed almost all
+    /// the time, so that work is otherwise wasted on every tick.
+    SkillFocus(Vec<i64>),
 }
 
 /// Non-fatal status banner shown above the player rows.
@@ -487,6 +495,12 @@ pub struct OverlayApp {
     /// `BTreeMap` so several open windows keep a stable draw order across
     /// frames.
     skill_windows: std::collections::BTreeMap<i64, SkillWindowState>,
+    /// The `skill_windows` key set as of the last `UiCommand::SkillFocus`
+    /// sent to the pipeline thread (PR #268 review, finding 2). Compared
+    /// against `skill_windows.keys()` each frame so the command only goes
+    /// out on an actual open/close, not on every frame a window happens to
+    /// be open.
+    last_sent_skill_focus: Vec<i64>,
     /// Issue #39: the history thread's handle, or `None` when history is
     /// disabled or its database could not be opened — every history control is
     /// then simply absent, and nothing else changes.
@@ -898,6 +912,101 @@ fn demo_skill_rows(skills: &[DemoSkill], player_damage: i64, duration_ms: u64) -
     rows
 }
 
+/// The healing a demo row's class puts out (issue #245), in the same
+/// `DemoSkill` shape the damage fixtures use. Only the two healer classes
+/// have any — a `Marksman` healing for a third of their damage would be a
+/// prettier demo and a less honest one.
+fn demo_heals(class: Class) -> &'static [DemoSkill] {
+    match class {
+        // "Life Bloom" / "Verdant Grace" — ids from `tables::skill_name`.
+        Class::VerdantOracle => &[
+            (2_003, 41_200_000, 210, 62, 16_800_000, 402_000),
+            (2_001, 18_900_000, 96, 25, 6_200_000, 331_000),
+        ],
+        Class::BeatPerformer => &[(2_401, 27_400_000, 158, 44, 9_900_000, 288_000)],
+        _ => &[],
+    }
+}
+
+/// That fixture list's total, i.e. the Heal tab's `% Heal` denominator.
+fn heal_total(class: Class) -> i64 {
+    demo_heals(class)
+        .iter()
+        .map(|&(_, amount, ..)| amount)
+        .sum()
+}
+
+/// The "Skill dealt" tab's demo fixture (issue #245, PR #268 review finding
+/// 3): `skills` and `heals` merged by skill id via `SkillStats::merge`,
+/// exactly like the real `dealt_rows` (`crates/meter/src/encounter.rs`)
+/// merges `stats.skills` and `stats.heals` — not concatenated, which would
+/// leave two rows standing for one skill id that happens to appear in both
+/// fixture lists rather than summing them into one. `total` is the row's
+/// combined damage+heal total, the same "% Dealt" denominator the real
+/// `dealt_rows` passes through from `stats.total_damage + stats.total_heal`.
+fn demo_dealt_rows(
+    skills: &[DemoSkill],
+    heals: &[DemoSkill],
+    total: i64,
+    duration_ms: u64,
+) -> Vec<SkillRow> {
+    let mut merged: std::collections::HashMap<i32, SkillStats> = std::collections::HashMap::new();
+    for &(skill_id, damage, hits, crit_hits, crit_damage, max_crit) in
+        skills.iter().chain(heals.iter())
+    {
+        let entry = SkillStats {
+            total_damage: damage,
+            hits,
+            crit_hits,
+            crit_damage,
+            max_crit,
+            ..Default::default()
+        };
+        merged.entry(skill_id).or_default().merge(&entry);
+    }
+    let mut rows: Vec<SkillRow> = merged
+        .iter()
+        .map(|(&skill_id, stats)| skill_row_from_stats(skill_id, stats, total, duration_ms))
+        .collect();
+    rows.sort_by_key(|s| std::cmp::Reverse(s.damage));
+    rows
+}
+
+/// What the demo's boss lands on each row (issue #245) — the Skill
+/// received tab's fixture. Three monster abilities, one of them a
+/// heavy-hitting crit, which is the shape a tank's received breakdown has.
+const DEMO_RECEIVED: &[DemoSkill] = &[
+    (1_120_101, 4_820_000, 34, 6, 1_640_000, 412_000),
+    (1_120_104, 2_310_000, 12, 3, 980_000, 388_000),
+    (1_120_107, 640_000, 4, 0, 0, 0),
+];
+
+/// `DEMO_RECEIVED`'s total, i.e. the Skill received tab's `% Amt`
+/// denominator.
+fn demo_received_total() -> i64 {
+    DEMO_RECEIVED.iter().map(|&(_, amount, ..)| amount).sum()
+}
+
+/// The Skill casts tab's demo fixture (issue #245): one cast per three
+/// recorded hits of each damaging skill, floored at one. A real cast count
+/// is never derivable from a hit count — that is exactly why the tab needs
+/// its own packet source — but the demo only has to look like a plausible
+/// pull, and a ratio keeps the two columns telling a consistent story.
+fn demo_cast_rows(skills: &[DemoSkill], duration_ms: u64) -> Vec<SkillRow> {
+    let mut rows: Vec<SkillRow> = skills
+        .iter()
+        .map(|&(skill_id, _, hits, ..)| {
+            let stats = SkillStats {
+                hits: (hits / 3).max(1),
+                ..Default::default()
+            };
+            skill_row_from_stats(skill_id, &stats, 0, duration_ms)
+        })
+        .collect();
+    rows.sort_by_key(|s| std::cmp::Reverse(s.hits));
+    rows
+}
+
 /// The synthetic snapshot `demo_enabled` seeds the overlay with. The header's
 /// `total_damage`/`total_dps` are derived from `DEMO_ROWS` rather than a
 /// separate literal (issue #148), so the two can never disagree the way they
@@ -950,6 +1059,27 @@ fn demo_snapshot() -> Snapshot {
                     // Deaths count would show the wrong chrome.
                     dead_ms: Some(u64::from(deaths) * 12_000),
                     skills: demo_skill_rows(demo_skills, damage, duration_ms),
+                    // Issue #245: the demo seed exercises the breakdown
+                    // window's other tabs too, so `--demo` shows a
+                    // populated tab strip rather than five empty ones.
+                    // Healing is only seeded for the two healer classes,
+                    // which is the shape a real pull has; "dealt" is
+                    // damage plus that healing, exactly as the meter's
+                    // `dealt_rows` merges them, and "received" is the
+                    // boss's swings landing back on the row.
+                    heals: demo_skill_rows(demo_heals(class), heal_total(class), duration_ms),
+                    dealt: demo_dealt_rows(
+                        demo_skills,
+                        demo_heals(class),
+                        damage + heal_total(class),
+                        duration_ms,
+                    ),
+                    received: demo_skill_rows(DEMO_RECEIVED, demo_received_total(), duration_ms),
+                    // A cast count per damaging skill, deliberately a
+                    // little above its hit count — most BPSR skills land
+                    // more than one hit per cast, so equal figures would
+                    // be the odd-looking ones.
+                    casts: demo_cast_rows(demo_skills, duration_ms),
                 }
             },
         )
@@ -1037,6 +1167,7 @@ impl OverlayApp {
             demo_mode,
             startup_toggles_applied: false,
             skill_windows: std::collections::BTreeMap::new(),
+            last_sent_skill_focus: Vec::new(),
             history,
             rx_history,
             tx_history,
@@ -1744,7 +1875,7 @@ impl eframe::App for OverlayApp {
                 });
             let already_open =
                 open_skill_window(&mut self.skill_windows, uid, source, || SkillWindowState {
-                    sort: skills::SkillSort::default(),
+                    tabs: SkillTabs::default(),
                     pos: skills::place_window(main_outer, monitor, SKILL_WINDOW_SIZE),
                     size: SKILL_WINDOW_SIZE,
                     source,
@@ -1814,7 +1945,7 @@ impl eframe::App for OverlayApp {
                     let x_clicked = draw_skill_window(
                         ui,
                         row,
-                        &mut state.sort,
+                        &mut state.tabs,
                         state.source,
                         icons,
                         opacity,
@@ -1840,6 +1971,27 @@ impl eframe::App for OverlayApp {
         }
         for uid in closed_skill_windows {
             close_skill_window(&mut self.skill_windows, uid);
+        }
+
+        // PR #268 review, finding 2: tell the pipeline thread which players
+        // it can skip the heals/dealt/received/casts breakdowns for. Only
+        // `Live`-sourced windows count — a `History`-sourced one draws from
+        // `history_open`'s own already-fully-populated snapshot above, never
+        // from the live one the pipeline thread builds, so naming its uid
+        // here would cost real work for nothing. Sent only when the set
+        // actually changed, so an open (or already-focused) window doesn't
+        // resend it every frame.
+        let live_skill_focus: Vec<i64> = self
+            .skill_windows
+            .iter()
+            .filter(|(_, state)| state.source == SkillWindowSource::Live)
+            .map(|(&uid, _)| uid)
+            .collect();
+        if live_skill_focus != self.last_sent_skill_focus {
+            let _ = self
+                .tx_command
+                .try_send(UiCommand::SkillFocus(live_skill_focus.clone()));
+            self.last_sent_skill_focus = live_skill_focus;
         }
 
         // ~10 Hz.
@@ -6974,6 +7126,15 @@ const SKILL_CHROME_FILL: egui::Color32 = egui::Color32::from_rgb(0x11, 0x11, 0x1
 const SKILL_PANEL_FILL: egui::Color32 = egui::Color32::from_rgb(0x21, 0x21, 0x27);
 /// Dps column-header text — the reference's `#ef5350`.
 const SKILL_HEADER_RGB: egui::Color32 = egui::Color32::from_rgb(0xef, 0x53, 0x50);
+/// An unselected tab's label (issue #245). The reference's tab strip
+/// leaves unselected headers on the header band with dimmer text; this is
+/// the same read at egui's flat alpha — bright enough to be obviously
+/// clickable, clearly behind the selected tab's pure white.
+const SKILL_TAB_IDLE_RGB: egui::Color32 = egui::Color32::from_rgb(0x9a, 0x9a, 0xa4);
+/// A tab this build cannot fill (issue #245: Buff). Dimmer
+/// again than `SKILL_TAB_IDLE_RGB`, so the strip reads honestly at a
+/// glance, but still selectable — the body explains the gap.
+const SKILL_TAB_UNTRACKED_RGB: egui::Color32 = egui::Color32::from_rgb(0x5e, 0x5e, 0x68);
 /// Close glyph — the reference's `LightRed #ff5555`.
 const SKILL_CLOSE_RGB: egui::Color32 = egui::Color32::from_rgb(0xff, 0x55, 0x55);
 /// Translucent-white row hover — the reference's `#10FFFFFF`. Its alpha is
@@ -7119,23 +7280,46 @@ const SKILL_HEADER_PILL_GAP: f32 = 10.0;
 /// equivalent in the main row scale (`FONT_SIZE_ROW` tops out at 13.0).
 const FONT_SIZE_SKILL_HEADER_NAME: f32 = 24.0;
 
-/// D5's column order, as a fixed array so the header row and every data
-/// row iterate it identically — a column can never appear in one but not
-/// the other.
-const SKILL_COLUMN_ORDER: [skills::SkillColumn; 12] = [
-    skills::SkillColumn::Icon,
-    skills::SkillColumn::Name,
-    skills::SkillColumn::Damage,
-    skills::SkillColumn::DmgPct,
-    skills::SkillColumn::CritPct,
-    skills::SkillColumn::MaxCrit,
-    skills::SkillColumn::AvgCrit,
-    skills::SkillColumn::AvgWhite,
-    skills::SkillColumn::Avg,
-    skills::SkillColumn::Hits,
-    skills::SkillColumn::Crits,
-    skills::SkillColumn::HitPerMin,
-];
+/// Per-tab selection and sort state for one breakdown window (issue #245).
+///
+/// The sort is kept *per tab*, not per window: the Dps tab's columns and
+/// the Heal tab's are largely different, so one shared `SkillSort` would
+/// either be reset on every tab switch (losing the ordering the user chose)
+/// or left pointing at a column the newly-selected tab does not show. An
+/// array indexed by tab makes both impossible — every entry starts on its
+/// own tab's `default_sort`, and `sort_mut` can only ever hand back the
+/// selected tab's own entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SkillTabs {
+    selected: skills::SkillTab,
+    sorts: [skills::SkillSort; skills::SKILL_TABS.len()],
+}
+
+impl Default for SkillTabs {
+    fn default() -> Self {
+        Self {
+            selected: skills::SkillTab::Dps,
+            sorts: skills::SKILL_TABS.map(|tab| tab.default_sort()),
+        }
+    }
+}
+
+impl SkillTabs {
+    /// This tab's index into `sorts`. `SKILL_TABS` is the single source of
+    /// tab order, so the array and the strip can never disagree.
+    fn index(tab: skills::SkillTab) -> usize {
+        skills::SKILL_TABS
+            .iter()
+            .position(|t| *t == tab)
+            .expect("every SkillTab is listed in SKILL_TABS")
+    }
+
+    /// The selected tab's own sort state.
+    fn sort_mut(&mut self) -> &mut skills::SkillSort {
+        let index = Self::index(self.selected);
+        &mut self.sorts[index]
+    }
+}
 
 /// Initial inner size for a skill breakdown window (issue #181: the viewport
 /// is resizable, so this is only the size a newly opened one starts at —
@@ -7155,7 +7339,14 @@ const SKILL_COLUMN_ORDER: [skills::SkillColumn; 12] = [
 // breaking the "roughly ten rows" promise above. 572 is also the reference
 // capture's own content height (928x574 minus its 2px border), where ten
 // 44px rows fill y=133..573 exactly.
-const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 572.0);
+// Issue #245's live-window pass then measured the *header labels* against
+// their columns for the first time and found nine of them overflowing (see
+// `SkillColumn::width`), so their widths grew too: the widest tab's sum,
+// Dps, went 728 -> 832, and this with it, 760 -> 864 — still 8pt of slack
+// over the floor below. It stays inside the reference capture's own
+// 928x574 content box, so the window this is modelled on is still the
+// wider of the two.
+const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(864.0, 572.0);
 /// Floor on the skill breakdown viewport's inner size (issue #181) so a
 /// resize can't shrink it into uselessness — tall enough for the header, tab
 /// strip and column-header row plus a couple of rows before the list
@@ -7175,7 +7366,14 @@ const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(760.0, 572.0);
 /// budget, so `column_anchors_from_widths` can still scale a fraction of a
 /// point for rounding but never enough to visibly compress a label. See
 /// `skill_window_min_width_fits_every_column_at_its_stated_width`.
-const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(752.0, 220.0);
+///
+/// Issue #245 widened that budget twice over: first with five more tabs,
+/// whose column sets this floor has to clear too (the widest, `Dps`, is
+/// what sets it), and then by measuring the header labels themselves — the
+/// widths were only ever sized to their columns' *values*, so the labels
+/// overlapped even at the initial width. The widest tab's sum went 728 ->
+/// 832 and this floor with it, 752 -> 856.
+const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(856.0, 220.0);
 
 /// One open breakdown window's own state (issue #16, D9): its sort column/
 /// direction, the screen position it was placed at when opened, and the
@@ -7194,7 +7392,8 @@ const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(752.0, 220.0);
 /// (and back again) as the user moves between the two surfaces, for any uid
 /// that happens to exist in both.
 struct SkillWindowState {
-    sort: skills::SkillSort,
+    /// Issue #245: which breakdown tab is showing, and each tab's own sort.
+    tabs: SkillTabs,
     pos: egui::Pos2,
     size: egui::Vec2,
     source: SkillWindowSource,
@@ -7376,20 +7575,46 @@ fn skill_windows_to_draw<'a>(
 /// `SKILL_PANEL_FILL`, in a box flush with the window's left edge that hugs
 /// the label with one `SKILL_HEADER_PAD_X` of padding on each side — the
 /// measured `Dps` box runs x 2..51 against a label starting at x≈17.
-fn skill_selected_tab_rect(tabs_rect: egui::Rect, text_width: f32) -> egui::Rect {
-    egui::Rect::from_min_size(
-        tabs_rect.min,
-        egui::vec2(text_width + 2.0 * SKILL_HEADER_PAD_X, tabs_rect.height()),
-    )
+fn skill_tab_rects(tabs_rect: egui::Rect, text_widths: &[f32]) -> Vec<egui::Rect> {
+    let mut x = tabs_rect.left();
+    text_widths
+        .iter()
+        .map(|text_width| {
+            let width = text_width + 2.0 * SKILL_HEADER_PAD_X;
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(x, tabs_rect.top()),
+                egui::vec2(width, tabs_rect.height()),
+            );
+            x += width;
+            rect
+        })
+        .collect()
 }
 
 /// The column-header band's rect (issue #200): flush with the window's
 /// left/right edges, directly beneath the tab strip, `SKILL_COLUMN_HEADER_
 /// HEIGHT` tall. Painted with `SKILL_COLUMN_HEADER_FILL`.
-fn skill_column_header_rect(rect: egui::Rect, tabs_rect: egui::Rect) -> egui::Rect {
+///
+/// A tab with no columns (issue #245: `Buff`, which has nothing behind it
+/// to tabulate) gets a zero-height band instead of an empty one. The live
+/// window painted the full 40pt of `SKILL_COLUMN_HEADER_FILL` there with
+/// no labels in it, which read as a stray lighter strip above the
+/// explanatory text rather than as a header. Collapsing the rect — rather
+/// than special-casing the paint — also lifts `skill_rows_rect`, so the
+/// explanation sits where the rows would, directly under the tab strip.
+fn skill_column_header_rect(
+    rect: egui::Rect,
+    tabs_rect: egui::Rect,
+    columns: &[skills::SkillColumn],
+) -> egui::Rect {
+    let height = if columns.is_empty() {
+        0.0
+    } else {
+        SKILL_COLUMN_HEADER_HEIGHT
+    };
     egui::Rect::from_min_size(
         egui::pos2(rect.left(), tabs_rect.bottom()),
-        egui::vec2(rect.width(), SKILL_COLUMN_HEADER_HEIGHT),
+        egui::vec2(rect.width(), height),
     )
 }
 
@@ -7417,13 +7642,31 @@ fn skill_rows_rect(rect: egui::Rect, col_header_rect: egui::Rect) -> egui::Rect 
 /// running, so the live wording promises the rows are coming.
 fn skill_window_empty_message(
     source: SkillWindowSource,
+    tab: skills::SkillTab,
     skill_row_count: usize,
 ) -> Option<&'static str> {
     if skill_row_count > 0 {
         return None;
     }
+    // Issue #245: a tab nothing feeds says so, whatever the window's
+    // source — "No damage recorded yet" would read as "this fight had
+    // none", when the truth is that this build never looks.
+    if let Some(untracked) = tab.untracked_message() {
+        return Some(untracked);
+    }
     Some(match source {
-        SkillWindowSource::Live => "No damage recorded yet",
+        // The breakdowns issue #245 adds are live-only: the on-disk fight
+        // history serialises `PlayerRow::skills` and nothing else, so a
+        // saved fight has no heal/dealt/received rows to hand back and the
+        // existing history wording covers all four alike.
+        SkillWindowSource::Live => match tab {
+            skills::SkillTab::Dps => "No damage recorded yet",
+            skills::SkillTab::Heal => "No healing recorded yet",
+            skills::SkillTab::Dealt => "Nothing dealt yet",
+            skills::SkillTab::Received => "Nothing received yet",
+            skills::SkillTab::Casts => "Nothing cast yet",
+            skills::SkillTab::Buff => "Nothing recorded yet",
+        },
         SkillWindowSource::History(_) => "No per-skill data recorded for this fight",
     })
 }
@@ -7591,7 +7834,7 @@ fn skill_death_time_text(dead_ms: Option<u64>) -> Option<String> {
 fn draw_skill_window(
     ui: &mut egui::Ui,
     row: &PlayerRow,
-    sort: &mut skills::SkillSort,
+    tabs: &mut SkillTabs,
     source: SkillWindowSource,
     icons: &Icons,
     opacity: f32,
@@ -7785,10 +8028,10 @@ fn draw_skill_window(
     }
     let close_clicked = close.clicked();
 
-    // -- tab strip: `Dps` only, styled selected (D11) ---------------------
-    // The reference's other six tabs (Heal, Mana, Buff, Counter,
-    // SkillDealt, SkillReceived) are explicitly out of scope per the issue
-    // — drawing six dead tabs would be clutter, not fidelity.
+    // -- tab strip (D11, issue #245) --------------------------------------
+    // The reference's seven tabs (`Skills.xaml:227-236`) minus `Mana`,
+    // which BPSR's packet stream has no resource to fill — see
+    // `skills::SkillTab`. Clicking one selects it; each keeps its own sort.
     let tabs_rect = egui::Rect::from_min_size(
         egui::pos2(rect.left(), header_rect.bottom()),
         egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
@@ -7798,43 +8041,85 @@ fn draw_skill_window(
     // header band exactly, while only the selected `Dps` tab (x 2..51)
     // carries the lighter `#212127` box. Filling the whole strip made the
     // window read as a two-tone sandwich instead of a tab row.
-    let tab_label = "Dps";
     let tab_font = bold(FONT_SIZE_ROW);
-    let tab_text_width = painter
-        .layout_no_wrap(tab_label.to_owned(), tab_font.clone(), egui::Color32::WHITE)
-        .size()
-        .x;
-    painter.rect_filled(
-        skill_selected_tab_rect(tabs_rect, tab_text_width),
-        0.0,
-        SKILL_PANEL_FILL.gamma_multiply(opacity),
-    );
-    paint_text(
-        &painter,
-        tabs_rect.left_center() + egui::vec2(SKILL_HEADER_PAD_X, 0.0),
-        egui::Align2::LEFT_CENTER,
-        tab_label,
-        tab_font,
-        egui::Color32::WHITE,
-        true,
-    );
+    let tab_text_widths: Vec<f32> = skills::SKILL_TABS
+        .iter()
+        .map(|tab| {
+            painter
+                .layout_no_wrap(
+                    tab.label().to_owned(),
+                    tab_font.clone(),
+                    egui::Color32::WHITE,
+                )
+                .size()
+                .x
+        })
+        .collect();
+    for (i, (tab, tab_rect)) in skills::SKILL_TABS
+        .iter()
+        .zip(skill_tab_rects(tabs_rect, &tab_text_widths))
+        .enumerate()
+    {
+        let selected = tabs.selected == *tab;
+        let response = ui.interact(
+            tab_rect,
+            ui.id().with(("skill_tab", row.uid, i)),
+            egui::Sense::click(),
+        );
+        if response.clicked() {
+            tabs.selected = *tab;
+        }
+        if response.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if selected || response.hovered() {
+            painter.rect_filled(tab_rect, 0.0, SKILL_PANEL_FILL.gamma_multiply(opacity));
+        }
+        // An untracked tab (issue #245: Buff) is drawn muted
+        // rather than hidden — the reference has it, this build cannot
+        // fill it, and the body says why once it is opened. Hiding it
+        // would leave the gap unexplained; greying it out of clicking
+        // would leave the explanation unreachable.
+        let color = match (selected, tab.is_tracked()) {
+            (true, true) => egui::Color32::WHITE,
+            (false, true) => SKILL_TAB_IDLE_RGB,
+            (true, false) => SKILL_TAB_IDLE_RGB,
+            (false, false) => SKILL_TAB_UNTRACKED_RGB,
+        };
+        paint_text(
+            &painter,
+            tab_rect.left_center() + egui::vec2(SKILL_HEADER_PAD_X, 0.0),
+            egui::Align2::LEFT_CENTER,
+            tab.label(),
+            tab_font.clone(),
+            color,
+            true,
+        );
+    }
+    let tab = tabs.selected;
+    let columns = tab.columns();
+    let sort = tabs.sort_mut();
 
     // -- column header row: click (either button, D9) toggles sort -------
-    let col_header_rect = skill_column_header_rect(rect, tabs_rect);
+    let col_header_rect = skill_column_header_rect(rect, tabs_rect, columns);
     painter.rect_filled(
         col_header_rect,
         0.0,
         SKILL_COLUMN_HEADER_FILL.gamma_multiply(opacity),
     );
-    let widths: Vec<f32> = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).collect();
-    let anchors = column_anchors_from_widths(
-        col_header_rect.left() + SKILL_HEADER_PAD_X,
-        col_header_rect.right() - SKILL_HEADER_PAD_X,
-        &widths,
-        0.0,
-    );
-    for (i, (&anchor_x, kind)) in anchors.iter().zip(SKILL_COLUMN_ORDER.iter()).enumerate() {
-        let width = kind.width();
+    // Issue #245: the narrower tabs would otherwise pack against the
+    // window's right edge (`column_anchors_from_widths` lays out
+    // right-to-left), so any slack goes to the `Name` column.
+    let content_left = col_header_rect.left() + SKILL_HEADER_PAD_X;
+    let content_right = col_header_rect.right() - SKILL_HEADER_PAD_X;
+    let widths = skills::column_widths(columns, content_right - content_left);
+    let anchors = column_anchors_from_widths(content_left, content_right, &widths, 0.0);
+    for (i, ((&anchor_x, kind), &width)) in anchors
+        .iter()
+        .zip(columns.iter())
+        .zip(widths.iter())
+        .enumerate()
+    {
         let cell = egui::Rect::from_min_max(
             egui::pos2(anchor_x - width, col_header_rect.top()),
             egui::pos2(anchor_x, col_header_rect.bottom()),
@@ -7848,7 +8133,7 @@ fn draw_skill_window(
             sort.toggle(*kind);
         }
         let label = sort.header_label(*kind);
-        let (align, pos) = if *kind == skills::SkillColumn::Name {
+        let (align, pos) = if kind.left_aligned() {
             (egui::Align2::LEFT_CENTER, cell.left_center())
         } else {
             (egui::Align2::RIGHT_CENTER, cell.right_center())
@@ -7874,14 +8159,14 @@ fn draw_skill_window(
     // `SKILL_PANEL_FILL - SKILL_CHROME_FILL` (16 per channel) brighter than
     // the header above it.
     painter.rect_filled(rows_rect, 0.0, SKILL_PANEL_FILL.gamma_multiply(opacity));
-    let mut skill_rows = row.skills.clone();
+    let mut skill_rows = tab.rows(row).to_vec();
     skills::sort_rows(&mut skill_rows, *sort);
 
     // Issue #216: an empty row list gets a message in place of the rows,
     // worded for where the window's data comes from — a historical fight
     // never has per-skill rows at all, a live one just doesn't have them
     // yet (see `skill_window_empty_message`).
-    if let Some(message) = skill_window_empty_message(source, skill_rows.len()) {
+    if let Some(message) = skill_window_empty_message(source, tab, skill_rows.len()) {
         paint_text(
             &painter,
             rows_rect.center(),
@@ -7925,8 +8210,9 @@ fn draw_skill_window(
                         SKILL_ROW_HOVER_FILL.gamma_multiply(opacity),
                     );
                 }
-                for (&anchor_x, kind) in anchors.iter().zip(SKILL_COLUMN_ORDER.iter()) {
-                    let width = kind.width();
+                for ((&anchor_x, kind), &width) in
+                    anchors.iter().zip(columns.iter()).zip(widths.iter())
+                {
                     let clip = egui::Rect::from_min_max(
                         egui::pos2(anchor_x - width, skill_rect.top()),
                         egui::pos2(anchor_x, skill_rect.bottom()),
@@ -7977,7 +8263,7 @@ fn draw_skill_window(
                         }
                         continue;
                     }
-                    let (align, pos) = if *kind == skills::SkillColumn::Name {
+                    let (align, pos) = if kind.left_aligned() {
                         (egui::Align2::LEFT_CENTER, clip.left_center())
                     } else {
                         (egui::Align2::RIGHT_CENTER, clip.right_center())
@@ -8585,7 +8871,7 @@ mod tests {
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_SIZE);
-        let mut sort = skills::SkillSort::default();
+        let mut tabs_state = SkillTabs::default();
 
         let output = ctx.run_ui(
             egui::RawInput {
@@ -8596,7 +8882,7 @@ mod tests {
                 draw_skill_window(
                     ui,
                     &row,
-                    &mut sort,
+                    &mut tabs_state,
                     SkillWindowSource::Live,
                     &icons,
                     1.0,
@@ -8614,7 +8900,10 @@ mod tests {
         // center from (issue #200's `skill_header_rect`/
         // `skill_column_header_rect`/`skill_rows_rect`, and the shared
         // column `anchors` the row loop reuses from the column-header
-        // row) — replicated here rather than pulled into a shared helper,
+        // row — over issue #245's `skills::column_widths`, which hands the
+        // content's slack to `Name` alone, so replicating the layout with
+        // the raw `SkillColumn::width`s would land the icon elsewhere)
+        // — replicated here rather than pulled into a shared helper,
         // since nothing else needs "where does the icon column sit"
         // outside this one check.
         let header = skill_header_rect(screen_rect);
@@ -8622,22 +8911,21 @@ mod tests {
             egui::pos2(screen_rect.left(), header.bottom()),
             egui::vec2(screen_rect.width(), SKILL_TAB_HEIGHT),
         );
-        let col_header = skill_column_header_rect(screen_rect, tabs);
+        // The default tab (`SkillTabs::default`) is the one the frame above
+        // painted, and issue #245 made each tab's column list its own.
+        let columns = skills::SkillTab::Dps.columns();
+        let col_header = skill_column_header_rect(screen_rect, tabs, columns);
         let rows_rect = skill_rows_rect(screen_rect, col_header);
-        let widths: Vec<f32> = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).collect();
-        let anchors = column_anchors_from_widths(
-            col_header.left() + SKILL_HEADER_PAD_X,
-            col_header.right() - SKILL_HEADER_PAD_X,
-            &widths,
-            0.0,
-        );
-        let icon_index = SKILL_COLUMN_ORDER
+        let content_left = col_header.left() + SKILL_HEADER_PAD_X;
+        let content_right = col_header.right() - SKILL_HEADER_PAD_X;
+        let widths = skills::column_widths(columns, content_right - content_left);
+        let anchors = column_anchors_from_widths(content_left, content_right, &widths, 0.0);
+        let icon_index = columns
             .iter()
             .position(|k| *k == skills::SkillColumn::Icon)
             .expect("skill columns always include Icon");
-        let icon_width = skills::SkillColumn::Icon.width();
         let expected_center = egui::pos2(
-            anchors[icon_index] - icon_width + SKILL_ICON_SIZE / 2.0,
+            anchors[icon_index] - widths[icon_index] + SKILL_ICON_SIZE / 2.0,
             rows_rect.top() + SKILL_ROW_HEIGHT / 2.0,
         );
 
@@ -9036,6 +9324,191 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- heals/dealt/received/casts demo fixtures (PR #268 review, finding
+    // 3) --------------------------------------------------------------
+    //
+    // Every test above this point only ever looks at `row.skills`; nothing
+    // in this file asserted the other four tabs `demo_snapshot` claims to
+    // populate (issue #245) actually are. These mirror the `skills` tests'
+    // shape for each of `heals`/`dealt`/`received`/`casts`.
+
+    /// Only the demo party's healer class (`VerdantOracle`/`Fizz`) has any
+    /// healing fixture (`demo_heals`) — every other row must come through
+    /// with an empty `heals`, and the healer's own must be non-empty and
+    /// sum to `heal_total`'s declared denominator, its shares summing to
+    /// ~100% the same way `demo_snapshot_header_and_rows_are_internally_
+    /// consistent` checks the damage rows.
+    #[test]
+    fn demo_heal_breakdown_is_populated_only_for_the_healer_role_and_sums_correctly() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            let class = row.class.expect("every demo row has a class");
+            let total = heal_total(class);
+            if total == 0 {
+                assert!(
+                    row.heals.is_empty(),
+                    "row {} ({class:?}) has no heal fixture and must have an empty heals tab",
+                    row.name
+                );
+                continue;
+            }
+            assert!(
+                !row.heals.is_empty(),
+                "row {} ({class:?}) must have a non-empty heals tab",
+                row.name
+            );
+            let heal_sum: i64 = row.heals.iter().map(|s| s.damage).sum();
+            assert_eq!(
+                heal_sum, total,
+                "row {}'s heal breakdown must sum to heal_total",
+                row.name
+            );
+            let share_sum: f32 = row.heals.iter().map(|s| s.share_pct).sum();
+            assert!(
+                (share_sum - 100.0).abs() < 0.1,
+                "row {}'s heal shares must sum to ~100%, got {share_sum}",
+                row.name
+            );
+        }
+    }
+
+    /// The boss's swings (`DEMO_RECEIVED`) land on every row identically —
+    /// there is no per-class variation the way heals has — so every row's
+    /// `received` must be non-empty and sum to `demo_received_total`.
+    #[test]
+    fn demo_received_breakdown_is_populated_for_every_row_and_sums_to_its_total() {
+        let snapshot = demo_snapshot();
+        let total = demo_received_total();
+        for row in &snapshot.rows {
+            assert!(
+                !row.received.is_empty(),
+                "row {} must have a non-empty received tab",
+                row.name
+            );
+            let received_sum: i64 = row.received.iter().map(|s| s.damage).sum();
+            assert_eq!(
+                received_sum, total,
+                "row {}'s received breakdown must sum to demo_received_total",
+                row.name
+            );
+        }
+    }
+
+    /// `demo_cast_rows` is built 1:1 from `demo_skills` (issue #245): same
+    /// skill ids, hits floored at one third of the damage row's own hit
+    /// count. Every row's casts must be non-empty and match that exactly —
+    /// this is the "populated" half of finding 3's coverage gap for the
+    /// Skill casts tab.
+    #[test]
+    fn demo_cast_breakdown_is_populated_and_derives_from_the_skill_hits() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            assert!(
+                !row.casts.is_empty(),
+                "row {} must have a non-empty casts tab",
+                row.name
+            );
+            assert_eq!(
+                row.casts.len(),
+                row.skills.len(),
+                "row {}'s casts must have one entry per skill",
+                row.name
+            );
+            for skill in &row.skills {
+                let cast = row
+                    .casts
+                    .iter()
+                    .find(|c| c.skill_id == skill.skill_id)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "row {}'s casts is missing skill id {}",
+                            row.name, skill.skill_id
+                        )
+                    });
+                assert_eq!(
+                    cast.hits,
+                    (skill.hits / 3).max(1),
+                    "row {}'s cast count for skill {} must be its hit count / 3, floored at 1",
+                    row.name,
+                    skill.skill_id
+                );
+            }
+        }
+    }
+
+    /// The "Skill dealt" tab is damage and healing merged under one skill
+    /// id (issue #245) — for the current, non-colliding fixtures that's
+    /// equivalent to a plain concatenation, so this only pins the *sum*:
+    /// `demo_dealt_rows_merges_a_shared_skill_id_instead_of_duplicating_it`
+    /// below is what actually exercises the merge itself.
+    #[test]
+    fn demo_dealt_breakdown_sums_to_damage_plus_heals() {
+        let snapshot = demo_snapshot();
+        for row in &snapshot.rows {
+            let heal_sum: i64 = row.heals.iter().map(|s| s.damage).sum();
+            let dealt_sum: i64 = row.dealt.iter().map(|s| s.damage).sum();
+            assert_eq!(
+                dealt_sum,
+                row.damage + heal_sum,
+                "row {}'s dealt breakdown must sum to damage + heals",
+                row.name
+            );
+            assert!(
+                !row.dealt.is_empty(),
+                "row {} must have a non-empty dealt tab",
+                row.name
+            );
+        }
+    }
+
+    /// PR #268 review, finding 3: the "Skill dealt" tab used to be built by
+    /// chaining `demo_skill_rows(demo_skills, ...)` and
+    /// `demo_skill_rows(demo_heals(class), ...)` end to end, with no merge
+    /// step — so a skill id that happened to appear in *both* fixture lists
+    /// would silently show up as two separate rows instead of one summed
+    /// row, unlike the real meter's `dealt_rows`
+    /// (`crates/meter/src/encounter.rs`), which merges by skill id via
+    /// `SkillStats::merge`. None of today's `DEMO_ROWS` fixtures happen to
+    /// collide, so that bug shipped invisibly; this drives `demo_dealt_rows`
+    /// directly with two synthetic lists sharing a skill id and would fail
+    /// against the old chain-based implementation (two rows, wrong per-row
+    /// damage) the same way it would against a real collision.
+    #[test]
+    fn demo_dealt_rows_merges_a_shared_skill_id_instead_of_duplicating_it() {
+        let skills: &[DemoSkill] = &[
+            (9001, 1_000, 10, 2, 400, 200), // shared id
+            (9002, 500, 5, 1, 200, 150),
+        ];
+        let heals: &[DemoSkill] = &[
+            (9001, 300, 3, 1, 150, 100), // same id as skills[0]
+        ];
+        let rows = demo_dealt_rows(skills, heals, 1_800, 60_000);
+
+        assert_eq!(
+            rows.iter().filter(|r| r.skill_id == 9001).count(),
+            1,
+            "a skill id shared between skills and heals must merge into one dealt row, not two"
+        );
+        let merged = rows
+            .iter()
+            .find(|r| r.skill_id == 9001)
+            .expect("the merged 9001 row must be present");
+        assert_eq!(
+            merged.damage, 1_300,
+            "the merged row's damage must be the sum of both sources' damage"
+        );
+        assert_eq!(
+            merged.hits, 13,
+            "the merged row's hits must be the sum of both sources' hits"
+        );
+
+        let untouched = rows
+            .iter()
+            .find(|r| r.skill_id == 9002)
+            .expect("a non-colliding skill id must still come through");
+        assert_eq!(untouched.damage, 500);
     }
 
     /// The regression this guards: a future refactor that deletes or
@@ -12427,6 +12900,10 @@ mod tests {
             imagines: [None, None],
             imagine_tiers: [None, None],
             skills: Vec::new(),
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
         }
     }
 
@@ -13432,6 +13909,10 @@ mod tests {
             imagines: [Some(99_999), Some(99_999)],
             imagine_tiers: [Some(IMAGINE_MAX_TIER), Some(IMAGINE_MAX_TIER)],
             skills: Vec::new(),
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
         };
 
         for (kind, column) in ColumnKind::ALL
@@ -13842,10 +14323,117 @@ mod tests {
     /// silently shrink every column to fit (the trap issue #192 hit).
     #[test]
     fn skill_columns_fit_the_initial_window_at_their_stated_widths() {
-        let total: f32 = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).sum();
+        // Issue #245: every tab, not just `Dps` — each one lays its own
+        // column set out in the same window.
+        for tab in skills::SKILL_TABS {
+            let total: f32 = tab.columns().iter().map(|c| c.width()).sum();
+            assert!(
+                total <= SKILL_WINDOW_SIZE.x - 2.0 * SKILL_HEADER_PAD_X,
+                "{tab:?} columns total {total}"
+            );
+        }
+    }
+
+    /// Every column header label must fit the width its column reserves,
+    /// on every tab and in every sort state. None of them were measured
+    /// before: the widths were eyeballed off `fmt_short`'s longest *value*
+    /// only, and `draw_skill_window`'s header loop paints labels
+    /// right-aligned on each column's anchor at fixed size, so a label
+    /// wider than its own slot spills *left* over its neighbour. Four of
+    /// the six tabs shipped overlapping header rows at both the initial
+    /// and the minimum width — Dps and Heal read `Avg criAvg white`, the
+    /// two amount tabs read `Amount ↓% Amt`.
+    ///
+    /// The sort state is half the bug: `SkillSort::header_label` appends
+    /// its direction arrow to the active column's label *after* the widths
+    /// were chosen, so sorting could push a label out of a slot that fit
+    /// it bare (Heal sorted by `% Crit` degraded to `Hea% Hea% Crit ↑`).
+    /// So this walks every column of every tab against every sort state
+    /// that tab can reach — each of its own columns, both directions —
+    /// and measures through the exact font the header loop paints with
+    /// (`bold(FONT_SIZE_ROW)`) rather than against any hardcoded
+    /// expectation.
+    ///
+    /// One honest caveat: `bold()` only resolves to the real bold family
+    /// when `fonts::has_real_bold()` is true, and that flag stays `false`
+    /// here — it is only ever flipped by `install_cjk_fallback`, which this
+    /// test never calls (see `fonts.rs`'s own
+    /// `no_real_bold_is_reported_before_install_runs`). CI runs on
+    /// ubuntu-latest with no `C:\Windows\Fonts`, so this measures egui's
+    /// bundled regular-weight fallback, not the real Segoe UI Bold
+    /// production paints with — it is a proxy that catches gross budget
+    /// errors, not a guarantee the labels fit the real bold glyphs. The
+    /// per-label widths that motivate `skills.rs`'s column widths were
+    /// measured on the live Windows window, not by this test.
+    #[test]
+    fn every_tab_header_label_fits_its_column_at_every_sort_state() {
+        let ctx = egui::Context::default();
+        // Load the real (non-empty) default fonts so glyph metrics match
+        // what the header loop actually paints with (see the caveat above:
+        // "real" here is still egui's bundled regular weight, since
+        // `has_real_bold()` is false in every test run).
+        ctx.run_ui(egui::RawInput::default(), |_ui| {})
+            .drop_without_applying_deltas();
+        let mut overflowing = Vec::new();
+        for tab in skills::SKILL_TABS {
+            let sorts: Vec<skills::SkillSort> = tab
+                .columns()
+                .iter()
+                .flat_map(|column| {
+                    [true, false].map(|descending| skills::SkillSort {
+                        column: *column,
+                        descending,
+                    })
+                })
+                .collect();
+            for kind in tab.columns() {
+                for sort in &sorts {
+                    let label = sort.header_label(*kind);
+                    let text_width = ctx.fonts_mut(|f| {
+                        f.layout_no_wrap(label.clone(), bold(FONT_SIZE_ROW), egui::Color32::WHITE)
+                            .rect
+                            .size()
+                            .x
+                    });
+                    let complaint = format!(
+                        "{tab:?}/{kind:?}: \"{label}\" is {text_width}pt in a {}pt column",
+                        kind.width()
+                    );
+                    // The same label recurs once per sort state that
+                    // leaves it bare, so report each distinct overflow
+                    // once rather than n times.
+                    if text_width > kind.width() && !overflowing.contains(&complaint) {
+                        overflowing.push(complaint);
+                    }
+                }
+            }
+        }
         assert!(
-            total <= SKILL_WINDOW_SIZE.x - 2.0 * SKILL_HEADER_PAD_X,
-            "columns total {total}"
+            overflowing.is_empty(),
+            "header labels overflow their columns and overdraw their \
+             neighbours: {overflowing:?}"
+        );
+    }
+
+    /// Issue #245: `Buff` has no columns, and painted a full 40pt band of
+    /// `SKILL_COLUMN_HEADER_FILL` with nothing in it — a stray lighter
+    /// strip above the explanatory text. A tab with no columns gets no
+    /// band at all, so its rows area (and the explanation in it) starts
+    /// straight under the tab strip.
+    #[test]
+    fn a_tab_with_no_columns_gets_no_column_header_band() {
+        let rect = egui::Rect::from_min_size(egui::pos2(5.0, 5.0), egui::vec2(800.0, 600.0));
+        let tabs_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), 75.0),
+            egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
+        );
+        assert!(skills::SkillTab::Buff.columns().is_empty());
+        let col_header_rect =
+            skill_column_header_rect(rect, tabs_rect, skills::SkillTab::Buff.columns());
+        assert_eq!(col_header_rect.height(), 0.0);
+        assert_eq!(
+            skill_rows_rect(rect, col_header_rect).top(),
+            tabs_rect.bottom()
         );
     }
 
@@ -13869,7 +14457,13 @@ mod tests {
     /// narrower text-rendering mode.
     #[test]
     fn skill_window_min_width_fits_every_column_at_its_stated_width() {
-        let total: f32 = SKILL_COLUMN_ORDER.iter().map(|c| c.width()).sum();
+        // Issue #245: the widest tab, not just `Dps` — every tab's header
+        // row is painted unclipped at fixed size, so all of them have to
+        // clear the floor.
+        let total: f32 = skills::SKILL_TABS
+            .iter()
+            .map(|tab| tab.columns().iter().map(|c| c.width()).sum::<f32>())
+            .fold(0.0_f32, f32::max);
         assert!(
             SKILL_WINDOW_MIN_SIZE.x >= total + 2.0 * SKILL_HEADER_PAD_X,
             "min width {} is narrower than the columns' {total} + padding, \
@@ -13897,7 +14491,8 @@ mod tests {
     fn selected_tab_fill_hugs_its_label_instead_of_the_whole_strip() {
         let tabs =
             egui::Rect::from_min_size(egui::pos2(10.0, 60.0), egui::vec2(760.0, SKILL_TAB_HEIGHT));
-        let fill = skill_selected_tab_rect(tabs, 26.0);
+        let rects = skill_tab_rects(tabs, &[26.0, 40.0]);
+        let fill = rects[0];
         assert_eq!(fill.left(), tabs.left());
         assert_eq!(fill.top(), tabs.top());
         assert_eq!(fill.height(), tabs.height());
@@ -13905,6 +14500,60 @@ mod tests {
         assert!(
             fill.right() < tabs.right(),
             "the rest of the strip must stay window fill"
+        );
+        // Issue #245: the next tab starts exactly where this one ends —
+        // the strip is a row of abutting boxes, not one filled band.
+        assert_eq!(rects[1].left(), fill.right());
+        assert_eq!(rects[1].width(), 40.0 + 2.0 * SKILL_HEADER_PAD_X);
+    }
+
+    /// Issue #245: every tab's box is sized to its own label, so a click
+    /// lands on the tab whose text is under the pointer.
+    #[test]
+    fn tab_rects_tile_the_strip_left_to_right_without_gaps() {
+        let tabs =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(760.0, SKILL_TAB_HEIGHT));
+        let rects = skill_tab_rects(tabs, &[10.0, 20.0, 30.0]);
+        assert_eq!(rects.len(), 3);
+        for pair in rects.windows(2) {
+            assert_eq!(pair[0].right(), pair[1].left());
+        }
+        assert!(rects.last().expect("three tabs").right() <= tabs.right());
+    }
+
+    /// Issue #245: each tab keeps its own sort, so switching away and back
+    /// returns to the ordering the user chose rather than resetting.
+    #[test]
+    fn every_tab_starts_on_its_own_default_sort_and_keeps_it() {
+        let mut tabs = SkillTabs::default();
+        assert_eq!(tabs.selected, skills::SkillTab::Dps);
+        assert_eq!(tabs.sort_mut().column, skills::SkillColumn::Damage);
+
+        tabs.selected = skills::SkillTab::Heal;
+        assert_eq!(tabs.sort_mut().column, skills::SkillColumn::Heal);
+        tabs.sort_mut().toggle(skills::SkillColumn::Hits);
+
+        tabs.selected = skills::SkillTab::Dps;
+        assert_eq!(tabs.sort_mut().column, skills::SkillColumn::Damage);
+        tabs.selected = skills::SkillTab::Heal;
+        assert_eq!(tabs.sort_mut().column, skills::SkillColumn::Hits);
+    }
+
+    /// Issue #245: an untracked tab explains itself instead of implying
+    /// the fight simply had none of that.
+    #[test]
+    fn an_untracked_tab_says_why_it_is_empty() {
+        assert_eq!(
+            skill_window_empty_message(SkillWindowSource::Live, skills::SkillTab::Buff, 0),
+            skills::SkillTab::Buff.untracked_message()
+        );
+        assert_eq!(
+            skill_window_empty_message(SkillWindowSource::Live, skills::SkillTab::Heal, 0),
+            Some("No healing recorded yet")
+        );
+        assert_eq!(
+            skill_window_empty_message(SkillWindowSource::Live, skills::SkillTab::Heal, 3),
+            None
         );
     }
 
@@ -13918,7 +14567,8 @@ mod tests {
             egui::pos2(rect.left(), 75.0),
             egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
         );
-        let col_header_rect = skill_column_header_rect(rect, tabs_rect);
+        let col_header_rect =
+            skill_column_header_rect(rect, tabs_rect, skills::SkillTab::Dps.columns());
         assert_eq!(col_header_rect.left(), rect.left());
         assert_eq!(col_header_rect.right(), rect.right());
         assert_eq!(col_header_rect.top(), tabs_rect.bottom());
@@ -13992,7 +14642,10 @@ mod tests {
             egui::pos2(rect.left(), header.bottom()),
             egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
         );
-        let rows = skill_rows_rect(rect, skill_column_header_rect(rect, tabs));
+        let rows = skill_rows_rect(
+            rect,
+            skill_column_header_rect(rect, tabs, skills::SkillTab::Dps.columns()),
+        );
         assert!(!skill_drag_band(header).intersects(rows));
     }
 
@@ -14088,7 +14741,7 @@ mod tests {
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_MIN_SIZE);
-        let mut sort = skills::SkillSort::default();
+        let mut tabs_state = SkillTabs::default();
 
         let output = ctx.run_ui(
             egui::RawInput {
@@ -14099,7 +14752,7 @@ mod tests {
                 draw_skill_window(
                     ui,
                     &row,
-                    &mut sort,
+                    &mut tabs_state,
                     SkillWindowSource::Live,
                     &icons,
                     1.0,
@@ -14247,13 +14900,17 @@ mod tests {
     fn the_close_button_paints_its_hover_wash_only_while_hovered() {
         let row = PlayerRow {
             skills: vec![sample_skill_row(1550)],
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
             ..sample_row(None)
         };
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_MIN_SIZE);
-        let mut sort = skills::SkillSort::default();
+        let mut tabs = SkillTabs::default();
 
         // Two frames per probe: egui resolves hover against the widgets the
         // *previous* frame registered, so a single frame would report the
@@ -14271,7 +14928,7 @@ mod tests {
                         draw_skill_window(
                             ui,
                             &row,
-                            &mut sort,
+                            &mut tabs,
                             SkillWindowSource::Live,
                             &icons,
                             1.0,
@@ -14334,7 +14991,7 @@ mod tests {
         // Deliberately at the window's floor: 40 rows cannot fit, so a bar
         // is needed.
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_MIN_SIZE);
-        let mut sort = skills::SkillSort::default();
+        let mut tabs = SkillTabs::default();
         // Two frames: egui animates a scroll bar in, so the first frame's
         // `show_factor` is still 0 and paints nothing either way.
         for _ in 0..2 {
@@ -14347,7 +15004,7 @@ mod tests {
                     draw_skill_window(
                         ui,
                         &row,
-                        &mut sort,
+                        &mut tabs,
                         SkillWindowSource::Live,
                         &icons,
                         1.0,
@@ -14366,7 +15023,7 @@ mod tests {
                 draw_skill_window(
                     ui,
                     &row,
-                    &mut sort,
+                    &mut tabs,
                     SkillWindowSource::Live,
                     &icons,
                     1.0,
@@ -14385,7 +15042,10 @@ mod tests {
             egui::pos2(screen_rect.left(), header.bottom()),
             egui::vec2(screen_rect.width(), SKILL_TAB_HEIGHT),
         );
-        let rows = skill_rows_rect(screen_rect, skill_column_header_rect(screen_rect, tabs));
+        let rows = skill_rows_rect(
+            screen_rect,
+            skill_column_header_rect(screen_rect, tabs, skills::SkillTab::Dps.columns()),
+        );
         let bar = rects.iter().find(|r| {
             r.right() == rows.right()
                 && r.width() == SKILL_SCROLL_BAR_WIDTH
@@ -17882,7 +18542,7 @@ mod tests {
 
     fn skill_window_state(pos: egui::Pos2) -> SkillWindowState {
         SkillWindowState {
-            sort: skills::SkillSort::default(),
+            tabs: SkillTabs::default(),
             pos,
             size: SKILL_WINDOW_SIZE,
             source: SkillWindowSource::Live,
@@ -18135,19 +18795,23 @@ mod tests {
     /// totals (issue #222) — settled either way, not still arriving.
     #[test]
     fn skill_window_empty_message_is_worded_for_the_window_s_source() {
+        let dps = skills::SkillTab::Dps;
         assert_eq!(
-            skill_window_empty_message(SkillWindowSource::History(7), 0),
+            skill_window_empty_message(SkillWindowSource::History(7), dps, 0),
             Some("No per-skill data recorded for this fight")
         );
         assert_eq!(
-            skill_window_empty_message(SkillWindowSource::Live, 0),
+            skill_window_empty_message(SkillWindowSource::Live, dps, 0),
             Some("No damage recorded yet"),
             "an ongoing fight's rows are still coming — claiming nothing was \
              recorded for it would be wrong"
         );
-        assert_eq!(skill_window_empty_message(SkillWindowSource::Live, 3), None);
         assert_eq!(
-            skill_window_empty_message(SkillWindowSource::History(7), 3),
+            skill_window_empty_message(SkillWindowSource::Live, dps, 3),
+            None
+        );
+        assert_eq!(
+            skill_window_empty_message(SkillWindowSource::History(7), dps, 3),
             None
         );
     }
@@ -18175,8 +18839,8 @@ mod tests {
     /// ids line up) sends a synthesized left click there and returns
     /// whatever this run reports the `X` glyph did, leaving `sort` mutated
     /// in place for the caller to inspect.
-    fn click_skill_window_at(row: &PlayerRow, sort: &mut skills::SkillSort, value: &str) -> bool {
-        click_skill_window(row, sort, |frame| frame.text_box(value).center())
+    fn click_skill_window_at(row: &PlayerRow, tabs: &mut SkillTabs, value: &str) -> bool {
+        click_skill_window(row, tabs, |frame| frame.text_box(value).center())
     }
 
     /// The same two-frame harness, aimed by an arbitrary `locate` instead of
@@ -18184,7 +18848,7 @@ mod tests {
     /// issue #218 turned its `\u{2715}` into two line segments.
     fn click_skill_window(
         row: &PlayerRow,
-        sort: &mut skills::SkillSort,
+        tabs: &mut SkillTabs,
         locate: impl FnOnce(&RowFrame) -> egui::Pos2,
     ) -> bool {
         let ctx = egui::Context::default();
@@ -18201,7 +18865,7 @@ mod tests {
                 draw_skill_window(
                     ui,
                     row,
-                    sort,
+                    tabs,
                     SkillWindowSource::Live,
                     &icons,
                     1.0,
@@ -18229,7 +18893,7 @@ mod tests {
                 clicked = draw_skill_window(
                     ui,
                     row,
-                    sort,
+                    tabs,
                     SkillWindowSource::Live,
                     &icons,
                     1.0,
@@ -18245,19 +18909,23 @@ mod tests {
     fn clicking_a_column_header_toggles_its_sort() {
         let row = PlayerRow {
             skills: vec![sample_skill_row(1550), sample_skill_row(1551)],
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
             ..sample_row(None)
         };
-        let mut sort = skills::SkillSort::default();
-        assert_eq!(sort.column, skills::SkillColumn::Damage);
+        let mut tabs = SkillTabs::default();
+        assert_eq!(tabs.sort_mut().column, skills::SkillColumn::Damage);
 
         // "Skill name" is the `Name` header's plain (unselected) label —
         // the default sort is `Damage`, so this is never the active-sort
         // text `header_label` would instead paint.
-        click_skill_window_at(&row, &mut sort, "Skill name");
+        click_skill_window_at(&row, &mut tabs, "Skill name");
 
-        assert_eq!(sort.column, skills::SkillColumn::Name);
+        assert_eq!(tabs.sort_mut().column, skills::SkillColumn::Name);
         assert!(
-            sort.descending,
+            tabs.sort_mut().descending,
             "a newly-clicked column always starts descending (D9)"
         );
     }
@@ -18550,13 +19218,17 @@ mod tests {
     fn clicking_the_close_glyph_closes_the_window() {
         let row = PlayerRow {
             skills: vec![sample_skill_row(1550)],
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
             ..sample_row(None)
         };
-        let mut sort = skills::SkillSort::default();
+        let mut tabs = SkillTabs::default();
 
         // The close button is aimed at geometrically: it paints two line
         // segments now, not a glyph (issue #218).
-        let closed = click_skill_window(&row, &mut sort, |_| {
+        let closed = click_skill_window(&row, &mut tabs, |_| {
             skill_close_rect(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 SKILL_WINDOW_SIZE,

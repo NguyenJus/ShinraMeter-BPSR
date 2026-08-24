@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::event::{
-    Class, DamageEvent, EDungeonState, EnemyHp, EntityKind, PlayerInfo, ProtocolEvent,
+    CastEvent, Class, DamageEvent, EDungeonState, EnemyHp, EntityKind, PlayerInfo, ProtocolEvent,
 };
 use crate::fight::{FightConfig, FightEndCause, FightState};
 use crate::phase;
@@ -705,6 +705,10 @@ impl Meter {
     pub fn apply(&mut self, ev: &ProtocolEvent) -> Option<ResetReason> {
         match ev {
             ProtocolEvent::Damage(d) => self.apply_damage(d),
+            ProtocolEvent::Cast(c) => {
+                self.apply_cast(c);
+                None
+            }
             ProtocolEvent::Player(p) => {
                 self.apply_player(p);
                 None
@@ -1326,8 +1330,16 @@ impl Meter {
             }
         }
 
-        // Healing view is a non-goal: heal events never touch damage totals
-        // or fight timing.
+        // issue #245: the per-tab breakdowns the skill window's Heal,
+        // "Skill dealt" and "Skill received" tabs read. Recorded here, and
+        // deliberately above both of the early returns that follow: the
+        // `is_heal` return below drops the events the Heal tab is entirely
+        // about, and the `attacker_kind != Player` return further down
+        // drops the monster damage the received tab is mostly about.
+        self.record_breakdowns(d);
+
+        // Healing never touches damage totals or fight timing — it reaches
+        // the UI only through the Heal / dealt tabs recorded just above.
         if d.is_heal {
             return reason;
         }
@@ -1915,6 +1927,60 @@ impl Meter {
     /// ever having attacked (e.g. a healer or a fresh join), so this cannot
     /// rely on an entry the attacker-side path in `apply_damage` already
     /// made.
+    /// Counts one skill activation against its caster (issue #245).
+    ///
+    /// Deliberately inert beyond that count. A cast does not start the
+    /// fight clock, does not advance `last_event_ms`, does not end a hold,
+    /// and is not evidence of a revive — the attr it is decoded from rides
+    /// every delta a player's client sends, in town as much as in a
+    /// dungeon, so treating it as combat activity would keep the meter
+    /// permanently "in a fight" and dilute every DPS figure with the walk
+    /// back to the vendor.
+    ///
+    /// `get_mut`, not `entry`: same rule the breakdowns below follow. A
+    /// stranger casting past the player must not open a row in a fight
+    /// they are no part of, and a cast carries no damage to justify one.
+    /// A cast that arrives while a finished fight is held on screen is
+    /// dropped, for the same reason every other event is.
+    fn apply_cast(&mut self, c: &CastEvent) {
+        if self.fight_end_ms.is_some() {
+            return;
+        }
+        if let Some(stats) = self.players.get_mut(&c.caster_uid) {
+            *stats.casts.entry(c.skill_id).or_insert(0) += 1;
+        }
+    }
+
+    /// Accumulates one event into issue #245's per-tab breakdowns: the
+    /// attacker's outgoing healing, and the target's incoming everything
+    /// (damage taken and healing received alike).
+    ///
+    /// `get_mut`, never the `entry` API the outgoing-damage path uses —
+    /// the same rule the revive detection in `apply_damage` follows. These
+    /// views may enrich a row the roster already holds, but must never
+    /// *open* one: a stranger healing their way past the player in town,
+    /// or a field mob swinging at a passer-by, is not a participant in
+    /// this encounter and must not appear as a row in it.
+    fn record_breakdowns(&mut self, d: &DamageEvent) {
+        if d.is_heal
+            && d.attacker_kind == EntityKind::Player
+            && let Some(stats) = self.players.get_mut(&d.attacker_uid)
+        {
+            accumulate_skill(stats.heals.entry(d.skill_id).or_default(), d);
+            if !d.is_miss {
+                stats.total_heal += d.value;
+            }
+        }
+        if d.target_kind == EntityKind::Player
+            && let Some(stats) = self.players.get_mut(&d.target_uid)
+        {
+            accumulate_skill(stats.incoming.entry(d.skill_id).or_default(), d);
+            if !d.is_miss {
+                stats.total_incoming += d.value;
+            }
+        }
+    }
+
     fn record_death(&mut self, target_uid: i64, timestamp_ms: u64) {
         let stats = self
             .players
@@ -2391,6 +2457,32 @@ impl Meter {
     }
 
     pub fn snapshot(&self, now_ms: u64) -> Snapshot {
+        self.snapshot_focused(now_ms, None)
+    }
+
+    /// Same as [`Meter::snapshot`], but skips the four breakdown-tab
+    /// vectors (`heals`, `dealt`, `received`, `casts`) for any player not
+    /// named in `focus` — building only `skills`, which every row needs for
+    /// the always-visible Dps bar.
+    ///
+    /// `focus` is the set of player uids with an open skill-breakdown
+    /// window (`crates/app/src/ui.rs`'s `skill_windows` keys), threaded in
+    /// from the UI via `UiCommand::SkillFocus`
+    /// (`crates/app/src/pipeline.rs`'s live publish loop). `None` means
+    /// "build every breakdown for every player" — [`Meter::snapshot`]'s own
+    /// behavior, and every non-live caller (tests, replay/history, the
+    /// sanitizer) goes through that path unchanged.
+    ///
+    /// This exists because the live pipeline (`crates/app/src/pipeline.rs`)
+    /// publishes a snapshot ~10x/second regardless of whether any skill
+    /// window is even open, and a skill window is closed almost all the
+    /// time (PR #268 review, finding 2): sorting four extra `Vec<SkillRow>`
+    /// per player on every tick for tabs nobody is looking at is pure
+    /// waste. Gating by player rather than by (player, tab) keeps this
+    /// crate ignorant of `bpsr-app`'s `SkillTab` type, and means flipping
+    /// tabs on an already-open window never has to wait a tick for data
+    /// that was already being built for that player.
+    pub fn snapshot_focused(&self, now_ms: u64, focus: Option<&[i64]>) -> Snapshot {
         let total_damage: i64 = self.players.values().map(|p| p.total_damage).sum();
 
         // issue #78: once the fight has ended the snapshot is rendered as of
@@ -2421,6 +2513,26 @@ impl Meter {
                     0.0
                 };
                 let skills = skill_rows(p, dps_duration_ms);
+                // issue #245, gated per PR #268 review finding 2: one
+                // vector per breakdown tab, built here rather than lazily on
+                // the UI side because every one of them needs
+                // `dps_duration_ms`, which is snapshot-local. `focus` limits
+                // this real work to players whose skill window is actually
+                // open (see `snapshot_focused`'s doc comment) — everyone
+                // else gets the same empty vectors `SkillTab::rows` already
+                // returns for `Buff`, which is indistinguishable from "no
+                // events yet" to every consumer since none is looking.
+                let wants_breakdowns = focus.is_none_or(|uids| uids.contains(&p.uid));
+                let (heals, dealt, received, casts) = if wants_breakdowns {
+                    (
+                        breakdown_rows(&p.heals, p.total_heal, dps_duration_ms),
+                        dealt_rows(p, dps_duration_ms),
+                        breakdown_rows(&p.incoming, p.total_incoming, dps_duration_ms),
+                        cast_rows(p, dps_duration_ms),
+                    )
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                };
                 PlayerRow {
                     uid: p.uid,
                     name: p
@@ -2444,6 +2556,10 @@ impl Meter {
                     // death still open then stops accruing with them.
                     dead_ms: Some(p.dead_ms_as_of(effective_now_ms)),
                     skills,
+                    heals,
+                    dealt,
+                    received,
+                    casts,
                 }
             })
             .collect();
@@ -2599,15 +2715,90 @@ pub fn skill_row_from_stats(
 /// function so the per-skill arithmetic sits beside its own unit tests
 /// rather than buried in the row-building closure.
 fn skill_rows(stats: &PlayerStats, dps_duration_ms: u64) -> Vec<SkillRow> {
-    let mut rows: Vec<SkillRow> = stats
-        .skills
+    breakdown_rows(&stats.skills, stats.total_damage, dps_duration_ms)
+}
+
+/// Folds one event's amount/crit/lucky facts into a per-skill accumulator
+/// (issue #245), mirroring `Meter::apply_damage`'s own outgoing-damage
+/// bookkeeping exactly: `hits` counts the swing whether or not it landed
+/// (a miss is a use of the skill, not a non-event), while every amount is
+/// gated on `!is_miss`.
+fn accumulate_skill(skill: &mut SkillStats, d: &DamageEvent) {
+    skill.hits += 1;
+    if d.is_miss {
+        return;
+    }
+    skill.total_damage += d.value;
+    if d.crit {
+        skill.crit_hits += 1;
+        skill.crit_damage += d.value;
+        skill.max_crit = skill.max_crit.max(d.value);
+    }
+    if d.lucky {
+        skill.lucky_hits += 1;
+        skill.lucky_damage += d.value;
+    }
+}
+
+/// Turns any per-skill accumulator map into display rows, amount-descending
+/// (issue #245). The generalisation of the original `skill_rows`: `total`
+/// is whichever player total that map's `% ` column divides by — damage
+/// dealt, healing done, or amount received — so the four breakdown tabs
+/// share one arithmetic path (`skill_row_from_stats`) and can never drift
+/// apart in how a share, an average or a hit rate is computed.
+fn breakdown_rows(
+    skills: &HashMap<i32, SkillStats>,
+    total: i64,
+    dps_duration_ms: u64,
+) -> Vec<SkillRow> {
+    let mut rows: Vec<SkillRow> = skills
         .iter()
-        .map(|(&skill_id, skill)| {
-            skill_row_from_stats(skill_id, skill, stats.total_damage, dps_duration_ms)
-        })
+        .map(|(&skill_id, skill)| skill_row_from_stats(skill_id, skill, total, dps_duration_ms))
         .collect();
     rows.sort_by_key(|s| std::cmp::Reverse(s.damage));
     rows
+}
+
+/// The Skill casts tab's rows (issue #245): one row per skill this player
+/// has begun, cast-count-descending.
+///
+/// Goes through `skill_row_from_stats` like every other breakdown so the
+/// per-minute rate shares the Dps tab's denominator exactly — a cast rate
+/// and a hit rate that disagreed about how long the fight was would be
+/// worse than either alone. Every amount-shaped field falls out as `0`
+/// from an all-zero `SkillStats`, which is correct: a cast has no amount,
+/// and the tab shows no amount column.
+fn cast_rows(stats: &PlayerStats, dps_duration_ms: u64) -> Vec<SkillRow> {
+    let mut rows: Vec<SkillRow> = stats
+        .casts
+        .iter()
+        .map(|(&skill_id, &count)| {
+            let stats = SkillStats {
+                hits: count,
+                ..Default::default()
+            };
+            skill_row_from_stats(skill_id, &stats, 0, dps_duration_ms)
+        })
+        .collect();
+    rows.sort_by_key(|s| std::cmp::Reverse(s.hits));
+    rows
+}
+
+/// The "Skill dealt" tab's rows (issue #245): everything this player put
+/// out, damage and healing merged under one skill id. A skill that both
+/// damages and heals lands in both accumulators and is summed here, which
+/// is what "amount dealt" means for it — `SkillStats::merge` maxes
+/// `max_crit` rather than summing it, being a running max.
+fn dealt_rows(stats: &PlayerStats, dps_duration_ms: u64) -> Vec<SkillRow> {
+    let mut merged = stats.skills.clone();
+    for (&skill_id, heal) in &stats.heals {
+        merged.entry(skill_id).or_default().merge(heal);
+    }
+    breakdown_rows(
+        &merged,
+        stats.total_damage + stats.total_heal,
+        dps_duration_ms,
+    )
 }
 
 /// Builds the "scene changed" diagnostic line (issue #69), or `None` when
@@ -2736,6 +2927,296 @@ mod tests {
             timestamp_ms: ts,
             ..Default::default()
         })
+    }
+
+    // -- issue #245: Heal / Skill dealt / Skill received breakdowns -------
+
+    fn heal(
+        attacker_uid: i64,
+        target_uid: i64,
+        skill_id: i32,
+        value: i64,
+        ts: u64,
+    ) -> ProtocolEvent {
+        ProtocolEvent::Damage(DamageEvent {
+            attacker_uid,
+            attacker_kind: EntityKind::Player,
+            target_uid,
+            target_kind: EntityKind::Player,
+            skill_id,
+            value,
+            is_heal: true,
+            timestamp_ms: ts,
+            ..Default::default()
+        })
+    }
+
+    fn hit_on_player(
+        attacker_uid: i64,
+        attacker_kind: EntityKind,
+        target_uid: i64,
+        skill_id: i32,
+        value: i64,
+        ts: u64,
+    ) -> ProtocolEvent {
+        ProtocolEvent::Damage(DamageEvent {
+            attacker_uid,
+            attacker_kind,
+            target_uid,
+            target_kind: EntityKind::Player,
+            skill_id,
+            value,
+            timestamp_ms: ts,
+            ..Default::default()
+        })
+    }
+
+    fn cast(caster_uid: i64, skill_id: i32, ts: u64) -> ProtocolEvent {
+        ProtocolEvent::Cast(CastEvent {
+            caster_uid,
+            skill_id,
+            timestamp_ms: ts,
+        })
+    }
+
+    #[test]
+    fn casts_are_counted_per_skill_for_a_player_in_the_roster() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 1000));
+        m.apply(&cast(1, 1550, 1100));
+        m.apply(&cast(1, 1550, 1200));
+        m.apply(&cast(1, 1551, 1300));
+        let snap = m.snapshot(2000);
+        let row = &snap.rows[0];
+        assert_eq!(row.casts.len(), 2);
+        // Cast-count-descending, like every other breakdown's amount.
+        assert_eq!(row.casts[0].skill_id, 1550);
+        assert_eq!(row.casts[0].hits, 2);
+        assert_eq!(row.casts[1].skill_id, 1551);
+        assert_eq!(row.casts[1].hits, 1);
+        // A cast has no amount, and the tab shows no amount column.
+        assert_eq!(row.casts[0].damage, 0);
+        assert_eq!(row.casts[0].share_pct, 0.0);
+    }
+
+    /// A cast rides every delta a player's client sends, in town as much
+    /// as in a dungeon — so it must not open a row, start the fight clock,
+    /// or advance the idle deadline.
+    #[test]
+    fn a_cast_alone_never_opens_a_row_or_starts_a_fight() {
+        let mut m = Meter::new();
+        m.apply(&cast(1, 1550, 1000));
+        assert!(m.snapshot(2000).rows.is_empty());
+        assert!(!m.is_active());
+    }
+
+    #[test]
+    fn casts_share_the_dps_windows_per_minute_denominator() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0));
+        m.apply(&dmg(1, 100, 5_000));
+        for ts in 0..6 {
+            m.apply(&cast(1, 1550, ts * 1_000));
+        }
+        let snap = m.snapshot(5_000);
+        let row = &snap.rows[0];
+        // Two hits and six casts over the same window, so the cast rate is
+        // exactly three times the Dps tab's hit rate for the same skill —
+        // an assertion that pins the shared denominator without restating
+        // how `snapshot` computes it.
+        assert_eq!(row.skills[0].hits, 2);
+        assert_eq!(row.casts[0].hits, 6);
+        assert!(
+            (row.casts[0].hits_per_min - 3.0 * row.skills[0].hits_per_min).abs() < 0.01,
+            "cast rate {} vs hit rate {}",
+            row.casts[0].hits_per_min,
+            row.skills[0].hits_per_min
+        );
+    }
+
+    #[test]
+    fn healing_lands_on_the_heal_tab_for_a_player_already_in_the_roster() {
+        let mut m = Meter::new();
+        // Open the row with real damage first — healing alone must not.
+        m.apply(&dmg(1, 100, 1000));
+        m.apply(&heal(1, 2, 55, 400, 1100));
+        m.apply(&heal(1, 2, 55, 600, 1200));
+        let snap = m.snapshot(2000);
+        let row = &snap.rows[0];
+        assert_eq!(row.heals.len(), 1);
+        assert_eq!(row.heals[0].skill_id, 55);
+        assert_eq!(row.heals[0].damage, 1000);
+        assert_eq!(row.heals[0].hits, 2);
+        // The share column divides by healing done, not damage done.
+        assert!((row.heals[0].share_pct - 100.0).abs() < 0.01);
+        // ...and none of it leaks into the damage view.
+        assert_eq!(row.damage, 100);
+        assert_eq!(row.skills.len(), 1);
+    }
+
+    #[test]
+    fn healing_alone_never_opens_a_row() {
+        let mut m = Meter::new();
+        m.apply(&heal(1, 2, 55, 400, 1000));
+        assert!(m.snapshot(2000).rows.is_empty());
+    }
+
+    #[test]
+    fn damage_taken_lands_on_the_received_tab() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 1000));
+        // A monster hitting the player: dropped by the damage pipeline's
+        // `attacker_kind != Player` return, but it is exactly what the
+        // received tab exists to show.
+        m.apply(&hit_on_player(9, EntityKind::Monster, 1, 77, 250, 1100));
+        m.apply(&hit_on_player(9, EntityKind::Monster, 1, 77, 250, 1200));
+        let snap = m.snapshot(2000);
+        let row = &snap.rows[0];
+        assert_eq!(row.received.len(), 1);
+        assert_eq!(row.received[0].skill_id, 77);
+        assert_eq!(row.received[0].damage, 500);
+        assert_eq!(row.received[0].hits, 2);
+        assert!((row.received[0].share_pct - 100.0).abs() < 0.01);
+        // The attacker was a monster, so no second row was opened for it.
+        assert_eq!(snap.rows.len(), 1);
+    }
+
+    #[test]
+    fn healing_received_lands_on_the_received_tab_too() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 1000));
+        m.apply(&dmg(2, 100, 1000));
+        m.apply(&heal(2, 1, 55, 300, 1100));
+        let snap = m.snapshot(2000);
+        let healed = snap.rows.iter().find(|r| r.uid == 1).expect("uid 1");
+        assert_eq!(healed.received.len(), 1);
+        assert_eq!(healed.received[0].skill_id, 55);
+        assert_eq!(healed.received[0].damage, 300);
+        // ...and the healer's own received tab stays empty.
+        let healer = snap.rows.iter().find(|r| r.uid == 2).expect("uid 2");
+        assert!(healer.received.is_empty());
+    }
+
+    #[test]
+    fn the_dealt_tab_merges_outgoing_damage_and_healing() {
+        let mut m = Meter::new();
+        // Skill 10 damages, skill 55 heals, skill 20 does both.
+        m.apply(&ProtocolEvent::Damage(DamageEvent {
+            attacker_uid: 1,
+            attacker_kind: EntityKind::Player,
+            target_uid: 9,
+            target_kind: EntityKind::Monster,
+            skill_id: 10,
+            value: 700,
+            timestamp_ms: 1000,
+            ..Default::default()
+        }));
+        m.apply(&ProtocolEvent::Damage(DamageEvent {
+            attacker_uid: 1,
+            attacker_kind: EntityKind::Player,
+            target_uid: 9,
+            target_kind: EntityKind::Monster,
+            skill_id: 20,
+            value: 100,
+            timestamp_ms: 1100,
+            ..Default::default()
+        }));
+        m.apply(&heal(1, 2, 20, 200, 1200));
+        m.apply(&heal(1, 2, 55, 50, 1300));
+        let snap = m.snapshot(2000);
+        let row = &snap.rows[0];
+
+        let dealt: HashMap<i32, &SkillRow> = row.dealt.iter().map(|r| (r.skill_id, r)).collect();
+        assert_eq!(dealt.len(), 3);
+        assert_eq!(dealt[&10].damage, 700);
+        assert_eq!(dealt[&20].damage, 300);
+        assert_eq!(dealt[&20].hits, 2);
+        assert_eq!(dealt[&55].damage, 50);
+        // Shares divide by everything dealt: 700 + 300 + 50 = 1050.
+        assert!((dealt[&10].share_pct - 700.0 / 1050.0 * 100.0).abs() < 0.01);
+        // Rows arrive amount-descending, like every other breakdown.
+        assert_eq!(
+            row.dealt.iter().map(|r| r.skill_id).collect::<Vec<_>>(),
+            vec![10, 20, 55]
+        );
+        // The Dps tab is untouched by the merge.
+        assert_eq!(row.skills.len(), 2);
+    }
+
+    #[test]
+    fn a_missed_heal_counts_as_a_use_but_adds_no_amount() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 1000));
+        m.apply(&ProtocolEvent::Damage(DamageEvent {
+            attacker_uid: 1,
+            attacker_kind: EntityKind::Player,
+            target_uid: 2,
+            target_kind: EntityKind::Player,
+            skill_id: 55,
+            value: 400,
+            is_heal: true,
+            is_miss: true,
+            timestamp_ms: 1100,
+            ..Default::default()
+        }));
+        let snap = m.snapshot(2000);
+        let row = &snap.rows[0];
+        assert_eq!(row.heals.len(), 1);
+        assert_eq!(row.heals[0].hits, 1);
+        assert_eq!(row.heals[0].damage, 0);
+    }
+
+    #[test]
+    fn a_crit_heal_feeds_the_heal_tabs_crit_columns() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 1000));
+        m.apply(&ProtocolEvent::Damage(DamageEvent {
+            attacker_uid: 1,
+            attacker_kind: EntityKind::Player,
+            target_uid: 2,
+            target_kind: EntityKind::Player,
+            skill_id: 55,
+            value: 900,
+            is_heal: true,
+            crit: true,
+            timestamp_ms: 1100,
+            ..Default::default()
+        }));
+        m.apply(&heal(1, 2, 55, 100, 1200));
+        let snap = m.snapshot(2000);
+        let heal_row = &snap.rows[0].heals[0];
+        assert_eq!(heal_row.crit_hits, 1);
+        assert_eq!(heal_row.max_crit, 900);
+        assert!((heal_row.crit_pct - 50.0).abs() < 0.01);
+        assert!((heal_row.avg_crit - 900.0).abs() < 0.01);
+        assert!((heal_row.avg_white - 100.0).abs() < 0.01);
+        assert!((heal_row.avg - 500.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn merging_skill_stats_maxes_the_crit_rather_than_summing_it() {
+        let mut a = SkillStats {
+            total_damage: 100,
+            hits: 1,
+            crit_hits: 1,
+            crit_damage: 100,
+            max_crit: 100,
+            ..Default::default()
+        };
+        let b = SkillStats {
+            total_damage: 40,
+            hits: 1,
+            crit_hits: 1,
+            crit_damage: 40,
+            max_crit: 40,
+            ..Default::default()
+        };
+        a.merge(&b);
+        assert_eq!(a.total_damage, 140);
+        assert_eq!(a.hits, 2);
+        assert_eq!(a.crit_hits, 2);
+        assert_eq!(a.crit_damage, 140);
+        assert_eq!(a.max_crit, 100);
     }
 
     #[test]
