@@ -174,8 +174,8 @@ const SKILL_PLACEHOLDER_PALETTE: [(u8, u8, u8); 12] = [
     (0xB0, 0x3A, 0x2E), // brick red
     (0xC5, 0x6A, 0x1E), // burnt orange
     (0xD8, 0xB0, 0x2A), // gold
-    (0x4C, 0x8C, 0x2B), // moss green
-    (0x1E, 0x8A, 0x74), // teal
+    (0x52, 0x97, 0x2E), // moss green
+    (0x1C, 0x80, 0x6C), // teal
     (0x1E, 0x6F, 0x9E), // steel blue
     (0x3A, 0x4E, 0xB0), // indigo
     (0x6A, 0x3A, 0xB0), // violet
@@ -213,8 +213,14 @@ fn relative_luminance((r, g, b): (u8, u8, u8)) -> f32 {
 /// round-number guess: it is the relative luminance at which the two
 /// ratios cross, solved from `(l + 0.05)^2 = 1.05 * (l_black + 0.05)` where
 /// `l_black` is `#1A1A1A`'s own luminance. Every current palette entry
-/// clears 3:1 (WCAG AA's minimum for large text, which this glyph's ~15pt
-/// bold weight qualifies as) against its chosen color; most clear 4.5+.
+/// clears 4.5:1 (WCAG AA's minimum for *normal* text, stricter than the
+/// 3:1 large-text floor this glyph's ~15pt bold weight would otherwise
+/// only need to clear) against its chosen glyph color — issue #281's
+/// live-window pass found the original teal (4.25:1 against white) and
+/// moss green (4.23:1 against black) both fell short of 4.5 despite
+/// clearing 3:1, so both were darkened/lightened respectively until they
+/// cleared 4.5 with a small margin, without changing which glyph color
+/// either one picks.
 ///
 /// Lives here rather than in `skills.rs` (moved in the issue #281 review
 /// pass): `skills.rs`'s module doc says this file owns skill-name/sort
@@ -271,11 +277,15 @@ fn paint_skill_icon_placeholder(
     opacity: f32,
 ) {
     let Some(glyph) = skills::skill_monogram(name) else {
-        painter.circle_filled(center, SKILL_ICON_SIZE / 2.0, SKILL_ICON_EMPTY);
+        painter.circle_filled(center, SKILL_ICON_PLACEHOLDER_RADIUS, SKILL_ICON_EMPTY);
         return;
     };
     let (bg, fg) = skill_placeholder_colors(skill_id);
-    painter.circle_filled(center, SKILL_ICON_SIZE / 2.0, bg.gamma_multiply(opacity));
+    painter.circle_filled(
+        center,
+        SKILL_ICON_PLACEHOLDER_RADIUS,
+        bg.gamma_multiply(opacity),
+    );
     paint_bold_text(
         painter,
         center,
@@ -6374,6 +6384,23 @@ const SKILL_ROW_HEIGHT: f32 = 44.0;
 /// (`scripts/prep-skill-icons.py`), so this is still a downscale at 100%
 /// display scaling.
 const SKILL_ICON_SIZE: f32 = 38.0;
+/// Per-side inset the issue #275 monogram placeholder disc (and the
+/// `SKILL_ICON_EMPTY` fallback beside it) is drawn at, versus the full
+/// `SKILL_ICON_SIZE / 2.0` radius vendored skill-icon PNGs occupy in code.
+/// Issue #281's live-window pass found the placeholder disc painted at the
+/// full 38x38 slot while real vendored art's own baked-in transparent
+/// padding gives it a visible footprint of only ~26x28 within that same
+/// slot — in a mixed row list, the placeholder read noticeably heavier
+/// than its neighbors. `2.5` isn't a reproduction of that rectangle (a
+/// circle can't match a rectangle's two different margins); it is a small
+/// uniform inset that closes the weight gap without shrinking the disc so
+/// far it stops looking like it belongs in the same size class as the
+/// other 38px slot content.
+const SKILL_ICON_PLACEHOLDER_INSET: f32 = 2.5;
+/// Radius the issue #275 monogram placeholder disc and the
+/// `SKILL_ICON_EMPTY` fallback are painted at — see
+/// `SKILL_ICON_PLACEHOLDER_INSET`.
+const SKILL_ICON_PLACEHOLDER_RADIUS: f32 = SKILL_ICON_SIZE / 2.0 - SKILL_ICON_PLACEHOLDER_INSET;
 /// Fill for a row whose skill has no icon to paint *and* no name to derive
 /// a monogram placeholder from (issue #275 — see
 /// `paint_skill_icon_placeholder`). Deliberately the same flat disc the
@@ -7761,6 +7788,22 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_disc_is_inset_from_the_full_icon_slot() {
+        // Issue #281: the placeholder disc used to fill the full
+        // `SKILL_ICON_SIZE` slot, reading heavier than real vendored art's
+        // ~26x28 visible footprint (its own transparent padding) in the
+        // same 38x38 slot. Pins the inset to the small "~2-3px" range that
+        // closes that gap without shrinking the disc out of the same size
+        // class as real icon art.
+        assert!((2.0..=3.0).contains(&SKILL_ICON_PLACEHOLDER_INSET));
+        assert_eq!(
+            SKILL_ICON_PLACEHOLDER_RADIUS,
+            SKILL_ICON_SIZE / 2.0 - SKILL_ICON_PLACEHOLDER_INSET
+        );
+        assert!(SKILL_ICON_PLACEHOLDER_RADIUS < SKILL_ICON_SIZE / 2.0);
+    }
+
+    #[test]
     fn different_ids_sharing_a_monogram_can_still_land_on_different_swatches() {
         // Every Lucky Strike weapon variant collapses to the same "LS"
         // glyph (they are literally the same base skill), so the id-keyed
@@ -7780,11 +7823,15 @@ mod tests {
     }
 
     #[test]
-    fn every_placeholder_swatch_clears_wcag_large_text_contrast_with_its_chosen_glyph_color() {
+    fn every_placeholder_swatch_clears_wcag_normal_text_contrast_with_its_chosen_glyph_color() {
         // Exercises the legibility rule this placeholder encodes: whichever
         // of near-black or white `skill_placeholder_colors` picks must clear
-        // WCAG AA's 3:1 minimum for large text against every swatch in the
-        // palette, not just the ones a spot check happens to hit.
+        // WCAG AA's 4.5:1 minimum for normal text against every swatch in
+        // the palette, not just the ones a spot check happens to hit.
+        // Issue #281's live-window pass found two swatches (teal, moss
+        // green) that cleared the looser 3:1 large-text floor but fell
+        // short of 4.5 — this asserts the stricter bound so that class of
+        // regression can't land unnoticed again.
         for &(r, g, b) in &SKILL_PLACEHOLDER_PALETTE {
             let bg_lum = relative_luminance((r, g, b));
             let fg = if bg_lum > 0.2017 {
@@ -7800,7 +7847,7 @@ mod tests {
             };
             let ratio = (hi + 0.05) / (lo + 0.05);
             assert!(
-                ratio >= 3.0,
+                ratio >= 4.5,
                 "swatch {:?} only reaches a {ratio:.2}:1 contrast ratio",
                 (r, g, b)
             );
