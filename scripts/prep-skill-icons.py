@@ -8,10 +8,11 @@ only to refresh or extend the icon set, then re-run
 
 The sources are the skill icons committed in the BPSR-ZDPS reference tracker.
 They are game-client-derived assets — see `THIRD_PARTY_NOTICES.md` for the basis
-on which this project redistributes them. Only the basenames actually named by
-`crates/meter/data/SkillOverridesIcons.json` (the vendored `Icon` half of
-BPSR-ZDPS's curated skill overrides, produced by `scripts/gen-name-tables.py`)
-are copied, so the redistributed set stays as small as the feature needs — the
+on which this project redistributes them. Only the basenames actually named by the vendored icon tables
+(`crates/meter/data/SkillOverridesIcons.json` and, since issue #247,
+`crates/meter/data/SkillTableIcons.json` — the `Icon` halves of BPSR-ZDPS's
+curated skill overrides and of the full client skill table, produced by
+`scripts/gen-name-tables.py`) are copied, so the redistributed set stays as small as the feature needs — the
 same discipline the Imagine icons follow.
 
 Upstream splits the icons across two sibling directories, and the `Icon` field
@@ -48,7 +49,13 @@ import sys
 from PIL import Image
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-TABLE = ROOT / "crates" / "meter" / "data" / "SkillOverridesIcons.json"
+# Both vendored icon layers (issue #247): the curated overrides and the full
+# client table that backfills them. `bpsr_meter::tables::skill_icon` is their
+# union, so the committed PNG set has to be their union too.
+TABLES = (
+    ROOT / "crates" / "meter" / "data" / "SkillOverridesIcons.json",
+    ROOT / "crates" / "meter" / "data" / "SkillTableIcons.json",
+)
 OUT = ROOT / "crates" / "app" / "assets" / "skills"
 
 # `prep-imagine-icons.py` is not an importable identifier (the dash), hence
@@ -75,7 +82,9 @@ def main() -> None:
     if not images.is_dir():
         sys.exit(f"not a directory: {images}")
 
-    wanted = sorted(set(json.loads(TABLE.read_text(encoding="utf-8")).values()))
+    wanted = sorted(
+        {v for t in TABLES for v in json.loads(t.read_text(encoding="utf-8")).values()}
+    )
 
     found, missing = {}, []
     for name in wanted:

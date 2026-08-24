@@ -4,6 +4,18 @@ All notable changes to ShinraMeter-BPSR are documented here. This project is
 a fan-made, unofficial tool for Blue Protocol: Star Resonance and is not
 affiliated with the game's publisher.
 
+## Unreleased
+
+### Fixed
+
+- Far more skill breakdown rows now show their real icon instead of a blank
+  disc. The id -> icon table was built only from the game's curated skill
+  overrides, which name an icon for a minority of ids; it is now backfilled
+  from the full client skill table, and the matching art is shipped. Measured
+  against a real capture, 70.8% of the skill ids seen in play now paint an
+  icon, up from 58.9%. The remainder are proc and damage-over-time sources the
+  game itself ships no icon for, and keep the blank disc.
+
 ## v0.2.5
 
 ### Added

@@ -952,6 +952,82 @@ mod tests {
         assert_eq!(skill_icon_basename(1201), Some("weapon_mz-01_skill_atk"));
     }
 
+    /// Distinct skill ids observed across a real 9-encounter capture on a
+    /// live server (`encounter_player_skills` in the meter's own
+    /// `history.sqlite`), sorted. This is the population issue #247 is about:
+    /// what the breakdown window is actually asked to draw, as opposed to
+    /// what the generated table happens to contain. Extend it, never prune
+    /// it — an id that dropped out of coverage is exactly the regression the
+    /// assertion below exists to catch.
+    const OBSERVED_SKILL_IDS: &[i32] = &[
+        1_203, 1_216, 1_222, 1_223, 1_248, 1_259, 1_261, 1_262, 1_263, 1_401, 1_402, 1_403, 1_404,
+        1_409, 1_411, 1_418, 1_420, 1_421, 1_422, 1_427, 1_434, 1_435, 1_501, 1_502, 1_503, 1_504,
+        1_509, 1_529, 1_541, 1_550, 1_551, 1_561, 1_601, 1_602, 1_603, 1_604, 1_605, 1_607, 1_608,
+        1_609, 1_610, 1_611, 1_612, 1_618, 1_619, 1_620, 1_701, 1_702, 1_703, 1_713, 1_715, 1_719,
+        1_724, 1_732, 1_737, 1_738, 1_739, 1_740, 1_741, 1_742, 1_901, 1_902, 1_903, 1_904, 1_907,
+        1_922, 1_924, 1_927, 1_930, 1_935, 1_937, 1_939, 1_940, 1_941, 1_942, 2_233, 2_240, 2_289,
+        2_292, 2_294, 2_295, 2_301, 2_302, 2_303, 2_304, 2_312, 2_313, 2_330, 2_332, 2_336, 2_352,
+        2_362, 2_366, 2_401, 2_402, 2_403, 2_404, 2_406, 2_407, 2_410, 2_416, 2_417, 2_421, 2_426,
+        2_453, 3_614, 7_998, 21_414, 21_424, 31_901, 35_107, 35_108, 35_109, 44_701, 50_036,
+        50_049, 55_231, 55_240, 55_404, 55_417, 55_432, 111_069, 120_201, 120_301, 120_401,
+        120_501, 120_901, 120_902, 121_302, 121_501, 140_145, 140_301, 140_401, 149_901, 150_101,
+        150_103, 150_104, 150_106, 150_107, 150_110, 160_102, 170_112, 179_906, 179_908, 199_902,
+        199_903, 220_101, 220_102, 220_103, 220_104, 220_105, 220_106, 220_108, 220_109, 220_110,
+        220_111, 220_113, 220_203, 220_301, 230_401, 230_501, 230_801, 230_901, 231_001, 240_102,
+        1_005_240, 1_006_940, 1_007_741, 1_008_440, 1_011_011, 1_100_740, 1_102_205, 1_121_508,
+        1_700_440, 1_700_820, 1_700_825, 1_700_826, 1_700_827, 2_002_441, 2_002_853, 2_031_101,
+        2_031_102, 2_031_103, 2_031_104, 2_031_105, 2_031_107, 2_031_109, 2_031_110, 2_031_111,
+        2_110_099, 2_110_130, 2_201_240, 2_201_540, 2_201_570, 2_201_640, 2_203_091, 2_203_101,
+        2_203_102, 2_203_141, 2_203_291, 2_203_521, 2_203_531, 2_203_621, 2_203_622, 2_204_081,
+        2_205_060, 2_205_071, 2_206_243, 2_206_290, 2_206_552, 2_208_172, 2_208_181, 2_900_740,
+        2_900_840, 3_003_213, 3_054_440, 3_210_051, 3_210_231, 10_310_051,
+    ];
+
+    /// How many of `OBSERVED_SKILL_IDS` resolve all the way to a committed
+    /// PNG — the only definition of "has an icon" the user can see.
+    fn observed_ids_with_a_painted_icon() -> usize {
+        OBSERVED_SKILL_IDS
+            .iter()
+            .filter(|&&id| {
+                skill_icon_basename(id)
+                    .is_some_and(|icon| crate::skill_icons::SKILL_ICON_FILES.contains(&icon))
+            })
+            .count()
+    }
+
+    #[test]
+    fn most_observed_skill_ids_paint_a_real_icon_not_the_blank_disc() {
+        // Issue #247: keying the table off BPSR-ZDPS's *curated*
+        // `SkillOverrides.en.json` alone covered only 129 of these 219 ids
+        // (58.9%); backfilling it from the full client `SkillTable.json` and
+        // re-vendoring the art takes it to 155 (70.8%). The floor is set at
+        // 65% — under the current figure with enough headroom that a game
+        // patch re-iding a handful of skills is a nag, not a red build, but
+        // high enough that dropping back to the curated-only table (58.9%)
+        // fails immediately.
+        //
+        // It cannot reach 100%: the rest are proc/DoT damage sources that
+        // upstream itself leaves iconless (2031103 "Lucky Strike (Battle
+        // Axe)" is a `BuffTable.json` row with `Icon: ""`), so there is no
+        // art anywhere to draw. Those keep the blank placeholder by design.
+        let covered = observed_ids_with_a_painted_icon();
+        let pct = 100.0 * covered as f64 / OBSERVED_SKILL_IDS.len() as f64;
+        assert!(
+            pct >= 65.0,
+            "only {covered}/{} observed skill ids ({pct:.1}%) resolve to a committed icon; \
+             regenerate with `python3 scripts/gen-name-tables.py` and re-vendor with \
+             `python3 scripts/prep-skill-icons.py <BPSR-ZDPS>/Data/Images`",
+            OBSERVED_SKILL_IDS.len(),
+        );
+    }
+
+    #[test]
+    fn the_observed_id_fixture_is_sorted_and_free_of_duplicates() {
+        // Guards the fixture itself: a pasted-in duplicate would quietly
+        // double-weight one skill in the coverage rate above.
+        assert!(OBSERVED_SKILL_IDS.windows(2).all(|w| w[0] < w[1]));
+    }
+
     #[test]
     fn an_unmapped_skill_id_falls_back_to_a_placeholder() {
         // 2_000_000_000 sits well outside the generated table's coverage.

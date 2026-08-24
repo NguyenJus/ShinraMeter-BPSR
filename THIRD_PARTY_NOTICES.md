@@ -98,13 +98,15 @@ WinDivert's LGPL-3.0 option is compatible.
 
 ## BPSR-ZDPS skill icons
 
-- Files: `crates/app/assets/skills/*.png` — 179 of the 180 icon basenames
-  referenced by `crates/meter/data/SkillOverridesIcons.json`. The one
-  remaining reference is not an asset name at all (upstream stores the prose
-  "From Shield Combo talent" in that row's `Icon` field) and no image exists
-  for it. Only the icons the meter can actually draw are shipped, the same
-  footprint discipline the Imagine icons above follow — the 348 + 86 upstream
-  images are not bulk-redistributed.
+- Files: `crates/app/assets/skills/*.png` — 387 of the 446 icon basenames
+  referenced by `crates/meter/data/SkillOverridesIcons.json` and
+  `crates/meter/data/SkillTableIcons.json` together. The 59 remaining
+  references have no image upstream at all: some are not asset names (upstream
+  stores the prose "From Shield Combo talent" in one row's `Icon` field), the
+  rest name art the client ships in an atlas BPSR-ZDPS does not extract
+  (`talent_skill_*`, `weapon_iruna_*`). Only the icons the meter can actually
+  draw are shipped, the same footprint discipline the Imagine icons above
+  follow — the 348 + 86 upstream images are not bulk-redistributed.
 - Upstream: <https://github.com/Blue-Protocol-Source/BPSR-ZDPS>
   (`Data/Images/Skills/` and `Data/Images/Skills_Imagines/`; the `Icon` field
   does not say which of the two an icon lives in, so both are searched)
@@ -122,9 +124,10 @@ WinDivert's LGPL-3.0 option is compatible.
   reasoning). The file names and bytes are generated into `SKILL_ICON_FILES`
   and `SKILL_ICON_BYTES` in `crates/app/src/skill_icons.rs` by
   `scripts/gen-skill-icons.py`.
-- The id -> icon table these are keyed against,
-  `crates/meter/data/SkillOverridesIcons.json` and the `skill_icon` function it
-  generates in `crates/meter/src/tables.rs`, is covered by the BPSR-ZDPS game
+- The id -> icon tables these are keyed against,
+  `crates/meter/data/SkillOverridesIcons.json` and
+  `crates/meter/data/SkillTableIcons.json`, and the `skill_icon` function they
+  generate in `crates/meter/src/tables.rs`, are covered by the BPSR-ZDPS game
   table section below, under that section's MIT grant.
 - Takedown: these assets will be removed promptly on request from the rights
   holder. To request removal, open a GitHub issue on this repository. For an
@@ -258,11 +261,15 @@ WinDivert's LGPL-3.0 option is compatible.
   (~56 KB) is vendored as `SkillOverridesNames.json`, and — since issue #192
   — the `{id: Icon}` projection (~11 KB, 327 of the 1487 rows carry a usable
   icon reference) as `SkillOverridesIcons.json`, produced by `filter_id_icons`
-  in the same script. Only the last path segment of each `Icon` value is kept:
-  upstream they are client atlas paths
-  (`ui/atlas/skill_weapon_mz/weapon_mz-01_kx06`) and this project's asset
-  directory is flat. Re-run `scripts/gen-name-tables.py --refresh` to
-  reproduce the filtering from upstream.
+  in the same script. Since issue #247 the full client `SkillTable.json`
+  (10.8 MB) is filtered by the same `filter_id_icons` into a third file, the
+  `{id: Icon}` projection `SkillTableIcons.json` (~35 KB, 1,089 of its 4,796
+  rows carry a usable icon reference); nothing else from those rows is copied.
+  Only the last path segment of each `Icon` value is kept: upstream they are
+  client atlas paths (`ui/atlas/skill_weapon_mz/weapon_mz-01_kx06`) and this
+  project's asset directory is flat. Re-run
+  `scripts/gen-name-tables.py --refresh` to reproduce the filtering from
+  upstream.
 - Added by issue #36 to backfill the ids the community tables do not cover:
   they take `monster_name` from 216 to 3,094 ids and `scene_name` from 340 to
   605, so far fewer encounters fall back to a raw `Monster #40010` /
