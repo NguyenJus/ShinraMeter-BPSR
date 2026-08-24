@@ -3821,6 +3821,13 @@ fn draw_header_menu(
     // here has to guard the bottom end — `Settings::OPACITY_MIN` documents
     // why a fully transparent backdrop stays recoverable.
     let mut opacity = settings.opacity;
+    // Issue #235: `Slider` has no width-builder of its own — its rail is
+    // sized entirely off `Spacing::slider_width` (a fixed ~100pt default),
+    // unlike the Columns checkboxes and buttons below, which already stretch
+    // to the row's available width. This is the only `Slider` in the whole
+    // overlay, so widening the shared spacing setting here can't affect
+    // anything painted after it.
+    ui.spacing_mut().slider_width = ui.available_width();
     let opacity_response = ui.add(
         egui::Slider::new(&mut opacity, Settings::OPACITY_MIN..=Settings::OPACITY_MAX)
             .show_value(false),
@@ -14121,11 +14128,12 @@ mod tests {
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, rx_settings) = crossbeam_channel::unbounded();
         let mut settings = Settings::default();
-        assert_eq!(
-            settings.opacity,
-            Settings::OPACITY_MAX,
-            "the default must start at full opacity for this test to prove a drag actually moved it"
-        );
+        // Issue #233 lowered the default below `OPACITY_MAX`, so this can no
+        // longer assume `Settings::default()` already sits at the ceiling —
+        // it needs to start there explicitly for the drag-to-the-floor below
+        // to prove it actually moved something.
+        settings.set_opacity(Settings::OPACITY_MAX);
+        assert_eq!(settings.opacity, Settings::OPACITY_MAX);
 
         // Frame 1: lay the menu out with no input, and read back where
         // AccessKit says the opacity slider actually painted — its rect
@@ -14213,6 +14221,71 @@ mod tests {
         assert!(
             rx_settings.try_recv().is_err(),
             "releasing the slider without moving it must not send again"
+        );
+    }
+
+    /// Issue #235: the opacity slider used to size itself off
+    /// `Spacing::slider_width` (a fixed ~100pt rail) instead of stretching
+    /// to fill its row the way the menu's other full-width controls do.
+    /// Compares its painted rect against the "Minimize to tray" button's —
+    /// a plain, always-visible control in the same popup, not nested inside
+    /// the Columns disclosure.
+    ///
+    /// Every other `draw_header_menu` test calls it directly on the bare
+    /// `Ui` `ctx.run_ui` hands back, bypassing the real
+    /// `egui::Popup::menu(&chevron_response)` wiring `draw_header` builds
+    /// around it (see the doc comment on the Close-button regression test
+    /// above). That's fine for click/drag behavior, but the "full width"
+    /// this issue is about only exists because `Popup::menu` sets
+    /// `Layout::top_down_justified` — outside that layout, *every* widget
+    /// here (button included) just reports its own natural minimum size,
+    /// so this test recreates that one piece of the real wiring by hand
+    /// rather than the whole popup/anchor apparatus.
+    #[test]
+    fn draw_header_menu_opacity_slider_fills_the_row_width() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+
+        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_max_width(220.0);
+            ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+                draw_header_menu(
+                    ui,
+                    &ctx,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    &mut UpdateCheckState::default(),
+                    &unused_log_export_sender(),
+                );
+            });
+        });
+        let update = layout
+            .platform_output
+            .accesskit_update
+            .clone()
+            .expect("accesskit was enabled for this frame");
+        let slider_rect = accessible_rect_for_role(&update, egui::accesskit::Role::Slider);
+        let button_rect = accessible_rect_for_label(&update, "Minimize to tray");
+        layout.drop_without_applying_deltas();
+
+        assert!(
+            (slider_rect.left() - button_rect.left()).abs() < 1.0,
+            "the slider must start at the same left edge as the row below it: \
+             slider {slider_rect:?}, button {button_rect:?}"
+        );
+        assert!(
+            (slider_rect.width() - button_rect.width()).abs() < 1.0,
+            "the slider must fill the same row width as the row below it, not a fixed rail: \
+             slider {slider_rect:?}, button {button_rect:?}"
         );
     }
 

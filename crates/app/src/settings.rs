@@ -360,10 +360,18 @@ pub struct Settings {
     pub history_min_duration_ms: u64,
 }
 
-/// The `opacity` default for a settings.json predating issue #166: fully
-/// opaque, i.e. the fixed look every existing user already sees today.
+/// The `opacity` default (issue #233): restores the panel to the ~78%
+/// (200/255) look every stable release painted before issue #182 removed
+/// `ui::PANEL_FILL`'s baked-in 200/255 alpha. That change moved all
+/// transparency into this multiplier and left `PANEL_FILL` fully opaque,
+/// but left this default at 1.0 — which silently turned the *default*
+/// install from ~78%-opaque to 100%-opaque, a look that never shipped
+/// stable before. `200.0 / 255.0` reproduces the old combined alpha
+/// (`PANEL_FILL`'s 200/255 times opacity's 1.0) now that `opacity` is the
+/// only place transparency lives, matching
+/// `docs/reference/new-shinra-ex.webp`.
 fn default_opacity() -> f32 {
-    1.0
+    200.0 / 255.0
 }
 
 /// `Settings::always_on_top`'s serde default (issue #167) — see that
@@ -1332,11 +1340,16 @@ mod tests {
     // -- opacity (issue #166) ------------------------------------------
 
     #[test]
-    fn default_opacity_is_fully_opaque() {
-        // Existing users must see no change on upgrade: a settings.json
-        // predating issue #166 has no `opacity` key, and the freshly
-        // installed default must render exactly as opaque as it always has.
-        assert_eq!(Settings::default().opacity, 1.0);
+    fn default_opacity_restores_the_pre_182_look() {
+        // Issue #233: before issue #182, `ui::PANEL_FILL` carried a baked-in
+        // 200/255 alpha, so the rendered default (`default_opacity() == 1.0`
+        // multiplying that 200/255) was ~78% opaque. #182 made `PANEL_FILL`
+        // fully opaque and moved all transparency into this multiplier, but
+        // left the default at 1.0 — silently turning the *default* install
+        // from ~78%-opaque to 100%-opaque, a look that never shipped stable
+        // before. 200.0 / 255.0 reproduces that original combined alpha now
+        // that `opacity` is the only place transparency lives.
+        assert_eq!(Settings::default().opacity, 200.0 / 255.0);
     }
 
     /// Issue #203: the header dropdown's "Reset to defaults" item needs a
@@ -1376,7 +1389,9 @@ mod tests {
 
         let loaded = load_from(&path);
 
-        assert_eq!(loaded.opacity, 1.0);
+        // Issue #233: falls back to the restored ~78%-opaque default, not
+        // the drifted 1.0 this assertion used to check.
+        assert_eq!(loaded.opacity, 200.0 / 255.0);
         let _ = fs::remove_file(&path);
     }
 
