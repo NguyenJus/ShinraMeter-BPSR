@@ -14,6 +14,7 @@ pub mod paths;
 pub mod pipeline;
 pub mod platform;
 pub mod settings;
+pub mod single_instance;
 pub mod skill_icons;
 pub mod skills;
 pub mod ui;

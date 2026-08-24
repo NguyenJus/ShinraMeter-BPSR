@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bpsr_app::{
-    fonts, history, inspect, logging, paths, pipeline, platform, settings, ui, update_check,
+    fonts, history, inspect, logging, paths, pipeline, platform, settings, single_instance, ui,
+    update_check,
 };
 use bpsr_protocol::ProtocolEvent;
 use crossbeam_channel::bounded;
@@ -41,8 +42,10 @@ fn names_cache_path() -> PathBuf {
 
 /// Where the encounter-history database (issue #39) lives:
 /// `%APPDATA%\ShinraMeter-BPSR\history.sqlite`. `SHINRA_HISTORY_DB` overrides
-/// it outright — the only one of these three files with an override, because
-/// it is the only one a developer routinely wants pointed at a scratch copy.
+/// it outright, because it is the file a developer most often wants pointed
+/// at a scratch copy — though it is no longer the only override among the
+/// app's on-disk files: the single-instance lock (issue #277) has its own,
+/// `SHINRA_INSTANCE_LOCK` (see `single_instance::lock_file_path`).
 fn history_db_path() -> PathBuf {
     let (path, warning) = paths::resolve(
         std::env::var("SHINRA_HISTORY_DB").ok().as_deref(),
@@ -231,6 +234,44 @@ fn dx12_composition_setup() -> Option<eframe::WgpuConfiguration> {
     Some(wgpu_options)
 }
 
+/// What `main` should do given the outcome of [`single_instance::acquire`]:
+/// whether startup continues at all, and — if so — with what guard and what
+/// warning (if any) to log on the way. Pulled out of `main()` as a pure
+/// function (`Acquisition` in, `InstanceDecision` out; no logging, no
+/// message box) so the decision issue #277 actually depends on — does a
+/// second copy get told to stand down — is unit-testable without booting
+/// the app, rather than only reachable by running `main()` end to end.
+enum InstanceDecision {
+    /// Continue starting up, holding this guard (if any) for the life of
+    /// the process. `warning`, if set, is logged once by the caller.
+    Continue {
+        guard: Option<single_instance::InstanceGuard>,
+        warning: Option<String>,
+    },
+    /// Another live instance already owns the meter slot: exit before
+    /// capture ever opens a WinDivert handle.
+    Exit,
+}
+
+fn decide_instance(acquisition: single_instance::Acquisition) -> InstanceDecision {
+    match acquisition {
+        single_instance::Acquisition::Acquired(guard) => InstanceDecision::Continue {
+            guard: Some(guard),
+            warning: None,
+        },
+        single_instance::Acquisition::AlreadyRunning => InstanceDecision::Exit,
+        // A guard that cannot be evaluated must not be able to stop the app:
+        // refusing to start because the *lock* is broken would be a worse
+        // failure than the duplicate rows it exists to prevent.
+        single_instance::Acquisition::Unavailable(reason) => InstanceDecision::Continue {
+            guard: None,
+            warning: Some(format!(
+                "single-instance guard unavailable ({reason}); a second copy of the meter would go undetected (issue #277)"
+            )),
+        },
+    }
+}
+
 fn main() -> eframe::Result {
     // `env_logger::init()` alone defaults to `error`-only and, since this
     // binary carries `windows_subsystem = "windows"`, has no console for
@@ -239,14 +280,37 @@ fn main() -> eframe::Result {
     // a file so a user hitting a bug can actually produce diagnostics.
     logging::init();
 
+    // Issue #277: a second copy of the meter is never what the user meant.
+    // Both instances append to the same log (every event line then appears
+    // twice, from two independent capture loops) and both write the same
+    // fight to `history.sqlite`, so the history list grows a duplicate row
+    // per fight. Claimed before capture opens a WinDivert handle, so a
+    // refused instance never touches the driver — and held in `_instance`
+    // for the rest of `main`, because dropping the guard frees the slot.
+    let _instance = match decide_instance(single_instance::acquire()) {
+        InstanceDecision::Continue { guard, warning } => {
+            if let Some(warning) = warning {
+                log::warn!("{warning}");
+            }
+            guard
+        }
+        InstanceDecision::Exit => {
+            log::error!("{}", single_instance::ALREADY_RUNNING_MESSAGE);
+            platform::warn_already_running(single_instance::ALREADY_RUNNING_MESSAGE);
+            return Ok(());
+        }
+    };
+
     // Issue #250: the previous in-place update, if there was one, left the
     // build it replaced beside the executable as `<exe>.old` — Windows will
     // not let a running image be deleted, so the process that installed the
     // update could not clean up after itself. This one can: whatever held
     // that file open is the process that exited to make room for this one.
-    // Best-effort and never fatal (see the function's doc comment), and
-    // deliberately after `logging::init` so a failure has somewhere to be
-    // logged.
+    // Which is only true *here*, after the guard: on a relaunch the
+    // predecessor is still running until it releases the lock, and deleting
+    // its own running image would have failed. Best-effort and never fatal
+    // (see the function's doc comment), and still after `logging::init` so a
+    // failure has somewhere to be logged.
     update_check::clean_up_previous_update();
 
     let (tx_events, rx_events) = bounded::<ProtocolEvent>(EVENT_CAPACITY);
@@ -473,6 +537,56 @@ mod tests {
             WindowComposition::NoDx12Adapter,
         ] {
             assert!(!choice.reason().is_empty(), "{choice:?} has no reason");
+        }
+    }
+
+    // -- decide_instance (issue #277) ----------------------------------------
+    //
+    // `main()` itself is untestable end to end, but the decision that
+    // matters for issue #277 — does a second copy get told to stand down —
+    // is this match, extracted into a pure function precisely so a refactor
+    // that drops the early exit or reorders it after `start_capture` fails
+    // a test instead of silently reintroducing the bug.
+
+    fn instance_lock_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("shinra-main-decide-instance-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("instance.lock")
+    }
+
+    #[test]
+    fn acquired_continues_and_keeps_the_guard() {
+        let acquisition = single_instance::acquire_at(&instance_lock_path("acquired"));
+        match decide_instance(acquisition) {
+            InstanceDecision::Continue { guard, warning } => {
+                assert!(guard.is_some(), "the winning guard must be kept alive");
+                assert!(warning.is_none());
+            }
+            InstanceDecision::Exit => panic!("expected Continue"),
+        }
+    }
+
+    #[test]
+    fn already_running_exits() {
+        let path = instance_lock_path("already_running");
+        let _first = single_instance::acquire_at(&path);
+        let second = single_instance::acquire_at(&path);
+        assert!(
+            matches!(decide_instance(second), InstanceDecision::Exit),
+            "a second live instance must be told to exit, not to continue"
+        );
+    }
+
+    #[test]
+    fn unavailable_continues_without_a_guard_and_logs_the_reason() {
+        let acquisition = single_instance::Acquisition::Unavailable("disk full".to_string());
+        match decide_instance(acquisition) {
+            InstanceDecision::Continue { guard, warning } => {
+                assert!(guard.is_none(), "a broken guard must not be held");
+                let warning = warning.expect("an unavailable guard should still warn");
+                assert!(warning.contains("disk full"));
+            }
+            InstanceDecision::Exit => panic!("a broken guard must not stop the app (issue #277)"),
         }
     }
 }

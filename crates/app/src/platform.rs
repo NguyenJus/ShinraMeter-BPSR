@@ -298,6 +298,38 @@ pub fn force_frame_recompute() {
 #[cfg(not(windows))]
 pub fn force_frame_recompute() {}
 
+/// Tells the user why this launch did nothing (issue #277).
+///
+/// The binary carries `windows_subsystem = "windows"`, so a second instance
+/// that just logs and exits is indistinguishable from a broken shortcut —
+/// and the instance it lost to is minimized to the notification area, which
+/// is exactly the state that makes a user launch a second copy in the first
+/// place. A modal box is the only channel that reaches them here.
+///
+/// Blocks until dismissed, which is fine: the caller exits straight after.
+#[cfg(windows)]
+pub fn warn_already_running(message: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW};
+    use windows::core::HSTRING;
+
+    let text = HSTRING::from(message);
+    let caption = HSTRING::from("ShinraMeter-BPSR");
+    // SAFETY: both strings are NUL-terminated UTF-16 owned by `HSTRING`s
+    // that outlive the call, and a null owner window is valid for an
+    // application-modal box.
+    unsafe {
+        MessageBoxW(
+            None,
+            windows::core::PCWSTR(text.as_ptr()),
+            windows::core::PCWSTR(caption.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn warn_already_running(_message: &str) {}
+
 /// A monitor's or window's rectangle in physical pixels / virtual-screen
 /// coordinates — so a monitor to the left of or above the primary one has
 /// negative `left`/`top`, never remapped to `[0, size]`. Left/top are
