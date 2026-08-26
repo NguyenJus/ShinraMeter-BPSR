@@ -49,13 +49,20 @@ pub enum ResetReason {
     /// tick to be observed as `Ended` and recorded to history, so it is
     /// left latched-but-uncleared for the ordinary `NewFight` reset to
     /// catch on the new dungeon's first real hit instead, the same way
-    /// issue #138's `ServerChanged`-cut-short case already relies on. Nor
-    /// does it fire when the previous scene id was unknown (`None`) rather
-    /// than a specific different one — that can mean a genuinely new
-    /// instance after a `ServerChanged`, but it can just as well mean this
-    /// `Scene` packet is only the late confirmation of the instance the
-    /// currently-held fight was already fought in (issue #152), and the
-    /// meter cannot tell those apart from here.
+    /// issue #138's `ServerChanged`-cut-short case already relies on.
+    ///
+    /// The comparison this fires on is against the *last scene id an actual
+    /// `Scene` packet reported* (issue #295), not the live, currently-held
+    /// one — `ServerChanged` nulls that one out on every reconnect, and
+    /// every real zone transition in capture sends a `ServerChanged`
+    /// immediately before the `Scene` that follows it. Comparing against
+    /// the live value would see `None` on every real dungeon entry and
+    /// never fire outside a unit test; the previous *confirmed* scene is
+    /// still around to compare against by the time this packet lands, and
+    /// the two cases it needs to tell apart — a genuinely new instance
+    /// versus the late confirmation of the one the currently-held fight was
+    /// already fought in (issue #152) — are exactly a changed versus
+    /// unchanged id against it.
     SceneChanged,
     /// A `ProtocolEvent::DungeonState::Playing` was observed, or the
     /// raid-boss reset detector fired (issue #139 §§2,6): the dungeon
