@@ -275,8 +275,11 @@ pub fn decode_varint_i32_truncating(raw: &[u8]) -> Option<i32> {
 /// guaranteed. `None` when no field 1-3 was seen at all (an empty or
 /// entirely off-cluster payload), or on any malformed varint/truncated
 /// float — never panics. A wire type other than `fixed32` on a fields-1-3
-/// tag is treated as unrecognized data and also yields `None`, rather than
-/// guessing how to skip it.
+/// tag is malformed for this shape and also yields `None`, rather than
+/// guessing how to interpret it; a tag for any *other* field number, of any
+/// wire type, is genuinely unknown rather than malformed, so its payload is
+/// skipped generically (via `prost::encoding::skip_field`) instead of
+/// aborting the whole parse.
 pub fn decode_position(raw: &[u8]) -> Option<[f32; 3]> {
     let mut cursor = Cursor::new(raw);
     let mut pos = [0.0f32; 3];
@@ -285,15 +288,32 @@ pub fn decode_position(raw: &[u8]) -> Option<[f32; 3]> {
         let tag = prost::encoding::decode_varint(&mut cursor).ok()?;
         let field = tag >> 3;
         let wire_type = tag & 0x7;
+        let is_target_field = (1..=3).contains(&field);
         if wire_type != 5 {
-            return None;
+            // A fields-1-3 tag with a wire type other than fixed32 is
+            // malformed for this shape (see doc comment above) — bail
+            // rather than guess. Any other field is genuinely unknown, so
+            // skip its payload generically instead of aborting the whole
+            // parse over data we don't care about.
+            if is_target_field {
+                return None;
+            }
+            let wire_type = prost::encoding::WireType::try_from(wire_type).ok()?;
+            prost::encoding::skip_field(
+                wire_type,
+                tag as u32,
+                &mut cursor,
+                prost::encoding::DecodeContext::default(),
+            )
+            .ok()?;
+            continue;
         }
         let start = cursor.position() as usize;
         let end = start.checked_add(4)?;
         let bytes = raw.get(start..end)?;
         let value = f32::from_le_bytes(bytes.try_into().expect("checked-length slice"));
         cursor.set_position(end as u64);
-        if (1..=3).contains(&field) {
+        if is_target_field {
             pos[(field - 1) as usize] = value;
             seen = true;
         }
@@ -308,6 +328,11 @@ pub fn decode_position(raw: &[u8]) -> Option<[f32; 3]> {
 /// carry every id in the cluster.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SkillCastMetadata {
+    /// [`attr_id::SKILL_ID`], decoded in the same pass as the rest of this
+    /// cluster — see [`cast_skill_id_from_attrs`] for the id's own doc
+    /// comment (same decode rules: strict [`decode_varint_i32`], zero
+    /// rejected as "no skill").
+    pub skill_id: Option<i32>,
     /// [`attr_id::SKILL_STAGE`] — medium confidence, see that constant's
     /// doc comment.
     pub skill_stage: Option<i32>,
@@ -325,11 +350,13 @@ pub struct SkillCastMetadata {
     pub skill_uuid: Option<i32>,
 }
 
-/// Decodes issue #287's skill-cast metadata cluster off an entity's `Attr`
-/// list — the sibling ids [`cast_skill_id_from_attrs`] doesn't read. Called
-/// alongside it in `decode::on_aoi_sync_delta`; every field stays `None`
-/// when its id is absent or malformed, matching this module's
-/// zero-is-absent / malformed-is-absent convention rather than erroring.
+/// Decodes [`attr_id::SKILL_ID`] plus issue #287's skill-cast metadata
+/// cluster off an entity's `Attr` list in a single pass — `decode::
+/// on_aoi_sync_delta` used to call this alongside a separate
+/// [`cast_skill_id_from_attrs`] walk of the same slice; folded together here
+/// so the slice is only walked once. Every field stays `None` when its id
+/// is absent or malformed, matching this module's zero-is-absent /
+/// malformed-is-absent convention rather than erroring.
 pub fn skill_cast_metadata_from_attrs(attrs: &[pb::Attr]) -> SkillCastMetadata {
     let mut out = SkillCastMetadata::default();
     for attr in attrs {
@@ -337,6 +364,9 @@ pub fn skill_cast_metadata_from_attrs(attrs: &[pb::Attr]) -> SkillCastMetadata {
             continue;
         }
         match attr.id {
+            attr_id::SKILL_ID => {
+                out.skill_id = decode_varint_i32(&attr.raw_data).filter(|id| *id != 0);
+            }
             attr_id::SKILL_STAGE => {
                 out.skill_stage = decode_varint_i32_truncating(&attr.raw_data);
             }
@@ -1268,6 +1298,18 @@ mod tests {
         // Field 1 tagged as a varint (wire type 0), not this bundle's shape.
         let raw = vec![0x08, 0x01];
         assert_eq!(decode_position(&raw), None);
+    }
+
+    #[test]
+    fn decode_position_skips_a_trailing_unknown_varint_field() {
+        // A well-formed x/y/z triple followed by an unrelated field 4,
+        // wire type 0 (varint) — not this bundle's fixed32 shape, but not
+        // malformed either: it should be skipped, not treated as an abort
+        // condition for the whole payload.
+        let mut raw = encode_position(Some(1.5), Some(-2.25), Some(3.75));
+        raw.push(0x20); // tag: field 4, wire type 0 (varint)
+        raw.push(0x05); // value: 5
+        assert_eq!(decode_position(&raw), Some([1.5, -2.25, 3.75]));
     }
 
     /// Issue #286's own evidence: `raw_hex=0d140d8141151b5ad5421d983d0043`,

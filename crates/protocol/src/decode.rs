@@ -10,7 +10,7 @@ use prost::Message;
 use std::sync::Arc;
 
 use crate::attrs::{
-    cast_skill_id_from_attrs, enemy_hp_from_attrs, player_info_from_attrs, scene_id_from_attrs,
+    enemy_hp_from_attrs, player_info_from_attrs, scene_id_from_attrs,
     skill_cast_metadata_from_attrs,
 };
 use crate::blob;
@@ -259,13 +259,14 @@ fn on_aoi_sync_delta(
                 // cast is a *thing that happened at a time*, while every
                 // other field on `PlayerInfo` is a standing property the
                 // meter merges rather than counts.
-                if let Some(skill_id) = cast_skill_id_from_attrs(&attrs.attrs) {
-                    // Issue #287: the metadata cluster rides the same attr
-                    // delta as `skill_id` — decoded unconditionally here
-                    // rather than gated on any individual sibling id being
-                    // present, since each field is independently `None`
-                    // when its own id is absent.
-                    let meta = skill_cast_metadata_from_attrs(&attrs.attrs);
+                //
+                // Issue #287: the metadata cluster rides the same attr
+                // delta as `skill_id`, so both are decoded together in one
+                // walk of `attrs.attrs` — each field (including `skill_id`
+                // itself) is independently `None` when its own id is
+                // absent.
+                let meta = skill_cast_metadata_from_attrs(&attrs.attrs);
+                if let Some(skill_id) = meta.skill_id {
                     out.push(ProtocolEvent::Cast(CastEvent {
                         caster_uid: target_uid,
                         skill_id,
