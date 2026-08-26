@@ -93,6 +93,22 @@ pub struct CastEvent {
     pub caster_uid: i64,
     pub skill_id: i32,
     pub timestamp_ms: u64,
+    /// Issue #287's skill-cast metadata cluster, decoded alongside
+    /// `skill_id` off the same `AoiSyncDelta` (see
+    /// `attrs::skill_cast_metadata_from_attrs`). Every field below is
+    /// independently `None` when its id was absent from this particular
+    /// delta. [`attrs::attr_id::SKILL_STAGE`] — medium confidence.
+    pub skill_stage: Option<i32>,
+    /// [`attrs::attr_id::SKILL_LEVEL`] — medium confidence.
+    pub skill_level: Option<i32>,
+    /// [`attrs::attr_id::SKILL_BEGIN_TIME`] — high confidence: a real cast
+    /// begin time (Unix epoch ms), not packet-arrival time.
+    pub skill_begin_time_ms: Option<i64>,
+    /// [`attrs::attr_id::SKILL_STAGE_NUM`] — medium confidence.
+    pub skill_stage_num: Option<i32>,
+    /// [`attrs::attr_id::SKILL_UUID`] — medium confidence; not a `uid_of`-
+    /// shaped entity uuid.
+    pub skill_uuid: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -129,6 +145,17 @@ pub struct PlayerInfo {
     /// Imagine *is* (name/icon classification happens above this crate, in
     /// `crates/app`).
     pub skill_ids: Vec<(i32, i32)>,
+    /// World position, sourced from `attr_id::POSITION` (`0x34`, issue
+    /// #286). `None` when this packet's attrs carried no position update —
+    /// see `attrs::attr_id::POSITION`'s doc comment for the wire evidence
+    /// and sourcing.
+    pub position: Option<[f32; 3]>,
+    /// Target/destination position, sourced from `attr_id::TARGET_POSITION`
+    /// (`0x35`, issue #286) — rides the same attr channel as `position`
+    /// above but is a distinct id; see `attrs::attr_id::TARGET_POSITION`'s
+    /// doc comment for why these are believed to be current-vs-target
+    /// rather than duplicates, and the confidence caveat on that belief.
+    pub target_position: Option<[f32; 3]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -138,6 +165,14 @@ pub struct EnemyHp {
     pub max_hp: Option<u64>,
     pub monster_id: Option<u32>,
     pub timestamp_ms: u64,
+    /// World position, sourced from `attr_id::POSITION` (`0x34`, issue
+    /// #286) — same field and sourcing as `PlayerInfo::position`, applied
+    /// to monster/boss entities.
+    pub position: Option<[f32; 3]>,
+    /// Target/destination position, sourced from `attr_id::TARGET_POSITION`
+    /// (`0x35`, issue #286) — same field and sourcing as
+    /// `PlayerInfo::target_position`.
+    pub target_position: Option<[f32; 3]>,
 }
 
 /// Dungeon flow state (`decode::opcode::SYNC_DUNGEON_DATA` /

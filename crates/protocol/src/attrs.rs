@@ -130,6 +130,99 @@ pub mod attr_id {
     /// world uuid), `AttrSceneChannel` (343, `0x157`, the instance/channel
     /// number), and `AttrSceneLevelId` (345, `0x159`).
     pub const SCENE_BASIC_ID: i32 = 0x155;
+
+    /// `AttrPos` (52, `0x34`) — issue #286: the entity's current world
+    /// position, a 3-float `(x, y, z)` submessage. Wire-confirmed against
+    /// this project's own captures: fields 1-3, wire type 5 (`fixed32`) —
+    /// see [`crate::attrs::decode_position`] for the parse and both real
+    /// dumps' sample bytes in that function's tests.
+    ///
+    /// The name and "current" (as opposed to "target") semantics are
+    /// BPSR-ZDPS's own: `BPSR-ZDPSLib/protos/EnumEAttrType.cs:815`
+    /// (`AttrPos = 52`), read straight into `entity.SetPosition(...)` at
+    /// `Managers/EncounterManager.cs:773`, and decoded as a `Vec3`
+    /// submessage in `Managers/MessageManager.cs`'s attr-parse switch —
+    /// matching the fixed32-triple shape observed here. This is the same
+    /// trust chain `SCENE_BASIC_ID` (above) uses: single-source, but from
+    /// the enum block that has already reproduced half a dozen of this
+    /// module's other constants byte-for-byte (issue #76). Not
+    /// independently confirmed by a live control run that visibly moves an
+    /// entity and diffs the two ids (issue #286's own open item) — see
+    /// [`TARGET_POSITION`].
+    pub const POSITION: i32 = 0x34;
+
+    /// `AttrTargetPos` (53, `0x35`) — issue #286's sibling to [`POSITION`]:
+    /// the identical 3-float wire shape. BPSR-ZDPS's enum names it the
+    /// entity's *target* position rather than a duplicate of `AttrPos`
+    /// (`EnumEAttrType.cs:816`, `AttrTargetPos = 53`).
+    ///
+    /// That label is corroborated, not just repeated, by this project's own
+    /// captures: for a moving entity the two payloads are close but not
+    /// identical (e.g. one player observed at `(-22.97, 115.56, 114.55)`
+    /// vs. `(-22.07, 115.53, 113.76)` in the same session), which is what
+    /// "where I am" vs. "where I'm headed" looks like on the wire — not a
+    /// redundant echo of the same value. Issue #286's original evidence also
+    /// found the two payloads byte-identical for one uid, consistent with
+    /// current == target at spawn. Same single-source caveat as `POSITION`
+    /// above: the id *values* are trustworthy (issue #76's reproduction
+    /// chain), but the current-vs-target *label* has not been independently
+    /// re-derived from a live control run.
+    pub const TARGET_POSITION: i32 = 0x35;
+
+    /// `AttrSkillStage` (101, `0x65`) — issue #287, **medium** confidence.
+    /// Named from this module's own [`SKILL_ID`] doc comment, which already
+    /// identified the 100/101/103/106/108/111 cluster riding together
+    /// (`EnumEAttrType.cs:836`, `AttrSkillStage = 101`) but left this one
+    /// undecoded until now.
+    ///
+    /// Every real-capture sample seen so far (two independent dumps) is a
+    /// full 10-byte two's-complement varint decoding to `-1`. BPSR-ZDPS's
+    /// own `MessageManager.cs` attr-parse switch has no explicit case for
+    /// this id, so it falls to the generic `default: reader.ReadInt32()`
+    /// arm — i.e. it is a genuine signed `int32`, and `-1` is a real
+    /// (probably "no active stage") sentinel, not a corrupt or
+    /// out-of-range value. See [`decode_varint_i32_truncating`], which this
+    /// id needs instead of the stricter [`decode_varint_i32`].
+    pub const SKILL_STAGE: i32 = 0x65;
+
+    /// `AttrSkillLevel` (103, `0x67`) — issue #287, **medium** confidence;
+    /// see [`SKILL_STAGE`]'s doc comment for the shared cluster/source
+    /// citation (`EnumEAttrType.cs:838`, `AttrSkillLevel = 103`). Observed
+    /// as small positive values (`1`, `30`) across two independent
+    /// captures — also `default`-cased in BPSR-ZDPS, hence
+    /// [`decode_varint_i32_truncating`] here too.
+    pub const SKILL_LEVEL: i32 = 0x67;
+
+    /// `AttrSkillBeginTime` (106, `0x6a`) — issue #287, **high** confidence:
+    /// the one id in this cluster with independently verified semantics.
+    /// Its varint decodes to a Unix-epoch-milliseconds value matching the
+    /// capture's own wall-clock date (e.g. `1,787,022,297,550` ms ≈
+    /// 2026-08-18, and again `1,787,014,557,724` ms in a second, unrelated
+    /// dump) — a real cast *begin* time, not the packet-arrival time every
+    /// other event in this crate is stamped with, which network jitter and
+    /// reassembly delay can skew.
+    ///
+    /// `EnumEAttrType.cs:841` (`AttrSkillBeginTime = 106`); explicitly
+    /// cased as `reader.ReadInt64()` in `MessageManager.cs` (unlike its
+    /// `default`-cased siblings above/below), so [`decode_varint_i64`] —
+    /// not the truncating `i32` helper — is the correct width here.
+    pub const SKILL_BEGIN_TIME: i32 = 0x6a;
+
+    /// `AttrSkillStageNum` (108, `0x6c`) — issue #287, **medium**
+    /// confidence; see [`SKILL_STAGE`]'s doc comment for the shared
+    /// cluster/source citation (`EnumEAttrType.cs:843`,
+    /// `AttrSkillStageNum = 108`). Observed decoding consistently to `2`
+    /// across two independent captures.
+    pub const SKILL_STAGE_NUM: i32 = 0x6c;
+
+    /// `AttrSkillUuid` (111, `0x6f`) — issue #287, **medium** confidence;
+    /// see [`SKILL_STAGE`]'s doc comment for the shared cluster/source
+    /// citation (`EnumEAttrType.cs:846`, `AttrSkillUuid = 111`). Despite the
+    /// name this is not an entity uuid in [`crate::event::uid_of`]'s sense —
+    /// the observed values (`1,610,613,212` / `1,610,613,327`) don't land on
+    /// plausible entity uids when unpacked that way. Treated as an opaque
+    /// per-cast identifier until proven otherwise.
+    pub const SKILL_UUID: i32 = 0x6f;
 }
 
 /// protobuf varint → `u64`; `None` on empty/malformed input. The widest
@@ -156,6 +249,143 @@ pub fn decode_varint_i32(raw: &[u8]) -> Option<i32> {
 /// outside `u32` range (truncating it would yield a plausible-but-wrong id).
 pub fn decode_varint_u32(raw: &[u8]) -> Option<u32> {
     decode_varint_u64(raw).and_then(|v| u32::try_from(v).ok())
+}
+
+/// protobuf varint → `i32`, reinterpreting the low 32 bits as two's
+/// complement rather than rejecting a value that doesn't fit (contrast
+/// [`decode_varint_i32`], which is the right choice for an id: an
+/// out-of-range value there really is corrupt). Some attrs in this module
+/// are genuine protobuf `int32` fields (issue #287's `attr_id::SKILL_STAGE`
+/// cluster) whose negative values still get the wire's full 10-byte
+/// two's-complement varint encoding — `0xff` x9 then `0x01` is `-1`, a real
+/// sentinel value, not a corrupt out-of-range id. `None` only on a truly
+/// malformed/empty varint.
+pub fn decode_varint_i32_truncating(raw: &[u8]) -> Option<i32> {
+    decode_varint_u64(raw).map(|v| v as i64 as i32)
+}
+
+/// `raw_data` for [`attr_id::POSITION`] / [`attr_id::TARGET_POSITION`]
+/// (issue #286) → a `[x, y, z]` world-position triple. The wire shape is a
+/// tiny 3-field submessage, fields 1-3, wire type 5 (`fixed32`) — a
+/// textbook `{ float x = 1; float y = 2; float z = 3; }` (see
+/// [`attr_id::POSITION`]'s doc comment for the confirming evidence). Fields
+/// are walked generically rather than assumed to sit at a fixed 15-byte
+/// offset: proto3 omits a field whose value is the default `0.0`, so a real
+/// payload can be shorter than 3 floats, and wire field order is not
+/// guaranteed. `None` when no field 1-3 was seen at all (an empty or
+/// entirely off-cluster payload), or on any malformed varint/truncated
+/// float — never panics. A wire type other than `fixed32` on a fields-1-3
+/// tag is malformed for this shape and also yields `None`, rather than
+/// guessing how to interpret it; a tag for any *other* field number, of any
+/// wire type, is genuinely unknown rather than malformed, so its payload is
+/// skipped generically (via `prost::encoding::skip_field`) instead of
+/// aborting the whole parse.
+pub fn decode_position(raw: &[u8]) -> Option<[f32; 3]> {
+    let mut cursor = Cursor::new(raw);
+    let mut pos = [0.0f32; 3];
+    let mut seen = false;
+    while (cursor.position() as usize) < raw.len() {
+        let tag = prost::encoding::decode_varint(&mut cursor).ok()?;
+        let field = tag >> 3;
+        let wire_type = tag & 0x7;
+        let is_target_field = (1..=3).contains(&field);
+        if wire_type != 5 {
+            // A fields-1-3 tag with a wire type other than fixed32 is
+            // malformed for this shape (see doc comment above) — bail
+            // rather than guess. Any other field is genuinely unknown, so
+            // skip its payload generically instead of aborting the whole
+            // parse over data we don't care about.
+            if is_target_field {
+                return None;
+            }
+            let wire_type = prost::encoding::WireType::try_from(wire_type).ok()?;
+            prost::encoding::skip_field(
+                wire_type,
+                tag as u32,
+                &mut cursor,
+                prost::encoding::DecodeContext::default(),
+            )
+            .ok()?;
+            continue;
+        }
+        let start = cursor.position() as usize;
+        let end = start.checked_add(4)?;
+        let bytes = raw.get(start..end)?;
+        let value = f32::from_le_bytes(bytes.try_into().expect("checked-length slice"));
+        cursor.set_position(end as u64);
+        if is_target_field {
+            pos[(field - 1) as usize] = value;
+            seen = true;
+        }
+    }
+    seen.then_some(pos)
+}
+
+/// Issue #287's skill-cast metadata cluster, decoded alongside
+/// [`cast_skill_id_from_attrs`] — the same `AoiSyncDelta` that carries
+/// [`attr_id::SKILL_ID`] also carries some or all of these siblings. Every
+/// field is independently optional: a cast attr delta is not guaranteed to
+/// carry every id in the cluster.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SkillCastMetadata {
+    /// [`attr_id::SKILL_ID`], decoded in the same pass as the rest of this
+    /// cluster — see [`cast_skill_id_from_attrs`] for the id's own doc
+    /// comment (same decode rules: strict [`decode_varint_i32`], zero
+    /// rejected as "no skill").
+    pub skill_id: Option<i32>,
+    /// [`attr_id::SKILL_STAGE`] — medium confidence, see that constant's
+    /// doc comment.
+    pub skill_stage: Option<i32>,
+    /// [`attr_id::SKILL_LEVEL`] — medium confidence.
+    pub skill_level: Option<i32>,
+    /// [`attr_id::SKILL_BEGIN_TIME`] — high confidence, the one
+    /// independently timestamp-verified id in the cluster. Milliseconds
+    /// since the Unix epoch.
+    pub skill_begin_time_ms: Option<i64>,
+    /// [`attr_id::SKILL_STAGE_NUM`] — medium confidence.
+    pub skill_stage_num: Option<i32>,
+    /// [`attr_id::SKILL_UUID`] — medium confidence; not a
+    /// [`crate::event::uid_of`]-shaped entity uuid — see that constant's
+    /// doc comment.
+    pub skill_uuid: Option<i32>,
+}
+
+/// Decodes [`attr_id::SKILL_ID`] plus issue #287's skill-cast metadata
+/// cluster off an entity's `Attr` list in a single pass — `decode::
+/// on_aoi_sync_delta` used to call this alongside a separate
+/// [`cast_skill_id_from_attrs`] walk of the same slice; folded together here
+/// so the slice is only walked once. Every field stays `None` when its id
+/// is absent or malformed, matching this module's zero-is-absent /
+/// malformed-is-absent convention rather than erroring.
+pub fn skill_cast_metadata_from_attrs(attrs: &[pb::Attr]) -> SkillCastMetadata {
+    let mut out = SkillCastMetadata::default();
+    for attr in attrs {
+        if attr.raw_data.is_empty() || attr.id == 0 {
+            continue;
+        }
+        match attr.id {
+            attr_id::SKILL_ID => {
+                out.skill_id = decode_varint_i32(&attr.raw_data).filter(|id| *id != 0);
+            }
+            attr_id::SKILL_STAGE => {
+                out.skill_stage = decode_varint_i32_truncating(&attr.raw_data);
+            }
+            attr_id::SKILL_LEVEL => {
+                out.skill_level = decode_varint_i32_truncating(&attr.raw_data);
+            }
+            attr_id::SKILL_BEGIN_TIME => {
+                out.skill_begin_time_ms = decode_varint_i64(&attr.raw_data);
+            }
+            attr_id::SKILL_STAGE_NUM => {
+                out.skill_stage_num = decode_varint_i32_truncating(&attr.raw_data);
+            }
+            attr_id::SKILL_UUID => {
+                out.skill_uuid = decode_varint_i32_truncating(&attr.raw_data);
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Set once a nonzero `remodel_level` (tier) has been observed on any
@@ -284,6 +514,8 @@ pub fn player_info_from_attrs(
     let mut season_level = None;
     let mut season_strength = None;
     let mut skill_ids = Vec::new();
+    let mut position = None;
+    let mut target_position = None;
     for attr in attrs {
         if attr.raw_data.is_empty() || attr.id == 0 {
             continue;
@@ -297,6 +529,8 @@ pub fn player_info_from_attrs(
                     | attr_id::SEASON_LEVEL
                     | attr_id::SEASON_STRENGTH
                     | attr_id::SKILL_LEVEL_ID_LIST
+                    | attr_id::POSITION
+                    | attr_id::TARGET_POSITION
             );
             sink.on_attr(uid, attr.id, &attr.raw_data, known);
         }
@@ -341,6 +575,16 @@ pub fn player_info_from_attrs(
                     skill_ids = ids;
                 }
             }
+            attr_id::POSITION => {
+                if let Some(p) = decode_position(&attr.raw_data) {
+                    position = Some(p);
+                }
+            }
+            attr_id::TARGET_POSITION => {
+                if let Some(p) = decode_position(&attr.raw_data) {
+                    target_position = Some(p);
+                }
+            }
             _ => {}
         }
     }
@@ -352,6 +596,8 @@ pub fn player_info_from_attrs(
         season_level,
         season_strength,
         skill_ids,
+        position,
+        target_position,
     }
 }
 
@@ -371,12 +617,21 @@ pub fn enemy_hp_from_attrs(
     let mut curr_hp = None;
     let mut max_hp = None;
     let mut monster_id = None;
+    let mut position = None;
+    let mut target_position = None;
     for attr in attrs {
         if attr.raw_data.is_empty() || attr.id == 0 {
             continue;
         }
         if let Some(sink) = sink {
-            let known = matches!(attr.id, attr_id::HP | attr_id::MAX_HP | attr_id::MONSTER_ID);
+            let known = matches!(
+                attr.id,
+                attr_id::HP
+                    | attr_id::MAX_HP
+                    | attr_id::MONSTER_ID
+                    | attr_id::POSITION
+                    | attr_id::TARGET_POSITION
+            );
             sink.on_attr(uid, attr.id, &attr.raw_data, known);
         }
         match attr.id {
@@ -395,6 +650,16 @@ pub fn enemy_hp_from_attrs(
                     monster_id = Some(v);
                 }
             }
+            attr_id::POSITION => {
+                if let Some(p) = decode_position(&attr.raw_data) {
+                    position = Some(p);
+                }
+            }
+            attr_id::TARGET_POSITION => {
+                if let Some(p) = decode_position(&attr.raw_data) {
+                    target_position = Some(p);
+                }
+            }
             _ => {}
         }
     }
@@ -404,6 +669,8 @@ pub fn enemy_hp_from_attrs(
         max_hp,
         monster_id,
         timestamp_ms: now_ms,
+        position,
+        target_position,
     }
 }
 
@@ -979,5 +1246,203 @@ mod tests {
         let _ = enemy_hp_from_attrs(1, &attrs, 0, Some(&sink));
 
         assert!(sink.attrs.lock().unwrap().is_empty());
+    }
+
+    // -- Entity position bundle (issue #286) --------------------------------
+
+    /// Manually encodes a 3-float fixed32 triple the way `attr_id::POSITION`
+    /// / `attr_id::TARGET_POSITION` ride the wire: tag byte
+    /// `(field << 3) | 5` then the float's 4 little-endian bytes, fields 1-3
+    /// in order. A `None` component is proto3's own default-omission
+    /// behaviour (`0.0` is never written), not a wire absence this crate
+    /// invents.
+    fn encode_position(x: Option<f32>, y: Option<f32>, z: Option<f32>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for (field, v) in [(1u8, x), (2, y), (3, z)] {
+            if let Some(v) = v {
+                buf.push((field << 3) | 5);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn decode_position_reads_all_three_fields() {
+        let raw = encode_position(Some(1.5), Some(-2.25), Some(3.75));
+        assert_eq!(decode_position(&raw), Some([1.5, -2.25, 3.75]));
+    }
+
+    #[test]
+    fn decode_position_fills_a_proto3_omitted_zero_field() {
+        // proto3 never writes a float field whose value is the default
+        // 0.0 — field 2 (y) is entirely absent from the wire here.
+        let raw = encode_position(Some(1.5), None, Some(3.75));
+        assert_eq!(decode_position(&raw), Some([1.5, 0.0, 3.75]));
+    }
+
+    #[test]
+    fn decode_position_empty_payload_is_none() {
+        assert_eq!(decode_position(&[]), None);
+    }
+
+    #[test]
+    fn decode_position_truncated_float_is_none() {
+        // A field-1 tag with only 2 of its 4 float bytes present.
+        let raw = vec![0x0d, 0x00, 0x00];
+        assert_eq!(decode_position(&raw), None);
+    }
+
+    #[test]
+    fn decode_position_non_fixed32_wire_type_is_none() {
+        // Field 1 tagged as a varint (wire type 0), not this bundle's shape.
+        let raw = vec![0x08, 0x01];
+        assert_eq!(decode_position(&raw), None);
+    }
+
+    #[test]
+    fn decode_position_skips_a_trailing_unknown_varint_field() {
+        // A well-formed x/y/z triple followed by an unrelated field 4,
+        // wire type 0 (varint) — not this bundle's fixed32 shape, but not
+        // malformed either: it should be skipped, not treated as an abort
+        // condition for the whole payload.
+        let mut raw = encode_position(Some(1.5), Some(-2.25), Some(3.75));
+        raw.push(0x20); // tag: field 4, wire type 0 (varint)
+        raw.push(0x05); // value: 5
+        assert_eq!(decode_position(&raw), Some([1.5, -2.25, 3.75]));
+    }
+
+    /// Issue #286's own evidence: `raw_hex=0d140d8141151b5ad5421d983d0043`,
+    /// which the issue decodes to `(16.13, 106.68, 128.24)` — pinned here
+    /// byte for byte as a real-capture fixture, not a synthetic one.
+    #[test]
+    fn decode_position_real_capture_fixture_from_issue_286() {
+        let raw = [
+            0x0d, 0x14, 0x0d, 0x81, 0x41, 0x15, 0x1b, 0x5a, 0xd5, 0x42, 0x1d, 0x98, 0x3d, 0x00,
+            0x43,
+        ];
+        let pos = decode_position(&raw).expect("well-formed fixed32 triple");
+        assert!((pos[0] - 16.131_386).abs() < 1e-3);
+        assert!((pos[1] - 106.675_99).abs() < 1e-3);
+        assert!((pos[2] - 128.240_6).abs() < 1e-3);
+    }
+
+    #[test]
+    fn position_and_target_position_attrs_set_on_player_info() {
+        let attrs = vec![
+            pb::Attr {
+                id: attr_id::POSITION,
+                raw_data: encode_position(Some(1.0), Some(2.0), Some(3.0)),
+            },
+            pb::Attr {
+                id: attr_id::TARGET_POSITION,
+                raw_data: encode_position(Some(4.0), Some(5.0), Some(6.0)),
+            },
+        ];
+        let info = player_info_from_attrs(1, &attrs, None);
+        assert_eq!(info.position, Some([1.0, 2.0, 3.0]));
+        assert_eq!(info.target_position, Some([4.0, 5.0, 6.0]));
+    }
+
+    #[test]
+    fn position_attr_sets_on_enemy_hp_and_leaves_target_position_none() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::POSITION,
+            raw_data: encode_position(Some(7.0), Some(8.0), Some(9.0)),
+        }];
+        let hp = enemy_hp_from_attrs(1, &attrs, 0, None);
+        assert_eq!(hp.position, Some([7.0, 8.0, 9.0]));
+        assert_eq!(hp.target_position, None);
+    }
+
+    #[test]
+    fn position_attr_is_reported_to_the_sink_as_known() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::POSITION,
+            raw_data: encode_position(Some(1.0), Some(1.0), Some(1.0)),
+        }];
+        let sink = RecordingSink::new();
+        let _ = player_info_from_attrs(1, &attrs, Some(&sink));
+        assert!(sink.attrs.lock().unwrap()[0].3, "POSITION must be known");
+    }
+
+    // -- Skill-cast metadata cluster (issue #287) ----------------------------
+
+    #[test]
+    fn decode_varint_i32_truncating_reads_small_positive_values() {
+        assert_eq!(decode_varint_i32_truncating(&varint(30)), Some(30));
+    }
+
+    /// Issue #287: `SKILL_STAGE`'s real-capture sample is a full 10-byte
+    /// two's-complement varint for `-1` (`0xff` x9, `0x01`) — the shape a
+    /// protobuf `int32` field uses for any negative value. The strict
+    /// `decode_varint_i32` helper rejects this (its `u64` doesn't fit an
+    /// `i32`); this helper must not.
+    #[test]
+    fn decode_varint_i32_truncating_reads_the_negative_one_sentinel() {
+        let raw = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        assert_eq!(decode_varint_i32_truncating(&raw), Some(-1));
+        // Pins the two helpers' actual difference rather than assuming it.
+        assert_eq!(decode_varint_i32(&raw), None);
+    }
+
+    #[test]
+    fn decode_varint_i32_truncating_empty_is_none() {
+        assert_eq!(decode_varint_i32_truncating(&[]), None);
+    }
+
+    /// Issue #287's real-capture fixtures (`dump-2976.jsonl` /
+    /// `dump-7896.jsonl`, sampled via `inspect-replay`'s attr histogram):
+    /// every field in the cluster lands in its own typed slot.
+    #[test]
+    fn skill_cast_metadata_decodes_the_full_cluster() {
+        let attrs = vec![
+            pb::Attr {
+                id: attr_id::SKILL_STAGE,
+                raw_data: vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01],
+            },
+            pb::Attr {
+                id: attr_id::SKILL_LEVEL,
+                raw_data: vec![0x1e],
+            },
+            pb::Attr {
+                id: attr_id::SKILL_BEGIN_TIME,
+                raw_data: vec![0xce, 0x93, 0xd1, 0x96, 0x81, 0x34],
+            },
+            pb::Attr {
+                id: attr_id::SKILL_STAGE_NUM,
+                raw_data: vec![0x02],
+            },
+            pb::Attr {
+                id: attr_id::SKILL_UUID,
+                raw_data: vec![0xdc, 0x83, 0x80, 0x80, 0x06],
+            },
+        ];
+        let meta = skill_cast_metadata_from_attrs(&attrs);
+        assert_eq!(meta.skill_stage, Some(-1));
+        assert_eq!(meta.skill_level, Some(30));
+        assert_eq!(meta.skill_begin_time_ms, Some(1_787_022_297_550));
+        assert_eq!(meta.skill_stage_num, Some(2));
+        assert_eq!(meta.skill_uuid, Some(1_610_613_212));
+    }
+
+    #[test]
+    fn skill_cast_metadata_missing_ids_stay_none() {
+        assert_eq!(
+            skill_cast_metadata_from_attrs(&[]),
+            SkillCastMetadata::default()
+        );
+    }
+
+    #[test]
+    fn skill_cast_metadata_malformed_varint_stays_none_for_that_field() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::SKILL_LEVEL,
+            raw_data: vec![0x80], // continuation bit set, nothing follows
+        }];
+        assert_eq!(
+            skill_cast_metadata_from_attrs(&attrs),
+            SkillCastMetadata::default()
+        );
     }
 }
