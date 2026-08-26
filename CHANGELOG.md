@@ -4,7 +4,39 @@ All notable changes to ShinraMeter-BPSR are documented here. This project is
 a fan-made, unofficial tool for Blue Protocol: Star Resonance and is not
 affiliated with the game's publisher.
 
-## Unreleased
+## v0.2.6
+
+### Added
+
+- The header and player rows can now be given custom background
+  artwork, including animated GIFs, from the Settings dropdown's new
+  "Background images" section. Artwork resizes and re-crops cleanly as
+  the window is resized, with no seam between the header and the rows.
+- The skill breakdown window gains Heal, Skill dealt, Skill received
+  and Skill casts tabs alongside the existing Dps tab, each with its
+  own columns and sort order.
+- The skill breakdown window's Buff tab now shows real buff uptime,
+  count and duration instead of sitting empty.
+- The skill breakdown header gains an estimated death-time pill next
+  to the Deaths count, showing how long that player spent on the
+  floor this encounter.
+- Double-clicking a resize handle now snaps the overlay between two
+  preset heights (5 rows and 20 rows) instead of only free resizing.
+- The header dropdown's update check can now download and install a
+  new release in place — click "Update now" instead of downloading
+  and swapping the file by hand. The meter relaunches itself once the
+  update finishes.
+
+### Changed
+
+- Pinning the overlay locks moving again, but a pinned window can now
+  be resized like any other — only moving stays locked.
+- A skill row with no vendored icon art now shows a colored monogram
+  derived from its name instead of a flat blank disc, so different
+  unlabelled skills are easier to tell apart in a list.
+- The release download is now a single .exe instead of a zip archive
+  — no extraction step, and the version is baked into the filename so
+  several downloads stay distinguishable.
 
 ### Fixed
 
@@ -15,6 +47,48 @@ affiliated with the game's publisher.
   against a real capture, 70.8% of the skill ids seen in play now paint an
   icon, up from 58.9%. The remainder are proc and damage-over-time sources the
   game itself ships no icon for, and keep the blank disc.
+- A fight could stay stuck for tens of minutes after a boss kill in
+  some zone-transition sequences instead of ending; the reset now
+  reliably tracks the current zone.
+- A boss that despawned without a clean death signal — evicted from
+  view rather than actually killed — could wrongly be counted as a
+  kill and end the fight early; the meter now reads the server's own
+  reason for the despawn instead of guessing from its health.
+- In multi-boss raids, killing one boss selection could leave the
+  fight running instead of ending it, and a wipe the server rolled
+  back mid-check could be silently discarded instead of saved as an
+  attempt; both are fixed.
+- Heavy traffic could cause permanent data loss when packets merely
+  arrived late rather than being lost, and the watchdog that restarts
+  a stalled capture could stop running entirely once the game
+  connection died outright; both are fixed, cutting down on "meter
+  stopped updating" episodes.
+- Starting the meter after the game connection was already
+  established, such as launching it mid-dungeon, went undetected; it
+  is now picked up the same as any other connection.
+- An unrelated connection sharing the game server's subnet could
+  occasionally be mistaken for the real one, resetting a live
+  encounter mid-fight; that misfire is fixed.
+- Running a second copy of the meter used to duplicate every fight in
+  the history list instead of catching the mistake; it now shows a
+  message and exits, leaving the first copy untouched.
+- The click-through toggle was nearly invisible when off; it now
+  stays clearly dimmed when off and fills with a distinct highlight
+  when on.
+- The header's emblem and background wash now fade with the opacity
+  slider like the rest of the overlay, instead of staying fully
+  opaque.
+- An oversized window proposal, from an external tool or a bad
+  debugging command, could crash the meter outright; it is now
+  refused, keeping the window at its last valid size.
+- In the skill breakdown window, the Deaths pill now sits beside the
+  player's name instead of jammed against the close button, and the
+  Name column is wide enough to fit the longest skill names without
+  crowding the column after it.
+- Starting to move or resize the overlay while a skill tab with no
+  rows was showing (such as Buff, before it decoded real data) could
+  leave the gesture stuck and jump the window when switching back to
+  a populated tab; every tab now tracks the gesture correctly.
 
 ## v0.2.5
 
