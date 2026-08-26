@@ -1459,12 +1459,6 @@ impl eframe::App for OverlayApp {
         if !self.startup_toggles_applied {
             self.startup_toggles_applied = true;
             crate::platform::set_click_through(self.settings.click_through);
-            // Issue #232: same one-shot re-apply as click-through above,
-            // for the native resize-border override — a returning user
-            // whose last session left the pin locked otherwise gets a
-            // window whose OS-level edge-drag resize is live again until
-            // the next pin click re-syncs it.
-            crate::platform::set_resize_locked(self.settings.always_on_top);
             let level = if self.settings.always_on_top {
                 egui::WindowLevel::AlwaysOnTop
             } else {
@@ -1666,13 +1660,7 @@ impl eframe::App for OverlayApp {
             .show(ui, |ui| {
                 // First, so the header buttons drawn afterwards stay on top of
                 // the corner zones they overlap.
-                draw_resize_handles(
-                    ui,
-                    &ctx,
-                    &mut self.window_gesture,
-                    "root",
-                    resize_locked_by_pin(self.settings.always_on_top),
-                );
+                draw_resize_handles(ui, &ctx, &mut self.window_gesture, "root");
                 // Issue #39: what the header and rows paint this frame — the
                 // live snapshot, or the open historical one (`history_open`,
                 // cloned above before this closure existed). Computed here,
@@ -2931,10 +2919,6 @@ fn title_row_toggles(
         };
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
-        // Issue #232: pinning now locks the native resize border the same
-        // frame it locks Z-order and (via `drag_locked_by_pin`/
-        // `resize_locked_by_pin`) the manual move/resize gestures.
-        crate::platform::set_resize_locked(settings.always_on_top);
         let _ = tx_settings.send(settings.clone());
     }
     if let Some(pin) = icons.glyphs.get(GlyphIcon::Pin) {
@@ -5413,16 +5397,10 @@ fn gesture_end_needs_frame_recompute(kind: GestureKind, viewport: egui::Viewport
 /// by an accidental drag of its header — which is the opposite of what a
 /// pushpin means to anyone who clicks it. Pinning now locks both.
 ///
-/// Deliberately only `GestureKind::Move` — the eight `resize_zones` have
-/// their own gate, `resize_locked_by_pin`, checked separately at
-/// `draw_resize_handles`. Issue #183 originally left resize live here on
-/// purpose ("pinned" meant staying put, not frozen in size); issue #232
-/// reversed that call, since a lock a user can still resize through reads
-/// as only half a lock. The two gates stay separate functions rather than
-/// one shared check because their call sites want different things: this
-/// one gates a gesture *start*, `resize_locked_by_pin` gates eight of them
-/// plus (via `platform::resize_lock_hit_test`) Windows' own native
-/// edge-drag resize.
+/// Deliberately only `GestureKind::Move`: the eight `resize_zones` stay
+/// live, because "pinned" is about the overlay staying put, not about
+/// freezing its size, and a pinned overlay the user can't resize would be a
+/// second surprise rather than a fix for the first.
 ///
 /// Trivial enough to inline, spelled as a function anyway so the rule has
 /// one name and one doc comment shared by the drag band and
@@ -5449,29 +5427,6 @@ fn cancel_move_gesture_when_pinned(gesture: &mut WindowGesture, always_on_top: b
     if drag_locked_by_pin(always_on_top) && gesture.kind() == Some(GestureKind::Move) {
         gesture.end();
     }
-}
-
-/// Issue #232: whether `draw_resize_handles`' eight resize zones must
-/// refuse to *start* a new resize gesture, because the overlay is pinned
-/// (`Settings::always_on_top`).
-///
-/// No in-flight-cancel counterpart is needed here the way
-/// `cancel_move_gesture_when_pinned` exists for `drag_locked_by_pin`: the
-/// pin button lives in the header band, physically separate from every
-/// resize handle, and only one pointer-drag gesture can be held at a time
-/// — so pinning can never land mid-resize the way it can land mid-move.
-/// Gating the start is therefore the whole fix on the egui side.
-/// `platform::resize_lock_hit_test` is the matching gate for Windows' own
-/// native edge-drag resize, which `WS_THICKFRAME` allows independently of
-/// any of this module's gesture code.
-///
-/// Same trivial `always_on_top` body as `drag_locked_by_pin` — kept as its
-/// own named function (rather than reusing that one under a
-/// resize-flavored call) so each call site's intent reads directly off the
-/// function name, and so the two stay independently unit-testable if the
-/// policies these two gates express are ever split again.
-fn resize_locked_by_pin(always_on_top: bool) -> bool {
-    always_on_top
 }
 
 /// Starts `kind` from wherever the pointer and window are right now.
@@ -5682,14 +5637,6 @@ fn resize_zones(rect: egui::Rect) -> [(egui::Rect, egui::ResizeDirection, egui::
 /// now serves the root window and every open breakdown viewport, and both
 /// are drawn from a root `Ui` whose own id is the same in each — without a
 /// salt, two windows' north handles would be one widget.
-///
-/// `locked` (issue #232) is `resize_locked_by_pin(settings.always_on_top)`
-/// at the root call site — the breakdown viewport call site always passes
-/// `false`, since a skill window has no pin of its own to lock against.
-/// While locked, the handles stay hovered/drawn (so the invisible strip is
-/// still there to hit-test against, matching the header drag band's own
-/// choice to keep sensing hover) but never start a gesture, and the cursor
-/// says so with `NotAllowed` instead of the usual resize glyph.
 fn draw_resize_handles(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -5699,7 +5646,6 @@ fn draw_resize_handles(
     // salt's `Debug` rendering in `id_source` so an id clash names the
     // widgets that collided. Not ours to drop.
     id_salt: impl std::hash::Hash + std::fmt::Debug,
-    locked: bool,
 ) {
     // The viewport this `Ui` belongs to — the root window, or, inside
     // `show_viewport_immediate`'s callback, the child. Either way it is the
@@ -5714,15 +5660,11 @@ fn draw_resize_handles(
             egui::Sense::drag(),
         );
         if handle.hovered() {
-            ctx.set_cursor_icon(if locked {
-                egui::CursorIcon::NotAllowed
-            } else {
-                cursor
-            });
+            ctx.set_cursor_icon(cursor);
         }
         // Same as the title-bar drag: the anchor is captured once, then
         // `drive_window_gesture` does the per-frame work.
-        if !locked && handle.drag_started_by(egui::PointerButton::Primary) {
+        if handle.drag_started_by(egui::PointerButton::Primary) {
             begin_window_gesture(ctx, gesture, GestureKind::Resize(direction));
         }
     }
@@ -7942,9 +7884,7 @@ fn draw_skill_window(
     // grips exactly as the root window does. Registered first so the header
     // widgets below win the pixels they overlap; egui gives interaction
     // priority to whatever was registered later.
-    // A breakdown viewport has no pin of its own — issue #232's lock is a
-    // main-window setting — so its resize handles are never locked here.
-    draw_resize_handles(ui, &ctx, gesture, ("skill", row.uid), false);
+    draw_resize_handles(ui, &ctx, gesture, ("skill", row.uid));
 
     // -- header: class icon, player name, the pill cluster (D10) ---------
     let header_rect = skill_header_rect(rect);
@@ -12541,17 +12481,6 @@ mod tests {
             Some(resize),
             "pinning is about position, not size"
         );
-    }
-
-    /// Issue #232: pinning now locks size the same way it already locks
-    /// position — reversing the #183 call above that deliberately left
-    /// resize live. `draw_resize_handles` reads this before starting a new
-    /// resize gesture, the same way the drag band reads `drag_locked_by_
-    /// pin` before starting a move.
-    #[test]
-    fn resize_locked_by_pin_mirrors_the_move_lock() {
-        assert!(resize_locked_by_pin(true));
-        assert!(!resize_locked_by_pin(false));
     }
 
     /// Issue #231: the header dropdown's Columns list can grow taller than
