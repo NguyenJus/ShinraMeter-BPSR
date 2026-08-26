@@ -16,8 +16,9 @@ pub const LOGIN_RETURN_SIGNATURE_1: [u8; 10] = [0, 0, 0, 0x62, 0, 3, 0, 0, 0, 1]
 pub const LOGIN_RETURN_SIGNATURE_2: [u8; 6] = [0, 0, 0, 0, 0x0a, 0x4e];
 pub const LOGIN_RETURN_SIGNATURE_SIZE: usize = 0x62;
 
-/// Bound on fragments walked per payload scan, so a malformed length field
-/// cannot spin the scan indefinitely.
+/// Bound on candidate signature matches checked per payload scan, so a
+/// payload that happens to contain many literal occurrences of
+/// [`SERVER_SIGNATURE`] cannot spin the scan indefinitely.
 const MAX_SCAN_FRAGMENTS: usize = 1000;
 
 /// Payload-size ceiling for the subnet-reconnect path (issue #258).
@@ -78,44 +79,70 @@ impl fmt::Display for Conn {
     }
 }
 
-/// Scans a TCP payload for the game-server signature by walking
-/// length-prefixed fragments (BE u32 len; fragment body length = `len - 4`)
-/// and comparing each fragment's bytes at [`SERVER_SIGNATURE_OFFSET`]
-/// against [`SERVER_SIGNATURE`]. Bounded to `MAX_SCAN_FRAGMENTS` fragments;
-/// never panics on malformed input.
+/// Scans a TCP payload for the game-server signature.
+///
+/// Rather than walking length-prefixed fragments (BE u32 len; fragment body
+/// length = `len - 4`) starting strictly at `offset = 0`, this locates every
+/// literal occurrence of [`SERVER_SIGNATURE`] in the payload directly and,
+/// for each one, checks whether the 4 bytes immediately in front of it form
+/// a length header describing a fragment that both contains the signature
+/// at [`SERVER_SIGNATURE_OFFSET`] and fits inside this payload. That is
+/// exactly the local evidence a valid frame boundary would produce, and
+/// finding it doesn't require any frame *before* the signature-bearing one
+/// to be present or valid.
+///
+/// `offset = 0` is only guaranteed to be a real frame boundary when capture
+/// has observed the connection from its start; a capture that attaches
+/// mid-connection (issue #282) sees its first packets at an arbitrary byte
+/// offset into the frame stream. Locating the boundary from the signature
+/// backward, instead of assuming it forward from `offset = 0`, is what lets
+/// this recognize the game server either way. Bounded to `MAX_SCAN_FRAGMENTS`
+/// candidate matches; never panics on malformed input.
 pub fn looks_like_game_server(payload: &[u8]) -> bool {
-    if payload.len() < 10 || payload[4] != 0 {
+    let sig_len = SERVER_SIGNATURE.len();
+    let min_len = SERVER_SIGNATURE_OFFSET + sig_len;
+    if payload.len() < min_len {
         return false;
     }
 
-    let sig_end = SERVER_SIGNATURE_OFFSET + SERVER_SIGNATURE.len();
-    let mut offset = 0usize;
-    for _ in 0..MAX_SCAN_FRAGMENTS {
-        if offset + 4 > payload.len() {
+    let mut checked = 0usize;
+    for sig_pos in 0..=(payload.len() - sig_len) {
+        if payload[sig_pos..sig_pos + sig_len] != SERVER_SIGNATURE {
+            continue;
+        }
+        checked += 1;
+        if checked > MAX_SCAN_FRAGMENTS {
             break;
+        }
+
+        let Some(frag_start) = sig_pos.checked_sub(SERVER_SIGNATURE_OFFSET) else {
+            continue;
+        };
+        let Some(header_start) = frag_start.checked_sub(4) else {
+            continue;
+        };
+        if payload[frag_start] != 0 {
+            continue;
         }
         let len = u32::from_be_bytes([
-            payload[offset],
-            payload[offset + 1],
-            payload[offset + 2],
-            payload[offset + 3],
+            payload[header_start],
+            payload[header_start + 1],
+            payload[header_start + 2],
+            payload[header_start + 3],
         ]) as usize;
         if len < 4 {
-            break;
+            continue;
         }
         let frag_len = len - 4;
-        let frag_start = offset + 4;
         let Some(frag_end) = frag_start.checked_add(frag_len) else {
-            break;
+            continue;
         };
         if frag_end > payload.len() {
-            break;
+            continue;
         }
-        let frag = &payload[frag_start..frag_end];
-        if frag.len() >= sig_end && frag[SERVER_SIGNATURE_OFFSET..sig_end] == SERVER_SIGNATURE {
+        if frag_end - frag_start >= SERVER_SIGNATURE_OFFSET + sig_len {
             return true;
         }
-        offset = frag_end;
     }
     false
 }
@@ -552,6 +579,47 @@ mod tests {
     #[test]
     fn too_short_payload_does_not_detect() {
         assert!(!looks_like_game_server(&[0u8; 4]));
+    }
+
+    #[test]
+    fn mid_stream_attach_before_the_frame_boundary_still_detects() {
+        // Simulates attaching capture after the game connection is already
+        // open (issue #282): the first payload the detector ever sees begins
+        // at an arbitrary byte offset into the frame stream -- partway
+        // through a frame that started before capture began -- rather than
+        // at a true frame boundary the way it would if capture had observed
+        // the connection from its start.
+        let frag = frag_with_signature_at(SERVER_SIGNATURE_OFFSET);
+
+        let mut full_stream = Vec::new();
+        // A preceding frame that would have arrived before capture attached.
+        full_stream.extend_from_slice(&20u32.to_be_bytes()); // 4-byte header + 16-byte frag
+        full_stream.extend_from_slice(&[0xAAu8; 16]);
+        // The signature-bearing frame, immediately after it.
+        full_stream.extend_from_slice(&payload_with_frag(&frag));
+
+        // Drop the first 7 bytes: capture joins mid-way through the
+        // preceding frame's body, not at offset 0 of any frame.
+        let joined_mid_stream = &full_stream[7..];
+
+        assert!(looks_like_game_server(joined_mid_stream));
+    }
+
+    #[test]
+    fn non_game_traffic_is_still_rejected() {
+        // Guard against false positives from the mid-stream scan: a stream
+        // that never carries the signature bytes anywhere must not detect,
+        // no matter how many candidate start offsets get tried.
+        let mut noise = Vec::with_capacity(600);
+        let mut state: u32 = 0x1234_5678;
+        for _ in 0..600 {
+            // Simple xorshift PRNG -- deterministic, no extra dependency.
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            noise.push((state & 0xFF) as u8);
+        }
+        assert!(!looks_like_game_server(&noise));
     }
 
     #[test]
