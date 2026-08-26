@@ -70,6 +70,12 @@ pub(crate) struct ActiveBuff {
     /// original application didn't.
     pub(crate) base_id: Option<i32>,
     pub(crate) start_ms: u64,
+    /// How many stack layers this instance currently holds: 1 when it opens,
+    /// grown by a `StackLayer` apply and shrunk by a `RemoveLayer` remove
+    /// (see `ProtocolEvent::BuffRemove::removes_layer`). The interval closes
+    /// when it reaches zero, so a stacking buff that sheds one layer stays
+    /// up instead of losing the rest of its uptime.
+    pub(crate) layers: u32,
 }
 
 #[derive(Debug, Clone)]

@@ -305,6 +305,7 @@ pub enum ProtocolEvent {
         host_uid: i64,
         buff_uuid: i32,
         base_id: Option<i32>,
+        adds_layer: bool,
         timestamp_ms: u64,
     },
     /// Mirrors `bpsr_protocol::ProtocolEvent::BuffRemove` (issue #267). See
@@ -312,6 +313,7 @@ pub enum ProtocolEvent {
     BuffRemove {
         host_uid: i64,
         buff_uuid: i32,
+        removes_layer: bool,
         timestamp_ms: u64,
     },
 }

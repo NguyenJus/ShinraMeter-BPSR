@@ -757,17 +757,19 @@ impl Meter {
                 host_uid,
                 buff_uuid,
                 base_id,
+                adds_layer,
                 timestamp_ms,
             } => {
-                self.apply_buff_apply(*host_uid, *buff_uuid, *base_id, *timestamp_ms);
+                self.apply_buff_apply(*host_uid, *buff_uuid, *base_id, *adds_layer, *timestamp_ms);
                 None
             }
             ProtocolEvent::BuffRemove {
                 host_uid,
                 buff_uuid,
+                removes_layer,
                 timestamp_ms,
             } => {
-                self.apply_buff_remove(*host_uid, *buff_uuid, *timestamp_ms);
+                self.apply_buff_remove(*host_uid, *buff_uuid, *removes_layer, *timestamp_ms);
                 None
             }
             ProtocolEvent::Scene { level_map_id } => {
@@ -2145,12 +2147,16 @@ impl Meter {
     /// application: the original `start_ms` is kept (so re-applying a
     /// still-up buff does not reset its uptime clock), and `base_id` is
     /// backfilled only if this event supplies one the opening event didn't
-    /// (see `ActiveBuff::base_id`'s doc comment).
+    /// (see `ActiveBuff::base_id`'s doc comment). An `adds_layer` event
+    /// (`StackLayer`) additionally grows the instance's layer count, so a
+    /// later `RemoveLayer` sheds that layer rather than closing the whole
+    /// interval — see `ActiveBuff::layers`.
     fn apply_buff_apply(
         &mut self,
         host_uid: i64,
         buff_uuid: i32,
         base_id: Option<i32>,
+        adds_layer: bool,
         timestamp_ms: u64,
     ) {
         if self.fight_end_ms.is_some() {
@@ -2164,6 +2170,9 @@ impl Meter {
                 if active.base_id.is_none() {
                     active.base_id = base_id;
                 }
+                if adds_layer {
+                    active.layers += 1;
+                }
             }
             None => {
                 stats.active_buffs.insert(
@@ -2171,6 +2180,7 @@ impl Meter {
                     ActiveBuff {
                         base_id,
                         start_ms: timestamp_ms,
+                        layers: 1,
                     },
                 );
             }
@@ -2184,13 +2194,30 @@ impl Meter {
     /// learned a `base_id` is dropped silently: there is nothing to
     /// attribute the uptime to (see `ProtocolEvent::BuffRemove`'s doc
     /// comment for why this happens for roughly half of real removes).
-    fn apply_buff_remove(&mut self, host_uid: i64, buff_uuid: i32, timestamp_ms: u64) {
+    ///
+    /// A `removes_layer` event (`RemoveLayer`) only sheds one layer: the
+    /// interval closes when the last one goes, which for the overwhelmingly
+    /// common single-layer instance is that very event. A full `Remove`
+    /// closes the interval outright, however many layers it held.
+    fn apply_buff_remove(
+        &mut self,
+        host_uid: i64,
+        buff_uuid: i32,
+        removes_layer: bool,
+        timestamp_ms: u64,
+    ) {
         if self.fight_end_ms.is_some() {
             return;
         }
         let Some(stats) = self.players.get_mut(&host_uid) else {
             return;
         };
+        if removes_layer && let Some(active) = stats.active_buffs.get_mut(&buff_uuid) {
+            active.layers = active.layers.saturating_sub(1);
+            if active.layers > 0 {
+                return;
+            }
+        }
         let Some(active) = stats.active_buffs.remove(&buff_uuid) else {
             return;
         };
@@ -3368,16 +3395,96 @@ mod tests {
             host_uid,
             buff_uuid,
             base_id,
+            adds_layer: false,
             timestamp_ms: ts,
         }
     }
 
+    /// The `StackLayer` shape of an apply: a new layer on an instance that
+    /// is already up.
+    fn buff_stack(host_uid: i64, buff_uuid: i32, ts: u64) -> ProtocolEvent {
+        ProtocolEvent::BuffApply {
+            host_uid,
+            buff_uuid,
+            base_id: None,
+            adds_layer: true,
+            timestamp_ms: ts,
+        }
+    }
+
+    /// The full `Remove`: the whole instance, however many layers.
     fn buff_remove(host_uid: i64, buff_uuid: i32, ts: u64) -> ProtocolEvent {
         ProtocolEvent::BuffRemove {
             host_uid,
             buff_uuid,
+            removes_layer: false,
             timestamp_ms: ts,
         }
+    }
+
+    /// The `RemoveLayer` shape: one layer off, which for a single-layer
+    /// instance is the whole thing.
+    fn buff_remove_layer(host_uid: i64, buff_uuid: i32, ts: u64) -> ProtocolEvent {
+        ProtocolEvent::BuffRemove {
+            host_uid,
+            buff_uuid,
+            removes_layer: true,
+            timestamp_ms: ts,
+        }
+    }
+
+    /// The dominant real-capture shape (see `pb::EBuffEventType`): one
+    /// `AddTo` closed by one `RemoveLayer`. Layer accounting must not
+    /// change it — the single layer it opened with is the one shed, so the
+    /// interval closes exactly as a full `Remove` would.
+    #[test]
+    fn a_single_layer_buff_is_closed_by_one_remove_layer() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0));
+        m.apply(&buff_apply(1, 417, Some(3_210_031), 1_000));
+        m.apply(&buff_remove_layer(1, 417, 4_000));
+        let snap = m.snapshot(5_000);
+        assert_eq!(snap.rows[0].buffs[0].damage, 3_000);
+        assert_eq!(snap.rows[0].buffs[0].hits, 1);
+    }
+
+    /// Issue #267 follow-up: a stacking buff that sheds one of two layers
+    /// stays up. Closing on the first `RemoveLayer` would have ended the
+    /// interval early and left the rest of the buff's uptime uncounted (the
+    /// reopened interval would carry no `base_id` and be dropped).
+    #[test]
+    fn shedding_one_of_two_layers_keeps_the_buff_up() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0));
+        m.apply(&buff_apply(1, 417, Some(3_210_031), 1_000));
+        m.apply(&buff_stack(1, 417, 2_000));
+        m.apply(&buff_remove_layer(1, 417, 3_000));
+        // Still up: nothing closed, so nothing is credited yet.
+        assert!(m.snapshot(3_500).rows[0].buffs.is_empty());
+        m.apply(&buff_remove_layer(1, 417, 6_000));
+        let snap = m.snapshot(7_000);
+        // One continuous interval from the original start, not two.
+        assert_eq!(snap.rows[0].buffs.len(), 1);
+        assert_eq!(snap.rows[0].buffs[0].damage, 5_000);
+        assert_eq!(snap.rows[0].buffs[0].hits, 1);
+    }
+
+    /// A full `Remove` ends a multi-layer instance outright, rather than
+    /// leaving it up with its remaining layers.
+    #[test]
+    fn a_full_remove_closes_a_multi_layer_buff() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0));
+        m.apply(&buff_apply(1, 417, Some(3_210_031), 1_000));
+        m.apply(&buff_stack(1, 417, 2_000));
+        m.apply(&buff_stack(1, 417, 2_500));
+        m.apply(&buff_remove(1, 417, 4_000));
+        let snap = m.snapshot(5_000);
+        assert_eq!(snap.rows[0].buffs[0].damage, 3_000);
+        assert_eq!(snap.rows[0].buffs[0].hits, 1);
+        // Truly closed: a stray remove afterwards finds nothing to credit.
+        m.apply(&buff_remove(1, 417, 6_000));
+        assert_eq!(m.snapshot(7_000).rows[0].buffs[0].hits, 1);
     }
 
     #[test]

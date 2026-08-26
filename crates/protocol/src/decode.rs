@@ -332,12 +332,14 @@ fn on_aoi_sync_delta(
                     host_uid: target_uid,
                     buff_uuid: be.buff_uuid,
                     base_id: buff_base_id_from_logic_effects(&be.logic_effect),
+                    adds_layer: be.r#type == pb::EBuffEventType::StackLayer as i32,
                     timestamp_ms: now_ms,
                 });
             } else if is_buff_remove_event(be.r#type) {
                 out.push(ProtocolEvent::BuffRemove {
                     host_uid: target_uid,
                     buff_uuid: be.buff_uuid,
+                    removes_layer: be.r#type == pb::EBuffEventType::RemoveLayer as i32,
                     timestamp_ms: now_ms,
                 });
             }
@@ -355,8 +357,11 @@ fn is_buff_apply_event(r#type: i32) -> bool {
         || r#type == pb::EBuffEventType::StackLayer as i32
 }
 
-/// Whether a `BuffEffect.type` (issue #267) marks a buff as no longer up
-/// (in full, or one fewer stack layer).
+/// Whether a `BuffEffect.type` (issue #267) tears a buff down, in full
+/// (`Remove`) or by one stack layer (`RemoveLayer`). Which of the two it was
+/// rides along on `ProtocolEvent::BuffRemove::removes_layer`, so the meter
+/// can keep a multi-layer buff up through a partial teardown instead of
+/// closing its uptime interval early.
 fn is_buff_remove_event(r#type: i32) -> bool {
     r#type == pb::EBuffEventType::Remove as i32 || r#type == pb::EBuffEventType::RemoveLayer as i32
 }
@@ -1050,6 +1055,7 @@ mod tests {
                     host_uid,
                     buff_uuid,
                     base_id,
+                    adds_layer: _,
                     timestamp_ms,
                 },
             ] => (*host_uid, *buff_uuid, *base_id, *timestamp_ms),
@@ -1105,7 +1111,12 @@ mod tests {
 
     #[test]
     fn replace_and_stack_layer_events_are_treated_as_apply() {
-        for event_type in [pb::EBuffEventType::Replace, pb::EBuffEventType::StackLayer] {
+        // Only `StackLayer` grows a stacking buff's layer count; `Replace`
+        // is a refresh of the instance that is already up.
+        for (event_type, adds_layer) in [
+            (pb::EBuffEventType::Replace, false),
+            (pb::EBuffEventType::StackLayer, true),
+        ] {
             let effect = pb::BuffEffect {
                 r#type: event_type as i32,
                 buff_uuid: 7,
@@ -1116,15 +1127,22 @@ mod tests {
             let mut out = Vec::new();
             decode_notify(&buff_notify(ATTACKER_UUID, vec![effect]), 0, &mut out, None);
             assert!(
-                matches!(out.as_slice(), [ProtocolEvent::BuffApply { .. }]),
-                "{event_type:?} should emit BuffApply, got {out:?}"
+                matches!(
+                    out.as_slice(),
+                    [ProtocolEvent::BuffApply { adds_layer: a, .. }] if *a == adds_layer
+                ),
+                "{event_type:?} should emit BuffApply with adds_layer={adds_layer}, got {out:?}"
             );
         }
     }
 
     #[test]
     fn remove_and_remove_layer_events_emit_buff_remove() {
-        for event_type in [pb::EBuffEventType::Remove, pb::EBuffEventType::RemoveLayer] {
+        // `removes_layer` separates the partial teardown from the full one.
+        for (event_type, removes_layer) in [
+            (pb::EBuffEventType::Remove, false),
+            (pb::EBuffEventType::RemoveLayer, true),
+        ] {
             let effect = pb::BuffEffect {
                 r#type: event_type as i32,
                 buff_uuid: 417,
@@ -1144,11 +1162,13 @@ mod tests {
                     ProtocolEvent::BuffRemove {
                         host_uid,
                         buff_uuid,
+                        removes_layer: layer,
                         timestamp_ms,
                     },
                 ] => {
                     assert_eq!(*host_uid, uid_of(ATTACKER_UUID));
                     assert_eq!(*buff_uuid, 417);
+                    assert_eq!(*layer, removes_layer, "{event_type:?}");
                     assert_eq!(*timestamp_ms, 5000);
                 }
                 other => panic!("{event_type:?} should emit BuffRemove, got {other:?}"),

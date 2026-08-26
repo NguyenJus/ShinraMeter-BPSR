@@ -322,10 +322,17 @@ pub enum ProtocolEvent {
     /// a real buff", only "this event didn't say which one". The consumer is
     /// expected to remember a buff's `base_id` from whichever event first
     /// supplies it, keyed by `buff_uuid`.
+    ///
+    /// `adds_layer` is true only for `StackLayer`, the one apply-shaped
+    /// event that grows a stacking buff's layer count; `AddTo`/`Replace` on
+    /// an instance that is already up are refreshes, not extra layers. It
+    /// pairs with [`ProtocolEvent::BuffRemove::removes_layer`] so a consumer
+    /// can tell a partial teardown from a full one.
     BuffApply {
         host_uid: i64,
         buff_uuid: i32,
         base_id: Option<i32>,
+        adds_layer: bool,
         timestamp_ms: u64,
     },
     /// A buff was removed, or lost a stack layer, on `host_uid` (issue
@@ -333,9 +340,17 @@ pub enum ProtocolEvent {
     /// events observed in this project's own captures carry only
     /// `Type`/`BuffUuid` — never a `LogicEffect` list — so identifying which
     /// buff this is is the consumer's job, via `buff_uuid`.
+    ///
+    /// `removes_layer` distinguishes `RemoveLayer` (drops one layer; the
+    /// instance is only gone once its last layer is) from `Remove` (the
+    /// whole instance, however many layers it held). A single-layer buff
+    /// ends the same way either way — which is why the near-parity of real
+    /// `AddTo`/`RemoveLayer` counts documented on `pb::EBuffEventType` is
+    /// not a contradiction.
     BuffRemove {
         host_uid: i64,
         buff_uuid: i32,
+        removes_layer: bool,
         timestamp_ms: u64,
     },
 }

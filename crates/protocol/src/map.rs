@@ -155,20 +155,24 @@ pub fn map_event(
             host_uid,
             buff_uuid,
             base_id,
+            adds_layer,
             timestamp_ms,
         } => meter::ProtocolEvent::BuffApply {
             host_uid,
             buff_uuid,
             base_id,
+            adds_layer,
             timestamp_ms,
         },
         ProtocolEvent::BuffRemove {
             host_uid,
             buff_uuid,
+            removes_layer,
             timestamp_ms,
         } => meter::ProtocolEvent::BuffRemove {
             host_uid,
             buff_uuid,
+            removes_layer,
             timestamp_ms,
         },
     }
