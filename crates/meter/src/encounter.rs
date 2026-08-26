@@ -2607,7 +2607,12 @@ impl Meter {
             .boss_uid
             .and_then(|uid| self.enemies.get(&uid))
             .and_then(|e| e.pct());
-        let party_down = self.players.values().filter(|p| p.deaths > 0).count();
+        // issue #284: live down-state, not cumulative deaths — see
+        // `party_is_wiped`'s doc comment for why `deaths > 0` is the wrong
+        // read (a battle rez can never bring that counter back down, so it
+        // stays true for the rest of the pull and makes a correct decision
+        // read exactly like #259's original bug evidence).
+        let party_down = self.players.values().filter(|p| !p.alive).count();
         log::info!(
             "{}",
             reset_log(reason, boss_hp_pct, party_down, self.players.len())
@@ -8612,6 +8617,71 @@ mod tests {
             assert!(
                 logged(&format!("cause=server_changed boss_monster_id={DIAG_BOSS}")),
                 "the fight-end line must still name the boss the fight was on"
+            );
+        }
+
+        /// Issue #284: `reset`'s `party_down` used to be
+        /// `players.values().filter(|p| p.deaths > 0).count()` — a
+        /// cumulative "ever died" tally that a battle rez can never bring
+        /// back down, so it stays true for the rest of the pull. This pins
+        /// the fix: a player who died once and was rezzed (their next
+        /// action clears `alive`, per `party_is_wiped`'s doc comment) must
+        /// not still count as "down" in the reset diagnostic, the same way
+        /// `party_mostly_down`/`party_is_wiped` already read `alive` rather
+        /// than `deaths` for the wipe-vs-rollback decision itself.
+        #[test]
+        fn reset_log_reports_players_currently_down_not_a_cumulative_death_count() {
+            install_capture();
+
+            let mut m = Meter::new();
+            // uid 1 dies to a monster...
+            m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 90,
+                attacker_kind: EntityKind::Monster,
+                target_uid: 1,
+                target_kind: EntityKind::Player,
+                value: 500,
+                is_dead: true,
+                timestamp_ms: 1_000,
+                ..Default::default()
+            }));
+            // ...uid 2 is just a second known party member, never down...
+            m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 2,
+                attacker_kind: EntityKind::Player,
+                target_uid: 90,
+                target_kind: EntityKind::Monster,
+                value: 1_000,
+                timestamp_ms: 1_000,
+                ..Default::default()
+            }));
+            // ...and uid 1 is battle-rezzed: their next action (a hit)
+            // clears `alive` back to true, but `deaths` stays 1 forever.
+            m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: 90,
+                target_kind: EntityKind::Monster,
+                value: 1_000,
+                timestamp_ms: 2_000,
+                ..Default::default()
+            }));
+            assert_eq!(
+                m.players.get(&1).map(|p| (p.deaths, p.alive)),
+                Some((1, true)),
+                "the rez must leave a cumulative death on the board but the player standing"
+            );
+
+            m.reset(ResetReason::Manual, 3_000);
+
+            assert!(
+                logged("party_down=0/2"),
+                "nobody is down right now, so the reset diagnostic must not \
+                 report the one player who merely died earlier in the pull"
+            );
+            assert!(
+                !logged("party_down=1/2"),
+                "the cumulative-deaths count must not leak into the live down-state diagnostic"
             );
         }
 
