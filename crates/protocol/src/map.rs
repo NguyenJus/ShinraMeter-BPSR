@@ -151,6 +151,26 @@ pub fn map_event(
             uid,
             reason: reason.map(map_disappear_reason),
         },
+        ProtocolEvent::BuffApply {
+            host_uid,
+            buff_uuid,
+            base_id,
+            timestamp_ms,
+        } => meter::ProtocolEvent::BuffApply {
+            host_uid,
+            buff_uuid,
+            base_id,
+            timestamp_ms,
+        },
+        ProtocolEvent::BuffRemove {
+            host_uid,
+            buff_uuid,
+            timestamp_ms,
+        } => meter::ProtocolEvent::BuffRemove {
+            host_uid,
+            buff_uuid,
+            timestamp_ms,
+        },
     }
 }
 

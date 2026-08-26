@@ -326,6 +326,7 @@ fn sync_to_me_delta_info_uses_outer_uuid() {
                 skill_effects: Some(bpsr_protocol::pb::SkillEffect {
                     damages: vec![base_damage(ATTACKER_UUID, 8, 512)],
                 }),
+                buff_effect: None,
             }),
             uuid: TARGET_UUID,
         }),

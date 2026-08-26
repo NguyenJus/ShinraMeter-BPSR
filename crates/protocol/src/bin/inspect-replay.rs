@@ -418,6 +418,7 @@ mod tests {
             uuid: PLAYER_UUID,
             attrs: Some(attrs),
             skill_effects: None,
+            buff_effect: None,
         };
         let msg = pb::SyncNearDeltaInfo {
             delta_infos: vec![delta],

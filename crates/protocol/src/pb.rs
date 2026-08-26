@@ -48,6 +48,141 @@ pub struct SkillEffect {
     pub damages: Vec<SyncDamageInfo>,
 }
 
+/// Mirrors BPSR-ZDPS's `EnumEBuffEventType.cs`. **Live-capture evidence**
+/// (house rule for a decoded field, `docs/packet-inspection.md`): of the
+/// values seen across every non-empty `inspect/dump-*.jsonl` on disk (6
+/// files, 61,189 `AoiSyncDelta` records, 15,472 carrying tag 10), `AddTo`(1)
+/// and `RemoveLayer`(6) dominate (~9.7k / ~10.3k occurrences respectively),
+/// with `Remove`(2), `Replace`/`Timer`-shaped others, and `StackLayer`(5)
+/// also observed — see [`AoiSyncDelta`]'s doc comment on its `buff_effect`
+/// field for the full derivation. Every other variant here is ported from
+/// the reference unconfirmed (same status as `attr_id::SEASON_LEVEL`'s
+/// documented exception) purely so an out-of-range wire value still has a
+/// name; nothing in this crate assumes an unconfirmed variant's numbering is
+/// correct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum EBuffEventType {
+    Unknown = 0,
+    AddTo = 1,
+    Remove = 2,
+    Replace = 3,
+    Timer = 4,
+    StackLayer = 5,
+    RemoveLayer = 6,
+}
+
+/// `FightSourceInfo` (issue #267), nested on [`BuffInfo`] tag 12. Field
+/// numbers ported from BPSR-ZDPS's `StruFightSourceInfo.cs` — both reference
+/// trackers agree on `BuffInfo`'s own field layout (unlike the outer
+/// `AoiSyncDelta` tag, see [`AoiSyncDelta::buff_effect`]'s doc comment), so
+/// this one small struct is not independently re-derived.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FightSourceInfo {
+    #[prost(int32, tag = "1")]
+    pub fight_source_type: i32,
+    #[prost(int32, tag = "2")]
+    pub source_config_id: i32,
+}
+
+/// `EBuffEffectLogicPbType::BuffEffectAddBuff` (BPSR-ZDPS
+/// `EnumEBuffEffectLogicPbType.cs`): the [`BuffEffectLogicInfo::effect_type`]
+/// value whose `raw_data` is itself a protobuf-encoded [`BuffInfo`] — the
+/// "double-encoded" shape issue #267 flags. Confirmed against this
+/// project's own captures: of 9,662 `logic_effect` entries carrying this
+/// value, every one's `raw_data` decoded as a valid `BuffInfo` whose own
+/// `buff_uuid` (tag 1) matched the enclosing [`BuffEffect::buff_uuid`]
+/// exactly.
+pub const BUFF_EFFECT_ADD_BUFF: i32 = 18;
+
+/// One entry of [`BuffEffect::logic_effect`] / [`BuffInfo::logic_effect`]
+/// (issue #267). `effect_type` is left a plain `i32` (`EBuffEffectLogicPbType`
+/// on the wire) rather than a fully-named enum — only [`BUFF_EFFECT_ADD_BUFF`]
+/// is acted on here, and the reference's ~20 other variants have no
+/// consumer. When `effect_type == BUFF_EFFECT_ADD_BUFF`, `raw_data` decodes
+/// as a [`BuffInfo`] (see `decode::buff_base_id_from_logic_effects`).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BuffEffectLogicInfo {
+    #[prost(int32, tag = "1")]
+    pub effect_type: i32,
+    #[prost(bytes = "vec", tag = "2")]
+    pub raw_data: Vec<u8>,
+    #[prost(bool, tag = "3")]
+    pub is_loop: bool,
+}
+
+/// One buff's full snapshot (issue #267), reached only via the
+/// double-encoded [`BuffEffectLogicInfo::raw_data`] path — this build's live
+/// `BuffEffect` events never carry a `base_id` directly (see
+/// [`AoiSyncDelta::buff_effect`]'s doc comment). Field numbers 1/2/3/5/6/7/8
+/// are individually confirmed against this project's own captures; 4
+/// (`host_uuid`), 9 (`part_id`), 13 (`logic_effect`) and 14 (`skin_id`) are
+/// ported from the reference (both trackers agree on this struct's layout)
+/// and were never observed populated in these captures, so they decode
+/// (prost skips absent tags) but are not independently confirmed. 10
+/// (`count`) was observed but only ever as the sentinel `-1`, so its
+/// meaning is unconfirmed too.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BuffInfo {
+    #[prost(int32, tag = "1")]
+    pub buff_uuid: i32,
+    #[prost(int32, tag = "2")]
+    pub base_id: i32,
+    #[prost(int32, tag = "3")]
+    pub level: i32,
+    #[prost(int64, tag = "4")]
+    pub host_uuid: i64,
+    #[prost(int32, tag = "5")]
+    pub table_uuid: i32,
+    #[prost(int64, tag = "6")]
+    pub create_time: i64,
+    #[prost(int64, tag = "7")]
+    pub fire_uuid: i64,
+    #[prost(int32, tag = "8")]
+    pub layer: i32,
+    #[prost(int32, tag = "9")]
+    pub part_id: i32,
+    #[prost(int32, tag = "10")]
+    pub count: i32,
+    #[prost(int32, tag = "11")]
+    pub duration: i32,
+    #[prost(message, optional, tag = "12")]
+    pub fight_source_info: Option<FightSourceInfo>,
+    #[prost(message, repeated, tag = "13")]
+    pub logic_effect: Vec<BuffEffectLogicInfo>,
+    #[prost(int32, tag = "14")]
+    pub skin_id: i32,
+}
+
+/// One buff apply/remove/stack event (issue #267), BPSR-ZDPS's `BuffEffect`.
+/// Field numbers confirmed against this project's own captures — see
+/// [`AoiSyncDelta::buff_effect`]'s doc comment.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BuffEffect {
+    #[prost(enumeration = "EBuffEventType", tag = "1")]
+    pub r#type: i32,
+    #[prost(int32, tag = "2")]
+    pub buff_uuid: i32,
+    #[prost(int64, tag = "3")]
+    pub host_uuid: i64,
+    #[prost(int64, tag = "4")]
+    pub trigger_time: i64,
+    #[prost(message, repeated, tag = "5")]
+    pub logic_effect: Vec<BuffEffectLogicInfo>,
+}
+
+/// Wrapper for [`AoiSyncDelta::buff_effect`] (issue #267), BPSR-ZDPS's
+/// `BuffEffectSync`. `uuid` (tag 1) was never observed populated in this
+/// project's own captures — every sample carried only tag 2 — so it decodes
+/// but is unconfirmed.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BuffEffectSync {
+    #[prost(int64, tag = "1")]
+    pub uuid: i64,
+    #[prost(message, repeated, tag = "2")]
+    pub buff_effects: Vec<BuffEffect>,
+}
+
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AoiSyncDelta {
     #[prost(int64, tag = "1")]
@@ -56,6 +191,45 @@ pub struct AoiSyncDelta {
     pub attrs: Option<AttrCollection>,
     #[prost(message, optional, tag = "7")]
     pub skill_effects: Option<SkillEffect>,
+    /// Buff apply/remove/stack events (issue #267). **Re-derived against
+    /// this project's own dumps**, per `docs/packet-inspection.md`'s
+    /// discipline — the two reference trackers disagree on this tag:
+    /// resonance-logs' `blueprotobuf_package.rs` declares tag 10 as a
+    /// `BuffInfoSync` *snapshot* list and tag 11 as `BuffEffectSync`;
+    /// BPSR-ZDPS's decompiled, protoc-generated `Csharp.cs` instead has tag
+    /// 10 as `BuffEffectSync` directly and tag 11 as `FakeBullets`.
+    ///
+    /// Scanning every non-empty `inspect/dump-*.jsonl` on disk (6 files,
+    /// 61,189 parsed `AoiSyncDelta`, of which 15,472 carry tag 10 and 656
+    /// carry tag 11) resolves it in BPSR-ZDPS's favor for *this* client
+    /// build:
+    ///
+    /// - Tag 11's sub-message decodes as small varints plus a nested
+    ///   `{2: f32, 3: f32}`-shaped pair — IEEE-754 floats, not buff data;
+    ///   consistent with `FakeBulletInfo` position data, not `BuffEffect`.
+    ///   This crate does not decode tag 11 at all as a result.
+    /// - Tag 10's sub-message decodes as `{2: repeated message}`
+    ///   (`BuffEffectSync.buff_effects`), and every nested entry's own tag 3
+    ///   (varint) exactly equals the wrapping delta's `uuid` in 19,947/19,947
+    ///   occurrences where tag 3 is present, and tag 4 (varint) falls within
+    ///   5s of the record's own capture timestamp in 10,273/10,279
+    ///   occurrences where tag 4 is present — i.e. tag 3 is `host_uuid` and
+    ///   tag 4 is `trigger_time`, field-for-field exactly where BPSR-ZDPS's
+    ///   `BuffEffect` puts them (tags 1/2/3/4/5 =
+    ///   `Type`/`BuffUuid`/`HostUuid`/`TriggerTime`/`LogicEffect`). Tag 5's
+    ///   nested entries further decode as `BuffEffectLogicInfo`
+    ///   (`effect_type`/`raw_data`/`is_loop`), and — the clinching evidence —
+    ///   9,662 of them carry `effect_type == BUFF_EFFECT_ADD_BUFF` whose
+    ///   `raw_data` double-decodes as a `BuffInfo` whose own `buff_uuid`
+    ///   (tag 1) matches the enclosing `BuffEffect.buff_uuid` in every case.
+    ///
+    /// resonance-logs' snapshot-shaped `BuffInfoSync` does not appear on
+    /// either tag in this build's captures at all — plausibly client-version
+    /// schema drift between the two reference tools, exactly as this
+    /// project's own issue #267 hypothesized before either shape was
+    /// confirmed.
+    #[prost(message, optional, tag = "10")]
+    pub buff_effect: Option<BuffEffectSync>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]

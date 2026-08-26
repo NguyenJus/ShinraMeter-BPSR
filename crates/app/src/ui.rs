@@ -1080,6 +1080,11 @@ fn demo_snapshot() -> Snapshot {
                     // more than one hit per cast, so equal figures would
                     // be the odd-looking ones.
                     casts: demo_cast_rows(demo_skills, duration_ms),
+                    // Issue #267: the Buff tab has no demo seed yet — left
+                    // empty rather than fabricated, same as every other
+                    // untracked-until-now tab was before its own issue
+                    // seeded one.
+                    buffs: Vec::new(),
                 }
             },
         )
@@ -13011,6 +13016,7 @@ mod tests {
             dealt: Vec::new(),
             received: Vec::new(),
             casts: Vec::new(),
+            buffs: Vec::new(),
         }
     }
 
@@ -14069,6 +14075,7 @@ mod tests {
             dealt: Vec::new(),
             received: Vec::new(),
             casts: Vec::new(),
+            buffs: Vec::new(),
         };
 
         for (kind, column) in ColumnKind::ALL
@@ -14644,11 +14651,14 @@ mod tests {
         );
     }
 
-    /// Issue #245: `Buff` has no columns, and painted a full 40pt band of
-    /// `SKILL_COLUMN_HEADER_FILL` with nothing in it — a stray lighter
-    /// strip above the explanatory text. A tab with no columns gets no
-    /// band at all, so its rows area (and the explanation in it) starts
-    /// straight under the tab strip.
+    /// Issue #245: a tab with no columns at all (every real tab has some
+    /// today — issue #267 gave `Buff`, the last holdout, its own column set
+    /// — but `skill_column_header_rect` still has to handle the case, since
+    /// nothing in its signature rules it out) must not paint a full 40pt
+    /// band of `SKILL_COLUMN_HEADER_FILL` with nothing in it — a stray
+    /// lighter strip above the explanatory text. No columns gets no band at
+    /// all, so the rows area (and the explanation in it) starts straight
+    /// under the tab strip.
     #[test]
     fn a_tab_with_no_columns_gets_no_column_header_band() {
         let rect = egui::Rect::from_min_size(egui::pos2(5.0, 5.0), egui::vec2(800.0, 600.0));
@@ -14656,9 +14666,7 @@ mod tests {
             egui::pos2(rect.left(), 75.0),
             egui::vec2(rect.width(), SKILL_TAB_HEIGHT),
         );
-        assert!(skills::SkillTab::Buff.columns().is_empty());
-        let col_header_rect =
-            skill_column_header_rect(rect, tabs_rect, skills::SkillTab::Buff.columns());
+        let col_header_rect = skill_column_header_rect(rect, tabs_rect, &[]);
         assert_eq!(col_header_rect.height(), 0.0);
         assert_eq!(
             skill_rows_rect(rect, col_header_rect).top(),
@@ -14850,12 +14858,16 @@ mod tests {
     }
 
     /// Issue #245: an untracked tab explains itself instead of implying
-    /// the fight simply had none of that.
+    /// the fight simply had none of that. Issue #267 gave `Buff` a real
+    /// decode path, so it now falls through to the ordinary per-tab
+    /// "nothing yet" wording like every other tracked tab, rather than
+    /// `untracked_message` (which is `None` for it today).
     #[test]
-    fn an_untracked_tab_says_why_it_is_empty() {
+    fn a_tracked_tab_with_no_rows_says_nothing_recorded_rather_than_untracked() {
+        assert_eq!(skills::SkillTab::Buff.untracked_message(), None);
         assert_eq!(
             skill_window_empty_message(SkillWindowSource::Live, skills::SkillTab::Buff, 0),
-            skills::SkillTab::Buff.untracked_message()
+            Some("Nothing recorded yet")
         );
         assert_eq!(
             skill_window_empty_message(SkillWindowSource::Live, skills::SkillTab::Heal, 0),

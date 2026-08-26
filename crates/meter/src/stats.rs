@@ -40,6 +40,38 @@ impl SkillStats {
     }
 }
 
+/// Per-buff-type uptime accumulator (issue #267), keyed by `base_id` on
+/// `PlayerStats::buffs` — the Buff tab. Built only from **closed**
+/// apply→remove intervals (`Meter::apply_buff_remove`); a buff still active
+/// when a snapshot is read contributes nothing until it closes. This is an
+/// acceptable v1 undercount, not a wrong number: the alternative (counting
+/// a still-open interval up to "now") is a documented follow-up, not
+/// implemented here.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuffStats {
+    /// Summed over every closed interval this encounter, milliseconds.
+    pub total_uptime_ms: u64,
+    /// How many apply→remove cycles have closed for this buff this
+    /// encounter — not the same as how many `BuffApply`-shaped wire events
+    /// arrived (a stack/refresh mid-interval does not open a new one).
+    pub apply_count: u32,
+}
+
+/// One in-flight buff instance (issue #267), tracked on
+/// `PlayerStats::active_buffs` between an apply-like wire event and the
+/// remove-like one that closes it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ActiveBuff {
+    /// The buff's definition/template id, once known. Starts however the
+    /// opening apply event resolved it (`ProtocolEvent::BuffApply::base_id`
+    /// — frequently `None`, see that variant's doc comment) and is
+    /// backfilled by a later apply-like event for the same `buff_uuid` that
+    /// does carry one, since a stack/refresh can supply it even when the
+    /// original application didn't.
+    pub(crate) base_id: Option<i32>,
+    pub(crate) start_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct PlayerStats {
     pub uid: i64,
@@ -157,6 +189,15 @@ pub struct PlayerStats {
     /// start would silently shorten the death by the gap between the two
     /// copies. This one is written on the up→down edge only.
     pub(crate) dead_since_ms: Option<u64>,
+    /// Per-buff-type breakdown (issue #267), keyed by `base_id` — the Buff
+    /// tab. See [`BuffStats`] for what is (and isn't) counted.
+    pub buffs: HashMap<i32, BuffStats>,
+    /// In-flight buff instances, keyed by wire `buff_uuid` (issue #267).
+    /// `pub(crate)`, not part of the display DTO (`PlayerRow`) — see
+    /// [`ActiveBuff`]. `buff_uuid` alone is enough to key this map: each
+    /// `PlayerStats` is already scoped to one host, and a host cannot have
+    /// two simultaneously-active buff instances sharing one `buff_uuid`.
+    pub(crate) active_buffs: HashMap<i32, ActiveBuff>,
 }
 
 impl PlayerStats {
@@ -187,6 +228,8 @@ impl PlayerStats {
             alive_as_of_ms: None,
             dead_ms: 0,
             dead_since_ms: None,
+            buffs: HashMap::new(),
+            active_buffs: HashMap::new(),
         }
     }
 
@@ -334,6 +377,15 @@ pub struct PlayerRow {
     /// amount and the tab shows no amount column
     /// (`skills::SkillTab::columns`).
     pub casts: Vec<SkillRow>,
+    /// The Buff tab's rows (issue #267): this player's per-buff-type
+    /// uptime, uptime-descending. `SkillRow` is reused verbatim, like every
+    /// other breakdown tab (`hits` is the apply count and `avg` the mean
+    /// duration per application, milliseconds; `crit_pct`/`max_crit`/
+    /// `avg_crit`/`avg_white`/`crit_hits`/`hits_per_min` stay `0`, unused by
+    /// `skills::SkillTab::Buff`'s column set) — `skill_id` carries the
+    /// buff's `base_id`, and `damage`/`share_pct` carry total/percentage
+    /// uptime. See [`BuffStats`] for what is (and isn't) counted.
+    pub buffs: Vec<SkillRow>,
 }
 
 /// One row of a player's skill breakdown (issue #16). This is the contract

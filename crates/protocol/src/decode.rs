@@ -277,46 +277,103 @@ fn on_aoi_sync_delta(
             EntityKind::Unknown => {}
         }
     }
-    let Some(effects) = &delta.skill_effects else {
-        return;
-    };
-    for dmg in &effects.damages {
-        // Pet/summon damage is attributed to the top summoner.
-        let attacker_uuid = if dmg.top_summoner_id != 0 {
-            dmg.top_summoner_id
-        } else if dmg.attacker_uuid != 0 {
-            dmg.attacker_uuid
-        } else {
-            continue;
-        };
-        // No skill id → skip.
-        if dmg.owner_id == 0 {
-            continue;
+    if let Some(effects) = &delta.skill_effects {
+        for dmg in &effects.damages {
+            // Pet/summon damage is attributed to the top summoner.
+            let attacker_uuid = if dmg.top_summoner_id != 0 {
+                dmg.top_summoner_id
+            } else if dmg.attacker_uuid != 0 {
+                dmg.attacker_uuid
+            } else {
+                continue;
+            };
+            // No skill id → skip.
+            if dmg.owner_id == 0 {
+                continue;
+            }
+            let value = if dmg.lucky_value != 0 {
+                dmg.lucky_value
+            } else {
+                dmg.value
+            };
+            out.push(ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: uid_of(attacker_uuid),
+                attacker_kind: kind_of(attacker_uuid),
+                skill_id: dmg.owner_id,
+                value,
+                crit: dmg.type_flag & 1 != 0,
+                lucky: dmg.lucky_value != 0,
+                hp_lessen: dmg.hp_lessen_value,
+                is_miss: dmg.is_miss || dmg.r#type == EDamageType::Miss as i32,
+                is_heal: dmg.r#type == EDamageType::Heal as i32,
+                target_uid,
+                target_kind,
+                timestamp_ms: now_ms,
+                // `dmg.is_dead` (SyncDamageInfo tag 17) flags that
+                // `target_uid` died from this hit — a victim-side signal,
+                // not an attacker-side kill count (issue #49).
+                is_dead: dmg.is_dead,
+            }));
         }
-        let value = if dmg.lucky_value != 0 {
-            dmg.lucky_value
-        } else {
-            dmg.value
-        };
-        out.push(ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: uid_of(attacker_uuid),
-            attacker_kind: kind_of(attacker_uuid),
-            skill_id: dmg.owner_id,
-            value,
-            crit: dmg.type_flag & 1 != 0,
-            lucky: dmg.lucky_value != 0,
-            hp_lessen: dmg.hp_lessen_value,
-            is_miss: dmg.is_miss || dmg.r#type == EDamageType::Miss as i32,
-            is_heal: dmg.r#type == EDamageType::Heal as i32,
-            target_uid,
-            target_kind,
-            timestamp_ms: now_ms,
-            // `dmg.is_dead` (SyncDamageInfo tag 17) flags that `target_uid`
-            // died from this hit — a victim-side signal, not an
-            // attacker-side kill count (issue #49).
-            is_dead: dmg.is_dead,
-        }));
     }
+    // Issue #267: buff apply/remove/stack events. Player-only, matching the
+    // rest of this function — `bpsr_meter` keeps no per-monster buff
+    // breakdown, and the skill window is opened from a player row. Uses
+    // `target_uid` (the delta's own identity) rather than decoding
+    // `be.host_uuid` a second time: every sample in this project's own
+    // captures had them equal (see `pb::AoiSyncDelta::buff_effect`'s doc
+    // comment), and `target_uid` is already computed above.
+    if target_kind == EntityKind::Player
+        && let Some(buff_effect) = &delta.buff_effect
+    {
+        for be in &buff_effect.buff_effects {
+            if is_buff_apply_event(be.r#type) {
+                out.push(ProtocolEvent::BuffApply {
+                    host_uid: target_uid,
+                    buff_uuid: be.buff_uuid,
+                    base_id: buff_base_id_from_logic_effects(&be.logic_effect),
+                    timestamp_ms: now_ms,
+                });
+            } else if is_buff_remove_event(be.r#type) {
+                out.push(ProtocolEvent::BuffRemove {
+                    host_uid: target_uid,
+                    buff_uuid: be.buff_uuid,
+                    timestamp_ms: now_ms,
+                });
+            }
+        }
+    }
+}
+
+/// Whether a `BuffEffect.type` (issue #267) marks a buff as up: a fresh
+/// application, a re-application/refresh, or a new stack layer. See
+/// `pb::AoiSyncDelta::buff_effect`'s doc comment for the confirmed-vs-ported
+/// status of each `EBuffEventType` variant.
+fn is_buff_apply_event(r#type: i32) -> bool {
+    r#type == pb::EBuffEventType::AddTo as i32
+        || r#type == pb::EBuffEventType::Replace as i32
+        || r#type == pb::EBuffEventType::StackLayer as i32
+}
+
+/// Whether a `BuffEffect.type` (issue #267) marks a buff as no longer up
+/// (in full, or one fewer stack layer).
+fn is_buff_remove_event(r#type: i32) -> bool {
+    r#type == pb::EBuffEventType::Remove as i32 || r#type == pb::EBuffEventType::RemoveLayer as i32
+}
+
+/// Double-decodes a buff's `base_id` out of `logic_effect` (issue #267),
+/// when present: the entry whose `effect_type == pb::BUFF_EFFECT_ADD_BUFF`
+/// has a `raw_data` that is itself a protobuf-encoded `pb::BuffInfo` — see
+/// `pb::BUFF_EFFECT_ADD_BUFF`'s doc comment for the confirming evidence.
+/// `None` when no such entry is present (common — see
+/// `ProtocolEvent::BuffApply`'s doc comment) or its `raw_data` fails to
+/// decode.
+fn buff_base_id_from_logic_effects(logic_effect: &[pb::BuffEffectLogicInfo]) -> Option<i32> {
+    logic_effect
+        .iter()
+        .find(|le| le.effect_type == pb::BUFF_EFFECT_ADD_BUFF)
+        .and_then(|le| pb::BuffInfo::decode(le.raw_data.as_slice()).ok())
+        .map(|info| info.base_id)
 }
 
 /// Emits `Player` only — the scene half of this notify was removed (issue
@@ -687,6 +744,7 @@ mod tests {
             uuid: TARGET_UUID,
             attrs: None,
             skill_effects: Some(SkillEffect { damages: vec![dmg] }),
+            buff_effect: None,
         };
         let msg = SyncNearDeltaInfo {
             delta_infos: vec![delta],
@@ -848,6 +906,7 @@ mod tests {
             uuid: ATTACKER_UUID,
             attrs: Some(attrs),
             skill_effects: None,
+            buff_effect: None,
         };
         let msg = SyncNearDeltaInfo {
             delta_infos: vec![delta],
@@ -887,6 +946,7 @@ mod tests {
                 }],
             }),
             skill_effects: None,
+            buff_effect: None,
         };
         let msg = SyncNearDeltaInfo {
             delta_infos: vec![delta],
@@ -946,6 +1006,224 @@ mod tests {
         );
     }
 
+    // -- issue #267: buff apply/remove events ----------------------------
+
+    fn buff_notify(uuid: i64, effects: Vec<pb::BuffEffect>) -> Notify {
+        let delta = AoiSyncDelta {
+            uuid,
+            attrs: None,
+            skill_effects: None,
+            buff_effect: Some(pb::BuffEffectSync {
+                uuid: 0,
+                buff_effects: effects,
+            }),
+        };
+        let msg = SyncNearDeltaInfo {
+            delta_infos: vec![delta],
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id: opcode::SYNC_NEAR_DELTA_INFO,
+            payload,
+        }
+    }
+
+    /// Encodes a `BuffInfo` carrying only `base_id`, for use as a
+    /// `BuffEffectLogicInfo.raw_data` — the double-encoding issue #267
+    /// documents.
+    fn buff_info_raw_data(base_id: i32) -> Vec<u8> {
+        let info = pb::BuffInfo {
+            base_id,
+            ..Default::default()
+        };
+        let mut raw = Vec::new();
+        info.encode(&mut raw).unwrap();
+        raw
+    }
+
+    fn only_buff_apply(out: &[ProtocolEvent]) -> (i64, i32, Option<i32>, u64) {
+        match out {
+            [
+                ProtocolEvent::BuffApply {
+                    host_uid,
+                    buff_uuid,
+                    base_id,
+                    timestamp_ms,
+                },
+            ] => (*host_uid, *buff_uuid, *base_id, *timestamp_ms),
+            other => panic!("expected exactly one BuffApply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_to_event_with_double_encoded_base_id_emits_buff_apply_with_base_id() {
+        let effect = pb::BuffEffect {
+            r#type: pb::EBuffEventType::AddTo as i32,
+            buff_uuid: 417,
+            host_uuid: ATTACKER_UUID,
+            trigger_time: 999,
+            logic_effect: vec![pb::BuffEffectLogicInfo {
+                effect_type: pb::BUFF_EFFECT_ADD_BUFF,
+                raw_data: buff_info_raw_data(3_210_031),
+                is_loop: false,
+            }],
+        };
+        let mut out = Vec::new();
+        decode_notify(
+            &buff_notify(ATTACKER_UUID, vec![effect]),
+            4242,
+            &mut out,
+            None,
+        );
+        let (host_uid, buff_uuid, base_id, timestamp_ms) = only_buff_apply(&out);
+        assert_eq!(host_uid, uid_of(ATTACKER_UUID));
+        assert_eq!(buff_uuid, 417);
+        assert_eq!(base_id, Some(3_210_031));
+        assert_eq!(timestamp_ms, 4242);
+    }
+
+    /// Roughly half of this build's real `AddTo` events carry no
+    /// double-encoded `BuffInfo` at all (see `pb::AoiSyncDelta::buff_effect`'s
+    /// doc comment) — `base_id` must be `None`, not a decode error, when
+    /// `logic_effect` is empty.
+    #[test]
+    fn add_to_event_with_no_logic_effect_emits_buff_apply_with_no_base_id() {
+        let effect = pb::BuffEffect {
+            r#type: pb::EBuffEventType::AddTo as i32,
+            buff_uuid: 1,
+            host_uuid: ATTACKER_UUID,
+            trigger_time: 0,
+            logic_effect: Vec::new(),
+        };
+        let mut out = Vec::new();
+        decode_notify(&buff_notify(ATTACKER_UUID, vec![effect]), 0, &mut out, None);
+        let (_, _, base_id, _) = only_buff_apply(&out);
+        assert_eq!(base_id, None);
+    }
+
+    #[test]
+    fn replace_and_stack_layer_events_are_treated_as_apply() {
+        for event_type in [pb::EBuffEventType::Replace, pb::EBuffEventType::StackLayer] {
+            let effect = pb::BuffEffect {
+                r#type: event_type as i32,
+                buff_uuid: 7,
+                host_uuid: ATTACKER_UUID,
+                trigger_time: 0,
+                logic_effect: Vec::new(),
+            };
+            let mut out = Vec::new();
+            decode_notify(&buff_notify(ATTACKER_UUID, vec![effect]), 0, &mut out, None);
+            assert!(
+                matches!(out.as_slice(), [ProtocolEvent::BuffApply { .. }]),
+                "{event_type:?} should emit BuffApply, got {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_and_remove_layer_events_emit_buff_remove() {
+        for event_type in [pb::EBuffEventType::Remove, pb::EBuffEventType::RemoveLayer] {
+            let effect = pb::BuffEffect {
+                r#type: event_type as i32,
+                buff_uuid: 417,
+                host_uuid: ATTACKER_UUID,
+                trigger_time: 5000,
+                logic_effect: Vec::new(),
+            };
+            let mut out = Vec::new();
+            decode_notify(
+                &buff_notify(ATTACKER_UUID, vec![effect]),
+                5000,
+                &mut out,
+                None,
+            );
+            match out.as_slice() {
+                [
+                    ProtocolEvent::BuffRemove {
+                        host_uid,
+                        buff_uuid,
+                        timestamp_ms,
+                    },
+                ] => {
+                    assert_eq!(*host_uid, uid_of(ATTACKER_UUID));
+                    assert_eq!(*buff_uuid, 417);
+                    assert_eq!(*timestamp_ms, 5000);
+                }
+                other => panic!("{event_type:?} should emit BuffRemove, got {other:?}"),
+            }
+        }
+    }
+
+    /// `Timer` (periodic tick) is neither an apply nor a remove signal —
+    /// see `is_buff_apply_event`/`is_buff_remove_event`.
+    #[test]
+    fn timer_event_emits_no_buff_event() {
+        let effect = pb::BuffEffect {
+            r#type: pb::EBuffEventType::Timer as i32,
+            buff_uuid: 1,
+            host_uuid: ATTACKER_UUID,
+            trigger_time: 0,
+            logic_effect: Vec::new(),
+        };
+        let mut out = Vec::new();
+        decode_notify(&buff_notify(ATTACKER_UUID, vec![effect]), 0, &mut out, None);
+        assert!(out.is_empty(), "Timer should emit nothing: {out:?}");
+    }
+
+    /// Buffs ride every entity's deltas, monsters included, but
+    /// `bpsr_meter` keeps no per-monster buff breakdown — mirrors
+    /// `a_skill_id_attr_on_a_monster_emits_no_cast`.
+    #[test]
+    fn buff_event_on_a_monster_emits_nothing() {
+        let effect = pb::BuffEffect {
+            r#type: pb::EBuffEventType::AddTo as i32,
+            buff_uuid: 1,
+            host_uuid: TARGET_UUID,
+            trigger_time: 0,
+            logic_effect: Vec::new(),
+        };
+        let mut out = Vec::new();
+        decode_notify(&buff_notify(TARGET_UUID, vec![effect]), 0, &mut out, None);
+        assert!(out.is_empty(), "a monster's buffs are not tracked: {out:?}");
+    }
+
+    /// Regression fixture, values taken verbatim from a real capture
+    /// (`inspect/dump-2976.jsonl`, per `docs/packet-inspection.md`'s
+    /// "Recording a result"): one `AddTo` event whose double-encoded
+    /// `BuffInfo` carries `base_id = 21_404`, `buff_uuid = 1247`, on player
+    /// uuid `51_373_802_112` (`uuid & 0xFFFF == 640`, the player entity-type
+    /// bits — confirmed against `wire::player_uuid`'s own layout, unlike
+    /// the otherwise-similar sample this project's issue #267 investigation
+    /// first tried, whose uuid turned out to be a monster's).
+    #[test]
+    fn real_capture_add_to_event_decodes_expected_base_id() {
+        const HOST_UUID: i64 = 51_373_802_112;
+        let effect = pb::BuffEffect {
+            r#type: pb::EBuffEventType::AddTo as i32,
+            buff_uuid: 1247,
+            host_uuid: HOST_UUID,
+            trigger_time: 1_787_022_226_743,
+            logic_effect: vec![pb::BuffEffectLogicInfo {
+                effect_type: pb::BUFF_EFFECT_ADD_BUFF,
+                raw_data: buff_info_raw_data(21_404),
+                is_loop: false,
+            }],
+        };
+        let mut out = Vec::new();
+        decode_notify(
+            &buff_notify(HOST_UUID, vec![effect]),
+            1_787_022_226_743,
+            &mut out,
+            None,
+        );
+        let (host_uid, buff_uuid, base_id, _) = only_buff_apply(&out);
+        assert_eq!(host_uid, uid_of(HOST_UUID));
+        assert_eq!(buff_uuid, 1247);
+        assert_eq!(base_id, Some(21_404));
+    }
+
     fn to_me_notify(outer_uuid: i64, base_uuid: i64) -> Notify {
         let attrs = AttrCollection {
             uuid: 0,
@@ -960,6 +1238,7 @@ mod tests {
                     uuid: base_uuid,
                     attrs: Some(attrs),
                     skill_effects: None,
+                    buff_effect: None,
                 }),
                 uuid: outer_uuid,
             }),
@@ -1085,6 +1364,7 @@ mod tests {
             uuid: ATTACKER_UUID,
             attrs: Some(attrs),
             skill_effects: None,
+            buff_effect: None,
         };
         let msg = SyncNearDeltaInfo {
             delta_infos: vec![delta],
@@ -1126,6 +1406,7 @@ mod tests {
             uuid: ATTACKER_UUID,
             attrs: Some(attrs),
             skill_effects: None,
+            buff_effect: None,
         };
         let msg = SyncNearDeltaInfo {
             delta_infos: vec![delta],

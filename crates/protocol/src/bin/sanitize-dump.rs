@@ -885,6 +885,7 @@ mod tests {
             uuid: (7i64 << 16) | 640,
             attrs: Some(attrs),
             skill_effects: None,
+            buff_effect: None,
         };
         let payload = proto::pb::SyncNearDeltaInfo {
             delta_infos: vec![delta],
@@ -911,6 +912,7 @@ mod tests {
                     }],
                 }),
                 skill_effects: None,
+                buff_effect: None,
             }],
         }
         .encode_to_vec();
@@ -961,6 +963,7 @@ mod tests {
                         top_summoner_id: 0,
                     }],
                 }),
+                buff_effect: None,
             }],
         }
         .encode_to_vec();

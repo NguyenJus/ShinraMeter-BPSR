@@ -162,6 +162,7 @@ pub fn damage_delta_multi(target_uuid: i64, dmgs: Vec<pb::SyncDamageInfo>) -> Ve
         uuid: target_uuid,
         attrs: None,
         skill_effects: Some(pb::SkillEffect { damages: dmgs }),
+        buff_effect: None,
     };
     let msg = pb::SyncNearDeltaInfo {
         delta_infos: vec![delta],
@@ -179,6 +180,67 @@ pub fn attr_delta_payload(uuid: i64, attrs: Vec<pb::Attr>) -> Vec<u8> {
         uuid,
         attrs: Some(pb::AttrCollection { uuid, attrs }),
         skill_effects: None,
+        buff_effect: None,
+    };
+    let msg = pb::SyncNearDeltaInfo {
+        delta_infos: vec![delta],
+    };
+    let mut payload = Vec::new();
+    msg.encode(&mut payload).unwrap();
+    payload
+}
+
+/// Builds a `BuffEffect` for `AoiSyncDelta.buff_effect` (issue #267).
+/// `event_type` is the wire `EBuffEventType` value (`AddTo`, `Remove`, ...);
+/// `base_id`, when `Some`, is carried the same way a real `AddTo` event
+/// carries one — double-encoded as a `BuffInfo` inside a
+/// `BuffEffectLogicInfo` with `effect_type == pb::BUFF_EFFECT_ADD_BUFF` (see
+/// `pb::AoiSyncDelta::buff_effect`'s doc comment for why that indirection is
+/// how this build's wire format actually works).
+pub fn buff_effect(
+    event_type: pb::EBuffEventType,
+    buff_uuid: i32,
+    host_uuid: i64,
+    trigger_time: i64,
+    base_id: Option<i32>,
+) -> pb::BuffEffect {
+    let logic_effect = match base_id {
+        Some(base_id) => {
+            let info = pb::BuffInfo {
+                buff_uuid,
+                base_id,
+                ..Default::default()
+            };
+            let mut raw_data = Vec::new();
+            info.encode(&mut raw_data).unwrap();
+            vec![pb::BuffEffectLogicInfo {
+                effect_type: pb::BUFF_EFFECT_ADD_BUFF,
+                raw_data,
+                is_loop: false,
+            }]
+        }
+        None => Vec::new(),
+    };
+    pb::BuffEffect {
+        r#type: event_type as i32,
+        buff_uuid,
+        host_uuid,
+        trigger_time,
+        logic_effect,
+    }
+}
+
+/// Prost-encodes a `SyncNearDeltaInfo` payload (not wrapped in a frame)
+/// carrying `effects` against `target_uuid` (issue #267).
+pub fn buff_delta_payload(target_uuid: i64, effects: Vec<pb::BuffEffect>) -> Vec<u8> {
+    let delta = pb::AoiSyncDelta {
+        uuid: target_uuid,
+        attrs: None,
+        skill_effects: None,
+        buff_effect: Some(pb::BuffEffectSync {
+            uuid: 0,
+            buff_effects: effects,
+        }),
     };
     let msg = pb::SyncNearDeltaInfo {
         delta_infos: vec![delta],

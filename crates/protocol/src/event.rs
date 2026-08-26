@@ -309,6 +309,35 @@ pub enum ProtocolEvent {
         uid: i64,
         reason: Option<DisappearReason>,
     },
+    /// A buff was applied, refreshed, or gained a stack layer on `host_uid`
+    /// (issue #267), decoded from `AoiSyncDelta.buff_effect` — see
+    /// `crate::pb::AoiSyncDelta::buff_effect`'s doc comment for the field-tag
+    /// evidence and `crate::decode::on_aoi_sync_delta` for which
+    /// `EBuffEventType` values map to this variant.
+    ///
+    /// `base_id` is the buff's definition/template id, present only when
+    /// this particular wire event carried the double-encoded `BuffInfo` (see
+    /// `crate::pb::BUFF_EFFECT_ADD_BUFF`) — roughly half of apply events in
+    /// this project's own captures do not, so `None` here does not mean "not
+    /// a real buff", only "this event didn't say which one". The consumer is
+    /// expected to remember a buff's `base_id` from whichever event first
+    /// supplies it, keyed by `buff_uuid`.
+    BuffApply {
+        host_uid: i64,
+        buff_uuid: i32,
+        base_id: Option<i32>,
+        timestamp_ms: u64,
+    },
+    /// A buff was removed, or lost a stack layer, on `host_uid` (issue
+    /// #267). Never carries a `base_id`: the wire's `Remove`/`RemoveLayer`
+    /// events observed in this project's own captures carry only
+    /// `Type`/`BuffUuid` — never a `LogicEffect` list — so identifying which
+    /// buff this is is the consumer's job, via `buff_uuid`.
+    BuffRemove {
+        host_uid: i64,
+        buff_uuid: i32,
+        timestamp_ms: u64,
+    },
 }
 
 #[cfg(test)]
