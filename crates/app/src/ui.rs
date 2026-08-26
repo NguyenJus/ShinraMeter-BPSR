@@ -1668,12 +1668,12 @@ impl eframe::App for OverlayApp {
                 // `InnerSize` command the header dropdown's "Reset to
                 // defaults" item already uses for its own (width-and-
                 // height) resize.
-                if let Some(target_height) = resize_double_click_command(
-                    resize_double_clicked,
-                    ctx.input(|i| i.viewport_rect()).height(),
-                ) {
+                let viewport_rect = ctx.input(|i| i.viewport_rect());
+                if let Some(target_height) =
+                    resize_double_click_command(resize_double_clicked, viewport_rect.height())
+                {
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                        ctx.input(|i| i.viewport_rect()).width(),
+                        viewport_rect.width(),
                         target_height,
                     )));
                 }
