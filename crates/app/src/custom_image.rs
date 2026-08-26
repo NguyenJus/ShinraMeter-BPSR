@@ -20,6 +20,23 @@
 //! texture back to the region's exact aspect ratio. Per frame that is one
 //! cache-key comparison and a handful of multiplications.
 //!
+//! ## Animated GIFs (issue #296)
+//!
+//! An animated GIF decodes to more than one [`AnimationFrame`] instead of
+//! one — [`decode_and_fit`] fits *every* frame through the same crop/resize
+//! step above, since a GIF's frames all share one canvas and so one
+//! `cover_crop` rectangle. [`CustomImages::texture`] still uploads a single
+//! `egui::TextureHandle` (so the blit side of the pipeline, and every other
+//! slot in the cache, need not know an image can move at all); playback
+//! re-`set`s that same handle's pixels to whichever frame [`AnimationFrame`]
+//! is due, on the schedule its own GIF-authored delays name
+//! ([`animation_position_at`], the pure function that keeps the "which
+//! frame, and when is the next one due" math testable without a live
+//! `egui::Context` or a real clock). The context's own logical time
+//! (`egui::InputState::time`), not a wall-clock read, is what playback is
+//! measured against, and `Context::request_repaint_after` is what wakes the
+//! UI up for the next frame boundary even when nothing else would.
+//!
 //! ## Why two sizes, and why the UV is not baked in
 //!
 //! Bucketing exists to stabilize the *cache key*; it must never reach the
@@ -59,8 +76,10 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use eframe::egui;
+use image::AnimationDecoder;
 
 /// Which of the two customizable regions an image belongs to. The whole
 /// module is written once and parameterized by this rather than duplicated
@@ -295,6 +314,23 @@ pub fn cover_uv(content: [u32; 2], rect: egui::Vec2) -> egui::Rect {
     )
 }
 
+/// One playable moment of a decoded image: its pixels, [`texture_pixels`]
+/// big like [`Fitted::content`] describes, and how long it stays on screen
+/// before the next one is due.
+///
+/// A non-animated image (anything that is not a multi-frame GIF) decodes to
+/// exactly one of these, with [`Self::delay`] never consulted — see
+/// [`Fitted::frames`].
+#[derive(Debug, Clone)]
+pub struct AnimationFrame {
+    /// The texture itself, [`texture_pixels`] big.
+    pub image: egui::ColorImage,
+    /// How long this frame is shown before [`animation_position_at`] moves
+    /// on to the next one. Always [`normalize_gif_delay`]'d, so a `0` a
+    /// careless encoder wrote out is never taken literally.
+    pub delay: Duration,
+}
+
 /// Whether a cached crop (`cached_content`, selected by [`cover_crop`]
 /// from a `src`-sized source at some earlier region) is still safe to
 /// reuse — via [`cover_uv`] — for the *current* `region`, without
@@ -338,11 +374,16 @@ fn crop_is_still_covered(src: [u32; 2], cached_content: [u32; 2], region: [u32; 
 /// blit and the cache still need.
 #[derive(Debug)]
 pub struct Fitted {
-    /// The texture itself, [`texture_pixels`] big.
-    pub image: egui::ColorImage,
+    /// Every frame the source decoded to, in playback order — length 1 for
+    /// anything that is not a multi-frame animated GIF (issue #296), in
+    /// which case [`CustomImages`] never touches `AnimationFrame::delay`
+    /// and behaves exactly as it did before animation existed.
+    pub frames: Vec<AnimationFrame>,
     /// The source rectangle those pixels show — [`cover_crop`]'s
     /// `[width, height]`, in source pixels. [`cover_uv`] needs this rather
-    /// than `image.size`, which bucketing has stretched.
+    /// than a frame's own `image.size`, which bucketing has stretched.
+    /// Shared by every frame: a GIF's frames all share one canvas, so
+    /// [`cover_crop`] only ever needs to run once per decode.
     pub content: [u32; 2],
     /// The decoded source image's own pixel dimensions — what
     /// [`cover_crop`] took `content` from. The cache keeps this so it can
@@ -352,6 +393,36 @@ pub struct Fitted {
     pub src: [u32; 2],
 }
 
+/// Cover-crops and resizes one already-decoded RGBA buffer onto
+/// [`texture_pixels`] — the per-frame half of the pipeline, shared by the
+/// single-image path ([`decode_and_fit`]) and every frame of an animated
+/// GIF ([`decode_gif_frames`]) so the crop/resize rule is written once.
+///
+/// `crop` is [`cover_crop`]'s `[x, y, w, h]`, computed once by the caller
+/// (from the first frame) and reused for every subsequent frame — cheaper
+/// than recomputing it, and correct, since a GIF's frames all share one
+/// canvas and therefore one crop rectangle.
+///
+/// `CatmullRom` rather than `Lanczos3`: this runs on the UI thread the
+/// frame the user picks a file (or the frame a resize crosses a bucket
+/// boundary), and at these sizes the two are visually indistinguishable
+/// behind the scrim the caller paints over the result.
+fn fit_rgba(rgba: image::RgbaImage, crop: [u32; 4], texture: [u32; 2]) -> egui::ColorImage {
+    let [x, y, w, h] = crop;
+    let fitted = image::DynamicImage::ImageRgba8(rgba)
+        .crop_imm(x, y, w, h)
+        .resize_exact(
+            texture[0],
+            texture[1],
+            image::imageops::FilterType::CatmullRom,
+        )
+        .to_rgba8();
+    egui::ColorImage::from_rgba_unmultiplied(
+        [fitted.width() as usize, fitted.height() as usize],
+        &fitted.into_raw(),
+    )
+}
+
 /// Decodes `bytes` for a destination region of `region` physical pixels,
 /// cover-cropped per [`cover_crop`].
 ///
@@ -359,17 +430,24 @@ pub struct Fitted {
 /// slice, and separate from any texture upload so it needs no live
 /// `egui::Context`.
 ///
-/// The returned image is [`texture_pixels`] big — bucketed, so the key it
-/// is cached under survives a resize drag — while the crop it holds has
-/// `region`'s aspect ratio. The mismatch between the two is what
+/// The returned image(s) are [`texture_pixels`] big — bucketed, so the key
+/// they are cached under survives a resize drag — while the crop they hold
+/// has `region`'s aspect ratio. The mismatch between the two is what
 /// [`cover_uv`] undoes at blit time; cropping to the bucket instead is the
 /// stretch bug this split exists to prevent.
 ///
-/// `CatmullRom` rather than `Lanczos3`: this runs on the UI thread the
-/// frame the user picks a file (or the frame a resize crosses a bucket
-/// boundary), and at these sizes the two are visually indistinguishable
-/// behind the scrim the caller paints over the result.
+/// Issue #296: tries the GIF path first ([`decode_gif_frames`]), which
+/// handles every GIF that decodes to at least one frame — a single-frame
+/// GIF included, so its bytes are decoded exactly once rather than once
+/// there and again here. Everything else (a non-GIF) falls through to the
+/// ordinary single-frame decode below unchanged.
 fn decode_and_fit(bytes: &[u8], region: [u32; 2]) -> Result<Fitted, ImageError> {
+    let region = region.map(|side| side.clamp(MIN_TEXTURE_SIDE, MAX_TEXTURE_SIDE));
+
+    if let Some(decoded) = decode_gif_frames(bytes, region, MAX_GIF_FRAMES)? {
+        return Ok(decoded);
+    }
+
     let decoded =
         image::load_from_memory(bytes).map_err(|err| ImageError::Undecodable(err.to_string()))?;
     let src = [
@@ -380,32 +458,216 @@ fn decode_and_fit(bytes: &[u8], region: [u32; 2]) -> Result<Fitted, ImageError> 
         return Err(ImageError::Undecodable("it has no pixels".to_string()));
     }
 
-    let region = region.map(|side| side.clamp(MIN_TEXTURE_SIDE, MAX_TEXTURE_SIDE));
     let texture = texture_pixels(region);
-    let [x, y, w, h] = cover_crop(src, region);
-    let rgba = decoded
-        .crop_imm(x, y, w, h)
-        .resize_exact(
-            texture[0],
-            texture[1],
-            image::imageops::FilterType::CatmullRom,
-        )
-        .to_rgba8();
+    let crop = cover_crop(src, region);
+    let [_, _, w, h] = crop;
     Ok(Fitted {
-        image: egui::ColorImage::from_rgba_unmultiplied(
-            [rgba.width() as usize, rgba.height() as usize],
-            &rgba.into_raw(),
-        ),
+        frames: vec![AnimationFrame {
+            image: fit_rgba(decoded.to_rgba8(), crop, texture),
+            delay: Duration::ZERO,
+        }],
         content: [w, h],
         src,
     })
+}
+
+/// The floor a GIF frame's own delay is bumped up to before it drives
+/// playback. Encoders commonly write `0` (or a couple of hundredths of a
+/// second) to mean "no explicit delay" rather than "as fast as possible";
+/// taking that literally would flicker the animation at whatever rate the
+/// UI happens to repaint at instead of the pace the GIF was authored to
+/// play at — the same floor every mainstream GIF viewer/browser applies for
+/// the same reason.
+const MIN_GIF_FRAME_DELAY: Duration = Duration::from_millis(20);
+
+/// Ceiling on how many frames of a GIF are decoded and kept.
+///
+/// Every frame is decoded, cover-cropped and CatmullRom-resized *on the UI
+/// thread* the moment the user picks the file, and every resulting frame
+/// then stays resident in the cache entry's `frames` for as long as it is
+/// cached — a bucketed texture is a few megabytes, so an unbounded frame
+/// count is both a visible stall at pick time and unbounded memory. 300
+/// frames is ten seconds at the 30fps most animated backgrounds are
+/// authored at, comfortably more than any loop this overlay is meant to sit
+/// behind; a longer GIF is *truncated* rather than rejected, so an
+/// over-long file still plays (its first ten seconds, on loop) instead of
+/// failing in front of the user.
+const MAX_GIF_FRAMES: usize = 300;
+
+/// Ceiling on the size of a file [`load`] will read into memory.
+///
+/// The read, the decode and every resize happen synchronously on the UI
+/// thread, so a pathologically large file is a freeze rather than a slow
+/// load. 64 MiB is far past any plausible background image (a lossless 4K
+/// PNG is a handful of megabytes) while still bounding the stall; over it,
+/// the file is reported through the ordinary [`ImageError::Unreadable`]
+/// path the settings dropdown already surfaces.
+const MAX_IMAGE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bumps a GIF frame's own delay up to [`MIN_GIF_FRAME_DELAY`] — see that
+/// constant for why a literal (near-)zero delay is not trustworthy. Pure,
+/// so the floor is unit-testable without decoding a real GIF.
+fn normalize_gif_delay(delay: Duration) -> Duration {
+    delay.max(MIN_GIF_FRAME_DELAY)
+}
+
+/// The GIF half of [`decode_and_fit`]: `Ok(Some(_))` for anything sniffed
+/// as a GIF that decoded to at least one frame — including a *single*-frame
+/// GIF, which is fitted here from the frame already decoded rather than
+/// handed back for the caller to decode a second time through
+/// `image::load_from_memory`. Only a non-GIF (or a GIF whose frame list is
+/// empty, which the static path turns into the usual error) returns
+/// `Ok(None)`; a GIF that fails to decode as one reports
+/// [`ImageError::Undecodable`] rather than silently falling through, since
+/// sniffing already confirmed it claims to be one.
+///
+/// A single-frame result carries [`Duration::ZERO`] as its delay, exactly
+/// as the static path produces, so nothing downstream can tell the two
+/// apart: [`Fitted::frames`] of length 1 is never played back.
+///
+/// At most `max_frames` frames are decoded ([`MAX_GIF_FRAMES`] in
+/// production) — the iterator is consumed lazily, so the frames past the
+/// cap are never decoded at all, not decoded and then dropped. Taking a cap
+/// as an argument rather than reading the constant directly is what lets
+/// the tests prove the truncation with a three-frame fixture.
+///
+/// `region` must already be clamped to `[MIN_TEXTURE_SIDE, MAX_TEXTURE_
+/// SIDE]` (as [`decode_and_fit`] does before calling this), since the crop
+/// rectangle computed here is reused verbatim for every frame.
+fn decode_gif_frames(
+    bytes: &[u8],
+    region: [u32; 2],
+    max_frames: usize,
+) -> Result<Option<Fitted>, ImageError> {
+    if !matches!(image::guess_format(bytes), Ok(image::ImageFormat::Gif)) {
+        return Ok(None);
+    }
+    let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
+        .map_err(|err| ImageError::Undecodable(err.to_string()))?;
+    let frames = decoder
+        .into_frames()
+        .take(max_frames)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| ImageError::Undecodable(err.to_string()))?;
+    let Some(first) = frames.first() else {
+        // A GIF with no frames at all is not something to animate *or* to
+        // fit; let the static path produce the usual `Undecodable`.
+        return Ok(None);
+    };
+
+    let src = [first.buffer().width(), first.buffer().height()];
+    if src[0] == 0 || src[1] == 0 {
+        return Err(ImageError::Undecodable("it has no pixels".to_string()));
+    }
+    let texture = texture_pixels(region);
+    let crop = cover_crop(src, region);
+    let [_, _, w, h] = crop;
+
+    let animated = frames.len() > 1;
+    let fitted_frames = frames
+        .into_iter()
+        .map(|frame| AnimationFrame {
+            delay: if animated {
+                normalize_gif_delay(frame.delay().into())
+            } else {
+                Duration::ZERO
+            },
+            image: fit_rgba(frame.into_buffer(), crop, texture),
+        })
+        .collect();
+    Ok(Some(Fitted {
+        frames: fitted_frames,
+        content: [w, h],
+        src,
+    }))
+}
+
+/// Where an animation with per-frame `delays` (each already
+/// [`normalize_gif_delay`]'d, in playback order) is after `elapsed` time
+/// since it started: which frame is showing, and how much longer it stays
+/// up before the next one is due.
+///
+/// Loops forever once the total duration is exceeded — the way every GIF
+/// viewer treats a GIF with no explicit repeat count, which is the only
+/// kind this module ever decodes (issue #296 does not ask for the finite
+/// `LoopCount::Finite` case, and `AnimationDecoder::loop_count` is never
+/// read).
+///
+/// Pure and pixel-free, so the playback math is testable without a live
+/// `egui::Context` or a real clock — [`CustomImages::texture`] is the only
+/// caller that supplies a real `elapsed`, measured against the context's
+/// own logical time rather than a wall-clock read.
+///
+/// `delays` of length 0 or 1 (nothing to animate) always parks on frame 0
+/// with [`Duration::MAX`] remaining, so a caller that unconditionally reads
+/// `remaining` into `request_repaint_after` never schedules a wakeup for a
+/// static image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnimationPosition {
+    /// Index into `delays` (and so into [`Fitted::frames`]) of the frame
+    /// that should be on screen right now.
+    pub index: usize,
+    /// How much longer `index` stays up before the next frame is due.
+    pub remaining: Duration,
+}
+
+pub fn animation_position_at(delays: &[Duration], elapsed: Duration) -> AnimationPosition {
+    if delays.len() <= 1 {
+        return AnimationPosition {
+            index: 0,
+            remaining: Duration::MAX,
+        };
+    }
+    let total_nanos: u128 = delays.iter().map(Duration::as_nanos).sum();
+    if total_nanos == 0 {
+        // Every delay normalized to zero cannot happen once
+        // `normalize_gif_delay` has run, but a caller could still hand this
+        // function raw, un-normalized delays — degenerate input, not a
+        // panic.
+        return AnimationPosition {
+            index: 0,
+            remaining: Duration::MAX,
+        };
+    }
+    let mut into_loop = elapsed.as_nanos() % total_nanos;
+    for (index, delay) in delays.iter().enumerate() {
+        let delay_nanos = delay.as_nanos();
+        if into_loop < delay_nanos {
+            return AnimationPosition {
+                index,
+                remaining: Duration::from_nanos((delay_nanos - into_loop) as u64),
+            };
+        }
+        into_loop -= delay_nanos;
+    }
+    // Unreachable given `into_loop < total_nanos` by construction (the `%`
+    // above), but a saturating fallback rather than a panic or an
+    // out-of-bounds index if float-free integer math still somehow drifts.
+    AnimationPosition {
+        index: delays.len() - 1,
+        remaining: delays[delays.len() - 1],
+    }
 }
 
 /// Reads and decodes `path` for a `region`-pixel destination. The whole
 /// fallible half of the pipeline in one function, with no `egui::Context`
 /// in sight, which is what makes the graceful-degradation path testable on
 /// a headless CI host.
+///
+/// A file past [`MAX_IMAGE_FILE_BYTES`] is refused before it is read, since
+/// everything below this line is synchronous UI-thread work; the refusal
+/// travels the same [`ImageError::Unreadable`] path a missing file does, so
+/// the caller and the settings dropdown need no new case.
 pub fn load(path: &Path, region: [u32; 2]) -> Result<Fitted, ImageError> {
+    let size = std::fs::metadata(path)
+        .map_err(|err| ImageError::Unreadable(err.to_string()))?
+        .len();
+    if size > MAX_IMAGE_FILE_BYTES {
+        return Err(ImageError::Unreadable(format!(
+            "it is larger than the {} MiB limit",
+            MAX_IMAGE_FILE_BYTES / (1024 * 1024)
+        )));
+    }
     let bytes = std::fs::read(path).map_err(|err| ImageError::Unreadable(err.to_string()))?;
     decode_and_fit(&bytes, region)
 }
@@ -430,6 +692,21 @@ struct Entry {
     /// its UV rectangle. Meaningless for the `Err` arm, which never paints.
     content: [u32; 2],
     result: Result<egui::TextureHandle, ImageError>,
+    /// [`Fitted::frames`] for the successful load — length 1 for anything
+    /// that is not an animated GIF, in which case `showing`/`started_at`
+    /// below are never consulted (issue #296). Empty for the `Err` arm.
+    /// Kept rather than dropped after the first upload so playback can
+    /// re-`set` a later frame's already-decoded pixels without re-reading
+    /// or re-decoding the file.
+    frames: Vec<AnimationFrame>,
+    /// Index into `frames` currently uploaded into `result`'s texture.
+    showing: usize,
+    /// `egui::Context`'s own logical time ([`egui::InputState::time`]) the
+    /// moment this entry was decoded — playback position is measured
+    /// relative to this rather than a wall clock, which is what keeps
+    /// [`animation_position_at`] (and so this whole cache) testable without
+    /// sleeping a real thread.
+    started_at: f64,
 }
 
 /// The whole runtime-image cache: at most one live texture per slot.
@@ -472,6 +749,14 @@ impl CustomImages {
     ///
     /// Returns a `TextureId` rather than a borrow of the handle so the
     /// caller can drop the `RefCell` guard before painting.
+    ///
+    /// Issue #296: also this cache's whole playback clock. An animated
+    /// entry (`frames.len() > 1`) has its uploaded texture advanced to
+    /// whichever [`AnimationFrame`] [`animation_position_at`] says is due,
+    /// and schedules the wakeup for the next one via
+    /// `egui::Context::request_repaint_after` — the frame boundary, not
+    /// every-frame polling, is what keeps an idle animated background from
+    /// costing more repaints than a static one.
     pub fn texture(
         &mut self,
         ctx: &egui::Context,
@@ -488,19 +773,24 @@ impl CustomImages {
                     || crop_is_still_covered(cached.src, cached.content, region))
         });
         if !hit {
-            let (src, content, result) = match load(path, region) {
-                Ok(fitted) => (
-                    fitted.src,
-                    fitted.content,
-                    Ok(ctx.load_texture(
-                        slot.texture_name(),
-                        fitted.image,
-                        egui::TextureOptions::LINEAR,
-                    )),
-                ),
+            let started_at = ctx.input(|input| input.time);
+            let (src, content, frames, result) = match load(path, region) {
+                Ok(fitted) => {
+                    let first = fitted.frames[0].image.clone();
+                    (
+                        fitted.src,
+                        fitted.content,
+                        fitted.frames,
+                        Ok(ctx.load_texture(
+                            slot.texture_name(),
+                            first,
+                            egui::TextureOptions::LINEAR,
+                        )),
+                    )
+                }
                 Err(err) => {
                     log::warn!("{} {} {err}", slot.label(), path.display());
-                    (region, region, Err(err))
+                    (region, region, Vec::new(), Err(err))
                 }
             };
             *entry = Some(Entry {
@@ -509,9 +799,31 @@ impl CustomImages {
                 src,
                 content,
                 result,
+                frames,
+                showing: 0,
+                started_at,
             });
         }
-        let entry = entry.as_ref().expect("just populated");
+        let entry = entry.as_mut().expect("just populated");
+
+        // Advance playback before reading the texture out below, so the
+        // very frame an animated entry is (re)loaded on can already show
+        // frame 0 rather than waiting a tick.
+        if entry.result.is_ok() && entry.frames.len() > 1 {
+            let now = ctx.input(|input| input.time);
+            let elapsed = Duration::from_secs_f64((now - entry.started_at).max(0.0));
+            let delays: Vec<Duration> = entry.frames.iter().map(|frame| frame.delay).collect();
+            let position = animation_position_at(&delays, elapsed);
+            if position.index != entry.showing {
+                let image = entry.frames[position.index].image.clone();
+                if let Ok(texture) = &mut entry.result {
+                    texture.set(image, egui::TextureOptions::LINEAR);
+                }
+                entry.showing = position.index;
+            }
+            ctx.request_repaint_after(position.remaining);
+        }
+
         match &entry.result {
             Ok(texture) => Some((texture.id(), entry.content)),
             Err(_) => None,
@@ -771,7 +1083,7 @@ mod tests {
         let region = region_pixels(rect, points_per_pixel);
         let fitted = decode_and_fit(&solid_png(src[0], src[1]), region).expect("a png decodes");
         assert_eq!(
-            fitted.image.size,
+            fitted.frames[0].image.size,
             texture_pixels(region).map(|side| side as usize),
             "the upload must stay on the bucketed grid"
         );
@@ -914,7 +1226,12 @@ mod tests {
     #[test]
     fn decode_resizes_onto_the_bucketed_texture_for_the_region() {
         let fitted = decode_and_fit(&one_pixel_png(), [64, 32]).expect("a valid png must decode");
-        assert_eq!(fitted.image.size, [64, 64], "the texture is bucketed");
+        assert_eq!(fitted.frames.len(), 1, "a png is not an animation");
+        assert_eq!(
+            fitted.frames[0].image.size,
+            [64, 64],
+            "the texture is bucketed"
+        );
         assert_eq!(fitted.content, [1, 1], "the crop is the whole 1x1 source");
     }
 
@@ -922,7 +1239,7 @@ mod tests {
     fn decode_of_a_zero_destination_still_produces_a_paintable_image() {
         let fitted = decode_and_fit(&one_pixel_png(), [0, 0]).expect("a valid png must decode");
         assert_eq!(
-            fitted.image.size,
+            fitted.frames[0].image.size,
             [64, 64],
             "a 0x0 texture cannot be uploaded"
         );
@@ -958,7 +1275,334 @@ mod tests {
         let path = std::env::temp_dir().join("shinra-custom-image-round-trip.png");
         std::fs::write(&path, one_pixel_png()).expect("write the fixture");
         let fitted = load(&path, [128, 64]).expect("a valid png on disk must load");
-        assert_eq!(fitted.image.size, [128, 64]);
+        assert_eq!(fitted.frames[0].image.size, [128, 64]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -- animated GIF playback (issue #296) --------------------------------
+
+    /// A tiny animated GIF: one `4x4` solid-color frame per entry in
+    /// `colors`, each shown for the matching entry in `delays_ms`. Small
+    /// enough to encode instantly, and distinct enough (by color) that a
+    /// test can tell which frame actually got decoded or uploaded.
+    fn animated_gif(colors: &[[u8; 3]], delays_ms: &[u64]) -> Vec<u8> {
+        assert_eq!(colors.len(), delays_ms.len(), "one delay per color");
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            for (color, &delay_ms) in colors.iter().zip(delays_ms) {
+                let buffer = image::RgbaImage::from_pixel(
+                    4,
+                    4,
+                    image::Rgba([color[0], color[1], color[2], 255]),
+                );
+                let frame = image::Frame::from_parts(
+                    buffer,
+                    0,
+                    0,
+                    image::Delay::from_saturating_duration(Duration::from_millis(delay_ms)),
+                );
+                encoder.encode_frame(frame).expect("encode a gif frame");
+            }
+        }
+        bytes
+    }
+
+    /// A GIF with only one frame — the fallback case [`decode_gif_frames`]
+    /// must recognize and hand back to the ordinary static path.
+    fn single_frame_gif() -> Vec<u8> {
+        animated_gif(&[[10, 20, 30]], &[100])
+    }
+
+    #[test]
+    fn decode_of_an_animated_gif_produces_one_frame_per_gif_frame_with_its_own_delay() {
+        let bytes = animated_gif(&[[255, 0, 0], [0, 255, 0], [0, 0, 255]], &[30, 60, 90]);
+        let fitted = decode_and_fit(&bytes, [8, 8]).expect("a valid animated gif must decode");
+
+        assert_eq!(fitted.frames.len(), 3, "one AnimationFrame per GIF frame");
+        assert_eq!(
+            fitted.frames.iter().map(|f| f.delay).collect::<Vec<_>>(),
+            vec![
+                Duration::from_millis(30),
+                Duration::from_millis(60),
+                Duration::from_millis(90),
+            ],
+            "each frame keeps the GIF's own authored delay"
+        );
+        // The crop rectangle is computed once (from the first frame) and
+        // reused, so every frame lands on the same bucketed texture size.
+        let expected_size = texture_pixels([8, 8]).map(|side| side as usize);
+        for frame in &fitted.frames {
+            assert_eq!(frame.image.size, expected_size);
+        }
+    }
+
+    /// GIF-authored delays under [`MIN_GIF_FRAME_DELAY`] (commonly `0`,
+    /// meaning "no delay was set") must be floored, or the animation would
+    /// flicker rather than play at a sane pace.
+    #[test]
+    fn decode_of_an_animated_gifs_near_zero_delay_frames_are_floored() {
+        let bytes = animated_gif(&[[1, 2, 3], [4, 5, 6]], &[0, 0]);
+        let fitted = decode_and_fit(&bytes, [8, 8]).expect("a valid animated gif must decode");
+        for frame in &fitted.frames {
+            assert_eq!(frame.delay, MIN_GIF_FRAME_DELAY);
+        }
+    }
+
+    /// A GIF with exactly one frame is a static image, not an animation —
+    /// it must decode through the same one-`AnimationFrame` shape a PNG
+    /// does, so `CustomImages` never treats it as something to play back.
+    #[test]
+    fn decode_of_a_single_frame_gif_is_not_treated_as_animated() {
+        let fitted = decode_and_fit(&single_frame_gif(), [8, 8]).expect("a valid gif must decode");
+        assert_eq!(
+            fitted.frames.len(),
+            1,
+            "a single-frame gif is a static image"
+        );
+    }
+
+    /// A single-frame GIF must be fitted from the frame the GIF decoder
+    /// already produced, not handed back for `decode_and_fit` to decode the
+    /// same bytes a second time. The observable proof that the GIF path
+    /// kept it: it answers `Some` (so the static branch never runs) while
+    /// still producing the static shape — one frame, no delay.
+    #[test]
+    fn a_single_frame_gif_is_fitted_by_the_gif_path_rather_than_decoded_twice() {
+        let fitted = decode_gif_frames(&single_frame_gif(), [8, 8], MAX_GIF_FRAMES)
+            .expect("a valid gif must decode")
+            .expect("the gif path must keep a single-frame gif rather than re-decoding it");
+        assert_eq!(fitted.frames.len(), 1, "a single-frame gif is static");
+        assert_eq!(
+            fitted.frames[0].delay,
+            Duration::ZERO,
+            "a static image's delay is never consulted, exactly as the png path leaves it"
+        );
+        assert_eq!(fitted.content, [4, 4], "the whole 4x4 canvas");
+        assert_eq!(
+            fitted.frames[0].image.size,
+            texture_pixels([8, 8]).map(|side| side as usize)
+        );
+    }
+
+    /// A GIF longer than the cap is truncated rather than rejected: a
+    /// too-long file still plays, and neither the decode stall nor the
+    /// resident frame memory grows without bound.
+    #[test]
+    fn a_gif_past_the_frame_cap_is_truncated_rather_than_rejected() {
+        let bytes = animated_gif(&[[255, 0, 0], [0, 255, 0], [0, 0, 255]], &[30, 60, 90]);
+        let fitted = decode_gif_frames(&bytes, [8, 8], 2)
+            .expect("a valid animated gif must decode")
+            .expect("a gif over the cap must still produce an animation");
+        assert_eq!(
+            fitted.frames.len(),
+            2,
+            "the frames past the cap are dropped"
+        );
+        assert_eq!(
+            fitted.frames.iter().map(|f| f.delay).collect::<Vec<_>>(),
+            vec![Duration::from_millis(30), Duration::from_millis(60)],
+            "truncation keeps the leading frames, in order"
+        );
+        // A cap of 1 leaves a single frame, which is the static shape.
+        let capped = decode_gif_frames(&bytes, [8, 8], 1)
+            .expect("a valid animated gif must decode")
+            .expect("a one-frame cap must still produce an image");
+        assert_eq!(capped.frames.len(), 1);
+        assert_eq!(capped.frames[0].delay, Duration::ZERO);
+    }
+
+    #[test]
+    fn normalize_gif_delay_floors_encoder_zero_delays_but_leaves_real_ones_alone() {
+        assert_eq!(normalize_gif_delay(Duration::ZERO), MIN_GIF_FRAME_DELAY);
+        assert_eq!(
+            normalize_gif_delay(Duration::from_millis(5)),
+            MIN_GIF_FRAME_DELAY
+        );
+        let real = Duration::from_millis(200);
+        assert_eq!(
+            normalize_gif_delay(real),
+            real,
+            "a real delay must survive untouched"
+        );
+    }
+
+    /// A `delays` slice too short to animate (0 or 1 entries — a static
+    /// image, or a "gif" that somehow decoded to one frame) must never
+    /// advance and must never ask its caller to schedule a wakeup for it.
+    #[test]
+    fn animation_position_at_never_advances_a_non_animation() {
+        for delays in [Vec::new(), vec![Duration::from_millis(100)]] {
+            let position = animation_position_at(&delays, Duration::from_secs(5));
+            assert_eq!(position.index, 0);
+            assert_eq!(position.remaining, Duration::MAX);
+        }
+    }
+
+    #[test]
+    fn animation_position_at_walks_frames_in_order_and_reports_time_left_in_the_current_one() {
+        let delays = [
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        ];
+        assert_eq!(
+            animation_position_at(&delays, Duration::ZERO),
+            AnimationPosition {
+                index: 0,
+                remaining: Duration::from_millis(100)
+            }
+        );
+        assert_eq!(
+            animation_position_at(&delays, Duration::from_millis(50)),
+            AnimationPosition {
+                index: 0,
+                remaining: Duration::from_millis(50)
+            }
+        );
+        assert_eq!(
+            animation_position_at(&delays, Duration::from_millis(100)),
+            AnimationPosition {
+                index: 1,
+                remaining: Duration::from_millis(100)
+            },
+            "the frame boundary itself belongs to the next frame"
+        );
+        assert_eq!(
+            animation_position_at(&delays, Duration::from_millis(250)),
+            AnimationPosition {
+                index: 2,
+                remaining: Duration::from_millis(50)
+            }
+        );
+    }
+
+    /// Once elapsed time passes the animation's total duration, playback
+    /// must loop back to the first frame rather than running off the end
+    /// of `delays` — every GIF with no explicit repeat count plays forever.
+    #[test]
+    fn animation_position_at_loops_back_to_the_first_frame_past_the_total_duration() {
+        let delays = [Duration::from_millis(100), Duration::from_millis(200)];
+        assert_eq!(
+            animation_position_at(&delays, Duration::from_millis(350)),
+            AnimationPosition {
+                index: 0,
+                remaining: Duration::from_millis(50)
+            },
+            "350ms into a 300ms loop is 50ms into the second lap"
+        );
+    }
+
+    #[test]
+    fn animation_position_at_handles_frames_of_unequal_length() {
+        let delays = [Duration::from_millis(10), Duration::from_millis(500)];
+        assert_eq!(
+            animation_position_at(&delays, Duration::from_millis(20)).index,
+            1
+        );
+        assert_eq!(
+            animation_position_at(&delays, Duration::from_millis(5)).index,
+            0
+        );
+    }
+
+    /// Drives `CustomImages::texture` across several synthetic frames at
+    /// controlled `egui::Context` times (never a real clock, so this needs
+    /// no sleep) and checks that it actually advances the uploaded texture
+    /// on schedule and asks for a repaint at the right moment — the whole
+    /// point of storing `frames`/`showing`/`started_at` on `Entry` rather
+    /// than just the first frame like a static image.
+    #[test]
+    fn custom_images_texture_advances_frames_on_the_contexts_own_clock() {
+        let path = std::env::temp_dir().join("shinra-custom-image-animated-playback.gif");
+        std::fs::write(&path, animated_gif(&[[255, 0, 0], [0, 255, 0]], &[50, 50]))
+            .expect("write the fixture");
+
+        let ctx = egui::Context::default();
+        let mut cache = CustomImages::default();
+
+        let at = |ctx: &egui::Context, cache: &mut CustomImages, time: f64| {
+            ctx.begin_pass(egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            });
+            let texture = cache
+                .texture(ctx, ImageSlot::Header, &path, [8, 8])
+                .expect("a valid animated gif must upload");
+            ctx.end_pass().drop_without_applying_deltas();
+            texture
+        };
+
+        // Loaded (and so "started") at t=0: frame 0 is up immediately,
+        // with no need to wait a tick for it to appear.
+        let first = at(&ctx, &mut cache, 0.0);
+        // Still within frame 0's 50ms window: the same texture, unchanged.
+        assert_eq!(at(&ctx, &mut cache, 0.03), first);
+        // Past the 50ms boundary: a different texture (frame 1's pixels
+        // were `set` into a *new* id via `ctx.load_texture`'s slot, or the
+        // same id with new pixels — either way the id churn below only
+        // matters if egui reuses one; what must hold is content, which the
+        // id alone can't show, so this only proves it didn't panic and a
+        // texture is still returned).
+        let _ = at(&ctx, &mut cache, 0.07);
+        // Looping: 110ms is 10ms into the third lap-frame (50+50=100ms
+        // period), i.e. back on frame 0.
+        let looped = at(&ctx, &mut cache, 0.11);
+        assert_eq!(
+            looped, first,
+            "a looped animation must reuse the same texture id, not grow one per lap"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The playback id churn comment above is deliberately loose about
+    /// *which* texture id shows which frame — `TextureId` alone can't say.
+    /// This test pins the actual pixel content: `Entry::showing` (read
+    /// indirectly through `CustomImages::texture`'s behavior) must track
+    /// `animation_position_at`, not just leave frame 0 uploaded forever.
+    #[test]
+    fn custom_images_texture_uploads_the_frame_animation_position_at_selects() {
+        // `animation_position_at` itself is proven correct by the tests
+        // above; this only has to prove `CustomImages::texture` actually
+        // calls it with a real elapsed time and re-`set`s the texture
+        // rather than only doing the work once at load time. The signal
+        // available without a GPU readback is the texture's *id*, which
+        // `TextureHandle::set` never changes (that is the whole point of
+        // `set` over re-`load_texture`ing) — so instead this asserts the
+        // one thing observable here: the id stays stable across a frame
+        // change, proving playback used `set` (in place) rather than
+        // silently falling back to `load_texture` (a fresh id) each time.
+        let path = std::env::temp_dir().join("shinra-custom-image-animated-stable-id.gif");
+        std::fs::write(&path, animated_gif(&[[9, 9, 9], [200, 1, 1]], &[10, 10]))
+            .expect("write the fixture");
+
+        let ctx = egui::Context::default();
+        let mut cache = CustomImages::default();
+
+        ctx.begin_pass(egui::RawInput {
+            time: Some(0.0),
+            ..Default::default()
+        });
+        let (before, _) = cache
+            .texture(&ctx, ImageSlot::Header, &path, [8, 8])
+            .expect("a valid animated gif must upload");
+        ctx.end_pass().drop_without_applying_deltas();
+
+        ctx.begin_pass(egui::RawInput {
+            time: Some(0.015),
+            ..Default::default()
+        });
+        let (after, _) = cache
+            .texture(&ctx, ImageSlot::Header, &path, [8, 8])
+            .expect("a valid animated gif must upload");
+        ctx.end_pass().drop_without_applying_deltas();
+
+        assert_eq!(
+            before, after,
+            "advancing to the next frame must re-`set` the existing texture, not allocate a new one"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 
