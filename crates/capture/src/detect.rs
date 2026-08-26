@@ -19,7 +19,7 @@ pub const LOGIN_RETURN_SIGNATURE_SIZE: usize = 0x62;
 /// Bound on candidate signature matches checked per payload scan, so a
 /// payload that happens to contain many literal occurrences of
 /// [`SERVER_SIGNATURE`] cannot spin the scan indefinitely.
-const MAX_SCAN_FRAGMENTS: usize = 1000;
+const MAX_SIGNATURE_CANDIDATES: usize = 1000;
 
 /// Payload-size ceiling for the subnet-reconnect path (issue #258).
 ///
@@ -96,8 +96,9 @@ impl fmt::Display for Conn {
 /// mid-connection (issue #282) sees its first packets at an arbitrary byte
 /// offset into the frame stream. Locating the boundary from the signature
 /// backward, instead of assuming it forward from `offset = 0`, is what lets
-/// this recognize the game server either way. Bounded to `MAX_SCAN_FRAGMENTS`
-/// candidate matches; never panics on malformed input.
+/// this recognize the game server either way. Bounded to
+/// `MAX_SIGNATURE_CANDIDATES` candidate matches; never panics on malformed
+/// input.
 pub fn looks_like_game_server(payload: &[u8]) -> bool {
     let sig_len = SERVER_SIGNATURE.len();
     let min_len = SERVER_SIGNATURE_OFFSET + sig_len;
@@ -111,7 +112,7 @@ pub fn looks_like_game_server(payload: &[u8]) -> bool {
             continue;
         }
         checked += 1;
-        if checked > MAX_SCAN_FRAGMENTS {
+        if checked > MAX_SIGNATURE_CANDIDATES {
             break;
         }
 
@@ -620,6 +621,25 @@ mod tests {
             noise.push((state & 0xFF) as u8);
         }
         assert!(!looks_like_game_server(&noise));
+    }
+
+    #[test]
+    fn scan_terminates_when_candidates_exceed_the_cap() {
+        // Guard against a future off-by-one or misplaced increment in the
+        // MAX_SIGNATURE_CANDIDATES cap logic: build a payload with more
+        // literal SERVER_SIGNATURE occurrences than the cap allows, none of
+        // which form a valid frame header, and assert the scan still
+        // terminates and correctly reports no detection instead of, say,
+        // panicking or looping past the payload's bounds.
+        let block_len = SERVER_SIGNATURE.len() + 10; // signature + 0xFF filler
+        let block_count = MAX_SIGNATURE_CANDIDATES + 200;
+        let mut payload = Vec::with_capacity(block_len * block_count);
+        for _ in 0..block_count {
+            payload.extend_from_slice(&SERVER_SIGNATURE);
+            payload.extend_from_slice(&[0xFFu8; 10]);
+        }
+
+        assert!(!looks_like_game_server(&payload));
     }
 
     #[test]
