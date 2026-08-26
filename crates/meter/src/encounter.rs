@@ -8841,10 +8841,18 @@ mod tests {
                 "nobody is down right now, so the reset diagnostic must not \
                  report the one player who merely died earlier in the pull"
             );
-            assert!(
-                !logged("party_down=1/2"),
-                "the cumulative-deaths count must not leak into the live down-state diagnostic"
-            );
+            // No negative assertion here (e.g. `!logged("party_down=1/2")`):
+            // per this module's doc comment above, `CAPTURED` is shared by
+            // every test in the binary and never cleared, so an *absence*
+            // proves nothing and a generic line like `party_down=1/2` is
+            // not unique to this test -- `reset_clears_deaths` (the
+            // `deaths` module) legitimately logs that exact line for an
+            // unrelated scenario, so asserting its absence here raced
+            // against test scheduling instead of testing this fix. The
+            // positive assertion above already pins the fix: if the
+            // cumulative-count bug regressed, this reset would log
+            // `party_down=1/2` instead of `0/2` and that assertion alone
+            // would fail.
         }
 
         /// issue #256: pins every field of the new "boss death did not end
