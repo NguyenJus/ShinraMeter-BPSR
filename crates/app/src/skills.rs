@@ -6,7 +6,7 @@
 //! so all of it is unit-testable with no window. `crates/app/src/ui.rs`
 //! (T4) owns painting this; it must not be touched here.
 
-use crate::ui::{fmt_pct0, fmt_short};
+use crate::ui::{fmt_duration, fmt_pct0, fmt_short};
 use bpsr_meter::{PlayerRow, SkillRow};
 
 /// One column of a breakdown tab (issue #16, D5; issue #245), in
@@ -55,6 +55,22 @@ pub enum SkillColumn {
     /// counts rather than landed hits.
     Casts,
     CastPerMin,
+    /// The Buff tab's uptime-percentage column (issue #267). Reads
+    /// `SkillRow::share_pct`, repurposed the same way `HealPct`/`AmountPct`
+    /// already repurpose it — see `bpsr_meter::PlayerRow::buffs`'s doc
+    /// comment for the full field remapping.
+    UptimePct,
+    /// The Buff tab's apply-count column (issue #267). Reads
+    /// `SkillRow::hits`, repurposed from "hits landed" to "apply→remove
+    /// cycles closed" — a distinct label from `Casts`/`Hits` because
+    /// neither word fits what this counts.
+    BuffCount,
+    /// The Buff tab's mean-duration-per-application column (issue #267).
+    /// Reads `SkillRow::avg` (milliseconds) through `fmt_duration`, the
+    /// same `MM:SS` formatter the header stat pills use, rather than
+    /// `fmt_short`'s raw-number formatting every other `Avg`-shaped column
+    /// uses — a duration is a time, not a count.
+    Duration,
 }
 
 impl SkillColumn {
@@ -81,6 +97,9 @@ impl SkillColumn {
             SkillColumn::AmountPct => "% Amt",
             SkillColumn::Casts => "Casts",
             SkillColumn::CastPerMin => "Cast/m",
+            SkillColumn::UptimePct => "% Uptime",
+            SkillColumn::BuffCount => "Count",
+            SkillColumn::Duration => "Duration",
         }
     }
 
@@ -175,6 +194,16 @@ impl SkillColumn {
             // labels instead.
             SkillColumn::HitPerMin => 56.0,
             SkillColumn::CastPerMin => 64.0,
+            // Issue #267, measured through `every_tab_header_label_fits_
+            // its_column_at_every_sort_state` (`ui.rs`) the same way every
+            // other width here is: sorted (arrow included), "% Uptime"
+            // measures 72.97pt and "Duration" 67.41pt, both wider than the
+            // `DmgPct`/`HealPct`/`Avg`-family budgets their own values
+            // would otherwise fit. `Count`'s value and label both fit the
+            // plain `Hits`/`Casts` 56pt budget.
+            SkillColumn::UptimePct => 80.0,
+            SkillColumn::Duration => 72.0,
+            SkillColumn::BuffCount => 56.0,
         }
     }
 
@@ -202,6 +231,9 @@ impl SkillColumn {
             SkillColumn::HealPct | SkillColumn::AmountPct => fmt_pct0(row.share_pct),
             SkillColumn::Casts => fmt_short(row.hits as i64),
             SkillColumn::CastPerMin => format!("{:.2}", row.hits_per_min),
+            SkillColumn::UptimePct => fmt_pct0(row.share_pct),
+            SkillColumn::BuffCount => fmt_short(row.hits as i64),
+            SkillColumn::Duration => fmt_duration(row.avg.max(0.0) as u64),
         }
     }
 
@@ -247,6 +279,9 @@ impl SkillColumn {
             SkillColumn::HealPct | SkillColumn::AmountPct => row.share_pct as f64,
             SkillColumn::Casts => row.hits as f64,
             SkillColumn::CastPerMin => row.hits_per_min,
+            SkillColumn::UptimePct => row.share_pct as f64,
+            SkillColumn::BuffCount => row.hits as f64,
+            SkillColumn::Duration => row.avg,
         }
     }
 }
@@ -346,6 +381,18 @@ const CAST_COLUMNS: [SkillColumn; 4] = [
     SkillColumn::CastPerMin,
 ];
 
+/// The Buff tab's columns (issue #267) — the reference's
+/// `EnduranceDebuffHeader`: name, uptime %, count, duration. No leading
+/// `Icon`: there is no vendored buff-icon table (only skills have one), so
+/// an icon column here would paint nothing but the generated placeholder
+/// disc for every single row.
+const BUFF_COLUMNS: [SkillColumn; 4] = [
+    SkillColumn::Name,
+    SkillColumn::UptimePct,
+    SkillColumn::BuffCount,
+    SkillColumn::Duration,
+];
+
 impl SkillTab {
     /// Tab-strip label. Kept to the reference's own wording where it has
     /// one, and to issue #245's where it doesn't.
@@ -369,9 +416,7 @@ impl SkillTab {
             SkillTab::Heal => &HEAL_COLUMNS,
             SkillTab::Dealt | SkillTab::Received => &AMOUNT_COLUMNS,
             SkillTab::Casts => &CAST_COLUMNS,
-            // A tab with no data has no rows to give columns to; the body
-            // paints `empty_message` instead of a header row.
-            SkillTab::Buff => &[],
+            SkillTab::Buff => &BUFF_COLUMNS,
         }
     }
 
@@ -386,7 +431,9 @@ impl SkillTab {
             SkillTab::Heal => SkillColumn::Heal,
             SkillTab::Dealt | SkillTab::Received => SkillColumn::Amount,
             SkillTab::Casts => SkillColumn::Casts,
-            SkillTab::Buff => SkillColumn::Name,
+            // Issue #267: uptime is this tab's "amount", the same role
+            // `Damage`/`Heal`/`Amount`/`Casts` play on every other tab.
+            SkillTab::Buff => SkillColumn::UptimePct,
         };
         SkillSort {
             column,
@@ -395,10 +442,6 @@ impl SkillTab {
     }
 
     /// This tab's rows out of one player's snapshot row.
-    ///
-    /// `Buff` and `Casts` return nothing: neither has any packet-level
-    /// tracking behind it (see `empty_message`), so the honest answer is an
-    /// empty list and an explanatory body, not fabricated numbers.
     pub fn rows(self, row: &PlayerRow) -> &[SkillRow] {
         match self {
             SkillTab::Dps => &row.skills,
@@ -406,7 +449,7 @@ impl SkillTab {
             SkillTab::Dealt => &row.dealt,
             SkillTab::Received => &row.received,
             SkillTab::Casts => &row.casts,
-            SkillTab::Buff => &[],
+            SkillTab::Buff => &row.buffs,
         }
     }
 
@@ -415,24 +458,22 @@ impl SkillTab {
     /// existence would leave the user guessing why the reference has a tab
     /// this build doesn't — but it is painted muted and says why when
     /// opened.
+    ///
+    /// Issue #267 gave `Buff` a real decode path (`AoiSyncDelta.buff_effect`),
+    /// so every tab is tracked today. `SkillTab` keeps this method (rather
+    /// than callers dropping it as dead) so the next untracked tab has an
+    /// obvious place to land.
     pub fn is_tracked(self) -> bool {
-        !matches!(self, SkillTab::Buff)
+        true
     }
 
     /// What an empty body says. An untracked tab explains the gap rather
     /// than implying the fight simply had none of that; a tracked one falls
-    /// through to the caller's live/history wording.
+    /// through to the caller's live/history wording. Every tab is tracked
+    /// today (issue #267), so this always returns `None` — kept, like
+    /// `is_tracked`, as the landing spot for the next tab that isn't.
     pub fn untracked_message(self) -> Option<&'static str> {
-        match self {
-            SkillTab::Buff => {
-                // Issue #267 has the full decode recipe and the reason it
-                // is not here: the two reference trackers disagree on
-                // `AoiSyncDelta`'s buff field tag, and this project's own
-                // dumps cannot yet tell them apart.
-                Some("Buff uptime is not tracked yet (needs buff packet decoding — see issue #267)")
-            }
-            _ => None,
-        }
+        None
     }
 }
 
@@ -683,6 +724,7 @@ mod tests {
             dealt: Vec::new(),
             received: Vec::new(),
             casts: Vec::new(),
+            buffs: Vec::new(),
         }
     }
 
@@ -758,6 +800,9 @@ mod tests {
             SkillColumn::AmountPct,
             SkillColumn::Casts,
             SkillColumn::CastPerMin,
+            SkillColumn::UptimePct,
+            SkillColumn::BuffCount,
+            SkillColumn::Duration,
         ] {
             assert!(column.sortable(), "{column:?} should be sortable");
         }
@@ -767,9 +812,12 @@ mod tests {
 
     #[test]
     fn every_tab_but_buff_has_a_name_column_and_a_leading_icon() {
+        // Issue #267: `Buff` has a real `Name` column too now, just no
+        // leading `Icon` — there is no vendored buff-icon table (see
+        // `BUFF_COLUMNS`'s doc comment).
         for tab in SKILL_TABS {
             if tab == SkillTab::Buff {
-                assert!(tab.columns().is_empty(), "{tab:?} should have no columns");
+                assert_eq!(tab.columns()[0], SkillColumn::Name, "{tab:?}");
                 continue;
             }
             let columns = tab.columns();
@@ -781,9 +829,6 @@ mod tests {
     #[test]
     fn every_tabs_default_sort_column_is_one_of_its_own_columns() {
         for tab in SKILL_TABS {
-            if tab == SkillTab::Buff {
-                continue;
-            }
             let sort = tab.default_sort();
             assert!(
                 tab.columns().contains(&sort.column),
@@ -822,16 +867,10 @@ mod tests {
     }
 
     #[test]
-    fn untracked_tabs_say_so_and_tracked_ones_do_not() {
-        assert!(!SkillTab::Buff.is_tracked());
-        assert!(SkillTab::Buff.untracked_message().is_some());
-        for tab in [
-            SkillTab::Dps,
-            SkillTab::Heal,
-            SkillTab::Dealt,
-            SkillTab::Received,
-            SkillTab::Casts,
-        ] {
+    fn every_tab_is_tracked() {
+        // Issue #267 gave `Buff` a real decode path, so nothing in
+        // `SKILL_TABS` is untracked any more.
+        for tab in SKILL_TABS {
             assert!(tab.is_tracked(), "{tab:?}");
             assert_eq!(tab.untracked_message(), None, "{tab:?}");
         }
@@ -850,7 +889,8 @@ mod tests {
         assert_eq!(SkillTab::Received.rows(&row)[0].skill_id, 5);
         row.casts = vec![skill_row(6, 0)];
         assert_eq!(SkillTab::Casts.rows(&row)[0].skill_id, 6);
-        assert!(SkillTab::Buff.rows(&row).is_empty());
+        row.buffs = vec![skill_row(7, 70)];
+        assert_eq!(SkillTab::Buff.rows(&row)[0].skill_id, 7);
     }
 
     #[test]

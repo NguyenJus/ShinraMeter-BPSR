@@ -232,6 +232,7 @@ mod tests {
                 dealt: Vec::new(),
                 received: Vec::new(),
                 casts: Vec::new(),
+                buffs: Vec::new(),
             }],
             encounter: EncounterInfo::default(),
         };

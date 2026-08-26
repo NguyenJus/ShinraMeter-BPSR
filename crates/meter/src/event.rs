@@ -299,6 +299,23 @@ pub enum ProtocolEvent {
         uid: i64,
         reason: Option<DisappearReason>,
     },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::BuffApply` (issue #267). See
+    /// `Meter::apply_buff_apply` for what the meter does with it.
+    BuffApply {
+        host_uid: i64,
+        buff_uuid: i32,
+        base_id: Option<i32>,
+        adds_layer: bool,
+        timestamp_ms: u64,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::BuffRemove` (issue #267). See
+    /// `Meter::apply_buff_remove`.
+    BuffRemove {
+        host_uid: i64,
+        buff_uuid: i32,
+        removes_layer: bool,
+        timestamp_ms: u64,
+    },
 }
 
 #[cfg(test)]

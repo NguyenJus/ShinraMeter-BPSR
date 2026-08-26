@@ -1902,6 +1902,7 @@ mod tests {
             dealt: Vec::new(),
             received: Vec::new(),
             casts: Vec::new(),
+            buffs: Vec::new(),
         };
         assert_eq!((ColumnKind::Deaths.spec().text)(&row), "12");
     }

@@ -10,7 +10,9 @@ use crate::event::{
 use crate::fight::{FightConfig, FightEndCause, FightState};
 use crate::phase;
 use crate::reset::{EnemyState, ResetConfig, ResetReason, check_hp_rollback};
-use crate::stats::{EncounterInfo, PlayerRow, PlayerStats, SkillRow, SkillStats, Snapshot};
+use crate::stats::{
+    ActiveBuff, EncounterInfo, PlayerRow, PlayerStats, SkillRow, SkillStats, Snapshot,
+};
 use crate::tables;
 
 /// Debounce window for `DamageEvent::is_dead`: a death for the same uid
@@ -751,6 +753,25 @@ impl Meter {
                 None
             }
             ProtocolEvent::EnemyHp(e) => self.apply_enemy_hp(e),
+            ProtocolEvent::BuffApply {
+                host_uid,
+                buff_uuid,
+                base_id,
+                adds_layer,
+                timestamp_ms,
+            } => {
+                self.apply_buff_apply(*host_uid, *buff_uuid, *base_id, *adds_layer, *timestamp_ms);
+                None
+            }
+            ProtocolEvent::BuffRemove {
+                host_uid,
+                buff_uuid,
+                removes_layer,
+                timestamp_ms,
+            } => {
+                self.apply_buff_remove(*host_uid, *buff_uuid, *removes_layer, *timestamp_ms);
+                None
+            }
             ProtocolEvent::Scene { level_map_id } => {
                 // Sparse, transition-only diagnostic (issue #69): a scene
                 // sync packet can repeat while the player stays in the same
@@ -2118,6 +2139,96 @@ impl Meter {
         }
     }
 
+    /// Opens (or refreshes) one in-flight buff interval (issue #267). Only
+    /// enriches an existing row, like `record_breakdowns` — a buff landing
+    /// on a uid with no row yet is not a participant in this encounter.
+    ///
+    /// A `buff_uuid` already active is a refresh/stack, not a fresh
+    /// application: the original `start_ms` is kept (so re-applying a
+    /// still-up buff does not reset its uptime clock), and `base_id` is
+    /// backfilled only if this event supplies one the opening event didn't
+    /// (see `ActiveBuff::base_id`'s doc comment). An `adds_layer` event
+    /// (`StackLayer`) additionally grows the instance's layer count, so a
+    /// later `RemoveLayer` sheds that layer rather than closing the whole
+    /// interval — see `ActiveBuff::layers`.
+    fn apply_buff_apply(
+        &mut self,
+        host_uid: i64,
+        buff_uuid: i32,
+        base_id: Option<i32>,
+        adds_layer: bool,
+        timestamp_ms: u64,
+    ) {
+        if self.fight_end_ms.is_some() {
+            return;
+        }
+        let Some(stats) = self.players.get_mut(&host_uid) else {
+            return;
+        };
+        match stats.active_buffs.get_mut(&buff_uuid) {
+            Some(active) => {
+                if active.base_id.is_none() {
+                    active.base_id = base_id;
+                }
+                if adds_layer {
+                    active.layers += 1;
+                }
+            }
+            None => {
+                stats.active_buffs.insert(
+                    buff_uuid,
+                    ActiveBuff {
+                        base_id,
+                        start_ms: timestamp_ms,
+                        layers: 1,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Closes one in-flight buff interval (issue #267), crediting its
+    /// duration to `PlayerStats::buffs[base_id]`. A `buff_uuid` with no
+    /// open interval (no matching apply seen, or already closed — a
+    /// retransmitted remove) is a no-op, and one whose interval never
+    /// learned a `base_id` is dropped silently: there is nothing to
+    /// attribute the uptime to (see `ProtocolEvent::BuffRemove`'s doc
+    /// comment for why this happens for roughly half of real removes).
+    ///
+    /// A `removes_layer` event (`RemoveLayer`) only sheds one layer: the
+    /// interval closes when the last one goes, which for the overwhelmingly
+    /// common single-layer instance is that very event. A full `Remove`
+    /// closes the interval outright, however many layers it held.
+    fn apply_buff_remove(
+        &mut self,
+        host_uid: i64,
+        buff_uuid: i32,
+        removes_layer: bool,
+        timestamp_ms: u64,
+    ) {
+        if self.fight_end_ms.is_some() {
+            return;
+        }
+        let Some(stats) = self.players.get_mut(&host_uid) else {
+            return;
+        };
+        if removes_layer && let Some(active) = stats.active_buffs.get_mut(&buff_uuid) {
+            active.layers = active.layers.saturating_sub(1);
+            if active.layers > 0 {
+                return;
+            }
+        }
+        let Some(active) = stats.active_buffs.remove(&buff_uuid) else {
+            return;
+        };
+        let Some(base_id) = active.base_id else {
+            return;
+        };
+        let entry = stats.buffs.entry(base_id).or_default();
+        entry.total_uptime_ms += timestamp_ms.saturating_sub(active.start_ms);
+        entry.apply_count += 1;
+    }
+
     /// Accumulates one event into issue #245's per-tab breakdowns: the
     /// attacker's outgoing healing, and the target's incoming everything
     /// (damage taken and healing received alike).
@@ -2732,15 +2843,16 @@ impl Meter {
                 // returns for `Buff`, which is indistinguishable from "no
                 // events yet" to every consumer since none is looking.
                 let wants_breakdowns = focus.is_none_or(|uids| uids.contains(&p.uid));
-                let (heals, dealt, received, casts) = if wants_breakdowns {
+                let (heals, dealt, received, casts, buffs) = if wants_breakdowns {
                     (
                         breakdown_rows(&p.heals, p.total_heal, dps_duration_ms),
                         dealt_rows(p, dps_duration_ms),
                         breakdown_rows(&p.incoming, p.total_incoming, dps_duration_ms),
                         cast_rows(p, dps_duration_ms),
+                        buff_rows(p, dps_duration_ms),
                     )
                 } else {
-                    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
                 };
                 PlayerRow {
                     uid: p.uid,
@@ -2769,6 +2881,7 @@ impl Meter {
                     dealt,
                     received,
                     casts,
+                    buffs,
                 }
             })
             .collect();
@@ -3010,6 +3123,43 @@ fn dealt_rows(stats: &PlayerStats, dps_duration_ms: u64) -> Vec<SkillRow> {
     )
 }
 
+/// The Buff tab's rows (issue #267): this player's per-buff-type uptime,
+/// uptime-descending. Built from `PlayerStats::buffs` only — a buff still
+/// active when the snapshot is taken contributes nothing until its interval
+/// closes (see `BuffStats`'s doc comment).
+///
+/// Reuses `SkillRow` verbatim, like every other breakdown tab — see
+/// `PlayerRow::buffs`'s doc comment for the field remapping.
+fn buff_rows(stats: &PlayerStats, dps_duration_ms: u64) -> Vec<SkillRow> {
+    let mut rows: Vec<SkillRow> = stats
+        .buffs
+        .iter()
+        .map(|(&base_id, buff)| SkillRow {
+            skill_id: base_id,
+            damage: buff.total_uptime_ms as i64,
+            share_pct: if dps_duration_ms > 0 {
+                (buff.total_uptime_ms as f64 / dps_duration_ms as f64 * 100.0) as f32
+            } else {
+                0.0
+            },
+            crit_pct: 0.0,
+            max_crit: 0,
+            avg_crit: 0.0,
+            avg_white: 0.0,
+            avg: if buff.apply_count > 0 {
+                buff.total_uptime_ms as f64 / buff.apply_count as f64
+            } else {
+                0.0
+            },
+            hits: buff.apply_count as u64,
+            crit_hits: 0,
+            hits_per_min: 0.0,
+        })
+        .collect();
+    rows.sort_by_key(|s| std::cmp::Reverse(s.damage));
+    rows
+}
+
 /// Builds the "scene changed" diagnostic line (issue #69), or `None` when
 /// `new_scene_id` matches `previous` — the transition-only guard that keeps
 /// this out of the #87-style flood. `new_scene_id` is `Option<u32>` so this
@@ -3241,6 +3391,214 @@ mod tests {
             row.casts[0].hits_per_min,
             row.skills[0].hits_per_min
         );
+    }
+
+    // -- issue #267: Buff tab ---------------------------------------------
+
+    fn buff_apply(host_uid: i64, buff_uuid: i32, base_id: Option<i32>, ts: u64) -> ProtocolEvent {
+        ProtocolEvent::BuffApply {
+            host_uid,
+            buff_uuid,
+            base_id,
+            adds_layer: false,
+            timestamp_ms: ts,
+        }
+    }
+
+    /// The `StackLayer` shape of an apply: a new layer on an instance that
+    /// is already up.
+    fn buff_stack(host_uid: i64, buff_uuid: i32, ts: u64) -> ProtocolEvent {
+        ProtocolEvent::BuffApply {
+            host_uid,
+            buff_uuid,
+            base_id: None,
+            adds_layer: true,
+            timestamp_ms: ts,
+        }
+    }
+
+    /// The full `Remove`: the whole instance, however many layers.
+    fn buff_remove(host_uid: i64, buff_uuid: i32, ts: u64) -> ProtocolEvent {
+        ProtocolEvent::BuffRemove {
+            host_uid,
+            buff_uuid,
+            removes_layer: false,
+            timestamp_ms: ts,
+        }
+    }
+
+    /// The `RemoveLayer` shape: one layer off, which for a single-layer
+    /// instance is the whole thing.
+    fn buff_remove_layer(host_uid: i64, buff_uuid: i32, ts: u64) -> ProtocolEvent {
+        ProtocolEvent::BuffRemove {
+            host_uid,
+            buff_uuid,
+            removes_layer: true,
+            timestamp_ms: ts,
+        }
+    }
+
+    /// The dominant real-capture shape (see `pb::EBuffEventType`): one
+    /// `AddTo` closed by one `RemoveLayer`. Layer accounting must not
+    /// change it — the single layer it opened with is the one shed, so the
+    /// interval closes exactly as a full `Remove` would.
+    #[test]
+    fn a_single_layer_buff_is_closed_by_one_remove_layer() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0));
+        m.apply(&buff_apply(1, 417, Some(3_210_031), 1_000));
+        m.apply(&buff_remove_layer(1, 417, 4_000));
+        let snap = m.snapshot(5_000);
+        assert_eq!(snap.rows[0].buffs[0].damage, 3_000);
+        assert_eq!(snap.rows[0].buffs[0].hits, 1);
+    }
+
+    /// Issue #267 follow-up: a stacking buff that sheds one of two layers
+    /// stays up. Closing on the first `RemoveLayer` would have ended the
+    /// interval early and left the rest of the buff's uptime uncounted (the
+    /// reopened interval would carry no `base_id` and be dropped).
+    #[test]
+    fn shedding_one_of_two_layers_keeps_the_buff_up() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0));
+        m.apply(&buff_apply(1, 417, Some(3_210_031), 1_000));
+        m.apply(&buff_stack(1, 417, 2_000));
+        m.apply(&buff_remove_layer(1, 417, 3_000));
+        // Still up: nothing closed, so nothing is credited yet.
+        assert!(m.snapshot(3_500).rows[0].buffs.is_empty());
+        m.apply(&buff_remove_layer(1, 417, 6_000));
+        let snap = m.snapshot(7_000);
+        // One continuous interval from the original start, not two.
+        assert_eq!(snap.rows[0].buffs.len(), 1);
+        assert_eq!(snap.rows[0].buffs[0].damage, 5_000);
+        assert_eq!(snap.rows[0].buffs[0].hits, 1);
+    }
+
+    /// A full `Remove` ends a multi-layer instance outright, rather than
+    /// leaving it up with its remaining layers.
+    #[test]
+    fn a_full_remove_closes_a_multi_layer_buff() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0));
+        m.apply(&buff_apply(1, 417, Some(3_210_031), 1_000));
+        m.apply(&buff_stack(1, 417, 2_000));
+        m.apply(&buff_stack(1, 417, 2_500));
+        m.apply(&buff_remove(1, 417, 4_000));
+        let snap = m.snapshot(5_000);
+        assert_eq!(snap.rows[0].buffs[0].damage, 3_000);
+        assert_eq!(snap.rows[0].buffs[0].hits, 1);
+        // Truly closed: a stray remove afterwards finds nothing to credit.
+        m.apply(&buff_remove(1, 417, 6_000));
+        assert_eq!(m.snapshot(7_000).rows[0].buffs[0].hits, 1);
+    }
+
+    #[test]
+    fn a_closed_apply_remove_interval_credits_uptime_to_its_base_id() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0)); // open the row
+        m.apply(&buff_apply(1, 417, Some(3_210_031), 1_000));
+        m.apply(&buff_remove(1, 417, 4_000));
+        let snap = m.snapshot(5_000);
+        let row = &snap.rows[0];
+        assert_eq!(row.buffs.len(), 1);
+        assert_eq!(row.buffs[0].skill_id, 3_210_031);
+        assert_eq!(row.buffs[0].damage, 3_000); // uptime_ms
+        assert_eq!(row.buffs[0].hits, 1); // apply_count
+        assert!((row.buffs[0].avg - 3_000.0).abs() < 0.01);
+    }
+
+    /// A buff still active when the snapshot is read contributes nothing
+    /// yet — see `BuffStats`'s doc comment for why this is an accepted v1
+    /// undercount rather than a wrong number.
+    #[test]
+    fn a_still_active_buff_contributes_no_uptime_until_it_closes() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0));
+        m.apply(&buff_apply(1, 417, Some(3_210_031), 1_000));
+        let snap = m.snapshot(5_000);
+        assert!(snap.rows[0].buffs.is_empty());
+    }
+
+    /// A `BuffRemove` with no matching open interval (a stray/duplicate
+    /// event) must not panic or fabricate a row.
+    #[test]
+    fn a_remove_with_no_matching_apply_is_a_no_op() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0));
+        m.apply(&buff_remove(1, 417, 4_000));
+        assert!(m.snapshot(5_000).rows[0].buffs.is_empty());
+    }
+
+    /// A remove event never carries a `base_id` (see
+    /// `ProtocolEvent::BuffRemove`'s doc comment) — an interval that never
+    /// learned one from its apply event is dropped rather than attributed
+    /// to a fabricated id.
+    #[test]
+    fn an_interval_that_never_learned_a_base_id_is_dropped_on_remove() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0));
+        m.apply(&buff_apply(1, 417, None, 1_000));
+        m.apply(&buff_remove(1, 417, 4_000));
+        assert!(m.snapshot(5_000).rows[0].buffs.is_empty());
+    }
+
+    /// A refresh/stack (a second `BuffApply` for the same `buff_uuid`
+    /// before it closes) must not reset the uptime clock — the interval
+    /// keeps its original `start_ms`.
+    #[test]
+    fn reapplying_a_still_active_buff_keeps_its_original_start() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0));
+        m.apply(&buff_apply(1, 417, Some(3_210_031), 1_000));
+        m.apply(&buff_apply(1, 417, Some(3_210_031), 2_000)); // refresh
+        m.apply(&buff_remove(1, 417, 4_000));
+        let snap = m.snapshot(5_000);
+        // 4_000 - 1_000, not 4_000 - 2_000: the refresh did not restart the
+        // clock.
+        assert_eq!(snap.rows[0].buffs[0].damage, 3_000);
+        assert_eq!(snap.rows[0].buffs[0].hits, 1);
+    }
+
+    /// A later apply-like event for the same instance can backfill a
+    /// `base_id` the opening one didn't carry (issue #267's common case —
+    /// roughly half of real `AddTo` events carry no double-encoded
+    /// `BuffInfo`).
+    #[test]
+    fn a_later_event_can_backfill_a_missing_base_id() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0));
+        m.apply(&buff_apply(1, 417, None, 1_000));
+        m.apply(&buff_apply(1, 417, Some(3_210_031), 2_000));
+        m.apply(&buff_remove(1, 417, 4_000));
+        let snap = m.snapshot(5_000);
+        assert_eq!(snap.rows[0].buffs[0].skill_id, 3_210_031);
+        assert_eq!(snap.rows[0].buffs[0].damage, 3_000);
+    }
+
+    /// Two closed applications of the same buff accumulate uptime and
+    /// apply count together, not overwrite.
+    #[test]
+    fn two_closed_applications_of_the_same_buff_accumulate() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 0));
+        m.apply(&buff_apply(1, 417, Some(3_210_031), 1_000));
+        m.apply(&buff_remove(1, 417, 3_000)); // 2s
+        m.apply(&buff_apply(1, 417, Some(3_210_031), 3_500));
+        m.apply(&buff_remove(1, 417, 5_500)); // 2s
+        let snap = m.snapshot(6_000);
+        assert_eq!(snap.rows[0].buffs[0].damage, 4_000);
+        assert_eq!(snap.rows[0].buffs[0].hits, 2);
+        assert!((snap.rows[0].buffs[0].avg - 2_000.0).abs() < 0.01);
+    }
+
+    /// A buff on a uid with no row in the roster yet must not open one —
+    /// mirrors `record_breakdowns`' rule for incoming damage/healing.
+    #[test]
+    fn a_buff_on_an_unrostered_uid_opens_no_row() {
+        let mut m = Meter::new();
+        m.apply(&buff_apply(1, 417, Some(3_210_031), 1_000));
+        m.apply(&buff_remove(1, 417, 4_000));
+        assert!(m.snapshot(5_000).rows.is_empty());
     }
 
     #[test]

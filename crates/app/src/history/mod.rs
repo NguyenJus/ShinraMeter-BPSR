@@ -208,6 +208,10 @@ impl PlayerRecord {
             dealt: Vec::new(),
             received: Vec::new(),
             casts: Vec::new(),
+            // Issue #267: same story as `heals`/`dealt`/`received`/`casts`
+            // above — the Buff tab is live-only, and the schema has no
+            // per-buff column to replay.
+            buffs: Vec::new(),
         }
     }
 }
@@ -394,6 +398,7 @@ mod tests {
             dealt: Vec::new(),
             received: Vec::new(),
             casts: Vec::new(),
+            buffs: Vec::new(),
         }
     }
 
