@@ -617,6 +617,8 @@ mod tests {
                 season_level: Some(42),
                 season_strength: Some(3_333),
                 skill_ids: Vec::new(),
+                position: None,
+                target_position: None,
             }),
             0,
         );
@@ -650,6 +652,8 @@ mod tests {
                 season_level: None,
                 season_strength: None,
                 skill_ids: vec![(3905, 1), (102640, 4), (3926, 3), (999_999_999, 9)],
+                position: None,
+                target_position: None,
             }),
             0,
         );
@@ -671,6 +675,8 @@ mod tests {
                 season_level: None,
                 season_strength: None,
                 skill_ids: Vec::new(),
+                position: None,
+                target_position: None,
             }),
             0,
         );
@@ -690,6 +696,8 @@ mod tests {
                 max_hp: Some(100),
                 monster_id: Some(3),
                 timestamp_ms: 1_234,
+                position: None,
+                target_position: None,
             }),
             0,
         );
@@ -923,6 +931,8 @@ mod tests {
                     season_level: None,
                     season_strength: None,
                     skill_ids: Vec::new(),
+                    position: None,
+                    target_position: None,
                 }),
                 1_000,
             );
@@ -960,6 +970,8 @@ mod tests {
                     season_level: None,
                     season_strength: None,
                     skill_ids: Vec::new(),
+                    position: None,
+                    target_position: None,
                 }),
                 1_000,
             );
@@ -996,6 +1008,8 @@ mod tests {
                 season_level: None,
                 season_strength: None,
                 skill_ids: Vec::new(),
+                position: None,
+                target_position: None,
             }),
             1_000,
         );
@@ -1017,6 +1031,8 @@ mod tests {
                 season_level: None,
                 season_strength: None,
                 skill_ids: Vec::new(),
+                position: None,
+                target_position: None,
             }),
             1_000,
         );
@@ -1037,6 +1053,8 @@ mod tests {
                 season_level: None,
                 season_strength: Some(3_333),
                 skill_ids: Vec::new(),
+                position: None,
+                target_position: None,
             }),
             1_000,
         );
