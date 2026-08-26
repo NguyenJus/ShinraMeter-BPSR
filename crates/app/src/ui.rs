@@ -2214,17 +2214,21 @@ fn draw_header(
     // 98pt run before that: the gradient and the oversized emblem it carries
     // are the header's background, so they run behind the stat-pill row too.
     //
-    // Issue #158: `band_height` alone stops 8pt short of the first player
-    // row — `OverlayApp::ui` puts a `ui.separator()` between the header and
-    // the rows, and pays the layout's ordinary `ITEM_SPACING_Y` gap before
-    // it, neither of which is inside the band. Sizing the wash to just
-    // `band_height` left that 8pt strip showing the bare panel fill (with
-    // the separator's faint line inside it) between the wash's bottom edge
-    // and the first row — a hard, visible cutoff, not a fade. Extending to
-    // `first_player_row_top_offset` — the same function `default_inner_
-    // height` sums for the window's default open height — closes that gap
-    // and keeps the two derivations from ever drifting apart again. Never a
-    // literal.
+    // Issue #158 (offset corrected by #297): `band_height` alone stops
+    // `2 * ITEM_SPACING_Y + SEPARATOR_HEIGHT` (10pt) short of the first
+    // player row — `OverlayApp::ui` puts a `ui.separator()` between the
+    // header and the rows, and egui's vertical layout pays its ordinary
+    // `ITEM_SPACING_Y` gap on both sides of it (once landing the separator,
+    // once landing the first row after it), none of which is inside the
+    // band. Sizing the wash to just `band_height` left that strip showing
+    // the bare panel fill (with the separator's faint line inside it)
+    // between the wash's bottom edge and the first row — a hard, visible
+    // cutoff, not a fade, and (#297) a seam once either region carries its
+    // own background image rather than the same-colored default artwork.
+    // Extending to `first_player_row_top_offset` — the same function
+    // `default_inner_height` sums for the window's default open height —
+    // closes that gap and keeps the two derivations from ever drifting
+    // apart again. Never a literal.
     let wash_height = first_player_row_top_offset(band_height) - HEADER_WASH_INSET;
     // Issue #252: `settings` carries the overlay-opacity slider the wash's
     // own fills and emblem fade with, so it stays at its baked-in alpha no
@@ -3992,19 +3996,29 @@ fn header_band_height(button_row_height: f32) -> f32 {
     header_text_band_height() + HEADER_STAT_ROW_GAP + button_row_height
 }
 
-/// Issue #158: the panel-top-relative y where the first player row
-/// actually begins — which is *not* `band_height`. `OverlayApp::ui` puts a
-/// `ui.separator()` (`SEPARATOR_HEIGHT`, egui's own fixed 6.0) between the
-/// header and the row list, and egui's vertical layout pays its ordinary
-/// `ITEM_SPACING_Y` gap before that separator, same as between any other
-/// two consecutive widgets in the panel. So the band's own bottom edge is
-/// 8pt short of where the rows start; this is the single function both
-/// `default_inner_height` (the window's default open height) and the
-/// header wash (`draw_header`'s `wash_height`) derive the true offset from,
-/// so the two can never drift back out of sync the way `band_height` alone
-/// did.
+/// Issue #158 (corrected by issue #297): the panel-top-relative y where the
+/// first player row actually begins — which is *not* `band_height`.
+/// `OverlayApp::ui` puts a `ui.separator()` (`SEPARATOR_HEIGHT`, egui's own
+/// fixed 6.0) between the header and the row list, and egui's vertical
+/// layout pays its ordinary `ITEM_SPACING_Y` gap *twice* around it: once
+/// between the header's last widget and the separator, and again between
+/// the separator and the first row — `egui::Ui::cursor`'s own doc comment
+/// is explicit that the cursor always sits one `item_spacing` past the
+/// latest child, so placing the separator consumes the first gap and its
+/// own advance opens the second. So the band's own bottom edge is
+/// `2 * ITEM_SPACING_Y + SEPARATOR_HEIGHT` short of where the rows start,
+/// not `ITEM_SPACING_Y + SEPARATOR_HEIGHT` (issue #297: the row backdrop
+/// image painted at the old, one-gap offset left a bare sliver of panel
+/// fill between it and the header wash — flush for a same-colored solid
+/// wash, but a visible seam once either region carries its own artwork).
+/// This is the single function both `default_inner_height` (the window's
+/// default open height) and the header wash (`draw_header`'s
+/// `wash_height`) derive the true offset from, so the two can never drift
+/// back out of sync the way `band_height` alone did. Verified against a
+/// real `egui::Ui` — not just self-consistency — by
+/// `the_row_area_begins_exactly_where_first_player_row_top_offset_predicts`.
 fn first_player_row_top_offset(band_height: f32) -> f32 {
-    band_height + ITEM_SPACING_Y + SEPARATOR_HEIGHT
+    band_height + 2.0 * ITEM_SPACING_Y + SEPARATOR_HEIGHT
 }
 
 /// Height of the header's *text* rows alone: the title line, the gap, and
@@ -13544,6 +13558,78 @@ mod tests {
         );
     }
 
+    /// Issue #297: the row area (and so the row backdrop image
+    /// `draw_row_backdrop` paints into it) must begin at *exactly* the y
+    /// `first_player_row_top_offset` predicts — the same y the header wash's
+    /// bottom edge is anchored to (see `draw_header`'s `wash_height`) — or a
+    /// sliver of bare panel fill shows between the two images at the
+    /// banner/body seam.
+    ///
+    /// This drives `draw_header` and a real `ui.separator()` through an
+    /// actual `egui::Ui` (the same layout `OverlayApp::ui` uses) rather than
+    /// trusting the pure functions to agree with egui's own bookkeeping:
+    /// `Ui::cursor` already carries one pending `item_spacing` past the last
+    /// widget it placed, so the separator's *own* trailing advance adds a
+    /// second one that `first_player_row_top_offset` must also count.
+    #[test]
+    fn the_row_area_begins_exactly_where_first_player_row_top_offset_predicts() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(0);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(default_inner_width(), default_inner_height()),
+            )),
+            ..Default::default()
+        };
+
+        let mut panel_top = 0.0_f32;
+        let mut rows_top = 0.0_f32;
+        let output = ctx.run_ui(input, |ui| {
+            panel_top = ui.available_rect_before_wrap().top();
+            draw_header(
+                ui,
+                &ctx,
+                &snapshot,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut WindowGesture::default(),
+                false,
+                true,
+                &mut UpdateCheckState::default(),
+                &unused_log_export_sender(),
+                false,
+                &mut false,
+                None,
+            );
+            // Exactly what `OverlayApp::ui` does between `draw_header` and
+            // `draw_row_backdrop`: one `ui.separator()`, then read the
+            // cursor it left behind.
+            ui.separator();
+            rows_top = ui.available_rect_before_wrap().top();
+        });
+        output.drop_without_applying_deltas();
+
+        let band_height = header_band_height(BUTTON_ROW_HEIGHT);
+        let predicted = panel_top + first_player_row_top_offset(band_height);
+        assert!(
+            (rows_top - predicted).abs() < 0.05,
+            "the rows actually start at {rows_top}, but first_player_row_top_offset \
+             (and so the header wash's bottom edge) predicts {predicted} — a {}pt gap \
+             would open at the banner/body seam",
+            rows_top - predicted
+        );
+    }
+
     /// A collapsed window can hand the layout a degenerate strip; that must
     /// produce an empty rect the painter skips, not a negative-size one.
     #[test]
@@ -15693,15 +15779,22 @@ mod tests {
             + SUBTITLE_LINE_HEIGHT
             + HEADER_STAT_ROW_GAP
             + BUTTON_ROW_HEIGHT;
-        let expected = band + SEPARATOR_HEIGHT + rows + ITEM_SPACING_Y;
+        // Issue #297: egui's vertical layout pays `ITEM_SPACING_Y` on *both*
+        // sides of the separator (once landing it after the band, once
+        // landing the first row after it) — see
+        // `first_player_row_top_offset`'s doc comment — so this independent
+        // sum needs both, not one.
+        let expected = band + SEPARATOR_HEIGHT + rows + 2.0 * ITEM_SPACING_Y;
         assert_eq!(default_inner_height(), expected);
         // Issue #91 grew this from `652.0` -> `658.0` (a 2pt taller title
         // line, and `HEADER_STAT_ROW_GAP` above the stat row in place of
         // `ITEM_SPACING_Y`) -> `676.0` here: the band now reserves the
         // subtitle's line and gap whether or not an area name is known, so
         // the default window has to budget them too or it opens 18pt short
-        // of the 20 rows it promises.
-        assert_eq!(default_inner_height(), 676.0);
+        // of the 20 rows it promises. Issue #297 then grew it to `678.0`:
+        // the missing second `ITEM_SPACING_Y` around the separator was a
+        // real 2pt gap at the banner/body seam, not just a test bug.
+        assert_eq!(default_inner_height(), 678.0);
     }
 
     #[test]
@@ -15774,8 +15867,10 @@ mod tests {
     #[test]
     fn reset_to_defaults_inner_height_matches_header_plus_separator_plus_five_rows_plus_gap() {
         let rows = RESET_TO_DEFAULTS_VISIBLE_ROWS as f32 * ROW_HEIGHT;
+        // Issue #297: both `ITEM_SPACING_Y` gaps around the separator — see
+        // `first_player_row_top_offset`'s doc comment.
         let expected =
-            header_band_height(BUTTON_ROW_HEIGHT) + SEPARATOR_HEIGHT + rows + ITEM_SPACING_Y;
+            header_band_height(BUTTON_ROW_HEIGHT) + SEPARATOR_HEIGHT + rows + 2.0 * ITEM_SPACING_Y;
         assert_eq!(reset_to_defaults_inner_height(), expected);
     }
 
