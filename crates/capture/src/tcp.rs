@@ -31,6 +31,12 @@ const MIN_BEHIND_FOR_RESYNC: u32 = 16 * 1024 * 1024;
 /// up again — not how much memory waiting costs.
 const MAX_STALL_BACKOFF: u32 = 64;
 
+/// `reason` tag [`TcpReassembler::push`]'s stall guard passes to
+/// `resync_with_reason` when it re-anchors on the live segment. Unlike an
+/// externally driven resync it must *keep* the backoff it has earned — the
+/// trip doubles it immediately afterwards (see `stall_backoff`).
+const STALL_GUARD_REASON: &str = "stall_guard_re_anchor";
+
 /// Reassembles a TCP byte stream from possibly out-of-order / retransmitted
 /// segments, handling 32-bit sequence-number wraparound and recovering from
 /// a permanent gap (e.g. after a reconnect or zone change) via a stall guard.
@@ -187,7 +193,17 @@ impl TcpReassembler {
         // every segment is dropped as a retransmit and capture stays dead
         // forever with no loss reported.
         let re_anchored = diff < 0 && before.wrapping_sub(seq) >= MIN_BEHIND_FOR_RESYNC;
-        if after == before && (!self.cache.is_empty() || re_anchored) {
+        if after != before {
+            // Forward progress: whatever gap was being waited on is gone.
+            self.stall_pushes = 0;
+            // Progress with nothing left cached: the stream is fully caught
+            // up, not just past the one gap that last tripped. Only this —
+            // not merely surviving to the next push — earns back the
+            // default threshold.
+            if self.cache.is_empty() {
+                self.stall_backoff = 1;
+            }
+        } else if !self.cache.is_empty() || re_anchored {
             self.stall_pushes += 1;
             if self.stall_pushes >= self.stall_threshold() {
                 match self.nearest_cached_seq() {
@@ -219,7 +235,7 @@ impl TcpReassembler {
                              the peer re-anchored behind next_seq, so re-anchoring on the live segment at seq={seq}",
                             self.stall_pushes,
                         );
-                        self.resync_with_reason(seq, "stall_guard_re_anchor");
+                        self.resync_with_reason(seq, STALL_GUARD_REASON);
                         self.advance_with(payload);
                     }
                 }
@@ -230,16 +246,12 @@ impl TcpReassembler {
                 // before the guard gives up on it too.
                 self.stall_backoff = self.stall_backoff.saturating_mul(2).min(MAX_STALL_BACKOFF);
             }
-        } else {
-            self.stall_pushes = 0;
-            // Forward progress with nothing left cached: the stream is
-            // fully caught up, not just past the one gap that last
-            // tripped. Only this — not merely surviving to the next
-            // push — earns back the default threshold.
-            if self.cache.is_empty() {
-                self.stall_backoff = 1;
-            }
         }
+        // Remaining case: no progress, nothing cached, no re-anchor — an
+        // ordinary fully-consumed retransmit or duplicate. It is neither a
+        // stall (there is no gap to wait on) nor progress, so it must
+        // neither count toward the stall counter nor erase backoff earned
+        // by a recent trip (#283).
     }
 
     /// Appends `payload` (already known to start exactly at `next_seq`) to
@@ -381,6 +393,16 @@ impl TcpReassembler {
         self.buffer.clear();
         self.next_seq = Some(seq);
         self.stall_pushes = 0;
+        // An externally driven resync — win.rs adopting a brand-new server
+        // connection onto this instance — starts a fresh flow, whose gaps
+        // have nothing to do with the dead flow's. Carrying the old flow's
+        // backoff over would hand it an up-to-64x inflated trip threshold.
+        // The stall guard's own re-anchor is the opposite case: its
+        // doubling (applied right after this returns) is meant to compound
+        // across a gap cluster (#283), so it keeps what it earned.
+        if reason != STALL_GUARD_REASON {
+            self.stall_backoff = 1;
+        }
         self.loss = false;
     }
 
@@ -1219,6 +1241,100 @@ mod tests {
                 delivered.windows(4).any(|w| w == b"LATE"),
                 "the late-but-not-lost segment must reach the decoder:\n{:?}",
                 delivered
+            );
+        }
+
+        /// Trips the guard once on a permanent gap at `base + 1`, leaving
+        /// `r` with an empty cache, `next_seq` just past a drained cluster,
+        /// and a doubled stall backoff. Returns the new `next_seq`.
+        fn trip_once(r: &mut TcpReassembler, base: u32) -> u32 {
+            const SEG_LEN: u32 = 4;
+            const SEGS: u32 = TcpReassembler::MAX_STALL_PUSHES as u32;
+            r.push(base, b"A"); // next_seq = base + 1
+            let cluster = base + 0x1000;
+            for i in 0..SEGS {
+                r.push(cluster + i * SEG_LEN, &[b'X'; SEG_LEN as usize]);
+            }
+            assert_eq!(
+                count_logged(&["stall guard tripped", &format!("next_seq={}", base + 1)]),
+                1,
+                "setup expected exactly one trip:\n{}",
+                dump()
+            );
+            assert_eq!(r.gap_segments(), 0, "setup expected a drained cache");
+            cluster + SEGS * SEG_LEN
+        }
+
+        /// Regression test for the reset in `push`'s tail firing on pushes
+        /// that made no progress at all. A fully-consumed retransmit or
+        /// duplicate arriving while the cache is empty is neither progress
+        /// nor a stall, so it must not erase the backoff a recent trip
+        /// earned — otherwise one stray duplicate between two gap clusters
+        /// re-arms the guard at the fixed threshold #283 exists to avoid.
+        #[test]
+        fn a_consumed_duplicate_does_not_reset_the_backoff() {
+            install_capture();
+            let base: u32 = 0x0721_0000;
+            let mut r = TcpReassembler::new();
+            let next_seq = trip_once(&mut r, base);
+            let _ = r.take_stream();
+
+            // A duplicate of bytes already delivered, arriving with nothing
+            // cached: entirely behind `next_seq`, and far too close to it to
+            // read as the peer re-anchoring.
+            r.push(base + 0x1000, &[b'X'; 4]);
+
+            // The backoff must still be 2, so a fresh cluster of exactly
+            // MAX_STALL_PUSHES no-progress pushes stays under the threshold.
+            const SEG_LEN: u32 = 4;
+            let cluster = next_seq + 0x1000;
+            for i in 0..TcpReassembler::MAX_STALL_PUSHES as u32 {
+                r.push(cluster + i * SEG_LEN, &[b'Y'; SEG_LEN as usize]);
+            }
+            assert_eq!(
+                count_logged(&["stall guard tripped", &format!("next_seq={next_seq}")]),
+                0,
+                "the duplicate reset the earned backoff, so the guard tripped early:\n{}",
+                dump()
+            );
+
+            // And the merely-late segment filling that gap still heals it.
+            r.push(next_seq, b"LATE");
+            let delivered = r.take_stream();
+            assert!(
+                delivered.windows(4).any(|w| w == b"LATE"),
+                "the late segment must reach the decoder:\n{delivered:?}"
+            );
+        }
+
+        /// A resync driven from outside (win.rs adopting a brand-new server
+        /// connection onto the same reassembler) starts an unrelated flow;
+        /// it must not inherit the dead flow's inflated trip threshold.
+        #[test]
+        fn adopting_a_new_connection_resets_the_backoff() {
+            install_capture();
+            let base: u32 = 0x0821_0000;
+            let mut r = TcpReassembler::new();
+            trip_once(&mut r, base);
+            let _ = r.take_stream();
+
+            // New connection, fresh ISN.
+            let fresh: u32 = 0x0931_0000;
+            r.resync(fresh);
+            let _ = r.take_stream();
+
+            // Back at the default threshold: a permanent gap here must trip
+            // after MAX_STALL_PUSHES pushes, not 2x that.
+            const SEG_LEN: u32 = 4;
+            let cluster = fresh + 0x1000;
+            for i in 0..TcpReassembler::MAX_STALL_PUSHES as u32 {
+                r.push(cluster + i * SEG_LEN, &[b'Z'; SEG_LEN as usize]);
+            }
+            assert_eq!(
+                count_logged(&["stall guard tripped", &format!("next_seq={fresh}")]),
+                1,
+                "the adopted connection inherited the old flow's backoff:\n{}",
+                dump()
             );
         }
     }
