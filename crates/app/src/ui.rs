@@ -2473,6 +2473,18 @@ const TOGGLE_OFF_COLOR: egui::Color32 =
 /// paint at this tint; click-through and always-on-top use it only in their
 /// "on" state (`toggle_state_tint`).
 const TOGGLE_ACTIVE_COLOR: egui::Color32 = TOOLBAR_ICON_TINT;
+/// Filled circle painted behind the click-through icon while click-through
+/// is enabled (issue #292): `toggle_state_tint`'s on/off distinction is
+/// only a ~25% alpha delta on the same white glyph (`TOGGLE_OFF_COLOR` vs
+/// `TOGGLE_ACTIVE_COLOR`), which reads as nearly identical at a glance —
+/// not obvious enough for a control that flips a system-wide mouse
+/// passthrough mode. An amber wash (the color already associated with
+/// "caution, behavior changed") is a second, unmistakable signal on top of
+/// the existing tint, painted only in the "on" state; "off" is unchanged
+/// (relies on the pill's own `PILL_FILL` plus the dim icon tint, same as
+/// before this issue).
+const CLICK_THROUGH_ON_FILL: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(233, 196, 106, 130);
 /// Circular hover wash painted behind a toggle-cluster button, matching the
 /// oval pill's own shape rather than a foreign square badge.
 const TOGGLE_HOVER_FILL: egui::Color32 =
@@ -2890,6 +2902,16 @@ fn title_row_toggles(
     } else {
         "Click-through: off"
     };
+    // Issue #292: a second, color-based on/off signal painted behind the
+    // icon (see `CLICK_THROUGH_ON_FILL`'s doc comment) — before
+    // `toggle_button` so its own hover wash still paints on top of it.
+    if settings.click_through {
+        ui.painter().circle_filled(
+            click_through_rect.center(),
+            click_through_rect.width() / 2.0 + 3.0,
+            CLICK_THROUGH_ON_FILL,
+        );
+    }
     if toggle_button(ui, click_through_rect, click_through_label, capturing, true).clicked() {
         settings.toggle_click_through();
         crate::platform::set_click_through(settings.click_through);
@@ -11351,6 +11373,61 @@ mod tests {
         );
     }
 
+    /// Issue #292: `toggle_state_tint` alone is a ~25% alpha delta on the
+    /// same white glyph (`TOGGLE_OFF_COLOR` vs `TOGGLE_ACTIVE_COLOR`), which
+    /// reads as nearly identical at a glance — not the "obvious at a
+    /// glance" on/off signal click-through needs, since it flips a
+    /// system-wide mouse-passthrough mode. This drives `CLICK_THROUGH_ON_FILL`,
+    /// a second, high-contrast signal painted only while click-through is
+    /// enabled, using the same `collect_circle_fills` helper the hover-fill
+    /// suppression tests use.
+    #[test]
+    fn click_through_paints_a_distinct_fill_circle_only_while_enabled() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+
+        let fills_for = |click_through: bool| -> Vec<egui::Color32> {
+            let mut settings = Settings {
+                click_through,
+                ..Settings::default()
+            };
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let title_row = test_title_row(ui);
+                title_row_toggles(
+                    ui,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    title_row,
+                    false,
+                );
+            });
+            let mut fills = Vec::new();
+            for clipped in &output.shapes {
+                collect_circle_fills(&clipped.shape, &mut fills);
+            }
+            output.drop_without_applying_deltas();
+            fills
+        };
+
+        let on = fills_for(true);
+        assert!(
+            on.contains(&CLICK_THROUGH_ON_FILL),
+            "click-through enabled must paint CLICK_THROUGH_ON_FILL: {on:?}"
+        );
+
+        let off = fills_for(false);
+        assert!(
+            !off.contains(&CLICK_THROUGH_ON_FILL),
+            "click-through disabled must not paint CLICK_THROUGH_ON_FILL: {off:?}"
+        );
+    }
+
     /// Clicking the click-through button flips `Settings::click_through`,
     /// tells the platform layer (`platform::set_click_through` — issue
     /// #167 rehash; a no-op stub off-Windows, so not independently
@@ -19796,6 +19873,88 @@ mod tests {
             reported_rows_top > pre_call_top,
             "rows_top must move past the history bar and separator \
              (pre-call top {pre_call_top}, reported {reported_rows_top})"
+        );
+    }
+
+    /// Issue #298: strengthens the test above's loose `>` check into a
+    /// concrete pixel accounting — proving not just that `rows_top` moves
+    /// past the "← Live"/"← Back" bar, but that a Share screenshot sized to
+    /// the *correct* bound fully contains the open encounter's rows, while
+    /// the same image sized to the naive, pre-#219 bound (measured before
+    /// `draw_history`'s own bar and separator, the way the outer panel's
+    /// stale `rows_top` used to be) would truncate real row pixels off the
+    /// bottom — exactly the symptom issue #298 reports.
+    #[test]
+    fn share_crop_bound_for_an_open_encounter_fully_contains_its_rows_past_the_history_bar() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let settings = Settings::default();
+        let row_count = 3;
+        let mut state = HistoryUi {
+            open: Some(OpenEncounter {
+                id: 1,
+                title: "Fight".to_string(),
+                subtitle: None,
+                ended_at_ms: 0,
+                snapshot: rows_test_snapshot(row_count),
+            }),
+            ..HistoryUi::default()
+        };
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut back_to_live = false;
+
+        let mut pre_call_top = 0.0;
+        let mut reported_rows_top = 0.0;
+        let mut rows_area_height = 0.0;
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            pre_call_top = ui.cursor().top();
+            let (rows_top, area_height) = draw_history(
+                ui,
+                &mut state,
+                &settings,
+                &icons,
+                None,
+                &tx,
+                &mut back_to_live,
+                &mut None,
+            );
+            reported_rows_top = rows_top;
+            rows_area_height = area_height;
+        })
+        .drop_without_applying_deltas();
+
+        let bar_height = reported_rows_top - pre_call_top;
+        assert!(
+            bar_height > 0.0,
+            "the history bar and separator must occupy real space (got {bar_height})"
+        );
+
+        let pixels_per_point = 1.0;
+        let correct_bound =
+            rows_content_bottom_y(reported_rows_top, row_count, ROW_HEIGHT, rows_area_height);
+        // An image exactly as tall as the correctly-measured content: the
+        // real Share crop must keep every pixel of it.
+        let image_height_px = correct_bound.round() as usize;
+        let correct_crop =
+            screenshot_crop_height_px(correct_bound, pixels_per_point, image_height_px);
+        assert_eq!(
+            correct_crop, image_height_px,
+            "the correct bound must keep the full image, not truncate real row pixels"
+        );
+
+        // The pre-#219 regression: computing the bound from `pre_call_top`
+        // (before the bar and separator `draw_history` itself paints)
+        // against that same image truncates real row content off the
+        // bottom.
+        let naive_bound =
+            rows_content_bottom_y(pre_call_top, row_count, ROW_HEIGHT, rows_area_height);
+        let naive_crop = screenshot_crop_height_px(naive_bound, pixels_per_point, image_height_px);
+        assert!(
+            naive_crop < image_height_px,
+            "sanity check: the naive (pre-#219) bound must actually be \
+             shorter, proving it would have cropped real row pixels off \
+             (naive {naive_crop}, image {image_height_px})"
         );
     }
 
