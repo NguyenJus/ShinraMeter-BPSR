@@ -7715,9 +7715,17 @@ mod tests {
             m.apply(&ProtocolEvent::ServerChanged {
                 timestamp_ms: 2_640_000,
             });
-            m.apply(&ProtocolEvent::Scene {
+            let scene_reason = m.apply(&ProtocolEvent::Scene {
                 level_map_id: DUNGEON_SCENE,
             });
+            assert_eq!(
+                scene_reason,
+                Some(ResetReason::SceneChanged),
+                "the confirmed different scene already fires the fast \
+                 reset on its own -- this test's point is that the \
+                 dungeon's `Playing` signal below still finishes the job \
+                 (issue #295) rather than being needed to fire it"
+            );
             let reason = m.apply(&ProtocolEvent::DungeonState {
                 state: EDungeonState::Playing,
                 scene_uuid: None,
@@ -7727,7 +7735,8 @@ mod tests {
                 reason,
                 Some(ResetReason::DungeonStarted),
                 "issue #295: the new dungeon's own start signal must clear \
-                 a fight held since a raid selection's death"
+                 a fight held since a raid selection's death, even after \
+                 the `Scene` event ahead of it already reset once"
             );
             assert_eq!(m.snapshot(2_640_100).total_damage, 0);
             assert_eq!(m.fight_state(2_640_100), FightState::Idle);
