@@ -295,8 +295,47 @@ pub fn cover_uv(content: [u32; 2], rect: egui::Vec2) -> egui::Rect {
     )
 }
 
-/// A decoded image ready to upload, plus the one piece of geometry the
-/// blit still needs.
+/// Whether a cached crop (`cached_content`, selected by [`cover_crop`]
+/// from a `src`-sized source at some earlier region) is still safe to
+/// reuse — via [`cover_uv`] — for the *current* `region`, without
+/// redecoding.
+///
+/// Issue #294: reusing a bucket-keyed texture across a resize drag (the
+/// whole point of [`texture_pixels`]) is only sound while the crop
+/// [`cover_crop`] would select for `region` is a *subset* of what is
+/// already decoded. [`cover_uv`] can re-frame what survived the original
+/// crop, but the pixels outside it were thrown away for good the moment
+/// [`decode_and_fit`] ran — it cannot recover them. Two ways the current
+/// region can ask for more than that:
+///
+/// - **A bigger crop on the same axis.** A region closer to `src`'s own
+///   aspect ratio than the one that was baked needs more of the trimmed
+///   axis than survived the crop.
+/// - **The opposite axis entirely.** A region on the other side of `src`'s
+///   aspect ratio needs the axis the bake trimmed away completely, and
+///   only has as much of it as the bake's *other* axis happened to keep.
+///
+/// Both show up as the same thing: [`cover_crop`] against `region` asking
+/// for more pixels, on either axis, than `cached_content` holds. Shrinking
+/// back down — the common case for a resize that only drifts within its
+/// bucket — always passes, so a monotonically shrinking drag keeps reusing
+/// the same texture exactly as before; only a drag that grows past its own
+/// high-water mark, or flips which axis is trimmed, pays for a redecode.
+///
+/// Without this check the cache kept whichever crop happened to be baked
+/// first and let [`cover_uv`] silently mis-frame every region after it —
+/// history-dependent, exactly what a pure function of the current size
+/// must not be.
+///
+/// Pure integer geometry, same as [`cover_crop`] itself, so every case is
+/// unit-testable without a decode.
+fn crop_is_still_covered(src: [u32; 2], cached_content: [u32; 2], region: [u32; 2]) -> bool {
+    let [_, _, w, h] = cover_crop(src, region);
+    w <= cached_content[0] && h <= cached_content[1]
+}
+
+/// A decoded image ready to upload, plus the two pieces of geometry the
+/// blit and the cache still need.
 #[derive(Debug)]
 pub struct Fitted {
     /// The texture itself, [`texture_pixels`] big.
@@ -305,6 +344,12 @@ pub struct Fitted {
     /// `[width, height]`, in source pixels. [`cover_uv`] needs this rather
     /// than `image.size`, which bucketing has stretched.
     pub content: [u32; 2],
+    /// The decoded source image's own pixel dimensions — what
+    /// [`cover_crop`] took `content` from. The cache keeps this so it can
+    /// recompute, on every call and without redecoding, whether `content`
+    /// is still what the *current* region would select (issue #294's
+    /// [`crop_is_still_covered`]).
+    pub src: [u32; 2],
 }
 
 /// Decodes `bytes` for a destination region of `region` physical pixels,
@@ -352,6 +397,7 @@ fn decode_and_fit(bytes: &[u8], region: [u32; 2]) -> Result<Fitted, ImageError> 
             &rgba.into_raw(),
         ),
         content: [w, h],
+        src,
     })
 }
 
@@ -375,6 +421,11 @@ struct Entry {
     /// not the region that produced it: a region that moves within its
     /// bucket must hit this entry rather than re-decode.
     key: [u32; 2],
+    /// [`Fitted::src`] for the successful load — the decoded image's own
+    /// dimensions, needed by [`crop_is_still_covered`] to tell whether a
+    /// later region still fits inside `content` (issue #294). Meaningless
+    /// for the `Err` arm.
+    src: [u32; 2],
     /// [`Fitted::content`] for the successful load, so the blit can build
     /// its UV rectangle. Meaningless for the `Err` arm, which never paints.
     content: [u32; 2],
@@ -430,12 +481,16 @@ impl CustomImages {
     ) -> Option<(egui::TextureId, [u32; 2])> {
         let key = texture_pixels(region);
         let entry = self.slot(slot);
-        let hit = entry
-            .as_ref()
-            .is_some_and(|cached| cached.path == path && cached.key == key);
+        let hit = entry.as_ref().is_some_and(|cached| {
+            cached.path == path
+                && cached.key == key
+                && (cached.result.is_err()
+                    || crop_is_still_covered(cached.src, cached.content, region))
+        });
         if !hit {
-            let (content, result) = match load(path, region) {
+            let (src, content, result) = match load(path, region) {
                 Ok(fitted) => (
+                    fitted.src,
                     fitted.content,
                     Ok(ctx.load_texture(
                         slot.texture_name(),
@@ -445,12 +500,13 @@ impl CustomImages {
                 ),
                 Err(err) => {
                     log::warn!("{} {} {err}", slot.label(), path.display());
-                    (region, Err(err))
+                    (region, region, Err(err))
                 }
             };
             *entry = Some(Entry {
                 path: path.to_path_buf(),
                 key,
+                src,
                 content,
                 result,
             });
@@ -558,6 +614,71 @@ mod tests {
     fn cover_crop_handles_sources_too_large_to_cross_multiply_in_u32() {
         let [_, _, w, h] = cover_crop([100_000, 80_000], [400, 200]);
         assert_eq!([w, h], [100_000, 50_000]);
+    }
+
+    // -- crop_is_still_covered (issue #294) ---------------------------------
+
+    /// A widescreen source, so trimming width vs. trimming height are
+    /// genuinely different crops rather than both collapsing to "the whole
+    /// image" the way a 1x1 fixture would.
+    const WIDESCREEN: [u32; 2] = [1920, 1080];
+
+    #[test]
+    fn covered_when_the_new_region_only_shrinks_the_trimmed_axis() {
+        // Baked at the source's own aspect ratio (no trim at all, full
+        // 1080px height survives); a more extreme wide region trims height
+        // down further, well inside what survived.
+        let baked = cover_crop(WIDESCREEN, [64, 36]);
+        assert_eq!([baked[2], baked[3]], [1920, 1080], "sanity: no trim yet");
+        assert!(crop_is_still_covered(
+            WIDESCREEN,
+            [baked[2], baked[3]],
+            [64, 20]
+        ));
+    }
+
+    #[test]
+    fn not_covered_when_the_new_region_grows_past_the_high_water_mark() {
+        // Baked for a region that trims width down to 1000px; a region
+        // closer to the source's own aspect ratio needs *more* of that
+        // same trimmed axis (1900px) than survived the first crop.
+        let baked_narrow = cover_crop(WIDESCREEN, [1000, 1080]);
+        assert!(!crop_is_still_covered(
+            WIDESCREEN,
+            [baked_narrow[2], baked_narrow[3]],
+            [1900, 1080]
+        ));
+    }
+
+    /// The exact shape of issue #294: a region that flips which axis
+    /// `cover_crop` trims (wide destination vs. tall destination) cannot
+    /// reuse a bake from the other side, because the axis it now needs in
+    /// full is the one the earlier bake threw away.
+    #[test]
+    fn not_covered_when_the_trimmed_axis_flips() {
+        let baked_wide = cover_crop(WIDESCREEN, [64, 20]);
+        assert!(!crop_is_still_covered(
+            WIDESCREEN,
+            [baked_wide[2], baked_wide[3]],
+            [40, 60]
+        ));
+
+        let baked_tall = cover_crop(WIDESCREEN, [40, 60]);
+        assert!(!crop_is_still_covered(
+            WIDESCREEN,
+            [baked_tall[2], baked_tall[3]],
+            [64, 20]
+        ));
+    }
+
+    #[test]
+    fn covered_when_nothing_changed_at_all() {
+        let baked = cover_crop(WIDESCREEN, [351, 75]);
+        assert!(crop_is_still_covered(
+            WIDESCREEN,
+            [baked[2], baked[3]],
+            [351, 75]
+        ));
     }
 
     // -- region_pixels / texture_pixels ------------------------------------
@@ -915,6 +1036,51 @@ mod tests {
             .texture(&ctx, ImageSlot::Backdrop, &path, [128, 64])
             .expect("a valid png must upload at the new size");
         assert_ne!(resized, first, "a new bucket must re-decode");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Issue #294: the whole bug, driven through the real stateful cache.
+    /// Two resize *histories* — one that passes through a wide region
+    /// before landing on a tall final one, one that lands there directly —
+    /// must agree on the crop they end up painting, even though both
+    /// intermediate and final regions fall in the same 64px texture
+    /// bucket (so the old path-independent-looking bucket key alone would
+    /// have called the wide bake a cache hit for the tall region too).
+    #[test]
+    fn resize_history_does_not_change_the_final_crop() {
+        let ctx = egui::Context::default();
+        let path = std::env::temp_dir().join("shinra-custom-image-history-a.png");
+        std::fs::write(&path, solid_png(WIDESCREEN[0], WIDESCREEN[1])).expect("write the fixture");
+
+        let final_region = [40, 60];
+        assert_eq!(
+            texture_pixels([64, 20]),
+            texture_pixels(final_region),
+            "sanity: both regions must land in the same bucket for this to test anything"
+        );
+
+        // Path A: visits a wide region first, then resizes to the final
+        // (tall) one.
+        let mut via_wide = CustomImages::default();
+        via_wide
+            .texture(&ctx, ImageSlot::Backdrop, &path, [64, 20])
+            .expect("the wide bake must upload");
+        let (_, content_via_wide) = via_wide
+            .texture(&ctx, ImageSlot::Backdrop, &path, final_region)
+            .expect("the final region must still upload");
+
+        // Path B: lands on the same final region with no history at all.
+        let mut direct = CustomImages::default();
+        let (_, content_direct) = direct
+            .texture(&ctx, ImageSlot::Backdrop, &path, final_region)
+            .expect("a fresh cache must upload the final region too");
+
+        assert_eq!(
+            content_via_wide, content_direct,
+            "the same final region must select the same crop regardless of \
+             which region the resize passed through first"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

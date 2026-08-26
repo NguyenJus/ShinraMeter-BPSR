@@ -1464,12 +1464,6 @@ impl eframe::App for OverlayApp {
         if !self.startup_toggles_applied {
             self.startup_toggles_applied = true;
             crate::platform::set_click_through(self.settings.click_through);
-            // Issue #232: same one-shot re-apply as click-through above,
-            // for the native resize-border override — a returning user
-            // whose last session left the pin locked otherwise gets a
-            // window whose OS-level edge-drag resize is live again until
-            // the next pin click re-syncs it.
-            crate::platform::set_resize_locked(self.settings.always_on_top);
             let level = if self.settings.always_on_top {
                 egui::WindowLevel::AlwaysOnTop
             } else {
@@ -1671,13 +1665,23 @@ impl eframe::App for OverlayApp {
             .show(ui, |ui| {
                 // First, so the header buttons drawn afterwards stay on top of
                 // the corner zones they overlap.
-                draw_resize_handles(
-                    ui,
-                    &ctx,
-                    &mut self.window_gesture,
-                    "root",
-                    resize_locked_by_pin(self.settings.always_on_top),
-                );
+                let resize_double_clicked =
+                    draw_resize_handles(ui, &ctx, &mut self.window_gesture, "root");
+                // Issue #300: a resize-border double-click snaps the
+                // window's height to whichever 5-row/20-row preset it
+                // isn't already at, leaving width untouched — same
+                // `InnerSize` command the header dropdown's "Reset to
+                // defaults" item already uses for its own (width-and-
+                // height) resize.
+                let viewport_rect = ctx.input(|i| i.viewport_rect());
+                if let Some(target_height) =
+                    resize_double_click_command(resize_double_clicked, viewport_rect.height())
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                        viewport_rect.width(),
+                        target_height,
+                    )));
+                }
                 // Issue #39: what the header and rows paint this frame — the
                 // live snapshot, or the open historical one (`history_open`,
                 // cloned above before this closure existed). Computed here,
@@ -2474,6 +2478,18 @@ const TOGGLE_OFF_COLOR: egui::Color32 =
 /// paint at this tint; click-through and always-on-top use it only in their
 /// "on" state (`toggle_state_tint`).
 const TOGGLE_ACTIVE_COLOR: egui::Color32 = TOOLBAR_ICON_TINT;
+/// Filled circle painted behind the click-through icon while click-through
+/// is enabled (issue #292): `toggle_state_tint`'s on/off distinction is
+/// only a ~25% alpha delta on the same white glyph (`TOGGLE_OFF_COLOR` vs
+/// `TOGGLE_ACTIVE_COLOR`), which reads as nearly identical at a glance —
+/// not obvious enough for a control that flips a system-wide mouse
+/// passthrough mode. An amber wash (the color already associated with
+/// "caution, behavior changed") is a second, unmistakable signal on top of
+/// the existing tint, painted only in the "on" state; "off" is unchanged
+/// (relies on the pill's own `PILL_FILL` plus the dim icon tint, same as
+/// before this issue).
+const CLICK_THROUGH_ON_FILL: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(233, 196, 106, 130);
 /// Circular hover wash painted behind a toggle-cluster button, matching the
 /// oval pill's own shape rather than a foreign square badge.
 const TOGGLE_HOVER_FILL: egui::Color32 =
@@ -2891,6 +2907,16 @@ fn title_row_toggles(
     } else {
         "Click-through: off"
     };
+    // Issue #292: a second, color-based on/off signal painted behind the
+    // icon (see `CLICK_THROUGH_ON_FILL`'s doc comment) — before
+    // `toggle_button` so its own hover wash still paints on top of it.
+    if settings.click_through {
+        ui.painter().circle_filled(
+            click_through_rect.center(),
+            click_through_rect.width() / 2.0 + 3.0,
+            CLICK_THROUGH_ON_FILL,
+        );
+    }
     if toggle_button(ui, click_through_rect, click_through_label, capturing, true).clicked() {
         settings.toggle_click_through();
         crate::platform::set_click_through(settings.click_through);
@@ -2936,10 +2962,6 @@ fn title_row_toggles(
         };
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
-        // Issue #232: pinning now locks the native resize border the same
-        // frame it locks Z-order and (via `drag_locked_by_pin`/
-        // `resize_locked_by_pin`) the manual move/resize gestures.
-        crate::platform::set_resize_locked(settings.always_on_top);
         let _ = tx_settings.send(settings.clone());
     }
     if let Some(pin) = icons.glyphs.get(GlyphIcon::Pin) {
@@ -5418,16 +5440,10 @@ fn gesture_end_needs_frame_recompute(kind: GestureKind, viewport: egui::Viewport
 /// by an accidental drag of its header — which is the opposite of what a
 /// pushpin means to anyone who clicks it. Pinning now locks both.
 ///
-/// Deliberately only `GestureKind::Move` — the eight `resize_zones` have
-/// their own gate, `resize_locked_by_pin`, checked separately at
-/// `draw_resize_handles`. Issue #183 originally left resize live here on
-/// purpose ("pinned" meant staying put, not frozen in size); issue #232
-/// reversed that call, since a lock a user can still resize through reads
-/// as only half a lock. The two gates stay separate functions rather than
-/// one shared check because their call sites want different things: this
-/// one gates a gesture *start*, `resize_locked_by_pin` gates eight of them
-/// plus (via `platform::resize_lock_hit_test`) Windows' own native
-/// edge-drag resize.
+/// Deliberately only `GestureKind::Move`: the eight `resize_zones` stay
+/// live, because "pinned" is about the overlay staying put, not about
+/// freezing its size, and a pinned overlay the user can't resize would be a
+/// second surprise rather than a fix for the first.
 ///
 /// Trivial enough to inline, spelled as a function anyway so the rule has
 /// one name and one doc comment shared by the drag band and
@@ -5454,29 +5470,6 @@ fn cancel_move_gesture_when_pinned(gesture: &mut WindowGesture, always_on_top: b
     if drag_locked_by_pin(always_on_top) && gesture.kind() == Some(GestureKind::Move) {
         gesture.end();
     }
-}
-
-/// Issue #232: whether `draw_resize_handles`' eight resize zones must
-/// refuse to *start* a new resize gesture, because the overlay is pinned
-/// (`Settings::always_on_top`).
-///
-/// No in-flight-cancel counterpart is needed here the way
-/// `cancel_move_gesture_when_pinned` exists for `drag_locked_by_pin`: the
-/// pin button lives in the header band, physically separate from every
-/// resize handle, and only one pointer-drag gesture can be held at a time
-/// — so pinning can never land mid-resize the way it can land mid-move.
-/// Gating the start is therefore the whole fix on the egui side.
-/// `platform::resize_lock_hit_test` is the matching gate for Windows' own
-/// native edge-drag resize, which `WS_THICKFRAME` allows independently of
-/// any of this module's gesture code.
-///
-/// Same trivial `always_on_top` body as `drag_locked_by_pin` — kept as its
-/// own named function (rather than reusing that one under a
-/// resize-flavored call) so each call site's intent reads directly off the
-/// function name, and so the two stay independently unit-testable if the
-/// policies these two gates express are ever split again.
-fn resize_locked_by_pin(always_on_top: bool) -> bool {
-    always_on_top
 }
 
 /// Starts `kind` from wherever the pointer and window are right now.
@@ -5688,13 +5681,12 @@ fn resize_zones(rect: egui::Rect) -> [(egui::Rect, egui::ResizeDirection, egui::
 /// are drawn from a root `Ui` whose own id is the same in each — without a
 /// salt, two windows' north handles would be one widget.
 ///
-/// `locked` (issue #232) is `resize_locked_by_pin(settings.always_on_top)`
-/// at the root call site — the breakdown viewport call site always passes
-/// `false`, since a skill window has no pin of its own to lock against.
-/// While locked, the handles stay hovered/drawn (so the invisible strip is
-/// still there to hit-test against, matching the header drag band's own
-/// choice to keep sensing hover) but never start a gesture, and the cursor
-/// says so with `NotAllowed` instead of the usual resize glyph.
+/// Returns whether any of the eight zones was double-clicked this frame
+/// (issue #300) — the root call site turns that into a height-preset
+/// resize via `resize_double_click_command`; the breakdown-viewport call
+/// site (a skill window has no row-count preset of its own) just discards
+/// it. Sensed here rather than left to the caller because only this
+/// function actually owns the eight zone `Response`s.
 fn draw_resize_handles(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -5704,33 +5696,36 @@ fn draw_resize_handles(
     // salt's `Debug` rendering in `id_source` so an id clash names the
     // widgets that collided. Not ours to drop.
     id_salt: impl std::hash::Hash + std::fmt::Debug,
-    locked: bool,
-) {
+) -> bool {
     // The viewport this `Ui` belongs to — the root window, or, inside
     // `show_viewport_immediate`'s callback, the child. Either way it is the
     // rect `Ui::max_rect` was built from (egui's `root_ui`).
     let window = ctx.input(|i| i.viewport_rect());
+    let mut double_clicked = false;
     // `ResizeDirection` is not `Hash`, so the zone's position in the array is
     // what keeps the eight ids distinct.
     for (index, (zone, direction, cursor)) in resize_zones(window).into_iter().enumerate() {
+        // `click_and_drag` (rather than plain `drag`) so a double-click on
+        // the handle registers as a click pair, not just the first click's
+        // drag start — issue #300 needs both out of the same `Response`.
         let handle = ui.interact(
             zone,
             ui.id().with((&id_salt, "resize", index)),
-            egui::Sense::drag(),
+            egui::Sense::click_and_drag(),
         );
         if handle.hovered() {
-            ctx.set_cursor_icon(if locked {
-                egui::CursorIcon::NotAllowed
-            } else {
-                cursor
-            });
+            ctx.set_cursor_icon(cursor);
         }
         // Same as the title-bar drag: the anchor is captured once, then
         // `drive_window_gesture` does the per-frame work.
-        if !locked && handle.drag_started_by(egui::PointerButton::Primary) {
+        if handle.drag_started_by(egui::PointerButton::Primary) {
             begin_window_gesture(ctx, gesture, GestureKind::Resize(direction));
         }
+        if handle.double_clicked_by(egui::PointerButton::Primary) {
+            double_clicked = true;
+        }
     }
+    double_clicked
 }
 
 /// Takes the whole `Icons` bundle rather than just `ClassIcons`: since issue
@@ -6994,6 +6989,46 @@ fn inner_height_for_rows(rows: usize) -> f32 {
     first_player_row_top_offset(header_band_height(BUTTON_ROW_HEIGHT)) + rows
 }
 
+/// Issue #300: the inner height a resize-border double-click should snap
+/// the window to, given its inner height right now — alternating between
+/// the same two presets `reset_to_defaults_inner_height`
+/// (`RESET_TO_DEFAULTS_VISIBLE_ROWS`, 5) and `default_inner_height`
+/// (`DEFAULT_VISIBLE_ROWS`, 20) already compute.
+///
+/// No latched "which preset did the last double-click apply" state is
+/// kept anywhere — the current height alone decides: whichever preset is
+/// farther from it wins, with the midpoint between the two as the tie
+/// line. That is what makes back-to-back double-clicks alternate at all:
+/// landing on one preset puts the window closer to it and farther from
+/// the other, so the very next double-click's farther-preset pick is
+/// always the other one. It also means a window resized by hand to some
+/// arbitrary height resolves its first double-click sensibly, with
+/// nothing to initialize.
+fn resize_double_click_preset_height(current_height: f32) -> f32 {
+    let five_rows = reset_to_defaults_inner_height();
+    let twenty_rows = default_inner_height();
+    let midpoint = (five_rows + twenty_rows) / 2.0;
+    if current_height < midpoint {
+        twenty_rows
+    } else {
+        five_rows
+    }
+}
+
+/// Issue #300: turns "did a resize-border zone get double-clicked this
+/// frame" (`draw_resize_handles`' own return value) into the `InnerSize`
+/// height command the root call site should queue, if any.
+///
+/// Kept separate from `resize_double_click_preset_height` so the "was
+/// there actually a double-click this frame" gate and the "what height
+/// does that resolve to" math stay two independently testable decisions —
+/// without it, every ordinary frame (no double-click at all) would need
+/// its own `current_height` threaded through the preset math just to
+/// throw the answer away.
+fn resize_double_click_command(double_clicked: bool, current_height: f32) -> Option<f32> {
+    double_clicked.then(|| resize_double_click_preset_height(current_height))
+}
+
 /// Extra width folded into `default_inner_width` on top of the row-column
 /// budget below, so the window opens wide enough to lay out the header's
 /// stat row without wrapping. That row (issue #59's real rasterized pill
@@ -7946,10 +7981,10 @@ fn draw_skill_window(
     // `with_resizable(true)` on its builder is dead. It supplies its own
     // grips exactly as the root window does. Registered first so the header
     // widgets below win the pixels they overlap; egui gives interaction
-    // priority to whatever was registered later.
-    // A breakdown viewport has no pin of its own — issue #232's lock is a
-    // main-window setting — so its resize handles are never locked here.
-    draw_resize_handles(ui, &ctx, gesture, ("skill", row.uid), false);
+    // priority to whatever was registered later. Its double-click return
+    // (issue #300) is discarded here — a breakdown viewport has no row-count
+    // preset of its own to snap to.
+    let _ = draw_resize_handles(ui, &ctx, gesture, ("skill", row.uid));
 
     // -- header: class icon, player name, the pill cluster (D10) ---------
     let header_rect = skill_header_rect(rect);
@@ -8288,6 +8323,17 @@ fn draw_skill_window(
             egui::Color32::GRAY,
             false,
         );
+        // Issue #299: this used to return before `drive_window_gesture`
+        // ran. The Buff tab's rows are *always* empty (`SkillTab::rows`
+        // hands it `&[]` unconditionally), so this branch is taken on
+        // every single frame the Buff tab is selected — meaning a
+        // move/resize gesture begun while it was showing was never driven
+        // to completion: not moved, not ended when the pointer let go,
+        // just stranded until the user switched to a tab with rows, which
+        // then applied the whole stale delta in one jump. Switching tabs
+        // must only change the displayed breakdown, never a live gesture
+        // (or anything else) in flight.
+        drive_window_gesture(&ctx, gesture, SKILL_WINDOW_MIN_SIZE);
         return close_clicked;
     }
 
@@ -11343,6 +11389,61 @@ mod tests {
         );
     }
 
+    /// Issue #292: `toggle_state_tint` alone is a ~25% alpha delta on the
+    /// same white glyph (`TOGGLE_OFF_COLOR` vs `TOGGLE_ACTIVE_COLOR`), which
+    /// reads as nearly identical at a glance — not the "obvious at a
+    /// glance" on/off signal click-through needs, since it flips a
+    /// system-wide mouse-passthrough mode. This drives `CLICK_THROUGH_ON_FILL`,
+    /// a second, high-contrast signal painted only while click-through is
+    /// enabled, using the same `collect_circle_fills` helper the hover-fill
+    /// suppression tests use.
+    #[test]
+    fn click_through_paints_a_distinct_fill_circle_only_while_enabled() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+
+        let fills_for = |click_through: bool| -> Vec<egui::Color32> {
+            let mut settings = Settings {
+                click_through,
+                ..Settings::default()
+            };
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let title_row = test_title_row(ui);
+                title_row_toggles(
+                    ui,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    title_row,
+                    false,
+                );
+            });
+            let mut fills = Vec::new();
+            for clipped in &output.shapes {
+                collect_circle_fills(&clipped.shape, &mut fills);
+            }
+            output.drop_without_applying_deltas();
+            fills
+        };
+
+        let on = fills_for(true);
+        assert!(
+            on.contains(&CLICK_THROUGH_ON_FILL),
+            "click-through enabled must paint CLICK_THROUGH_ON_FILL: {on:?}"
+        );
+
+        let off = fills_for(false);
+        assert!(
+            !off.contains(&CLICK_THROUGH_ON_FILL),
+            "click-through disabled must not paint CLICK_THROUGH_ON_FILL: {off:?}"
+        );
+    }
+
     /// Clicking the click-through button flips `Settings::click_through`,
     /// tells the platform layer (`platform::set_click_through` — issue
     /// #167 rehash; a no-op stub off-Windows, so not independently
@@ -12546,17 +12647,6 @@ mod tests {
             Some(resize),
             "pinning is about position, not size"
         );
-    }
-
-    /// Issue #232: pinning now locks size the same way it already locks
-    /// position — reversing the #183 call above that deliberately left
-    /// resize live. `draw_resize_handles` reads this before starting a new
-    /// resize gesture, the same way the drag band reads `drag_locked_by_
-    /// pin` before starting a move.
-    #[test]
-    fn resize_locked_by_pin_mirrors_the_move_lock() {
-        assert!(resize_locked_by_pin(true));
-        assert!(!resize_locked_by_pin(false));
     }
 
     /// Issue #231: the header dropdown's Columns list can grow taller than
@@ -15807,6 +15897,57 @@ mod tests {
         );
     }
 
+    /// Issue #300: double-clicking a resize border snaps the window
+    /// straight to whichever of the two presets it isn't already at — so a
+    /// window already sitting exactly on one preset always flips to the
+    /// other on the next double-click, the "alternating" the issue asks
+    /// for.
+    #[test]
+    fn resize_double_click_preset_height_alternates_between_the_two_presets() {
+        let five = reset_to_defaults_inner_height();
+        let twenty = default_inner_height();
+        assert_eq!(resize_double_click_preset_height(five), twenty);
+        assert_eq!(resize_double_click_preset_height(twenty), five);
+    }
+
+    /// From any height that isn't already sitting on a preset (a window
+    /// resized by hand, or one that has never been snapped), the target is
+    /// whichever preset is farther away — the midpoint between the two
+    /// presets is where that flips.
+    #[test]
+    fn resize_double_click_preset_height_picks_the_farther_preset_from_an_arbitrary_height() {
+        let five = reset_to_defaults_inner_height();
+        let twenty = default_inner_height();
+        let midpoint = (five + twenty) / 2.0;
+        assert_eq!(resize_double_click_preset_height(midpoint - 1.0), twenty);
+        assert_eq!(resize_double_click_preset_height(midpoint + 1.0), five);
+    }
+
+    /// A frame with no resize-border double-click this frame must never
+    /// queue a resize command, no matter what the current height is —
+    /// otherwise every ordinary frame would re-issue the same `InnerSize`
+    /// command against whatever height a manual drag last left the window
+    /// at.
+    #[test]
+    fn resize_double_click_command_is_none_without_a_double_click() {
+        assert_eq!(resize_double_click_command(false, 100.0), None);
+        assert_eq!(
+            resize_double_click_command(false, reset_to_defaults_inner_height()),
+            None
+        );
+    }
+
+    /// A resize-border double-click turns into exactly the target height
+    /// `resize_double_click_preset_height` computes from the window's
+    /// current height.
+    #[test]
+    fn resize_double_click_command_uses_the_preset_height_when_double_clicked() {
+        let five = reset_to_defaults_inner_height();
+        let twenty = default_inner_height();
+        assert_eq!(resize_double_click_command(true, five), Some(twenty));
+        assert_eq!(resize_double_click_command(true, twenty), Some(five));
+    }
+
     // -- draw_rows scrolling (issue #84) and the row-pitch/centering
     // regression harness (issue #83) ---------------------------------------
 
@@ -18243,6 +18384,64 @@ mod tests {
         assert_eq!(gesture.kind(), None);
     }
 
+    /// Issue #299: the Buff tab is the one tab whose rows are *always*
+    /// empty (`SkillTab::rows` hands it `&[]` unconditionally, since
+    /// buff tracking isn't implemented yet — see `skills::SkillTab::Buff`),
+    /// so `draw_skill_window` always takes its "nothing recorded" early
+    /// return while it is selected — before `drive_window_gesture` ever
+    /// runs. A move/resize gesture begun while the window happened to be
+    /// showing Buff was therefore never driven to completion: not moved,
+    /// not ended when the pointer let go, just silently frozen mid-drag
+    /// with its whole stale `start_pointer`/`start_rect` delta waiting to
+    /// be applied in one jump the moment the user switched back to a tab
+    /// with rows — reading as the window (and the fight beneath it)
+    /// suddenly resetting. Switching tabs must never affect anything but
+    /// which breakdown is displayed.
+    #[test]
+    fn switching_to_the_buff_tab_still_lets_an_in_flight_gesture_end() {
+        let row = sample_row(None);
+        let mut tabs = SkillTabs {
+            selected: skills::SkillTab::Buff,
+            ..Default::default()
+        };
+
+        let mut gesture = WindowGesture::default();
+        gesture.begin(GestureKind::Move, egui::pos2(10.0, 10.0), window_rect());
+        assert_eq!(gesture.kind(), Some(GestureKind::Move));
+
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_SIZE);
+        // No pointer input this frame: the drag has already been
+        // released, and `drive_window_gesture` is the only thing that
+        // ever notices that and ends the gesture.
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_skill_window(
+                    ui,
+                    &row,
+                    &mut tabs,
+                    SkillWindowSource::Live,
+                    &icons,
+                    1.0,
+                    &mut gesture,
+                );
+            },
+        )
+        .drop_without_applying_deltas();
+
+        assert_eq!(
+            gesture.kind(),
+            None,
+            "the Buff tab's empty state must not skip driving an in-flight gesture to completion"
+        );
+    }
+
     #[test]
     fn a_finished_resize_needs_a_frame_recompute() {
         // Issue #74: a resize is the gesture kind that can leave DWM's frame
@@ -19755,6 +19954,88 @@ mod tests {
             reported_rows_top > pre_call_top,
             "rows_top must move past the history bar and separator \
              (pre-call top {pre_call_top}, reported {reported_rows_top})"
+        );
+    }
+
+    /// Issue #298: strengthens the test above's loose `>` check into a
+    /// concrete pixel accounting — proving not just that `rows_top` moves
+    /// past the "← Live"/"← Back" bar, but that a Share screenshot sized to
+    /// the *correct* bound fully contains the open encounter's rows, while
+    /// the same image sized to the naive, pre-#219 bound (measured before
+    /// `draw_history`'s own bar and separator, the way the outer panel's
+    /// stale `rows_top` used to be) would truncate real row pixels off the
+    /// bottom — exactly the symptom issue #298 reports.
+    #[test]
+    fn share_crop_bound_for_an_open_encounter_fully_contains_its_rows_past_the_history_bar() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let settings = Settings::default();
+        let row_count = 3;
+        let mut state = HistoryUi {
+            open: Some(OpenEncounter {
+                id: 1,
+                title: "Fight".to_string(),
+                subtitle: None,
+                ended_at_ms: 0,
+                snapshot: rows_test_snapshot(row_count),
+            }),
+            ..HistoryUi::default()
+        };
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut back_to_live = false;
+
+        let mut pre_call_top = 0.0;
+        let mut reported_rows_top = 0.0;
+        let mut rows_area_height = 0.0;
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            pre_call_top = ui.cursor().top();
+            let (rows_top, area_height) = draw_history(
+                ui,
+                &mut state,
+                &settings,
+                &icons,
+                None,
+                &tx,
+                &mut back_to_live,
+                &mut None,
+            );
+            reported_rows_top = rows_top;
+            rows_area_height = area_height;
+        })
+        .drop_without_applying_deltas();
+
+        let bar_height = reported_rows_top - pre_call_top;
+        assert!(
+            bar_height > 0.0,
+            "the history bar and separator must occupy real space (got {bar_height})"
+        );
+
+        let pixels_per_point = 1.0;
+        let correct_bound =
+            rows_content_bottom_y(reported_rows_top, row_count, ROW_HEIGHT, rows_area_height);
+        // An image exactly as tall as the correctly-measured content: the
+        // real Share crop must keep every pixel of it.
+        let image_height_px = correct_bound.round() as usize;
+        let correct_crop =
+            screenshot_crop_height_px(correct_bound, pixels_per_point, image_height_px);
+        assert_eq!(
+            correct_crop, image_height_px,
+            "the correct bound must keep the full image, not truncate real row pixels"
+        );
+
+        // The pre-#219 regression: computing the bound from `pre_call_top`
+        // (before the bar and separator `draw_history` itself paints)
+        // against that same image truncates real row content off the
+        // bottom.
+        let naive_bound =
+            rows_content_bottom_y(pre_call_top, row_count, ROW_HEIGHT, rows_area_height);
+        let naive_crop = screenshot_crop_height_px(naive_bound, pixels_per_point, image_height_px);
+        assert!(
+            naive_crop < image_height_px,
+            "sanity check: the naive (pre-#219) bound must actually be \
+             shorter, proving it would have cropped real row pixels off \
+             (naive {naive_crop}, image {image_height_px})"
         );
     }
 

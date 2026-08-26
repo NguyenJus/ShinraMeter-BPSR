@@ -10,7 +10,8 @@ use prost::Message;
 use std::sync::Arc;
 
 use crate::attrs::{
-    cast_skill_id_from_attrs, enemy_hp_from_attrs, player_info_from_attrs, scene_id_from_attrs,
+    enemy_hp_from_attrs, player_info_from_attrs, scene_id_from_attrs,
+    skill_cast_metadata_from_attrs,
 };
 use crate::blob;
 use crate::event::{
@@ -258,11 +259,23 @@ fn on_aoi_sync_delta(
                 // cast is a *thing that happened at a time*, while every
                 // other field on `PlayerInfo` is a standing property the
                 // meter merges rather than counts.
-                if let Some(skill_id) = cast_skill_id_from_attrs(&attrs.attrs) {
+                //
+                // Issue #287: the metadata cluster rides the same attr
+                // delta as `skill_id`, so both are decoded together in one
+                // walk of `attrs.attrs` — each field (including `skill_id`
+                // itself) is independently `None` when its own id is
+                // absent.
+                let meta = skill_cast_metadata_from_attrs(&attrs.attrs);
+                if let Some(skill_id) = meta.skill_id {
                     out.push(ProtocolEvent::Cast(CastEvent {
                         caster_uid: target_uid,
                         skill_id,
                         timestamp_ms: now_ms,
+                        skill_stage: meta.skill_stage,
+                        skill_level: meta.skill_level,
+                        skill_begin_time_ms: meta.skill_begin_time_ms,
+                        skill_stage_num: meta.skill_stage_num,
+                        skill_uuid: meta.skill_uuid,
                     }));
                 }
             }
@@ -420,6 +433,10 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
         // Same: no confirmed `CharBaseInfo` field for equipped Imagines
         // (issue #33) — attr-list path only.
         skill_ids: Vec::new(),
+        // `SyncContainerData` carries no position field — attr-list path
+        // only (issue #286).
+        position: None,
+        target_position: None,
     }));
 }
 
@@ -493,6 +510,10 @@ fn on_notify_join_team(msg: &pb::NotifyJoinTeam, out: &mut Vec<ProtocolEvent>) {
             season_level: None,
             season_strength,
             skill_ids: Vec::new(),
+            // `NotifyJoinTeam`'s roster push carries no position field —
+            // attr-list path only (issue #286).
+            position: None,
+            target_position: None,
         }));
     }
 }
@@ -984,6 +1005,67 @@ mod tests {
         assert_eq!(cast.caster_uid, uid_of(ATTACKER_UUID));
         assert_eq!(cast.skill_id, 1550);
         assert_eq!(cast.timestamp_ms, 4242);
+    }
+
+    /// Issue #287: the skill-cast metadata cluster (`SKILL_LEVEL` /
+    /// `SKILL_BEGIN_TIME` here) rides the same delta as `SKILL_ID` and must
+    /// land on the emitted `CastEvent`'s new fields.
+    #[test]
+    fn a_skill_id_attr_with_metadata_emits_a_cast_carrying_it() {
+        let mut level_raw = Vec::new();
+        prost::encoding::encode_varint(30u64, &mut level_raw);
+        let mut begin_time_raw = Vec::new();
+        prost::encoding::encode_varint(1_787_022_297_550u64, &mut begin_time_raw);
+        let mut skill_id_raw = Vec::new();
+        prost::encoding::encode_varint(1550u64, &mut skill_id_raw);
+
+        let attrs = AttrCollection {
+            uuid: ATTACKER_UUID,
+            attrs: vec![
+                pb::Attr {
+                    id: crate::attrs::attr_id::SKILL_ID,
+                    raw_data: skill_id_raw,
+                },
+                pb::Attr {
+                    id: crate::attrs::attr_id::SKILL_LEVEL,
+                    raw_data: level_raw,
+                },
+                pb::Attr {
+                    id: crate::attrs::attr_id::SKILL_BEGIN_TIME,
+                    raw_data: begin_time_raw,
+                },
+            ],
+        };
+        let delta = AoiSyncDelta {
+            uuid: ATTACKER_UUID,
+            attrs: Some(attrs),
+            skill_effects: None,
+        };
+        let msg = SyncNearDeltaInfo {
+            delta_infos: vec![delta],
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let n = Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id: opcode::SYNC_NEAR_DELTA_INFO,
+            payload,
+        };
+
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        let cast = out
+            .iter()
+            .find_map(|ev| match ev {
+                ProtocolEvent::Cast(c) => Some(c),
+                _ => None,
+            })
+            .expect("expected a Cast event");
+        assert_eq!(cast.skill_level, Some(30));
+        assert_eq!(cast.skill_begin_time_ms, Some(1_787_022_297_550));
+        assert_eq!(cast.skill_stage, None);
+        assert_eq!(cast.skill_stage_num, None);
+        assert_eq!(cast.skill_uuid, None);
     }
 
     /// The attr rides every entity's deltas, monsters included, but a
