@@ -318,6 +318,22 @@ pub struct Meter {
     /// boss-HP rollback both stay in the same dungeon); cleared only on
     /// `ServerChanged`, in `apply` directly rather than in `reset` itself.
     scene_id: Option<u32>,
+    /// The most recent scene id an actual `ProtocolEvent::Scene` reported,
+    /// **not** cleared by `ServerChanged` (issue #295). `scene_id` goes
+    /// `None` across a reconnect because the destination is genuinely
+    /// unknown until the next `Scene` packet — but by the time that packet
+    /// arrives, comparing its id against the *previous* confirmed scene is
+    /// no longer ambiguous, and every real capture sends `ServerChanged`
+    /// immediately before the `Scene` that follows a zone transition. Using
+    /// `scene_id` itself for that comparison (as the `Scene` arm's
+    /// `entering_dungeon` gate once did) meant the comparison always saw
+    /// `None` in production and could never tell a genuinely new dungeon
+    /// from a late reconnect-confirmation of the one just left — so the
+    /// fast `SceneChanged` reset never fired outside a unit test, and a
+    /// fight held since the previous instance sat un-reset until either
+    /// real combat (`NewFight`) or that dungeon's own `Playing` packet
+    /// (`DungeonStarted`) eventually caught it, sometimes minutes later.
+    last_known_scene_id: Option<u32>,
     /// When the current fight ended, if it has (issue #78). `Some(t)` puts
     /// the meter in [`FightState::Ended`]: the snapshot is rendered as of
     /// `t` rather than the caller's `now_ms`, so rows, totals and the
@@ -454,6 +470,7 @@ impl Meter {
             last_reset_ms: None,
             boss_uid: None,
             scene_id: None,
+            last_known_scene_id: None,
             fight_end_ms: None,
             fight_end_boss_id: None,
             wipe_hold: false,
@@ -831,22 +848,25 @@ impl Meter {
                     // had no such hit to eventually clean it up at all),
                     // but not eliminated by it.
                     //
-                    // And gated on `self.scene_id.is_some()`: a `None`
-                    // scene id going in is *unknown*, not *different* — it
-                    // can mean a genuinely new instance (after a
-                    // `ServerChanged`), but it can just as well mean this
-                    // very `Scene` packet is the *late* confirmation of the
-                    // instance the currently-held fight was already fought
-                    // in (`a_scene_that_arrives_after_the_boss_still_captions_the_held_fight`,
+                    // And gated on `self.last_known_scene_id` rather than
+                    // the live `self.scene_id` (issue #295): `scene_id`
+                    // itself goes `None` across a `ServerChanged`, since the
+                    // destination really is unknown until this very packet
+                    // — and every real zone transition in capture sends a
+                    // `ServerChanged` first, so comparing against `scene_id`
+                    // here always saw `None` in production and could never
+                    // resolve immediately. `last_known_scene_id` is not
+                    // cleared by `ServerChanged`, so by the time this packet
+                    // lands the comparison is no longer ambiguous: a
+                    // different id from the last one actually confirmed
+                    // *is* a genuinely new instance, and the same id is the
+                    // *late* confirmation of the instance the currently-held
+                    // fight was already fought in
+                    // (`a_scene_that_arrives_after_the_boss_still_captions_the_held_fight`,
                     // issue #152: `EnterScene` can land after the pull
-                    // already started). The meter has no way to tell those
-                    // two apart from here, and wrongly clearing the second
-                    // one would erase a fight's identity in the same call
-                    // that was supposed to fill it in. Only a scene change
-                    // *positively confirmed* by a known previous id is
-                    // resolved immediately; the unknown-origin case still
-                    // falls back to `prune_stale_preloads` plus the
-                    // ordinary `NewFight` reset, exactly as before #191.
+                    // already started) — that case still falls back to
+                    // `prune_stale_preloads` plus the ordinary `NewFight`
+                    // reset, exactly as before #191.
                     // issue #202: a wipe latches `fight_end_ms` right away
                     // (see `apply_damage`'s `FightEndCause::Wipe` arm), so
                     // by the time this packet lands `cut_short` already
@@ -858,8 +878,10 @@ impl Meter {
                     // `Ended` and recorded either, and clearing `players`
                     // here would drop it — death counts included — before
                     // anything ever sees it.
-                    let entering_dungeon =
-                        tables::is_dungeon_scene(*level_map_id) && self.scene_id.is_some();
+                    let entering_dungeon = tables::is_dungeon_scene(*level_map_id)
+                        && self
+                            .last_known_scene_id
+                            .is_some_and(|id| id != *level_map_id);
                     if entering_dungeon && !cut_short && !self.wipe_hold {
                         self.reset(ResetReason::SceneChanged, self.last_event_ms);
                         // PR #198 review, finding 1: `reset` is shared with
@@ -951,6 +973,7 @@ impl Meter {
                     }
                 }
                 self.scene_id = Some(*level_map_id);
+                self.last_known_scene_id = Some(*level_map_id);
                 reason
             }
             ProtocolEvent::ServerChanged { timestamp_ms } => {
@@ -7639,6 +7662,136 @@ mod tests {
                 "the untouched next selection is still standing -- it simply \
                  has no say in whether this pull ended"
             );
+        }
+
+        /// Issue #295's real-world repro: a raid selection's death freezes
+        /// the meter exactly as the test above shows, the party leaves the
+        /// instance, and -- a long real-world gap later (the capture that
+        /// reported #295 shows 43 minutes) -- queues into an entirely
+        /// unrelated dungeon. That dungeon's own `Playing` signal is the
+        /// authoritative "a fresh encounter is starting" event
+        /// (`ResetReason::DungeonStarted`'s doc comment) and must clear the
+        /// held fight the same way it does for any other dungeon entry, no
+        /// matter how long the meter sat idle in between.
+        #[test]
+        fn a_new_dungeons_playing_signal_resets_a_fight_held_since_a_raid_selection_died() {
+            let mut m = in_raid();
+            objective_running(&mut m);
+            m.apply(&hp(OTHER_UID, 1_000_000, 1_000_000, CONTINUATION, 0));
+            m.apply(&hp(BOSS_UID, 2_000_000, 2_000_000, ORIGIN, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            m.apply(&hp(BOSS_UID, 60_000, 2_000_000, ORIGIN, 1_500));
+            m.apply(&gone(BOSS_UID));
+            assert_eq!(
+                m.fight_state(1_600),
+                FightState::Ended,
+                "sanity check: the kill froze the meter"
+            );
+            assert_eq!(
+                m.snapshot(1_600).total_damage,
+                500,
+                "the held numbers from the kill"
+            );
+
+            // The party leaves the raid for the open world -- a reconnect
+            // followed by the destination `Scene`, the same shape every
+            // real zone transition takes in capture (issue #191).
+            const TOWN_SCENE: u32 = 8;
+            m.apply(&ProtocolEvent::ServerChanged {
+                timestamp_ms: 60_000,
+            });
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: TOWN_SCENE,
+            });
+            assert_eq!(
+                m.fight_state(60_000),
+                FightState::Ended,
+                "issue #152: the kill's numbers stay on screen out in town"
+            );
+
+            // A long real-world gap, then a queue into a *different*
+            // dungeon: another reconnect, its `Scene`, and the instance's
+            // own `Playing`.
+            m.apply(&ProtocolEvent::ServerChanged {
+                timestamp_ms: 2_640_000,
+            });
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: DUNGEON_SCENE,
+            });
+            let reason = m.apply(&ProtocolEvent::DungeonState {
+                state: EDungeonState::Playing,
+                scene_uuid: None,
+            });
+
+            assert_eq!(
+                reason,
+                Some(ResetReason::DungeonStarted),
+                "issue #295: the new dungeon's own start signal must clear \
+                 a fight held since a raid selection's death"
+            );
+            assert_eq!(m.snapshot(2_640_100).total_damage, 0);
+            assert_eq!(m.fight_state(2_640_100), FightState::Idle);
+        }
+
+        /// Issue #295's actual root cause: `ServerChanged` nulls `scene_id`
+        /// before the `Scene` event that reports the destination lands --
+        /// and every real zone transition in capture carries a
+        /// `ServerChanged` first, a reconnect always accompanying a scene
+        /// change. The `Scene` arm's `entering_dungeon` gate used to read
+        /// `self.scene_id.is_some()` to tell "a specific previous scene is
+        /// known" from "unknown", so in every real capture it saw `None`
+        /// and never fired the fast `SceneChanged` reset -- leaving a fight
+        /// held since a raid selection's death to wait on that new
+        /// dungeon's own `Playing` signal (which can be minutes away, or
+        /// require a manual reset) instead of clearing the moment the
+        /// party is confirmed to be somewhere new.
+        #[test]
+        fn a_new_dungeon_scene_resets_a_fight_held_since_a_raid_selection_died_before_the_dungeon_even_starts()
+         {
+            let mut m = in_raid();
+            objective_running(&mut m);
+            m.apply(&hp(OTHER_UID, 1_000_000, 1_000_000, CONTINUATION, 0));
+            m.apply(&hp(BOSS_UID, 2_000_000, 2_000_000, ORIGIN, 0));
+            m.apply(&hit(BOSS_UID, 1_000));
+            m.apply(&hp(BOSS_UID, 60_000, 2_000_000, ORIGIN, 1_500));
+            m.apply(&gone(BOSS_UID));
+            assert_eq!(
+                m.fight_state(1_600),
+                FightState::Ended,
+                "sanity check: the kill froze the meter"
+            );
+
+            // The party leaves the raid for the open world -- a reconnect
+            // followed by the destination `Scene`, exactly as every real
+            // zone transition in capture (issue #191).
+            const TOWN_SCENE: u32 = 8;
+            m.apply(&ProtocolEvent::ServerChanged {
+                timestamp_ms: 60_000,
+            });
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: TOWN_SCENE,
+            });
+
+            // Sometime later, another reconnect into a genuinely different
+            // dungeon. The `Scene` event alone -- before that dungeon's own
+            // `Playing` ever arrives -- must be enough to know this is not
+            // the raid just left.
+            m.apply(&ProtocolEvent::ServerChanged {
+                timestamp_ms: 2_640_000,
+            });
+            let reason = m.apply(&ProtocolEvent::Scene {
+                level_map_id: DUNGEON_SCENE,
+            });
+
+            assert_eq!(
+                reason,
+                Some(ResetReason::SceneChanged),
+                "issue #295: stepping into a confirmed different dungeon must \
+                 reset immediately, without waiting on that dungeon's own \
+                 `Playing` signal"
+            );
+            assert_eq!(m.snapshot(2_640_100).total_damage, 0);
+            assert_eq!(m.fight_state(2_640_100), FightState::Idle);
         }
 
         /// The counterweight to the test above: dropping the objective gate
