@@ -18258,8 +18258,10 @@ mod tests {
     #[test]
     fn switching_to_the_buff_tab_still_lets_an_in_flight_gesture_end() {
         let row = sample_row(None);
-        let mut tabs = SkillTabs::default();
-        tabs.selected = skills::SkillTab::Buff;
+        let mut tabs = SkillTabs {
+            selected: skills::SkillTab::Buff,
+            ..Default::default()
+        };
 
         let mut gesture = WindowGesture::default();
         gesture.begin(GestureKind::Move, egui::pos2(10.0, 10.0), window_rect());
