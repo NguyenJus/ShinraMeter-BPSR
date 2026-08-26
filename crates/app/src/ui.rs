@@ -8318,6 +8318,17 @@ fn draw_skill_window(
             egui::Color32::GRAY,
             false,
         );
+        // Issue #299: this used to return before `drive_window_gesture`
+        // ran. The Buff tab's rows are *always* empty (`SkillTab::rows`
+        // hands it `&[]` unconditionally), so this branch is taken on
+        // every single frame the Buff tab is selected — meaning a
+        // move/resize gesture begun while it was showing was never driven
+        // to completion: not moved, not ended when the pointer let go,
+        // just stranded until the user switched to a tab with rows, which
+        // then applied the whole stale delta in one jump. Switching tabs
+        // must only change the displayed breakdown, never a live gesture
+        // (or anything else) in flight.
+        drive_window_gesture(&ctx, gesture, SKILL_WINDOW_MIN_SIZE);
         return close_clicked;
     }
 
@@ -18359,6 +18370,64 @@ mod tests {
         gesture.end();
         gesture.end();
         assert_eq!(gesture.kind(), None);
+    }
+
+    /// Issue #299: the Buff tab is the one tab whose rows are *always*
+    /// empty (`SkillTab::rows` hands it `&[]` unconditionally, since
+    /// buff tracking isn't implemented yet — see `skills::SkillTab::Buff`),
+    /// so `draw_skill_window` always takes its "nothing recorded" early
+    /// return while it is selected — before `drive_window_gesture` ever
+    /// runs. A move/resize gesture begun while the window happened to be
+    /// showing Buff was therefore never driven to completion: not moved,
+    /// not ended when the pointer let go, just silently frozen mid-drag
+    /// with its whole stale `start_pointer`/`start_rect` delta waiting to
+    /// be applied in one jump the moment the user switched back to a tab
+    /// with rows — reading as the window (and the fight beneath it)
+    /// suddenly resetting. Switching tabs must never affect anything but
+    /// which breakdown is displayed.
+    #[test]
+    fn switching_to_the_buff_tab_still_lets_an_in_flight_gesture_end() {
+        let row = sample_row(None);
+        let mut tabs = SkillTabs {
+            selected: skills::SkillTab::Buff,
+            ..Default::default()
+        };
+
+        let mut gesture = WindowGesture::default();
+        gesture.begin(GestureKind::Move, egui::pos2(10.0, 10.0), window_rect());
+        assert_eq!(gesture.kind(), Some(GestureKind::Move));
+
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SKILL_WINDOW_SIZE);
+        // No pointer input this frame: the drag has already been
+        // released, and `drive_window_gesture` is the only thing that
+        // ever notices that and ends the gesture.
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_skill_window(
+                    ui,
+                    &row,
+                    &mut tabs,
+                    SkillWindowSource::Live,
+                    &icons,
+                    1.0,
+                    &mut gesture,
+                );
+            },
+        )
+        .drop_without_applying_deltas();
+
+        assert_eq!(
+            gesture.kind(),
+            None,
+            "the Buff tab's empty state must not skip driving an in-flight gesture to completion"
+        );
     }
 
     #[test]
