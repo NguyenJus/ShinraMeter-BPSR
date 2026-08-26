@@ -391,15 +391,16 @@ fn fit_rgba(rgba: image::RgbaImage, crop: [u32; 4], texture: [u32; 2]) -> egui::
 /// [`cover_uv`] undoes at blit time; cropping to the bucket instead is the
 /// stretch bug this split exists to prevent.
 ///
-/// Issue #296: tries the animated-GIF path first ([`decode_gif_frames`]),
-/// which only ever returns `Some` for a GIF that actually has more than one
-/// frame — everything else (a non-GIF, or a GIF with exactly one frame)
-/// falls through to the ordinary single-frame decode below unchanged.
+/// Issue #296: tries the GIF path first ([`decode_gif_frames`]), which
+/// handles every GIF that decodes to at least one frame — a single-frame
+/// GIF included, so its bytes are decoded exactly once rather than once
+/// there and again here. Everything else (a non-GIF) falls through to the
+/// ordinary single-frame decode below unchanged.
 fn decode_and_fit(bytes: &[u8], region: [u32; 2]) -> Result<Fitted, ImageError> {
     let region = region.map(|side| side.clamp(MIN_TEXTURE_SIDE, MAX_TEXTURE_SIDE));
 
-    if let Some(animated) = decode_gif_frames(bytes, region)? {
-        return Ok(animated);
+    if let Some(decoded) = decode_gif_frames(bytes, region, MAX_GIF_FRAMES)? {
+        return Ok(decoded);
     }
 
     let decoded =
@@ -433,6 +434,30 @@ fn decode_and_fit(bytes: &[u8], region: [u32; 2]) -> Result<Fitted, ImageError> 
 /// the same reason.
 const MIN_GIF_FRAME_DELAY: Duration = Duration::from_millis(20);
 
+/// Ceiling on how many frames of a GIF are decoded and kept.
+///
+/// Every frame is decoded, cover-cropped and CatmullRom-resized *on the UI
+/// thread* the moment the user picks the file, and every resulting frame
+/// then stays resident in the cache entry's `frames` for as long as it is
+/// cached — a bucketed texture is a few megabytes, so an unbounded frame
+/// count is both a visible stall at pick time and unbounded memory. 300
+/// frames is ten seconds at the 30fps most animated backgrounds are
+/// authored at, comfortably more than any loop this overlay is meant to sit
+/// behind; a longer GIF is *truncated* rather than rejected, so an
+/// over-long file still plays (its first ten seconds, on loop) instead of
+/// failing in front of the user.
+const MAX_GIF_FRAMES: usize = 300;
+
+/// Ceiling on the size of a file [`load`] will read into memory.
+///
+/// The read, the decode and every resize happen synchronously on the UI
+/// thread, so a pathologically large file is a freeze rather than a slow
+/// load. 64 MiB is far past any plausible background image (a lossless 4K
+/// PNG is a handful of megabytes) while still bounding the stall; over it,
+/// the file is reported through the ordinary [`ImageError::Unreadable`]
+/// path the settings dropdown already surfaces.
+const MAX_IMAGE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Bumps a GIF frame's own delay up to [`MIN_GIF_FRAME_DELAY`] — see that
 /// constant for why a literal (near-)zero delay is not trustworthy. Pure,
 /// so the floor is unit-testable without decoding a real GIF.
@@ -440,18 +465,34 @@ fn normalize_gif_delay(delay: Duration) -> Duration {
     delay.max(MIN_GIF_FRAME_DELAY)
 }
 
-/// The animated-GIF half of [`decode_and_fit`]: `Ok(Some(_))` only for a
-/// GIF whose decode produced more than one frame — a single-frame GIF (or
-/// anything not sniffed as a GIF at all) returns `Ok(None)` so the caller
-/// falls through to the ordinary static path unchanged, and a GIF that
-/// fails to decode as one reports [`ImageError::Undecodable`] rather than
-/// silently falling through, since sniffing already confirmed it claims to
-/// be one.
+/// The GIF half of [`decode_and_fit`]: `Ok(Some(_))` for anything sniffed
+/// as a GIF that decoded to at least one frame — including a *single*-frame
+/// GIF, which is fitted here from the frame already decoded rather than
+/// handed back for the caller to decode a second time through
+/// `image::load_from_memory`. Only a non-GIF (or a GIF whose frame list is
+/// empty, which the static path turns into the usual error) returns
+/// `Ok(None)`; a GIF that fails to decode as one reports
+/// [`ImageError::Undecodable`] rather than silently falling through, since
+/// sniffing already confirmed it claims to be one.
+///
+/// A single-frame result carries [`Duration::ZERO`] as its delay, exactly
+/// as the static path produces, so nothing downstream can tell the two
+/// apart: [`Fitted::frames`] of length 1 is never played back.
+///
+/// At most `max_frames` frames are decoded ([`MAX_GIF_FRAMES`] in
+/// production) — the iterator is consumed lazily, so the frames past the
+/// cap are never decoded at all, not decoded and then dropped. Taking a cap
+/// as an argument rather than reading the constant directly is what lets
+/// the tests prove the truncation with a three-frame fixture.
 ///
 /// `region` must already be clamped to `[MIN_TEXTURE_SIDE, MAX_TEXTURE_
 /// SIDE]` (as [`decode_and_fit`] does before calling this), since the crop
 /// rectangle computed here is reused verbatim for every frame.
-fn decode_gif_frames(bytes: &[u8], region: [u32; 2]) -> Result<Option<Fitted>, ImageError> {
+fn decode_gif_frames(
+    bytes: &[u8],
+    region: [u32; 2],
+    max_frames: usize,
+) -> Result<Option<Fitted>, ImageError> {
     if !matches!(image::guess_format(bytes), Ok(image::ImageFormat::Gif)) {
         return Ok(None);
     }
@@ -459,17 +500,16 @@ fn decode_gif_frames(bytes: &[u8], region: [u32; 2]) -> Result<Option<Fitted>, I
         .map_err(|err| ImageError::Undecodable(err.to_string()))?;
     let frames = decoder
         .into_frames()
-        .collect_frames()
+        .take(max_frames)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|err| ImageError::Undecodable(err.to_string()))?;
-    if frames.len() < 2 {
-        // A single-frame GIF has nothing to animate; let the caller decode
-        // it through the ordinary `image::load_from_memory` path instead of
-        // duplicating that here.
+    let Some(first) = frames.first() else {
+        // A GIF with no frames at all is not something to animate *or* to
+        // fit; let the static path produce the usual `Undecodable`.
         return Ok(None);
-    }
+    };
 
-    let first = frames[0].buffer();
-    let src = [first.width(), first.height()];
+    let src = [first.buffer().width(), first.buffer().height()];
     if src[0] == 0 || src[1] == 0 {
         return Err(ImageError::Undecodable("it has no pixels".to_string()));
     }
@@ -477,10 +517,15 @@ fn decode_gif_frames(bytes: &[u8], region: [u32; 2]) -> Result<Option<Fitted>, I
     let crop = cover_crop(src, region);
     let [_, _, w, h] = crop;
 
+    let animated = frames.len() > 1;
     let fitted_frames = frames
         .into_iter()
         .map(|frame| AnimationFrame {
-            delay: normalize_gif_delay(frame.delay().into()),
+            delay: if animated {
+                normalize_gif_delay(frame.delay().into())
+            } else {
+                Duration::ZERO
+            },
             image: fit_rgba(frame.into_buffer(), crop, texture),
         })
         .collect();
@@ -561,7 +606,21 @@ pub fn animation_position_at(delays: &[Duration], elapsed: Duration) -> Animatio
 /// fallible half of the pipeline in one function, with no `egui::Context`
 /// in sight, which is what makes the graceful-degradation path testable on
 /// a headless CI host.
+///
+/// A file past [`MAX_IMAGE_FILE_BYTES`] is refused before it is read, since
+/// everything below this line is synchronous UI-thread work; the refusal
+/// travels the same [`ImageError::Unreadable`] path a missing file does, so
+/// the caller and the settings dropdown need no new case.
 pub fn load(path: &Path, region: [u32; 2]) -> Result<Fitted, ImageError> {
+    let size = std::fs::metadata(path)
+        .map_err(|err| ImageError::Unreadable(err.to_string()))?
+        .len();
+    if size > MAX_IMAGE_FILE_BYTES {
+        return Err(ImageError::Unreadable(format!(
+            "it is larger than the {} MiB limit",
+            MAX_IMAGE_FILE_BYTES / (1024 * 1024)
+        )));
+    }
     let bytes = std::fs::read(path).map_err(|err| ImageError::Unreadable(err.to_string()))?;
     decode_and_fit(&bytes, region)
 }
@@ -1179,6 +1238,52 @@ mod tests {
             1,
             "a single-frame gif is a static image"
         );
+    }
+
+    /// A single-frame GIF must be fitted from the frame the GIF decoder
+    /// already produced, not handed back for `decode_and_fit` to decode the
+    /// same bytes a second time. The observable proof that the GIF path
+    /// kept it: it answers `Some` (so the static branch never runs) while
+    /// still producing the static shape — one frame, no delay.
+    #[test]
+    fn a_single_frame_gif_is_fitted_by_the_gif_path_rather_than_decoded_twice() {
+        let fitted = decode_gif_frames(&single_frame_gif(), [8, 8], MAX_GIF_FRAMES)
+            .expect("a valid gif must decode")
+            .expect("the gif path must keep a single-frame gif rather than re-decoding it");
+        assert_eq!(fitted.frames.len(), 1, "a single-frame gif is static");
+        assert_eq!(
+            fitted.frames[0].delay,
+            Duration::ZERO,
+            "a static image's delay is never consulted, exactly as the png path leaves it"
+        );
+        assert_eq!(fitted.content, [4, 4], "the whole 4x4 canvas");
+        assert_eq!(
+            fitted.frames[0].image.size,
+            texture_pixels([8, 8]).map(|side| side as usize)
+        );
+    }
+
+    /// A GIF longer than the cap is truncated rather than rejected: a
+    /// too-long file still plays, and neither the decode stall nor the
+    /// resident frame memory grows without bound.
+    #[test]
+    fn a_gif_past_the_frame_cap_is_truncated_rather_than_rejected() {
+        let bytes = animated_gif(&[[255, 0, 0], [0, 255, 0], [0, 0, 255]], &[30, 60, 90]);
+        let fitted = decode_gif_frames(&bytes, [8, 8], 2)
+            .expect("a valid animated gif must decode")
+            .expect("a gif over the cap must still produce an animation");
+        assert_eq!(fitted.frames.len(), 2, "the frames past the cap are dropped");
+        assert_eq!(
+            fitted.frames.iter().map(|f| f.delay).collect::<Vec<_>>(),
+            vec![Duration::from_millis(30), Duration::from_millis(60)],
+            "truncation keeps the leading frames, in order"
+        );
+        // A cap of 1 leaves a single frame, which is the static shape.
+        let capped = decode_gif_frames(&bytes, [8, 8], 1)
+            .expect("a valid animated gif must decode")
+            .expect("a one-frame cap must still produce an image");
+        assert_eq!(capped.frames.len(), 1);
+        assert_eq!(capped.frames[0].delay, Duration::ZERO);
     }
 
     #[test]
