@@ -1,11 +1,11 @@
 scenario=idle_timeout_freeze
-at_ms=14000
+at_ms=75000
 fight_state=Ended
 duration_ms=3500
 total_damage=80000
 total_dps=22857.14
 encounter.boss_monster_id=103
-encounter.boss_name=Rathalos
+encounter.boss_name=Ignisor
 encounter.is_boss=true
 encounter.scene_id=7
 encounter.scene_name=Asteria Plains

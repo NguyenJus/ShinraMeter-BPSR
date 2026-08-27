@@ -83,10 +83,17 @@ pub struct FightConfig {
     /// screenshot, *not* to outlast every gap inside a pull — issue #151
     /// showed that no fixed value can, since a raid's immunity and mechanic
     /// windows exceed it by design. What makes 9s safe is that
-    /// `Meter::fight_ended_at` suppresses this timeout entirely while the
-    /// party is still in an instance with a damaged, living, recognized
-    /// boss; the boundary there comes from the boss dying, the party wiping
-    /// (issue #154) or leaving, never from the clock.
+    /// `Meter::fight_ended_at` suppresses this timeout entirely while there
+    /// is a damaged, living, recognized boss the party was hitting recently
+    /// (`Meter::engaged_boss_still_up`); the boundary there comes from the
+    /// boss dying, the party wiping (issue #154), the scene changing (issue
+    /// #191) or the engagement window lapsing, never from this clock.
+    ///
+    /// Issue #313: that suppression used to apply only inside a
+    /// `tables::DUNGEON_SCENE_IDS` instance, which left world-boss arenas
+    /// (scene 7152) running on the bare 9s and wiping live pulls the moment
+    /// a boss went invulnerable. It is scene-independent now, bounded
+    /// instead by `BOSS_ENGAGEMENT_WINDOW_MS`.
     ///
     /// `0` disables idle detection entirely, leaving [`Self::end_on_boss_death`]
     /// as the only way a fight can end.

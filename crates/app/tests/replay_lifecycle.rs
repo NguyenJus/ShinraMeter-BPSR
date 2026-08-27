@@ -19,7 +19,7 @@ const P_BRIN: i64 = 1002;
 const P_PET_OWNER: i64 = 1004;
 const PET_UID: i64 = 5001;
 const M_BOSS: i64 = 2001;
-const RATHALOS: u32 = 103;
+const IGNISOR: u32 = 103;
 const TOWERING_RUIN: u32 = 1101;
 /// An open-world zone (`tables::is_dungeon_scene` is false for it), where
 /// the idle timeout is still the only thing that ends a pull — issue #151
@@ -40,7 +40,7 @@ fn boss_hp_rollback_auto_reset() {
         .at(1_000)
         .enter_scene(TOWERING_RUIN)
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
-        .monster_appear(M_BOSS, RATHALOS, 1_000_000, 1_000_000)
+        .monster_appear(M_BOSS, IGNISOR, 1_000_000, 1_000_000)
         // A hit is required before the HP curve: `recompute_boss` only
         // considers enemies with `took_damage == true`, so this is what
         // makes M_BOSS the selected boss at all.
@@ -108,7 +108,7 @@ fn server_change_holds_the_numbers() {
         .enter_scene(TOWERING_RUIN)
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
         .player_appear(P_BRIN, "Brin", prof::FROST_MAGE, 11_500)
-        .monster_appear(M_BOSS, RATHALOS, 1_000_000, 1_000_000)
+        .monster_appear(M_BOSS, IGNISOR, 1_000_000, 1_000_000)
         .at(2_000)
         .hit(P_ARIA, M_BOSS, 101, 40_000)
         .at(2_500)
@@ -142,8 +142,8 @@ fn server_change_holds_the_numbers() {
     // both invalidated by the reconnect.
     assert_eq!(capture.snapshot.encounter.scene_id, Some(TOWERING_RUIN));
     assert_eq!(capture.snapshot.encounter.scene_name, Some("Towering Ruin"));
-    assert_eq!(capture.snapshot.encounter.boss_monster_id, Some(RATHALOS));
-    assert_eq!(capture.snapshot.encounter.boss_name, Some("Rathalos"));
+    assert_eq!(capture.snapshot.encounter.boss_monster_id, Some(IGNISOR));
+    assert_eq!(capture.snapshot.encounter.boss_name, Some("Ignisor"));
 
     assert_golden(capture);
 }
@@ -152,7 +152,7 @@ fn server_change_holds_the_numbers() {
 /// default 9s) elapses with no further hits: the fight must freeze —
 /// `duration_ms`/`total_dps`/rows held at their last-damage values, not
 /// still advancing or decaying — until real combat resumes. Captured once
-/// right at the freeze and again 46s later to prove the hold, not just the
+/// right at the freeze and again much later to prove the hold, not just the
 /// initial latch (`crates/meter/src/fight.rs`).
 ///
 /// Set in an **open-world zone** on purpose: issue #151 stops the idle
@@ -160,6 +160,13 @@ fn server_change_holds_the_numbers() {
 /// *inside an instance*, which is what `dungeon_boss_lull_does_not_end_the_pull`
 /// covers. Everywhere else — a field pull, a trash pack, a boss already
 /// dead — the timeout is still what freezes the meter.
+///
+/// Issue #313 widened that same hold to *every* scene, not just instances:
+/// `IGNISOR` here is a recognized boss (`tables::is_boss_monster`) that has
+/// taken damage, so the engagement-window guard keeps the fight `Active` for
+/// `BOSS_ENGAGEMENT_WINDOW_MS` (60s) past the last hit before the idle
+/// timeout is even allowed to bite — the wait below has to clear that window
+/// first, not just the 9s idle timeout alone.
 #[test]
 fn idle_timeout_freeze() {
     let scenario = Scenario::new("idle_timeout_freeze")
@@ -167,19 +174,22 @@ fn idle_timeout_freeze() {
         .enter_scene(ASTERIA_PLAINS)
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
         .player_appear(P_BRIN, "Brin", prof::FROST_MAGE, 11_500)
-        .monster_appear(M_BOSS, RATHALOS, 5_000_000, 5_000_000)
+        .monster_appear(M_BOSS, IGNISOR, 5_000_000, 5_000_000)
         .at(1_500)
         .hit(P_ARIA, M_BOSS, 101, 40_000)
         .at(3_000)
         .hit(P_BRIN, M_BOSS, 202, 25_000)
         .at(5_000)
         .hit(P_ARIA, M_BOSS, 101, 15_000)
-        // 5_000 (last damage) + idle_timeout_ms 9_000.
-        .at(14_000)
+        // 5_000 (last damage) + BOSS_ENGAGEMENT_WINDOW_MS 60_000 (the
+        // engagement-window guard, issue #313) + idle_timeout_ms 9_000,
+        // plus a 1s margin so the tick lands past the boundary rather than
+        // exactly on it.
+        .at(75_000)
         .tick()
         .capture("idle_timeout_freeze")
         // No further damage or tick: the hold must survive on its own.
-        .at(60_000)
+        .at(121_000)
         .capture("idle_timeout_freeze_held");
 
     let mut rig = Rig::new();
@@ -230,7 +240,7 @@ fn dungeon_boss_lull_does_not_end_the_pull() {
         .enter_scene(TOWERING_RUIN)
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
         .player_appear(P_BRIN, "Brin", prof::FROST_MAGE, 11_500)
-        .monster_appear(M_BOSS, RATHALOS, 5_000_000, 5_000_000)
+        .monster_appear(M_BOSS, IGNISOR, 5_000_000, 5_000_000)
         .at(1_500)
         .hit(P_ARIA, M_BOSS, 101, 40_000)
         .at(3_000)
@@ -288,7 +298,7 @@ fn pet_damage_credited_to_owner() {
         .enter_scene(TOWERING_RUIN)
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
         .player_appear(P_PET_OWNER, "Nyx", prof::VERDANT_ORACLE, 10_000)
-        .monster_appear(M_BOSS, RATHALOS, 5_000_000, 5_000_000)
+        .monster_appear(M_BOSS, IGNISOR, 5_000_000, 5_000_000)
         .at(2_000)
         .hit(P_ARIA, M_BOSS, 101, 30_000)
         .at(2_500)

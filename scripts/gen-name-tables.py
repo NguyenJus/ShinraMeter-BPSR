@@ -170,6 +170,63 @@ BOSS_ID_MANUAL_OVERRIDES: dict[int, str] = {
     # its own encounter, so it is kept rather than silently losing its header
     # display when the source of truth switched to MonsterType.
     61_220: "Storm Goblin King",
+    # The World Dominator daily rotation (issue #313). Scene 7152 cycles a
+    # different world boss each night; two consecutive sessions
+    # (2026-08-25 23:37 and 2026-08-26 23:21) ended their pull against
+    # 3000022 and 3000063 respectively, both unrecognized, both wiping the
+    # meter mid-pull with `reset reason=NewFight` at 35.7% / 41.8% boss HP.
+    #
+    # `MonsterTable.json` marks both `MonsterType == 0`, but that block's
+    # classification is stale rather than considered: 3000000..=3000081 is
+    # the World Dominator registry — 81 rows, of which only 5 carry
+    # `MonsterType == 2` (those 5 are already in the generated set) and the
+    # remaining 76 carry `MonsterType == 0` *and* `BloodTubeCount == 0`. A
+    # world boss with no health bars at all is not a plain monster; the field
+    # was simply never filled in for these rows. 3000063's own base template,
+    # 1701 "Denvel", *is* `MonsterType == 2` and is already in the set, which
+    # is the tell.
+    3_000_063: "Denvel",
+    3_000_022: "Muku Chief - Resonance",
+}
+
+# Manual overrides (issue #313): dungeon scene ids `DungeonsTable.json`'s
+# `SceneID` column omits but that behave as instances in the logs. Same idiom
+# and same one-way guarantee as `BOSS_ID_MANUAL_OVERRIDES` above — unioned on
+# top of the generated set, so this can only ever add ids, never suppress one.
+DUNGEON_SCENE_ID_MANUAL_OVERRIDES: dict[int, str] = {
+    # "World Dominator": `SceneTableNames.json` names 7150, 7151 and 7152
+    # identically, and 7150/7151 are both already in the generated set —
+    # upstream's `DungeonsTable.SceneID` simply has no row pointing at 7152.
+    # The 2026-08-26 log shows the client tearing down and re-establishing its
+    # server connection to enter it, and `cause=dungeon_ended` firing on the
+    # way out: it is an instance by every behaviour the meter can observe.
+    # Without it here, issue #151's in-dungeon fight hold
+    # (`Meter::engaged_boss_still_up`) never engages in a world-boss scene and
+    # a 9s immunity window reads as the end of the encounter.
+    7_152: "World Dominator",
+}
+
+# Manual overrides (issue #313): monster names the *curated* community layer
+# gets wrong — the last word on ids where the shipped client's own name is the
+# one players see. This is the only layer above `MonsterName.json`, and it
+# exists because the curated-wins precedence (see `merge_names` and `HEADER`)
+# is right in general but not universally: the community trackers carry a
+# pre-release name for some templates that the live client no longer uses.
+#
+# Deliberately per-id rather than a global precedence flip: `MonsterName.json`
+# and `MonsterTableNames.json` disagree on 59 ids, and the curated name is the
+# better one on nearly all of them.
+MONSTER_NAME_MANUAL_OVERRIDES: dict[int, str] = {
+    # The Ignisor family. `MonsterName.json` calls all four "Rathalos"; every
+    # one of them is "Ignisor" in `MonsterTableNames.json`, which is the name
+    # the shipped client renders and the name the issue #313 reporter read off
+    # their own screen for 20004. (Id 104 is the same monster and already
+    # resolves to "Ignisor" — no community file names it, so it needs no
+    # override.)
+    103: "Ignisor",
+    1_013: "Ignisor",
+    20_004: "Ignisor",
+    60_021: "Ignisor",
 }
 
 HEADER = """//! Static id -> display-name tables for monsters, scenes and skills.
@@ -203,11 +260,37 @@ mod tests {
 
     #[test]
     fn curated_names_win_over_the_authoritative_table() {
-        // BPSR-ZDPS's `MonsterTable.json` calls template 1013 "Ignisor";
-        // the community tables call it "Rathalos". The curated community name
-        // is the one players actually use, so it must survive the backfill —
+        // BPSR-ZDPS's `MonsterTable.json` carries a bare "ID Placeholder" for
+        // template 11019; the community tables name it "Boss - Darkened
+        // Python". The curated community name has to survive the backfill —
         // this is the precedence in `merge_names` observed end to end.
-        assert_eq!(monster_name(1013), Some("Rathalos"));
+        //
+        // (This test used to point at 1013, where the client says "Ignisor"
+        // and the community tables say "Rathalos". Issue #313 established
+        // that "Ignisor" is what the live client actually renders, so that id
+        // is now pinned the other way by `MONSTER_NAME_MANUAL_OVERRIDES` —
+        // see `the_ignisor_ids_keep_the_clients_own_name`. A placeholder-vs-
+        // real-name pair illustrates why the curated layer wins far better
+        // than a name-vs-name pair the client turned out to win anyway.)
+        assert_eq!(monster_name(11_019), Some("Boss - Darkened Python"));
+    }
+
+    #[test]
+    fn the_ignisor_ids_keep_the_clients_own_name() {
+        // Issue #313: `MonsterName.json` calls this family "Rathalos", but
+        // the shipped client renders "Ignisor" — the reporter read it off
+        // their own screen for 20004, mid-pull, while the header showed
+        // "Rathalos". `MONSTER_NAME_MANUAL_OVERRIDES` is layered above the
+        // curated table for exactly these ids, and nothing else.
+        assert_eq!(monster_name(20_004), Some("Ignisor"));
+        assert_eq!(monster_name(103), Some("Ignisor"));
+        assert_eq!(monster_name(1_013), Some("Ignisor"));
+        assert_eq!(monster_name(60_021), Some("Ignisor"));
+        // 104 is the same monster but absent from every community file, so it
+        // was already correct via the authoritative backfill. Pinned so a
+        // future precedence change cannot quietly rename it out from under
+        // the four above.
+        assert_eq!(monster_name(104), Some("Ignisor"));
     }
 
     #[test]
@@ -270,6 +353,35 @@ mod tests {
         // fought as one — see `BOSS_ID_MANUAL_OVERRIDES` in
         // `scripts/gen-name-tables.py`.
         assert!(is_boss_monster(61_220));
+    }
+
+    #[test]
+    fn is_boss_monster_true_for_the_world_dominator_rotation() {
+        // Issue #313: scene 7152 rotates its world boss nightly, and two
+        // consecutive sessions ended on these two ids. `MonsterTable.json`
+        // marks both `MonsterType == 0`, but so is every one of the 76
+        // non-boss rows in the 3000000..=3000081 World Dominator registry,
+        // and all 76 also carry `BloodTubeCount == 0` — a world boss with no
+        // health bars is an unfilled row, not a classification. Unrecognized,
+        // they cost the meter a full wipe mid-pull: `is_engaged_recognized_boss`
+        // went false, issue #151's fight hold dropped, and a 9s immunity
+        // window ended the encounter at 41.8% boss HP.
+        assert!(is_boss_monster(3_000_063)); // Denvel; base template 1701 is MonsterType 2
+        assert!(is_boss_monster(3_000_022)); // Muku Chief - Resonance
+    }
+
+    #[test]
+    fn is_dungeon_scene_true_for_every_world_dominator_scene() {
+        // Issue #313: all three of these are named "World Dominator" in
+        // `SceneTableNames.json`, but upstream's `DungeonsTable.SceneID`
+        // lists only the first two, so 7152 alone fell out of the instance
+        // set — and with it out of `Meter::engaged_boss_still_up`'s
+        // `in_dungeon_scene()` guard. 7152 is restored by
+        // `DUNGEON_SCENE_ID_MANUAL_OVERRIDES`.
+        assert!(is_dungeon_scene(7150));
+        assert!(is_dungeon_scene(7151));
+        assert!(is_dungeon_scene(7152));
+        assert_eq!(scene_name(7152), Some("World Dominator"));
     }
 
     #[test]
@@ -744,8 +856,8 @@ BOSS_IDS_DOC = """/// Boss-monster template ids (issue #42): the top-bar encount
 /// A short manual-override list in `scripts/gen-name-tables.py`
 /// (`BOSS_ID_MANUAL_OVERRIDES`) adds back ids the previous hand-curated list
 /// carried that `MonsterType` does not mark as 2 but that community trackers
-/// fought and flagged as bosses; see its comment for the one id it currently
-/// carries.
+/// fought and flagged as bosses, plus ids whose `MonsterType` is demonstrably
+/// stale (issue #313's World Dominator rotation); see its per-id comments.
 ///
 /// Previously hand-curated from `crates/meter/data/MonsterNameBoss.json`
 /// (community-tracker data, GPL-3.0); see `THIRD_PARTY_NOTICES.md` for the
@@ -811,7 +923,9 @@ def emit_boss_ids(out: io.StringIO, ids: list[int]) -> None:
 
 
 DUNGEON_SCENE_IDS_DOC = """/// Dungeon scene ids (issue #125): every scene id `DungeonsTable.json` lists
-/// as a dungeon instance's `SceneID` — 572 distinct ids (min 1001, max
+/// as a dungeon instance's `SceneID`, plus the short manual-override list in
+/// `scripts/gen-name-tables.py` (`DUNGEON_SCENE_ID_MANUAL_OVERRIDES`) for
+/// instances that column omits — 573 distinct ids (min 1001, max
 /// 171001). No upstream table maps a scene/dungeon to its final boss (issue
 /// #125's investigation checked every `BPSR-ZDPS/Data/*.json` table and both
 /// community data repos), which is why [`SCENE_FINAL_BOSSES`] is curated by
@@ -978,6 +1092,10 @@ def render() -> str:
         _keyed(load("MonsterTableNames.json")),
         _keyed(load("MonsterName.json")),
         _keyed(load("MonsterNameCrowdsource.json")),
+        # Issue #313: the final word, above even the curated community layer.
+        # See `MONSTER_NAME_MANUAL_OVERRIDES` for why a handful of ids need
+        # the client's own name back.
+        _keyed(MONSTER_NAME_MANUAL_OVERRIDES),
     )
     scenes = merge_names(
         # `DungeonsTableNames` is currently a strict id-subset of
@@ -992,7 +1110,10 @@ def render() -> str:
     boss_ids = sorted(
         {int(x) for x in load("MonsterTableBossIds.json")} | set(BOSS_ID_MANUAL_OVERRIDES)
     )
-    dungeon_scene_ids = sorted({int(x) for x in load("DungeonSceneIds.json")})
+    dungeon_scene_ids = sorted(
+        {int(x) for x in load("DungeonSceneIds.json")}
+        | set(DUNGEON_SCENE_ID_MANUAL_OVERRIDES)
+    )
     scene_final_bosses = filter_scene_final_bosses(
         load(SCENE_FINAL_BOSSES_FILE),
         scenes,

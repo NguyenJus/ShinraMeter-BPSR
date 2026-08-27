@@ -654,8 +654,7 @@ impl Meter {
     }
 
     /// Whether the party is mid-pull on a boss that simply is not being hit
-    /// right now (issue #151): still inside an instance
-    /// (`tables::is_dungeon_scene`), with *any* recognized boss
+    /// right now (issue #151): *any* recognized boss
     /// (`tables::is_boss_monster`) that has taken damage this fight and is
     /// not known to be dead.
     ///
@@ -676,9 +675,10 @@ impl Meter {
     ///
     /// A pull held open this way still ends: the boss dying latches it
     /// (`end_fight_on_boss_death`), a party wipe latches it (issue #154),
-    /// leaving the instance clears `scene_id` and hands the fight straight
-    /// back to the idle timeout — which, being derived rather than stored,
-    /// then ends it retroactively at the last hit.
+    /// and a scene change latches it at the last hit (issue #191, see the
+    /// `SceneChanged` arm in `apply`) — zoning out never leaves a held
+    /// fight running. Failing all three, the engagement window below ends
+    /// it on its own.
     ///
     /// Deliberately scoped by `took_damage`, like `other_living_boss`:
     /// a boss standing in the room the party walked past is not a pull in
@@ -700,12 +700,34 @@ impl Meter {
     /// are far shorter than 60s), while turning a missed death signal from
     /// a permanent wedge into one bounded the same way a boss nobody has
     /// ever touched already is.
+    ///
+    /// Issue #313: this used to require `in_dungeon_scene()` as well, and
+    /// scene 7152 ("World Dominator") — a world-boss arena that is not a
+    /// `tables::DUNGEON_SCENE_IDS` instance — is what exposed that as
+    /// wrong: an arena boss went invulnerable mid-phase, the 9s idle
+    /// timeout ran out unopposed, and the party's next hit fired
+    /// `ResetReason::NewFight` on a pull still 41.8% from done. The scene
+    /// check dates from PR #163, *before* `BOSS_ENGAGEMENT_WINDOW_MS`
+    /// existed: back then "damaged and alive" was unbounded, so a boss
+    /// whose death signal never arrived read alive forever and the scene
+    /// check was the only valve that could ever release the suppression.
+    /// The window carries that whole bound now — the guard self-releases
+    /// 60s after the last hit, and `fight_ended_at` then ends the fight
+    /// retroactively at `last_event_ms`, fabricating no elapsed time — so
+    /// the scene check was pure vestige. The accepted cost is that out in
+    /// the open world a fight with an engaged recognized boss is now held
+    /// open up to 60s past the last hit instead of 9s: the same trade
+    /// every dungeon pull already makes, and the price of not wiping a
+    /// live world-boss pull.
+    ///
+    /// Note this is the *idle* path's judgement only. The issue #154 wipe
+    /// hold keeps its own `in_dungeon_scene()` gate at its call site (PR
+    /// #163 review, finding 1) — that gate has an instance justification of
+    /// its own, and is not widened here.
     fn engaged_boss_still_up(&self, now_ms: u64) -> bool {
-        self.in_dungeon_scene()
-            && self
-                .enemies
-                .values()
-                .any(|e| is_engaged_recognized_boss(e, now_ms))
+        self.enemies
+            .values()
+            .any(|e| is_engaged_recognized_boss(e, now_ms))
     }
 
     /// Where the meter is in the fight lifecycle as of `now_ms`.
@@ -1406,7 +1428,17 @@ impl Meter {
             // dropped. Elsewhere a wipe still freezes the numbers — the
             // idle timeout takes it, now that issue #155 stops the mob
             // swinging at the corpses from holding the fight open.
-            if self.party_is_wiped() && self.engaged_boss_still_up(d.timestamp_ms) {
+            //
+            // The `in_dungeon_scene` half is spelled out *here* rather than
+            // inherited from `engaged_boss_still_up`, which used to carry it
+            // (issue #313 removed it there): the idle path's reason for the
+            // scene check was vestigial, this one's is not. Scene 7152 picks
+            // the wipe hold up regardless, via issue #313's
+            // `DUNGEON_SCENE_IDS` addition.
+            if self.party_is_wiped()
+                && self.in_dungeon_scene()
+                && self.engaged_boss_still_up(d.timestamp_ms)
+            {
                 self.latch_fight_end(FightEndCause::Wipe, d.timestamp_ms, self.boss_monster_id());
                 self.wipe_hold = true;
             }
@@ -2420,8 +2452,19 @@ impl Meter {
             if e.max_hp.is_some() {
                 enemy.max_hp = e.max_hp;
             }
-            if e.monster_id.is_some() {
-                enemy.monster_id = e.monster_id;
+            if let Some(new_id) = e.monster_id {
+                // issue #313: this in-place rewrite is how a `uid=1` boss
+                // silently went from monster_id 20004 ("Ignisor", a
+                // `BOSS_MONSTER_IDS` entry) to 3000063 ("Denvel", which was
+                // not one) mid-pull, with no `boss target changed` line
+                // anywhere in the log — that diagnostic keys off the uid,
+                // and the uid never moved. Log the id transition too, so
+                // the next World Dominator run can settle whether the game
+                // re-templates one live entity or recycles the uid.
+                if let Some(msg) = monster_id_change_log(e.uid, enemy.monster_id, new_id) {
+                    log::info!("{msg}");
+                }
+                enemy.monster_id = Some(new_id);
             }
             if let Some(pct) = enemy.pct() {
                 enemy.lowest_pct = Some(enemy.lowest_pct.map_or(pct, |lp| lp.min(pct)));
@@ -3251,6 +3294,31 @@ fn boss_transition_log(
             None => format!("encounter: boss target changed to uid={uid} monster_id=<unknown>"),
         },
     })
+}
+
+/// Builds the "monster id changed" diagnostic line (issue #313), or `None`
+/// when nothing actually changed — `old` unknown (the first id ever seen for
+/// this uid, which [`boss_transition_log`] already covers when it matters) or
+/// `old == new`. Transition-only, in the issue #69 idiom: `apply_enemy_hp`
+/// runs on every enemy-HP sync, so an unconditional line here would reproduce
+/// the #87 flood.
+///
+/// Fills the blind spot issue #313 named: `boss_transition_log` keys off the
+/// boss *uid*, so an entity whose `monster_id` is rewritten under a stable
+/// uid — recognized boss to unrecognized, in the reported case — changes the
+/// meter's whole read of the fight while emitting nothing at all. Carries
+/// both catalogued names so the two ids are readable without a table lookup.
+/// Never a player name or uid (`crates/app/src/logging.rs`); an enemy uid is
+/// not player data. Pure, like the builders around it, for the same
+/// testability reason.
+fn monster_id_change_log(uid: i64, old: Option<u32>, new: u32) -> Option<String> {
+    let old = old.filter(|id| *id != new)?;
+    let old_name = tables::monster_name(old).unwrap_or("<unresolved>");
+    let new_name = tables::monster_name(new).unwrap_or("<unresolved>");
+    let recognized = tables::is_boss_monster(new);
+    Some(format!(
+        "encounter: monster id changed for uid={uid} from monster_id={old} name={old_name} to monster_id={new} name={new_name} recognized_boss={recognized}"
+    ))
 }
 
 /// Builds the "fight ended" diagnostic line (issue #151's diagnostics gap).
@@ -5140,7 +5208,7 @@ mod tests {
 
             let snap = m.snapshot(1_000);
             assert!(snap.encounter.is_boss);
-            assert_eq!(snap.encounter.boss_name, Some("Rathalos"));
+            assert_eq!(snap.encounter.boss_name, Some("Ignisor"));
             assert_eq!(snap.encounter.scene_boss_name, Some(CURATED_BOSS));
         }
 
@@ -5202,7 +5270,7 @@ mod tests {
     mod reset {
         use super::*;
 
-        /// "Rathalos" (103), a recognized boss: `is_boss_monster` is what
+        /// "Ignisor" (103), a recognized boss: `is_boss_monster` is what
         /// gates the rollback reset (issue #157), so an enemy driving one
         /// has to be one.
         const BOSS: u32 = 103;
@@ -6283,7 +6351,7 @@ mod tests {
 
         /// Any `tables::is_dungeon_scene` id.
         const DUNGEON_SCENE: u32 = 1_001;
-        /// "Rathalos", a recognized boss.
+        /// "Ignisor", a recognized boss.
         const BOSS: u32 = 103;
         /// "Moonstrike": the other half of Dreambloom Ruins' Caprahorn
         /// pair, two recognized bosses spawned and fought together.
@@ -6323,14 +6391,76 @@ mod tests {
         }
 
         #[test]
-        fn the_idle_timeout_still_ends_a_boss_fight_outside_a_dungeon() {
-            // A world boss in an open-world zone: no instance to be stuck
-            // in, so the ordinary freeze applies.
+        fn an_idle_lull_does_not_end_the_fight_while_a_world_boss_is_still_up() {
+            // Issue #313: the same immunity/mechanic lull as the case
+            // above, in a plain open-world zone rather than an instance.
+            // The suppression used to require `in_dungeon_scene()`, so out
+            // here the 9s clock ran unopposed and the party's next hit
+            // wiped a pull still 41.8% from done. A recognized boss the
+            // party is actively hitting is a pull in progress wherever it
+            // is standing.
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Scene { level_map_id: 8 });
             m.apply(&hp(10, 50, Some(BOSS), 0));
             m.apply(&boss_hit(10, 1_000, false));
-            assert_eq!(m.fight_state(1_000 + idle()), FightState::Ended);
+            assert_eq!(m.fight_state(1_000 + 6 * idle()), FightState::Active);
+            assert_eq!(m.tick(1_000 + 6 * idle()), FightState::Active);
+        }
+
+        #[test]
+        fn the_engagement_window_ends_a_boss_fight_outside_a_dungeon() {
+            // The control for the case above, and what replaced the scene
+            // check as the bound (issue #313): the hold is not unlimited
+            // out in the world either. It lapses
+            // `BOSS_ENGAGEMENT_WINDOW_MS` after the last hit — the same
+            // release valve every dungeon pull has had since issue
+            // #210/#211 — and the idle timeout takes it from there.
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 8 });
+            m.apply(&hp(10, 50, Some(BOSS), 0));
+            m.apply(&boss_hit(10, 1_000, false));
+
+            // Inside the window: still a pull.
+            assert_eq!(m.fight_state(1_000 + 6 * idle()), FightState::Active);
+
+            // Past it: the guard releases and the fight ends.
+            let now = 1_000 + BOSS_ENGAGEMENT_WINDOW_MS + idle();
+            assert_eq!(m.fight_state(now), FightState::Ended);
+            assert_eq!(
+                m.snapshot(now).duration_ms,
+                1,
+                "the bound ends the fight retroactively at the last hit, \
+                 so holding it open fabricates no elapsed time"
+            );
+        }
+
+        #[test]
+        fn the_world_dominator_arena_boss_holds_the_pull_open() {
+            // Issue #313 end to end: scene 7152 ("World Dominator") with
+            // monster 3000063 ("Denvel"), the exact pair from the report.
+            // The boss went invulnerable, the idle timeout ended the fight,
+            // and the party's next hit fired `ResetReason::NewFight` and
+            // cleared every row mid-pull.
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: 7_152,
+            });
+            m.apply(&hp(1, 50, Some(3_000_063), 0));
+            m.apply(&boss_hit(1, 1_000, false));
+
+            let lull = 1_000 + idle() + 500;
+            assert_eq!(m.fight_state(lull), FightState::Active);
+
+            // ...so the hit that ends the lull resumes the pull instead of
+            // destroying it.
+            let reason = m.apply(&boss_hit(1, lull, false));
+            assert_eq!(reason, None, "the pull is still the same pull");
+
+            // And the header names the boss, rather than blanking on an
+            // unrecognized id (the third defect in the same report).
+            let snap = m.snapshot(lull);
+            assert!(snap.encounter.is_boss);
+            assert_eq!(snap.encounter.boss_name, Some("Denvel"));
         }
 
         #[test]
@@ -6371,7 +6501,12 @@ mod tests {
         }
 
         #[test]
-        fn leaving_the_dungeon_lets_the_idle_timeout_end_a_held_boss_pull() {
+        fn leaving_the_scene_latches_a_held_boss_pull_at_its_last_hit() {
+            // Issue #191, not the idle timeout: a fight still running when
+            // the scene changes is latched right there by the `SceneChanged`
+            // arm, timestamped at the last real damage. That is what ends
+            // this pull — issue #313 removed `engaged_boss_still_up`'s scene
+            // check entirely, and these assertions are unmoved by it.
             let mut m = in_dungeon();
             m.apply(&hp(10, 50, Some(BOSS), 0));
             m.apply(&boss_hit(10, 1_000, false));
@@ -6770,6 +6905,32 @@ mod tests {
             assert_eq!(snap.total_damage, 3_000, "the second hit still counts");
             assert_eq!(snap.rows[0].hits, 2);
             assert_eq!(snap.rows[0].deaths, 1);
+        }
+
+        #[test]
+        fn the_wipe_hold_still_requires_an_instance() {
+            // Issue #313 widened `engaged_boss_still_up` past
+            // `in_dungeon_scene()` for the *idle* path only. The wipe hold
+            // keeps that gate at its own call site: PR #163 review finding
+            // 1's reasoning is about instances specifically, and freezing
+            // the meter out in the open world — where the only thing that
+            // lifts a hold is a hit on a recognized boss — is how a solo
+            // player ended up with a dead meter until they zoned.
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: FIELD_SCENE,
+            });
+            m.apply(&player_info(1, "Alpha"));
+            m.apply(&player_info(2, "Bravo"));
+            m.apply(&enemy_hp(BOSS_UID, 500_000, BOSS, 0));
+            m.apply(&hit(1, BOSS_UID, 1_000, 1_000));
+            m.apply(&hit(2, BOSS_UID, 1_000, 1_500));
+            m.apply(&killing_blow(1, 2_000));
+            m.apply(&killing_blow(2, 2_500));
+
+            assert_eq!(m.fight_end_ms, None, "no wipe latch outside an instance");
+            assert!(!m.wipe_hold, "and no hold to have to lift");
+            assert_eq!(m.fight_state(3_000), FightState::Active);
         }
 
         #[test]
@@ -7354,7 +7515,7 @@ mod tests {
             // guards against, just inside a real boss-select scene instead
             // of a synthetic dungeon id.
             const DREAMBLOOM_SCENE: u32 = 13_011;
-            /// "Rathalos", a recognized boss — stands in for one Caprahorn
+            /// "Ignisor", a recognized boss — stands in for one Caprahorn
             /// twin.
             const CAPRAHORN_A: u32 = 103;
             /// "Moonstrike", the other half of the pair.
@@ -8407,17 +8568,28 @@ mod tests {
             // Only a boss *death* arms resumption. Walking away from a pull
             // and coming back to the same boss family is a new fight, which
             // is what the user means by it.
-            let mut m = Meter::new();
+            // Issue #313 note: `engaged_boss_still_up` no longer requires a
+            // dungeon scene, so a recognized boss suppresses the idle
+            // timeout for `BOSS_ENGAGEMENT_WINDOW_MS` past the last hit out
+            // here too — and that window is exactly as long as the default
+            // phase-resume one, both being anchored on the same last hit.
+            // Widen the resume window so the idle end still lands well
+            // *inside* it, which is the case these tests are about.
+            let mut m = Meter::with_fight_config(FightConfig {
+                phase_resume_window_ms: 2 * BOSS_ENGAGEMENT_WINDOW_MS,
+                ..FightConfig::default()
+            });
             m.apply(&hp(10, 900, 1_000, ORIGIN, 0));
             m.apply(&hit(10, 500, 100, false));
-            assert_eq!(m.fight_state(100 + 20_000), FightState::Ended);
+            let ended = 100 + BOSS_ENGAGEMENT_WINDOW_MS + 20_000;
+            assert_eq!(m.fight_state(ended), FightState::Ended);
             assert_eq!(m.fight_end_boss_id, None);
 
-            m.apply(&hp(11, 500, 500, CONTINUATION, 20_000));
-            let reason = m.apply(&hit(11, 700, 20_100, false));
+            m.apply(&hp(11, 500, 500, CONTINUATION, ended));
+            let reason = m.apply(&hit(11, 700, ended + 100, false));
 
             assert_eq!(reason, Some(ResetReason::NewFight));
-            assert_eq!(m.snapshot(20_200).total_damage, 700);
+            assert_eq!(m.snapshot(ended + 200).total_damage, 700);
         }
 
         #[test]
@@ -8618,17 +8790,28 @@ mod tests {
             // And the third: an idle-timeout end leaves `fight_end_boss_id`
             // `None`, so the window never arms even though the boss that was
             // being fought is a phased one.
-            let mut m = Meter::new();
+            // Issue #313 note: `engaged_boss_still_up` no longer requires a
+            // dungeon scene, so a recognized boss suppresses the idle
+            // timeout for `BOSS_ENGAGEMENT_WINDOW_MS` past the last hit out
+            // here too — and that window is exactly as long as the default
+            // phase-resume one, both being anchored on the same last hit.
+            // Widen the resume window so the idle end still lands well
+            // *inside* it, which is the case these tests are about.
+            let mut m = Meter::with_fight_config(FightConfig {
+                phase_resume_window_ms: 2 * BOSS_ENGAGEMENT_WINDOW_MS,
+                ..FightConfig::default()
+            });
             m.apply(&hp(10, 900, 1_000, ORIGIN, 0));
             m.apply(&hit(10, 500, 100, false));
-            assert_eq!(m.fight_state(100 + 20_000), FightState::Ended);
+            let ended = 100 + BOSS_ENGAGEMENT_WINDOW_MS + 20_000;
+            assert_eq!(m.fight_state(ended), FightState::Ended);
             assert_eq!(m.fight_end_boss_id, None);
 
-            m.apply(&hp(12, 100, 100, TRASH, 20_000));
-            let reason = m.apply(&hit(12, 50, 20_100, false));
+            m.apply(&hp(12, 100, 100, TRASH, ended));
+            let reason = m.apply(&hit(12, 50, ended + 100, false));
 
             assert_eq!(reason, Some(ResetReason::NewFight));
-            assert_eq!(m.snapshot(20_200).total_damage, 50);
+            assert_eq!(m.snapshot(ended + 200).total_damage, 50);
         }
 
         // -- Part D: a corpse stays a corpse across a reset -----------------
@@ -8806,7 +8989,7 @@ mod tests {
             m.apply(&hp(10, 100, 100, Some(103), 0));
             let snap = m.snapshot(1000);
             assert_eq!(snap.encounter.boss_monster_id, Some(103));
-            assert_eq!(snap.encounter.boss_name, Some("Rathalos"));
+            assert_eq!(snap.encounter.boss_name, Some("Ignisor"));
             assert!(snap.encounter.is_boss);
         }
 
@@ -8851,7 +9034,7 @@ mod tests {
             }));
             let snap = m.snapshot(1000);
             assert_eq!(snap.encounter.boss_monster_id, Some(103));
-            assert_eq!(snap.encounter.boss_name, Some("Rathalos"));
+            assert_eq!(snap.encounter.boss_name, Some("Ignisor"));
             assert!(snap.encounter.is_boss);
         }
 
@@ -9323,12 +9506,32 @@ mod tests {
         }
 
         #[test]
+        fn monster_id_change_log_fires_only_when_the_id_actually_changes() {
+            // Issue #313: the first id ever seen for a uid is not a change
+            // — `boss_transition_log` already covers that moment — and a
+            // resync repeating the same id is the #87 flood waiting to
+            // happen.
+            assert_eq!(monster_id_change_log(1, None, 20_004), None);
+            assert_eq!(monster_id_change_log(1, Some(20_004), 20_004), None);
+
+            // The reported rewrite: uid 1 goes from a recognized boss to an
+            // id that was not one, with the uid — and so
+            // `boss_transition_log` — never moving.
+            let msg = monster_id_change_log(1, Some(20_004), 3_000_063).unwrap();
+            assert!(msg.contains("uid=1"), "{msg}");
+            assert!(msg.contains("20004"), "{msg}");
+            assert!(msg.contains("3000063"), "{msg}");
+            assert!(msg.contains("Ignisor"), "{msg}");
+            assert!(msg.contains("Denvel"), "{msg}");
+        }
+
+        #[test]
         fn boss_transition_log_reports_recognition_and_the_resolved_name() {
             // Recognized boss id with a catalogued name.
             let msg = boss_transition_log(None, Some(10), Some(103)).unwrap();
             assert!(msg.contains("monster_id=103"));
             assert!(msg.contains("recognized_boss=true"));
-            assert!(msg.contains("name=Rathalos"));
+            assert!(msg.contains("name=Ignisor"));
 
             // A monster id outside the boss table: recognized_boss=false,
             // name still resolved if catalogued (boss_monster_id itself is
@@ -9377,7 +9580,7 @@ mod tests {
             let msg = fight_end_log(FightEndCause::BossDeath, Some(103));
             assert!(msg.contains("cause=boss_death"));
             assert!(msg.contains("boss_monster_id=103"));
-            assert!(msg.contains("name=Rathalos"));
+            assert!(msg.contains("name=Ignisor"));
 
             let msg = fight_end_log(FightEndCause::IdleTimeout, Some(999_999));
             assert!(msg.contains("cause=idle_timeout"));
@@ -9478,7 +9681,7 @@ mod tests {
             let snap = m.snapshot(6_000);
             assert_eq!(snap.encounter.boss_monster_id, Some(103));
             assert!(snap.encounter.is_boss);
-            assert_eq!(snap.encounter.boss_name, Some("Rathalos"));
+            assert_eq!(snap.encounter.boss_name, Some("Ignisor"));
             assert_eq!(snap.encounter.scene_id, Some(1001));
             assert_eq!(snap.encounter.scene_name, Some("Tina's Mindrealm"));
         }
@@ -9568,7 +9771,7 @@ mod tests {
     mod dungeon {
         use super::*;
 
-        /// 103 = "Rathalos", a `tables::BOSS_MONSTER_IDS` entry, same id
+        /// 103 = "Ignisor", a `tables::BOSS_MONSTER_IDS` entry, same id
         /// `held_fight_identity` above already relies on being recognized.
         const BOSS: u32 = 103;
         const BOSS_UID: i64 = 10;
