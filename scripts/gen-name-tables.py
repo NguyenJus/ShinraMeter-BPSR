@@ -5,9 +5,11 @@ Two families of source feed these tables, and they are merged, not chosen
 between (issue #36):
 
 *Curated community tables* (GPL-3.0, the same licence as this project) from the
-`resonance-logs` and `bpsr-logs` trackers. Small, hand-checked, and using the
-names players actually say — "Rathalos", not the client's "Ignisor". Vendored
-verbatim under `crates/meter/data/`.
+`resonance-logs` and `bpsr-logs` trackers. Small, hand-checked, and generally
+closer to what's on screen than a raw client dump — id 11019 is a bare "ID
+Placeholder" in the authoritative table below, but the community files call
+it "Boss - Darkened Python". Vendored verbatim under `crates/meter/data/`.
+(A handful of ids run the other way — see `MONSTER_NAME_MANUAL_OVERRIDES`.)
 
 *Authoritative game tables* (MIT) from `Blue-Protocol-Source/BPSR-ZDPS`'s
 `Data/`. These are the full client tables the community files were derived
