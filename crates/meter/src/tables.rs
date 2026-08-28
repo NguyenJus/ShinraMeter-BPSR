@@ -27,7 +27,7 @@ pub fn monster_name(id: u32) -> Option<&'static str> {
     Some(match id {
         101 => "Dummy (Flame Orc)",
         102 => "Test Dummy (Enemy)",
-        103 => "Rathalos",
+        103 => "Ignisor",
         104 => "Ignisor",
         105 => "Test Dummy (Ally)",
         106 => "Test Dummy (Neutral)",
@@ -55,7 +55,7 @@ pub fn monster_name(id: u32) -> Option<&'static str> {
         205 => "Void Bzzar",
         206 => "Nitro Bzzar",
         1012 => "Flame Orc",
-        1013 => "Rathalos",
+        1013 => "Ignisor",
         1100 => "Defensive Type 04",
         1101 => "Defensive Type 06",
         1102 => "Defensive Type 04",
@@ -1067,7 +1067,7 @@ pub fn monster_name(id: u32) -> Option<&'static str> {
         20001 => "Goblin Dagger",
         20002 => "Goblin Crossbow",
         20003 => "Goblin Axe",
-        20004 => "Rathalos",
+        20004 => "Ignisor",
         20005 => "Goblin Cudgel",
         20006 => "Void Goblin Cudgel",
         20007 => "Goblin Mage",
@@ -1666,7 +1666,7 @@ pub fn monster_name(id: u32) -> Option<&'static str> {
         60017 => "Goblin Crossbow",
         60018 => "Goblin Sword",
         60020 => "Goblin Axe",
-        60021 => "Rathalos",
+        60021 => "Ignisor",
         60100 => "Invader Type 04",
         60101 => "Hunter Type 02",
         60102 => "Annihilation Fortress Type 01",
@@ -14510,8 +14510,8 @@ pub fn skill_icon(id: u32) -> Option<&'static str> {
 /// A short manual-override list in `scripts/gen-name-tables.py`
 /// (`BOSS_ID_MANUAL_OVERRIDES`) adds back ids the previous hand-curated list
 /// carried that `MonsterType` does not mark as 2 but that community trackers
-/// fought and flagged as bosses; see its comment for the one id it currently
-/// carries.
+/// fought and flagged as bosses, plus ids whose `MonsterType` is demonstrably
+/// stale (issue #313's World Dominator rotation); see its per-id comments.
 ///
 /// Previously hand-curated from `crates/meter/data/MonsterNameBoss.json`
 /// (community-tracker data, GPL-3.0); see `THIRD_PARTY_NOTICES.md` for the
@@ -14555,7 +14555,7 @@ const BOSS_MONSTER_IDS: &[u32] = &[
     2000115, 2000116, 2000121, 2000123, 2000124, 2000127, 2000128, 2000129, 2000131, 2000132,
     2000133, 2000134, 2000135, 2000137, 2000138, 2000139, 2000140, 2000141, 2000199, 2004109,
     2004120, 2004126, 2004131, 2004152, 2004171, 2004172, 3000000, 3000001, 3000003, 3000006,
-    3000007, 5026001, 6116001, 7700001,
+    3000007, 3000022, 3000063, 5026001, 6116001, 7700001,
 ];
 
 /// Whether `id` is a known boss-monster template id (issue #42) — i.e.
@@ -14565,7 +14565,9 @@ pub fn is_boss_monster(id: u32) -> bool {
 }
 
 /// Dungeon scene ids (issue #125): every scene id `DungeonsTable.json` lists
-/// as a dungeon instance's `SceneID` — 572 distinct ids (min 1001, max
+/// as a dungeon instance's `SceneID`, plus the short manual-override list in
+/// `scripts/gen-name-tables.py` (`DUNGEON_SCENE_ID_MANUAL_OVERRIDES`) for
+/// instances that column omits — 573 distinct ids (min 1001, max
 /// 171001). No upstream table maps a scene/dungeon to its final boss (issue
 /// #125's investigation checked every `BPSR-ZDPS/Data/*.json` table and both
 /// community data repos), which is why [`SCENE_FINAL_BOSSES`] is curated by
@@ -14592,39 +14594,39 @@ const DUNGEON_SCENE_IDS: &[u32] = &[
     6411, 6412, 6421, 6422, 6423, 6511, 6512, 6513, 6514, 6515, 6521, 6522, 6523, 6524, 6525,
     6541, 6542, 6543, 6544, 6545, 6561, 6562, 6563, 6564, 6565, 7001, 7002, 7003, 7004, 7050,
     7051, 7052, 7053, 7054, 7055, 7056, 7057, 7058, 7060, 7061, 7065, 7070, 7071, 7072, 7073,
-    7075, 7076, 7077, 7080, 7085, 7090, 7095, 7101, 7102, 7103, 7150, 7151, 8001, 8002, 8005,
-    8006, 8020, 8021, 8051, 8052, 8053, 9000, 9001, 9002, 9200, 9201, 9202, 9203, 9204, 9205,
-    9206, 9207, 10003, 10004, 10020, 10021, 11001, 12000, 12011, 12012, 12013, 12014, 12015,
-    12016, 12017, 12018, 12019, 12022, 12023, 12030, 12040, 12050, 12051, 12100, 13001, 13002,
-    13003, 13011, 13012, 13013, 13021, 13022, 13023, 15001, 15002, 15003, 15004, 15005, 15006,
-    15007, 15008, 15009, 15010, 15011, 15012, 15501, 15502, 15503, 15504, 15505, 15506, 15507,
-    15508, 16001, 16002, 16003, 16004, 16005, 16006, 16501, 16502, 16503, 16504, 17001, 17002,
-    17003, 17004, 17501, 17502, 17503, 17504, 17505, 18001, 18002, 18003, 18004, 18501, 18502,
-    18503, 18504, 19001, 19002, 19003, 19004, 19005, 20043, 20101, 20102, 20201, 20202, 20301,
-    20302, 20303, 20401, 20402, 20501, 20502, 20701, 20702, 20801, 20802, 20803, 21201, 21202,
-    21301, 21302, 21303, 21304, 21305, 21306, 21307, 21308, 21309, 21310, 21401, 21402, 22101,
-    22201, 22202, 22301, 22401, 22402, 22501, 22502, 22503, 22504, 22505, 22601, 22602, 22701,
-    22702, 23101, 23102, 23103, 23104, 23105, 23201, 23301, 23302, 23401, 23501, 23502, 23601,
-    23602, 23701, 23702, 24101, 24102, 24103, 24104, 24105, 24106, 24107, 24108, 24109, 24110,
-    24201, 24202, 24203, 24204, 24301, 24302, 24303, 24304, 24402, 24403, 24404, 24501, 24502,
-    24503, 24504, 24601, 24602, 24603, 24604, 24650, 24651, 24652, 30001, 30101, 30102, 30103,
-    30104, 30105, 30106, 30107, 30108, 30109, 30110, 30111, 30112, 30113, 30114, 30115, 30116,
-    30117, 30118, 30119, 30120, 30121, 30122, 30123, 30124, 30125, 30126, 30127, 30128, 30129,
-    30130, 30131, 30132, 30133, 30134, 30135, 30136, 30137, 30138, 30139, 30140, 30141, 30142,
-    30143, 30144, 30145, 30146, 30147, 30148, 30149, 30150, 30151, 30152, 30153, 30154, 30155,
-    30156, 30157, 30158, 30159, 30160, 30161, 30162, 30163, 30164, 30165, 30166, 30167, 30168,
-    30169, 30170, 30171, 30172, 30173, 30174, 30175, 30200, 31101, 31102, 31103, 31104, 31105,
-    31106, 31107, 31108, 31109, 31110, 31111, 31112, 31113, 31114, 31115, 31116, 31117, 31118,
-    31119, 31120, 31121, 31122, 31123, 31124, 31125, 31126, 31127, 31128, 31129, 31130, 31131,
-    31132, 31133, 31134, 31135, 31136, 31137, 31138, 31139, 31140, 31141, 31142, 31143, 31144,
-    31145, 31146, 31147, 31148, 31149, 31150, 31151, 31152, 31153, 31154, 31155, 31156, 31157,
-    31158, 31159, 31160, 31161, 31162, 31163, 31164, 31165, 31166, 31167, 31168, 31169, 31170,
-    31171, 31172, 31173, 31174, 31175, 32101, 32102, 32103, 32104, 32105, 32106, 32107, 32108,
-    32109, 32110, 32111, 32112, 32113, 32114, 32115, 32116, 32117, 32118, 32119, 32120, 32121,
-    32122, 32123, 32124, 32125, 32126, 32127, 32128, 32129, 32130, 32131, 32132, 32133, 32134,
-    32135, 32136, 32137, 32138, 32139, 32140, 32141, 32142, 32143, 32144, 32145, 32146, 32147,
-    32148, 32149, 32150, 32151, 32152, 32153, 32154, 32155, 32156, 32157, 32158, 32159, 32160,
-    40001, 171001,
+    7075, 7076, 7077, 7080, 7085, 7090, 7095, 7101, 7102, 7103, 7150, 7151, 7152, 8001, 8002,
+    8005, 8006, 8020, 8021, 8051, 8052, 8053, 9000, 9001, 9002, 9200, 9201, 9202, 9203, 9204,
+    9205, 9206, 9207, 10003, 10004, 10020, 10021, 11001, 12000, 12011, 12012, 12013, 12014,
+    12015, 12016, 12017, 12018, 12019, 12022, 12023, 12030, 12040, 12050, 12051, 12100, 13001,
+    13002, 13003, 13011, 13012, 13013, 13021, 13022, 13023, 15001, 15002, 15003, 15004, 15005,
+    15006, 15007, 15008, 15009, 15010, 15011, 15012, 15501, 15502, 15503, 15504, 15505, 15506,
+    15507, 15508, 16001, 16002, 16003, 16004, 16005, 16006, 16501, 16502, 16503, 16504, 17001,
+    17002, 17003, 17004, 17501, 17502, 17503, 17504, 17505, 18001, 18002, 18003, 18004, 18501,
+    18502, 18503, 18504, 19001, 19002, 19003, 19004, 19005, 20043, 20101, 20102, 20201, 20202,
+    20301, 20302, 20303, 20401, 20402, 20501, 20502, 20701, 20702, 20801, 20802, 20803, 21201,
+    21202, 21301, 21302, 21303, 21304, 21305, 21306, 21307, 21308, 21309, 21310, 21401, 21402,
+    22101, 22201, 22202, 22301, 22401, 22402, 22501, 22502, 22503, 22504, 22505, 22601, 22602,
+    22701, 22702, 23101, 23102, 23103, 23104, 23105, 23201, 23301, 23302, 23401, 23501, 23502,
+    23601, 23602, 23701, 23702, 24101, 24102, 24103, 24104, 24105, 24106, 24107, 24108, 24109,
+    24110, 24201, 24202, 24203, 24204, 24301, 24302, 24303, 24304, 24402, 24403, 24404, 24501,
+    24502, 24503, 24504, 24601, 24602, 24603, 24604, 24650, 24651, 24652, 30001, 30101, 30102,
+    30103, 30104, 30105, 30106, 30107, 30108, 30109, 30110, 30111, 30112, 30113, 30114, 30115,
+    30116, 30117, 30118, 30119, 30120, 30121, 30122, 30123, 30124, 30125, 30126, 30127, 30128,
+    30129, 30130, 30131, 30132, 30133, 30134, 30135, 30136, 30137, 30138, 30139, 30140, 30141,
+    30142, 30143, 30144, 30145, 30146, 30147, 30148, 30149, 30150, 30151, 30152, 30153, 30154,
+    30155, 30156, 30157, 30158, 30159, 30160, 30161, 30162, 30163, 30164, 30165, 30166, 30167,
+    30168, 30169, 30170, 30171, 30172, 30173, 30174, 30175, 30200, 31101, 31102, 31103, 31104,
+    31105, 31106, 31107, 31108, 31109, 31110, 31111, 31112, 31113, 31114, 31115, 31116, 31117,
+    31118, 31119, 31120, 31121, 31122, 31123, 31124, 31125, 31126, 31127, 31128, 31129, 31130,
+    31131, 31132, 31133, 31134, 31135, 31136, 31137, 31138, 31139, 31140, 31141, 31142, 31143,
+    31144, 31145, 31146, 31147, 31148, 31149, 31150, 31151, 31152, 31153, 31154, 31155, 31156,
+    31157, 31158, 31159, 31160, 31161, 31162, 31163, 31164, 31165, 31166, 31167, 31168, 31169,
+    31170, 31171, 31172, 31173, 31174, 31175, 32101, 32102, 32103, 32104, 32105, 32106, 32107,
+    32108, 32109, 32110, 32111, 32112, 32113, 32114, 32115, 32116, 32117, 32118, 32119, 32120,
+    32121, 32122, 32123, 32124, 32125, 32126, 32127, 32128, 32129, 32130, 32131, 32132, 32133,
+    32134, 32135, 32136, 32137, 32138, 32139, 32140, 32141, 32142, 32143, 32144, 32145, 32146,
+    32147, 32148, 32149, 32150, 32151, 32152, 32153, 32154, 32155, 32156, 32157, 32158, 32159,
+    32160, 40001, 171001,
 ];
 
 /// Whether `id` is a known dungeon scene id (issue #125) — i.e. whether
@@ -14680,11 +14682,37 @@ mod tests {
 
     #[test]
     fn curated_names_win_over_the_authoritative_table() {
-        // BPSR-ZDPS's `MonsterTable.json` calls template 1013 "Ignisor";
-        // the community tables call it "Rathalos". The curated community name
-        // is the one players actually use, so it must survive the backfill —
+        // BPSR-ZDPS's `MonsterTable.json` carries a bare "ID Placeholder" for
+        // template 11019; the community tables name it "Boss - Darkened
+        // Python". The curated community name has to survive the backfill —
         // this is the precedence in `merge_names` observed end to end.
-        assert_eq!(monster_name(1013), Some("Rathalos"));
+        //
+        // (This test used to point at 1013, where the client says "Ignisor"
+        // and the community tables say "Rathalos". Issue #313 established
+        // that "Ignisor" is what the live client actually renders, so that id
+        // is now pinned the other way by `MONSTER_NAME_MANUAL_OVERRIDES` —
+        // see `the_ignisor_ids_keep_the_clients_own_name`. A placeholder-vs-
+        // real-name pair illustrates why the curated layer wins far better
+        // than a name-vs-name pair the client turned out to win anyway.)
+        assert_eq!(monster_name(11_019), Some("Boss - Darkened Python"));
+    }
+
+    #[test]
+    fn the_ignisor_ids_keep_the_clients_own_name() {
+        // Issue #313: `MonsterName.json` calls this family "Rathalos", but
+        // the shipped client renders "Ignisor" — the reporter read it off
+        // their own screen for 20004, mid-pull, while the header showed
+        // "Rathalos". `MONSTER_NAME_MANUAL_OVERRIDES` is layered above the
+        // curated table for exactly these ids, and nothing else.
+        assert_eq!(monster_name(20_004), Some("Ignisor"));
+        assert_eq!(monster_name(103), Some("Ignisor"));
+        assert_eq!(monster_name(1_013), Some("Ignisor"));
+        assert_eq!(monster_name(60_021), Some("Ignisor"));
+        // 104 is the same monster but absent from every community file, so it
+        // was already correct via the authoritative backfill. Pinned so a
+        // future precedence change cannot quietly rename it out from under
+        // the four above.
+        assert_eq!(monster_name(104), Some("Ignisor"));
     }
 
     #[test]
@@ -14747,6 +14775,35 @@ mod tests {
         // fought as one — see `BOSS_ID_MANUAL_OVERRIDES` in
         // `scripts/gen-name-tables.py`.
         assert!(is_boss_monster(61_220));
+    }
+
+    #[test]
+    fn is_boss_monster_true_for_the_world_dominator_rotation() {
+        // Issue #313: scene 7152 rotates its world boss nightly, and two
+        // consecutive sessions ended on these two ids. `MonsterTable.json`
+        // marks both `MonsterType == 0`, but so is every one of the 76
+        // non-boss rows in the 3000000..=3000081 World Dominator registry,
+        // and all 76 also carry `BloodTubeCount == 0` — a world boss with no
+        // health bars is an unfilled row, not a classification. Unrecognized,
+        // they cost the meter a full wipe mid-pull: `is_engaged_recognized_boss`
+        // went false, issue #151's fight hold dropped, and a 9s immunity
+        // window ended the encounter at 41.8% boss HP.
+        assert!(is_boss_monster(3_000_063)); // Denvel; base template 1701 is MonsterType 2
+        assert!(is_boss_monster(3_000_022)); // Muku Chief - Resonance
+    }
+
+    #[test]
+    fn is_dungeon_scene_true_for_every_world_dominator_scene() {
+        // Issue #313: all three of these are named "World Dominator" in
+        // `SceneTableNames.json`, but upstream's `DungeonsTable.SceneID`
+        // lists only the first two, so 7152 alone fell out of the instance
+        // set — and with it out of `Meter::engaged_boss_still_up`'s
+        // `in_dungeon_scene()` guard. 7152 is restored by
+        // `DUNGEON_SCENE_ID_MANUAL_OVERRIDES`.
+        assert!(is_dungeon_scene(7150));
+        assert!(is_dungeon_scene(7151));
+        assert!(is_dungeon_scene(7152));
+        assert_eq!(scene_name(7152), Some("World Dominator"));
     }
 
     #[test]

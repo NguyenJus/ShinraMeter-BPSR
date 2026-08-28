@@ -29,9 +29,9 @@ const M_BOSS: i64 = 2001;
 /// Table ids picked in the plan (§0.7) because they satisfy both the name
 /// lookup and the boss/dungeon membership test.
 mod monster {
-    /// `tables::monster_name(103) == Some("Rathalos")`,
+    /// `tables::monster_name(103) == Some("Ignisor")`,
     /// `tables::is_boss_monster(103) == true`.
-    pub const RATHALOS: u32 = 103;
+    pub const IGNISOR: u32 = 103;
 }
 mod scene {
     /// `tables::scene_name(1101) == Some("Towering Ruin")`,
@@ -76,7 +76,7 @@ fn build_multi_player_pull(
         // Exercises the `SyncContainerData` path (keys on `char_id` as the
         // uid directly) with the same identity Aria already appeared with.
         .container_data(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
-        .monster_appear(M_BOSS, monster::RATHALOS, 5_000_000, 5_000_000)
+        .monster_appear(M_BOSS, monster::IGNISOR, 5_000_000, 5_000_000)
         .at(2_000)
         .hit(P_ARIA, M_BOSS, 101, 40_000)
         .at(2_500)
@@ -188,7 +188,7 @@ fn boss_kill_title() {
         .enter_scene(scene::TOWERING_RUIN)
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
         .player_appear(P_BRIN, "Brin", prof::FROST_MAGE, 11_500)
-        .monster_appear(M_BOSS, monster::RATHALOS, 1_000_000, 1_000_000)
+        .monster_appear(M_BOSS, monster::IGNISOR, 1_000_000, 1_000_000)
         .at(2_000)
         .hit(P_ARIA, M_BOSS, 101, 40_000)
         .at(2_500)
@@ -215,7 +215,7 @@ fn boss_kill_title() {
         assert_eq!(capture.snapshot.duration_ms, 1_000);
         assert_eq!(capture.snapshot.total_damage, 100_000);
         assert!((capture.snapshot.total_dps - 100_000.0).abs() < 0.01);
-        assert_eq!(capture.snapshot.encounter.boss_name, Some("Rathalos"));
+        assert_eq!(capture.snapshot.encounter.boss_name, Some("Ignisor"));
         assert!(capture.snapshot.encounter.is_boss);
         assert_eq!(capture.snapshot.encounter.scene_name, Some("Towering Ruin"));
         // Issue #201: the header names the boss through the *live* lock

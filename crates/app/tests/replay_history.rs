@@ -23,7 +23,7 @@ const P_ARIA: i64 = 1001;
 const P_BRIN: i64 = 1002;
 const M_BOSS: i64 = 2001;
 const M_BOSS_2: i64 = 2002;
-const RATHALOS: u32 = 103;
+const IGNISOR: u32 = 103;
 const TOWERING_RUIN: u32 = 1101;
 /// An open-world zone (`tables::is_dungeon_scene` is false for it), where
 /// the idle timeout is the only thing that ends a pull — mirrors
@@ -71,7 +71,7 @@ fn boss_kill_scenario(name: &'static str) -> Scenario {
         .enter_scene(TOWERING_RUIN)
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
         .player_appear(P_BRIN, "Brin", prof::FROST_MAGE, 11_500)
-        .monster_appear(M_BOSS, RATHALOS, 1_000_000, 1_000_000)
+        .monster_appear(M_BOSS, IGNISOR, 1_000_000, 1_000_000)
         .at(2_000)
         .hit(P_ARIA, M_BOSS, 101, 400_000)
         .at(8_000)
@@ -93,7 +93,7 @@ fn boss_kill_scenario(name: &'static str) -> Scenario {
 fn two_fights_scenario(name: &'static str) -> Scenario {
     boss_kill_scenario(name)
         .at(20_000)
-        .monster_appear(M_BOSS_2, RATHALOS, 1_000_000, 1_000_000)
+        .monster_appear(M_BOSS_2, IGNISOR, 1_000_000, 1_000_000)
         .at(21_000)
         .hit(P_ARIA, M_BOSS_2, 101, 300_000)
         .at(22_000)
@@ -132,7 +132,7 @@ fn a_finished_boss_fight_lands_in_the_database() {
         .expect("encounter must exist");
 
     assert_eq!(record.meter_version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(record.boss_monster_id, Some(RATHALOS));
+    assert_eq!(record.boss_monster_id, Some(IGNISOR));
     assert!(record.is_boss);
     assert_eq!(record.ended_at_ms, 8_000);
 
@@ -168,6 +168,13 @@ fn the_same_fight_is_never_recorded_twice() {
 
 /// DECISION D3: an idle-timeout end records the *last hit's* timestamp as
 /// `ended_at_ms`, not the tick that happened to observe the freeze.
+///
+/// Issue #313 widened the engagement-window hold (`BOSS_ENGAGEMENT_WINDOW_MS`,
+/// 60s) to every scene, not just dungeon instances: `IGNISOR` here is a
+/// recognized boss (`tables::is_boss_monster`) that has taken damage, in the
+/// open-world `ASTERIA_PLAINS` scene, so the idle timeout is only allowed to
+/// bite once that window lapses past the last hit — the tick below has to
+/// wait for both.
 #[test]
 fn an_idle_timeout_end_records_the_last_hit_as_the_end_time() {
     let path = temp_db_path("idle-end-time");
@@ -177,13 +184,16 @@ fn an_idle_timeout_end_records_the_last_hit_as_the_end_time() {
         .at(1_000)
         .enter_scene(ASTERIA_PLAINS)
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
-        .monster_appear(M_BOSS, RATHALOS, 5_000_000, 5_000_000)
+        .monster_appear(M_BOSS, IGNISOR, 5_000_000, 5_000_000)
         .at(2_000)
         .hit(P_ARIA, M_BOSS, 101, 300_000)
         .at(9_000)
         .hit(P_ARIA, M_BOSS, 101, 300_000)
-        // Last damage (9_000) + the default idle_timeout_ms (9_000).
-        .at(18_000)
+        // Last damage (9_000) + BOSS_ENGAGEMENT_WINDOW_MS 60_000 (the
+        // engagement-window guard, issue #313) + idle_timeout_ms 9_000,
+        // plus a 1s margin so the tick lands past the boundary rather than
+        // exactly on it.
+        .at(79_000)
         .tick();
 
     let (mut rig, history_thread) =
@@ -218,7 +228,7 @@ fn a_short_pull_is_not_recorded() {
         .at(1_000)
         .enter_scene(ASTERIA_PLAINS)
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
-        .monster_appear(M_BOSS, RATHALOS, 5_000_000, 5_000_000)
+        .monster_appear(M_BOSS, IGNISOR, 5_000_000, 5_000_000)
         .at(2_000)
         .hit(P_ARIA, M_BOSS, 101, 100_000)
         .at(3_000)
@@ -252,7 +262,7 @@ fn the_recorded_rows_match_the_live_snapshot() {
         .enter_scene(TOWERING_RUIN)
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
         .player_appear(P_BRIN, "Brin", prof::FROST_MAGE, 11_500)
-        .monster_appear(M_BOSS, RATHALOS, 1_000_000, 1_000_000)
+        .monster_appear(M_BOSS, IGNISOR, 1_000_000, 1_000_000)
         .at(2_000)
         .hit(P_ARIA, M_BOSS, 101, 300_000)
         .at(3_000)
