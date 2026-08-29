@@ -41,3 +41,7 @@ inspect-dumps/
 # Byte-compiled Python, created when `scripts/prep-skill-icons.py` imports
 # `scripts/prep-imagine-icons.py` to reuse its transforms.
 __pycache__/
+
+# token-savior MCP's local code index. Regenerated on demand, several MB, and
+# specific to one checkout path — never useful to commit.
+/.token-savior-cache.json
