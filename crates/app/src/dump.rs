@@ -65,14 +65,22 @@ use serde::Serialize;
 use crate::logging::{rotated_path, should_rotate};
 
 /// A dump file at or above this size gets rotated to `<path>.1` (replacing
-/// any previous `.1`), the same threshold and one-previous-file scheme as
-/// `crate::logging`'s log-file rotation (`should_rotate`/`rotated_path` are
-/// shared, not reimplemented) — now that inspection runs by default rather
-/// than opt-in (issue #87), the dump needs the same cap that keeps the log
-/// file from growing unbounded. Checked both at startup (a pre-existing
-/// oversized file from a prior run) and continuously while the writer thread
-/// runs, mirroring `logging::Tee`.
-const MAX_DUMP_BYTES: u64 = 5 * 1024 * 1024;
+/// any previous `.1`), the one-previous-file scheme of `crate::logging`'s
+/// log-file rotation (`should_rotate`/`rotated_path` are shared, not
+/// reimplemented). Checked both at startup (a pre-existing oversized file
+/// from a prior run) and continuously while the writer thread runs,
+/// mirroring `logging::Tee`.
+///
+/// Ten times `logging::MAX_LOG_BYTES`, deliberately. The two files are capped
+/// for different reasons: a log grows while the app merely runs, whereas a
+/// dump only grows under `SHINRA_INSPECT=1` (opt-in since issue #122), and
+/// one full play session emits roughly 10 MiB of hex-encoded fragments. At
+/// the log's 5 MiB the cap bit *mid-session* — real dumps from 2026-08-17
+/// came back with both `<path>` and `<path>.1` at the cap, meaning the
+/// earliest traffic had already been rotated away — which loses exactly the
+/// raid a capture was left running to catch (issue #285). 50 MiB holds a
+/// full evening, and the ceiling stays bounded at 2x this.
+const MAX_DUMP_BYTES: u64 = 50 * 1024 * 1024;
 
 /// How many records may queue up ahead of the writer thread. Bounded because
 /// an unbounded channel turns a stalled writer (slow disk, AV scan, a full

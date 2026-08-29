@@ -60,9 +60,13 @@ count towards the service/method histograms (a foreign codec is itself a
 finding) but contribute no attr ids, so a nonzero total there explains a
 thinner-than-expected attr section.
 
-A dump caps at 5 MiB and rotates to `<path>.1` (see `crates/app/src/dump.rs`
-and the README's "Packet inspection dumps" section) — routine enough for a
-long session once inspection is enabled. `inspect-replay` handles
+A dump caps at 50 MiB and rotates to `<path>.1` (see `crates/app/src/dump.rs`
+and the README's "Packet inspection dumps" section), so a session's ceiling is
+100 MiB across the pair. The cap was 5 MiB until it was found biting
+mid-session — a dump left running all evening had rotated the earliest traffic
+away before the interesting raid was ever read back (issue #285). If both
+files come back at the cap, assume the same thing happened and treat the
+window as truncated at the front. `inspect-replay` handles
 this itself: if `<path>.1` exists next to the file you pass it, it reads
 that rotated file first (so records stay in chronological order) and prints
 a `note:` line saying how many records it contributed. You only need to
