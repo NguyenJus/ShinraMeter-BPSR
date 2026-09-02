@@ -62,25 +62,53 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use serde::Serialize;
 
-use crate::logging::{rotated_path, should_rotate};
+use crate::logging::should_rotate;
 
-/// A dump file at or above this size gets rotated to `<path>.1` (replacing
-/// any previous `.1`), the one-previous-file scheme of `crate::logging`'s
-/// log-file rotation (`should_rotate`/`rotated_path` are shared, not
-/// reimplemented). Checked both at startup (a pre-existing oversized file
-/// from a prior run) and continuously while the writer thread runs,
-/// mirroring `logging::Tee`.
+/// A dump chunk (the live file, or any numbered ring chunk) at or above this
+/// size gets rotated: the live file is renamed to `<path>.1` — any existing
+/// numbered chunks shift up by one first (`.1` -> `.2`, `.2` -> `.3`, ...,
+/// see [`shift_ring`]) — and `path` is reopened empty. Checked both at
+/// startup (a pre-existing oversized file from a prior run) and
+/// continuously while the writer thread runs, mirroring `logging::Tee`.
 ///
-/// Ten times `logging::MAX_LOG_BYTES`, deliberately. The two files are capped
-/// for different reasons: a log grows while the app merely runs, whereas a
-/// dump only grows under `SHINRA_INSPECT=1` (opt-in since issue #122), and
-/// one full play session emits roughly 10 MiB of hex-encoded fragments. At
-/// the log's 5 MiB the cap bit *mid-session* — real dumps from 2026-08-17
-/// came back with both `<path>` and `<path>.1` at the cap, meaning the
-/// earliest traffic had already been rotated away — which loses exactly the
-/// raid a capture was left running to catch (issue #285). 50 MiB holds a
-/// full evening, and the ceiling stays bounded at 2x this.
-const MAX_DUMP_BYTES: u64 = 50 * 1024 * 1024;
+/// Ten times `logging::MAX_LOG_BYTES`, deliberately — unchanged by issue
+/// #322. The two files are capped for different reasons: a log grows while
+/// the app merely runs, whereas a dump only grows under `SHINRA_INSPECT=1`
+/// (opt-in since issue #122). What #322 changed is what happens once a
+/// *chunk* fills up: issue #285's raid emitted roughly 2.5 MB/min, so a
+/// 90+ minute raid is on the order of 240 MB, and the old scheme (this
+/// threshold plus exactly one retained backup, `MAX_DUMP_BYTES` from before
+/// this issue) capped the whole *session* at 2x this value — losing the
+/// front ~70% of a long raid with no log signal that anything had been
+/// discarded. [`DEFAULT_MAX_TOTAL_RING_BYTES`] is the session-wide budget
+/// now; this constant is only the per-chunk threshold within it.
+const MAX_CHUNK_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Default total byte budget across every ring chunk (the live file plus
+/// every numbered `.1`, `.2`, ... chunk on disk) — see [`enforce_ring_budget`].
+/// [`MAX_TOTAL_BYTES_VAR`] overrides it. 512 MiB is roughly ten times the
+/// old 2-chunk / 100 MiB ceiling this replaces (issue #322): at the #285
+/// raid's measured ~2.5 MB/min, 512 MiB holds a bit over 3 hours — well
+/// past one raid — while keeping disk use bounded rather than unbounded.
+const DEFAULT_MAX_TOTAL_RING_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Overrides [`DEFAULT_MAX_TOTAL_RING_BYTES`] when set to a positive
+/// integer — an operator who knows their session runs unusually long (or
+/// wants to spend less disk) can size the ring from real numbers instead of
+/// the built-in guess.
+const MAX_TOTAL_BYTES_VAR: &str = "SHINRA_INSPECT_MAX_BYTES";
+
+/// [`DEFAULT_MAX_TOTAL_RING_BYTES`], or [`MAX_TOTAL_BYTES_VAR`]'s value if
+/// it parses as a positive integer.
+fn max_total_ring_bytes() -> u64 {
+    max_total_ring_bytes_from(std::env::var(MAX_TOTAL_BYTES_VAR).ok().as_deref())
+}
+
+fn max_total_ring_bytes_from(var: Option<&str>) -> u64 {
+    var.and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_TOTAL_RING_BYTES)
+}
 
 /// How many records may queue up ahead of the writer thread. Bounded because
 /// an unbounded channel turns a stalled writer (slow disk, AV scan, a full
@@ -166,17 +194,17 @@ pub struct DumpWriter {
 impl DumpWriter {
     /// Spawns the dedicated writer thread.
     pub fn spawn(path: PathBuf) -> Self {
-        Self::spawn_with_max_bytes(path, MAX_DUMP_BYTES)
+        Self::spawn_with_max_bytes(path, MAX_CHUNK_BYTES, max_total_ring_bytes())
     }
 
-    /// Like [`spawn`](Self::spawn), but with the rotation threshold
-    /// overridable — only so tests can cross it without writing megabytes of
-    /// records.
-    fn spawn_with_max_bytes(path: PathBuf, max_bytes: u64) -> Self {
+    /// Like [`spawn`](Self::spawn), but with both rotation thresholds
+    /// overridable — only so tests can cross them without writing megabytes
+    /// of records.
+    fn spawn_with_max_bytes(path: PathBuf, chunk_max_bytes: u64, total_max_bytes: u64) -> Self {
         let (tx, rx) = bounded::<Record>(CAPACITY);
         let handle = std::thread::Builder::new()
             .name("inspect-dump-writer".to_string())
-            .spawn(move || run_writer(rx, &path, max_bytes))
+            .spawn(move || run_writer(rx, &path, chunk_max_bytes, total_max_bytes))
             .expect("failed to spawn the inspect-dump-writer thread");
         Self {
             tx: RecordSender::new(tx),
@@ -221,19 +249,30 @@ impl DumpWriter {
 /// block on a dead writer.
 ///
 /// Also owns rotation: `written` is seeded from the (post-startup-rotation)
-/// file's length and grows with every line, and the file is rotated to
-/// `<path>.1` and reopened empty the moment the running total reaches
-/// `max_bytes` — mirrors `logging::Tee`'s runtime rotation of the log file.
-fn run_writer(rx: Receiver<Record>, path: &Path, max_bytes: u64) {
-    let file = match open(path, max_bytes) {
+/// file's length and grows with every line, and the file is rotated the
+/// moment the running total reaches `chunk_max_bytes` — mirrors
+/// `logging::Tee`'s runtime rotation of the log file, except a rotated-out
+/// chunk joins the numbered ring (see [`rotate`]) instead of overwriting a
+/// single backup. Issue #322: a routine rotation used to leave no trace in
+/// the log at all — `first_ts_ms`/`last_ts_ms` track the chunk currently
+/// being written (reset on every rotation, never by re-reading the file) so
+/// the info line logged right after a successful rotation says exactly what
+/// was rotated out and when it happened, in-session.
+fn run_writer(rx: Receiver<Record>, path: &Path, chunk_max_bytes: u64, total_max_bytes: u64) {
+    let file = match open(path, chunk_max_bytes, total_max_bytes) {
         Some(f) => f,
         None => {
             while rx.recv().is_ok() {}
             return;
         }
     };
+    log::info!(
+        "inspect dump writer started: path={}, chunk size={chunk_max_bytes} bytes, ring budget={total_max_bytes} bytes total (oldest chunk deleted once the ring exceeds this; override with {MAX_TOTAL_BYTES_VAR})",
+        path.display()
+    );
     let mut written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
     let mut out = BufWriter::new(file);
+    let mut first_ts_ms: Option<u64> = None;
     while let Ok(record) = rx.recv() {
         let line = Line::from(&record);
         let json = match serde_json::to_string(&line) {
@@ -247,11 +286,27 @@ fn run_writer(rx: Receiver<Record>, path: &Path, max_bytes: u64) {
             log::warn!("inspect dump write failed: {err}");
             continue;
         }
+        if first_ts_ms.is_none() {
+            first_ts_ms = Some(record.ts_ms);
+        }
+        // `record` is always the last one written into the chunk by the
+        // time a rotation check below can fire (the write above already
+        // happened this same iteration), so it doubles as the chunk's
+        // last-ts_ms without a separately tracked running variable.
+        let last_ts_ms = record.ts_ms;
         written += json.len() as u64 + 1; // +1 for the trailing newline
-        if should_rotate(written, max_bytes) {
+        if should_rotate(written, chunk_max_bytes) {
             let _ = out.flush();
-            let rotated = rotate(path);
+            let bytes_rotated = written;
+            let rotated = rotate(path, total_max_bytes);
+            if rotated.is_some() {
+                log::info!(
+                    "inspect dump rotated: {bytes_rotated} bytes written, ts_ms range [{}, {last_ts_ms}]",
+                    first_ts_ms.unwrap_or(0),
+                );
+            }
             (out, written) = rotation_outcome(out, rotated);
+            first_ts_ms = None;
         }
     }
     let _ = out.flush();
@@ -276,18 +331,112 @@ fn rotation_outcome(current: BufWriter<File>, rotated: Option<File>) -> (BufWrit
     }
 }
 
-/// Renames `path` to `<path>.1` (replacing any previous `.1`) and reopens
-/// `path` empty. `None` on failure, already logged.
-fn rotate(path: &Path) -> Option<File> {
-    let rotated = rotated_path(path);
-    if let Err(err) = fs::rename(path, &rotated) {
+/// `<path>.n` for `n >= 1` — the ring chunk `n` rotations back from the live
+/// file. `n=1` is the most recently rotated (newest) chunk; higher `n` is
+/// older.
+fn numbered_path(path: &Path, n: u64) -> PathBuf {
+    let mut numbered = path.as_os_str().to_owned();
+    numbered.push(format!(".{n}"));
+    PathBuf::from(numbered)
+}
+
+/// Every numbered ring chunk currently on disk next to `path`, ascending by
+/// `n` (index 0 is `.1`, the newest rotated chunk). Stops at the first
+/// missing `n` — [`shift_ring`] always shifts contiguously, so the ring
+/// never has gaps.
+fn ring_chunks(path: &Path) -> Vec<(u64, PathBuf)> {
+    let mut chunks = Vec::new();
+    let mut n = 1;
+    loop {
+        let candidate = numbered_path(path, n);
+        if !candidate.exists() {
+            break;
+        }
+        chunks.push((n, candidate));
+        n += 1;
+    }
+    chunks
+}
+
+/// Renames every existing numbered chunk up by one — highest `n` first, so
+/// none get clobbered mid-shift — vacating `<path>.1` for [`rotate`] to move
+/// the live file into. Best-effort: a single failed rename only warns (the
+/// ring is left slightly inconsistent for that one chunk) rather than
+/// aborting the rotation the live file itself still needs.
+fn shift_ring(path: &Path) {
+    for (n, chunk) in ring_chunks(path).into_iter().rev() {
+        let to = numbered_path(path, n + 1);
+        if let Err(err) = fs::rename(&chunk, &to) {
+            log::warn!(
+                "failed to shift inspect dump ring chunk {} to {} ({err}); the ring may now be inconsistent",
+                chunk.display(),
+                to.display()
+            );
+        }
+    }
+}
+
+/// Deletes the oldest (highest-numbered) ring chunks until the numbered
+/// chunks' total size is at or under `total_max_bytes` (issue #322's
+/// numbered-ring replacement for the old single-backup cap). The live file
+/// itself doesn't count towards the budget — it's still being written, and
+/// is capped independently by [`MAX_CHUNK_BYTES`] triggering the next
+/// rotation. Each deletion is logged at info with the chunk's path and
+/// size; the deleted chunk's `ts_ms` range is only known if this process's
+/// own `run_writer` tracked it while writing that exact chunk (true only
+/// for the newest one — once later rotations shift it further back, the
+/// range isn't carried along), so an older deletion names just the path.
+fn enforce_ring_budget(path: &Path, total_max_bytes: u64) {
+    let mut chunks: Vec<(PathBuf, u64)> = ring_chunks(path)
+        .into_iter()
+        .map(|(_, chunk)| {
+            let len = fs::metadata(&chunk).map(|meta| meta.len()).unwrap_or(0);
+            (chunk, len)
+        })
+        .collect();
+    let mut total: u64 = chunks.iter().map(|(_, len)| len).sum();
+    while total > total_max_bytes {
+        let Some((oldest, len)) = chunks.pop() else {
+            break;
+        };
+        match fs::remove_file(&oldest) {
+            Ok(()) => {
+                total = total.saturating_sub(len);
+                log::info!(
+                    "inspect dump ring exceeded its {total_max_bytes} byte budget; deleted oldest chunk {} ({len} bytes)",
+                    oldest.display()
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    "failed to delete oversized inspect dump ring chunk {}: {err}",
+                    oldest.display()
+                );
+                break;
+            }
+        }
+    }
+}
+
+/// Shifts the numbered ring up by one (see [`shift_ring`]), renames the
+/// live `path` into the now-vacated `<path>.1`, enforces the total ring
+/// budget (see [`enforce_ring_budget`], which may delete the oldest
+/// chunk(s)), and reopens `path` empty. `None` only when the live-file
+/// rename itself fails (already logged) — a ring-shift or budget-enforcement
+/// failure only warns, since the live file has already been safely rotated
+/// out by that point.
+fn rotate(path: &Path, total_max_bytes: u64) -> Option<File> {
+    shift_ring(path);
+    let first_chunk = numbered_path(path, 1);
+    if let Err(err) = fs::rename(path, &first_chunk) {
         log::warn!(
             "failed to rotate inspect dump {} to {} ({err}); continuing without rotation",
             path.display(),
-            rotated.display()
+            first_chunk.display()
         );
         return None;
     }
+    enforce_ring_budget(path, total_max_bytes);
     match fs::OpenOptions::new().create(true).append(true).open(path) {
         Ok(f) => Some(f),
         Err(err) => {
@@ -301,9 +450,9 @@ fn rotate(path: &Path) -> Option<File> {
 }
 
 /// Opens (or creates) the dump file for appending, first rotating it away if
-/// it's already at or above `max_bytes` from a previous run — mirrors
+/// it's already at or above `chunk_max_bytes` from a previous run — mirrors
 /// `logging::init`'s startup rotation check.
-fn open(path: &Path, max_bytes: u64) -> Option<File> {
+fn open(path: &Path, chunk_max_bytes: u64, total_max_bytes: u64) -> Option<File> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
         && let Err(err) = fs::create_dir_all(parent)
@@ -315,13 +464,13 @@ fn open(path: &Path, max_bytes: u64) -> Option<File> {
         return None;
     }
     if let Some(len) = fs::metadata(path).ok().map(|meta| meta.len())
-        && should_rotate(len, max_bytes)
-        && let Err(err) = fs::rename(path, rotated_path(path))
+        && should_rotate(len, chunk_max_bytes)
     {
-        log::warn!(
-            "failed to rotate pre-existing inspect dump {} ({err}); continuing without rotation",
-            path.display()
-        );
+        // Reuses `rotate` for the ring-shift/budget-enforcement logic and
+        // discards the fresh handle it opens — the real open happens below
+        // regardless of whether this succeeds, mirroring the original
+        // best-effort "continue either way" behavior.
+        drop(rotate(path, total_max_bytes));
     }
     match fs::OpenOptions::new().create(true).append(true).open(path) {
         Ok(f) => Some(f),
@@ -470,8 +619,9 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    // -- rotation (issue #87: no longer opt-in, so the dump needs the same
-    // fixed-size, one-previous-file cap as `crate::logging`) ---------------
+    // -- rotation (issue #322: a numbered ring — dump-<session>.jsonl, .1,
+    // .2, ... — replaced the old fixed-size, one-previous-file cap so a
+    // long raid no longer loses everything but its last few minutes) ------
 
     fn line_len(record: &Record) -> u64 {
         serde_json::to_string(&Line::from(record)).unwrap().len() as u64 + 1
@@ -483,7 +633,7 @@ mod tests {
     #[test]
     fn writer_rotates_when_the_running_total_crosses_the_threshold() {
         let path = temp_path("rotate");
-        let rotated = crate::logging::rotated_path(&path);
+        let rotated = numbered_path(&path, 1);
         let record1 = Record {
             ts_ms: 1,
             service_uuid: 0xAB,
@@ -500,7 +650,7 @@ mod tests {
         };
         let max_bytes = line_len(&record1) + line_len(&record2);
 
-        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes);
+        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes, u64::MAX);
         writer.sender().send(record1);
         writer.sender().send(record2);
         writer.shutdown();
@@ -522,7 +672,7 @@ mod tests {
     #[test]
     fn writer_seeds_its_running_total_from_an_existing_dump_file() {
         let path = temp_path("seed");
-        let rotated = crate::logging::rotated_path(&path);
+        let rotated = numbered_path(&path, 1);
         fs::write(&path, b"previous-session-line\n").unwrap();
         let existing_len = fs::metadata(&path).unwrap().len();
 
@@ -535,7 +685,7 @@ mod tests {
         };
         let max_bytes = existing_len + line_len(&record);
 
-        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes);
+        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes, u64::MAX);
         writer.sender().send(record);
         writer.shutdown();
 
@@ -548,6 +698,84 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&rotated);
+    }
+
+    /// Three chunk-sized rotations in a row must shift the whole ring, not
+    /// just overwrite a single `.1` — `.1` always ends up the newest
+    /// rotated-out chunk and `.3` the oldest, in that order.
+    #[test]
+    fn rotation_shifts_older_numbered_chunks_up_by_one() {
+        let path = temp_path("ring-shift");
+        let record = |ts_ms: u64| Record {
+            ts_ms,
+            service_uuid: 1,
+            method_id: 1,
+            payload: vec![0xAA],
+            payload_decoded: true,
+        };
+        let max_bytes = line_len(&record(1));
+
+        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes, u64::MAX);
+        writer.sender().send(record(1));
+        writer.sender().send(record(2));
+        writer.sender().send(record(3));
+        writer.shutdown();
+
+        let dot1 = fs::read_to_string(numbered_path(&path, 1)).expect(".1 should exist");
+        let dot2 = fs::read_to_string(numbered_path(&path, 2)).expect(".2 should exist");
+        let dot3 = fs::read_to_string(numbered_path(&path, 3)).expect(".3 should exist");
+        assert!(dot1.contains("\"ts_ms\":3"), "newest rotated chunk is .1");
+        assert!(dot2.contains("\"ts_ms\":2"), "middle chunk shifted to .2");
+        assert!(dot3.contains("\"ts_ms\":1"), "oldest chunk shifted to .3");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(numbered_path(&path, 1));
+        let _ = fs::remove_file(numbered_path(&path, 2));
+        let _ = fs::remove_file(numbered_path(&path, 3));
+    }
+
+    /// Once the ring's total size exceeds the byte budget, the oldest
+    /// (highest-numbered) chunk is deleted rather than kept forever —
+    /// issue #322's bounded replacement for the unbounded-disk-use
+    /// alternative.
+    #[test]
+    fn rotation_deletes_the_oldest_chunk_once_the_ring_exceeds_its_byte_budget() {
+        let path = temp_path("ring-budget");
+        let record = |ts_ms: u64| Record {
+            ts_ms,
+            service_uuid: 1,
+            method_id: 1,
+            payload: vec![0xAA],
+            payload_decoded: true,
+        };
+        let chunk_bytes = line_len(&record(1));
+        // Room for exactly two rotated chunks; a third rotation must evict
+        // the oldest one.
+        let total_bytes = chunk_bytes * 2;
+
+        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), chunk_bytes, total_bytes);
+        writer.sender().send(record(1));
+        writer.sender().send(record(2));
+        writer.sender().send(record(3));
+        writer.shutdown();
+
+        assert!(
+            numbered_path(&path, 1).exists(),
+            ".1 (newest rotated chunk) must survive"
+        );
+        assert!(
+            numbered_path(&path, 2).exists(),
+            ".2 must survive — it still fits the budget"
+        );
+        assert!(
+            !numbered_path(&path, 3).exists(),
+            ".3 (oldest) must be deleted once the ring goes over budget"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(numbered_path(&path, 1));
+        let _ = fs::remove_file(numbered_path(&path, 2));
     }
 
     /// Regression test for the review finding on PR #99: the failure arm
@@ -589,11 +817,11 @@ mod tests {
     #[test]
     fn writer_rotates_a_pre_existing_oversized_file_at_startup() {
         let path = temp_path("startup-rotate");
-        let rotated = crate::logging::rotated_path(&path);
+        let rotated = numbered_path(&path, 1);
         fs::write(&path, b"stale-oversized-content").unwrap();
         let max_bytes = fs::metadata(&path).unwrap().len();
 
-        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes);
+        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes, u64::MAX);
         writer.shutdown();
 
         assert_eq!(
@@ -603,5 +831,180 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&rotated);
+    }
+
+    // -- max_total_ring_bytes_from ------------------------------------------
+
+    #[test]
+    fn max_total_ring_bytes_from_prefers_a_valid_positive_override() {
+        assert_eq!(max_total_ring_bytes_from(Some("1024")), 1024);
+    }
+
+    #[test]
+    fn max_total_ring_bytes_from_falls_back_to_the_default_when_unset_zero_or_unparseable() {
+        assert_eq!(
+            max_total_ring_bytes_from(None),
+            DEFAULT_MAX_TOTAL_RING_BYTES
+        );
+        assert_eq!(
+            max_total_ring_bytes_from(Some("0")),
+            DEFAULT_MAX_TOTAL_RING_BYTES
+        );
+        assert_eq!(
+            max_total_ring_bytes_from(Some("not-a-number")),
+            DEFAULT_MAX_TOTAL_RING_BYTES
+        );
+    }
+
+    // -- rotation log signal (issue #322: a routine rotation used to leave
+    // no trace at all — see the module-level `diagnostics` submodule for
+    // the shared log-capture harness and its "positive assertions only"
+    // discipline, since `log` allows exactly one logger per test binary). -
+
+    mod diagnostics {
+        use super::*;
+        use std::sync::{Mutex, Once};
+
+        static CAPTURED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
+
+        struct CaptureLogger;
+
+        impl log::Log for CaptureLogger {
+            fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn log(&self, record: &log::Record<'_>) {
+                if let Ok(mut captured) = CAPTURED.lock() {
+                    captured.push(record.args().to_string());
+                }
+            }
+
+            fn flush(&self) {}
+        }
+
+        /// Installs [`CAPTURE_LOGGER`] once per process. Idempotent, so any
+        /// number of tests can call it, in any order, from any thread.
+        fn install_capture() {
+            static INSTALL: Once = Once::new();
+            INSTALL.call_once(|| {
+                let _ = log::set_logger(&CAPTURE_LOGGER);
+                log::set_max_level(log::LevelFilter::Trace);
+            });
+        }
+
+        /// Whether any captured line contains every one of `needles` —
+        /// callers pass a value unique to their test (a distinct `ts_ms` or
+        /// temp path) as one of the needles, so a match can only have come
+        /// from that test, never a different test sharing this
+        /// process-wide capture buffer.
+        fn logged(needles: &[&str]) -> bool {
+            CAPTURED
+                .lock()
+                .map(|captured| {
+                    captured
+                        .iter()
+                        .any(|line| needles.iter().all(|needle| line.contains(needle)))
+                })
+                .unwrap_or(false)
+        }
+
+        /// A successful rotation logs the bytes written and the first/last
+        /// `ts_ms` of the chunk being rotated out — tracked by `run_writer`
+        /// as records are written, never by re-reading the rotated file.
+        #[test]
+        fn rotation_logs_bytes_written_and_the_rotated_chunks_ts_ms_range() {
+            install_capture();
+            let path = temp_path("log-rotate");
+            let record = |ts_ms: u64| Record {
+                ts_ms,
+                service_uuid: 1,
+                method_id: 1,
+                payload: vec![0xAA],
+                payload_decoded: true,
+            };
+            // Unique, unmistakable ts_ms values so the assertion below can
+            // only match lines this test itself produced.
+            let (first_ts, last_ts) = (932_411_001_u64, 932_411_002_u64);
+            let max_bytes = line_len(&record(first_ts)) + line_len(&record(last_ts));
+
+            let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes, u64::MAX);
+            writer.sender().send(record(first_ts));
+            writer.sender().send(record(last_ts));
+            writer.shutdown();
+
+            assert!(
+                logged(&[
+                    "inspect dump rotated",
+                    &first_ts.to_string(),
+                    &last_ts.to_string()
+                ]),
+                "expected a rotation log line naming both ts_ms bounds; captured: {:?}",
+                CAPTURED.lock().unwrap()
+            );
+
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(numbered_path(&path, 1));
+        }
+
+        /// The writer logs which path it's using and the retention policy
+        /// (chunk size + ring budget) once at startup, not only on failure.
+        #[test]
+        fn writer_logs_its_path_and_retention_policy_at_startup() {
+            install_capture();
+            let path = temp_path("log-startup");
+            let chunk_bytes = 123_456_u64;
+            let total_bytes = 654_321_u64;
+
+            let writer = DumpWriter::spawn_with_max_bytes(path.clone(), chunk_bytes, total_bytes);
+            writer.shutdown();
+
+            assert!(
+                logged(&[
+                    "inspect dump writer started",
+                    &path.display().to_string(),
+                    &chunk_bytes.to_string(),
+                    &total_bytes.to_string(),
+                ]),
+                "expected a startup log line naming the path and retention policy; captured: {:?}",
+                CAPTURED.lock().unwrap()
+            );
+
+            let _ = fs::remove_file(&path);
+        }
+
+        /// Deleting the oldest ring chunk once the budget is exceeded is
+        /// itself logged, naming the deleted chunk's path.
+        #[test]
+        fn budget_eviction_logs_the_deleted_chunk_path() {
+            install_capture();
+            let path = temp_path("log-evict");
+            let record = |ts_ms: u64| Record {
+                ts_ms,
+                service_uuid: 1,
+                method_id: 1,
+                payload: vec![0xAA],
+                payload_decoded: true,
+            };
+            let chunk_bytes = line_len(&record(1));
+            let total_bytes = chunk_bytes; // room for exactly one rotated chunk
+
+            let writer = DumpWriter::spawn_with_max_bytes(path.clone(), chunk_bytes, total_bytes);
+            writer.sender().send(record(1));
+            writer.sender().send(record(2));
+            writer.shutdown();
+
+            let evicted = numbered_path(&path, 2).display().to_string();
+            assert!(
+                logged(&["deleted oldest chunk", &evicted]),
+                "expected an eviction log line naming the deleted chunk; captured: {:?}",
+                CAPTURED.lock().unwrap()
+            );
+            assert!(!numbered_path(&path, 2).exists());
+
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(numbered_path(&path, 1));
+        }
     }
 }

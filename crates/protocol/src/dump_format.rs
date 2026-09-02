@@ -98,15 +98,16 @@ pub fn parse_record(line: &str) -> Result<DumpRecord, String> {
     })
 }
 
-/// The rotated sibling `dump.rs` would have renamed `path` to once it grew
-/// past `MAX_DUMP_BYTES`: `<path>.1`, replacing any previous one. Matches
-/// `crate::logging::rotated_path` / `crates/app/src/dump.rs`'s
-/// `rotated_path`, reimplemented here rather than shared because this crate
-/// intentionally doesn't depend on the app crate.
-pub fn rotated_sibling(path: &Path) -> PathBuf {
-    let mut rotated = path.as_os_str().to_owned();
-    rotated.push(".1");
-    PathBuf::from(rotated)
+/// `<path>.n` for `n >= 1` — the numbered ring chunk `dump.rs` would have
+/// renamed `path` to `n` rotations ago (issue #322): `n=1` is the most
+/// recently rotated (newest) chunk, higher `n` is older. Matches
+/// `crates/app/src/dump.rs`'s own `numbered_path`, reimplemented here
+/// rather than shared because this crate intentionally doesn't depend on
+/// the app crate.
+pub fn numbered_sibling(path: &Path, n: u64) -> PathBuf {
+    let mut numbered = path.as_os_str().to_owned();
+    numbered.push(format!(".{n}"));
+    PathBuf::from(numbered)
 }
 
 /// Opens `path`, parses every JSONL line with [`parse_record`], and appends
@@ -148,29 +149,43 @@ pub fn append_records_from(
     Ok(appended)
 }
 
-/// Reads `path`, plus its rotated `<path>.1` sibling if present (read first,
-/// so records stay in chronological order — it holds strictly older
-/// records). Convenience wrapper around [`append_records_from`] +
-/// [`rotated_sibling`] for a CLI binary that just wants "all the records for
-/// this dump, oldest first". Rotated-sibling read failures are reported to
-/// stderr but not fatal; a failure to open `path` itself is returned.
+/// Reads `path`, plus every numbered ring chunk present alongside it
+/// (`.1`, `.2`, ... — see [`numbered_sibling`]), in chronological order:
+/// highest-numbered (oldest) chunk first, `path` (the live, newest data)
+/// last. Convenience wrapper around [`append_records_from`] for a CLI
+/// binary that just wants "every retained record for this dump, oldest
+/// first". A rotated chunk's read failure is reported to stderr but not
+/// fatal (older data is nice-to-have, not required); a failure to open
+/// `path` itself is returned.
 pub fn load_dump(path: &Path) -> Result<Vec<DumpRecord>, std::io::Error> {
     let mut records = Vec::new();
-    let rotated = rotated_sibling(path);
-    if rotated.exists() {
-        match append_records_from(&rotated, &mut records) {
+
+    let mut chunks = Vec::new();
+    let mut n = 1;
+    loop {
+        let candidate = numbered_sibling(path, n);
+        if !candidate.exists() {
+            break;
+        }
+        chunks.push((n, candidate));
+        n += 1;
+    }
+    for (n, chunk) in chunks.into_iter().rev() {
+        match append_records_from(&chunk, &mut records) {
             Ok(count) => eprintln!(
-                "note: also read rotated dump {} — {count} earlier record(s) included before {}",
-                rotated.display(),
+                "note: also read rotated dump chunk {} (.{n}) — {count} earlier record(s) \
+                 included before {}",
+                chunk.display(),
                 path.display()
             ),
             Err(err) => eprintln!(
-                "warning: found rotated dump {} but could not read it ({err}); \
+                "warning: found rotated dump chunk {} but could not read it ({err}); \
                  earlier records may be missing",
-                rotated.display()
+                chunk.display()
             ),
         }
     }
+
     append_records_from(path, &mut records)?;
     Ok(records)
 }
@@ -206,11 +221,15 @@ mod tests {
     }
 
     #[test]
-    fn rotated_sibling_appends_dot_one_to_the_path() {
+    fn numbered_sibling_appends_dot_n_to_the_path() {
         let path = PathBuf::from("/some/dir/dump-123.jsonl");
         assert_eq!(
-            rotated_sibling(&path),
+            numbered_sibling(&path, 1),
             PathBuf::from("/some/dir/dump-123.jsonl.1")
+        );
+        assert_eq!(
+            numbered_sibling(&path, 2),
+            PathBuf::from("/some/dir/dump-123.jsonl.2")
         );
     }
 
@@ -219,7 +238,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let n = std::process::id();
         let path = dir.join(format!("bpsr-dump-format-test-{n}.jsonl"));
-        let rotated = rotated_sibling(&path);
+        let rotated = numbered_sibling(&path, 1);
         std::fs::write(
             &rotated,
             format!("{}\n{}\n", dump_line(100), dump_line(200)),
@@ -236,5 +255,31 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&rotated);
+    }
+
+    /// Issue #322: the whole numbered ring, not just a single `.1`, is read
+    /// — and in chronological order (highest number = oldest, read first).
+    #[test]
+    fn load_dump_reads_every_numbered_ring_chunk_in_chronological_order() {
+        let dir = std::env::temp_dir();
+        let n = std::process::id();
+        let path = dir.join(format!("bpsr-dump-format-test-ring-{n}.jsonl"));
+        let dot1 = numbered_sibling(&path, 1);
+        let dot2 = numbered_sibling(&path, 2);
+        std::fs::write(&dot2, format!("{}\n", dump_line(100))).unwrap();
+        std::fs::write(&dot1, format!("{}\n", dump_line(200))).unwrap();
+        std::fs::write(&path, format!("{}\n", dump_line(300))).unwrap();
+
+        let records = load_dump(&path).expect("live file must open");
+
+        assert_eq!(
+            records.iter().map(|r| r.ts_ms).collect::<Vec<_>>(),
+            vec![100, 200, 300],
+            ".2 (oldest) must be read before .1, and .1 before the live file"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&dot1);
+        let _ = std::fs::remove_file(&dot2);
     }
 }
