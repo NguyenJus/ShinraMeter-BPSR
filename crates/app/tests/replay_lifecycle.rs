@@ -26,8 +26,8 @@ const TOWERING_RUIN: u32 = 1101;
 /// holds a pull open only inside an instance.
 const ASTERIA_PLAINS: u32 = 7;
 
-/// A wipe/re-pull: boss HP dips below `hp_drop_below_pct` (60%) then rolls
-/// back up to `hp_rollback_at_pct` (90%), which must auto-reset the
+/// A wipe/re-pull: boss HP dips below `hp_drop_below_pct` (95%) then rolls
+/// back above `hp_rollback_at_pct` (95%), which must auto-reset the
 /// encounter (`crates/meter/src/reset.rs`).
 ///
 /// Also the scenario that proves the reset is *selective*: `boss_uid`
@@ -46,12 +46,12 @@ fn boss_hp_rollback_auto_reset() {
         // makes M_BOSS the selected boss at all.
         .at(2_000)
         .hit(P_ARIA, M_BOSS, 101, 50_000)
-        // Walk HP down below the 60% drop threshold...
+        // Walk HP down below the 95% drop threshold...
         .at(2_500)
         .monster_hp(M_BOSS, 700_000)
         .at(3_000)
         .monster_hp(M_BOSS, 300_000)
-        // ...then back up past the 90% rollback threshold: a fresh
+        // ...then back up past the 95% rollback threshold: a fresh
         // pull/wipe, not genuine burst healing.
         .at(5_000)
         .monster_hp(M_BOSS, 1_000_000)

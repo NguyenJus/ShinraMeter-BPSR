@@ -88,8 +88,13 @@ pub struct ResetConfig {
 impl Default for ResetConfig {
     fn default() -> Self {
         Self {
-            hp_drop_below_pct: 60.0,
-            hp_rollback_at_pct: 90.0,
+            // 95/95, matching resonance-logs' `AttemptConfig` defaults: any
+            // dip below 95% that comes back above 95% reads as a wipe/reset,
+            // not just a burn past the 60/90 split this used to use — a
+            // boss can legitimately get burned to 61% and pushed back to
+            // 89% by real damage without ever wiping.
+            hp_drop_below_pct: 95.0,
+            hp_rollback_at_pct: 95.0,
             cooldown_ms: 2000,
         }
     }
@@ -209,13 +214,21 @@ impl EnemyState {
 }
 
 /// True iff the enemy's HP dropped below `hp_drop_below_pct` at some point
-/// during the fight and has since rolled back up to at least
+/// during the fight and has since rolled back to strictly above
 /// `hp_rollback_at_pct` — the signature of a boss-HP-bar reset/wipe rather
 /// than genuine burst damage.
+///
+/// Both thresholds default to 95% (resonance-logs' `AttemptConfig`): any dip
+/// below 95 that returns above 95 counts, so a boss idling at (or healed
+/// past) its peak with no real dip never trips the first half of the
+/// check. The second half is strictly `>`, not `>=`, to avoid the edge case
+/// of a `lowest_pct`/`current` pair landing on the threshold itself and
+/// disagreeing about whether that one reading was "still below" or
+/// "already recovered".
 pub fn check_hp_rollback(enemy: &EnemyState, cfg: &ResetConfig) -> bool {
     match (enemy.lowest_pct, enemy.pct()) {
         (Some(lowest), Some(current)) => {
-            lowest < cfg.hp_drop_below_pct && current >= cfg.hp_rollback_at_pct
+            lowest < cfg.hp_drop_below_pct && current > cfg.hp_rollback_at_pct
         }
         _ => false,
     }
@@ -315,31 +328,52 @@ mod tests {
     #[test]
     fn rollback_triggers_when_dropped_below_then_recovered_above() {
         let cfg = ResetConfig::default();
-        // lowest 55% (< 60), current 95% (>= 90) -> triggers.
-        let e = enemy(Some(55.0), 95, 100);
+        // lowest 65% (< 95), current 100% (> 95) -> triggers.
+        let e = enemy(Some(65.0), 100, 100);
         assert!(check_hp_rollback(&e, &cfg));
     }
 
     #[test]
     fn rollback_does_not_trigger_when_never_dropped_below_threshold() {
         let cfg = ResetConfig::default();
-        // lowest 70% never dipped below 60 -> no trigger even at 95%.
-        let e = enemy(Some(70.0), 95, 100);
+        // lowest 96% never dipped below 95 -> no trigger even back at 100%.
+        let e = enemy(Some(96.0), 100, 100);
+        assert!(!check_hp_rollback(&e, &cfg));
+    }
+
+    /// A boss idling at (or that has only ever been healed toward) its own
+    /// peak: `lowest_pct` never reads below the drop threshold, so the
+    /// first half of the check is false regardless of `current` — no
+    /// amount of time spent at full HP can look like a wipe.
+    #[test]
+    fn rollback_does_not_trigger_for_a_boss_idling_at_full_hp() {
+        let cfg = ResetConfig::default();
+        let e = enemy(Some(100.0), 100, 100);
         assert!(!check_hp_rollback(&e, &cfg));
     }
 
     #[test]
     fn rollback_does_not_trigger_when_current_below_recovery_threshold() {
         let cfg = ResetConfig::default();
-        // lowest 55% (< 60) but current only 80% (< 90) -> not recovered yet.
+        // lowest 55% (< 95) but current only 80% (< 95) -> not recovered yet.
         let e = enemy(Some(55.0), 80, 100);
+        assert!(!check_hp_rollback(&e, &cfg));
+    }
+
+    /// `current` landing exactly on the threshold does not count — the
+    /// comparison is strict `>`, precisely to keep this edge case out of
+    /// "recovered" (see the rationale on `check_hp_rollback`).
+    #[test]
+    fn rollback_does_not_trigger_when_current_exactly_at_the_threshold() {
+        let cfg = ResetConfig::default();
+        let e = enemy(Some(55.0), 95, 100);
         assert!(!check_hp_rollback(&e, &cfg));
     }
 
     #[test]
     fn rollback_false_when_lowest_pct_unknown() {
         let cfg = ResetConfig::default();
-        let e = enemy(None, 95, 100);
+        let e = enemy(None, 100, 100);
         assert!(!check_hp_rollback(&e, &cfg));
     }
 }

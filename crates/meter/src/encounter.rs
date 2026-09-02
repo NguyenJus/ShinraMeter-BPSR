@@ -5400,22 +5400,23 @@ mod tests {
         }
 
         #[test]
-        fn rollback_100_to_55_to_95_triggers_once() {
+        fn rollback_100_to_55_to_100_triggers_once() {
             let mut m = Meter::new();
             m.apply(&boss_hit(10, 0));
             assert_eq!(m.apply(&hp(10, 100, 100, 0)), None);
             assert_eq!(m.apply(&hp(10, 55, 100, 100)), None);
-            let r = m.apply(&hp(10, 95, 100, 200));
+            let r = m.apply(&hp(10, 100, 100, 200));
             assert_eq!(r, Some(ResetReason::BossHpRollback));
         }
 
         #[test]
-        fn rollback_100_to_70_to_95_never_triggers() {
+        fn rollback_100_to_96_to_100_never_triggers() {
             let mut m = Meter::new();
             m.apply(&boss_hit(10, 0));
             m.apply(&hp(10, 100, 100, 0));
-            m.apply(&hp(10, 70, 100, 100));
-            let r = m.apply(&hp(10, 95, 100, 200));
+            // 96% never dips below the 95% drop threshold.
+            m.apply(&hp(10, 96, 100, 100));
+            let r = m.apply(&hp(10, 100, 100, 200));
             assert_eq!(r, None);
         }
 
@@ -5425,12 +5426,12 @@ mod tests {
             m.apply(&boss_hit(10, 0));
             m.apply(&hp(10, 100, 100, 0));
             m.apply(&hp(10, 55, 100, 100));
-            let first = m.apply(&hp(10, 95, 100, 200));
+            let first = m.apply(&hp(10, 100, 100, 200));
             assert_eq!(first, Some(ResetReason::BossHpRollback));
 
             // 500ms later (< 2000ms cooldown): a second drop/recover must not fire.
             m.apply(&hp(10, 55, 100, 300));
-            let second = m.apply(&hp(10, 95, 100, 700));
+            let second = m.apply(&hp(10, 100, 100, 700));
             assert_eq!(second, None);
         }
 
@@ -5440,13 +5441,13 @@ mod tests {
             m.apply(&boss_hit(10, 0));
             m.apply(&hp(10, 100, 100, 0));
             m.apply(&hp(10, 55, 100, 100));
-            let first = m.apply(&hp(10, 95, 100, 200));
+            let first = m.apply(&hp(10, 100, 100, 200));
             assert_eq!(first, Some(ResetReason::BossHpRollback));
 
             // Within cooldown (last_reset_ms=200, cooldown=2000): the same
             // drop/recover shape is observed but suppressed.
             m.apply(&hp(10, 55, 100, 300));
-            let suppressed = m.apply(&hp(10, 95, 100, 700));
+            let suppressed = m.apply(&hp(10, 100, 100, 700));
             assert_eq!(suppressed, None);
 
             // Cooldown has now expired (2300 - 200 = 2100ms >= 2000ms). The
@@ -6311,7 +6312,7 @@ mod tests {
             m.apply(&boss_hit(10, 0, false));
             m.apply(&hp(10, 100, Some(103), 0));
             m.apply(&hp(10, 55, Some(103), 100));
-            let reason = m.apply(&hp(10, 95, Some(103), 200));
+            let reason = m.apply(&hp(10, 100, Some(103), 200));
             assert_eq!(reason, Some(ResetReason::BossHpRollback));
         }
 
