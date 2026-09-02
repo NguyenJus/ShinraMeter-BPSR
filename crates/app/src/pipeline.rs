@@ -479,8 +479,35 @@ fn run(
                          (the status banner explains why); nothing to restart"
                     ),
                 },
-                Ok(UiCommand::Quit) => break,
-                Err(_) => break,
+                // Issue #321: a fight already sitting in `FightState::Ended`
+                // at quit time would otherwise never reach history —
+                // `record_fight_end` only ever runs from the tick arm
+                // above, and quitting drops `tx_snapshot` (and with it the
+                // UI's only signal) the moment this loop exits, with no
+                // more ticks left to catch it. One last `publish` here
+                // flushes that final state — and its `record_fight_end`
+                // call — before the thread actually exits. Logged at INFO,
+                // not the ERROR `ui.rs::raise_pipeline_dead_status` used to
+                // log for every orderly quit (issue #321's false positive):
+                // this is the pipeline thread's own confirmation that the
+                // shutdown it is about to cause was requested, not a crash.
+                Ok(UiCommand::Quit) => {
+                    publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus);
+                    log::info!("quit requested; pipeline flushed its final snapshot and is shutting down");
+                    break;
+                }
+                // The overlay window closing without going through
+                // `UiCommand::Quit` first (or any other drop of the
+                // command channel) is an orderly shutdown too — see this
+                // function's own doc comment — so it gets the same final
+                // flush and the same INFO-level line.
+                Err(_) => {
+                    publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus);
+                    log::info!(
+                        "command channel disconnected; pipeline flushed its final snapshot and is shutting down"
+                    );
+                    break;
+                }
             },
             recv(ticker) -> _ => publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus),
         }
@@ -1252,6 +1279,53 @@ mod tests {
             let _ = std::fs::remove_file(&path);
 
             assert_eq!(count, 0);
+        }
+
+        /// Issue #321: `run`'s `UiCommand::Quit`/disconnect break arms both
+        /// call `publish` one last time before the thread exits, so a fight
+        /// already sitting in `FightState::Ended` at quit time still reaches
+        /// history — without it, that fight would simply never be recorded,
+        /// since `record_fight_end` otherwise only runs from the 100ms tick
+        /// arm and quitting drops the channel (and with it, any chance of
+        /// another tick) the moment the loop breaks. This drives `publish`
+        /// directly — the exact call the Quit/disconnect arms make — rather
+        /// than the real `spawn`-ed thread, so the test does not have to
+        /// race a live 100ms ticker to keep the periodic tick from
+        /// recording the fight first and masking a regression here.
+        #[test]
+        fn a_final_publish_at_quit_records_an_already_ended_fight() {
+            let path = temp_history_path("pipeline-quit-flush");
+            let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+            let mut pipeline = Pipeline::new().with_history(handle.clone());
+
+            let (state, _now) = ended_snapshot(&mut pipeline);
+            assert_eq!(
+                state,
+                meter::FightState::Ended,
+                "sanity: the scripted fight must already be Ended before the flush"
+            );
+
+            // Mirrors `spawn`'s own channel setup — a real `stale` clone of
+            // `tx_snapshot`'s receiver, exactly what `publish` needs for its
+            // drop-the-stale-and-retry fallback.
+            let (tx_snapshot, rx_snapshot) = bounded::<meter::Snapshot>(1);
+            let stale = rx_snapshot.clone();
+            let skill_focus: Vec<i64> = Vec::new();
+
+            // The call `Ok(UiCommand::Quit)` and `Err(_)` both make just
+            // before `break`.
+            publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus);
+
+            let count = row_count(&handle);
+            drop(handle);
+            drop(pipeline);
+            let _ = thread.join();
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(
+                count, 1,
+                "the final publish at quit must record the already-ended fight"
+            );
         }
 
         #[test]
