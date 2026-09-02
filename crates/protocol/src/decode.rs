@@ -309,6 +309,22 @@ fn on_aoi_sync_delta(
             } else {
                 dmg.value
             };
+            // A target's max HP can grow between the hit landing and this
+            // packet being built, making the server's own "new HP minus old
+            // HP" arithmetic underflow into a negative `value` (BPSR-ZDPS
+            // `MessageManager.cs` ~1372-1384). `hp_lessen_value` is computed
+            // independently and stays correct, so it takes over whenever it
+            // is usable; otherwise the hit reports no damage rather than a
+            // negative one.
+            let value = if value < 0 {
+                if dmg.hp_lessen_value > 0 {
+                    dmg.hp_lessen_value
+                } else {
+                    0
+                }
+            } else {
+                value
+            };
             out.push(ProtocolEvent::Damage(DamageEvent {
                 attacker_uid: uid_of(attacker_uuid),
                 attacker_kind: kind_of(attacker_uuid),
@@ -855,6 +871,72 @@ mod tests {
         let ev = only_damage(out);
         assert_eq!(ev.value, 250);
         assert!(ev.lucky);
+    }
+
+    /// A mid-frame max-HP increase can make the server's own `value` go
+    /// negative (BPSR-ZDPS `MessageManager.cs` ~1372-1384): the target's HP
+    /// pool grew between the hit landing and the packet being built, so the
+    /// naive "new HP minus old HP" the server computes underflows. When
+    /// that happens the *actual* HP the target lost, `hp_lessen_value`, is
+    /// still correct and takes over.
+    #[test]
+    fn negative_value_falls_back_to_a_positive_hp_lessen() {
+        let dmg = pb::SyncDamageInfo {
+            value: -500,
+            lucky_value: 0,
+            hp_lessen_value: 300,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(only_damage(out).value, 300);
+    }
+
+    /// If `hp_lessen_value` is *also* non-positive there is nothing
+    /// trustworthy to fall back to, so the hit reports zero damage rather
+    /// than propagating the negative (or another zero) value.
+    #[test]
+    fn negative_value_and_non_positive_hp_lessen_reports_zero() {
+        let dmg = pb::SyncDamageInfo {
+            value: -500,
+            lucky_value: 0,
+            hp_lessen_value: 0,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(only_damage(out).value, 0);
+
+        let dmg_negative_lessen = pb::SyncDamageInfo {
+            value: -500,
+            lucky_value: 0,
+            hp_lessen_value: -10,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg_negative_lessen);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(only_damage(out).value, 0);
+    }
+
+    /// A negative `lucky_value` is picked over `value` by the existing
+    /// preference rule (nonzero wins), so it must be guarded the same way.
+    #[test]
+    fn negative_lucky_value_falls_back_to_hp_lessen_too() {
+        let dmg = pb::SyncDamageInfo {
+            value: 100,
+            lucky_value: -500,
+            hp_lessen_value: 300,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        let ev = only_damage(out);
+        assert_eq!(ev.value, 300);
+        assert!(ev.lucky, "the lucky flag is still set on the raw field");
     }
 
     #[test]
