@@ -99,8 +99,11 @@ const DEFAULT_MAX_TOTAL_RING_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_TOTAL_BYTES_VAR: &str = "SHINRA_INSPECT_MAX_BYTES";
 
 /// [`DEFAULT_MAX_TOTAL_RING_BYTES`], or [`MAX_TOTAL_BYTES_VAR`]'s value if
-/// it parses as a positive integer.
-fn max_total_ring_bytes() -> u64 {
+/// it parses as a positive integer. `pub(crate)` (rather than private) so
+/// the session-bundle export (`crate::bundle`) can report the same budget a
+/// live session was actually running under, rather than re-guessing the
+/// default.
+pub(crate) fn max_total_ring_bytes() -> u64 {
     max_total_ring_bytes_from(std::env::var(MAX_TOTAL_BYTES_VAR).ok().as_deref())
 }
 
@@ -180,6 +183,15 @@ impl RecordSender {
         if self.tx.try_send(record).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// The drop count so far, safe to read from any clone at any time —
+    /// unlike `DumpWriter::shutdown`'s final tally, this doesn't need the
+    /// writer thread to have exited. Used by the session-bundle export
+    /// (`crate::inspect::dropped_count`) to report how incomplete an
+    /// in-progress dump might be without joining the writer thread first.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 

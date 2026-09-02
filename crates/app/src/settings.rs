@@ -762,8 +762,10 @@ impl Settings {
 }
 
 /// `%APPDATA%\ShinraMeter-BPSR\settings.json`, or `None` if `APPDATA` isn't set
-/// (e.g. running outside Windows).
-fn settings_path() -> Option<PathBuf> {
+/// (e.g. running outside Windows). `pub(crate)` (rather than private) so the
+/// session-bundle export (`crate::bundle`) can find the same file `load`/
+/// `save` use, rather than re-deriving the path.
+pub(crate) fn settings_path() -> Option<PathBuf> {
     let appdata = std::env::var("APPDATA").ok()?;
     Some(
         PathBuf::from(appdata)

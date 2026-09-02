@@ -2807,22 +2807,23 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Opens the native "Save As" common dialog so the user picks where the
-/// header dropdown's "Export logs" item (`ui::draw_header_menu`, issue
-/// #220) writes the bundled log file — issue #220 is explicit that this
-/// crate must never pick a fixed or hidden destination itself (logs may
-/// carry player names and other identifying traffic, per `logging`'s
-/// module doc comment, so silently dropping a file somewhere is worse than
-/// just not exporting). `default_filename` seeds the dialog's file name box
-/// (`logging::EXPORT_DEFAULT_FILENAME`); the user can still rename it
-/// before saving.
+/// Shared implementation behind [`choose_log_export_path`] and
+/// [`choose_bundle_export_path`]: both are "Save As"-style prompts for a
+/// destination the app will then write to (a single log file for the
+/// former, a whole directory for the latter — `GetSaveFileNameW` doesn't
+/// care which; it just hands back a path), differing only in title, filter
+/// text, whether the destination gets a default extension, and whether an
+/// existing-file overwrite prompt makes sense (it does for the log file;
+/// for a directory name it would only ever fire on an unrelated same-named
+/// *file*, which is confusing rather than useful, so the bundle export
+/// leaves it off).
 ///
 /// `GetSaveFileNameW` (the classic common dialog), not `IFileSaveDialog`
 /// (the modern COM one): this crate has no COM initialization anywhere
 /// today, and the COM dialog needs one (`CoInitializeEx`) plus a new
 /// `Win32_System_Com` feature — for a plain "pick a file to save" prompt
 /// with none of `IFileSaveDialog`'s extras (custom places, multiple
-/// simultaneous filters) actually needed here.
+/// simultaneous filters, or `FOS_PICKFOLDERS`) actually needed here.
 ///
 /// Synchronous and blocking, deliberately unlike `http_get`'s "always call
 /// from a spawned thread" rule: `GetSaveFileNameW` is itself a modal
@@ -2831,10 +2832,11 @@ fn wide(s: &str) -> Vec<u16> {
 /// blocking that wasn't already going to happen.
 ///
 /// That reasoning covers this dialog and nothing after it (PR #227
-/// review): the export's own copy can move up to two files of
-/// `logging::MAX_LOG_BYTES` each, which the OS is *not* already blocking
-/// the frame thread on, so `ui::start_log_export` runs it on a spawned
-/// thread once this function has returned a destination.
+/// review): both callers' own copy work — up to two files of
+/// `logging::MAX_LOG_BYTES` for "Export logs", a whole session bundle for
+/// "Export session bundle" — is *not* already blocking the frame thread,
+/// so each caller runs its copy on its own spawned thread once this
+/// function has returned a destination.
 ///
 /// Owned by the cached `OVERLAY_HWND` when it's available (same
 /// load-and-guard shape as `force_frame_recompute`) so the dialog is modal
@@ -2842,10 +2844,16 @@ fn wide(s: &str) -> Vec<u16> {
 /// yet rather than failing outright.
 ///
 /// Returns `None` if the user cancels, closes the dialog, or the call
-/// otherwise fails (e.g. `CommDlgExtendedError`-reported failure) — the
-/// caller treats every one of those the same: do nothing.
+/// otherwise fails (e.g. `CommDlgExtendedError`-reported failure) — both
+/// callers treat every one of those the same: do nothing.
 #[cfg(windows)]
-pub fn choose_log_export_path(default_filename: &str) -> Option<std::path::PathBuf> {
+fn save_as_dialog(
+    default_name: &str,
+    title: &str,
+    filter: &str,
+    def_ext: Option<&str>,
+    overwrite_prompt: bool,
+) -> Option<std::path::PathBuf> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Controls::Dialogs::{
         GetSaveFileNameW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
@@ -2868,22 +2876,29 @@ pub fn choose_log_export_path(default_filename: &str) -> Option<std::path::PathB
     // the documented practical ceiling for this API's buffer (the NTFS
     // long-path limit), so it comfortably fits any real save location.
     let mut file_buf = vec![0u16; 32767];
-    let default_wide = wide(default_filename);
+    let default_wide = wide(default_name);
     file_buf[..default_wide.len()].copy_from_slice(&default_wide);
 
-    let filter = wide("Log files\0*.log\0All files\0*.*\0");
-    let title = wide("Export ShinraMeter-BPSR logs");
-    let def_ext = wide("log");
+    let filter_wide = wide(filter);
+    let title_wide = wide(title);
+    let def_ext_wide = def_ext.map(wide);
 
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: owner,
-        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFilter: PCWSTR(filter_wide.as_ptr()),
         lpstrFile: PWSTR(file_buf.as_mut_ptr()),
         nMaxFile: file_buf.len() as u32,
-        lpstrTitle: PCWSTR(title.as_ptr()),
-        lpstrDefExt: PCWSTR(def_ext.as_ptr()),
-        Flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST,
+        lpstrTitle: PCWSTR(title_wide.as_ptr()),
+        lpstrDefExt: match &def_ext_wide {
+            Some(w) => PCWSTR(w.as_ptr()),
+            None => PCWSTR(std::ptr::null()),
+        },
+        Flags: if overwrite_prompt {
+            OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST
+        } else {
+            OFN_PATHMUSTEXIST
+        },
         ..Default::default()
     };
 
@@ -2908,12 +2923,56 @@ pub fn choose_log_export_path(default_filename: &str) -> Option<std::path::PathB
     )))
 }
 
-/// Non-Windows stub — see `choose_log_export_path`'s doc comment. Dev/CI
-/// hosts for this crate are Linux, so there is no native save dialog to
-/// call; `ui.rs`'s click handler treats `None` as "the user didn't pick a
+/// Opens the native "Save As" common dialog so the user picks where the
+/// header dropdown's "Export logs" item (`ui::draw_header_menu`, issue
+/// #220) writes the bundled log file — issue #220 is explicit that this
+/// crate must never pick a fixed or hidden destination itself (logs may
+/// carry player names and other identifying traffic, per `logging`'s
+/// module doc comment, so silently dropping a file somewhere is worse than
+/// just not exporting). `default_filename` seeds the dialog's file name box
+/// (`logging::EXPORT_DEFAULT_FILENAME`); the user can still rename it
+/// before saving. See [`save_as_dialog`] for the rest of the reasoning.
+#[cfg(windows)]
+pub fn choose_log_export_path(default_filename: &str) -> Option<std::path::PathBuf> {
+    save_as_dialog(
+        default_filename,
+        "Export ShinraMeter-BPSR logs",
+        "Log files\0*.log\0All files\0*.*\0",
+        Some("log"),
+        true,
+    )
+}
+
+/// Non-Windows stub — see [`save_as_dialog`]'s doc comment. Dev/CI hosts
+/// for this crate are Linux, so there is no native save dialog to call;
+/// `ui.rs`'s click handler treats `None` as "the user didn't pick a
 /// destination" either way, which is also the correct behavior here.
 #[cfg(not(windows))]
 pub fn choose_log_export_path(_default_filename: &str) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Same dialog as [`choose_log_export_path`], for the header dropdown's
+/// "Export session bundle" item (`ui::draw_header_menu`, `crate::bundle`):
+/// picks where the bundle *directory* gets created. `default_dirname`
+/// seeds the dialog's name box (`bundle::EXPORT_BUNDLE_DEFAULT_DIRNAME`);
+/// the user can still rename it before saving. No default extension (a
+/// directory has none) and no overwrite prompt — see [`save_as_dialog`]'s
+/// doc comment for why the latter would be actively confusing here.
+#[cfg(windows)]
+pub fn choose_bundle_export_path(default_dirname: &str) -> Option<std::path::PathBuf> {
+    save_as_dialog(
+        default_dirname,
+        "Export ShinraMeter-BPSR session bundle (choose a folder name and location)",
+        "All files\0*.*\0",
+        None,
+        false,
+    )
+}
+
+/// Non-Windows stub — see [`choose_log_export_path`]'s identical stub.
+#[cfg(not(windows))]
+pub fn choose_bundle_export_path(_default_dirname: &str) -> Option<std::path::PathBuf> {
     None
 }
 
