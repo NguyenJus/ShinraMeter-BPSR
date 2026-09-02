@@ -690,6 +690,65 @@ impl Meter {
         }
     }
 
+    /// Whether `timestamp_ms` falls inside the post-end grace window
+    /// (`FightConfig::post_end_grace_ms`) trailing the currently-held
+    /// fight's end.
+    ///
+    /// `false` while a fight is still running (`fight_end_ms` is `None`) —
+    /// grace only ever widens what an *ended* fight accepts, it is not a
+    /// second way to end one. A timestamp at or before `fight_end_ms`
+    /// itself counts too (`saturating_sub` floors at 0): a delayed-arrival
+    /// packet stamped a moment before the fight actually ended is exactly
+    /// the case this exists for, not an edge case to exclude.
+    ///
+    /// Only the timestamp half of the grace test: safe as-is for
+    /// `apply_cast`/`apply_buff_apply`/`apply_buff_remove`, none of which
+    /// can trigger the `NewFight` reset regardless of what they target (a
+    /// cast/buff event carries no monster target at all). `apply_damage`
+    /// needs the stronger, target-aware [`Self::damage_in_post_end_grace`]
+    /// instead — see its doc comment for why.
+    fn in_post_end_grace_window(&self, timestamp_ms: u64) -> bool {
+        self.fight_end_ms.is_some_and(|end_ms| {
+            timestamp_ms.saturating_sub(end_ms) <= self.fight_cfg.post_end_grace_ms
+        })
+    }
+
+    /// Whether `d` is a trailing packet of the fight that just ended,
+    /// rather than the first sign of a new one — the question
+    /// `apply_damage` needs answered both to decide whether the `NewFight`
+    /// reset may fire and, if the event is withheld some other way, whether
+    /// it should still be folded into the ended fight's stats
+    /// (`apply_damage_grace`).
+    ///
+    /// A heal, or any event a monster attacker deals, can never single-
+    /// handedly trigger that reset in the first place (see `apply_damage`'s
+    /// gate: `d.attacker_kind == EntityKind::Player && !d.is_heal`), so
+    /// grace for those needs only the timestamp check.
+    ///
+    /// A real (non-heal) player hit is different: on its own it is exactly
+    /// the signal issue #78's `NewFight` reset exists to catch, and a
+    /// timestamp alone cannot tell "the last DoT tick of the boss that just
+    /// died" from "the opening hit of an unrelated add, or the next pull,
+    /// that merely happens to land inside the window" — both PR #144's
+    /// straggling-add case and the reference implementation's own scope
+    /// (trailing packets of *this* encounter) are about the former, not the
+    /// latter. So this additionally requires the target to be an enemy this
+    /// fight had already damaged (`EnemyState::took_damage`) before it
+    /// ended: true of the boss the party was just hitting, false of an add,
+    /// the next dungeon's first pull, or a post-`ServerChanged` reconnect's
+    /// first swing on a uid this session has never named.
+    fn damage_in_post_end_grace(&self, d: &DamageEvent) -> bool {
+        if !self.in_post_end_grace_window(d.timestamp_ms) {
+            return false;
+        }
+        if d.attacker_kind != EntityKind::Player || d.is_heal {
+            return true;
+        }
+        self.enemies
+            .get(&d.target_uid)
+            .is_some_and(|e| e.took_damage)
+    }
+
     /// Whether the party is mid-pull on a boss that simply is not being hit
     /// right now (issue #151): *any* recognized boss
     /// (`tables::is_boss_monster`) that has taken damage this fight and is
@@ -1426,22 +1485,46 @@ impl Meter {
         // phase-resume window carves out of that rule (issue #124): while a
         // phase change is pending, a hit that is *not* positive evidence of
         // a different fight decides nothing.
+        //
+        // ...and `damage_in_post_end_grace`, a third, narrower exception: a
+        // hit landing inside `FightConfig::post_end_grace_ms` of the end,
+        // on a target this fight had already damaged, is not withheld
+        // pending some other signal, like the two above — it is simply too
+        // soon after the end, and on a target too well established as this
+        // fight's own, to be evidence of a *new* fight rather than the tail
+        // of the one that just finished (the reference implementation's
+        // rationale; see `FightConfig::post_end_grace_ms`). Must not
+        // re-open or extend the held fight either, so this sits in the same
+        // guard as the withholds, not as a fallback after it.
         let mut reason = None;
         if self.fight_end_ms.is_some()
             && d.attacker_kind == EntityKind::Player
             && !d.is_heal
             && !self.withholds_new_fight(d)
             && !self.withholds_after_wipe(d)
+            && !self.damage_in_post_end_grace(d)
         {
             self.reset(ResetReason::NewFight, d.timestamp_ms);
             reason = Some(ResetReason::NewFight);
         }
 
         // Still held (the reset above clears `fight_end_ms`, so this can only
-        // be the "combat the user isn't part of" case): the displayed fight
-        // is frozen, so nothing this event carries — not damage, not deaths,
-        // not the event clock — may touch it.
+        // be the "combat the user isn't part of", withheld, or post-end
+        // grace case): the displayed fight stays frozen — `fight_end_ms`,
+        // the elapsed timer and `FightState::Ended` are all left exactly as
+        // they are — but a grace-window event still gets folded into the
+        // ended fight's *stats* rather than being dropped outright (issue
+        // #post-end-grace; see `FightConfig::post_end_grace_ms`).
+        // `apply_damage_grace` is deliberately narrower than the rest of
+        // this function: it skips the enemy/boss/wipe bookkeeping below so
+        // a grace-window event can never change what a later, genuinely new
+        // hit's `resumes_held_fight`/`withholds_after_wipe` checks see —
+        // those must keep reading exactly the inputs they did before this
+        // window existed.
         if self.fight_end_ms.is_some() {
+            if self.damage_in_post_end_grace(d) {
+                return self.apply_damage_grace(d);
+            }
             return None;
         }
 
@@ -1597,6 +1680,56 @@ impl Meter {
             self.fight_start_ms = Some(d.timestamp_ms);
         }
 
+        self.accumulate_damage_stats(d);
+
+        reason
+    }
+
+    /// The narrow, stats-only path a player's damage/heal event takes when
+    /// it lands inside the post-end grace window of an already-ended fight
+    /// (`FightConfig::post_end_grace_ms`; see `apply_damage`'s "still held"
+    /// branch, which is this method's only caller, and
+    /// `Self::damage_in_post_end_grace` for what already screened `d` in —
+    /// a heal, a monster's own damage, or a player's real hit on a target
+    /// this fight had already engaged, never an unrelated add or the next
+    /// pull's opener).
+    ///
+    /// Deliberately does far less than the live path above:
+    ///
+    /// * `record_breakdowns` and (for a non-heal hit) the same total/hit/
+    ///   crit/lucky accumulation `apply_damage` itself does — the whole
+    ///   point of the grace window, so a straggling DoT tick or a killing-
+    ///   blow retransmit still counts.
+    /// * Nothing else. `last_event_ms`, `fight_start_ms` and `fight_end_ms`
+    ///   are all untouched, so the frozen elapsed timer and the DPS
+    ///   denominator (`snapshot`'s `dps_duration_ms`, which reads
+    ///   `last_event_ms`) can never move because of a grace-window event.
+    ///   And the enemy/boss bookkeeping (`took_damage`, `recompute_boss`,
+    ///   `end_fight_on_boss_death`, the wipe latch) is skipped outright:
+    ///   `end_fight_on_boss_death` already no-ops once `fight_end_ms` is
+    ///   `Some`, but the wipe latch's `self.wipe_hold = true` does not, and
+    ///   letting a grace-window player death set it would change what
+    ///   `withholds_after_wipe` sees on the *next* genuinely new fight —
+    ///   exactly the "same inputs" invariant this window must not disturb.
+    fn apply_damage_grace(&mut self, d: &DamageEvent) -> Option<ResetReason> {
+        self.record_breakdowns(d);
+        // Same gate `apply_damage` reaches this accumulation through: only
+        // a player's own non-heal damage feeds player/skill totals. Without
+        // it a monster's swing landing in the grace window (attacker_kind
+        // `Monster`) would open a row keyed on the monster's uid.
+        if !d.is_heal && d.attacker_kind == EntityKind::Player {
+            self.accumulate_damage_stats(d);
+        }
+        None
+    }
+
+    /// The per-player/per-skill hit, total-damage, crit and lucky
+    /// accumulation shared by the live path in `apply_damage` and the
+    /// post-end grace path in `apply_damage_grace`. Callers are responsible
+    /// for everything this does *not* do: starting the fight clock, gating
+    /// on `attacker_kind`/`is_heal`, and touching `last_event_ms` — none of
+    /// which the grace path may do (see its doc comment).
+    fn accumulate_damage_stats(&mut self, d: &DamageEvent) {
         let cached = self.name_lookup(d.attacker_uid);
         let stats = self
             .players
@@ -1640,8 +1773,6 @@ impl Meter {
                 skill.lucky_damage += d.value;
             }
         }
-
-        reason
     }
 
     /// Latches the fight end at `now_ms` if `uid` is a *recognized* boss
@@ -2333,9 +2464,13 @@ impl Meter {
     /// stranger casting past the player must not open a row in a fight
     /// they are no part of, and a cast carries no damage to justify one.
     /// A cast that arrives while a finished fight is held on screen is
-    /// dropped, for the same reason every other event is.
+    /// dropped, unless it lands inside `FightConfig::post_end_grace_ms` of
+    /// the end — the same grace window `apply_damage_grace` applies to
+    /// damage/heal events, for the same reason: a cast packet decoded from
+    /// the tail of the kill is not evidence of anything but that stream of
+    /// packets still being in flight.
     fn apply_cast(&mut self, c: &CastEvent) {
-        if self.fight_end_ms.is_some() {
+        if self.fight_end_ms.is_some() && !self.in_post_end_grace_window(c.timestamp_ms) {
             return;
         }
         if let Some(stats) = self.players.get_mut(&c.caster_uid) {
@@ -2363,7 +2498,11 @@ impl Meter {
         adds_layer: bool,
         timestamp_ms: u64,
     ) {
-        if self.fight_end_ms.is_some() {
+        // Grace window (`FightConfig::post_end_grace_ms`): a buff applied
+        // in the last moments before a kill can decode after `fight_end_ms`
+        // latches, same as a trailing damage packet — see
+        // `apply_damage_grace`'s doc comment.
+        if self.fight_end_ms.is_some() && !self.in_post_end_grace_window(timestamp_ms) {
             return;
         }
         let Some(stats) = self.players.get_mut(&host_uid) else {
@@ -2410,7 +2549,12 @@ impl Meter {
         removes_layer: bool,
         timestamp_ms: u64,
     ) {
-        if self.fight_end_ms.is_some() {
+        // Grace window: a buff's closing `Remove`/`RemoveLayer` is exactly
+        // the "buff closes" case `FightConfig::post_end_grace_ms` exists
+        // for — without this, a buff still open when the fight ended would
+        // never get the chance to credit its last stretch of uptime. See
+        // `apply_damage_grace`'s doc comment.
+        if self.fight_end_ms.is_some() && !self.in_post_end_grace_window(timestamp_ms) {
             return;
         }
         let Some(stats) = self.players.get_mut(&host_uid) else {
@@ -6474,11 +6618,13 @@ mod tests {
             m.apply(&boss_hit(10, 1_000, true));
             assert_eq!(m.fight_state(1_100), FightState::Ended);
 
-            // Next pull, only two seconds later — well inside the idle
-            // window, but the fight already ended, so this starts a new one.
-            let reason = m.apply(&dmg(1, 700, 3_000));
+            // Next pull, only a few seconds later — well inside the idle
+            // window, but past `FightConfig::post_end_grace_ms` (so this is
+            // a genuinely new pull, not a grace-window straggler) and the
+            // fight already ended, so this starts a new one.
+            let reason = m.apply(&dmg(1, 700, 3_500));
             assert_eq!(reason, Some(ResetReason::NewFight));
-            assert_eq!(m.snapshot(4_000).total_damage, 700);
+            assert_eq!(m.snapshot(4_500).total_damage, 700);
         }
 
         #[test]
@@ -6718,6 +6864,183 @@ mod tests {
                 (m.snapshot(6_000).total_dps - before).abs() < 0.001,
                 "a monster's swing must not dilute DPS with idle time"
             );
+        }
+
+        /// `FightConfig::post_end_grace_ms`: trailing packets (a DoT tick,
+        /// a killing-blow retransmit, a buff close) that land just after a
+        /// fight ends still count against it, without reopening or
+        /// extending it — see `Meter::apply_damage_grace`.
+        mod grace_window {
+            use super::*;
+
+            fn grace() -> u64 {
+                FightConfig::default().post_end_grace_ms
+            }
+
+            /// A player's real (non-heal) hit on a *monster* target,
+            /// distinct from the top-level `dmg` helper (which leaves
+            /// `target_kind` at its `Unknown` default): `damage_in_post_
+            /// end_grace` requires an already-`took_damage` monster target
+            /// to tell a trailing DoT tick from an unrelated new pull (PR
+            /// #144's straggling-add contract, which grace must not
+            /// re-break), so these tests need a real one.
+            fn monster_hit(
+                attacker_uid: i64,
+                target_uid: i64,
+                value: i64,
+                ts: u64,
+            ) -> ProtocolEvent {
+                ProtocolEvent::Damage(DamageEvent {
+                    attacker_uid,
+                    attacker_kind: EntityKind::Player,
+                    target_uid,
+                    target_kind: EntityKind::Monster,
+                    value,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                })
+            }
+
+            #[test]
+            fn a_dot_tick_inside_the_grace_window_is_counted() {
+                let mut m = Meter::new();
+                m.apply(&monster_hit(1, 10, 100, 1_000));
+                assert_eq!(m.tick(1_000 + idle()), FightState::Ended);
+                assert_eq!(m.fight_end_ms(), Some(1_000));
+
+                // A DoT tick 500ms after the latched end, on the same
+                // already-engaged target, well inside the 2s grace window.
+                let reason = m.apply(&monster_hit(1, 10, 50, 1_000 + 500));
+
+                assert_eq!(reason, None, "a grace-window hit must not reset the fight");
+                assert_eq!(m.snapshot(1_000 + idle() + 1_000).total_damage, 150);
+                assert_eq!(
+                    m.fight_end_ms(),
+                    Some(1_000),
+                    "fight_end_ms must not move for a grace-window hit"
+                );
+                assert_eq!(m.fight_state(1_000 + idle() + 1_000), FightState::Ended);
+            }
+
+            #[test]
+            fn a_hit_past_the_grace_window_still_starts_a_new_fight() {
+                let mut m = Meter::new();
+                m.apply(&dmg(1, 100, 1_000));
+                assert_eq!(m.tick(1_000 + idle()), FightState::Ended);
+                assert!(grace() < 3_000, "test assumes the 2s default grace");
+
+                // A hit 3s after the end: outside the grace window, so the
+                // pre-existing `NewFight` path applies unchanged.
+                let reason = m.apply(&dmg(1, 50, 1_000 + 3_000));
+
+                assert_eq!(reason, Some(ResetReason::NewFight));
+                assert_eq!(m.fight_end_ms(), None);
+                let snap = m.snapshot(1_000 + 3_000 + 1_000);
+                assert_eq!(
+                    snap.total_damage, 50,
+                    "the old fight's damage must be gone, not added to"
+                );
+            }
+
+            #[test]
+            fn a_grace_window_hit_does_not_move_the_dps_denominator() {
+                let mut m = Meter::new();
+                m.apply(&monster_hit(1, 10, 5_000, 0));
+                m.apply(&monster_hit(1, 10, 5_000, 5_000));
+                m.tick(5_000 + idle());
+                let before = m.snapshot(5_000 + idle());
+                // The dps window (`snapshot`'s `dps_duration_ms`, seconds)
+                // backed out of the pre-grace snapshot, so the assertion
+                // below never has to reach into private state to pin it.
+                let dps_duration_secs = before.total_damage as f64 / before.total_dps;
+
+                m.apply(&monster_hit(1, 10, 1_000, 5_000 + 500));
+
+                let after = m.snapshot(5_000 + idle());
+                assert_eq!(
+                    after.total_damage, 11_000,
+                    "the grace-window hit must still count toward totals"
+                );
+                let expected_dps = after.total_damage as f64 / dps_duration_secs;
+                assert!(
+                    (after.total_dps - expected_dps).abs() < 0.01,
+                    "the dps denominator (elapsed) must not move: got {}, expected {}",
+                    after.total_dps,
+                    expected_dps
+                );
+            }
+
+            #[test]
+            fn a_grace_window_hit_never_updates_the_player_alive_or_wipe_state() {
+                // Belt-and-suspenders for `apply_damage_grace`'s doc
+                // comment: a grace-window player death must not arm
+                // `wipe_hold`, which would change what a later, genuinely
+                // new fight's `withholds_after_wipe` sees.
+                let mut m = Meter::new();
+                m.apply(&dmg(1, 100, 1_000));
+                m.tick(1_000 + idle());
+
+                m.apply(&ProtocolEvent::Damage(DamageEvent {
+                    attacker_uid: 2,
+                    attacker_kind: EntityKind::Monster,
+                    target_uid: 1,
+                    target_kind: EntityKind::Player,
+                    value: 9_999,
+                    is_dead: true,
+                    timestamp_ms: 1_000 + 500,
+                    ..Default::default()
+                }));
+
+                // A hit well past the grace window resumes as an ordinary
+                // `NewFight`, exactly as it would have with no wipe hold at
+                // all — proving the grace-window death above did not latch
+                // one.
+                let reason = m.apply(&dmg(1, 10, 1_000 + 3_000));
+                assert_eq!(reason, Some(ResetReason::NewFight));
+            }
+
+            #[test]
+            fn a_cast_inside_the_grace_window_is_still_counted() {
+                let mut m = Meter::new();
+                m.apply(&dmg(1, 100, 1_000));
+                m.tick(1_000 + idle());
+
+                m.apply(&ProtocolEvent::Cast(CastEvent {
+                    caster_uid: 1,
+                    skill_id: 1550,
+                    timestamp_ms: 1_000 + 500,
+                }));
+
+                let snap = m.snapshot(1_000 + idle() + 1_000);
+                assert_eq!(snap.rows[0].casts[0].hits, 1);
+                assert_eq!(m.fight_end_ms(), Some(1_000));
+            }
+
+            #[test]
+            fn a_buff_close_inside_the_grace_window_credits_its_uptime() {
+                let mut m = Meter::new();
+                m.apply(&dmg(1, 100, 1_000));
+                m.apply(&ProtocolEvent::BuffApply {
+                    host_uid: 1,
+                    buff_uuid: 417,
+                    base_id: Some(3_210_031),
+                    adds_layer: false,
+                    timestamp_ms: 1_000,
+                });
+                m.tick(1_000 + idle());
+
+                // The buff closes 500ms into the grace window.
+                m.apply(&ProtocolEvent::BuffRemove {
+                    host_uid: 1,
+                    buff_uuid: 417,
+                    removes_layer: false,
+                    timestamp_ms: 1_000 + 500,
+                });
+
+                let snap = m.snapshot(1_000 + idle() + 1_000);
+                assert_eq!(snap.rows[0].buffs[0].damage, 500);
+                assert_eq!(m.fight_end_ms(), Some(1_000));
+            }
         }
     }
 

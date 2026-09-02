@@ -65,6 +65,17 @@ fn load_one(history: &HistoryHandle, id: i64) -> EncounterRecord {
 /// A two-player boss pull that ends on a boss kill: hit, hit, a killing hit,
 /// then a tick to observe the `Active -> Ended` edge and record it.
 /// Duration is 6s (2_000 -> 8_000), clear of the default 5s floor.
+///
+/// The tick lands at `kill + 2_500`, not right after the kill: issue
+/// #post-end-grace's `Pipeline::record_fight_end` no longer sends to
+/// history on the very first `Ended` tick, only once
+/// `FightConfig::post_end_grace_ms` (2_000ms by default) has fully elapsed
+/// past the kill — a tick inside that window would build the record but
+/// leave it queued (`Pipeline::pending_fight_end`), unsent until some later
+/// tick flushes it. `ended_at_ms` and every recorded stat are still pinned
+/// to the kill itself (`fight_end_ms`, frozen the instant the boss died),
+/// so moving this later changes nothing about what gets recorded — only
+/// when.
 fn boss_kill_scenario(name: &'static str) -> Scenario {
     Scenario::new(name)
         .at(1_000)
@@ -76,7 +87,7 @@ fn boss_kill_scenario(name: &'static str) -> Scenario {
         .hit(P_ARIA, M_BOSS, 101, 400_000)
         .at(8_000)
         .hits(M_BOSS, vec![Hit::new(P_BRIN, 202, 600_000).kill()])
-        .at(8_500)
+        .at(10_500)
         .tick()
 }
 
@@ -90,6 +101,10 @@ fn boss_kill_scenario(name: &'static str) -> Scenario {
 /// tick would still read `true` and swallow the second recording. Real
 /// production ticks every publish interval, so this interleaving always
 /// happens there; the harness has to script it explicitly.
+///
+/// Like `boss_kill_scenario`, the final tick lands at `kill + 2_500` so it
+/// lands past the post-end grace window and the second fight's record
+/// actually gets sent rather than left queued.
 fn two_fights_scenario(name: &'static str) -> Scenario {
     boss_kill_scenario(name)
         .at(20_000)
@@ -100,7 +115,7 @@ fn two_fights_scenario(name: &'static str) -> Scenario {
         .tick()
         .at(27_000)
         .hits(M_BOSS_2, vec![Hit::new(P_ARIA, 101, 700_000).kill()])
-        .at(27_500)
+        .at(29_500)
         .tick()
 }
 
@@ -269,7 +284,9 @@ fn the_recorded_rows_match_the_live_snapshot() {
         .hit(P_BRIN, M_BOSS, 202, 200_000)
         .at(9_000)
         .hits(M_BOSS, vec![Hit::new(P_ARIA, 101, 500_000).kill()])
-        .at(9_500)
+        // kill + 2_500, past the post-end grace window — see
+        // `boss_kill_scenario`'s doc comment.
+        .at(11_500)
         .tick();
 
     let (mut rig, history_thread) =

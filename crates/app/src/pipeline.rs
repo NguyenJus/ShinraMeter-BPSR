@@ -226,6 +226,23 @@ pub struct Pipeline {
     /// (`crates/meter/src/encounter.rs`) — a nine-second post-fight freeze
     /// produces ~90 consecutive `Ended` ticks and must produce one row.
     fight_end_recorded: bool,
+    /// The record `record_fight_end` would send to history *right now*,
+    /// rebuilt on every `Ended` tick while `Meter::fight_config`'s
+    /// `post_end_grace_ms` window is still open on the current fight (issue
+    /// #post-end-grace).
+    ///
+    /// Needed because the meter keeps folding trailing packets into an
+    /// ended fight's stats for that whole window
+    /// (`bpsr_meter::encounter::Meter::apply_damage_grace`), but the very
+    /// first `Ended` tick used to record history immediately — racing every
+    /// one of them. Delaying the actual send until the window closes fixes
+    /// that; caching the latest built record here (rather than just
+    /// delaying the whole build) is what lets a hold that ends *early* —
+    /// a scene change or manual reset landing inside the window, before it
+    /// would otherwise have closed — still flush whatever grace-window
+    /// stats it picked up instead of losing the encounter outright. `None`
+    /// once flushed (or if the fight has no history to build at all).
+    pending_fight_end: Option<history::EncounterRecord>,
 }
 
 impl Pipeline {
@@ -235,6 +252,7 @@ impl Pipeline {
             cache_writer: None,
             history: None,
             fight_end_recorded: false,
+            pending_fight_end: None,
         }
     }
 
@@ -250,6 +268,7 @@ impl Pipeline {
             cache_writer: Some(CacheWriter::spawn(path)),
             history: None,
             fight_end_recorded: false,
+            pending_fight_end: None,
         }
     }
 
@@ -342,29 +361,64 @@ impl Pipeline {
     /// the live publish loop's own snapshot may have skipped the
     /// heals/dealt/received/casts breakdown for players with no skill
     /// window open, and a saved history record must never carry that gap.
-    /// This only runs the extra `Meter::snapshot` once per fight — the
-    /// `fight_end_recorded` latch just above turns every other tick's call
-    /// into an early return before reaching it.
+    ///
+    /// Issue #post-end-grace: does **not** send to history on the first
+    /// `Ended` tick any more. `Meter::apply` keeps folding trailing packets
+    /// into an ended fight's stats for
+    /// `Meter::fight_config().post_end_grace_ms` after `fight_end_ms` — if
+    /// this sent immediately, the saved row would race that window and
+    /// routinely miss the tail of the fight it is supposed to capture (the
+    /// very packets the grace window exists to keep). So the record is
+    /// rebuilt on every `Ended` tick, and only actually sent once the
+    /// window has closed — via `flush_pending_fight_end`, which the `state
+    /// != Ended` branch below also calls, so a hold that ends *early* (a
+    /// scene change or manual reset landing inside the window) still gets
+    /// whatever grace-window stats it picked up recorded, rather than
+    /// silently dropped. Chosen over re-recording an already-sent row
+    /// (`crates/app/src/history` has no update-by-id request, only
+    /// `Record`/`Delete`/`Clear`) as the simpler of the two options the
+    /// grace window's design left open.
+    ///
+    /// Rebuilding the record every tick the window is open costs a handful
+    /// of extra snapshot builds per fight (the window is a couple of
+    /// seconds at 10 ticks/second) — negligible next to `snapshot`'s
+    /// existing ~10Hz publish cost, and this only runs the extra
+    /// `Meter::snapshot` at all while a fight is actually held — the
+    /// `fight_end_recorded` latch turns every tick after the flush into an
+    /// early return before reaching it.
     pub fn record_fight_end(&mut self, state: meter::FightState, now_ms: u64) {
         if state != meter::FightState::Ended {
+            self.flush_pending_fight_end();
             self.fight_end_recorded = false;
             return;
         }
         if self.fight_end_recorded {
             return;
         }
-        self.fight_end_recorded = true;
-        let Some(history) = &self.history else {
-            return;
-        };
         let Some(ended_at_ms) = self.meter.fight_end_ms() else {
             return;
         };
         let snapshot = self.meter.snapshot(now_ms);
         let title = encounter_title(&snapshot.encounter);
         let subtitle = encounter_subtitle(&snapshot.encounter);
-        if let Some(record) = history::record_from_snapshot(&snapshot, ended_at_ms, title, subtitle)
-        {
+        self.pending_fight_end =
+            history::record_from_snapshot(&snapshot, ended_at_ms, title, subtitle);
+        let grace_ms = self.meter.fight_config().post_end_grace_ms;
+        if now_ms.saturating_sub(ended_at_ms) < grace_ms {
+            return;
+        }
+        self.fight_end_recorded = true;
+        self.flush_pending_fight_end();
+    }
+
+    /// Sends `pending_fight_end` to history, if there is one queued and it
+    /// has not already gone out. See `record_fight_end`'s doc comment for
+    /// why the send is decoupled from the build.
+    fn flush_pending_fight_end(&mut self) {
+        let Some(record) = self.pending_fight_end.take() else {
+            return;
+        };
+        if let Some(history) = &self.history {
             history.record(record);
         }
     }
@@ -1206,6 +1260,48 @@ mod tests {
             pipeline.record_fight_end(state, now);
             pipeline.record_fight_end(state, now);
             pipeline.record_fight_end(state, now);
+
+            let count = row_count(&handle);
+            drop(handle);
+            drop(pipeline);
+            let _ = thread.join();
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(count, 1);
+        }
+
+        /// Issue #post-end-grace: `record_fight_end` must not send to
+        /// history until `Meter::fight_config`'s `post_end_grace_ms` has
+        /// fully elapsed past the fight's end — otherwise the saved row
+        /// races the meter's own grace window (`Meter::apply_damage_grace`)
+        /// and misses whatever trailing packets that window was built to
+        /// keep. A small idle timeout (well under the 2s default grace) is
+        /// used here so the fight can be observed `Ended` long before grace
+        /// closes, which `ended_snapshot`'s stock 9s idle timeout cannot
+        /// do (9s already exceeds the 2s grace by the time `tick` ever
+        /// sees `Ended` at all).
+        #[test]
+        fn recording_waits_for_the_grace_window_to_close() {
+            let path = temp_history_path("pipeline-grace-delay");
+            let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+            let mut pipeline = Pipeline::new().with_history(handle.clone());
+            pipeline.meter.set_fight_config(meter::FightConfig {
+                idle_timeout_ms: 50,
+                ..meter::FightConfig::default()
+            });
+            let grace = pipeline.meter.fight_config().post_end_grace_ms;
+
+            pipeline.step(proto::ProtocolEvent::Damage(damage(1, 100, 1_000)), 1_000);
+            let state = pipeline.tick(1_000 + 50);
+            assert_eq!(state, meter::FightState::Ended);
+            let ended_at = pipeline.meter.fight_end_ms().unwrap();
+
+            // Still inside the grace window: nothing sent yet.
+            pipeline.record_fight_end(state, ended_at + grace - 1);
+            assert_eq!(row_count(&handle), 0, "must not race the grace window");
+
+            // The window has now closed: the deferred record goes out.
+            pipeline.record_fight_end(state, ended_at + grace);
 
             let count = row_count(&handle);
             drop(handle);
