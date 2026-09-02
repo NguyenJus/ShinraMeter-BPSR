@@ -341,6 +341,10 @@ fn recv_loop(
         None => Decoder::new(),
     };
     let mut consecutive_errors: u32 = 0;
+    // Finding 2 (pipeline-robustness audit): a stalled pipeline must not
+    // block this thread behind a full channel and back the kernel WinDivert
+    // queue up with it. See `crate::backpressure`.
+    let mut drop_counter = crate::backpressure::DropCounter::new();
 
     log::info!("capture: WinDivert sniff loop started on filter {FILTER:?}");
 
@@ -499,12 +503,22 @@ fn recv_loop(
         }
 
         for event in decoder.push_stream(&stream, now_ms()) {
-            if tx.send(event).is_err() {
-                log::error!(
-                    "capture: the protocol-event channel is closed (the pipeline thread is gone); \
-                     the capture loop is exiting"
-                );
-                return;
+            use crate::backpressure::SendOutcome;
+            match drop_counter.try_send(&tx, event, Instant::now()) {
+                SendOutcome::Sent => {}
+                SendOutcome::Dropped(Some(total)) => log::warn!(
+                    "capture: the protocol-event channel is full; dropped {total} event(s) in \
+                     the last ~{:?} (the pipeline is not keeping up)",
+                    crate::backpressure::LOG_INTERVAL,
+                ),
+                SendOutcome::Dropped(None) => {}
+                SendOutcome::Disconnected => {
+                    log::error!(
+                        "capture: the protocol-event channel is closed (the pipeline thread is \
+                         gone); the capture loop is exiting"
+                    );
+                    return;
+                }
             }
         }
     }
