@@ -99,11 +99,26 @@ impl fmt::Display for Conn {
 /// this recognize the game server either way. Bounded to
 /// `MAX_SIGNATURE_CANDIDATES` candidate matches; never panics on malformed
 /// input.
-pub fn looks_like_game_server(payload: &[u8]) -> bool {
+///
+/// Returns `Some(header_start)` — the payload-relative byte offset of the
+/// validated fragment's length header — rather than just `true` (issue
+/// #293). Locating the boundary is exactly what this function already does
+/// to validate the match; discarding that position and reporting only a
+/// bool left the caller with no way to resync the reassembler onto the
+/// boundary it found, so an adoption mid-frame (the same #282 mid-connection
+/// attach this function already accounts for by scanning, rather than
+/// assuming `offset = 0`) still started the decoder at the packet's own,
+/// possibly mid-frame, sequence number. `win.rs`'s `sniff_loop` adds this
+/// offset to the adopting packet's TCP sequence number before calling
+/// `TcpReassembler::resync`, matching the alignment gate BPSR-ZDPS's
+/// `TcpReassembler.AddPacket` applies (checking the stream's very first
+/// payload begins on a length-prefix boundary) rather than trusting an
+/// arbitrary attach point.
+pub fn looks_like_game_server(payload: &[u8]) -> Option<usize> {
     let sig_len = SERVER_SIGNATURE.len();
     let min_len = SERVER_SIGNATURE_OFFSET + sig_len;
     if payload.len() < min_len {
-        return false;
+        return None;
     }
 
     let mut checked = 0usize;
@@ -142,10 +157,10 @@ pub fn looks_like_game_server(payload: &[u8]) -> bool {
             continue;
         }
         if frag_end - frag_start >= SERVER_SIGNATURE_OFFSET + sig_len {
-            return true;
+            return Some(header_start);
         }
     }
-    false
+    None
 }
 
 /// Login-return fallback signature check.
@@ -381,7 +396,7 @@ impl ServerDetector {
     /// reversing the tracked direction.
     pub fn detects(&mut self, conn: &Conn, payload: &[u8], server_adopted: bool) -> bool {
         if signature_direction_ok(conn, self.local_endpoint)
-            && (looks_like_game_server(payload) || is_login_return(payload))
+            && (looks_like_game_server(payload).is_some() || is_login_return(payload))
         {
             return true;
         }
@@ -476,6 +491,18 @@ pub struct AdoptionDecision {
     /// `ProtocolEvent::ServerChanged` — never on any other decision, which
     /// is what keeps a still-`Adopted` packet from re-triggering the event.
     pub newly_adopted: bool,
+    /// The payload-relative byte offset of the frame boundary the adopting
+    /// packet was matched at (issue #293), meaningful only when
+    /// `newly_adopted` is `true`; `0` otherwise. The caller must resync the
+    /// reassembler to `seq + frame_offset`, not the packet's bare `seq`,
+    /// or a mid-frame adoption (attaching while the connection is already
+    /// mid-stream, issue #282) starts the decoder mid-frame. Sourced from
+    /// [`looks_like_game_server`]'s located `header_start` when the
+    /// signature-scan path is what matched; the login-return and
+    /// subnet-reconnect paths carry no such byte-level evidence, so they
+    /// fall back to `0` — the packet's own `seq`, exactly today's
+    /// pre-#293 behavior for those two paths.
+    pub frame_offset: usize,
 }
 
 /// Decides what a captured packet means for the adopted-server state
@@ -512,12 +539,14 @@ pub fn decide_packet(
             torn_down,
             skip: true,
             newly_adopted: false,
+            frame_offset: 0,
         },
         ConnStreamRole::Adopted => AdoptionDecision {
             role,
             torn_down,
             skip: false,
             newly_adopted: false,
+            frame_offset: 0,
         },
         ConnStreamRole::Unrelated => {
             if !detector.detects(conn, payload, known_server.is_some()) {
@@ -526,15 +555,27 @@ pub fn decide_packet(
                     torn_down,
                     skip: true,
                     newly_adopted: false,
+                    frame_offset: 0,
                 }
             } else {
                 *known_server = Some(*conn);
                 detector.adopt(conn);
+                // Recovers the frame boundary `detector.detects` already
+                // found internally but didn't surface (its contract is a
+                // bool covering three different evidence paths, only one of
+                // which has a byte-exact offset to report). Re-running the
+                // signature scan here is cheap — one packet, at adoption
+                // time only, never per-packet on an already-adopted
+                // connection — and keeps `ServerDetector::detects`'s
+                // existing bool contract, and its ~20 direct callers below,
+                // untouched.
+                let frame_offset = looks_like_game_server(payload).unwrap_or(0);
                 AdoptionDecision {
                     role,
                     torn_down,
                     skip: false,
                     newly_adopted: true,
+                    frame_offset,
                 }
             }
         }
@@ -567,19 +608,22 @@ mod tests {
     fn signature_at_offset_5_detects() {
         let frag = frag_with_signature_at(SERVER_SIGNATURE_OFFSET);
         let payload = payload_with_frag(&frag);
-        assert!(looks_like_game_server(&payload));
+        // `payload_with_frag` puts the length header at the very start of
+        // `payload` (issue #293: the returned offset is where that header
+        // begins).
+        assert_eq!(looks_like_game_server(&payload), Some(0));
     }
 
     #[test]
     fn signature_at_offset_4_does_not_detect() {
         let frag = frag_with_signature_at(4);
         let payload = payload_with_frag(&frag);
-        assert!(!looks_like_game_server(&payload));
+        assert_eq!(looks_like_game_server(&payload), None);
     }
 
     #[test]
     fn too_short_payload_does_not_detect() {
-        assert!(!looks_like_game_server(&[0u8; 4]));
+        assert_eq!(looks_like_game_server(&[0u8; 4]), None);
     }
 
     #[test]
@@ -603,7 +647,11 @@ mod tests {
         // preceding frame's body, not at offset 0 of any frame.
         let joined_mid_stream = &full_stream[7..];
 
-        assert!(looks_like_game_server(joined_mid_stream));
+        // The signature-bearing frame's header sat at absolute offset 20 in
+        // `full_stream` (4-byte preceding header + 16-byte preceding body);
+        // dropping the first 7 bytes moves it to 13 (issue #293: this is
+        // the offset a caller must resync onto, not `0`).
+        assert_eq!(looks_like_game_server(joined_mid_stream), Some(13));
     }
 
     #[test]
@@ -620,7 +668,7 @@ mod tests {
             state ^= state << 5;
             noise.push((state & 0xFF) as u8);
         }
-        assert!(!looks_like_game_server(&noise));
+        assert_eq!(looks_like_game_server(&noise), None);
     }
 
     #[test]
@@ -639,7 +687,7 @@ mod tests {
             payload.extend_from_slice(&[0xFFu8; 10]);
         }
 
-        assert!(!looks_like_game_server(&payload));
+        assert_eq!(looks_like_game_server(&payload), None);
     }
 
     #[test]
@@ -845,7 +893,7 @@ mod tests {
     fn payload_signature_paths_never_fire_on_an_empty_payload() {
         // Guarantees no adoption path can resync the reassembler onto a
         // payload-less packet.
-        assert!(!looks_like_game_server(b""));
+        assert_eq!(looks_like_game_server(b""), None);
         assert!(!is_login_return(b""));
     }
 
@@ -1227,6 +1275,65 @@ mod tests {
         assert!(decision.skip);
         assert!(!decision.newly_adopted);
         assert_eq!(known_server, None);
+    }
+
+    /// issue #293: an adoption whose evidence is the signature scan must
+    /// report the frame boundary it actually found, not `0` — otherwise a
+    /// capture that attaches mid-connection (issue #282, the exact case
+    /// `looks_like_game_server`'s own mid-stream-attach test covers) starts
+    /// the decoder at the packet's raw `seq`, which can land mid-frame.
+    #[test]
+    fn decide_packet_reports_the_signature_paths_frame_offset_on_adoption() {
+        let frag = frag_with_signature_at(SERVER_SIGNATURE_OFFSET);
+
+        let mut full_stream = Vec::new();
+        // A preceding frame that would have arrived before capture attached
+        // — same construction as
+        // `mid_stream_attach_before_the_frame_boundary_still_detects`.
+        full_stream.extend_from_slice(&20u32.to_be_bytes());
+        full_stream.extend_from_slice(&[0xAAu8; 16]);
+        full_stream.extend_from_slice(&payload_with_frag(&frag));
+        let joined_mid_stream = &full_stream[7..];
+
+        let mut detector = ServerDetector::new();
+        let mut known_server = None;
+        let conn = server_to_client([203, 0, 113, 7], 5000);
+        let decision = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &conn,
+            joined_mid_stream,
+            false,
+            false,
+        );
+
+        assert!(decision.newly_adopted);
+        assert_eq!(
+            decision.frame_offset, 13,
+            "the caller must resync to seq + 13, not the packet's bare seq"
+        );
+    }
+
+    /// The login-return and subnet-reconnect paths carry no byte-level frame
+    /// evidence at all — `frame_offset` must fall back to `0` (today's
+    /// pre-#293 behavior: resync to the packet's own `seq`) rather than, say,
+    /// a leftover value from a previous call.
+    #[test]
+    fn decide_packet_frame_offset_is_zero_for_a_login_return_adoption() {
+        let mut detector = ServerDetector::new();
+        let mut known_server = None;
+        let conn = server_to_client([203, 0, 113, 7], 5000);
+        let decision = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &conn,
+            &login_return_payload(),
+            false,
+            false,
+        );
+
+        assert!(decision.newly_adopted);
+        assert_eq!(decision.frame_offset, 0);
     }
 
     // --- size-cap rejection logging bookkeeping (finding: observability) ---

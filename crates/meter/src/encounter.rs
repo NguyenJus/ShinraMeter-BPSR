@@ -826,7 +826,26 @@ impl Meter {
                 // numbers on screen for the user to screenshot as long as
                 // they're in the instance it was fought in.
                 let mut reason = None;
-                if self.scene_id != Some(*level_map_id) {
+                // issue #293: a genuinely first-ever scene learn — neither
+                // `scene_id` (this session) nor `last_known_scene_id`
+                // (survives `ServerChanged`, see issue #295 above) has ever
+                // been set — must not be treated as a scene *change*. That
+                // is exactly what a mid-instance attach looks like: there
+                // was no `ENTER_SCENE` to see (it fired once, before the
+                // meter existed), so the first `Scene` this session ever
+                // gets is `SyncContainerData`'s full-state push, which can
+                // land well after damage already has. Below this guard
+                // assumes a real transition — `cut_short`/`latch_fight_end`
+                // would otherwise stamp a fight still genuinely in progress
+                // as cut short by a "departure" that never happened, the
+                // instant a late-attaching meter finally learns where it
+                // is. `ServerChanged` having cleared `scene_id` is *not*
+                // this case — `last_known_scene_id` is still set then, so
+                // the check below still runs and issue #295's fast reset
+                // still fires on a confirmed different scene.
+                let first_ever_scene_learn =
+                    self.scene_id.is_none() && self.last_known_scene_id.is_none();
+                if !first_ever_scene_learn && self.scene_id != Some(*level_map_id) {
                     // issue #12: drop preloaded roster rows nobody ever
                     // damaged, logging a summary first — a stale party
                     // member from the last run must not linger even in the
@@ -6011,6 +6030,48 @@ mod tests {
             assert_eq!(m.scene_id, Some(31101));
             // issue #152: the numbers on screen are the cut-short pull's, so
             // the header keeps naming the fight they were fought in.
+            assert_eq!(snap.encounter.boss_monster_id, Some(103));
+        }
+
+        /// issue #293: a meter attached mid-instance has no `scene_id` at
+        /// all yet when damage starts — `ENTER_SCENE` fired once, before
+        /// the meter existed, and the only source left is
+        /// `SyncContainerData`'s full-state push, which can land well
+        /// after the pull is already underway. That first-ever `Scene`
+        /// event must be read as "learn where we already are", not as
+        /// "the party just zoned out mid-pull" (the case
+        /// `scene_change_mid_fight_latches_the_clock_and_keeps_the_stats`
+        /// above covers) — the instance hasn't changed, so the fight must
+        /// keep running rather than getting cut short.
+        #[test]
+        fn scene_learned_mid_fight_does_not_cut_it_short() {
+            let mut m = Meter::new();
+            // No `Scene` event yet: `m.scene_id` is still `None` even
+            // though damage — and a boss pull — are already in progress.
+            m.apply(&dmg(1, 700, 0));
+            m.apply(&boss_hit(10, 500, false));
+            m.apply(&hp(10, 50, Some(103), 500));
+            assert_eq!(m.scene_id, None);
+            assert_eq!(m.fight_state(1_000), FightState::Active);
+
+            // The scene id finally arrives, unchanged from what it always
+            // was — this is a *learn*, not a transition.
+            let reason = m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            assert_eq!(
+                reason, None,
+                "learning the scene mid-fight must not report a reset"
+            );
+
+            assert_eq!(m.scene_id, Some(1001));
+            assert_eq!(
+                m.fight_state(1_000),
+                FightState::Active,
+                "a fight already in progress must not be cut short just because \
+                 the meter finally learned which instance it's in"
+            );
+            let snap = m.snapshot(1_000);
+            assert_eq!(snap.total_damage, 800);
+            assert!(!snap.rows.is_empty());
             assert_eq!(snap.encounter.boss_monster_id, Some(103));
         }
 
