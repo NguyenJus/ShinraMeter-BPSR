@@ -124,6 +124,42 @@ pub struct FightConfig {
     /// `0` disables phase resumption, restoring the pre-#124 behaviour where
     /// every post-hold hit starts a fresh fight.
     pub phase_resume_window_ms: u64,
+    /// How long after a fight ends (`fight_end_ms`) a trailing event is
+    /// still folded into that ended fight's *stats* rather than either
+    /// resetting into a new fight or being dropped outright.
+    ///
+    /// Modeled on the reference implementation's fight-end deferral
+    /// (`BPSR-ZDPS/BattleStateMachine.cs`'s "new data will still be applied
+    /// to this ended encounter" and `EncounterManager.cs`'s 2s/5s final-end
+    /// delay, "because some packets are going to be delayed and come in
+    /// after this and they are typically the most important ones"): a
+    /// boss's last DoT ticks, a killing-blow retransmit, and a buff's
+    /// closing `Remove` all routinely arrive a few hundred milliseconds
+    /// after the packet that actually latched `fight_end_ms`, and without
+    /// this window every one of them used to be discarded — undercounting
+    /// totals and buff uptime on the tail of *every* kill.
+    ///
+    /// Distinct from [`Self::phase_resume_window_ms`]: a phase resume
+    /// un-freezes the fight (clears `fight_end_ms`, keeps the clock
+    /// running) because the pull is provably still going. This window does
+    /// the opposite on purpose — the fight stays frozen exactly as it was
+    /// (`fight_end_ms`, the elapsed timer, and `FightState::Ended` are all
+    /// left untouched) and only the accumulated stats grow, since a
+    /// straggling packet is evidence the fight *just* ended, not that it
+    /// didn't.
+    ///
+    /// 2000ms, matching the reference implementation's "known final"
+    /// deferral — generous enough for ordinary reassembly/decode jitter on
+    /// the last few packets of a kill, far short of
+    /// [`Self::phase_resume_window_ms`] so it can never be mistaken for one
+    /// (a phase-group hit inside this window still resumes the fight via
+    /// [`Self::phase_resume_window_ms`]'s own, unrelated check; a
+    /// non-phase-group hit inside this window is what this field is for).
+    ///
+    /// `0` disables the grace window entirely, restoring the pre-fix
+    /// behaviour where every event after `fight_end_ms` is either a new
+    /// fight or dropped.
+    pub post_end_grace_ms: u64,
 }
 
 impl Default for FightConfig {
@@ -132,6 +168,7 @@ impl Default for FightConfig {
             idle_timeout_ms: 9_000,
             end_on_boss_death: true,
             phase_resume_window_ms: 60_000,
+            post_end_grace_ms: 2_000,
         }
     }
 }
@@ -153,6 +190,11 @@ mod tests {
     #[test]
     fn phase_resume_window_defaults_to_sixty_seconds() {
         assert_eq!(FightConfig::default().phase_resume_window_ms, 60_000);
+    }
+
+    #[test]
+    fn post_end_grace_defaults_to_two_seconds() {
+        assert_eq!(FightConfig::default().post_end_grace_ms, 2_000);
     }
 
     #[test]

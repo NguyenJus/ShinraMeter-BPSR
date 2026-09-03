@@ -354,6 +354,14 @@ const TRANSIENT_STATUS_LINGER: Duration = Duration::from_secs(5);
 /// belongs.
 const PIPELINE_DEAD_STATUS: &str = "Meter pipeline stopped — restart ShinraMeter-BPSR to resume";
 
+/// What the banner says when the capture thread has died but the pipeline
+/// thread itself is still alive and publishing snapshots (pipeline-
+/// robustness audit, finding 1). Distinct from `PIPELINE_DEAD_STATUS`
+/// because the failure is: the snapshot channel never disconnects in this
+/// scenario, so `raise_pipeline_dead_status` never fires — the overlay
+/// looks alive but is frozen, and this is the only signal that says so.
+const CAPTURE_DEAD_STATUS: &str = "Packet capture stopped — restart the meter to resume";
+
 /// The overlay's eframe app: holds the latest snapshot plus the channel
 /// endpoints used to receive updates and send commands.
 pub struct OverlayApp {
@@ -525,6 +533,16 @@ pub struct OverlayApp {
     tx_history: Sender<history::writer::HistoryEvent>,
     /// Issue #39: which surface is showing. See `OverlayView`.
     view: OverlayView,
+    /// Issue #321: set the moment `UiCommand::Quit` is sent — the Close
+    /// menu item (`draw_header_menu`) and the in-place-update relaunch
+    /// (`finish_update_install_with`) are the two sites that send it.
+    /// `drain_snapshots` reads this when `rx_snapshot` disconnects to tell
+    /// an orderly shutdown (the pipeline thread exiting its `run` loop
+    /// right after `Quit`, which drops `tx_snapshot`) apart from the
+    /// pipeline thread actually dying mid-session (issue #214's real
+    /// failure mode) — only the latter should log at ERROR and raise the
+    /// permanent "frozen" banner.
+    quit_requested: bool,
 }
 
 /// All icon textures the overlay paints, bundled so `OverlayApp` has exactly
@@ -1114,6 +1132,7 @@ fn demo_snapshot() -> Snapshot {
             scene_boss_name: None,
             multi_boss_scene: false,
         },
+        capture_alive: true,
     }
 }
 
@@ -1134,6 +1153,7 @@ fn initial_snapshot(demo_mode: bool) -> Snapshot {
             total_dps: 0.0,
             rows: Vec::new(),
             encounter: EncounterInfo::default(),
+            capture_alive: true,
         }
     }
 }
@@ -1188,6 +1208,7 @@ impl OverlayApp {
             rx_history,
             tx_history,
             view: OverlayView::Live,
+            quit_requested: false,
         }
     }
 
@@ -1242,7 +1263,18 @@ impl OverlayApp {
         }
         loop {
             match self.rx_snapshot.try_recv() {
-                Ok(snap) => self.snapshot = snap,
+                Ok(snap) => {
+                    // Pipeline-robustness audit, finding 1: a dead capture
+                    // thread never disconnects this channel — the pipeline
+                    // thread is still alive and still publishing — so the
+                    // `Disconnected` arm below cannot see it. `capture_alive`
+                    // is how the pipeline says so instead; see
+                    // `raise_capture_dead_status`.
+                    if !snap.capture_alive {
+                        self.raise_capture_dead_status();
+                    }
+                    self.snapshot = snap;
+                }
                 // Nothing new this frame — the overwhelmingly common case.
                 Err(TryRecvError::Empty) => break,
                 // Issue #214: the pipeline thread is gone. `try_iter`, which
@@ -1253,8 +1285,21 @@ impl OverlayApp {
                 // could do but guess. `main.rs` never joins the thread
                 // either, so this dropped `Sender` is the only signal that
                 // reaches the UI at all.
+                //
+                // Issue #321: `run`'s own `Quit`/disconnect break drops
+                // `tx_snapshot` immediately, so an orderly shutdown hits
+                // this exact same `Disconnected` arm — one more egui frame
+                // painted before the window actually closes is enough to
+                // see it. `quit_requested` (set at both `UiCommand::Quit`
+                // send sites) is what tells that apart from #214's real
+                // failure mode, so only the latter still logs at ERROR and
+                // raises the permanent banner.
                 Err(TryRecvError::Disconnected) => {
-                    self.raise_pipeline_dead_status();
+                    if self.quit_requested {
+                        log::info!("quit requested; pipeline shut down");
+                    } else {
+                        self.raise_pipeline_dead_status();
+                    }
                     break;
                 }
             }
@@ -1294,6 +1339,31 @@ impl OverlayApp {
              for the rest of this session"
         );
         self.status = StatusLine::Error(PIPELINE_DEAD_STATUS.to_string());
+        self.status_expires_at = None;
+    }
+
+    /// Raises the *permanent* banner for a dead capture thread (pipeline-
+    /// robustness audit, finding 1) — the counterpart to
+    /// `raise_pipeline_dead_status` for the failure that mechanism cannot
+    /// see: the capture thread died, but the pipeline thread is still alive
+    /// and still publishing snapshots on schedule, so the snapshot channel
+    /// never disconnects. `drain_snapshots` calls this for every snapshot
+    /// it drains once `Snapshot::capture_alive` goes `false`, which is
+    /// permanently, so the same "logged/raised once" shape applies: the
+    /// early return below sees the banner it just set.
+    ///
+    /// Same precedence rule as `raise_pipeline_dead_status`: an existing
+    /// *permanent* banner wins (a named cause, or this same banner already
+    /// up), a *transient* one does not.
+    fn raise_capture_dead_status(&mut self) {
+        if matches!(self.status, StatusLine::Error(_)) && self.status_expires_at.is_none() {
+            return;
+        }
+        log::error!(
+            "the capture thread is gone (its event channel disconnected); the pipeline is still \
+             publishing snapshots but they will never change again for the rest of this session"
+        );
+        self.status = StatusLine::Error(CAPTURE_DEAD_STATUS.to_string());
         self.status_expires_at = None;
     }
 
@@ -1367,7 +1437,7 @@ impl OverlayApp {
     /// of `self.update_check` in `poll_update_check`'s match is already
     /// over by the time it is replaced.
     fn finish_update_install(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         available: CheckOutcome,
         result: Result<PathBuf, String>,
@@ -1382,7 +1452,7 @@ impl OverlayApp {
     /// this seam to drive the success branch without spawning a real
     /// process.
     fn finish_update_install_with(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         available: CheckOutcome,
         result: Result<PathBuf, String>,
@@ -1415,6 +1485,7 @@ impl OverlayApp {
             installed.display()
         );
         let _ = self.tx_command.try_send(UiCommand::Quit);
+        self.quit_requested = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         UpdateCheckState::Restarting
     }
@@ -1755,6 +1826,7 @@ impl eframe::App for OverlayApp {
                     self.history.is_some(),
                     &mut open_history_clicked,
                     header_history,
+                    &mut self.quit_requested,
                 );
                 // Issue #156: whether this frame's wait for the reply has
                 // gone on long enough that it's never coming — computed
@@ -2216,6 +2288,9 @@ fn draw_header(
     // else about the header — timer, DPS readout, toggle cluster, dropdown —
     // is identical in both modes.
     history: Option<HistoryHeader<'_>>,
+    // Issue #321: forwarded straight through to `draw_header_menu`, the
+    // only place that writes to it — see that parameter's doc comment.
+    quit_requested: &mut bool,
 ) -> bool {
     let (title, subtitle) = header_text(snapshot, history.as_ref());
     // The header band's height budget — also what `draw_header_wash` and the
@@ -2390,6 +2465,7 @@ fn draw_header(
                 icons,
                 update_check,
                 tx_log_export,
+                quit_requested,
             );
         });
     draw_subtitle_line(ui, subtitle.as_deref().unwrap_or(""));
@@ -4724,6 +4800,7 @@ fn background_image_row(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_header_menu(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -4738,6 +4815,14 @@ fn draw_header_menu(
     // `LogExportOutcome` and this module's own doc comment for why the two
     // items share one channel.
     tx_log_export: &Sender<LogExportOutcome>,
+    // Issue #321: set when the Close item below actually sends
+    // `UiCommand::Quit`, so `OverlayApp::ui` can flag `self.quit_requested`
+    // — the callers of that flag need to know an orderly quit is under way
+    // *before* the pipeline thread's snapshot channel disconnects, so
+    // `drain_snapshots` can tell that disconnect apart from a dead
+    // pipeline (issue #214's real failure mode) instead of logging a false
+    // "the meter is frozen" error on every clean shutdown.
+    quit_requested: &mut bool,
 ) {
     let SettingsHandle {
         settings,
@@ -5081,6 +5166,7 @@ fn draw_header_menu(
                 .clicked()
             {
                 let _ = tx_command.try_send(UiCommand::Quit);
+                *quit_requested = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 ui.close();
             }
@@ -9850,6 +9936,42 @@ mod tests {
         assert_eq!(app.snapshot.rows.len(), 2);
     }
 
+    /// Issue #321: `run`'s own break on `UiCommand::Quit` (or a disconnect
+    /// of its command channel) drops `tx_snapshot` right away, so an
+    /// orderly quit hits this exact `TryRecvError::Disconnected` arm one
+    /// egui frame later — the same arm issue #214's real failure mode (the
+    /// pipeline thread dying mid-session) raises the permanent "frozen"
+    /// banner from. `quit_requested`, set at both `UiCommand::Quit` send
+    /// sites, is what tells the two apart: a disconnect seen after it must
+    /// leave the status alone rather than raising that banner.
+    #[test]
+    fn drain_snapshots_disconnected_after_quit_does_not_raise_the_dead_pipeline_status() {
+        let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut app = OverlayApp::new(
+            rx_snapshot,
+            tx_command,
+            tx_settings,
+            Settings::default(),
+            None,
+        );
+        app.quit_requested = true;
+
+        drop(tx_snapshot);
+        app.drain_snapshots();
+
+        assert_eq!(
+            app.status,
+            StatusLine::Ok,
+            "a disconnect after Quit is an orderly shutdown, not a dead pipeline"
+        );
+        assert_eq!(
+            app.status_expires_at, None,
+            "no banner means no expiry either"
+        );
+    }
+
     /// PR #197 review: the Share clipboard failure is a *transient* banner
     /// — a later Share that works takes it down, and it times out on its
     /// own if none ever does — while the capture-init failure `main.rs`
@@ -10108,6 +10230,7 @@ mod tests {
                 scene_boss_name: None,
                 multi_boss_scene: false,
             },
+            capture_alive: true,
         }
     }
 
@@ -10217,6 +10340,7 @@ mod tests {
                 false,
                 &mut false,
                 None,
+                &mut false,
             );
         });
         let mut texts = Vec::new();
@@ -10376,6 +10500,7 @@ mod tests {
                 false,
                 &mut false,
                 None,
+                &mut false,
             );
         });
         for clipped in &output.shapes {
@@ -10631,6 +10756,7 @@ mod tests {
                 false,
                 &mut false,
                 None,
+                &mut false,
             );
         });
         let update = output
@@ -10716,6 +10842,7 @@ mod tests {
                 false,
                 &mut false,
                 None,
+                &mut false,
             );
             interact_size_y = ui.spacing().interact_size.y;
             rendered_height = ui.min_rect().height();
@@ -13835,6 +13962,7 @@ mod tests {
                 false,
                 &mut false,
                 None,
+                &mut false,
             );
             // Exactly what `OverlayApp::ui` does between `draw_header` and
             // `draw_row_backdrop`: one `ui.separator()`, then read the
@@ -16221,6 +16349,7 @@ mod tests {
                 })
                 .collect(),
             encounter: EncounterInfo::default(),
+            capture_alive: true,
         }
     }
 
@@ -16495,6 +16624,7 @@ mod tests {
             total_dps: row.dps,
             rows: vec![row.clone()],
             encounter: EncounterInfo::default(),
+            capture_alive: true,
         };
 
         let frame = rows_painted_boxes_with(
@@ -17138,6 +17268,7 @@ mod tests {
                     &icons,
                     update_check,
                     &unused_log_export_sender(),
+                    &mut false,
                 );
             });
             let update = output
@@ -17193,6 +17324,7 @@ mod tests {
                 &icons,
                 &mut update_check,
                 &unused_log_export_sender(),
+                &mut false,
             );
         });
         let mut texts = Vec::new();
@@ -17236,6 +17368,7 @@ mod tests {
                 &icons,
                 &mut update_check,
                 &unused_log_export_sender(),
+                &mut false,
             );
         });
         let mut texts = Vec::new();
@@ -17285,6 +17418,7 @@ mod tests {
                 &icons,
                 &mut update_check,
                 &unused_log_export_sender(),
+                &mut false,
             );
         });
         let mut texts = Vec::new();
@@ -17333,6 +17467,7 @@ mod tests {
                 &icons,
                 &mut update_check,
                 &unused_log_export_sender(),
+                &mut false,
             );
         });
         let mut texts = Vec::new();
@@ -17598,7 +17733,7 @@ mod tests {
         let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
         let (tx_command, rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
-        let app = OverlayApp::new(
+        let mut app = OverlayApp::new(
             rx_snapshot,
             tx_command,
             tx_settings,
@@ -17635,6 +17770,12 @@ mod tests {
             "a successful relaunch must also ask the viewport to close: {close_commands:?}"
         );
         output.drop_without_applying_deltas();
+        assert!(
+            app.quit_requested,
+            "a successful relaunch must set quit_requested (issue #321) so \
+             drain_snapshots can tell the resulting pipeline-channel disconnect \
+             apart from a dead pipeline"
+        );
     }
 
     /// Reset moved out of this menu into the toggle cluster (issue #82;
@@ -17651,6 +17792,7 @@ mod tests {
         let (tx_command, rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
         let mut settings = Settings::default();
+        let mut quit_requested = false;
 
         // Frame 1: lay the menu out with no input, and read back where
         // AccessKit says "Close" actually painted — its rect isn't knowable
@@ -17667,6 +17809,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut quit_requested,
             );
         });
         let update = layout
@@ -17676,6 +17819,10 @@ mod tests {
             .expect("accesskit was enabled for this frame");
         let close_pos = accessible_rect_for_label(&update, "Close").center();
         layout.drop_without_applying_deltas();
+        assert!(
+            !quit_requested,
+            "laying out the menu with no click must not itself request a quit"
+        );
 
         // Frame 2: click Close.
         let output = ctx.run_ui(click_at(close_pos), |ui| {
@@ -17690,6 +17837,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut quit_requested,
             );
         });
         let close_commands = output
@@ -17710,6 +17858,12 @@ mod tests {
         assert!(
             close_commands.contains(&egui::ViewportCommand::Close),
             "Close must also ask the viewport to close: {close_commands:?}"
+        );
+        assert!(
+            quit_requested,
+            "clicking Close must set quit_requested (issue #321) so drain_snapshots \
+             can tell the resulting pipeline-channel disconnect apart from a dead \
+             pipeline"
         );
     }
 
@@ -17749,6 +17903,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut false,
             );
         });
         let update = layout
@@ -17779,6 +17934,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut false,
             );
         });
         output.drop_without_applying_deltas();
@@ -17813,6 +17969,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut false,
             );
         });
         output.drop_without_applying_deltas();
@@ -17864,6 +18021,7 @@ mod tests {
                     &icons,
                     &mut UpdateCheckState::default(),
                     &unused_log_export_sender(),
+                    &mut false,
                 );
             });
         });
@@ -17922,6 +18080,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut false,
             );
         });
         let update = layout
@@ -17945,6 +18104,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut false,
             );
         });
         let viewport_commands = output
@@ -18012,6 +18172,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut false,
             );
         });
         let update = layout
@@ -18035,6 +18196,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut false,
             );
         });
         output.drop_without_applying_deltas();
@@ -18083,6 +18245,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut false,
             );
         });
         let update = layout
@@ -18190,6 +18353,7 @@ mod tests {
                     false,
                     &mut false,
                     None,
+                    &mut false,
                 );
             });
             let update = output
@@ -18362,6 +18526,7 @@ mod tests {
                     false,
                     &mut false,
                     None,
+                    &mut false,
                 );
             });
             let update = output
@@ -20291,6 +20456,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut false,
             );
         });
         let update = layout
@@ -20313,6 +20479,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut false,
             );
         });
         let viewport_commands = output

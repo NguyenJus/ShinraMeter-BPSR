@@ -400,6 +400,7 @@ mod sanitize {
                         name: "RealPlayerName".to_string(),
                         fight_point: 12345,
                     }),
+                    scene_data: None,
                     profession_list: None,
                 }),
             };
