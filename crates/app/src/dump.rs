@@ -63,6 +63,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use serde::Serialize;
 
 use crate::logging::should_rotate;
+use bpsr_protocol::dump_format::{numbered_sibling, ring_siblings};
 
 /// A dump chunk (the live file, or any numbered ring chunk) at or above this
 /// size gets rotated: the live file is renamed to `<path>.1` — any existing
@@ -255,7 +256,8 @@ impl DumpWriter {
 /// chunk joins the numbered ring (see [`rotate`]) instead of overwriting a
 /// single backup. Issue #322: a routine rotation used to leave no trace in
 /// the log at all — `first_ts_ms`/`last_ts_ms` track the chunk currently
-/// being written (reset on every rotation, never by re-reading the file) so
+/// being written (reset on every *successful* rotation — see
+/// [`next_first_ts_ms`] — never by re-reading the file) so
 /// the info line logged right after a successful rotation says exactly what
 /// was rotated out and when it happened, in-session.
 fn run_writer(rx: Receiver<Record>, path: &Path, chunk_max_bytes: u64, total_max_bytes: u64) {
@@ -305,8 +307,8 @@ fn run_writer(rx: Receiver<Record>, path: &Path, chunk_max_bytes: u64, total_max
                     first_ts_ms.unwrap_or(0),
                 );
             }
+            first_ts_ms = next_first_ts_ms(rotated.is_some(), first_ts_ms);
             (out, written) = rotation_outcome(out, rotated);
-            first_ts_ms = None;
         }
     }
     let _ = out.flush();
@@ -324,6 +326,21 @@ fn run_writer(rx: Receiver<Record>, path: &Path, chunk_max_bytes: u64, total_max
 /// once rotation starts failing, and every later record would retry the
 /// failing rename and log a warning — a per-record log-spam storm instead
 /// of the intended once-per-`max_bytes` backoff.
+/// The chunk-start timestamp [`run_writer`] carries into the next record
+/// after a rotation attempt, given whether that attempt actually rotated.
+///
+/// A success starts a genuinely new chunk, so the tracked start clears and
+/// the next record seeds it. A failure does not: the writer keeps appending
+/// to the very same file, so the chunk still starts where it always did.
+/// Clearing on failure too (the original shape of this code) would make the
+/// *next* successful rotation log a `ts_ms` range starting at the first
+/// record written after the failure, understating the chunk's real span by
+/// everything written before it — a pure function so that reasoning is
+/// testable without provoking a real rename failure, which isn't portable.
+fn next_first_ts_ms(rotated: bool, first_ts_ms: Option<u64>) -> Option<u64> {
+    if rotated { None } else { first_ts_ms }
+}
+
 fn rotation_outcome(current: BufWriter<File>, rotated: Option<File>) -> (BufWriter<File>, u64) {
     match rotated {
         Some(file) => (BufWriter::new(file), 0),
@@ -331,49 +348,31 @@ fn rotation_outcome(current: BufWriter<File>, rotated: Option<File>) -> (BufWrit
     }
 }
 
-/// `<path>.n` for `n >= 1` — the ring chunk `n` rotations back from the live
-/// file. `n=1` is the most recently rotated (newest) chunk; higher `n` is
-/// older.
-fn numbered_path(path: &Path, n: u64) -> PathBuf {
-    let mut numbered = path.as_os_str().to_owned();
-    numbered.push(format!(".{n}"));
-    PathBuf::from(numbered)
-}
-
-/// Every numbered ring chunk currently on disk next to `path`, ascending by
-/// `n` (index 0 is `.1`, the newest rotated chunk). Stops at the first
-/// missing `n` — [`shift_ring`] always shifts contiguously, so the ring
-/// never has gaps.
-fn ring_chunks(path: &Path) -> Vec<(u64, PathBuf)> {
-    let mut chunks = Vec::new();
-    let mut n = 1;
-    loop {
-        let candidate = numbered_path(path, n);
-        if !candidate.exists() {
-            break;
-        }
-        chunks.push((n, candidate));
-        n += 1;
-    }
-    chunks
-}
-
 /// Renames every existing numbered chunk up by one — highest `n` first, so
 /// none get clobbered mid-shift — vacating `<path>.1` for [`rotate`] to move
-/// the live file into. Best-effort: a single failed rename only warns (the
-/// ring is left slightly inconsistent for that one chunk) rather than
-/// aborting the rotation the live file itself still needs.
-fn shift_ring(path: &Path) {
-    for (n, chunk) in ring_chunks(path).into_iter().rev() {
-        let to = numbered_path(path, n + 1);
+/// the live file into. Returns whether the whole shift succeeded.
+///
+/// The first failed rename stops the shift and returns `false`: the chunk
+/// that failed to move is still sitting at its old number, so carrying on
+/// would have the *next* rename (`.2` -> `.3` after `.3` -> `.4` failed)
+/// silently overwrite it with newer data. Aborting instead leaves the ring
+/// exactly as it was and costs only this one rotation — [`rotate`] returns
+/// `None`, the live file keeps growing in place, and the attempt is retried
+/// after another `chunk_max_bytes` of writes.
+fn shift_ring(path: &Path) -> bool {
+    for (n, chunk) in ring_siblings(path).into_iter().rev() {
+        let to = numbered_sibling(path, n + 1);
         if let Err(err) = fs::rename(&chunk, &to) {
             log::warn!(
-                "failed to shift inspect dump ring chunk {} to {} ({err}); the ring may now be inconsistent",
+                "failed to shift inspect dump ring chunk {} to {} ({err}); skipping this rotation with the ring untouched, rather than letting the next shift overwrite {}",
                 chunk.display(),
-                to.display()
+                to.display(),
+                chunk.display()
             );
+            return false;
         }
     }
+    true
 }
 
 /// Deletes the oldest (highest-numbered) ring chunks until the numbered
@@ -382,12 +381,12 @@ fn shift_ring(path: &Path) {
 /// itself doesn't count towards the budget — it's still being written, and
 /// is capped independently by [`MAX_CHUNK_BYTES`] triggering the next
 /// rotation. Each deletion is logged at info with the chunk's path and
-/// size; the deleted chunk's `ts_ms` range is only known if this process's
-/// own `run_writer` tracked it while writing that exact chunk (true only
-/// for the newest one — once later rotations shift it further back, the
-/// range isn't carried along), so an older deletion names just the path.
+/// size, and nothing more: a chunk's `ts_ms` range is only ever known to
+/// `run_writer` while it is the live file, and isn't carried along as later
+/// rotations shift it back through the ring, so by eviction time there is
+/// no range left to name.
 fn enforce_ring_budget(path: &Path, total_max_bytes: u64) {
-    let mut chunks: Vec<(PathBuf, u64)> = ring_chunks(path)
+    let mut chunks: Vec<(PathBuf, u64)> = ring_siblings(path)
         .into_iter()
         .map(|(_, chunk)| {
             let len = fs::metadata(&chunk).map(|meta| meta.len()).unwrap_or(0);
@@ -421,13 +420,17 @@ fn enforce_ring_budget(path: &Path, total_max_bytes: u64) {
 /// Shifts the numbered ring up by one (see [`shift_ring`]), renames the
 /// live `path` into the now-vacated `<path>.1`, enforces the total ring
 /// budget (see [`enforce_ring_budget`], which may delete the oldest
-/// chunk(s)), and reopens `path` empty. `None` only when the live-file
-/// rename itself fails (already logged) — a ring-shift or budget-enforcement
-/// failure only warns, since the live file has already been safely rotated
-/// out by that point.
+/// chunk(s)), and reopens `path` empty. `None` (always already logged) when
+/// the ring shift couldn't be completed — in which case the live file is
+/// deliberately left alone, so nothing is renamed on top of a chunk that
+/// failed to move — or when the live-file rename or the reopen fails. A
+/// budget-enforcement failure only warns, since the live file has already
+/// been safely rotated out by that point.
 fn rotate(path: &Path, total_max_bytes: u64) -> Option<File> {
-    shift_ring(path);
-    let first_chunk = numbered_path(path, 1);
+    if !shift_ring(path) {
+        return None;
+    }
+    let first_chunk = numbered_sibling(path, 1);
     if let Err(err) = fs::rename(path, &first_chunk) {
         log::warn!(
             "failed to rotate inspect dump {} to {} ({err}); continuing without rotation",
@@ -633,7 +636,7 @@ mod tests {
     #[test]
     fn writer_rotates_when_the_running_total_crosses_the_threshold() {
         let path = temp_path("rotate");
-        let rotated = numbered_path(&path, 1);
+        let rotated = numbered_sibling(&path, 1);
         let record1 = Record {
             ts_ms: 1,
             service_uuid: 0xAB,
@@ -672,7 +675,7 @@ mod tests {
     #[test]
     fn writer_seeds_its_running_total_from_an_existing_dump_file() {
         let path = temp_path("seed");
-        let rotated = numbered_path(&path, 1);
+        let rotated = numbered_sibling(&path, 1);
         fs::write(&path, b"previous-session-line\n").unwrap();
         let existing_len = fs::metadata(&path).unwrap().len();
 
@@ -721,18 +724,18 @@ mod tests {
         writer.sender().send(record(3));
         writer.shutdown();
 
-        let dot1 = fs::read_to_string(numbered_path(&path, 1)).expect(".1 should exist");
-        let dot2 = fs::read_to_string(numbered_path(&path, 2)).expect(".2 should exist");
-        let dot3 = fs::read_to_string(numbered_path(&path, 3)).expect(".3 should exist");
+        let dot1 = fs::read_to_string(numbered_sibling(&path, 1)).expect(".1 should exist");
+        let dot2 = fs::read_to_string(numbered_sibling(&path, 2)).expect(".2 should exist");
+        let dot3 = fs::read_to_string(numbered_sibling(&path, 3)).expect(".3 should exist");
         assert!(dot1.contains("\"ts_ms\":3"), "newest rotated chunk is .1");
         assert!(dot2.contains("\"ts_ms\":2"), "middle chunk shifted to .2");
         assert!(dot3.contains("\"ts_ms\":1"), "oldest chunk shifted to .3");
         assert_eq!(fs::read_to_string(&path).unwrap(), "");
 
         let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(numbered_path(&path, 1));
-        let _ = fs::remove_file(numbered_path(&path, 2));
-        let _ = fs::remove_file(numbered_path(&path, 3));
+        let _ = fs::remove_file(numbered_sibling(&path, 1));
+        let _ = fs::remove_file(numbered_sibling(&path, 2));
+        let _ = fs::remove_file(numbered_sibling(&path, 3));
     }
 
     /// Once the ring's total size exceeds the byte budget, the oldest
@@ -761,21 +764,21 @@ mod tests {
         writer.shutdown();
 
         assert!(
-            numbered_path(&path, 1).exists(),
+            numbered_sibling(&path, 1).exists(),
             ".1 (newest rotated chunk) must survive"
         );
         assert!(
-            numbered_path(&path, 2).exists(),
+            numbered_sibling(&path, 2).exists(),
             ".2 must survive — it still fits the budget"
         );
         assert!(
-            !numbered_path(&path, 3).exists(),
+            !numbered_sibling(&path, 3).exists(),
             ".3 (oldest) must be deleted once the ring goes over budget"
         );
 
         let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(numbered_path(&path, 1));
-        let _ = fs::remove_file(numbered_path(&path, 2));
+        let _ = fs::remove_file(numbered_sibling(&path, 1));
+        let _ = fs::remove_file(numbered_sibling(&path, 2));
     }
 
     /// Regression test for the review finding on PR #99: the failure arm
@@ -812,12 +815,105 @@ mod tests {
         let _ = fs::remove_file(&failure_path);
     }
 
+    /// Companion to the test above, for the *other* piece of per-chunk
+    /// state a rotation attempt updates. `written` resets on both arms;
+    /// `first_ts_ms` must not. A failed rotation keeps appending to the same
+    /// file, so clearing the chunk's start timestamp would make the next
+    /// successful rotation log a `ts_ms` range that starts after the
+    /// failure and understates what the chunk actually holds.
+    #[test]
+    fn next_first_ts_ms_clears_only_after_a_rotation_that_succeeded() {
+        assert_eq!(
+            next_first_ts_ms(true, Some(1_000)),
+            None,
+            "a successful rotation starts a new chunk, so the range restarts"
+        );
+        assert_eq!(
+            next_first_ts_ms(false, Some(1_000)),
+            Some(1_000),
+            "a failed rotation keeps writing the same chunk, so its start \
+             timestamp must survive"
+        );
+        assert_eq!(next_first_ts_ms(false, None), None);
+    }
+
+    /// Regression test for the review finding on PR #325: a failed shift
+    /// used to warn and carry on, so the next rename in the loop overwrote
+    /// the chunk that had just failed to move. The shift now stops at the
+    /// first failure and reports it, and `rotate` skips the rotation
+    /// entirely rather than renaming the live file onto a ring it couldn't
+    /// vacate. Simulated by putting a directory where `.2` wants to move:
+    /// renaming a file onto an existing directory fails on every platform,
+    /// and a directory is not itself a ring chunk, so it doesn't shift.
+    #[test]
+    fn a_failed_ring_shift_aborts_the_rotation_instead_of_clobbering_a_chunk() {
+        let path = temp_path("shift-abort");
+        let dot1 = numbered_sibling(&path, 1);
+        let dot2 = numbered_sibling(&path, 2);
+        let blocked = numbered_sibling(&path, 3);
+        fs::write(&path, b"live").unwrap();
+        fs::write(&dot1, b"chunk-one").unwrap();
+        fs::write(&dot2, b"chunk-two").unwrap();
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("occupant"), b"x").unwrap();
+
+        assert!(!shift_ring(&path), "the shift must report its failure");
+        assert!(
+            rotate(&path, u64::MAX).is_none(),
+            "a rotation that can't vacate .1 must not touch the live file"
+        );
+
+        assert_eq!(
+            fs::read_to_string(&dot2).unwrap(),
+            "chunk-two",
+            ".2 could not move, so .1 must not have been renamed on top of it"
+        );
+        assert_eq!(fs::read_to_string(&dot1).unwrap(), "chunk-one");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "live",
+            "the live file stays put and is retried on the next threshold crossing"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&dot1);
+        let _ = fs::remove_file(&dot2);
+        let _ = fs::remove_dir_all(&blocked);
+    }
+
+    /// A gap in the numbering (here: `.1` deleted out from under the ring)
+    /// must not hide the chunks behind it from the byte budget — before the
+    /// enumeration became gap-tolerant those chunks were orphaned, counted
+    /// against nothing and evicted never.
+    #[test]
+    fn the_ring_budget_still_sees_chunks_behind_a_missing_number() {
+        let path = temp_path("budget-gap");
+        fs::write(&path, b"live").unwrap();
+        let dot2 = numbered_sibling(&path, 2);
+        let dot3 = numbered_sibling(&path, 3);
+        fs::write(&dot2, b"0123456789").unwrap();
+        fs::write(&dot3, b"0123456789").unwrap();
+
+        // Room for one 10-byte chunk only: the oldest (.3) has to go.
+        enforce_ring_budget(&path, 10);
+
+        assert!(dot2.exists(), ".2 must survive — it fits the budget");
+        assert!(
+            !dot3.exists(),
+            ".3 must be evicted; a vacant .1 must not hide it from the budget"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&dot2);
+        let _ = fs::remove_file(&dot3);
+    }
+
     /// A dump file already at or above the threshold at process start is
     /// rotated before the first record is ever written to it.
     #[test]
     fn writer_rotates_a_pre_existing_oversized_file_at_startup() {
         let path = temp_path("startup-rotate");
-        let rotated = numbered_path(&path, 1);
+        let rotated = numbered_sibling(&path, 1);
         fs::write(&path, b"stale-oversized-content").unwrap();
         let max_bytes = fs::metadata(&path).unwrap().len();
 
@@ -945,7 +1041,7 @@ mod tests {
             );
 
             let _ = fs::remove_file(&path);
-            let _ = fs::remove_file(numbered_path(&path, 1));
+            let _ = fs::remove_file(numbered_sibling(&path, 1));
         }
 
         /// The writer logs which path it's using and the retention policy
@@ -995,16 +1091,16 @@ mod tests {
             writer.sender().send(record(2));
             writer.shutdown();
 
-            let evicted = numbered_path(&path, 2).display().to_string();
+            let evicted = numbered_sibling(&path, 2).display().to_string();
             assert!(
                 logged(&["deleted oldest chunk", &evicted]),
                 "expected an eviction log line naming the deleted chunk; captured: {:?}",
                 CAPTURED.lock().unwrap()
             );
-            assert!(!numbered_path(&path, 2).exists());
+            assert!(!numbered_sibling(&path, 2).exists());
 
             let _ = fs::remove_file(&path);
-            let _ = fs::remove_file(numbered_path(&path, 1));
+            let _ = fs::remove_file(numbered_sibling(&path, 1));
         }
     }
 }

@@ -100,14 +100,59 @@ pub fn parse_record(line: &str) -> Result<DumpRecord, String> {
 
 /// `<path>.n` for `n >= 1` — the numbered ring chunk `dump.rs` would have
 /// renamed `path` to `n` rotations ago (issue #322): `n=1` is the most
-/// recently rotated (newest) chunk, higher `n` is older. Matches
-/// `crates/app/src/dump.rs`'s own `numbered_path`, reimplemented here
-/// rather than shared because this crate intentionally doesn't depend on
-/// the app crate.
+/// recently rotated (newest) chunk, higher `n` is older. The single
+/// definition of the ring's naming scheme: `crates/app/src/dump.rs` (the
+/// writer that creates these files) calls this one rather than keeping its
+/// own copy, so the reader and the writer cannot drift.
 pub fn numbered_sibling(path: &Path, n: u64) -> PathBuf {
     let mut numbered = path.as_os_str().to_owned();
     numbered.push(format!(".{n}"));
     PathBuf::from(numbered)
+}
+
+/// Every numbered ring chunk on disk next to `path`, ascending by `n`
+/// (index 0 is `.1`, the newest rotated chunk). The single enumeration used
+/// by both the writer's ring bookkeeping (`crates/app/src/dump.rs`) and
+/// [`load_dump`] below.
+///
+/// Gap-tolerant *by scanning the directory* for `<file name>.N` siblings
+/// rather than counting up from `.1` until a number is missing: a rotation
+/// that shifted the ring and then failed to rename the live file leaves `.1`
+/// vacant while `.2`, `.3`, ... still hold real data, and so does a chunk
+/// deleted by hand. Counting up would stop at the hole and orphan
+/// everything past it — never budgeted, never evicted, never replayed.
+/// Entries whose suffix isn't a plain decimal `n >= 1` (`.1.bak`, `.01`,
+/// `.gz`) are ignored, as is anything that isn't a regular file — a chunk
+/// is always a file, and treating a same-named directory as one would have
+/// the writer try to shift it through the ring.
+pub fn ring_siblings(path: &Path) -> Vec<(u64, PathBuf)> {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let prefix = format!("{name}.");
+    let mut chunks: Vec<(u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            if !entry.file_type().is_ok_and(|ty| ty.is_file()) {
+                return None;
+            }
+            let entry_name = entry.file_name().into_string().ok()?;
+            let suffix = entry_name.strip_prefix(&prefix)?;
+            let n: u64 = suffix.parse().ok()?;
+            // Rejects `.0` and any non-canonical spelling (`.01`) that would
+            // otherwise alias an existing chunk number.
+            (n >= 1 && suffix == n.to_string()).then(|| (n, entry.path()))
+        })
+        .collect();
+    chunks.sort_by_key(|(n, _)| *n);
+    chunks
 }
 
 /// Opens `path`, parses every JSONL line with [`parse_record`], and appends
@@ -150,7 +195,8 @@ pub fn append_records_from(
 }
 
 /// Reads `path`, plus every numbered ring chunk present alongside it
-/// (`.1`, `.2`, ... — see [`numbered_sibling`]), in chronological order:
+/// (`.1`, `.2`, ... — see [`ring_siblings`], which tolerates a gap in the
+/// numbering), in chronological order:
 /// highest-numbered (oldest) chunk first, `path` (the live, newest data)
 /// last. Convenience wrapper around [`append_records_from`] for a CLI
 /// binary that just wants "every retained record for this dump, oldest
@@ -160,17 +206,7 @@ pub fn append_records_from(
 pub fn load_dump(path: &Path) -> Result<Vec<DumpRecord>, std::io::Error> {
     let mut records = Vec::new();
 
-    let mut chunks = Vec::new();
-    let mut n = 1;
-    loop {
-        let candidate = numbered_sibling(path, n);
-        if !candidate.exists() {
-            break;
-        }
-        chunks.push((n, candidate));
-        n += 1;
-    }
-    for (n, chunk) in chunks.into_iter().rev() {
+    for (n, chunk) in ring_siblings(path).into_iter().rev() {
         match append_records_from(&chunk, &mut records) {
             Ok(count) => eprintln!(
                 "note: also read rotated dump chunk {} (.{n}) — {count} earlier record(s) \
@@ -281,5 +317,61 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&dot1);
         let _ = std::fs::remove_file(&dot2);
+    }
+
+    /// A hole in the numbering (a rotation that shifted the ring and then
+    /// failed to rename the live file into `.1`, or a chunk deleted by
+    /// hand) must not hide every older chunk behind it: enumeration scans
+    /// the directory instead of counting up until a number is missing.
+    #[test]
+    fn ring_siblings_enumerates_past_a_missing_number() {
+        let dir = std::env::temp_dir();
+        let n = std::process::id();
+        let path = dir.join(format!("bpsr-dump-format-test-gap-{n}.jsonl"));
+        let dot1 = numbered_sibling(&path, 1);
+        let dot2 = numbered_sibling(&path, 2);
+        let dot3 = numbered_sibling(&path, 3);
+        for chunk in [&dot1, &dot2, &dot3] {
+            std::fs::write(chunk, format!("{}\n", dump_line(1))).unwrap();
+        }
+        std::fs::remove_file(&dot1).unwrap();
+
+        let chunks = ring_siblings(&path);
+
+        assert_eq!(
+            chunks,
+            vec![(2, dot2.clone()), (3, dot3.clone())],
+            ".2 and .3 must still be enumerated, ascending, with .1 gone"
+        );
+
+        let _ = std::fs::remove_file(&dot2);
+        let _ = std::fs::remove_file(&dot3);
+    }
+
+    /// The reader side of the same gap: `load_dump` must still fold the
+    /// orphaned chunks in, oldest first, rather than reading only the live
+    /// file.
+    #[test]
+    fn load_dump_reads_chunks_past_a_missing_number() {
+        let dir = std::env::temp_dir();
+        let n = std::process::id();
+        let path = dir.join(format!("bpsr-dump-format-test-gap-load-{n}.jsonl"));
+        let dot2 = numbered_sibling(&path, 2);
+        let dot3 = numbered_sibling(&path, 3);
+        std::fs::write(&dot3, format!("{}\n", dump_line(100))).unwrap();
+        std::fs::write(&dot2, format!("{}\n", dump_line(200))).unwrap();
+        std::fs::write(&path, format!("{}\n", dump_line(300))).unwrap();
+
+        let records = load_dump(&path).expect("live file must open");
+
+        assert_eq!(
+            records.iter().map(|r| r.ts_ms).collect::<Vec<_>>(),
+            vec![100, 200, 300],
+            "a vacant .1 must not stop the reader at the live file"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&dot2);
+        let _ = std::fs::remove_file(&dot3);
     }
 }
