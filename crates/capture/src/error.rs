@@ -23,6 +23,9 @@ pub enum DriverRejection {
     VersionConflict,
     /// `EPT_S_NOT_REGISTERED` — the Base Filtering Engine service is off.
     FilteringEngineDisabled,
+    /// `ERROR_SERVICE_DISABLED` — the WinDivert driver service's Startup
+    /// type is set to Disabled, so Windows refuses to start it.
+    ServiceDisabled,
 }
 
 impl DriverRejection {
@@ -50,6 +53,11 @@ impl DriverRejection {
             DriverRejection::FilteringEngineDisabled => {
                 "The Base Filtering Engine service is disabled. Start it (services.msc → \
                  Base Filtering Engine) and try again."
+            }
+            DriverRejection::ServiceDisabled => {
+                "The WinDivert driver service is disabled. Open services.msc, find WinDivert, \
+                 and set Startup type to Manual (or run `sc config WinDivert start= demand`), \
+                 then try again."
             }
         }
     }
@@ -89,6 +97,7 @@ mod codes {
     pub(crate) const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
     pub(crate) const ERROR_DRIVER_BLOCKED: i32 = 1275;
     pub(crate) const EPT_S_NOT_REGISTERED: i32 = 1753;
+    pub(crate) const ERROR_SERVICE_DISABLED: i32 = 1058;
 }
 
 pub(crate) use codes::*;
@@ -110,6 +119,7 @@ impl CaptureError {
             Some(ERROR_INVALID_IMAGE_HASH) => DriverRejection::InvalidSignature,
             Some(ERROR_DRIVER_FAILED_PRIOR_UNLOAD) => DriverRejection::VersionConflict,
             Some(EPT_S_NOT_REGISTERED) => DriverRejection::FilteringEngineDisabled,
+            Some(ERROR_SERVICE_DISABLED) => DriverRejection::ServiceDisabled,
             _ => return CaptureError::Open(err.to_string()),
         };
         CaptureError::DriverRejected(rejection)
@@ -176,6 +186,7 @@ mod tests {
                 DriverRejection::FilteringEngineDisabled,
             ),
             (ERROR_SERVICE_DOES_NOT_EXIST, DriverRejection::SysNotFound),
+            (ERROR_SERVICE_DISABLED, DriverRejection::ServiceDisabled),
         ];
         for (code, want) in cases {
             match classify(code) {
@@ -208,6 +219,7 @@ mod tests {
             DriverRejection::InvalidSignature,
             DriverRejection::VersionConflict,
             DriverRejection::FilteringEngineDisabled,
+            DriverRejection::ServiceDisabled,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {

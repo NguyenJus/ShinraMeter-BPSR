@@ -109,6 +109,10 @@ WinDivert. Close it, or reboot, and retry.
 **"The Base Filtering Engine service is disabled"** — start it via
 `services.msc` → Base Filtering Engine → Start.
 
+**"The WinDivert driver service is disabled"** — its Startup type was set to
+Disabled. Open `services.msc`, find WinDivert, and set Startup type to
+Manual (or run `sc config WinDivert start= demand`), then retry.
+
 **"Windows could not find the WinDivert driver file"** — the driver is
 unpacked to `%LOCALAPPDATA%\ShinraMeter-BPSR\windivert\<version>\` at
 startup and wasn't found there. Check that antivirus isn't quarantining it,
@@ -252,9 +256,11 @@ The binaries live in `crates/capture/vendor/windivert/`, taken verbatim from the
 - `SHINRA_NO_COMPOSITION=1` — force the legacy (non-DirectComposition)
   overlay presentation path, useful on RDP sessions or virtualized GPUs
   where the transparent window fails to paint.
-- `SHINRA_INSPECT` / `SHINRA_INSPECT_DUMP` — diagnostic packet-dump
-  tooling used to confirm new protocol constants against live traffic; off
-  by default. See `docs/packet-inspection.md`.
+- `SHINRA_INSPECT` / `SHINRA_INSPECT_DUMP` / `SHINRA_INSPECT_MAX_BYTES` —
+  diagnostic packet-dump tooling used to confirm new protocol constants
+  against live traffic; off by default. `SHINRA_INSPECT_MAX_BYTES`
+  overrides the dump ring's total byte budget (512 MiB default). See
+  `docs/packet-inspection.md`.
 - `SHINRA_DEMO=1` — seed a fixed synthetic encounter for UI work when no
   live game session is available.
 - `SHINRA_HISTORY_DB` — points the encounter-history database at a different

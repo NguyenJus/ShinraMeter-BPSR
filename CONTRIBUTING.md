@@ -18,7 +18,7 @@ output into an issue.** These can contain other players' character names and
 other traffic from your game session, and issues are public. If a log excerpt
 is genuinely needed to diagnose the bug, trim it down to the minimal relevant
 lines and redact any names that aren't your own. Never attach the log file or
-dump file itself (`ShinraMeter-BPSR.log`, `inspect/dump-<pid>.jsonl`).
+dump file itself (`ShinraMeter-BPSR.log`, `inspect/dump-<session_id>.jsonl`).
 
 The same goes for `%APPDATA%\ShinraMeter-BPSR\names.json` and
 `%APPDATA%\ShinraMeter-BPSR\history.sqlite`. The meter keeps a local cache of

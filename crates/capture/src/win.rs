@@ -341,6 +341,10 @@ fn recv_loop(
         None => Decoder::new(),
     };
     let mut consecutive_errors: u32 = 0;
+    // Finding 2 (pipeline-robustness audit): a stalled pipeline must not
+    // block this thread behind a full channel and back the kernel WinDivert
+    // queue up with it. See `crate::backpressure`.
+    let mut drop_counter = crate::backpressure::DropCounter::new();
 
     log::info!("capture: WinDivert sniff loop started on filter {FILTER:?}");
 
@@ -458,11 +462,23 @@ fn recv_loop(
             continue;
         }
         if decision.newly_adopted {
+            // issue #293: `decision.frame_offset` is the byte offset of the
+            // actual frame boundary `decide_packet` located within this
+            // payload (0 when the adopting evidence carried no such
+            // boundary — the login-return and subnet-reconnect paths).
+            // Resyncing to the packet's bare `seq` instead would start the
+            // decoder at whatever byte the game server happened to send
+            // first after adoption, which is only a frame boundary when
+            // capture observed the connection from its very start — not
+            // true for a mid-connection attach (issue #282).
+            let resync_seq = seq.wrapping_add(decision.frame_offset as u32);
             log::info!(
-                "capture: adopted game-server connection {conn} at seq={seq} ({} payload bytes)",
+                "capture: adopted game-server connection {conn} at seq={seq} \
+                 frame_offset={} ({} payload bytes)",
+                decision.frame_offset,
                 payload.len(),
             );
-            reassembler.resync(seq);
+            reassembler.resync(resync_seq);
             decoder.reset();
             monitor.note_adopted(conn);
             if tx.send(ProtocolEvent::ServerChanged).is_err() {
@@ -499,12 +515,22 @@ fn recv_loop(
         }
 
         for event in decoder.push_stream(&stream, now_ms()) {
-            if tx.send(event).is_err() {
-                log::error!(
-                    "capture: the protocol-event channel is closed (the pipeline thread is gone); \
-                     the capture loop is exiting"
-                );
-                return;
+            use crate::backpressure::SendOutcome;
+            match drop_counter.try_send(&tx, event, Instant::now()) {
+                SendOutcome::Sent => {}
+                SendOutcome::Dropped(Some(total)) => log::warn!(
+                    "capture: the protocol-event channel is full; dropped {total} event(s) in \
+                     the last ~{:?} (the pipeline is not keeping up)",
+                    crate::backpressure::LOG_INTERVAL,
+                ),
+                SendOutcome::Dropped(None) => {}
+                SendOutcome::Disconnected => {
+                    log::error!(
+                        "capture: the protocol-event channel is closed (the pipeline thread is \
+                         gone); the capture loop is exiting"
+                    );
+                    return;
+                }
             }
         }
     }

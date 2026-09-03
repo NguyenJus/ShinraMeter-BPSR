@@ -110,6 +110,16 @@ pub struct EnemyState {
     /// mid-pull still has a denominator to measure rollbacks against. It is
     /// monotonically non-decreasing and deliberately survives `Meter::reset`
     /// — the peak is a property of the entity, not of the encounter.
+    ///
+    /// Does *not* survive a `monster_id` change on the uid it is keyed
+    /// under, though (issue #317): `apply_enemy_hp` resets the whole
+    /// `EnemyState` when an existing uid reports a new `monster_id`,
+    /// because the game recycles uids onto new entities rather than
+    /// re-templating one live entity in place (`uid = uuid >> 16` puts
+    /// uid=1 at the very first slot ever allocated, and every curated
+    /// `phase.rs` group stays inside one id family) — a stale peak from the
+    /// previous occupant would otherwise understate every `pct()` reading
+    /// against the new entity's actual HP pool.
     pub peak_hp: Option<u64>,
     pub lowest_pct: Option<f64>,
     pub took_damage: bool,
@@ -134,6 +144,12 @@ pub struct EnemyState {
     /// signal that separates that boss from the one issue #157 is about,
     /// whose damage a mid-pull reset erased seconds ago; see
     /// `Meter::recompute_boss`.
+    ///
+    /// Also reset on a `monster_id` change on the uid it is keyed under
+    /// (issue #317), for the same uid-recycle reason `peak_hp` is: a
+    /// timestamp from the previous occupant's fight history would let a
+    /// corpse the party abandoned minutes ago read as "recently damaged"
+    /// the instant a new entity takes over its uid.
     pub last_damaged_ms: Option<u64>,
     /// When this enemy was observed dying during the current fight (issue
     /// #124), as a rank in the encounter's death order: `Some(1)` died
@@ -156,12 +172,26 @@ pub struct EnemyState {
     /// A bare flag would leave that tie to be broken on `max_hp`, which in a
     /// phased fight can name the *first* phase (issue #124's premise is that
     /// an earlier phase carries the larger pool).
+    ///
+    /// Also reset on a `monster_id` change on the uid it is keyed under
+    /// (issue #317): a recycled uid's previous occupant's death has nothing
+    /// to say about whether the new entity now sitting on that uid is
+    /// alive, and leaving it set would make `is_alive`/`recompute_boss`
+    /// treat a live new entity as a standing corpse.
     pub death_order: Option<u64>,
     /// Monster template id, from `EnemyHp::monster_id` (issue #9 slice 2).
     /// Survives `Meter::reset` like the rest of `EnemyState` — only a
     /// `ProtocolEvent::ServerChanged` clears the enemy map itself (uids are
     /// re-issued by the new server session, so entity state does not
     /// survive a reconnect the way display state does — issue #138).
+    ///
+    /// A *change* to this field is a different event from a reconnect,
+    /// though (issue #317): `apply_enemy_hp` treats an existing uid
+    /// reporting a new `monster_id` as that uid being recycled onto a new
+    /// entity, and resets the rest of `EnemyState` — `peak_hp`, `max_hp`,
+    /// `curr_hp`, `lowest_pct`, `took_damage`, `death_order`, and
+    /// `last_damaged_ms` — to a fresh entity's starting values before
+    /// applying that same packet's own HP fields.
     pub monster_id: Option<u32>,
 }
 

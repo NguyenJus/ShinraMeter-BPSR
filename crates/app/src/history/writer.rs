@@ -235,6 +235,7 @@ mod tests {
                 buffs: Vec::new(),
             }],
             encounter: EncounterInfo::default(),
+            capture_alive: true,
         };
         record_from_snapshot(&snapshot, 1_000, title.to_string(), None).unwrap()
     }
