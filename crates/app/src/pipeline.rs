@@ -1776,10 +1776,15 @@ mod tests {
                 1_000,
             );
 
-            // A new fight's first hit, 40ms later — still inside a single
-            // 100ms publish tick, and no `pipeline.tick()` call anywhere in
-            // this test.
-            pipeline.step(proto::ProtocolEvent::Damage(damage(1, 100, 1_040)), 1_040);
+            // A new fight's first hit, 40ms later, on an unrelated add
+            // (uid 999, never engaged by the fight that just ended) — still
+            // inside a single 100ms publish tick, and no `pipeline.tick()`
+            // call anywhere in this test. Issue #post-end-grace: a hit on
+            // the *same* dead target would be folded into the grace window
+            // instead of resetting (see `a_phase_resume_inside_the_grace_
+            // window_records_one_row`), so this must target a different uid
+            // to still exercise the no-tick reset-driven flush.
+            pipeline.step(hit_on(999, 100, 1_040, false), 1_040);
 
             let count = row_count(&handle);
             drop(handle);
