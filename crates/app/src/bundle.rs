@@ -30,6 +30,13 @@ use serde::Serialize;
 /// `logging::EXPORT_DEFAULT_FILENAME`.
 pub(crate) const EXPORT_BUNDLE_DEFAULT_DIRNAME: &str = "ShinraMeter-BPSR-session-bundle";
 
+/// The one file name a bundle never contains. [`build_manifest`] names it
+/// in [`Manifest::excluded`] *and* [`bundle_entries`] drops any source that
+/// carries it, so the manifest's claim is enforced by the code that builds
+/// the bundle rather than resting on every caller remembering not to hand
+/// the history database over.
+pub(crate) const HISTORY_FILE_NAME: &str = "history.sqlite";
+
 /// Why `history.sqlite` never appears in a bundle — surfaced verbatim in
 /// `manifest.json`'s `excluded` list so a reader never has to guess whether
 /// the omission was deliberate or a bug in the export.
@@ -67,6 +74,15 @@ pub struct Manifest {
     /// own "count if available" reporting).
     pub dropped_records: Option<u64>,
     pub excluded: Vec<ExcludedFile>,
+    /// Files the export was told to collect but couldn't copy — the name
+    /// each *would* have had inside the bundle. Empty when everything
+    /// landed. Filled in by [`export_bundle_to`] rather than
+    /// [`build_manifest`], since only the copy loop knows: a dump-ring
+    /// chunk listed by [`dump_ring_parts`] can be rotated away by the live
+    /// writer thread between the listing and the copy, and a bundle that
+    /// silently came up a file short is exactly the thing a reader must not
+    /// have to guess at.
+    pub missing: Vec<String>,
 }
 
 /// Builds `manifest.json`'s contents — pure, so it's unit-tested without
@@ -91,9 +107,11 @@ pub fn build_manifest(
             None
         },
         excluded: vec![ExcludedFile {
-            name: "history.sqlite".to_string(),
+            name: HISTORY_FILE_NAME.to_string(),
             reason: HISTORY_EXCLUSION_REASON.to_string(),
         }],
+        // Only `export_bundle_to`'s copy loop can know this.
+        missing: Vec::new(),
     }
 }
 
@@ -123,27 +141,26 @@ pub fn started_at_from_session_id(session_id: &str) -> u64 {
 /// `dump_path` itself (the live chunk) last — if it exists. Mirrors
 /// `dump_format::load_dump`'s own chronological order, so a bundle's dump
 /// files read back the same way that reader expects. Touches the
-/// filesystem (existence checks only) — unlike [`build_manifest`] and
-/// [`bundle_entries`], this isn't a pure function.
+/// filesystem — unlike [`build_manifest`] and [`bundle_entries`], this
+/// isn't a pure function.
+///
+/// Enumeration is `dump_format::ring_siblings`, the one implementation the
+/// writer (`crate::dump`) and the reader (`dump_format::load_dump`) also
+/// use: a bundle must hand over exactly the chunks those two consider part
+/// of the ring, gap in the numbering included.
 pub fn dump_ring_parts(dump_path: &Path) -> Vec<PathBuf> {
-    let mut numbered = Vec::new();
-    let mut n = 1;
-    loop {
-        let candidate = bpsr_protocol::dump_format::numbered_sibling(dump_path, n);
-        if !candidate.exists() {
-            break;
-        }
-        numbered.push(candidate);
-        n += 1;
-    }
-    // Collected ascending by `n` (newest-rotated first); reversed so the
-    // oldest (highest `n`) chunk comes first, matching `dump_format::
-    // load_dump`'s read order.
-    numbered.reverse();
+    // `ring_siblings` is ascending by `n` (`.1`, the newest rotated chunk,
+    // first); reversed so the oldest (highest `n`) chunk comes first,
+    // matching `dump_format::load_dump`'s read order.
+    let mut parts: Vec<PathBuf> = bpsr_protocol::dump_format::ring_siblings(dump_path)
+        .into_iter()
+        .rev()
+        .map(|(_, chunk)| chunk)
+        .collect();
     if dump_path.exists() {
-        numbered.push(dump_path.to_path_buf());
+        parts.push(dump_path.to_path_buf());
     }
-    numbered
+    parts
 }
 
 /// Maps every source file a bundle export should collect to the name it
@@ -154,6 +171,13 @@ pub fn dump_ring_parts(dump_path: &Path) -> Vec<PathBuf> {
 /// skipped rather than panicking — pure and side-effect-free (no existence
 /// check, no IO), so it's unit-tested with made-up paths that don't need to
 /// exist on disk.
+///
+/// A source named [`HISTORY_FILE_NAME`] is dropped here (with a warning),
+/// whatever directory it came from: `manifest.json` states that file is
+/// excluded, and this is what makes that statement true no matter how a
+/// caller assembled `log_parts`/`dump_parts`/`settings_path`. Enforcing it
+/// at the single point every source funnels through beats trusting each
+/// call site.
 pub fn bundle_entries(
     log_parts: &[PathBuf],
     dump_parts: &[PathBuf],
@@ -168,6 +192,16 @@ pub fn bundle_entries(
             path.file_name()
                 .map(|name| (name.to_string_lossy().into_owned(), path.to_path_buf()))
         })
+        .filter(|(name, path)| {
+            if name == HISTORY_FILE_NAME {
+                log::warn!(
+                    "session bundle: refusing to include {} — {HISTORY_EXCLUSION_REASON}",
+                    path.display()
+                );
+                return false;
+            }
+            true
+        })
         .collect()
 }
 
@@ -180,12 +214,22 @@ pub fn bundle_entries(
 /// since a partial bundle is still useful to whoever's debugging it.
 /// `Err` only when `dest_dir` itself can't be created or `manifest.json`
 /// can't be written — those leave nothing worth handing over at all.
+///
+/// Every skipped entry's bundle name is recorded in the written manifest's
+/// [`Manifest::missing`] list *and* returned, so neither a reader of the
+/// folder nor the caller's status line has to diff `entries` against the
+/// directory to notice. That matters most for the dump ring: the writer
+/// thread keeps rotating while this copies, so a chunk
+/// [`dump_ring_parts`] listed can be renamed out from under `fs::copy`
+/// milliseconds later, and "the bundle is one chunk short" is a very
+/// different thing to hand a debugger than "the ring was that short".
 pub fn export_bundle_to(
     dest_dir: &Path,
     entries: &[(String, PathBuf)],
     manifest: &Manifest,
-) -> io::Result<()> {
+) -> io::Result<Vec<String>> {
     fs::create_dir_all(dest_dir)?;
+    let mut missing = Vec::new();
     for (name, source) in entries {
         let dest = dest_dir.join(name);
         if let Err(err) = fs::copy(source, &dest) {
@@ -194,12 +238,20 @@ pub fn export_bundle_to(
                 source.display(),
                 dest.display()
             );
+            missing.push(name.clone());
         }
     }
-    let json = serde_json::to_string_pretty(manifest)
+    // The manifest handed in was built before the copies ran, so it can't
+    // know what didn't land: written out with this run's failures folded
+    // in, leaving the caller's copy untouched.
+    let manifest = Manifest {
+        missing: missing.clone(),
+        ..manifest.clone()
+    };
+    let json = serde_json::to_string_pretty(&manifest)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
     fs::write(dest_dir.join("manifest.json"), json)?;
-    Ok(())
+    Ok(missing)
 }
 
 #[cfg(test)]
@@ -266,10 +318,20 @@ mod tests {
         assert_eq!(started_at_from_session_id("4242-1700000000"), 1_700_000_000);
     }
 
+    /// The parse is "whatever follows the *last* dash", so an id that
+    /// isn't shaped like `<pid>-<secs>` at all still yields its trailing
+    /// numeric segment rather than the epoch. Documented because it's the
+    /// reason the fallback below needs an id with no numeric tail to
+    /// exercise it.
     #[test]
-    fn started_at_from_session_id_falls_back_to_zero_for_a_malformed_id() {
+    fn started_at_from_session_id_parses_a_trailing_numeric_segment_of_an_odd_id() {
         assert_eq!(started_at_from_session_id("not-a-session-id-42"), 42);
+    }
+
+    #[test]
+    fn started_at_from_session_id_falls_back_to_zero_without_a_numeric_tail() {
         assert_eq!(started_at_from_session_id("nodash"), 0);
+        assert_eq!(started_at_from_session_id("1234-notanumber"), 0);
     }
 
     // -- bundle_entries (pure) --------------------------------------------
@@ -329,6 +391,25 @@ mod tests {
         assert!(bundle_entries(&[], &[], None).is_empty());
     }
 
+    /// The manifest promises `history.sqlite` is excluded; this is the
+    /// guard that makes the promise structural rather than a convention
+    /// every caller has to remember.
+    #[test]
+    fn bundle_entries_refuses_a_history_database_from_any_source_list() {
+        let entries = bundle_entries(
+            &[
+                PathBuf::from("/appdata/history.sqlite"),
+                PathBuf::from("/logs/a.log"),
+            ],
+            &[PathBuf::from("/elsewhere/history.sqlite")],
+            Some(Path::new("/appdata/history.sqlite")),
+        );
+        assert_eq!(
+            entries,
+            vec![("a.log".to_string(), PathBuf::from("/logs/a.log"))]
+        );
+    }
+
     // -- dump_ring_parts (touches disk) ------------------------------------
 
     fn temp_dump_path(tag: &str) -> PathBuf {
@@ -359,6 +440,25 @@ mod tests {
         let _ = fs::remove_file(&dot2);
     }
 
+    /// Shares `dump_format::ring_siblings` with the writer and the
+    /// replay reader, so a hole in the numbering (a failed rotation, a
+    /// hand-deleted chunk) doesn't orphan everything past it — the bundle
+    /// hands over exactly the chunks those two still consider live.
+    #[test]
+    fn dump_ring_parts_still_collects_chunks_past_a_gap_in_the_numbering() {
+        let path = temp_dump_path("gap");
+        let dot2 = bpsr_protocol::dump_format::numbered_sibling(&path, 2);
+        fs::write(&dot2, "oldest").unwrap();
+        fs::write(&path, "newest").unwrap();
+
+        let parts = dump_ring_parts(&path);
+
+        assert_eq!(parts, vec![dot2.clone(), path.clone()]);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&dot2);
+    }
+
     #[test]
     fn dump_ring_parts_is_empty_when_nothing_exists_yet() {
         let path = temp_dump_path("nothing-yet");
@@ -383,14 +483,94 @@ mod tests {
         let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None);
         let entries = vec![("session.log".to_string(), source.clone())];
 
-        export_bundle_to(&dir, &entries, &manifest).unwrap();
+        let missing = export_bundle_to(&dir, &entries, &manifest).unwrap();
 
+        assert!(missing.is_empty());
         assert_eq!(fs::read(dir.join("session.log")).unwrap(), b"log contents");
         let manifest_json = fs::read_to_string(dir.join("manifest.json")).unwrap();
         assert!(manifest_json.contains("\"session_id\": \"1-1700000000\""));
         assert!(manifest_json.contains("history.sqlite"));
+        assert!(manifest_json.contains("\"missing\": []"));
 
         let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The TOCTOU the dump ring makes real: the writer thread can rotate a
+    /// chunk away between `dump_ring_parts` listing it and `fs::copy`
+    /// reaching it. The export still succeeds (a partial bundle beats no
+    /// bundle), but says which file it came up short.
+    #[test]
+    fn export_bundle_to_reports_a_source_deleted_mid_export_in_the_manifest() {
+        let dir = std::env::temp_dir().join(format!(
+            "ShinraMeter-BPSR-bundle-export-toctou-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let kept = temp_dump_path("toctou-kept");
+        let evicted = temp_dump_path("toctou-evicted");
+        fs::write(&kept, b"live chunk").unwrap();
+        fs::write(&evicted, b"about to be rotated away").unwrap();
+
+        let entries = vec![
+            ("dump.jsonl".to_string(), kept.clone()),
+            ("dump.jsonl.1".to_string(), evicted.clone()),
+        ];
+        // Stands in for the writer thread rotating the chunk out from
+        // under the export after `dump_ring_parts` listed it.
+        fs::remove_file(&evicted).unwrap();
+
+        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, true, 100, Some(0));
+        let missing = export_bundle_to(&dir, &entries, &manifest).unwrap();
+
+        assert_eq!(missing, vec!["dump.jsonl.1".to_string()]);
+        assert_eq!(fs::read(dir.join("dump.jsonl")).unwrap(), b"live chunk");
+        assert!(!dir.join("dump.jsonl.1").exists());
+        let manifest_json = fs::read_to_string(dir.join("manifest.json")).unwrap();
+        assert!(
+            manifest_json.contains("\"dump.jsonl.1\""),
+            "manifest should name the file it couldn't copy: {manifest_json}"
+        );
+
+        let _ = fs::remove_file(&kept);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// End to end over the two functions the UI actually calls: a
+    /// `history.sqlite` handed in as a log part never reaches the bundle
+    /// directory, and the manifest still explains why it isn't there.
+    #[test]
+    fn export_never_copies_a_history_database_but_still_lists_it_as_excluded() {
+        let dir = std::env::temp_dir().join(format!(
+            "ShinraMeter-BPSR-bundle-export-history-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let history_dir = std::env::temp_dir().join(format!(
+            "ShinraMeter-BPSR-bundle-history-source-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&history_dir).unwrap();
+        let history = history_dir.join(HISTORY_FILE_NAME);
+        fs::write(&history, b"plaintext party member names").unwrap();
+        let log = history_dir.join("session.log");
+        fs::write(&log, b"log contents").unwrap();
+
+        let entries = bundle_entries(&[history.clone(), log.clone()], &[], None);
+        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None);
+        let missing = export_bundle_to(&dir, &entries, &manifest).unwrap();
+
+        assert!(missing.is_empty());
+        assert!(
+            !dir.join(HISTORY_FILE_NAME).exists(),
+            "the history database must never land in a bundle"
+        );
+        assert!(dir.join("session.log").exists());
+        let manifest_json = fs::read_to_string(dir.join("manifest.json")).unwrap();
+        assert!(manifest_json.contains(HISTORY_FILE_NAME));
+        assert!(manifest_json.contains(HISTORY_EXCLUSION_REASON));
+
+        let _ = fs::remove_dir_all(&history_dir);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -408,8 +588,9 @@ mod tests {
         let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, true, 100, Some(0));
         let entries = vec![("dump.jsonl".to_string(), missing)];
 
-        export_bundle_to(&dir, &entries, &manifest).unwrap();
+        let missing_names = export_bundle_to(&dir, &entries, &manifest).unwrap();
 
+        assert_eq!(missing_names, vec!["dump.jsonl".to_string()]);
         assert!(!dir.join("dump.jsonl").exists());
         assert!(dir.join("manifest.json").exists());
 

@@ -1431,10 +1431,14 @@ impl OverlayApp {
     /// same one the Share clipboard failure uses) as well as the log: the
     /// log-only reporting this used to do told a user whose export silently
     /// produced nothing exactly nothing, in the one situation where they
-    /// are already trying to hand over a log. A success is logged only —
-    /// `StatusLine` has no non-error state to say it with, and the
+    /// are already trying to hand over a log. A clean success is logged
+    /// only — `StatusLine` has no non-error state to say it with, and the
     /// file/folder appearing where the user just chose to put it is its own
-    /// feedback.
+    /// feedback. A bundle that landed but couldn't copy every file
+    /// (`bundle::export_bundle_to`'s missing list — a dump chunk the writer
+    /// rotated away mid-export, say) does use the banner: it looks
+    /// identical to a clean export on disk, so nothing else would tell the
+    /// user their handover is short.
     fn poll_log_export(&mut self, now: Instant) {
         // Collected before the loop rather than iterated in place: the
         // failure arm below needs `&mut self`, which a live borrow of
@@ -1442,7 +1446,25 @@ impl OverlayApp {
         let landed: Vec<LogExportOutcome> = self.rx_log_export.try_iter().collect();
         for outcome in landed {
             match outcome {
-                Ok(dest) => log::info!("export finished: {}", dest.display()),
+                Ok((dest, missing)) if missing.is_empty() => {
+                    log::info!("export finished: {}", dest.display())
+                }
+                // A bundle that came up short still landed, so this is not
+                // an "Export failed" — but it must not pass silently
+                // either: the whole point of a bundle is that whoever
+                // receives it can tell what's in it.
+                Ok((dest, missing)) => {
+                    log::warn!(
+                        "export finished with {} missing file(s) ({}): {}",
+                        missing.len(),
+                        missing.join(", "),
+                        dest.display()
+                    );
+                    self.raise_transient_status(
+                        format!("Bundle exported with {} missing file(s)", missing.len()),
+                        now,
+                    );
+                }
                 Err((dest, err)) => {
                     log::warn!("export to {} failed: {err}", dest.display());
                     self.raise_transient_status(format!("Export failed: {err}"), now);
@@ -5260,11 +5282,14 @@ fn start_update_install(available: CheckOutcome) -> UpdateCheckState {
 }
 
 /// What one "Export logs" thread reports back (issue #220): the
-/// destination it finished writing, or that destination plus why it
-/// couldn't. The destination rides along on the failure too so
+/// destination it finished writing plus the bundle names it couldn't copy
+/// (always empty for "Export logs", which has no per-entry reporting —
+/// only "Export session bundle" can come up short, see
+/// `bundle::export_bundle_to`), or that destination plus why it couldn't.
+/// The destination rides along on the failure too so
 /// `OverlayApp::poll_log_export` can name it in the log line — by the time
 /// a reply lands, the click that chose it is long gone.
-type LogExportOutcome = Result<PathBuf, (PathBuf, String)>;
+type LogExportOutcome = Result<(PathBuf, Vec<String>), (PathBuf, String)>;
 
 /// Starts a log export (issue #220, PR #227 review): spawns a one-shot
 /// `std::thread` that bundles the log files into `dest` and sends the
@@ -5287,7 +5312,7 @@ fn start_log_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
         .spawn(move || {
             let (log_path, _warning) = crate::logging::log_file_path();
             let outcome = match crate::logging::export_logs_to(&log_path, &dest) {
-                Ok(()) => Ok(dest),
+                Ok(()) => Ok((dest, Vec::new())),
                 Err(err) => Err((dest, err.to_string())),
             };
             // A dropped receiver means the app is shutting down; the export
@@ -5338,7 +5363,7 @@ fn start_bundle_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
             );
 
             let outcome = match bundle::export_bundle_to(&dest, &entries, &manifest) {
-                Ok(()) => Ok(dest),
+                Ok(missing) => Ok((dest, missing)),
                 Err(err) => Err((dest, err.to_string())),
             };
             // A dropped receiver means the app is shutting down; the export
@@ -9904,13 +9929,28 @@ mod tests {
         let now = Instant::now();
         let dest = PathBuf::from("exported-logs.log");
 
-        app.tx_log_export.send(Ok(dest.clone())).unwrap();
+        app.tx_log_export
+            .send(Ok((dest.clone(), Vec::new())))
+            .unwrap();
         app.poll_log_export(now);
         assert_eq!(
             app.status,
             StatusLine::Ok,
             "an export that worked must not raise a banner"
         );
+
+        // A bundle that landed but came up short: not a failure, but the
+        // folder looks identical to a clean one, so it must still say so.
+        app.tx_log_export
+            .send(Ok((dest.clone(), vec!["dump.jsonl.1".to_owned()])))
+            .unwrap();
+        app.poll_log_export(now);
+        assert!(
+            matches!(&app.status, StatusLine::Error(msg) if msg.contains("1 missing file")),
+            "an export missing a file must say how many on the banner: {:?}",
+            app.status
+        );
+        app.expire_transient_status(now + TRANSIENT_STATUS_LINGER);
 
         app.tx_log_export
             .send(Err((dest, "permission denied".to_owned())))
