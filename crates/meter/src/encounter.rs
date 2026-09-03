@@ -701,6 +701,14 @@ impl Meter {
     /// packet stamped a moment before the fight actually ended is exactly
     /// the case this exists for, not an edge case to exclude.
     ///
+    /// **Inclusive at the far edge too**: `end_ms + post_end_grace_ms`
+    /// itself is still inside the window. `bpsr_app`'s history recorder
+    /// (`Pipeline::record_fight_end`) shares that convention from the other
+    /// side, treating the window as closed only once `now` is *strictly
+    /// past* that instant — otherwise it would flush a record while this
+    /// was still folding packets into the fight it describes. Change one
+    /// and the other has to change with it.
+    ///
     /// Only the timestamp half of the grace test: safe as-is for
     /// `apply_cast`/`apply_buff_apply`/`apply_buff_remove`, none of which
     /// can trigger the `NewFight` reset regardless of what they target (a
@@ -852,6 +860,21 @@ impl Meter {
     /// and on nothing else.
     pub fn fight_end_ms(&self) -> Option<u64> {
         self.fight_end_ms
+    }
+
+    /// When the currently-running (or currently-held) fight started, in the
+    /// same event-clock milliseconds as [`Self::fight_end_ms`] — `None` when
+    /// no fight has begun since the last reset.
+    ///
+    /// Stable for the whole life of one fight, *including across a phase
+    /// resume*: [`Self::resumes_held_fight`] deliberately leaves it alone
+    /// (issue #124), while a `ResetReason::NewFight` moves it and a reset
+    /// clears it. That makes it the identity of "this fight" for callers
+    /// that have to tell a resumed fight from a brand-new one —
+    /// `bpsr_app::pipeline::Pipeline::record_fight_end` is exactly that
+    /// caller.
+    pub fn fight_start_ms(&self) -> Option<u64> {
+        self.fight_start_ms
     }
 
     /// Advances wall-clock-driven fight state and returns the resulting

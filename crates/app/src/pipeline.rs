@@ -226,23 +226,32 @@ pub struct Pipeline {
     /// (`crates/meter/src/encounter.rs`) — a nine-second post-fight freeze
     /// produces ~90 consecutive `Ended` ticks and must produce one row.
     fight_end_recorded: bool,
-    /// The record `record_fight_end` would send to history *right now*,
-    /// rebuilt on every `Ended` tick while `Meter::fight_config`'s
-    /// `post_end_grace_ms` window is still open on the current fight (issue
-    /// #post-end-grace).
+    /// The record `record_fight_end` captured when the current fight ended,
+    /// held back until `Meter::fight_config`'s `post_end_grace_ms` window
+    /// has closed on it (issue #post-end-grace).
     ///
     /// Needed because the meter keeps folding trailing packets into an
     /// ended fight's stats for that whole window
     /// (`bpsr_meter::encounter::Meter::apply_damage_grace`), but the very
     /// first `Ended` tick used to record history immediately — racing every
-    /// one of them. Delaying the actual send until the window closes fixes
-    /// that; caching the latest built record here (rather than just
-    /// delaying the whole build) is what lets a hold that ends *early* —
-    /// a scene change or manual reset landing inside the window, before it
-    /// would otherwise have closed — still flush whatever grace-window
-    /// stats it picked up instead of losing the encounter outright. `None`
-    /// once flushed (or if the fight has no history to build at all).
+    /// one of them. The record actually sent is rebuilt at the moment the
+    /// window closes, so it carries those packets; this cached copy exists
+    /// for the case where the hold ends *early* — a scene change, a manual
+    /// reset, or the next pull's first hit landing inside the window —
+    /// after which the meter no longer holds the fight's rows at all and
+    /// this is the only copy left. `None` once flushed, once discarded (see
+    /// `settle_pending_fight_end`), or if the fight had no history worth
+    /// building.
     pending_fight_end: Option<history::EncounterRecord>,
+    /// `Meter::fight_start_ms` as it was when `pending_fight_end` was
+    /// captured, and `None` whenever nothing is pending.
+    ///
+    /// The one signal that separates "the held fight resumed" (issue #124's
+    /// phase resume, which keeps the fight clock and therefore this value)
+    /// from "a new fight started, or the meter was reset" (both of which
+    /// move or clear it) on the `Ended -> non-Ended` edge. See
+    /// `record_fight_end`'s "Leaving `Ended` early".
+    held_fight_start_ms: Option<u64>,
 }
 
 impl Pipeline {
@@ -253,6 +262,7 @@ impl Pipeline {
             history: None,
             fight_end_recorded: false,
             pending_fight_end: None,
+            held_fight_start_ms: None,
         }
     }
 
@@ -269,6 +279,7 @@ impl Pipeline {
             history: None,
             fight_end_recorded: false,
             pending_fight_end: None,
+            held_fight_start_ms: None,
         }
     }
 
@@ -356,39 +367,75 @@ impl Pipeline {
     /// enqueues them on an unbounded channel, then returns. Every failure past
     /// that point is the history thread's to log and swallow.
     ///
-    /// Builds its own full (never `skill_focus`-gated) snapshot internally
-    /// rather than taking one from the caller (PR #268 review, finding 2):
-    /// the live publish loop's own snapshot may have skipped the
-    /// heals/dealt/received/casts breakdown for players with no skill
-    /// window open, and a saved history record must never carry that gap.
-    ///
     /// Issue #post-end-grace: does **not** send to history on the first
     /// `Ended` tick any more. `Meter::apply` keeps folding trailing packets
     /// into an ended fight's stats for
     /// `Meter::fight_config().post_end_grace_ms` after `fight_end_ms` — if
     /// this sent immediately, the saved row would race that window and
     /// routinely miss the tail of the fight it is supposed to capture (the
-    /// very packets the grace window exists to keep). So the record is
-    /// rebuilt on every `Ended` tick, and only actually sent once the
-    /// window has closed — via `flush_pending_fight_end`, which the `state
-    /// != Ended` branch below also calls, so a hold that ends *early* (a
-    /// scene change or manual reset landing inside the window) still gets
-    /// whatever grace-window stats it picked up recorded, rather than
-    /// silently dropped. Chosen over re-recording an already-sent row
+    /// very packets the grace window exists to keep). So nothing goes out
+    /// until the window has closed, and the record that does go out is
+    /// built *then*, from a meter that has already absorbed every trailing
+    /// packet. Chosen over re-recording an already-sent row
     /// (`crates/app/src/history` has no update-by-id request, only
     /// `Record`/`Delete`/`Clear`) as the simpler of the two options the
     /// grace window's design left open.
     ///
-    /// Rebuilding the record every tick the window is open costs a handful
-    /// of extra snapshot builds per fight (the window is a couple of
-    /// seconds at 10 ticks/second) — negligible next to `snapshot`'s
-    /// existing ~10Hz publish cost, and this only runs the extra
-    /// `Meter::snapshot` at all while a fight is actually held — the
-    /// `fight_end_recorded` latch turns every tick after the flush into an
-    /// early return before reaching it.
+    /// # Window boundary
+    ///
+    /// The window counts as closed once `now_ms - ended_at_ms` is
+    /// **strictly greater than** `post_end_grace_ms`, because the meter's
+    /// own test (`bpsr_meter::encounter::Meter::in_post_end_grace_window`)
+    /// is inclusive: a packet stamped exactly `ended_at_ms +
+    /// post_end_grace_ms` still gets folded in. Flushing at `==` would race
+    /// that last millisecond — precisely the bug this defers for. The two
+    /// sides share one convention deliberately; the meter's doc comment
+    /// points back here.
+    ///
+    /// # Cost
+    ///
+    /// One `Meter::snapshot` per fight end in the common case: an
+    /// idle-timeout end is already `idle_timeout_ms` (9s stock) past
+    /// `fight_end_ms` the first tick it is observed, i.e. long past the 2s
+    /// grace window, so it takes the flush path straight away. At most two
+    /// for a boss-death end genuinely observed inside the window — one to
+    /// capture the pending record, one to rebuild it when the window
+    /// closes. Every tick in between does no snapshot work at all, and a
+    /// pipeline with no history handle (`Pipeline::new()`, most tests)
+    /// returns before touching the meter (PR #333 review, finding 1).
+    ///
+    /// # Leaving `Ended` early
+    ///
+    /// Two very different things flip the state away from `Ended` before
+    /// the window closes, and `settle_pending_fight_end` tells them apart
+    /// by `Meter::fight_start_ms`:
+    ///
+    /// * **The held fight resumed.** A phase-2 boss taking its first hit
+    ///   clears `fight_end_ms` and keeps the fight clock running
+    ///   (`bpsr_meter::encounter::Meter::resumes_held_fight`, issue #124):
+    ///   the *same* fight is still going, so `fight_start_ms` is unchanged.
+    ///   The pending record covers phase 1 only, so sending it would write
+    ///   a truncated row now and a second, complete row when the fight
+    ///   really ends. It is discarded instead (PR #333 review, finding 2).
+    /// * **A new fight started, or the meter was reset.** `fight_start_ms`
+    ///   moved (a `ResetReason::NewFight`) or went away (a scene change or
+    ///   manual reset). The old fight really is over and the meter no
+    ///   longer holds its rows, so the pending record is the only copy left
+    ///   — it gets flushed rather than dropped.
+    ///
+    /// A resume landing *after* the record has already gone out is out of
+    /// scope here (stock `phase_resume_window_ms` is 60s against a 2s
+    /// grace, so that ordering is the common one): un-writing a row would
+    /// need an update-by-id request the history thread does not have.
     pub fn record_fight_end(&mut self, state: meter::FightState, now_ms: u64) {
+        // No history handle means no history writes at all, so skip the
+        // snapshot work rather than building records ~10 times a second for
+        // `flush_pending_fight_end` to throw away.
+        if self.history.is_none() {
+            return;
+        }
         if state != meter::FightState::Ended {
-            self.flush_pending_fight_end();
+            self.settle_pending_fight_end();
             self.fight_end_recorded = false;
             return;
         }
@@ -398,17 +445,57 @@ impl Pipeline {
         let Some(ended_at_ms) = self.meter.fight_end_ms() else {
             return;
         };
-        let snapshot = self.meter.snapshot(now_ms);
-        let title = encounter_title(&snapshot.encounter);
-        let subtitle = encounter_subtitle(&snapshot.encounter);
-        self.pending_fight_end =
-            history::record_from_snapshot(&snapshot, ended_at_ms, title, subtitle);
         let grace_ms = self.meter.fight_config().post_end_grace_ms;
-        if now_ms.saturating_sub(ended_at_ms) < grace_ms {
+        if now_ms.saturating_sub(ended_at_ms) <= grace_ms {
+            // Still inside the window. Capture the fight exactly once, so a
+            // hold cut short before the window closes still has something
+            // to flush, then leave every later tick alone.
+            if self.held_fight_start_ms.is_none() {
+                self.held_fight_start_ms = self.meter.fight_start_ms();
+                self.pending_fight_end = self.build_fight_end_record(now_ms, ended_at_ms);
+            }
             return;
         }
         self.fight_end_recorded = true;
+        self.held_fight_start_ms = None;
+        self.pending_fight_end = self.build_fight_end_record(now_ms, ended_at_ms);
         self.flush_pending_fight_end();
+    }
+
+    /// Builds the history record for a fight that ended at `ended_at_ms`,
+    /// or `None` when there is nothing worth saving (no rows, no damage).
+    ///
+    /// Builds its own full (never `skill_focus`-gated) snapshot rather than
+    /// taking one from the caller (PR #268 review, finding 2): the live
+    /// publish loop's own snapshot may have skipped the
+    /// heals/dealt/received/casts breakdown for players with no skill
+    /// window open, and a saved history record must never carry that gap.
+    fn build_fight_end_record(
+        &self,
+        now_ms: u64,
+        ended_at_ms: u64,
+    ) -> Option<history::EncounterRecord> {
+        let snapshot = self.meter.snapshot(now_ms);
+        let title = encounter_title(&snapshot.encounter);
+        let subtitle = encounter_subtitle(&snapshot.encounter);
+        history::record_from_snapshot(&snapshot, ended_at_ms, title, subtitle)
+    }
+
+    /// Decides what happens to `pending_fight_end` when the state leaves
+    /// `FightState::Ended` before the grace window closed: flushed if the
+    /// fight is genuinely over, discarded if the very same fight resumed.
+    /// See `record_fight_end`'s "Leaving `Ended` early" for why those two
+    /// must not be treated alike.
+    fn settle_pending_fight_end(&mut self) {
+        let resumed = self
+            .held_fight_start_ms
+            .take()
+            .is_some_and(|started_at| self.meter.fight_start_ms() == Some(started_at));
+        if resumed {
+            self.pending_fight_end = None;
+        } else {
+            self.flush_pending_fight_end();
+        }
     }
 
     /// Sends `pending_fight_end` to history, if there is one queued and it
@@ -1240,14 +1327,51 @@ mod tests {
             }
         }
 
-        /// Lists the history back and returns how many rows it holds.
-        fn row_count(handle: &HistoryHandle) -> usize {
+        /// Lists the history back, newest first.
+        fn list_rows(handle: &HistoryHandle) -> Vec<history::EncounterSummary> {
             let (reply_tx, reply_rx) = crossbeam_channel::unbounded();
             handle.list(10, &reply_tx);
             match reply_rx.recv().unwrap() {
-                HistoryEvent::Listed(rows) => rows.len(),
+                HistoryEvent::Listed(rows) => rows,
                 other => panic!("expected Listed, got {other:?}"),
             }
+        }
+
+        /// Lists the history back and returns how many rows it holds.
+        fn row_count(handle: &HistoryHandle) -> usize {
+            list_rows(handle).len()
+        }
+
+        /// A player hit on monster `target_uid`, optionally the killing
+        /// blow. The module-level `damage` helper is pinned to one target
+        /// uid; the phase tests need two distinct boss entities.
+        fn hit_on(target_uid: i64, value: i64, ts: u64, is_dead: bool) -> proto::ProtocolEvent {
+            proto::ProtocolEvent::Damage(proto::DamageEvent {
+                target_uid,
+                is_dead,
+                ..damage(1, value, ts)
+            })
+        }
+
+        /// The `EnemyHp` that names `uid` as monster template `monster_id` —
+        /// the only way the meter ever learns an entity is a boss, and so a
+        /// prerequisite for both the boss-death end and the phase grouping.
+        fn boss_appear(
+            uid: i64,
+            monster_id: u32,
+            curr: u64,
+            max: u64,
+            ts: u64,
+        ) -> proto::ProtocolEvent {
+            proto::ProtocolEvent::EnemyHp(proto::EnemyHp {
+                uid,
+                curr_hp: Some(curr),
+                max_hp: Some(max),
+                monster_id: Some(monster_id),
+                timestamp_ms: ts,
+                position: None,
+                target_position: None,
+            })
         }
 
         #[test]
@@ -1300,8 +1424,16 @@ mod tests {
             pipeline.record_fight_end(state, ended_at + grace - 1);
             assert_eq!(row_count(&handle), 0, "must not race the grace window");
 
-            // The window has now closed: the deferred record goes out.
+            // The far edge is still *inside* the window: the meter's
+            // `in_post_end_grace_window` is inclusive there, so a packet
+            // stamped exactly here is still folded in and the record must
+            // not go out yet (PR #333 review, finding 4).
             pipeline.record_fight_end(state, ended_at + grace);
+            assert_eq!(row_count(&handle), 0, "the far edge is inclusive");
+
+            // One millisecond later the window really is closed: the
+            // deferred record goes out.
+            pipeline.record_fight_end(state, ended_at + grace + 1);
 
             let count = row_count(&handle);
             drop(handle);
@@ -1310,6 +1442,97 @@ mod tests {
             let _ = std::fs::remove_file(&path);
 
             assert_eq!(count, 1);
+        }
+
+        /// Issues #124/#316 x #post-end-grace: a phase-1 boss dying, one
+        /// `Ended` tick observed inside the grace window, and then the
+        /// phase-2 boss's first hit resuming the *same* fight, must leave
+        /// exactly one history row covering both phases — not the pending
+        /// phase-1-only row plus a complete one (PR #333 review, finding 2).
+        #[test]
+        fn a_phase_resume_inside_the_grace_window_records_one_row() {
+            /// Dragonbane Golem - Right Cannon and - Left Cannon: two
+            /// phases of one curated fight
+            /// (`bpsr_meter::phase::BOSS_PHASE_GROUPS`).
+            const RIGHT_CANNON: u32 = 103_110;
+            const LEFT_CANNON: u32 = 103_111;
+
+            let path = temp_history_path("pipeline-phase-resume-grace");
+            let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+            let mut pipeline = Pipeline::new().with_history(handle.clone());
+            let grace = pipeline.meter.fight_config().post_end_grace_ms;
+
+            // Phase 1: 100 damage, then the cannon dies at 2_000.
+            pipeline.step(boss_appear(10, RIGHT_CANNON, 900, 1_000, 1_000), 1_000);
+            pipeline.step(hit_on(10, 100, 1_000, false), 1_000);
+            pipeline.step(hit_on(10, 100, 2_000, true), 2_000);
+            let state = pipeline.tick(2_100);
+            assert_eq!(state, meter::FightState::Ended, "the kill ends the fight");
+            assert_eq!(pipeline.meter.fight_end_ms(), Some(2_000));
+
+            // One `Ended` tick well inside the grace window: the record is
+            // captured but nothing goes out.
+            pipeline.record_fight_end(state, 2_100);
+            assert_eq!(row_count(&handle), 0, "must not race the grace window");
+            assert!(pipeline.pending_fight_end.is_some(), "captured, not sent");
+
+            // Phase 2 spawns and takes its first hit, still inside the
+            // grace window: the held fight resumes rather than restarting.
+            pipeline.step(boss_appear(11, LEFT_CANNON, 500, 500, 2_500), 2_500);
+            pipeline.step(hit_on(11, 300, 2_500, false), 2_500);
+            let state = pipeline.tick(2_600);
+            assert_eq!(state, meter::FightState::Active, "the same fight resumed");
+            assert_eq!(
+                pipeline.meter.fight_start_ms(),
+                Some(1_000),
+                "a resume keeps the fight clock, which is how the pipeline knows"
+            );
+
+            pipeline.record_fight_end(state, 2_600);
+            assert_eq!(
+                row_count(&handle),
+                0,
+                "a resumed fight must not leave a truncated phase-1 row"
+            );
+            assert!(
+                pipeline.pending_fight_end.is_none(),
+                "discarded, not queued"
+            );
+
+            // Phase 2 dies for real, and the window closes on that end.
+            pipeline.step(hit_on(11, 100, 3_000, true), 3_000);
+            let state = pipeline.tick(3_100);
+            assert_eq!(state, meter::FightState::Ended);
+            pipeline.record_fight_end(state, 3_000 + grace + 1);
+
+            let rows = list_rows(&handle);
+            drop(handle);
+            drop(pipeline);
+            let _ = thread.join();
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(rows.len(), 1, "one fight, one row");
+            assert_eq!(
+                rows[0].total_damage, 600,
+                "the row must carry both phases' damage"
+            );
+        }
+
+        /// With no history handle attached there is nothing to write, so
+        /// `record_fight_end` returns before touching the meter at all —
+        /// no `Meter::snapshot` ~10 times a second for the whole grace
+        /// window, and nothing queued for a flush that could never send
+        /// (PR #333 review, finding 1).
+        #[test]
+        fn no_history_handle_skips_the_record_entirely() {
+            let mut pipeline = Pipeline::new();
+
+            let (state, now) = ended_snapshot(&mut pipeline);
+            pipeline.record_fight_end(state, now);
+
+            assert!(pipeline.pending_fight_end.is_none(), "nothing built");
+            assert!(pipeline.held_fight_start_ms.is_none(), "nothing captured");
+            assert!(!pipeline.fight_end_recorded, "no latch to set");
         }
 
         #[test]
