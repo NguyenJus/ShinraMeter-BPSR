@@ -950,7 +950,26 @@ impl Meter {
                 // numbers on screen for the user to screenshot as long as
                 // they're in the instance it was fought in.
                 let mut reason = None;
-                if self.scene_id != Some(*level_map_id) {
+                // issue #293: a genuinely first-ever scene learn — neither
+                // `scene_id` (this session) nor `last_known_scene_id`
+                // (survives `ServerChanged`, see issue #295 above) has ever
+                // been set — must not be treated as a scene *change*. That
+                // is exactly what a mid-instance attach looks like: there
+                // was no `ENTER_SCENE` to see (it fired once, before the
+                // meter existed), so the first `Scene` this session ever
+                // gets is `SyncContainerData`'s full-state push, which can
+                // land well after damage already has. Below this guard
+                // assumes a real transition — `cut_short`/`latch_fight_end`
+                // would otherwise stamp a fight still genuinely in progress
+                // as cut short by a "departure" that never happened, the
+                // instant a late-attaching meter finally learns where it
+                // is. `ServerChanged` having cleared `scene_id` is *not*
+                // this case — `last_known_scene_id` is still set then, so
+                // the check below still runs and issue #295's fast reset
+                // still fires on a confirmed different scene.
+                let first_ever_scene_learn =
+                    self.scene_id.is_none() && self.last_known_scene_id.is_none();
+                if !first_ever_scene_learn && self.scene_id != Some(*level_map_id) {
                     // issue #12: drop preloaded roster rows nobody ever
                     // damaged, logging a summary first — a stale party
                     // member from the last run must not linger even in the
@@ -2762,6 +2781,49 @@ impl Meter {
         // toward zero with no combat happening.
         {
             let enemy = self.enemies.entry(e.uid).or_default();
+            if let Some(new_id) = e.monster_id {
+                // issue #313/#317: this in-place rewrite is how a `uid=1`
+                // boss silently went from monster_id 20004 ("Ignisor", a
+                // `BOSS_MONSTER_IDS` entry) to 3000063 ("Denvel", which was
+                // not one) mid-pull, with no `boss target changed` line
+                // anywhere in the log — that diagnostic keys off the uid,
+                // and the uid never moved. The #314 diagnostic this logs
+                // settled the question in #317: `uid = uuid >> 16` makes
+                // uid=1 the very first slot the game ever allocates, and
+                // every curated group in `phase.rs` stays inside one id
+                // family while 20004 -> 3000063 crosses id spaces — this is
+                // a recycled uid naming a *different* entity, not one live
+                // entity being re-templated. So on a real change (not the
+                // first id ever seen for this uid, and not a resync
+                // repeating the same id) the rest of `EnemyState` is reset
+                // to a fresh entity here: `peak_hp`/`max_hp`/`curr_hp`/
+                // `lowest_pct` described the old entity's HP pool, and
+                // `took_damage`/`death_order`/`last_damaged_ms` described
+                // its fight history, and none of that describes whatever
+                // just took over this uid. The incoming packet's own HP
+                // fields, applied below, become that fresh entity's first
+                // observation.
+                //
+                // A delta that carries `monster_id` without `curr_hp`/
+                // `max_hp` (an AOI-sync delta can — see
+                // `enemy_hp_from_attrs`) resets to `EnemyState::default()`
+                // same as any other change, so `curr_hp`/`max_hp` land as
+                // `None` and `pct()` reads `None` until the next HP-bearing
+                // packet for this uid arrives. That is deliberate, not an
+                // oversight: the old entity's HP pool has nothing to say
+                // about the new one's, so carrying it over would be a false
+                // reading, not a stale-but-close one. The HP bar is expected
+                // to blank out for the gap between the two packets.
+                if let Some(msg) = monster_id_change_log(e.uid, enemy.monster_id, new_id) {
+                    log::info!("{msg} — state reset");
+                    *enemy = EnemyState {
+                        monster_id: Some(new_id),
+                        ..Default::default()
+                    };
+                } else {
+                    enemy.monster_id = Some(new_id);
+                }
+            }
             if let Some(curr) = e.curr_hp {
                 enemy.curr_hp = Some(curr);
                 // High-water mark, updated *before* `pct()` is read so a new
@@ -2783,20 +2845,6 @@ impl Meter {
             }
             if e.max_hp.is_some() {
                 enemy.max_hp = e.max_hp;
-            }
-            if let Some(new_id) = e.monster_id {
-                // issue #313: this in-place rewrite is how a `uid=1` boss
-                // silently went from monster_id 20004 ("Ignisor", a
-                // `BOSS_MONSTER_IDS` entry) to 3000063 ("Denvel", which was
-                // not one) mid-pull, with no `boss target changed` line
-                // anywhere in the log — that diagnostic keys off the uid,
-                // and the uid never moved. Log the id transition too, so
-                // the next World Dominator run can settle whether the game
-                // re-templates one live entity or recycles the uid.
-                if let Some(msg) = monster_id_change_log(e.uid, enemy.monster_id, new_id) {
-                    log::info!("{msg}");
-                }
-                enemy.monster_id = Some(new_id);
             }
             if let Some(pct) = enemy.pct() {
                 enemy.lowest_pct = Some(enemy.lowest_pct.map_or(pct, |lp| lp.min(pct)));
@@ -3364,6 +3412,9 @@ impl Meter {
             total_dps,
             rows,
             encounter,
+            // The meter has no notion of capture; `bpsr_app::pipeline` is
+            // the only place that ever flips this (see `Snapshot::capture_alive`).
+            capture_alive: true,
         }
     }
 
@@ -5734,22 +5785,23 @@ mod tests {
         }
 
         #[test]
-        fn rollback_100_to_55_to_95_triggers_once() {
+        fn rollback_100_to_55_to_100_triggers_once() {
             let mut m = Meter::new();
             m.apply(&boss_hit(10, 0));
             assert_eq!(m.apply(&hp(10, 100, 100, 0)), None);
             assert_eq!(m.apply(&hp(10, 55, 100, 100)), None);
-            let r = m.apply(&hp(10, 95, 100, 200));
+            let r = m.apply(&hp(10, 100, 100, 200));
             assert_eq!(r, Some(ResetReason::BossHpRollback));
         }
 
         #[test]
-        fn rollback_100_to_70_to_95_never_triggers() {
+        fn rollback_100_to_96_to_100_never_triggers() {
             let mut m = Meter::new();
             m.apply(&boss_hit(10, 0));
             m.apply(&hp(10, 100, 100, 0));
-            m.apply(&hp(10, 70, 100, 100));
-            let r = m.apply(&hp(10, 95, 100, 200));
+            // 96% never dips below the 95% drop threshold.
+            m.apply(&hp(10, 96, 100, 100));
+            let r = m.apply(&hp(10, 100, 100, 200));
             assert_eq!(r, None);
         }
 
@@ -5759,12 +5811,12 @@ mod tests {
             m.apply(&boss_hit(10, 0));
             m.apply(&hp(10, 100, 100, 0));
             m.apply(&hp(10, 55, 100, 100));
-            let first = m.apply(&hp(10, 95, 100, 200));
+            let first = m.apply(&hp(10, 100, 100, 200));
             assert_eq!(first, Some(ResetReason::BossHpRollback));
 
             // 500ms later (< 2000ms cooldown): a second drop/recover must not fire.
             m.apply(&hp(10, 55, 100, 300));
-            let second = m.apply(&hp(10, 95, 100, 700));
+            let second = m.apply(&hp(10, 100, 100, 700));
             assert_eq!(second, None);
         }
 
@@ -5774,13 +5826,13 @@ mod tests {
             m.apply(&boss_hit(10, 0));
             m.apply(&hp(10, 100, 100, 0));
             m.apply(&hp(10, 55, 100, 100));
-            let first = m.apply(&hp(10, 95, 100, 200));
+            let first = m.apply(&hp(10, 100, 100, 200));
             assert_eq!(first, Some(ResetReason::BossHpRollback));
 
             // Within cooldown (last_reset_ms=200, cooldown=2000): the same
             // drop/recover shape is observed but suppressed.
             m.apply(&hp(10, 55, 100, 300));
-            let suppressed = m.apply(&hp(10, 95, 100, 700));
+            let suppressed = m.apply(&hp(10, 100, 100, 700));
             assert_eq!(suppressed, None);
 
             // Cooldown has now expired (2300 - 200 = 2100ms >= 2000ms). The
@@ -6348,6 +6400,48 @@ mod tests {
             assert_eq!(snap.encounter.boss_monster_id, Some(103));
         }
 
+        /// issue #293: a meter attached mid-instance has no `scene_id` at
+        /// all yet when damage starts — `ENTER_SCENE` fired once, before
+        /// the meter existed, and the only source left is
+        /// `SyncContainerData`'s full-state push, which can land well
+        /// after the pull is already underway. That first-ever `Scene`
+        /// event must be read as "learn where we already are", not as
+        /// "the party just zoned out mid-pull" (the case
+        /// `scene_change_mid_fight_latches_the_clock_and_keeps_the_stats`
+        /// above covers) — the instance hasn't changed, so the fight must
+        /// keep running rather than getting cut short.
+        #[test]
+        fn scene_learned_mid_fight_does_not_cut_it_short() {
+            let mut m = Meter::new();
+            // No `Scene` event yet: `m.scene_id` is still `None` even
+            // though damage — and a boss pull — are already in progress.
+            m.apply(&dmg(1, 700, 0));
+            m.apply(&boss_hit(10, 500, false));
+            m.apply(&hp(10, 50, Some(103), 500));
+            assert_eq!(m.scene_id, None);
+            assert_eq!(m.fight_state(1_000), FightState::Active);
+
+            // The scene id finally arrives, unchanged from what it always
+            // was — this is a *learn*, not a transition.
+            let reason = m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
+            assert_eq!(
+                reason, None,
+                "learning the scene mid-fight must not report a reset"
+            );
+
+            assert_eq!(m.scene_id, Some(1001));
+            assert_eq!(
+                m.fight_state(1_000),
+                FightState::Active,
+                "a fight already in progress must not be cut short just because \
+                 the meter finally learned which instance it's in"
+            );
+            let snap = m.snapshot(1_000);
+            assert_eq!(snap.total_damage, 800);
+            assert!(!snap.rows.is_empty());
+            assert_eq!(snap.encounter.boss_monster_id, Some(103));
+        }
+
         /// PR #198 review, finding 1: entering a new dungeon must not let
         /// the previous run's boss caption the new one. The old boss is
         /// still alive and was engaged well inside
@@ -6645,7 +6739,7 @@ mod tests {
             m.apply(&boss_hit(10, 0, false));
             m.apply(&hp(10, 100, Some(103), 0));
             m.apply(&hp(10, 55, Some(103), 100));
-            let reason = m.apply(&hp(10, 95, Some(103), 200));
+            let reason = m.apply(&hp(10, 100, Some(103), 200));
             assert_eq!(reason, Some(ResetReason::BossHpRollback));
         }
 
@@ -10332,6 +10426,164 @@ mod tests {
             assert!(!msg.contains("Player"));
             let msg = fight_end_log(FightEndCause::Wipe, Some(103));
             assert!(!msg.contains("uid"));
+        }
+    }
+
+    /// Issue #317: `apply_enemy_hp` treats an existing uid reporting a new
+    /// `monster_id` as the uid being recycled onto a different entity, not
+    /// one live entity being re-templated (`uid = uuid >> 16` puts uid=1 at
+    /// the very first slot ever allocated, and every curated `phase.rs`
+    /// group stays inside one id family) — so the rest of `EnemyState` is
+    /// reset to a fresh entity's starting values on that transition.
+    mod monster_id_reset {
+        use super::*;
+
+        /// "Ignisor" (103), a recognized boss.
+        const OLD_BOSS: u32 = 103;
+        /// "Golden Nappo" (10_900): not a `BOSS_MONSTER_IDS` entry, so the
+        /// id crosses out of `OLD_BOSS`'s family the way 20004 -> 3000063
+        /// did in the reported World Dominator log.
+        const NEW_BOSS: u32 = 10_900;
+        const UID: i64 = 1;
+
+        fn hp(monster_id: u32, curr: u64, max: u64, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::EnemyHp(EnemyHp {
+                uid: UID,
+                curr_hp: Some(curr),
+                max_hp: Some(max),
+                monster_id: Some(monster_id),
+                timestamp_ms: ts,
+            })
+        }
+
+        fn boss_hit(uid: i64, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 99,
+                attacker_kind: EntityKind::Player,
+                target_uid: uid,
+                target_kind: EntityKind::Monster,
+                value: 1,
+                timestamp_ms: ts,
+                ..Default::default()
+            })
+        }
+
+        /// (a) A boss burned to 40%, then the same uid reports a new
+        /// `monster_id` with full HP: `pct()` must read the *new* entity's
+        /// 100%, not 40% of the old one's pool, and every other HP-derived
+        /// or fight-history field must read like a never-before-seen enemy.
+        #[test]
+        fn a_monster_id_change_resets_hp_derived_and_history_fields() {
+            let mut m = Meter::new();
+            m.apply(&hp(OLD_BOSS, 1_000_000, 1_000_000, 0));
+            m.apply(&boss_hit(UID, 100));
+            m.apply(&hp(OLD_BOSS, 400_000, 1_000_000, 200));
+
+            let old = &m.enemies[&UID];
+            assert_eq!(old.pct(), Some(40.0));
+            assert_eq!(old.lowest_pct, Some(40.0));
+            assert!(old.took_damage);
+
+            m.apply(&hp(NEW_BOSS, 1_000_000, 1_000_000, 300));
+
+            let new = &m.enemies[&UID];
+            assert_eq!(new.monster_id, Some(NEW_BOSS));
+            assert_eq!(new.pct(), Some(100.0));
+            assert_eq!(
+                new.lowest_pct,
+                Some(100.0),
+                "the old entity's dip must not survive as the new entity's floor"
+            );
+            assert_eq!(new.death_order, None);
+            assert!(!new.took_damage);
+            assert_eq!(new.last_damaged_ms, None);
+        }
+
+        /// (b) A dead entity's uid reused with a new `monster_id` reads
+        /// alive again — the recycled uid is a different entity, not the
+        /// same corpse resyncing.
+        #[test]
+        fn a_dead_uids_monster_id_change_comes_back_alive() {
+            let mut m = Meter::new();
+            m.apply(&hp(OLD_BOSS, 1_000_000, 1_000_000, 0));
+            m.apply(&boss_hit(UID, 100));
+            m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 99,
+                attacker_kind: EntityKind::Player,
+                target_uid: UID,
+                target_kind: EntityKind::Monster,
+                value: 1,
+                is_dead: true,
+                timestamp_ms: 200,
+                ..Default::default()
+            }));
+            assert!(!m.enemies[&UID].is_alive());
+
+            m.apply(&hp(NEW_BOSS, 500_000, 1_000_000, 300));
+
+            assert!(m.enemies[&UID].is_alive());
+            assert_eq!(m.enemies[&UID].death_order, None);
+        }
+
+        /// (c) A resync repeating the *same* `monster_id` is not a change
+        /// and must not disturb anything already accumulated.
+        #[test]
+        fn the_same_monster_id_repeated_resets_nothing() {
+            let mut m = Meter::new();
+            m.apply(&hp(OLD_BOSS, 1_000_000, 1_000_000, 0));
+            m.apply(&boss_hit(UID, 100));
+            m.apply(&hp(OLD_BOSS, 400_000, 1_000_000, 200));
+
+            let before = m.enemies[&UID];
+            m.apply(&hp(OLD_BOSS, 400_000, 1_000_000, 300));
+            let after = m.enemies[&UID];
+
+            assert_eq!(before.lowest_pct, after.lowest_pct);
+            assert_eq!(before.took_damage, after.took_damage);
+            assert_eq!(before.death_order, after.death_order);
+            assert_eq!(before.last_damaged_ms, after.last_damaged_ms);
+            assert_eq!(after.monster_id, Some(OLD_BOSS));
+        }
+
+        /// (d) An AOI-sync delta can carry `monster_id` alone, with no
+        /// `curr_hp`/`max_hp` (see `enemy_hp_from_attrs`). The state still
+        /// resets — the recycled uid is still a new entity — but with no HP
+        /// fields in the packet to reapply, `curr_hp`/`max_hp` land as `None`
+        /// and `pct()` reads `None` until the next HP-bearing packet for this
+        /// uid arrives.
+        #[test]
+        fn monster_id_only_delta_resets_state_and_leaves_hp_unknown() {
+            let mut m = Meter::new();
+            m.apply(&hp(OLD_BOSS, 1_000_000, 1_000_000, 0));
+            m.apply(&boss_hit(UID, 100));
+            m.apply(&hp(OLD_BOSS, 400_000, 1_000_000, 200));
+            assert_eq!(m.enemies[&UID].pct(), Some(40.0));
+
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                uid: UID,
+                curr_hp: None,
+                max_hp: None,
+                monster_id: Some(NEW_BOSS),
+                timestamp_ms: 300,
+            }));
+
+            let reset = &m.enemies[&UID];
+            assert_eq!(reset.monster_id, Some(NEW_BOSS));
+            assert_eq!(reset.curr_hp, None);
+            assert_eq!(reset.max_hp, None);
+            assert_eq!(
+                reset.pct(),
+                None,
+                "no HP in the delta means no HP for the new entity yet"
+            );
+            assert_eq!(reset.lowest_pct, None);
+            assert!(!reset.took_damage);
+            assert_eq!(reset.death_order, None);
+            assert_eq!(reset.last_damaged_ms, None);
+
+            // The next HP-bearing packet restores a reading.
+            m.apply(&hp(NEW_BOSS, 500_000, 1_000_000, 400));
+            assert_eq!(m.enemies[&UID].pct(), Some(50.0));
         }
     }
 

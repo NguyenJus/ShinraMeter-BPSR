@@ -37,9 +37,12 @@ pub mod opcode {
     /// / `SyncContainerDirtyData` = 22, not otherwise used by this crate)
     /// trustworthy rather than another unverified port. Carries the scene
     /// attrs (`attrs::attr_id::SCENE_BASIC_ID` et al.) that
-    /// `on_enter_scene` reads `ProtocolEvent::Scene` from — replacing the
-    /// disproven `SyncContainerData.CharSerialize.scene_data` path (see
-    /// `pb::CharSerialize`'s doc comment).
+    /// `on_enter_scene` reads `ProtocolEvent::Scene` from. Only fires once,
+    /// on zone entry — `SYNC_CONTAINER_DATA`'s `on_sync_container_data` is
+    /// the other, complementary source (issue #293): it also emits
+    /// `ProtocolEvent::Scene`, from `CharSerialize.scene_data`, and is what
+    /// a meter attached mid-instance actually sees (see
+    /// `pb::CharSerialize::scene_data`'s doc comment).
     pub const ENTER_SCENE: u32 = 0x0000_0003;
     /// `WorldNtf.SyncDungeonData` (issue #139): the plain-protobuf full
     /// dungeon sync (`pb::DungeonSyncData`). Validated against this
@@ -309,6 +312,27 @@ fn on_aoi_sync_delta(
             } else {
                 dmg.value
             };
+            // A target's max HP can grow between the hit landing and this
+            // packet being built, making the server's own "new HP minus old
+            // HP" arithmetic underflow into a negative `value` (BPSR-ZDPS
+            // `MessageManager.cs` ~1372-1384). `hp_lessen_value` is computed
+            // independently and stays correct, so it takes over whenever it
+            // is usable; otherwise the hit reports no damage rather than a
+            // negative one. This guard applies to damage-typed hits only:
+            // heal-typed `SyncDamageInfo` can legitimately carry a negative
+            // `value` (lethal/self-damage heals — see encounter.rs's
+            // negative/lethal heal handling), so those pass through
+            // unchanged.
+            let is_heal = dmg.r#type == EDamageType::Heal as i32;
+            let value = if !is_heal && value < 0 {
+                if dmg.hp_lessen_value > 0 {
+                    dmg.hp_lessen_value
+                } else {
+                    0
+                }
+            } else {
+                value
+            };
             out.push(ProtocolEvent::Damage(DamageEvent {
                 attacker_uid: uid_of(attacker_uuid),
                 attacker_kind: kind_of(attacker_uuid),
@@ -318,7 +342,7 @@ fn on_aoi_sync_delta(
                 lucky: dmg.lucky_value != 0,
                 hp_lessen: dmg.hp_lessen_value,
                 is_miss: dmg.is_miss || dmg.r#type == EDamageType::Miss as i32,
-                is_heal: dmg.r#type == EDamageType::Heal as i32,
+                is_heal,
                 target_uid,
                 target_kind,
                 timestamp_ms: now_ms,
@@ -394,13 +418,33 @@ fn buff_base_id_from_logic_effects(logic_effect: &[pb::BuffEffectLogicInfo]) -> 
         .map(|info| info.base_id)
 }
 
-/// Emits `Player` only — the scene half of this notify was removed (issue
-/// #35): see `pb::CharSerialize`'s doc comment for why, and
-/// `on_enter_scene` for where the scene id actually comes from now.
+/// Emits `Scene` (issue #293) and `Player`.
+///
+/// `Scene` comes from `v_data.scene_data.level_map_id` — see
+/// `pb::CharSerialize::scene_data`'s doc comment for why this field, once
+/// pulled as "disproven" (issue #35), is back. It matters because this is
+/// the *only* scene id source a meter attached mid-instance ever sees:
+/// `on_enter_scene` fires once, on `ENTER_SCENE` (opcode 3), which the
+/// server sends on zone entry and never again — a capture started after
+/// that has already happened. `SyncContainerData` is different: it is the
+/// full-state push the server sends when a client (re)establishes its
+/// session with the world, independent of when the zone was actually
+/// entered, so it still carries the current scene on a late attach. A
+/// zero id is treated the same as an absent field — `scene_id_from_attrs`'s
+/// zero-is-absent guard, mirrored here rather than shared, since this path
+/// has no `AttrCollection` to route through.
 fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEvent>) {
     let Some(v_data) = &msg.v_data else {
         return;
     };
+    if let Some(level_map_id) = v_data
+        .scene_data
+        .as_ref()
+        .map(|s| s.level_map_id)
+        .filter(|&id| id != 0)
+    {
+        out.push(ProtocolEvent::Scene { level_map_id });
+    }
     let Some(char_base) = &v_data.char_base else {
         return;
     };
@@ -857,6 +901,72 @@ mod tests {
         assert!(ev.lucky);
     }
 
+    /// A mid-frame max-HP increase can make the server's own `value` go
+    /// negative (BPSR-ZDPS `MessageManager.cs` ~1372-1384): the target's HP
+    /// pool grew between the hit landing and the packet being built, so the
+    /// naive "new HP minus old HP" the server computes underflows. When
+    /// that happens the *actual* HP the target lost, `hp_lessen_value`, is
+    /// still correct and takes over.
+    #[test]
+    fn negative_value_falls_back_to_a_positive_hp_lessen() {
+        let dmg = pb::SyncDamageInfo {
+            value: -500,
+            lucky_value: 0,
+            hp_lessen_value: 300,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(only_damage(out).value, 300);
+    }
+
+    /// If `hp_lessen_value` is *also* non-positive there is nothing
+    /// trustworthy to fall back to, so the hit reports zero damage rather
+    /// than propagating the negative (or another zero) value.
+    #[test]
+    fn negative_value_and_non_positive_hp_lessen_reports_zero() {
+        let dmg = pb::SyncDamageInfo {
+            value: -500,
+            lucky_value: 0,
+            hp_lessen_value: 0,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(only_damage(out).value, 0);
+
+        let dmg_negative_lessen = pb::SyncDamageInfo {
+            value: -500,
+            lucky_value: 0,
+            hp_lessen_value: -10,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg_negative_lessen);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(only_damage(out).value, 0);
+    }
+
+    /// A negative `lucky_value` is picked over `value` by the existing
+    /// preference rule (nonzero wins), so it must be guarded the same way.
+    #[test]
+    fn negative_lucky_value_falls_back_to_hp_lessen_too() {
+        let dmg = pb::SyncDamageInfo {
+            value: 100,
+            lucky_value: -500,
+            hp_lessen_value: 300,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        let ev = only_damage(out);
+        assert_eq!(ev.value, 300);
+        assert!(ev.lucky, "the lucky flag is still set on the raw field");
+    }
+
     #[test]
     fn is_dead_flag_survives_decode() {
         // Issue #49: `SyncDamageInfo.is_dead` (tag 17) must reach the
@@ -890,6 +1000,27 @@ mod tests {
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
         assert!(only_damage(out).is_heal);
+    }
+
+    /// The negative-value guard is for damage-typed hits only. Heal-typed
+    /// `SyncDamageInfo` can legitimately carry a negative `value` (lethal /
+    /// self-damage heals — see `bpsr_meter::encounter`'s negative/lethal
+    /// heal handling), so it must survive decode unchanged even when a
+    /// positive `hp_lessen_value` is also present.
+    #[test]
+    fn heal_type_keeps_negative_value() {
+        let dmg = pb::SyncDamageInfo {
+            r#type: EDamageType::Heal as i32,
+            value: -500,
+            hp_lessen_value: 300,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        let ev = only_damage(out);
+        assert_eq!(ev.value, -500);
+        assert!(ev.is_heal);
     }
 
     #[test]
@@ -1557,6 +1688,7 @@ mod tests {
                 name: "Ari".to_string(),
                 fight_point: 0,
             }),
+            scene_data: None,
             profession_list: Some(pb::ProfessionList {
                 cur_profession_id: 8, // Dorothy (Imagine)
             }),
@@ -1566,6 +1698,96 @@ mod tests {
         assert_eq!(out.len(), 1);
         match &out[0] {
             ProtocolEvent::Player(p) => assert_eq!(p.class, None),
+            other => panic!("expected Player, got {other:?}"),
+        }
+    }
+
+    // -- SyncContainerData.scene_data (issue #293: mid-instance attach) -----
+
+    #[test]
+    fn container_data_scene_data_emits_a_scene_event() {
+        // A meter attached mid-instance never sees `ENTER_SCENE` (it fires
+        // once, on zone entry, before the meter existed) — this is the
+        // full-state push it sees instead.
+        let n = container_notify(pb::CharSerialize {
+            char_id: 0,
+            char_base: None,
+            scene_data: Some(pb::SceneData { level_map_id: 8 }),
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out, vec![ProtocolEvent::Scene { level_map_id: 8 }]);
+    }
+
+    #[test]
+    fn container_data_scene_data_zero_level_map_id_is_treated_as_absent() {
+        let n = container_notify(pb::CharSerialize {
+            char_id: 0,
+            char_base: None,
+            scene_data: Some(pb::SceneData { level_map_id: 0 }),
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn container_data_without_scene_data_emits_no_scene_event() {
+        let n = container_notify(pb::CharSerialize {
+            char_id: 8,
+            char_base: Some(pb::CharBaseInfo {
+                char_id: 8,
+                name: "Ari".to_string(),
+                fight_point: 0,
+            }),
+            scene_data: None,
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(
+            out,
+            vec![ProtocolEvent::Player(PlayerInfo {
+                uid: 8,
+                name: Some("Ari".to_string()),
+                class: None,
+                ability_score: None,
+                season_level: None,
+                season_strength: None,
+                skill_ids: Vec::new(),
+                position: None,
+                target_position: None,
+            })]
+        );
+    }
+
+    #[test]
+    fn container_data_scene_data_and_char_base_emits_scene_then_player() {
+        let n = container_notify(pb::CharSerialize {
+            char_id: 8,
+            char_base: Some(pb::CharBaseInfo {
+                char_id: 8,
+                name: "Ari".to_string(),
+                fight_point: 0,
+            }),
+            scene_data: Some(pb::SceneData {
+                level_map_id: 40001,
+            }),
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0],
+            ProtocolEvent::Scene {
+                level_map_id: 40001
+            }
+        );
+        match &out[1] {
+            ProtocolEvent::Player(p) => assert_eq!(p.uid, 8),
             other => panic!("expected Player, got {other:?}"),
         }
     }
