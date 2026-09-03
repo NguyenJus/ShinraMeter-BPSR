@@ -392,11 +392,25 @@ impl Pipeline {
         if self.fight_end_recorded {
             return;
         }
-        self.fight_end_recorded = true;
-        let Some(history) = &self.history else {
+        // PR #329 review, finding 1: the latch is set *after* this check,
+        // not before it. `Meter::fight_state` computes the idle-timeout end
+        // on the fly without latching it (only `Meter::tick` calls
+        // `latch_fight_end`), so `step`'s call above can observe `Ended`
+        // while `fight_end_ms` is still `None`. Latching on that
+        // observation used to poison this flag for good: the very next
+        // non-damage event routed through `step` after an idle timeout, but
+        // before the ticker's next `tick`, would mark the fight recorded
+        // without ever writing it, and the fight never reached history.
+        // Leaving the latch clear here makes an unlatched `Ended` a plain
+        // no-op that retries on the next call — by which time `tick` has
+        // latched the end and the write goes through. The boss-death path
+        // is unaffected: `Meter::apply` latches `fight_end_ms`
+        // synchronously, so it is already `Some` by the time `step` looks.
+        let Some(ended_at_ms) = self.meter.fight_end_ms() else {
             return;
         };
-        let Some(ended_at_ms) = self.meter.fight_end_ms() else {
+        self.fight_end_recorded = true;
+        let Some(history) = &self.history else {
             return;
         };
         let snapshot = self.meter.snapshot(now_ms);
@@ -466,6 +480,66 @@ pub fn spawn(
     (rx_snapshot, handle)
 }
 
+/// What `run`'s loop should do after a `UiCommand` has been applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandOutcome {
+    Continue,
+    Quit,
+}
+
+/// Applies one `UiCommand`. Factored out of `run`'s select loop (PR #329
+/// review, finding 2) because the events-`Err` arm has to drain the very
+/// same commands looking for a queued `Quit`, and the ones it passes on the
+/// way — a `SkillFocus` the overlay sent just before closing, say — must
+/// still take effect rather than be thrown away.
+fn handle_command(
+    cmd: UiCommand,
+    pipeline: &mut Pipeline,
+    skill_focus: &mut Vec<i64>,
+    capture_restart: &Option<CaptureRestart>,
+) -> CommandOutcome {
+    match cmd {
+        UiCommand::Reset => pipeline.reset(now_ms()),
+        UiCommand::SkillFocus(uids) => *skill_focus = uids,
+        // Issue #214. Logged unconditionally: knowing the user had to reach
+        // for this — and when — is exactly the context #211's silent log was
+        // missing, and it is what makes the capture-side lines that follow
+        // interpretable.
+        UiCommand::RestartCapture => match capture_restart {
+            Some(restart) => {
+                log::info!("restarting packet capture at the user's request");
+                restart.request();
+            }
+            None => log::warn!(
+                "a packet-capture restart was requested, but capture never started \
+                 (the status banner explains why); nothing to restart"
+            ),
+        },
+        UiCommand::Quit => return CommandOutcome::Quit,
+    }
+    CommandOutcome::Continue
+}
+
+/// Applies every command already queued and reports whether one of them was
+/// a `Quit` (PR #329 review, finding 2). `run`'s events-`Err` arm calls this
+/// to tell an orderly shutdown — `main.rs` queues `Quit` before it stops
+/// capture, so the disconnect it is looking at was caused by the quit — from
+/// the capture thread genuinely dying mid-session. Stops at the `Quit`: any
+/// command behind it is moot, since the loop is about to exit.
+fn drain_for_quit(
+    commands: &Receiver<UiCommand>,
+    pipeline: &mut Pipeline,
+    skill_focus: &mut Vec<i64>,
+    capture_restart: &Option<CaptureRestart>,
+) -> bool {
+    while let Ok(cmd) = commands.try_recv() {
+        if handle_command(cmd, pipeline, skill_focus, capture_restart) == CommandOutcome::Quit {
+            return true;
+        }
+    }
+    false
+}
+
 fn run(
     events: Receiver<proto::ProtocolEvent>,
     commands: Receiver<UiCommand>,
@@ -497,6 +571,33 @@ fn run(
                     pipeline.step(ev, now_ms());
                 }
                 Err(_) => {
+                    // PR #329 review, finding 2: an ordinary shutdown
+                    // reaches this arm too. `main.rs` stops capture (which
+                    // joins the capture thread and so drops `tx_events`) as
+                    // part of quitting, so without this check every clean
+                    // exit logged the ERROR below and raised the overlay's
+                    // dead-capture banner. `main.rs` now queues
+                    // `UiCommand::Quit` *before* stopping capture, so a
+                    // `Quit` already sitting in `commands` is the reliable
+                    // "this disconnect was expected" signal — draining for
+                    // it here (rather than trusting `select!` to pick the
+                    // commands arm first, which it chooses at random among
+                    // ready operations) is what makes the distinction
+                    // race-free. Mirrors PR #326's UI-side `quit_requested`
+                    // flag, which tells the same two cases apart on the
+                    // snapshot channel.
+                    if drain_for_quit(
+                        &commands,
+                        &mut pipeline,
+                        &mut skill_focus,
+                        &capture_restart,
+                    ) {
+                        log::info!(
+                            "capture channel closed after a quit was requested; this is an \
+                             orderly shutdown"
+                        );
+                        break;
+                    }
                     // Pipeline-robustness audit, finding 1: the capture
                     // thread panicked or exited and dropped `tx_events`.
                     // This used to log at `info` and otherwise carry on
@@ -517,23 +618,13 @@ fn run(
                 }
             },
             recv(commands) -> msg => match msg {
-                Ok(UiCommand::Reset) => pipeline.reset(now_ms()),
-                Ok(UiCommand::SkillFocus(uids)) => skill_focus = uids,
-                // Issue #214. Logged unconditionally: knowing the user had
-                // to reach for this — and when — is exactly the context
-                // #211's silent log was missing, and it is what makes the
-                // capture-side lines that follow interpretable.
-                Ok(UiCommand::RestartCapture) => match &capture_restart {
-                    Some(restart) => {
-                        log::info!("restarting packet capture at the user's request");
-                        restart.request();
+                Ok(cmd) => {
+                    if handle_command(cmd, &mut pipeline, &mut skill_focus, &capture_restart)
+                        == CommandOutcome::Quit
+                    {
+                        break;
                     }
-                    None => log::warn!(
-                        "a packet-capture restart was requested, but capture never started \
-                         (the status banner explains why); nothing to restart"
-                    ),
-                },
-                Ok(UiCommand::Quit) => break,
+                }
                 Err(_) => break,
             },
             recv(ticker) -> _ => publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus),
@@ -1369,10 +1460,156 @@ mod tests {
             assert_eq!(count, 0);
         }
 
+        /// PR #329 review, finding 1: `Meter::fight_state` reports an
+        /// idle-timeout `Ended` without latching it (only `Meter::tick`
+        /// calls `latch_fight_end`), so `step`'s own `record_fight_end`
+        /// call can see `Ended` while `fight_end_ms` is still `None`.
+        /// `record_fight_end` used to set its write-exactly-once latch
+        /// *before* checking `fight_end_ms`, so one non-damage event
+        /// arriving after the idle timeout but before the ticker's next
+        /// `tick` poisoned the latch and the fight was lost from history
+        /// entirely. The latch is now set only once `fight_end_ms` is
+        /// `Some`, which makes that observation a retryable no-op.
+        #[test]
+        fn a_non_damage_event_after_the_idle_timeout_does_not_lose_the_fight() {
+            let path = temp_history_path("pipeline-unlatched-end");
+            let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+            let mut pipeline = Pipeline::new().with_history(handle.clone());
+
+            pipeline.step(proto::ProtocolEvent::Damage(damage(1, 100, 1_000)), 1_000);
+            let idle = meter::FightConfig::default().idle_timeout_ms;
+            let after_idle = 1_000 + idle;
+
+            // The fight is over by wall clock, but nothing has latched that
+            // yet — no `tick` has run.
+            assert!(
+                pipeline.meter.fight_end_ms().is_none(),
+                "sanity: the idle-timeout end must still be unlatched here"
+            );
+            assert_eq!(
+                pipeline.meter.fight_state(after_idle),
+                meter::FightState::Ended
+            );
+
+            // A non-damage event routed through `step` — the exact call
+            // that used to poison the latch. A cast is the cleanest of the
+            // candidates: `Encounter::apply_cast` never resets and never
+            // extends the DPS window, so the only thing under test here is
+            // `step`'s own `record_fight_end` call.
+            pipeline.step(
+                proto::ProtocolEvent::Cast(proto::event::CastEvent {
+                    caster_uid: 1,
+                    skill_id: 7,
+                    timestamp_ms: after_idle,
+                    skill_stage: None,
+                    skill_level: None,
+                    skill_begin_time_ms: None,
+                    skill_stage_num: None,
+                    skill_uuid: None,
+                }),
+                after_idle,
+            );
+
+            // The ticker finally runs and latches the end, exactly as
+            // `publish` does.
+            let state = pipeline.tick(after_idle);
+            pipeline.record_fight_end(state, after_idle);
+
+            let count = row_count(&handle);
+            drop(handle);
+            drop(pipeline);
+            let _ = thread.join();
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(
+                count, 1,
+                "a non-damage event seen after the idle timeout but before the next tick must \
+                 not stop the fight from reaching history"
+            );
+        }
+
         #[test]
         fn a_pipeline_without_history_never_panics() {
             let mut pipeline = Pipeline::new();
             pipeline.record_fight_end(meter::FightState::Ended, 0);
+        }
+    }
+
+    /// PR #329 review, finding 2: telling an orderly shutdown (`main.rs`
+    /// queues `UiCommand::Quit`, then stops capture, which drops
+    /// `tx_events`) apart from the capture thread actually dying.
+    mod orderly_shutdown {
+        use super::*;
+
+        #[test]
+        fn a_queued_quit_marks_the_disconnect_as_orderly() {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            tx.send(UiCommand::Quit).unwrap();
+            let mut pipeline = Pipeline::new();
+            let mut skill_focus = Vec::new();
+
+            assert!(drain_for_quit(&rx, &mut pipeline, &mut skill_focus, &None));
+            assert!(
+                pipeline.capture_alive,
+                "an orderly shutdown must never mark capture dead"
+            );
+        }
+
+        /// The drain applies the commands it passes on the way rather than
+        /// discarding them — a `SkillFocus` the overlay sent just before
+        /// closing is still the pipeline's focus set afterwards.
+        #[test]
+        fn commands_ahead_of_the_quit_are_still_applied() {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            tx.send(UiCommand::SkillFocus(vec![7, 9])).unwrap();
+            tx.send(UiCommand::Quit).unwrap();
+            let mut pipeline = Pipeline::new();
+            let mut skill_focus = Vec::new();
+
+            assert!(drain_for_quit(&rx, &mut pipeline, &mut skill_focus, &None));
+            assert_eq!(skill_focus, vec![7, 9]);
+        }
+
+        /// No queued `Quit` is the genuine crash case: the caller falls
+        /// through to the ERROR log and `mark_capture_dead`.
+        #[test]
+        fn a_disconnect_with_no_quit_queued_is_still_a_crash() {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            tx.send(UiCommand::Reset).unwrap();
+            let mut pipeline = Pipeline::new();
+            let mut skill_focus = Vec::new();
+
+            assert!(!drain_for_quit(&rx, &mut pipeline, &mut skill_focus, &None));
+        }
+
+        /// End to end through the real spawned thread, in `main.rs`'s
+        /// shutdown order: `Quit` queued first, capture's sender dropped
+        /// second. The thread must exit without ever publishing a
+        /// `capture_alive: false` snapshot.
+        #[test]
+        fn quit_before_the_capture_sender_drops_never_reports_a_dead_capture() {
+            use bpsr_test_support::scratch_path;
+
+            let (tx_events, rx_events) = crossbeam_channel::unbounded();
+            let (tx_command, rx_command) = crossbeam_channel::unbounded();
+            let (rx_snapshot, thread) = spawn(
+                rx_events,
+                rx_command,
+                scratch_path("orderly-shutdown"),
+                None,
+                None,
+            );
+
+            tx_command.send(UiCommand::Quit).unwrap();
+            drop(tx_events);
+            thread.join().unwrap();
+
+            while let Ok(snap) = rx_snapshot.try_recv() {
+                assert!(
+                    snap.capture_alive,
+                    "an orderly shutdown must not publish capture_alive = false"
+                );
+            }
         }
     }
 

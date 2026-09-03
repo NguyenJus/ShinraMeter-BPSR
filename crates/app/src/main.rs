@@ -441,16 +441,24 @@ fn main() -> eframe::Result {
         }),
     );
 
-    // Window closed: stop capture (drops its sender) and tell the pipeline
-    // thread to stop explicitly. `run_native` returns after closing the
-    // window regardless of *how* it was closed (`UiCommand::Quit` via the
-    // in-app button, alt-F4, or the window manager) — sending `Quit` here
-    // guarantees a clean shutdown without relying on `OverlayApp`'s own
-    // command sender having already been dropped.
+    // Window closed: tell the pipeline thread to stop explicitly, then stop
+    // capture (which joins the capture thread and so drops its event
+    // sender). `run_native` returns after closing the window regardless of
+    // *how* it was closed (`UiCommand::Quit` via the in-app button, alt-F4,
+    // or the window manager) — sending `Quit` here guarantees a clean
+    // shutdown without relying on `OverlayApp`'s own command sender having
+    // already been dropped.
+    //
+    // PR #329 review, finding 2: the `Quit` must be queued *before* capture
+    // stops. The pipeline's events channel disconnecting is otherwise
+    // indistinguishable from the capture thread crashing, and it would log
+    // an ERROR and raise the overlay's permanent dead-capture banner on
+    // every ordinary exit. With this order a queued `Quit` is always there
+    // for `pipeline::drain_for_quit` to find.
+    let _ = tx_command_shutdown.try_send(UiCommand::Quit);
     if let Some(handle) = capture {
         handle.stop();
     }
-    let _ = tx_command_shutdown.try_send(UiCommand::Quit);
     let _ = pipeline_thread.join();
     // Issue #39: both `HistoryHandle` clones are gone by now — the
     // pipeline's, joined just above, and `OverlayApp`'s own (moved into
