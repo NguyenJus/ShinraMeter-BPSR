@@ -343,6 +343,14 @@ const TRANSIENT_STATUS_LINGER: Duration = Duration::from_secs(5);
 /// belongs.
 const PIPELINE_DEAD_STATUS: &str = "Meter pipeline stopped — restart ShinraMeter-BPSR to resume";
 
+/// What the banner says when the capture thread has died but the pipeline
+/// thread itself is still alive and publishing snapshots (pipeline-
+/// robustness audit, finding 1). Distinct from `PIPELINE_DEAD_STATUS`
+/// because the failure is: the snapshot channel never disconnects in this
+/// scenario, so `raise_pipeline_dead_status` never fires — the overlay
+/// looks alive but is frozen, and this is the only signal that says so.
+const CAPTURE_DEAD_STATUS: &str = "Packet capture stopped — restart the meter to resume";
+
 /// The overlay's eframe app: holds the latest snapshot plus the channel
 /// endpoints used to receive updates and send commands.
 pub struct OverlayApp {
@@ -1113,6 +1121,7 @@ fn demo_snapshot() -> Snapshot {
             scene_boss_name: None,
             multi_boss_scene: false,
         },
+        capture_alive: true,
     }
 }
 
@@ -1133,6 +1142,7 @@ fn initial_snapshot(demo_mode: bool) -> Snapshot {
             total_dps: 0.0,
             rows: Vec::new(),
             encounter: EncounterInfo::default(),
+            capture_alive: true,
         }
     }
 }
@@ -1242,7 +1252,18 @@ impl OverlayApp {
         }
         loop {
             match self.rx_snapshot.try_recv() {
-                Ok(snap) => self.snapshot = snap,
+                Ok(snap) => {
+                    // Pipeline-robustness audit, finding 1: a dead capture
+                    // thread never disconnects this channel — the pipeline
+                    // thread is still alive and still publishing — so the
+                    // `Disconnected` arm below cannot see it. `capture_alive`
+                    // is how the pipeline says so instead; see
+                    // `raise_capture_dead_status`.
+                    if !snap.capture_alive {
+                        self.raise_capture_dead_status();
+                    }
+                    self.snapshot = snap;
+                }
                 // Nothing new this frame — the overwhelmingly common case.
                 Err(TryRecvError::Empty) => break,
                 // Issue #214: the pipeline thread is gone. `try_iter`, which
@@ -1307,6 +1328,31 @@ impl OverlayApp {
              for the rest of this session"
         );
         self.status = StatusLine::Error(PIPELINE_DEAD_STATUS.to_string());
+        self.status_expires_at = None;
+    }
+
+    /// Raises the *permanent* banner for a dead capture thread (pipeline-
+    /// robustness audit, finding 1) — the counterpart to
+    /// `raise_pipeline_dead_status` for the failure that mechanism cannot
+    /// see: the capture thread died, but the pipeline thread is still alive
+    /// and still publishing snapshots on schedule, so the snapshot channel
+    /// never disconnects. `drain_snapshots` calls this for every snapshot
+    /// it drains once `Snapshot::capture_alive` goes `false`, which is
+    /// permanently, so the same "logged/raised once" shape applies: the
+    /// early return below sees the banner it just set.
+    ///
+    /// Same precedence rule as `raise_pipeline_dead_status`: an existing
+    /// *permanent* banner wins (a named cause, or this same banner already
+    /// up), a *transient* one does not.
+    fn raise_capture_dead_status(&mut self) {
+        if matches!(self.status, StatusLine::Error(_)) && self.status_expires_at.is_none() {
+            return;
+        }
+        log::error!(
+            "the capture thread is gone (its event channel disconnected); the pipeline is still \
+             publishing snapshots but they will never change again for the rest of this session"
+        );
+        self.status = StatusLine::Error(CAPTURE_DEAD_STATUS.to_string());
         self.status_expires_at = None;
     }
 
@@ -10055,6 +10101,7 @@ mod tests {
                 scene_boss_name: None,
                 multi_boss_scene: false,
             },
+            capture_alive: true,
         }
     }
 
@@ -16173,6 +16220,7 @@ mod tests {
                 })
                 .collect(),
             encounter: EncounterInfo::default(),
+            capture_alive: true,
         }
     }
 
@@ -16447,6 +16495,7 @@ mod tests {
             total_dps: row.dps,
             rows: vec![row.clone()],
             encounter: EncounterInfo::default(),
+            capture_alive: true,
         };
 
         let frame = rows_painted_boxes_with(

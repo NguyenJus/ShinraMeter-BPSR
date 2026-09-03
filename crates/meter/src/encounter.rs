@@ -3245,6 +3245,9 @@ impl Meter {
             total_dps,
             rows,
             encounter,
+            // The meter has no notion of capture; `bpsr_app::pipeline` is
+            // the only place that ever flips this (see `Snapshot::capture_alive`).
+            capture_alive: true,
         }
     }
 
