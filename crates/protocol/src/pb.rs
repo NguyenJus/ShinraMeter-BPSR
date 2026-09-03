@@ -404,19 +404,46 @@ pub struct EnterSceneInfo {
     pub attrs: Option<AttrCollection>,
 }
 
+/// `CharSerialize.scene_data` (field 3, issue #293's reinstated path — see
+/// that field's doc comment). Only `level_map_id` is modeled: it is the
+/// field `decode::on_sync_container_data` reads for
+/// `ProtocolEvent::Scene`. Byte-verified against BPSR-ZDPS's
+/// `BPSR-ZDPSLib/protos/StruSceneData.cs`, whose `WriteTo` writes
+/// `LevelMapId` with `WriteRawTag(48)` — `(6 << 3) | 0`, i.e. field 6,
+/// wire type 0 (varint) — matching bpsr-logs' `pb.proto`
+/// (`level_map_id = 6`) exactly. `line_id` (field 15) is real too but has
+/// no reader here; prost skips unmodeled fields automatically (see this
+/// file's module doc).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SceneData {
+    #[prost(uint32, tag = "6")]
+    pub level_map_id: u32,
+}
+
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CharSerialize {
     #[prost(int64, tag = "1")]
     pub char_id: i64,
     #[prost(message, optional, tag = "2")]
     pub char_base: Option<CharBaseInfo>,
-    // Field 3 was `scene_data: Option<SceneData>`, ported unverified from
-    // `winjwinj/bpsr-logs`' `pb.proto` (issue #35). **Disproven**: a live
-    // 19,667-message capture's single `SyncContainerData.CharSerialize` has
-    // no field 3 at all (its field numbers jump 2 -> 5), and zero messages
-    // anywhere in that capture match the `SceneData{level_map_id}` shape.
-    // The scene id actually rides `opcode::ENTER_SCENE`'s attr channel — see
-    // `attr_id::SCENE_BASIC_ID` and `decode::on_enter_scene`.
+    /// Field 3 (issue #35, reinstated for issue #293). Originally ported
+    /// unverified from `winjwinj/bpsr-logs`' `pb.proto`, then pulled after
+    /// a single 19,667-message capture's lone `SyncContainerData` had no
+    /// field 3 at all — but that capture only ever caught `SyncContainerData`
+    /// *after* `ENTER_SCENE` had already fired, and `scene_data` is not
+    /// resent on every sync (see `decode::on_sync_container_data`'s doc
+    /// comment). Issue #293 (attaching mid-instance, so `ENTER_SCENE` has
+    /// already come and gone) needs exactly the sync this field rides: a
+    /// meter attached late still gets a `SyncContainerData` full-state push,
+    /// and this is the only field on it carrying the scene id. Byte-verified
+    /// against both references, not re-ported unverified: BPSR-ZDPS's real
+    /// generated protobuf source
+    /// (`BPSR-ZDPSLib/protos/StruCharSerialize.cs`'s `WriteTo`) writes
+    /// `SceneData` with `WriteRawTag(26)` — `(3 << 3) | 2`, i.e. field 3,
+    /// wire type 2 (length-delimited) — confirming bpsr-logs' `pb.proto`
+    /// (`scene_data = 3`) independently.
+    #[prost(message, optional, tag = "3")]
+    pub scene_data: Option<SceneData>,
     #[prost(message, optional, tag = "61")]
     pub profession_list: Option<ProfessionList>,
 }

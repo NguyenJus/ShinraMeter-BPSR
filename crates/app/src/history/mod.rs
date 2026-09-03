@@ -329,6 +329,10 @@ impl EncounterRecord {
                 scene_id: self.scene_id,
                 ..EncounterInfo::default()
             },
+            // A rebuilt-from-history snapshot has no live capture thread to
+            // ask; it renders through the same live table path regardless,
+            // and is never checked for this (see `Snapshot::capture_alive`).
+            capture_alive: true,
         }
     }
 }
@@ -417,6 +421,7 @@ mod tests {
                 scene_boss_name: Some("Test Boss"),
                 multi_boss_scene: false,
             },
+            capture_alive: true,
         }
     }
 

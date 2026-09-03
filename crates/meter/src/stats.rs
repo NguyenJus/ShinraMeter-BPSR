@@ -481,6 +481,15 @@ pub struct Snapshot {
     /// What is being fought, if the packet stream has revealed it (issue #9
     /// slice 2).
     pub encounter: EncounterInfo,
+    /// Whether the packet-capture thread is still alive, as far as the
+    /// caller publishing this snapshot knows (pipeline-robustness audit,
+    /// finding 1). The meter itself has no way to know this — it only ever
+    /// sees the events it is handed — so every `Snapshot` this crate builds
+    /// sets it `true`; `bpsr_app::pipeline` is the one place that ever
+    /// flips it to `false`, once its capture-event channel disconnects, so
+    /// the overlay can tell "no data because nothing is happening" apart
+    /// from "no data because the thing that would produce it is gone."
+    pub capture_alive: bool,
 }
 
 #[cfg(test)]

@@ -88,8 +88,13 @@ pub struct ResetConfig {
 impl Default for ResetConfig {
     fn default() -> Self {
         Self {
-            hp_drop_below_pct: 60.0,
-            hp_rollback_at_pct: 90.0,
+            // 95/95, matching resonance-logs' `AttemptConfig` defaults: any
+            // dip below 95% that comes back above 95% reads as a wipe/reset,
+            // not just a burn past the 60/90 split this used to use — a
+            // boss can legitimately get burned to 61% and pushed back to
+            // 89% by real damage without ever wiping.
+            hp_drop_below_pct: 95.0,
+            hp_rollback_at_pct: 95.0,
             cooldown_ms: 2000,
         }
     }
@@ -105,6 +110,16 @@ pub struct EnemyState {
     /// mid-pull still has a denominator to measure rollbacks against. It is
     /// monotonically non-decreasing and deliberately survives `Meter::reset`
     /// — the peak is a property of the entity, not of the encounter.
+    ///
+    /// Does *not* survive a `monster_id` change on the uid it is keyed
+    /// under, though (issue #317): `apply_enemy_hp` resets the whole
+    /// `EnemyState` when an existing uid reports a new `monster_id`,
+    /// because the game recycles uids onto new entities rather than
+    /// re-templating one live entity in place (`uid = uuid >> 16` puts
+    /// uid=1 at the very first slot ever allocated, and every curated
+    /// `phase.rs` group stays inside one id family) — a stale peak from the
+    /// previous occupant would otherwise understate every `pct()` reading
+    /// against the new entity's actual HP pool.
     pub peak_hp: Option<u64>,
     pub lowest_pct: Option<f64>,
     pub took_damage: bool,
@@ -129,6 +144,12 @@ pub struct EnemyState {
     /// signal that separates that boss from the one issue #157 is about,
     /// whose damage a mid-pull reset erased seconds ago; see
     /// `Meter::recompute_boss`.
+    ///
+    /// Also reset on a `monster_id` change on the uid it is keyed under
+    /// (issue #317), for the same uid-recycle reason `peak_hp` is: a
+    /// timestamp from the previous occupant's fight history would let a
+    /// corpse the party abandoned minutes ago read as "recently damaged"
+    /// the instant a new entity takes over its uid.
     pub last_damaged_ms: Option<u64>,
     /// When this enemy was observed dying during the current fight (issue
     /// #124), as a rank in the encounter's death order: `Some(1)` died
@@ -151,12 +172,26 @@ pub struct EnemyState {
     /// A bare flag would leave that tie to be broken on `max_hp`, which in a
     /// phased fight can name the *first* phase (issue #124's premise is that
     /// an earlier phase carries the larger pool).
+    ///
+    /// Also reset on a `monster_id` change on the uid it is keyed under
+    /// (issue #317): a recycled uid's previous occupant's death has nothing
+    /// to say about whether the new entity now sitting on that uid is
+    /// alive, and leaving it set would make `is_alive`/`recompute_boss`
+    /// treat a live new entity as a standing corpse.
     pub death_order: Option<u64>,
     /// Monster template id, from `EnemyHp::monster_id` (issue #9 slice 2).
     /// Survives `Meter::reset` like the rest of `EnemyState` — only a
     /// `ProtocolEvent::ServerChanged` clears the enemy map itself (uids are
     /// re-issued by the new server session, so entity state does not
     /// survive a reconnect the way display state does — issue #138).
+    ///
+    /// A *change* to this field is a different event from a reconnect,
+    /// though (issue #317): `apply_enemy_hp` treats an existing uid
+    /// reporting a new `monster_id` as that uid being recycled onto a new
+    /// entity, and resets the rest of `EnemyState` — `peak_hp`, `max_hp`,
+    /// `curr_hp`, `lowest_pct`, `took_damage`, `death_order`, and
+    /// `last_damaged_ms` — to a fresh entity's starting values before
+    /// applying that same packet's own HP fields.
     pub monster_id: Option<u32>,
 }
 
@@ -209,13 +244,21 @@ impl EnemyState {
 }
 
 /// True iff the enemy's HP dropped below `hp_drop_below_pct` at some point
-/// during the fight and has since rolled back up to at least
+/// during the fight and has since rolled back to strictly above
 /// `hp_rollback_at_pct` — the signature of a boss-HP-bar reset/wipe rather
 /// than genuine burst damage.
+///
+/// Both thresholds default to 95% (resonance-logs' `AttemptConfig`): any dip
+/// below 95 that returns above 95 counts, so a boss idling at (or healed
+/// past) its peak with no real dip never trips the first half of the
+/// check. The second half is strictly `>`, not `>=`, to avoid the edge case
+/// of a `lowest_pct`/`current` pair landing on the threshold itself and
+/// disagreeing about whether that one reading was "still below" or
+/// "already recovered".
 pub fn check_hp_rollback(enemy: &EnemyState, cfg: &ResetConfig) -> bool {
     match (enemy.lowest_pct, enemy.pct()) {
         (Some(lowest), Some(current)) => {
-            lowest < cfg.hp_drop_below_pct && current >= cfg.hp_rollback_at_pct
+            lowest < cfg.hp_drop_below_pct && current > cfg.hp_rollback_at_pct
         }
         _ => false,
     }
@@ -315,31 +358,52 @@ mod tests {
     #[test]
     fn rollback_triggers_when_dropped_below_then_recovered_above() {
         let cfg = ResetConfig::default();
-        // lowest 55% (< 60), current 95% (>= 90) -> triggers.
-        let e = enemy(Some(55.0), 95, 100);
+        // lowest 65% (< 95), current 100% (> 95) -> triggers.
+        let e = enemy(Some(65.0), 100, 100);
         assert!(check_hp_rollback(&e, &cfg));
     }
 
     #[test]
     fn rollback_does_not_trigger_when_never_dropped_below_threshold() {
         let cfg = ResetConfig::default();
-        // lowest 70% never dipped below 60 -> no trigger even at 95%.
-        let e = enemy(Some(70.0), 95, 100);
+        // lowest 96% never dipped below 95 -> no trigger even back at 100%.
+        let e = enemy(Some(96.0), 100, 100);
+        assert!(!check_hp_rollback(&e, &cfg));
+    }
+
+    /// A boss idling at (or that has only ever been healed toward) its own
+    /// peak: `lowest_pct` never reads below the drop threshold, so the
+    /// first half of the check is false regardless of `current` — no
+    /// amount of time spent at full HP can look like a wipe.
+    #[test]
+    fn rollback_does_not_trigger_for_a_boss_idling_at_full_hp() {
+        let cfg = ResetConfig::default();
+        let e = enemy(Some(100.0), 100, 100);
         assert!(!check_hp_rollback(&e, &cfg));
     }
 
     #[test]
     fn rollback_does_not_trigger_when_current_below_recovery_threshold() {
         let cfg = ResetConfig::default();
-        // lowest 55% (< 60) but current only 80% (< 90) -> not recovered yet.
+        // lowest 55% (< 95) but current only 80% (< 95) -> not recovered yet.
         let e = enemy(Some(55.0), 80, 100);
+        assert!(!check_hp_rollback(&e, &cfg));
+    }
+
+    /// `current` landing exactly on the threshold does not count — the
+    /// comparison is strict `>`, precisely to keep this edge case out of
+    /// "recovered" (see the rationale on `check_hp_rollback`).
+    #[test]
+    fn rollback_does_not_trigger_when_current_exactly_at_the_threshold() {
+        let cfg = ResetConfig::default();
+        let e = enemy(Some(55.0), 95, 100);
         assert!(!check_hp_rollback(&e, &cfg));
     }
 
     #[test]
     fn rollback_false_when_lowest_pct_unknown() {
         let cfg = ResetConfig::default();
-        let e = enemy(None, 95, 100);
+        let e = enemy(None, 100, 100);
         assert!(!check_hp_rollback(&e, &cfg));
     }
 }
