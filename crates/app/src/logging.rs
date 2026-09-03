@@ -23,10 +23,32 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A log file at or above this size gets rotated to `<path>.1`.
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+static SESSION_ID: OnceLock<String> = OnceLock::new();
+
+/// `<pid>-<unix start seconds>`, computed once — the first call wins — and
+/// cached for the rest of the process (issue #322). Printed in [`init`]'s
+/// startup banner and reused by `crate::inspect::dump_path` to name the
+/// packet-inspection dump file, so a dump on disk can always be matched
+/// back to the session log line that produced it — a bare pid alone gets
+/// reused across runs and can't tell two sessions' dumps apart. `init`
+/// calls this before `inspect::init` ever runs (see `main.rs`), so by the
+/// time a dump path is resolved the value is already fixed for the
+/// process.
+pub fn session_id() -> &'static str {
+    SESSION_ID.get_or_init(|| {
+        let unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("{}-{unix_secs}", std::process::id())
+    })
+}
 
 /// Installs the global logger (stderr + file, `info` by default, `RUST_LOG`
 /// overridable) and a panic hook that logs uncaught panics before chaining
@@ -73,10 +95,11 @@ pub fn init() {
     install_panic_hook();
 
     log::info!(
-        "{} v{} starting (pid {}, log file: {}, filter: {})",
+        "{} v{} starting (pid {}, session {}, log file: {}, filter: {})",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
+        session_id(),
         resolved_path
             .as_ref()
             .map(|p| p.display().to_string())
@@ -429,6 +452,19 @@ mod tests {
     use bpsr_test_support::scratch_path;
 
     use super::*;
+
+    // -- session_id ---------------------------------------------------------
+
+    /// `<pid>-<unix start seconds>`, and stable across repeated calls
+    /// within the same process (the `OnceLock` computes it once).
+    #[test]
+    fn session_id_is_pid_dash_unix_seconds_and_stable() {
+        let id = session_id();
+        let (pid_part, secs_part) = id.split_once('-').expect("session id must contain a dash");
+        assert_eq!(pid_part.parse::<u32>().unwrap(), std::process::id());
+        assert!(secs_part.parse::<u64>().unwrap() > 0);
+        assert_eq!(session_id(), id, "cached, not regenerated per call");
+    }
 
     // -- log_file_path ----------------------------------------------------
 
