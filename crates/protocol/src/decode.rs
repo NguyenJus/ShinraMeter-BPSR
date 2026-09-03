@@ -315,8 +315,13 @@ fn on_aoi_sync_delta(
             // `MessageManager.cs` ~1372-1384). `hp_lessen_value` is computed
             // independently and stays correct, so it takes over whenever it
             // is usable; otherwise the hit reports no damage rather than a
-            // negative one.
-            let value = if value < 0 {
+            // negative one. This guard applies to damage-typed hits only:
+            // heal-typed `SyncDamageInfo` can legitimately carry a negative
+            // `value` (lethal/self-damage heals — see encounter.rs's
+            // negative/lethal heal handling), so those pass through
+            // unchanged.
+            let is_heal = dmg.r#type == EDamageType::Heal as i32;
+            let value = if !is_heal && value < 0 {
                 if dmg.hp_lessen_value > 0 {
                     dmg.hp_lessen_value
                 } else {
@@ -334,7 +339,7 @@ fn on_aoi_sync_delta(
                 lucky: dmg.lucky_value != 0,
                 hp_lessen: dmg.hp_lessen_value,
                 is_miss: dmg.is_miss || dmg.r#type == EDamageType::Miss as i32,
-                is_heal: dmg.r#type == EDamageType::Heal as i32,
+                is_heal,
                 target_uid,
                 target_kind,
                 timestamp_ms: now_ms,
@@ -972,6 +977,27 @@ mod tests {
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
         assert!(only_damage(out).is_heal);
+    }
+
+    /// The negative-value guard is for damage-typed hits only. Heal-typed
+    /// `SyncDamageInfo` can legitimately carry a negative `value` (lethal /
+    /// self-damage heals — see `bpsr_meter::encounter`'s negative/lethal
+    /// heal handling), so it must survive decode unchanged even when a
+    /// positive `hp_lessen_value` is also present.
+    #[test]
+    fn heal_type_keeps_negative_value() {
+        let dmg = pb::SyncDamageInfo {
+            r#type: EDamageType::Heal as i32,
+            value: -500,
+            hp_lessen_value: 300,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        let ev = only_damage(out);
+        assert_eq!(ev.value, -500);
+        assert!(ev.is_heal);
     }
 
     #[test]
