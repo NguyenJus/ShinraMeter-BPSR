@@ -1849,11 +1849,27 @@ impl Meter {
     /// `engaged_boss_still_up` is: a pull can have two bosses up at once,
     /// and the header's current selection is not necessarily the one whose
     /// idling out just ended the fight.
+    ///
+    /// `self.enemies` is a `HashMap`, so when more than one candidate
+    /// qualifies the iteration order is not meaningful and must not decide
+    /// the answer. Ties are broken deterministically: a candidate with a
+    /// curated [`phase::has_phase_group`] wins first (that is the one this
+    /// helper exists to resume against), then the one damaged most
+    /// recently, then — to make the choice fully deterministic even between
+    /// two otherwise-identical candidates — the lowest uid.
     fn engaged_boss_monster_id(&self) -> Option<u32> {
         self.enemies
-            .values()
-            .find(|e| is_damaged_living_boss(e))
-            .and_then(|e| e.monster_id)
+            .iter()
+            .filter(|(_, e)| is_damaged_living_boss(e))
+            .filter_map(|(&uid, e)| e.monster_id.map(|monster_id| (uid, monster_id, e)))
+            .max_by_key(|(uid, monster_id, e)| {
+                (
+                    phase::has_phase_group(*monster_id),
+                    e.last_damaged_ms,
+                    std::cmp::Reverse(*uid),
+                )
+            })
+            .map(|(_, monster_id, _)| monster_id)
     }
 
     /// Records that `uid` has died, assigning it the next rank in this
@@ -8830,6 +8846,60 @@ mod tests {
             assert!(!m.snapshot(11_100).encounter.multi_boss_scene);
         }
 
+        // -- Part B.5: `engaged_boss_monster_id` is deterministic ------------
+
+        #[test]
+        fn engaged_boss_monster_id_prefers_a_phased_candidate_regardless_of_map_order() {
+            // Issue #316 review: `self.enemies` is a `HashMap`, and this
+            // module's own doc comments (`other_living_boss`,
+            // `engaged_boss_monster_id`) say a pull can have two bosses up
+            // at once — so picking via `.values().find(..)` picked
+            // whichever one the map happened to visit first, not a
+            // meaningful answer. `ORIGIN` has a curated phase group
+            // (`phase::has_phase_group`); `OTHER_BOSS` does not — only the
+            // phased one is a sensible target to resume against, so it must
+            // win no matter which uid the map visits first.
+            for (first, second) in [(10i64, 11i64), (11, 10)] {
+                let mut m = Meter::new();
+                for &uid in &[first, second] {
+                    let monster_id = if uid == 10 { ORIGIN } else { OTHER_BOSS };
+                    m.apply(&hp(uid, 900, 1_000, monster_id, 0));
+                    m.apply(&hit(uid, 100, 100, false));
+                }
+                assert_eq!(
+                    m.engaged_boss_monster_id(),
+                    Some(ORIGIN),
+                    "insertion order {first},{second}: the phased boss must win"
+                );
+            }
+        }
+
+        #[test]
+        fn engaged_boss_monster_id_breaks_an_equally_phased_tie_by_most_recent_damage() {
+            // `ORIGIN` and `CONTINUATION` share a phase group, so the
+            // phase-group signal ties between them and the tiebreak falls to
+            // whichever was damaged more recently — the boss idling out
+            // right now, not an earlier phase still sitting in the map
+            // because its own death signal was never delivered.
+            for (first, second) in [(10i64, 11i64), (11, 10)] {
+                let mut m = Meter::new();
+                for &uid in &[first, second] {
+                    let (monster_id, ts) = if uid == 10 {
+                        (ORIGIN, 100)
+                    } else {
+                        (CONTINUATION, 200)
+                    };
+                    m.apply(&hp(uid, 900, 1_000, monster_id, 0));
+                    m.apply(&hit(uid, 100, ts, false));
+                }
+                assert_eq!(
+                    m.engaged_boss_monster_id(),
+                    Some(CONTINUATION),
+                    "insertion order {first},{second}: the more recently damaged phase must win"
+                );
+            }
+        }
+
         // -- Part C: what may and may not clear an armed hold ---------------
 
         #[test]
@@ -9047,6 +9117,69 @@ mod tests {
                 m.snapshot(2_200).total_damage,
                 700,
                 "the reconnecting hit must be counted, not dropped"
+            );
+        }
+
+        #[test]
+        fn a_scene_change_into_a_different_dungeon_after_a_phased_bosss_death_does_not_withhold_the_next_fight()
+         {
+            // Issue #316 (`Scene` counterpart to the `ServerChanged`
+            // regression above): the `Scene` arm's `entering_dungeon`
+            // branch clears `fight_end_boss_id` for the same reason the
+            // `ServerChanged` arm does — it empties `enemies`, and a stale
+            // arming against that now-empty map would read the next
+            // dungeon's first hit as "undecided, could still be the next
+            // phase" and withhold it (and every one after it) until
+            // `phase_resume_window_ms` lapsed on its own.
+            const DUNGEON_A: u32 = 1_001;
+            const DUNGEON_B: u32 = 40_001;
+
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: DUNGEON_A,
+            });
+            m.apply(&hp(10, 900, 1_000, ORIGIN, 0));
+            m.apply(&hit(10, 500, 100, false));
+            m.apply(&hit(10, 500, 1_000, true));
+            assert_eq!(
+                m.fight_end_boss_id,
+                Some(ORIGIN),
+                "sanity check: the kill armed the hold"
+            );
+
+            let reason = m.apply(&ProtocolEvent::Scene {
+                level_map_id: DUNGEON_B,
+            });
+            assert_eq!(
+                reason,
+                Some(ResetReason::SceneChanged),
+                "sanity check: this is the dungeon-to-dungeon transition"
+            );
+            assert_eq!(
+                m.fight_end_boss_id, None,
+                "the dungeon-to-dungeon transition must drop the stale arming"
+            );
+
+            // The new dungeon's first hit, on a target it has not even
+            // named yet — exactly the packet-order shape that used to read
+            // as "undecided" and get dropped. Unlike the `ServerChanged`
+            // case, the `Scene` arm's own `SceneChanged` reset above already
+            // ran (it does not defer to a held-fight `NewFight` reset the
+            // way `ServerChanged` does), so this lands as an ordinary fresh
+            // hit rather than one that itself triggers a reset — the
+            // regression this pins is that it is counted at all, not
+            // silently withheld forever behind a stale `fight_end_boss_id`.
+            let reason = m.apply(&hit(20, 700, 2_100, false));
+
+            assert_eq!(
+                reason, None,
+                "no reset fires here — the Scene arm's own reset already ran"
+            );
+            assert_eq!(m.fight_start_ms, Some(2_100));
+            assert_eq!(
+                m.snapshot(2_200).total_damage,
+                700,
+                "the new dungeon's hit must be counted, not dropped"
             );
         }
 
