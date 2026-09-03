@@ -486,10 +486,11 @@ pub struct AdoptionDecision {
     /// with no adoption).
     pub skip: bool,
     /// This call is the one that adopted `conn` as the server connection.
-    /// The caller must resync the reassembler to this packet's sequence
-    /// number, reset the decoder, and emit exactly one
-    /// `ProtocolEvent::ServerChanged` — never on any other decision, which
-    /// is what keeps a still-`Adopted` packet from re-triggering the event.
+    /// The caller must resync the reassembler to `seq + frame_offset` (see
+    /// [`frame_offset`](Self::frame_offset)), not the packet's bare `seq`,
+    /// reset the decoder, and emit exactly one `ProtocolEvent::ServerChanged`
+    /// — never on any other decision, which is what keeps a still-`Adopted`
+    /// packet from re-triggering the event.
     pub newly_adopted: bool,
     /// The payload-relative byte offset of the frame boundary the adopting
     /// packet was matched at (issue #293), meaningful only when
