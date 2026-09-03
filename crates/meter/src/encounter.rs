@@ -2452,6 +2452,17 @@ impl Meter {
                 // just took over this uid. The incoming packet's own HP
                 // fields, applied below, become that fresh entity's first
                 // observation.
+                //
+                // A delta that carries `monster_id` without `curr_hp`/
+                // `max_hp` (an AOI-sync delta can — see
+                // `enemy_hp_from_attrs`) resets to `EnemyState::default()`
+                // same as any other change, so `curr_hp`/`max_hp` land as
+                // `None` and `pct()` reads `None` until the next HP-bearing
+                // packet for this uid arrives. That is deliberate, not an
+                // oversight: the old entity's HP pool has nothing to say
+                // about the new one's, so carrying it over would be a false
+                // reading, not a stale-but-close one. The HP bar is expected
+                // to blank out for the gap between the two packets.
                 if let Some(msg) = monster_id_change_log(e.uid, enemy.monster_id, new_id) {
                     log::info!("{msg} — state reset");
                     *enemy = EnemyState {
@@ -9752,6 +9763,47 @@ mod tests {
             assert_eq!(before.death_order, after.death_order);
             assert_eq!(before.last_damaged_ms, after.last_damaged_ms);
             assert_eq!(after.monster_id, Some(OLD_BOSS));
+        }
+
+        /// (d) An AOI-sync delta can carry `monster_id` alone, with no
+        /// `curr_hp`/`max_hp` (see `enemy_hp_from_attrs`). The state still
+        /// resets — the recycled uid is still a new entity — but with no HP
+        /// fields in the packet to reapply, `curr_hp`/`max_hp` land as `None`
+        /// and `pct()` reads `None` until the next HP-bearing packet for this
+        /// uid arrives.
+        #[test]
+        fn monster_id_only_delta_resets_state_and_leaves_hp_unknown() {
+            let mut m = Meter::new();
+            m.apply(&hp(OLD_BOSS, 1_000_000, 1_000_000, 0));
+            m.apply(&boss_hit(UID, 100));
+            m.apply(&hp(OLD_BOSS, 400_000, 1_000_000, 200));
+            assert_eq!(m.enemies[&UID].pct(), Some(40.0));
+
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                uid: UID,
+                curr_hp: None,
+                max_hp: None,
+                monster_id: Some(NEW_BOSS),
+                timestamp_ms: 300,
+            }));
+
+            let reset = &m.enemies[&UID];
+            assert_eq!(reset.monster_id, Some(NEW_BOSS));
+            assert_eq!(reset.curr_hp, None);
+            assert_eq!(reset.max_hp, None);
+            assert_eq!(
+                reset.pct(),
+                None,
+                "no HP in the delta means no HP for the new entity yet"
+            );
+            assert_eq!(reset.lowest_pct, None);
+            assert!(!reset.took_damage);
+            assert_eq!(reset.death_order, None);
+            assert_eq!(reset.last_damaged_ms, None);
+
+            // The next HP-bearing packet restores a reading.
+            m.apply(&hp(NEW_BOSS, 500_000, 1_000_000, 400));
+            assert_eq!(m.enemies[&UID].pct(), Some(50.0));
         }
     }
 
