@@ -462,50 +462,64 @@ fn run(
                     events = crossbeam_channel::never();
                 }
             },
-            recv(commands) -> msg => match msg {
-                Ok(UiCommand::Reset) => pipeline.reset(now_ms()),
-                Ok(UiCommand::SkillFocus(uids)) => skill_focus = uids,
-                // Issue #214. Logged unconditionally: knowing the user had
-                // to reach for this — and when — is exactly the context
-                // #211's silent log was missing, and it is what makes the
-                // capture-side lines that follow interpretable.
-                Ok(UiCommand::RestartCapture) => match &capture_restart {
-                    Some(restart) => {
-                        log::info!("restarting packet capture at the user's request");
-                        restart.request();
-                    }
-                    None => log::warn!(
-                        "a packet-capture restart was requested, but capture never started \
-                         (the status banner explains why); nothing to restart"
-                    ),
-                },
+            recv(commands) -> msg => {
                 // Issue #321: a fight already sitting in `FightState::Ended`
                 // at quit time would otherwise never reach history —
                 // `record_fight_end` only ever runs from the tick arm
                 // above, and quitting drops `tx_snapshot` (and with it the
                 // UI's only signal) the moment this loop exits, with no
-                // more ticks left to catch it. One last `publish` here
+                // more ticks left to catch it. One last `publish` below
                 // flushes that final state — and its `record_fight_end`
                 // call — before the thread actually exits. Logged at INFO,
                 // not the ERROR `ui.rs::raise_pipeline_dead_status` used to
                 // log for every orderly quit (issue #321's false positive):
                 // this is the pipeline thread's own confirmation that the
                 // shutdown it is about to cause was requested, not a crash.
-                Ok(UiCommand::Quit) => {
-                    publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus);
-                    log::info!("quit requested; pipeline flushed its final snapshot and is shutting down");
-                    break;
-                }
+                //
                 // The overlay window closing without going through
                 // `UiCommand::Quit` first (or any other drop of the
                 // command channel) is an orderly shutdown too — see this
                 // function's own doc comment — so it gets the same final
                 // flush and the same INFO-level line.
-                Err(_) => {
+                let quit_reason = match msg {
+                    Ok(UiCommand::Reset) => {
+                        pipeline.reset(now_ms());
+                        None
+                    }
+                    Ok(UiCommand::SkillFocus(uids)) => {
+                        skill_focus = uids;
+                        None
+                    }
+                    // Issue #214. Logged unconditionally: knowing the user
+                    // had to reach for this — and when — is exactly the
+                    // context #211's silent log was missing, and it is what
+                    // makes the capture-side lines that follow
+                    // interpretable.
+                    Ok(UiCommand::RestartCapture) => {
+                        match &capture_restart {
+                            Some(restart) => {
+                                log::info!(
+                                    "restarting packet capture at the user's request"
+                                );
+                                restart.request();
+                            }
+                            None => log::warn!(
+                                "a packet-capture restart was requested, but capture never started \
+                                 (the status banner explains why); nothing to restart"
+                            ),
+                        }
+                        None
+                    }
+                    Ok(UiCommand::Quit) => Some(
+                        "quit requested; pipeline flushed its final snapshot and is shutting down",
+                    ),
+                    Err(_) => Some(
+                        "command channel disconnected; pipeline flushed its final snapshot and is shutting down",
+                    ),
+                };
+                if let Some(reason) = quit_reason {
                     publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus);
-                    log::info!(
-                        "command channel disconnected; pipeline flushed its final snapshot and is shutting down"
-                    );
+                    log::info!("{reason}");
                     break;
                 }
             },
