@@ -444,7 +444,8 @@ fn fit_rgba(rgba: image::RgbaImage, crop: [u32; 4], texture: [u32; 2]) -> egui::
 fn decode_and_fit(bytes: &[u8], region: [u32; 2]) -> Result<Fitted, ImageError> {
     let region = region.map(|side| side.clamp(MIN_TEXTURE_SIDE, MAX_TEXTURE_SIDE));
 
-    if let Some(decoded) = decode_gif_frames(bytes, region, MAX_GIF_FRAMES)? {
+    if let Some(decoded) = decode_gif_frames(bytes, region, MAX_GIF_FRAMES, MAX_DECODED_GIF_BYTES)?
+    {
         return Ok(decoded);
     }
 
@@ -507,21 +508,19 @@ const MAX_GIF_FRAMES: usize = 300;
 /// the UI-thread stall and the allocation a hostile file can force.
 const MAX_DECODED_GIF_BYTES: u64 = 256 * 1024 * 1024;
 
-/// True if collecting `frame_count` frames of a `width`x`height` GIF as
-/// RGBA would exceed [`MAX_DECODED_GIF_BYTES`]. Pure and free of any actual
-/// decode, so the budget math is testable with a pathological canvas
-/// (a would-be multi-gigabyte GIF) without allocating anywhere near it.
+/// How many RGBA bytes one `width`x`height` GIF frame decodes into. Pure
+/// and free of any actual decode, so the budget math is testable against a
+/// pathological canvas (a would-be multi-gigabyte frame) without
+/// allocating anywhere near it.
 ///
 /// `saturating_mul` throughout: `width` and `height` come straight off the
 /// GIF's logical screen descriptor, so a hostile file can claim values
 /// whose product overflows `u64` long before it overflows the budget check
 /// that is supposed to reject it.
-fn gif_decode_volume_exceeds_budget(width: u32, height: u32, frame_count: usize) -> bool {
-    let bytes_per_frame = u64::from(width)
+fn gif_frame_rgba_bytes(width: u32, height: u32) -> u64 {
+    u64::from(width)
         .saturating_mul(u64::from(height))
-        .saturating_mul(4);
-    let projected = bytes_per_frame.saturating_mul(frame_count as u64);
-    projected > MAX_DECODED_GIF_BYTES
+        .saturating_mul(4)
 }
 
 /// Ceiling on the size of a file [`load`] will read into memory.
@@ -557,9 +556,13 @@ fn normalize_gif_delay(delay: Duration) -> Duration {
 ///
 /// At most `max_frames` frames are decoded ([`MAX_GIF_FRAMES`] in
 /// production) — the iterator is consumed lazily, so the frames past the
-/// cap are never decoded at all, not decoded and then dropped. Taking a cap
-/// as an argument rather than reading the constant directly is what lets
-/// the tests prove the truncation with a three-frame fixture.
+/// cap are never decoded at all, not decoded and then dropped. The frames
+/// that *are* decoded may sum to at most `max_decoded_bytes` of RGBA
+/// ([`MAX_DECODED_GIF_BYTES`] in production); past that the decode stops
+/// and the file is rejected. Taking both caps as arguments rather than
+/// reading the constants directly is what lets the tests prove the
+/// truncation with a three-frame fixture, and the budget with a fixture
+/// far smaller than a real decode bomb.
 ///
 /// `region` must already be clamped to `[MIN_TEXTURE_SIDE, MAX_TEXTURE_
 /// SIDE]` (as [`decode_and_fit`] does before calling this), since the crop
@@ -568,6 +571,7 @@ fn decode_gif_frames(
     bytes: &[u8],
     region: [u32; 2],
     max_frames: usize,
+    max_decoded_bytes: u64,
 ) -> Result<Option<Fitted>, ImageError> {
     if !matches!(image::guess_format(bytes), Ok(image::ImageFormat::Gif)) {
         return Ok(None);
@@ -575,35 +579,33 @@ fn decode_gif_frames(
     let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
         .map_err(|err| ImageError::Undecodable(err.to_string()))?;
     let (canvas_width, canvas_height) = image::ImageDecoder::dimensions(&decoder);
-    if gif_decode_volume_exceeds_budget(canvas_width, canvas_height, max_frames) {
+    if gif_frame_rgba_bytes(canvas_width, canvas_height) > max_decoded_bytes {
         return Err(ImageError::Undecodable(format!(
-            "its {canvas_width}x{canvas_height} canvas would need more than the \
-             {} MiB this overlay allows decoding a GIF into",
-            MAX_DECODED_GIF_BYTES / (1024 * 1024)
+            "a single frame of its {canvas_width}x{canvas_height} canvas is already more \
+             than the {} MiB this overlay allows decoding a GIF into",
+            max_decoded_bytes / (1024 * 1024)
         )));
     }
 
-    // The canvas above is the cheap upfront estimate (logical screen
-    // descriptor, read before any frame is touched); this loop re-checks
-    // against each frame's *actual* decoded buffer as it arrives, in case a
-    // malformed file's per-frame data disagrees with what the header
-    // claimed. `into_frames` is lazy, so breaking here means the frames
-    // past the budget are never decoded at all.
+    // The canvas check above only catches a file whose very first frame is
+    // a bomb on its own; how many frames a GIF actually carries is not in
+    // its header at all, so the budget over a whole file is enforced here
+    // instead — each frame's decoded bytes are added to a running total as
+    // it arrives, and the decode stops the moment that total passes the
+    // budget. `into_frames` is lazy, so at most one frame is ever decoded
+    // past the budget and the frames after it are never decoded at all.
     let mut frames = Vec::new();
     let mut decoded_bytes: u64 = 0;
     for frame in decoder.into_frames().take(max_frames) {
         let frame = frame.map_err(|err| ImageError::Undecodable(err.to_string()))?;
         let buffer = frame.buffer();
-        decoded_bytes = decoded_bytes.saturating_add(
-            u64::from(buffer.width())
-                .saturating_mul(u64::from(buffer.height()))
-                .saturating_mul(4),
-        );
+        decoded_bytes =
+            decoded_bytes.saturating_add(gif_frame_rgba_bytes(buffer.width(), buffer.height()));
         frames.push(frame);
-        if decoded_bytes > MAX_DECODED_GIF_BYTES {
+        if decoded_bytes > max_decoded_bytes {
             return Err(ImageError::Undecodable(format!(
-                "decoded past the {} MiB this overlay allows decoding a GIF into",
-                MAX_DECODED_GIF_BYTES / (1024 * 1024)
+                "its frames decode past the {} MiB this overlay allows decoding a GIF into",
+                max_decoded_bytes / (1024 * 1024)
             )));
         }
     }
@@ -1344,14 +1346,26 @@ mod tests {
     /// enough to encode instantly, and distinct enough (by color) that a
     /// test can tell which frame actually got decoded or uploaded.
     fn animated_gif(colors: &[[u8; 3]], delays_ms: &[u64]) -> Vec<u8> {
+        animated_gif_of_size(4, 4, colors, delays_ms)
+    }
+
+    /// [`animated_gif`] on an arbitrary canvas, for the tests that care
+    /// about how many bytes a frame decodes into rather than about which
+    /// frame is which.
+    fn animated_gif_of_size(
+        width: u32,
+        height: u32,
+        colors: &[[u8; 3]],
+        delays_ms: &[u64],
+    ) -> Vec<u8> {
         assert_eq!(colors.len(), delays_ms.len(), "one delay per color");
         let mut bytes = Vec::new();
         {
             let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
             for (color, &delay_ms) in colors.iter().zip(delays_ms) {
                 let buffer = image::RgbaImage::from_pixel(
-                    4,
-                    4,
+                    width,
+                    height,
                     image::Rgba([color[0], color[1], color[2], 255]),
                 );
                 let frame = image::Frame::from_parts(
@@ -1427,9 +1441,14 @@ mod tests {
     /// still producing the static shape — one frame, no delay.
     #[test]
     fn a_single_frame_gif_is_fitted_by_the_gif_path_rather_than_decoded_twice() {
-        let fitted = decode_gif_frames(&single_frame_gif(), [8, 8], MAX_GIF_FRAMES)
-            .expect("a valid gif must decode")
-            .expect("the gif path must keep a single-frame gif rather than re-decoding it");
+        let fitted = decode_gif_frames(
+            &single_frame_gif(),
+            [8, 8],
+            MAX_GIF_FRAMES,
+            MAX_DECODED_GIF_BYTES,
+        )
+        .expect("a valid gif must decode")
+        .expect("the gif path must keep a single-frame gif rather than re-decoding it");
         assert_eq!(fitted.frames.len(), 1, "a single-frame gif is static");
         assert_eq!(
             fitted.frames[0].delay,
@@ -1449,7 +1468,7 @@ mod tests {
     #[test]
     fn a_gif_past_the_frame_cap_is_truncated_rather_than_rejected() {
         let bytes = animated_gif(&[[255, 0, 0], [0, 255, 0], [0, 0, 255]], &[30, 60, 90]);
-        let fitted = decode_gif_frames(&bytes, [8, 8], 2)
+        let fitted = decode_gif_frames(&bytes, [8, 8], 2, MAX_DECODED_GIF_BYTES)
             .expect("a valid animated gif must decode")
             .expect("a gif over the cap must still produce an animation");
         assert_eq!(
@@ -1463,7 +1482,7 @@ mod tests {
             "truncation keeps the leading frames, in order"
         );
         // A cap of 1 leaves a single frame, which is the static shape.
-        let capped = decode_gif_frames(&bytes, [8, 8], 1)
+        let capped = decode_gif_frames(&bytes, [8, 8], 1, MAX_DECODED_GIF_BYTES)
             .expect("a valid animated gif must decode")
             .expect("a one-frame cap must still produce an image");
         assert_eq!(capped.frames.len(), 1);
@@ -1473,61 +1492,84 @@ mod tests {
     // -- decode-bomb budget (issue #322) ------------------------------------
 
     #[test]
-    fn gif_decode_volume_exceeds_budget_is_false_comfortably_under_budget() {
-        assert!(!gif_decode_volume_exceeds_budget(64, 64, 300));
+    fn gif_frame_rgba_bytes_is_four_bytes_a_pixel() {
+        assert_eq!(gif_frame_rgba_bytes(64, 32), 64 * 32 * 4);
     }
 
     #[test]
-    fn gif_decode_volume_exceeds_budget_is_false_exactly_at_the_boundary() {
-        // 1024 * 1024 * 4 bytes/frame * 64 frames == MAX_DECODED_GIF_BYTES
-        // exactly; the budget is a ceiling, not a strict-less-than limit.
-        assert_eq!(1024u64 * 1024 * 4 * 64, MAX_DECODED_GIF_BYTES);
-        assert!(!gif_decode_volume_exceeds_budget(1024, 1024, 64));
-    }
-
-    #[test]
-    fn gif_decode_volume_exceeds_budget_is_true_one_frame_past_the_boundary() {
-        assert!(gif_decode_volume_exceeds_budget(1024, 1024, 65));
-    }
-
-    #[test]
-    fn gif_decode_volume_exceeds_budget_is_true_for_a_2000_square_300_frame_canvas() {
-        // The decode-bomb example the budget exists to reject: ~4.8 GB.
-        assert!(gif_decode_volume_exceeds_budget(2000, 2000, 300));
+    fn gif_frame_rgba_bytes_is_the_budget_exactly_at_the_boundary() {
+        // 8192 * 8192 * 4 == MAX_DECODED_GIF_BYTES exactly; the budget is a
+        // ceiling, not a strict-less-than limit, so a canvas this size is
+        // still allowed through.
+        assert_eq!(gif_frame_rgba_bytes(8192, 8192), MAX_DECODED_GIF_BYTES);
     }
 
     /// A hostile logical-screen descriptor can claim a `width`/`height`
     /// whose product overflows `u64` well before it overflows the budget;
-    /// the check must still answer (and answer `true`) rather than panic.
+    /// the math must still answer (and answer over-budget) rather than
+    /// panic or wrap around to a passing value.
     #[test]
-    fn gif_decode_volume_exceeds_budget_does_not_panic_on_pathological_dimensions() {
-        assert!(gif_decode_volume_exceeds_budget(
-            u32::MAX,
-            u32::MAX,
-            usize::MAX
-        ));
+    fn gif_frame_rgba_bytes_does_not_wrap_on_pathological_dimensions() {
+        assert_eq!(gif_frame_rgba_bytes(u32::MAX, u32::MAX), u64::MAX);
+        assert!(gif_frame_rgba_bytes(u32::MAX, u32::MAX) > MAX_DECODED_GIF_BYTES);
     }
 
-    /// The real decode path never allocates the bomb it's rejecting: a
-    /// tiny real GIF is decoded up to only the canvas-dimensions read, then
-    /// rejected once `max_frames` alone projects past the budget, so no
-    /// frame is ever decoded.
+    /// The upfront canvas check rejects only a *true* bomb — a canvas whose
+    /// single frame is already over budget — and does it before any frame
+    /// is decoded, so the allocation it exists to prevent never happens.
     #[test]
-    fn decode_gif_frames_rejects_a_would_be_huge_volume_without_decoding_it() {
-        let bytes = single_frame_gif();
-        let err = decode_gif_frames(&bytes, [8, 8], 5_000_000)
-            .expect_err("4x4 canvas * 5,000,000 frames blows the decode budget");
+    fn decode_gif_frames_rejects_a_canvas_whose_single_frame_is_over_budget() {
+        // A 4x4 frame is 64 RGBA bytes: over a 32-byte budget on its own.
+        let err = decode_gif_frames(&single_frame_gif(), [8, 8], MAX_GIF_FRAMES, 32)
+            .expect_err("a frame bigger than the whole budget must be rejected");
         assert!(matches!(err, ImageError::Undecodable(_)), "{err:?}");
-        assert!(err.to_string().contains("MiB"), "{err}");
+        assert!(err.to_string().contains("4x4"), "{err}");
     }
 
-    /// The same file, asked for well within the frame cap, still decodes —
-    /// the budget must not reject anything a real background GIF would do.
+    /// The frame count a file actually carries is not in its header, so the
+    /// running decoded total is what enforces the budget: the decode stops
+    /// as soon as the frames collected so far pass it, at most one frame
+    /// past.
+    #[test]
+    fn decode_gif_frames_stops_once_the_running_decoded_total_passes_the_budget() {
+        let bytes = animated_gif(&[[255, 0, 0], [0, 255, 0], [0, 0, 255]], &[30, 60, 90]);
+        // 64 RGBA bytes a frame: one frame fits a 100-byte budget, two do not.
+        let err = decode_gif_frames(&bytes, [8, 8], MAX_GIF_FRAMES, 100)
+            .expect_err("three 64-byte frames must blow a 100-byte budget");
+        assert!(matches!(err, ImageError::Undecodable(_)), "{err:?}");
+
+        // The same file under a budget its frames do fit inside decodes
+        // whole, so the rejection above is the running total talking and
+        // not the canvas check.
+        let fitted = decode_gif_frames(&bytes, [8, 8], MAX_GIF_FRAMES, 192)
+            .expect("192 bytes is exactly the three frames")
+            .expect("a gif inside the budget must still produce an animation");
+        assert_eq!(fitted.frames.len(), 3);
+    }
+
+    /// Regression (issue #322 review): the budget must be spent against the
+    /// frames a file really has, not against [`MAX_GIF_FRAMES`] worth of
+    /// them. Projecting the cap rejected any canvas over ~473 pixels a
+    /// side — every 720p GIF — however few frames it actually carried.
+    #[test]
+    fn a_large_canvas_gif_with_few_frames_decodes_rather_than_being_rejected() {
+        // 512 * 512 * 4 * MAX_GIF_FRAMES is ~314 MB (over budget) while the
+        // two frames this file really has are ~2 MB (far under it).
+        let bytes = animated_gif_of_size(512, 512, &[[255, 0, 0], [0, 0, 255]], &[30, 60]);
+        let fitted = decode_gif_frames(&bytes, [8, 8], MAX_GIF_FRAMES, MAX_DECODED_GIF_BYTES)
+            .expect("a two-frame 512x512 gif is nowhere near the decode budget")
+            .expect("an animated gif must produce an animation");
+        assert_eq!(fitted.frames.len(), 2);
+        assert_eq!(fitted.src, [512, 512]);
+    }
+
+    /// A tiny file asked for the production frame cap still decodes — the
+    /// cap alone must never be what rejects it.
     #[test]
     fn decode_gif_frames_still_decodes_when_comfortably_under_the_budget() {
         let bytes = single_frame_gif();
         assert!(
-            decode_gif_frames(&bytes, [8, 8], MAX_GIF_FRAMES)
+            decode_gif_frames(&bytes, [8, 8], MAX_GIF_FRAMES, MAX_DECODED_GIF_BYTES)
                 .expect("well under budget")
                 .is_some()
         );
