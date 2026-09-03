@@ -261,14 +261,24 @@ pub enum ProtocolEvent {
     Cast(CastEvent),
     Player(PlayerInfo),
     EnemyHp(EnemyHp),
-    /// The dungeon/instance id (issue #9 slice 2), decoded from
-    /// `AttrSceneBasicId` on `WorldNtf.EnterScene`'s attr channel — see
-    /// `decode::on_enter_scene` and `attrs::attr_id::SCENE_BASIC_ID`.
+    /// The dungeon/instance id (issue #9 slice 2), decoded from either of
+    /// two sources: `AttrSceneBasicId` on `WorldNtf.EnterScene`'s attr
+    /// channel (see `decode::on_enter_scene` and
+    /// `attrs::attr_id::SCENE_BASIC_ID`), or `SyncContainerData`'s
+    /// `CharSerialize.scene_data.level_map_id` (see
+    /// `decode::on_sync_container_data`). `EnterScene` fires once, on zone
+    /// entry; `SyncContainerData` is a full-state push that can land any
+    /// time a client's session with the world is (re)established,
+    /// including well after zone entry — which is what makes it the source
+    /// a meter attached mid-instance actually sees (issue #293). Consumers
+    /// must treat a repeat of the same id as a no-op, not a fresh
+    /// transition: see `bpsr-meter`'s `Scene` handling.
     ///
-    /// The originally-ported `CharSerialize.scene_data` path has been
-    /// **removed** (issue #35): a live capture proved it wrong for this
-    /// game build (zero messages anywhere matched `SceneData`'s shape),
-    /// and `EnterScene` is the verified source instead.
+    /// `CharSerialize.scene_data` was originally ported, then pulled as
+    /// "disproven" (issue #35) on a single capture that turned out to only
+    /// ever catch `SyncContainerData` after `EnterScene` had already fired
+    /// — see `pb::CharSerialize::scene_data`'s doc comment for the
+    /// byte-level re-verification that brought it back.
     Scene {
         level_map_id: u32,
     },
