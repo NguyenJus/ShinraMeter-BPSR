@@ -109,6 +109,10 @@ WinDivert. Close it, or reboot, and retry.
 **"The Base Filtering Engine service is disabled"** — start it via
 `services.msc` → Base Filtering Engine → Start.
 
+**"The WinDivert driver service is disabled"** — its Startup type was set to
+Disabled. Open `services.msc`, find WinDivert, and set Startup type to
+Manual (or run `sc config WinDivert start= demand`), then retry.
+
 **"Windows could not find the WinDivert driver file"** — the driver is
 unpacked to `%LOCALAPPDATA%\ShinraMeter-BPSR\windivert\<version>\` at
 startup and wasn't found there. Check that antivirus isn't quarantining it,
