@@ -45,7 +45,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bpsr_protocol::InspectSink;
 
@@ -86,7 +86,7 @@ fn enabled_from(var: Option<&str>) -> bool {
 
 /// Where the raw frame dump is written. See the module doc comment for the
 /// default and the `SHINRA_INSPECT_DUMP` override.
-fn dump_path() -> PathBuf {
+pub(crate) fn dump_path() -> PathBuf {
     dump_path_from(
         std::env::var("SHINRA_INSPECT_DUMP").ok().as_deref(),
         std::env::var("APPDATA").ok().as_deref(),
@@ -140,6 +140,20 @@ impl Handle {
     }
 }
 
+/// Process-wide handle to the current session's dump-writer drop counter
+/// (the session-bundle export's manifest field), set once by [`init`]'s `Some`
+/// branch — mirrors `logging::session_id`'s `OnceLock` shape. Reading it
+/// through [`dropped_count`] rather than threading a live [`Handle`]
+/// through `OverlayApp`/`ui::draw_header_menu`'s already-deep call chain
+/// lets the "Export session bundle" menu item report how incomplete the
+/// dump might be with no signature changes anywhere in `ui.rs`.
+///
+/// Only ever set from `init`'s `Some` branch, which nothing in this
+/// module's own unit tests calls (they construct `DumpWriter`/
+/// `DiagnosticSink` directly) — so it can never leak state between tests
+/// or carry a stale value from a previous process.
+static DROPPED_COUNTER: OnceLock<dump::RecordSender> = OnceLock::new();
+
 /// Turns diagnostics on when opted in via `SHINRA_INSPECT`, spawning the
 /// dump-writer thread and returning a `Handle`; `None` (zero cost beyond the
 /// env check) unless opted in.
@@ -153,8 +167,18 @@ pub fn init() -> Option<Handle> {
         path.display()
     );
     let writer = dump::DumpWriter::spawn(path);
+    let _ = DROPPED_COUNTER.set(writer.sender());
     let sink: Arc<dyn InspectSink> = Arc::new(DiagnosticSink::new(writer.sender()));
     Some(Handle { sink, writer })
+}
+
+/// Live dropped-record count for the current session's dump, or `None`
+/// when packet inspection was never turned on this run (`init` never
+/// reached its `Some` branch, so [`DROPPED_COUNTER`] was never set). Used
+/// by `crate::bundle::build_manifest`'s caller to report how incomplete an
+/// in-progress (or just-finished) dump might be.
+pub(crate) fn dropped_count() -> Option<u64> {
+    DROPPED_COUNTER.get().map(dump::RecordSender::dropped_count)
 }
 
 #[derive(Debug, Clone)]

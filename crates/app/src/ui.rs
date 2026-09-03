@@ -4,13 +4,23 @@
 //! `bpsr_meter::Snapshot` handed to it over a channel and emits `UiCommand`s
 //! for the app layer to act on. No threads or channels are created in this
 //! module beyond the `crossbeam_channel` endpoints eframe's caller hands in
-//! — with two deliberate exceptions, both header-menu items: issue #171's
-//! "Check for updates" (`draw_header_menu`, `UpdateCheckState`) and issue
-//! #220's "Export logs" (`start_log_export`). Each spawns its own one-shot
-//! `std::thread` and reports back over a `crossbeam_channel`, the same way
-//! `settings::spawn_writer` and `pipeline::spawn` do at the app layer,
-//! because the app layer has no channel of its own suited to a single
-//! manual, UI-triggered request/reply.
+//! — with three deliberate exceptions, all header-menu items: issue #171's
+//! "Check for updates" (`draw_header_menu`, `UpdateCheckState`), issue
+//! #220's "Export logs" (`start_log_export`), and "Export session bundle"
+//! (`start_bundle_export`, `crate::bundle`) — the whole-folder handover (log
+//! files, the packet-inspection dump ring if it was on, `settings.json`, and
+//! a `manifest.json`) so an agent can triage a session without the
+//! maintainer's help. Each spawns its own one-shot `std::thread` and reports
+//! back over a `crossbeam_channel`, the same way `settings::spawn_writer`
+//! and `pipeline::spawn` do at the app layer, because the app layer has no
+//! channel of its own suited to a single manual, UI-triggered request/reply.
+//! "Export session bundle" deliberately reuses "Export logs"' own
+//! `LogExportOutcome`/`tx_log_export`/`poll_log_export` machinery rather
+//! than adding a parallel copy of it — both report "a destination path, or
+//! that path plus why it failed", and threading a second reply channel
+//! through `draw_header`/`draw_header_menu`'s already-deep call chain (and
+//! every test that calls either) would cost far more than the shared type
+//! is worth.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -22,6 +32,7 @@ use bpsr_meter::{
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui;
 
+use crate::bundle;
 use crate::custom_image::{CustomImages, ImageError, ImageSlot};
 use crate::fonts;
 use crate::history;
@@ -1479,9 +1490,11 @@ impl OverlayApp {
         UpdateCheckState::Restarting
     }
 
-    /// Issue #220 (PR #227 review): picks up whatever the "Export logs"
-    /// threads have finished. Like `poll_update_check`, drained once per
-    /// frame whether or not the dropdown is open — the item closes the
+    /// Issue #220 (PR #227 review): picks up whatever the "Export logs" or
+    /// "Export session bundle" threads have finished — both report through
+    /// the same `LogExportOutcome`/`rx_log_export` (see this module's own
+    /// doc comment for why). Like `poll_update_check`, drained once per
+    /// frame whether or not the dropdown is open — either item closes the
     /// dropdown on click, so by the time a multi-megabyte copy finishes
     /// there is no menu left to report through.
     ///
@@ -1489,9 +1502,14 @@ impl OverlayApp {
     /// same one the Share clipboard failure uses) as well as the log: the
     /// log-only reporting this used to do told a user whose export silently
     /// produced nothing exactly nothing, in the one situation where they
-    /// are already trying to hand over a log. A success is logged only —
-    /// `StatusLine` has no non-error state to say it with, and the file
-    /// appearing where the user just chose to put it is its own feedback.
+    /// are already trying to hand over a log. A clean success is logged
+    /// only — `StatusLine` has no non-error state to say it with, and the
+    /// file/folder appearing where the user just chose to put it is its own
+    /// feedback. A bundle that landed but couldn't copy every file
+    /// (`bundle::export_bundle_to`'s missing list — a dump chunk the writer
+    /// rotated away mid-export, say) does use the banner: it looks
+    /// identical to a clean export on disk, so nothing else would tell the
+    /// user their handover is short.
     fn poll_log_export(&mut self, now: Instant) {
         // Collected before the loop rather than iterated in place: the
         // failure arm below needs `&mut self`, which a live borrow of
@@ -1499,10 +1517,28 @@ impl OverlayApp {
         let landed: Vec<LogExportOutcome> = self.rx_log_export.try_iter().collect();
         for outcome in landed {
             match outcome {
-                Ok(dest) => log::info!("exported logs to {}", dest.display()),
+                Ok((dest, missing)) if missing.is_empty() => {
+                    log::info!("export finished: {}", dest.display())
+                }
+                // A bundle that came up short still landed, so this is not
+                // an "Export failed" — but it must not pass silently
+                // either: the whole point of a bundle is that whoever
+                // receives it can tell what's in it.
+                Ok((dest, missing)) => {
+                    log::warn!(
+                        "export finished with {} missing file(s) ({}): {}",
+                        missing.len(),
+                        missing.join(", "),
+                        dest.display()
+                    );
+                    self.raise_transient_status(
+                        format!("Bundle exported with {} missing file(s)", missing.len()),
+                        now,
+                    );
+                }
                 Err((dest, err)) => {
-                    log::warn!("failed to export logs to {}: {err}", dest.display());
-                    self.raise_transient_status(format!("Export logs failed: {err}"), now);
+                    log::warn!("export to {} failed: {err}", dest.display());
+                    self.raise_transient_status(format!("Export failed: {err}"), now);
                 }
             }
         }
@@ -2233,9 +2269,9 @@ fn draw_header(
     // in-flight/last-result state — threaded through to `draw_header_menu`,
     // the only place that reads or mutates it.
     update_check: &mut UpdateCheckState,
-    // Issue #220: where the "Export logs" item's spawned copy thread
-    // reports back to — threaded through to `draw_header_menu`, the only
-    // place that clones it.
+    // Issue #220: where the "Export logs" or "Export session bundle" item's
+    // spawned copy thread reports back to — threaded through to
+    // `draw_header_menu`, the only place that clones it.
     tx_log_export: &Sender<LogExportOutcome>,
     // Issue #39: whether the history thread exists at all — threaded
     // through to `toggle_cluster` (issue #186 moved the History control
@@ -4613,8 +4649,9 @@ fn header_menu_scroll_max_height(screen_height: f32, margin: f32) -> f32 {
 /// Order matches the spec: a Columns disclosure section (issue #13's stat
 /// column toggles, unchanged in behavior — just relocated), a separator,
 /// the Opacity slider (issue #166), a separator, Minimize to tray, a
-/// separator, Reset to defaults (issue #203) and Export logs (issue #220),
-/// a separator, Check for updates and its result line (issue #171), a
+/// separator, Reset to defaults (issue #203), Export logs (issue #220), and
+/// Export session bundle (`crate::bundle`), a separator, Check for updates
+/// and its result line (issue #171), a
 /// separator, then Close. "Forget learned bosses" (issue #131) sat between
 /// the Opacity slider and Minimize until issue #201 replaced the runtime
 /// scene -> boss learning it reset with a curated static table
@@ -4773,8 +4810,10 @@ fn draw_header_menu(
     // Issue #171: the manual "Check for updates" item's in-flight/last-
     // result state — see `UpdateCheckState`'s doc comment.
     update_check: &mut UpdateCheckState,
-    // Issue #220: the reply channel each "Export logs" click's spawned
-    // thread sends its outcome back over — see `LogExportOutcome`.
+    // Issue #220: the reply channel each "Export logs" or "Export session
+    // bundle" click's spawned thread sends its outcome back over — see
+    // `LogExportOutcome` and this module's own doc comment for why the two
+    // items share one channel.
     tx_log_export: &Sender<LogExportOutcome>,
     // Issue #321: set when the Close item below actually sends
     // `UiCommand::Quit`, so `OverlayApp::ui` can flag `self.quit_requested`
@@ -4997,6 +5036,27 @@ fn draw_header_menu(
                     crate::platform::choose_log_export_path(crate::logging::EXPORT_DEFAULT_FILENAME)
                 {
                     start_log_export(dest, tx_log_export.clone());
+                }
+                ui.close();
+            }
+
+            // The whole-session handover: logs plus the packet-inspection dump
+            // ring (if `SHINRA_INSPECT` was on this session), `settings.json`,
+            // and a `manifest.json` describing all of it — everything an agent
+            // needs to find a bug without the maintainer's help, in one folder
+            // rather than the log-only file "Export logs" above hands over.
+            // `crate::bundle`'s module doc comment has the full shape;
+            // `history.sqlite` is deliberately never included (it holds
+            // plaintext party member names) and `manifest.json` says so.
+            //
+            // Same dialog-inline / copy-on-a-spawned-thread split as "Export
+            // logs" just above, and the same reply channel (see this module's
+            // own doc comment for why one channel serves both items).
+            if ui.button("Export session bundle").clicked() {
+                if let Some(dest) = crate::platform::choose_bundle_export_path(
+                    bundle::EXPORT_BUNDLE_DEFAULT_DIRNAME,
+                ) {
+                    start_bundle_export(dest, tx_log_export.clone());
                 }
                 ui.close();
             }
@@ -5308,11 +5368,14 @@ fn start_update_install(available: CheckOutcome) -> UpdateCheckState {
 }
 
 /// What one "Export logs" thread reports back (issue #220): the
-/// destination it finished writing, or that destination plus why it
-/// couldn't. The destination rides along on the failure too so
+/// destination it finished writing plus the bundle names it couldn't copy
+/// (always empty for "Export logs", which has no per-entry reporting —
+/// only "Export session bundle" can come up short, see
+/// `bundle::export_bundle_to`), or that destination plus why it couldn't.
+/// The destination rides along on the failure too so
 /// `OverlayApp::poll_log_export` can name it in the log line — by the time
 /// a reply lands, the click that chose it is long gone.
-type LogExportOutcome = Result<PathBuf, (PathBuf, String)>;
+type LogExportOutcome = Result<(PathBuf, Vec<String>), (PathBuf, String)>;
 
 /// Starts a log export (issue #220, PR #227 review): spawns a one-shot
 /// `std::thread` that bundles the log files into `dest` and sends the
@@ -5335,7 +5398,7 @@ fn start_log_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
         .spawn(move || {
             let (log_path, _warning) = crate::logging::log_file_path();
             let outcome = match crate::logging::export_logs_to(&log_path, &dest) {
-                Ok(()) => Ok(dest),
+                Ok(()) => Ok((dest, Vec::new())),
                 Err(err) => Err((dest, err.to_string())),
             };
             // A dropped receiver means the app is shutting down; the export
@@ -5344,6 +5407,57 @@ fn start_log_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
             let _ = tx.send(outcome);
         })
         .expect("failed to spawn the export-logs thread");
+}
+
+/// Starts a session-bundle export: spawns a one-shot `std::thread` that
+/// gathers the log files, the packet-inspection dump ring (if
+/// `SHINRA_INSPECT` was on this session), `settings.json`, and a
+/// `manifest.json` into the directory `dest`, and sends the outcome back
+/// over `tx` — the same `LogExportOutcome`/`poll_log_export` machinery
+/// "Export logs" uses (see this module's own doc comment for why one
+/// channel serves both items).
+///
+/// Every path is resolved *on the spawned thread*, not the click handler,
+/// same as `start_log_export`: cheap either way, but keeping it off the
+/// frame thread means a slow `APPDATA` lookup or a stalled disk (the copy
+/// itself, `bundle::export_bundle_to`) can never stall a frame.
+fn start_bundle_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
+    std::thread::Builder::new()
+        .name("export-bundle".to_string())
+        .spawn(move || {
+            let (log_path, _warning) = crate::logging::log_file_path();
+            let log_parts = crate::logging::files_to_export(&log_path);
+
+            let inspect_enabled = crate::inspect::enabled();
+            let dump_parts = if inspect_enabled {
+                bundle::dump_ring_parts(&crate::inspect::dump_path())
+            } else {
+                Vec::new()
+            };
+
+            let settings_path = crate::settings::settings_path();
+            let entries = bundle::bundle_entries(&log_parts, &dump_parts, settings_path.as_deref());
+
+            let session_id = crate::logging::session_id();
+            let manifest = bundle::build_manifest(
+                session_id,
+                env!("CARGO_PKG_VERSION"),
+                bundle::started_at_from_session_id(session_id),
+                inspect_enabled,
+                crate::dump::max_total_ring_bytes(),
+                crate::inspect::dropped_count(),
+            );
+
+            let outcome = match bundle::export_bundle_to(&dest, &entries, &manifest) {
+                Ok(missing) => Ok((dest, missing)),
+                Err(err) => Err((dest, err.to_string())),
+            };
+            // A dropped receiver means the app is shutting down; the export
+            // itself already happened, so there is nothing to report or
+            // retry.
+            let _ = tx.send(outcome);
+        })
+        .expect("failed to spawn the export-bundle thread");
 }
 
 /// The "Export logs" reply channel the header tests below hand to
@@ -9937,13 +10051,28 @@ mod tests {
         let now = Instant::now();
         let dest = PathBuf::from("exported-logs.log");
 
-        app.tx_log_export.send(Ok(dest.clone())).unwrap();
+        app.tx_log_export
+            .send(Ok((dest.clone(), Vec::new())))
+            .unwrap();
         app.poll_log_export(now);
         assert_eq!(
             app.status,
             StatusLine::Ok,
             "an export that worked must not raise a banner"
         );
+
+        // A bundle that landed but came up short: not a failure, but the
+        // folder looks identical to a clean one, so it must still say so.
+        app.tx_log_export
+            .send(Ok((dest.clone(), vec!["dump.jsonl.1".to_owned()])))
+            .unwrap();
+        app.poll_log_export(now);
+        assert!(
+            matches!(&app.status, StatusLine::Error(msg) if msg.contains("1 missing file")),
+            "an export missing a file must say how many on the banner: {:?}",
+            app.status
+        );
+        app.expire_transient_status(now + TRANSIENT_STATUS_LINGER);
 
         app.tx_log_export
             .send(Err((dest, "permission denied".to_owned())))

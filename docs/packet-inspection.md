@@ -114,6 +114,80 @@ two reports by eye — a service/method/attr id that only appears in the
 "after" window is the candidate. `cargo test -p bpsr-protocol` covers the
 reader itself against synthetic fixtures; it never needs a real dump to pass.
 
+## Offline replay: `replay-dump` (the live meter's lifecycle narrative)
+
+`inspect-replay` above rebuilds *histograms* — what ids showed up, how
+often. It says nothing about what the meter itself *concluded*: which boss
+it decided was being fought, when it decided a fight ended, which scene it
+thinks the party is in. `crates/app/src/bin/replay-dump.rs` fills that gap:
+it drives the exact same decoder and `bpsr_meter` pipeline the live overlay
+runs (`bpsr_app::pipeline::Pipeline`, the same `decode_notify ->
+Pipeline::step` wiring `crates/app/tests/common/mod.rs`'s `Rig::feed_notify`
+uses) over a dump, offline, and prints the same `encounter:`-prefixed
+lifecycle lines the live app logs — `reset_log`, `fight_end_log`,
+`scene_transition_log`, `boss_transition_log`, and their siblings in
+`crates/meter/src/encounter.rs` — each stamped with the dump-time `ts_ms` of
+the record that produced it. It lives in the app crate rather than
+alongside `inspect-replay` in `bpsr-protocol` specifically because it needs
+`Pipeline`/`Meter`, which only the app crate wires together.
+
+A synthetic tick every 100ms of dump time stands in for the live overlay's
+own render-loop tick, so idle-timeout-driven transitions (a fight ending
+because nothing happened for 9s) fire during replay the same way they would
+live, including a trailing margin of ticks past the last record so a fight
+still active at the end of the window gets the chance to end before replay
+finishes.
+
+```
+cargo run -p ShinraMeter-BPSR --bin replay-dump -- path/to/dump-<session_id>.jsonl
+```
+
+Same `--since`/`--until` window as `inspect-replay` (milliseconds, matching
+`ts_ms`); add `--snapshot-at-end` to also print the final meter snapshot's
+rows (uid, name if known, total damage, dps) once replay finishes:
+
+```
+cargo run -p ShinraMeter-BPSR --bin replay-dump -- dump.jsonl \
+  --since 1699999000000 --until 1699999060000 --snapshot-at-end
+```
+
+### Diffing a replay against the live log
+
+This is the tool an agent reaches for when a session bundle (the "Export
+session bundle" header-menu item, `crates/app/src/bundle.rs`) shows up with
+no maintainer around to explain it — the bundle's `manifest.json` says
+whether `SHINRA_INSPECT` was on and, if so, exactly which dump file to point
+this binary at:
+
+1. Run `replay-dump` against the bundle's dump file (all of its numbered
+   ring chunks are read automatically, same as `inspect-replay`) and save
+   its stdout.
+2. Filter the bundle's own log file (`ShinraMeter-BPSR.log`/`.log.1`) down
+   to the same `encounter:`-prefixed lines the live app logged, e.g.
+   `grep 'encounter:'`.
+3. Diff the two line-for-line. Both are the same lifecycle narrative,
+   independently produced — the log by the live process reading real wire
+   traffic in real time, the replay by re-running the *exact same bytes*
+   offline with no game session behind them. They should read identically:
+   the same boss recognized at the same moment, the same fight ends, the
+   same scene transitions, each within a tick or two of `ts_ms` (the
+   replay's synthetic 100ms tick versus the live app's own render cadence
+   accounts for small timing drift; a difference of *seconds*, or a
+   transition present in one and missing from the other entirely, is not
+   drift).
+4. A divergence — the log says a fight ended, the replay's boss target
+   never even changed against those bytes; the log names a scene the
+   replay resolves differently; a "dropped %d record(s)" summary in the
+   log's shutdown lines (see `manifest.json`'s `dropped_records`) that
+   would explain a gap in the replay but not in the live run — is the
+   symptom. What the log says the live meter decided and what these exact
+   bytes justify have parted ways, and the gap between them is where the
+   bug lives: either the decoder/meter logic itself, or (if
+   `dropped_records` is nonzero) a dump that is missing the very records
+   that would explain the live behavior, in which case the log alone —
+   not the incomplete replay — is the more trustworthy account of what
+   happened.
+
 ## Step 1 — control run: ability score (`FIGHT_POINT`)
 
 Ability score (`attr_id::FIGHT_POINT` / `SyncContainerData.char_base.fight_point`,
