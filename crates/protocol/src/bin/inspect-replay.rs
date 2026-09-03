@@ -51,14 +51,18 @@
 //!
 //! ## Rotated dumps
 //!
-//! `crates/app/src/dump.rs` caps a dump at 5 MiB and rotates it to
-//! `<path>.1` (replacing any previous one) rather than growing it
-//! unbounded — now that inspection runs by default (issue #87), a routine
-//! long session will hit that cap. If `<path>.1` exists alongside the path
-//! given on the command line, this binary reads it too — *before* `path`,
-//! so records stay in chronological order — and prints how many records it
-//! contributed, so a long session's histogram covers the full retained
-//! history instead of silently dropping its earliest records.
+//! `crates/app/src/dump.rs` caps each dump *chunk* at 50 MiB and rotates it
+//! into a numbered ring — `dump-<session_id>.jsonl`, `.1`, `.2`, ... —
+//! rather than growing any one file unbounded, up to a total ring budget
+//! (512 MiB by default, `SHINRA_INSPECT_MAX_BYTES`-overridable; issue #322
+//! replaced the old single-backup scheme, which capped a whole session at
+//! just 2 chunks and silently lost the front of any longer one). Every
+//! numbered chunk found alongside the path given on the command line is
+//! read too, via `bpsr_protocol::dump_format::load_dump` — oldest
+//! (highest-numbered) first, so records stay in chronological order — and
+//! this binary prints how many records each contributed, so a long
+//! session's histogram covers the full retained ring instead of silently
+//! dropping its earliest records.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -68,7 +72,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bpsr_protocol::decode::{decode_notify, opcode};
-use bpsr_protocol::dump_format::{DumpRecord, append_records_from, rotated_sibling};
+use bpsr_protocol::dump_format::{DumpRecord, load_dump};
 use bpsr_protocol::frame::{Notify, SERVICE_UUID};
 use bpsr_protocol::inspect::InspectSink;
 
@@ -364,31 +368,17 @@ fn main() -> ExitCode {
         eprintln!("usage: inspect-replay <dump.jsonl> [--since MS] [--until MS]");
         return ExitCode::FAILURE;
     };
-    let mut records = Vec::new();
-
-    // Read the rotated sibling first (if any) so records end up in
-    // chronological order — it holds strictly older records than `path`.
-    let rotated = rotated_sibling(&path);
-    if rotated.exists() {
-        match append_records_from(&rotated, &mut records) {
-            Ok(count) => eprintln!(
-                "note: also read rotated dump {} — {count} earlier record(s) included \
-                 before {} so the histogram covers the full retained history",
-                rotated.display(),
-                path.display()
-            ),
-            Err(err) => eprintln!(
-                "warning: found rotated dump {} but could not read it ({err}); \
-                 earlier records may be missing from this histogram",
-                rotated.display()
-            ),
+    // `load_dump` reads every numbered ring chunk found alongside `path`
+    // (`.1`, `.2`, ... — issue #322) before `path` itself, oldest first, so
+    // records end up in chronological order and its own stderr `note:`
+    // lines already report how many each rotated chunk contributed.
+    let records = match load_dump(&path) {
+        Ok(records) => records,
+        Err(err) => {
+            eprintln!("failed to open {}: {err}", path.display());
+            return ExitCode::FAILURE;
         }
-    }
-
-    if let Err(err) = append_records_from(&path, &mut records) {
-        eprintln!("failed to open {}: {err}", path.display());
-        return ExitCode::FAILURE;
-    }
+    };
 
     let histogram = build_histogram(records.into_iter(), since, until);
     print!("{}", format_report(&histogram));

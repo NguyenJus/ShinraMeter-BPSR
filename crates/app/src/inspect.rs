@@ -25,10 +25,20 @@
 //!   prefix) are still kept and logged in the shutdown summary, one line per
 //!   attr id.
 //!
-//! The dump path defaults to `%APPDATA%\ShinraMeter-BPSR\inspect\dump-<pid>.jsonl`
-//! (or `ShinraMeter-BPSR-inspect-dump-<pid>.jsonl` in the working directory if
-//! `APPDATA` is unset — e.g. this Linux dev host), overridable with
-//! `SHINRA_INSPECT_DUMP=<path>`.
+//! The dump path defaults to
+//! `%APPDATA%\ShinraMeter-BPSR\inspect\dump-<session_id>.jsonl` (or
+//! `ShinraMeter-BPSR-inspect-dump-<session_id>.jsonl` in the working
+//! directory if `APPDATA` is unset — e.g. this Linux dev host), overridable
+//! with `SHINRA_INSPECT_DUMP=<path>`. `<session_id>` is `<pid>-<unix start
+//! seconds>` (issue #322, see `crate::logging::session_id`) rather than a
+//! bare pid, and is printed in the startup log banner too, so a dump file
+//! can always be matched back to the session log that produced it.
+//!
+//! The dump file is capped and rotated into a numbered ring —
+//! `dump-<session_id>.jsonl`, `.1`, `.2`, ... — rather than growing
+//! unbounded; see [`crate::dump`]'s module doc comment for the per-chunk
+//! size, the total ring budget, and the `SHINRA_INSPECT_MAX_BYTES`
+//! override.
 //!
 //! Dumps contain player names and other identifying traffic — never attach
 //! one to an issue or PR (see `.gitignore`).
@@ -84,12 +94,21 @@ fn dump_path() -> PathBuf {
 }
 
 fn dump_path_from(inspect_dump: Option<&str>, appdata: Option<&str>) -> PathBuf {
-    let pid = std::process::id();
+    // Issue #322: keyed by session id (`<pid>-<unix start seconds>`, see
+    // `crate::logging::session_id`), not a bare pid — a pid alone is
+    // reused across runs and can't tell two sessions' dumps apart, and this
+    // is also the id the startup log banner prints, so a dump on disk can
+    // always be matched back to the session that produced it.
+    let session_id = crate::logging::session_id();
     let (path, warning) = crate::paths::resolve(
         inspect_dump,
         appdata,
-        &["ShinraMeter-BPSR", "inspect", &format!("dump-{pid}.jsonl")],
-        &format!("ShinraMeter-BPSR-inspect-dump-{pid}.jsonl"),
+        &[
+            "ShinraMeter-BPSR",
+            "inspect",
+            &format!("dump-{session_id}.jsonl"),
+        ],
+        &format!("ShinraMeter-BPSR-inspect-dump-{session_id}.jsonl"),
         "APPDATA is not set; falling back to a working-directory dump file",
     );
     if let Some(warning) = warning {
@@ -385,6 +404,17 @@ mod tests {
             path.to_string_lossy()
                 .starts_with("ShinraMeter-BPSR-inspect-dump-")
         );
+    }
+
+    /// Issue #322: the filename is keyed by session id (`<pid>-<unix start
+    /// seconds>`, `crate::logging::session_id`), not a bare pid — a bare
+    /// pid gets reused across runs and can't tell two sessions' dumps
+    /// apart.
+    #[test]
+    fn dump_path_is_keyed_by_the_process_wide_session_id_not_a_bare_pid() {
+        let path = dump_path_from(None, Some("/appdata"));
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, format!("dump-{}.jsonl", crate::logging::session_id()));
     }
 
     // -- DiagnosticSink ---------------------------------------------------

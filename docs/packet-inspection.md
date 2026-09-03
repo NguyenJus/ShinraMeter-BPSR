@@ -18,7 +18,13 @@ the minimal bytes needed as a synthetic fixture under
 
 1. Set `SHINRA_INSPECT=1` before launching `ShinraMeter-BPSR.exe` (optionally also
    `SHINRA_INSPECT_DUMP=<path>` to control where the dump lands; otherwise it
-   defaults to `%APPDATA%\ShinraMeter-BPSR\inspect\dump-<pid>.jsonl`).
+   defaults to `%APPDATA%\ShinraMeter-BPSR\inspect\dump-<session_id>.jsonl`,
+   where `<session_id>` is `<pid>-<unix start seconds>`, issue #322 — not a
+   bare pid, which gets reused across runs and can't tell two sessions'
+   dumps apart). The startup log banner prints the same session id
+   (`ShinraMeter-BPSR vX.Y.Z starting (pid ..., session <session_id>, ...`),
+   so a dump on disk can always be matched back to the log of the session
+   that produced it.
 2. Play normally. Every unrecognized service uuid and every unknown attr id
    — on enemy entities as well as player ones — gets logged
    (`packet-inspect: new ...`) the first time it's seen, with a running
@@ -33,7 +39,12 @@ the minimal bytes needed as a synthetic fixture under
    is bounded and drops records rather than back-pressuring packet capture,
    so a stalled disk can thin a dump; that line (absent when nothing was
    dropped) says how many records were lost, and therefore how much to trust
-   a count in the replay report below.
+   a count in the replay report below. Separately, watch for `inspect dump
+   rotated` and `inspect dump ring exceeded its ... byte budget; deleted
+   oldest chunk ...` lines (issue #322) — a rotation is now logged every
+   time it happens (bytes written plus the rotated-out chunk's `ts_ms`
+   range), and a ring-budget eviction names exactly which chunk it deleted,
+   so a long session no longer loses data with zero log signal.
 4. Note wall-clock (or in-app elapsed) timestamps for anything interesting
    you do below, so the corresponding dump records can be found afterward
    (`ts_ms` in each dump line).
@@ -60,22 +71,33 @@ count towards the service/method histograms (a foreign codec is itself a
 finding) but contribute no attr ids, so a nonzero total there explains a
 thinner-than-expected attr section.
 
-A dump caps at 50 MiB and rotates to `<path>.1` (see `crates/app/src/dump.rs`
-and the README's "Packet inspection dumps" section), so a session's ceiling is
-100 MiB across the pair. The cap was 5 MiB until it was found biting
-mid-session — a dump left running all evening had rotated the earliest traffic
-away before the interesting raid was ever read back (issue #285). If both
-files come back at the cap, assume the same thing happened and treat the
-window as truncated at the front. `inspect-replay` handles
-this itself: if `<path>.1` exists next to the file you pass it, it reads
-that rotated file first (so records stay in chronological order) and prints
-a `note:` line saying how many records it contributed. You only need to
-point it at the live (non-`.1`) path.
+Each dump *chunk* caps at 50 MiB and rotates into a numbered ring —
+`dump-<session_id>.jsonl`, `.1`, `.2`, ... (see `crates/app/src/dump.rs` and
+the README's "Packet inspection dumps" section) — up to a **512 MiB total
+ring budget** by default, overridable with `SHINRA_INSPECT_MAX_BYTES=<bytes>`
+(issue #322). Once the ring exceeds its budget, the oldest (highest-numbered)
+chunk is deleted, logged at info with its path and size. This replaced the
+old fixed 2-chunk / 100 MiB scheme: a raid captured for issue #285 emitted
+roughly **2.5 MB/min**, so a 90+ minute raid runs on the order of 240 MB, and
+the old cap silently lost the front ~70% of longer sessions with no log
+signal that anything had been discarded. 512 MiB holds a bit over 3 hours at
+that rate — comfortably more than one raid; size `SHINRA_INSPECT_MAX_BYTES`
+up from real numbers if your sessions run longer. If the *entire* ring
+(every numbered chunk plus the live file) comes back at budget, treat the
+window as truncated at the front — check the log for `inspect dump ring
+exceeded its ... byte budget; deleted oldest chunk ...` lines to see exactly
+what got dropped and when (approximately, from the surrounding rotation
+lines' `ts_ms` ranges). `inspect-replay` handles the ring itself via
+`bpsr_protocol::dump_format::load_dump`: every numbered chunk found next to
+the file you pass it is read first, oldest (highest-numbered) to newest, so
+records stay in chronological order, and it prints a `note:` line per chunk
+saying how many records it contributed. You only need to point it at the
+live (non-numbered) path.
 
 Run it against a dump:
 
 ```
-cargo run -p bpsr-protocol --bin inspect-replay -- path/to/dump-<pid>.jsonl
+cargo run -p bpsr-protocol --bin inspect-replay -- path/to/dump-<session_id>.jsonl
 ```
 
 Narrow it to a window around a noted timestamp with `--since`/`--until`
