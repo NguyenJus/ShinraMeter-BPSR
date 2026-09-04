@@ -2,12 +2,23 @@
 //! needs (see plan §0.4). No `build.rs` / `.proto` / `prost-build` — prost
 //! skips unknown tags automatically, so these stay forward-compatible.
 
+/// BPSR-ZDPS `BPSR-ZDPSLib/protos/EnumEDamageType.cs`: `Normal=0, Miss=1,
+/// Heal=2, Immune=3, Fall=4, Absorbed=5`. `Immune` and `Absorbed` are what
+/// issue #338 adds — a hit a target's shield fully soaks (`Absorbed`) or one
+/// their immunity blocks outright (`Immune`) previously decoded as a plain
+/// `Normal` value and got folded straight into dealt damage. `Fall` is
+/// ported for completeness (an out-of-range wire value still gets a name)
+/// but has no dedicated channel — no evidence distinguishes it from
+/// `Normal` damage in this project's captures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum EDamageType {
     Normal = 0,
     Miss = 1,
     Heal = 2,
+    Immune = 3,
+    Fall = 4,
+    Absorbed = 5,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, ::prost::Enumeration)]

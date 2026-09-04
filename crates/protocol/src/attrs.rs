@@ -223,6 +223,16 @@ pub mod attr_id {
     /// plausible entity uids when unpacked that way. Treated as an opaque
     /// per-cast identifier until proven otherwise.
     pub const SKILL_UUID: i32 = 0x6f;
+    /// `AttrShieldList` (60050, issue #338) — a repeated `ShieldInfo`
+    /// (uuid=1, shieldType=2, value=3, initialValue=4, maxValue=5, all
+    /// varint fields) tracking this entity's active shield instances.
+    /// Corroborated: BPSR-ZDPS `BPSR-ZDPSLib/protos/EnumEAttrType.cs:2086`
+    /// (`AttrShieldList = 60050`) and `protos/StruShieldInfo.cs`'s field
+    /// layout (`Managers/MessageManager.cs:885-903` decodes it exactly the
+    /// way [`decode_shield_total`] does here — a bare loop of
+    /// length-prefixed `ShieldInfo` submessages, not one message with a
+    /// repeated field).
+    pub const SHIELD_LIST: i32 = 60050;
 }
 
 /// protobuf varint → `u64`; `None` on empty/malformed input. The widest
@@ -319,6 +329,70 @@ pub fn decode_position(raw: &[u8]) -> Option<[f32; 3]> {
         }
     }
     seen.then_some(pos)
+}
+
+/// `raw_data` for [`attr_id::SHIELD_LIST`] (issue #338) → this entity's
+/// total *current* shield value, summed across every active shield
+/// instance. Unlike [`attr_id::SKILL_LEVEL_ID_LIST`]'s `pb::SkillLevelIdList`
+/// wrapper, this attr's raw bytes are *not* one message with a repeated
+/// field: BPSR-ZDPS reads it as a bare loop of `len = ReadLength(); ReadMessage
+/// (shield)` straight off the attr's own byte span
+/// (`MessageManager.cs:885-903`) — each shield instance is its own
+/// length-prefixed `ShieldInfo` submessage with no enclosing tag. This walks
+/// the same shape: repeated length-prefixed chunks until `raw` is exhausted,
+/// summing field 3 (`value`, the shield's current remaining amount — not
+/// `initialValue`/`maxValue`, which never shrink as the shield absorbs
+/// damage) out of each chunk.
+///
+/// `Some(0)` for an empty `raw` — this attr's own `isNoValue -> new
+/// List<ShieldInfo>()` wire convention, i.e. *known* to have no shields —
+/// and `None` only when a non-empty `raw` is malformed (a length prefix that
+/// overruns the buffer, or a truncated varint).
+pub fn decode_shield_total(raw: &[u8]) -> Option<i64> {
+    if raw.is_empty() {
+        return Some(0);
+    }
+    let mut cursor = Cursor::new(raw);
+    let mut total: i64 = 0;
+    while (cursor.position() as usize) < raw.len() {
+        let len = prost::encoding::decode_varint(&mut cursor).ok()?;
+        let start = cursor.position() as usize;
+        let end = start.checked_add(len as usize)?;
+        let chunk = raw.get(start..end)?;
+        total += decode_shield_chunk_value(chunk).unwrap_or(0);
+        cursor.set_position(end as u64);
+    }
+    Some(total)
+}
+
+/// One `ShieldInfo` submessage → its `value` field (tag 3, varint). Every
+/// field on this message is a varint (see [`attr_id::SHIELD_LIST`]'s doc
+/// comment), so a non-varint wire type is unrecognized shape for this
+/// message and its payload is skipped generically rather than guessed at —
+/// same convention as [`decode_position`].
+fn decode_shield_chunk_value(chunk: &[u8]) -> Option<i64> {
+    let mut cursor = Cursor::new(chunk);
+    let mut value = None;
+    while (cursor.position() as usize) < chunk.len() {
+        let tag = prost::encoding::decode_varint(&mut cursor).ok()?;
+        let field = tag >> 3;
+        let wire_type = prost::encoding::WireType::try_from(tag & 0x7).ok()?;
+        if wire_type != prost::encoding::WireType::Varint {
+            prost::encoding::skip_field(
+                wire_type,
+                tag as u32,
+                &mut cursor,
+                prost::encoding::DecodeContext::default(),
+            )
+            .ok()?;
+            continue;
+        }
+        let v = prost::encoding::decode_varint(&mut cursor).ok()?;
+        if field == 3 {
+            value = Some(v as i64);
+        }
+    }
+    value
 }
 
 /// Issue #287's skill-cast metadata cluster, decoded alongside
@@ -516,6 +590,7 @@ pub fn player_info_from_attrs(
     let mut skill_ids = Vec::new();
     let mut position = None;
     let mut target_position = None;
+    let mut shield = None;
     for attr in attrs {
         if attr.raw_data.is_empty() || attr.id == 0 {
             continue;
@@ -531,6 +606,7 @@ pub fn player_info_from_attrs(
                     | attr_id::SKILL_LEVEL_ID_LIST
                     | attr_id::POSITION
                     | attr_id::TARGET_POSITION
+                    | attr_id::SHIELD_LIST
             );
             sink.on_attr(uid, attr.id, &attr.raw_data, known);
         }
@@ -585,6 +661,11 @@ pub fn player_info_from_attrs(
                     target_position = Some(p);
                 }
             }
+            attr_id::SHIELD_LIST => {
+                if let Some(s) = decode_shield_total(&attr.raw_data) {
+                    shield = Some(s);
+                }
+            }
             _ => {}
         }
     }
@@ -598,6 +679,7 @@ pub fn player_info_from_attrs(
         skill_ids,
         position,
         target_position,
+        shield,
     }
 }
 
@@ -1444,5 +1526,93 @@ mod tests {
             skill_cast_metadata_from_attrs(&attrs),
             SkillCastMetadata::default()
         );
+    }
+
+    // -- issue #338: AttrShieldList -----------------------------------------
+
+    /// Encodes one `ShieldInfo` submessage (`uuid=1, shieldType=2, value=3,
+    /// initialValue=4, maxValue=5`, all varint) the way BPSR-ZDPS's own
+    /// `MessageManager.cs:885-903` loop expects to find it: a plain
+    /// varint-tagged field list, no length prefix of its own (the caller —
+    /// [`encode_shield_list`] below — adds that).
+    fn encode_shield_info(
+        uuid: i64,
+        shield_type: i32,
+        value: i64,
+        initial: i64,
+        max: i64,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for (field, v) in [
+            (1u64, uuid),
+            (2, shield_type as i64),
+            (3, value),
+            (4, initial),
+            (5, max),
+        ] {
+            prost::encoding::encode_varint(field << 3, &mut buf);
+            prost::encoding::encode_varint(v as u64, &mut buf);
+        }
+        buf
+    }
+
+    /// Concatenates length-prefixed `ShieldInfo` chunks the way
+    /// [`attr_id::SHIELD_LIST`]'s raw bytes are shaped — a bare
+    /// `len, payload, len, payload, ...` sequence, no enclosing tag.
+    fn encode_shield_list(chunks: &[Vec<u8>]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for chunk in chunks {
+            prost::encoding::encode_varint(chunk.len() as u64, &mut buf);
+            buf.extend_from_slice(chunk);
+        }
+        buf
+    }
+
+    #[test]
+    fn decode_shield_total_sums_a_single_shield() {
+        let raw = encode_shield_list(&[encode_shield_info(1, 0, 500, 1_000, 1_000)]);
+        assert_eq!(decode_shield_total(&raw), Some(500));
+    }
+
+    #[test]
+    fn decode_shield_total_sums_multiple_shields() {
+        let raw = encode_shield_list(&[
+            encode_shield_info(1, 0, 500, 1_000, 1_000),
+            encode_shield_info(2, 1, 300, 300, 300),
+        ]);
+        assert_eq!(decode_shield_total(&raw), Some(800));
+    }
+
+    #[test]
+    fn decode_shield_total_empty_raw_is_known_zero() {
+        // `isNoValue` on the wire — a real "no shields" fact, not an
+        // unseen attr (see the function's own doc comment).
+        assert_eq!(decode_shield_total(&[]), Some(0));
+    }
+
+    #[test]
+    fn decode_shield_total_malformed_length_prefix_is_none() {
+        // A length prefix claiming more bytes than actually follow.
+        let mut raw = Vec::new();
+        prost::encoding::encode_varint(50u64, &mut raw);
+        raw.extend_from_slice(&[0x08, 0x01]);
+        assert_eq!(decode_shield_total(&raw), None);
+    }
+
+    #[test]
+    fn player_info_from_attrs_decodes_shield_from_attrs() {
+        let raw = encode_shield_list(&[encode_shield_info(1, 0, 500, 1_000, 1_000)]);
+        let attrs = vec![pb::Attr {
+            id: attr_id::SHIELD_LIST,
+            raw_data: raw,
+        }];
+        let info = player_info_from_attrs(7, &attrs, None);
+        assert_eq!(info.shield, Some(500));
+    }
+
+    #[test]
+    fn player_info_from_attrs_shield_absent_when_no_shield_attr() {
+        let info = player_info_from_attrs(7, &[], None);
+        assert_eq!(info.shield, None);
     }
 }
