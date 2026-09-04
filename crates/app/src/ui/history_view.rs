@@ -33,7 +33,16 @@ pub(crate) struct HistoryUi {
     /// The encounter currently being read, already rebuilt into a `Snapshot`
     /// so `draw_rows` can render it unchanged — a past fight looks pixel
     /// identical to a live one.
-    pub(crate) open: Option<OpenEncounter>,
+    ///
+    /// Issue #350: `Arc`-wrapped, and only ever reassigned here (a fresh
+    /// `Loaded`/`Missing` reply or a "← Back"/"← Live" click) — never once
+    /// per frame. `OverlayApp::ui`'s `history_open` local used to deep-clone
+    /// the whole `OpenEncounter` (its `Snapshot`, rows and all) on every
+    /// single frame just to get a value it could hand `draw_header`/
+    /// `draw_rows`; cloning the `Arc` instead is a refcount bump regardless
+    /// of how large the held `Snapshot` is, and consecutive frames between
+    /// replies share the exact same allocation (`Arc::ptr_eq`).
+    pub(crate) open: Option<Arc<OpenEncounter>>,
     /// A `HistoryEvent::Failed` message worth showing, cleared on the next
     /// successful reply.
     pub(crate) error: Option<String>,
@@ -199,13 +208,13 @@ impl OverlayApp {
                         continue;
                     }
                     state.pending_load_id = None;
-                    state.open = Some(OpenEncounter {
+                    state.open = Some(Arc::new(OpenEncounter {
                         id,
                         title: record.title.clone(),
                         subtitle: record.subtitle.clone(),
                         ended_at_ms: record.ended_at_ms,
                         snapshot: record.to_snapshot(),
-                    });
+                    }));
                     state.error = None;
                     state.pending = false;
                 }
@@ -531,13 +540,13 @@ mod tests {
     #[test]
     fn share_active_for_view_is_true_when_a_historical_encounter_is_open() {
         let view = OverlayView::History(Box::new(HistoryUi {
-            open: Some(OpenEncounter {
+            open: Some(Arc::new(OpenEncounter {
                 id: 1,
                 title: "Fight".to_string(),
                 subtitle: None,
                 ended_at_ms: 0,
                 snapshot: rows_test_snapshot(3),
-            }),
+            })),
             ..HistoryUi::default()
         }));
         assert!(share_active_for_view(&view));
@@ -558,13 +567,13 @@ mod tests {
     #[test]
     fn screenshot_row_count_uses_the_open_encounters_count_when_history_is_open() {
         let view = OverlayView::History(Box::new(HistoryUi {
-            open: Some(OpenEncounter {
+            open: Some(Arc::new(OpenEncounter {
                 id: 1,
                 title: "Fight".to_string(),
                 subtitle: None,
                 ended_at_ms: 0,
                 snapshot: rows_test_snapshot(9),
-            }),
+            })),
             ..HistoryUi::default()
         }));
         assert_eq!(screenshot_row_count(&view, 5), 9);
@@ -588,13 +597,13 @@ mod tests {
     fn resolve_screenshot_row_count_uses_the_painted_view_even_when_back_to_live_fires_this_frame()
     {
         let mut view = OverlayView::History(Box::new(HistoryUi {
-            open: Some(OpenEncounter {
+            open: Some(Arc::new(OpenEncounter {
                 id: 1,
                 title: "Fight".to_string(),
                 subtitle: None,
                 ended_at_ms: 0,
                 snapshot: rows_test_snapshot(9),
-            }),
+            })),
             ..HistoryUi::default()
         }));
 
@@ -733,6 +742,45 @@ mod tests {
         assert_eq!(state.open.as_ref().map(|open| open.id), Some(7));
     }
 
+    /// Issue #350: `OverlayApp::ui`'s per-frame `history_open` local used to
+    /// deep-clone the whole `OpenEncounter` (`Snapshot`, rows and all) every
+    /// single frame; `HistoryUi::open` being `Arc`-wrapped means that local
+    /// is now a refcount bump. This is the property that actually matters:
+    /// two frames' worth of `state.open.clone()` — the exact call
+    /// `OverlayApp::ui` makes — with no `Loaded`/`Missing` reply landing in
+    /// between must hand back the *same* allocation, not two copies of an
+    /// equal one.
+    #[test]
+    fn consecutive_frames_without_a_new_reply_share_the_same_open_encounter_arc() {
+        let mut app = history_test_app();
+        app.open_history();
+        let OverlayView::History(state) = &mut app.view else {
+            panic!("expected the History view");
+        };
+        state.pending_load_id = Some(7);
+
+        app.tx_history
+            .send(history::writer::HistoryEvent::Loaded {
+                id: 7,
+                record: Box::new(history_test_record("Steady Fight")),
+            })
+            .unwrap();
+        app.poll_history();
+
+        let OverlayView::History(state) = &app.view else {
+            panic!("expected the History view");
+        };
+        // No new reply lands between these two "frames" — `state.open`
+        // itself is never reassigned, so every clone of it must point at
+        // the one `OpenEncounter` the `Loaded` reply above allocated.
+        let frame_one = state.open.clone().expect("the reply above opened it");
+        let frame_two = state.open.clone().expect("still open, unchanged");
+        assert!(
+            Arc::ptr_eq(&frame_one, &frame_two),
+            "consecutive frames must share the same Arc<OpenEncounter> allocation"
+        );
+    }
+
     /// Rows stay clickable while a load is in flight, so clicking row 1 and
     /// then row 2 leaves two `Load` requests outstanding: row 1's reply must
     /// not open its record under row 2's id, and must not consume the
@@ -805,13 +853,13 @@ mod tests {
             panic!("expected the History view");
         };
         state.pending_load_id = Some(9);
-        state.open = Some(OpenEncounter {
+        state.open = Some(Arc::new(OpenEncounter {
             id: 9,
             title: "Stale Fight".to_string(),
             subtitle: None,
             ended_at_ms: 0,
             snapshot: header_test_snapshot(1_000),
-        });
+        }));
 
         app.tx_history
             .send(history::writer::HistoryEvent::Missing(9))
@@ -993,13 +1041,13 @@ mod tests {
         let icons = Icons::load(&ctx);
         let settings = Settings::default();
         let mut state = HistoryUi {
-            open: Some(OpenEncounter {
+            open: Some(Arc::new(OpenEncounter {
                 id: 1,
                 title: "Fight".to_string(),
                 subtitle: None,
                 ended_at_ms: 0,
                 snapshot: rows_test_snapshot(3),
-            }),
+            })),
             ..HistoryUi::default()
         };
         let (tx, _rx) = crossbeam_channel::unbounded();
@@ -1046,13 +1094,13 @@ mod tests {
         let settings = Settings::default();
         let row_count = 3;
         let mut state = HistoryUi {
-            open: Some(OpenEncounter {
+            open: Some(Arc::new(OpenEncounter {
                 id: 1,
                 title: "Fight".to_string(),
                 subtitle: None,
                 ended_at_ms: 0,
                 snapshot: rows_test_snapshot(row_count),
-            }),
+            })),
             ..HistoryUi::default()
         };
         let (tx, _rx) = crossbeam_channel::unbounded();
