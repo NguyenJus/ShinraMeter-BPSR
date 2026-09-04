@@ -74,8 +74,10 @@ use bpsr_protocol::dump_format::{numbered_sibling, ring_siblings};
 ///
 /// Ten times `logging::MAX_LOG_BYTES`, deliberately — unchanged by issue
 /// #322. The two files are capped for different reasons: a log grows while
-/// the app merely runs, whereas a dump only grows under `SHINRA_INSPECT=1`
-/// (opt-in since issue #122). What #322 changed is what happens once a
+/// the app merely runs, whereas a dump only grows while packet-inspection
+/// diagnostics are on (`crate::inspect::enabled` — on by default since
+/// issue #346, opt-out via `SHINRA_INSPECT=0`). What #322 changed is what
+/// happens once a
 /// *chunk* fills up: issue #285's raid emitted roughly 2.5 MB/min, so a
 /// 90+ minute raid is on the order of 240 MB, and the old scheme (this
 /// threshold plus exactly one retained backup, `MAX_DUMP_BYTES` from before
@@ -205,19 +207,41 @@ pub struct DumpWriter {
 }
 
 impl DumpWriter {
-    /// Spawns the dedicated writer thread.
+    /// Spawns the dedicated writer thread with sanitization off — every
+    /// record is written to disk exactly as received. Kept for callers that
+    /// need the raw stream (and for tests exercising the writer/rotation
+    /// mechanics against records that aren't real, `pb.rs`-modeled
+    /// protobuf); production startup uses [`spawn_sanitized`](Self::spawn_sanitized)
+    /// or not, based on `settings::Settings::dump_sanitize` (issue #346).
     pub fn spawn(path: PathBuf) -> Self {
-        Self::spawn_with_max_bytes(path, MAX_CHUNK_BYTES, max_total_ring_bytes())
+        Self::spawn_with_max_bytes(path, MAX_CHUNK_BYTES, max_total_ring_bytes(), false)
+    }
+
+    /// Spawns the dedicated writer thread with sanitization on: every
+    /// record is run through `bpsr_protocol::sanitize::Sanitizer` before
+    /// being written, and dropped instead of written if the sanitizer can't
+    /// verify it's free of identifying data (see
+    /// [`Sanitizer::sanitize_record`](bpsr_protocol::sanitize::Sanitizer::sanitize_record)).
+    /// One `Sanitizer` lives for the whole writer-thread lifetime so the
+    /// same player gets the same pseudonym in every record of this dump
+    /// (issue #346).
+    pub fn spawn_sanitized(path: PathBuf) -> Self {
+        Self::spawn_with_max_bytes(path, MAX_CHUNK_BYTES, max_total_ring_bytes(), true)
     }
 
     /// Like [`spawn`](Self::spawn), but with both rotation thresholds
     /// overridable — only so tests can cross them without writing megabytes
     /// of records.
-    fn spawn_with_max_bytes(path: PathBuf, chunk_max_bytes: u64, total_max_bytes: u64) -> Self {
+    fn spawn_with_max_bytes(
+        path: PathBuf,
+        chunk_max_bytes: u64,
+        total_max_bytes: u64,
+        sanitize: bool,
+    ) -> Self {
         let (tx, rx) = bounded::<Record>(CAPACITY);
         let handle = std::thread::Builder::new()
             .name("inspect-dump-writer".to_string())
-            .spawn(move || run_writer(rx, &path, chunk_max_bytes, total_max_bytes))
+            .spawn(move || run_writer(rx, &path, chunk_max_bytes, total_max_bytes, sanitize))
             .expect("failed to spawn the inspect-dump-writer thread");
         Self {
             tx: RecordSender::new(tx),
@@ -272,7 +296,18 @@ impl DumpWriter {
 /// [`next_first_ts_ms`] — never by re-reading the file) so
 /// the info line logged right after a successful rotation says exactly what
 /// was rotated out and when it happened, in-session.
-fn run_writer(rx: Receiver<Record>, path: &Path, chunk_max_bytes: u64, total_max_bytes: u64) {
+///
+/// When `sanitize` is set (issue #346), every record is run through a
+/// session-lifetime `bpsr_protocol::sanitize::Sanitizer` before it's
+/// written — see [`sanitize_record`] — and dropped instead of written if
+/// the sanitizer can't verify it's free of identifying data.
+fn run_writer(
+    rx: Receiver<Record>,
+    path: &Path,
+    chunk_max_bytes: u64,
+    total_max_bytes: u64,
+    sanitize: bool,
+) {
     let file = match open(path, chunk_max_bytes, total_max_bytes) {
         Some(f) => f,
         None => {
@@ -281,13 +316,21 @@ fn run_writer(rx: Receiver<Record>, path: &Path, chunk_max_bytes: u64, total_max
         }
     };
     log::info!(
-        "inspect dump writer started: path={}, chunk size={chunk_max_bytes} bytes, ring budget={total_max_bytes} bytes total (oldest chunk deleted once the ring exceeds this; override with {MAX_TOTAL_BYTES_VAR})",
+        "inspect dump writer started: path={}, chunk size={chunk_max_bytes} bytes, ring budget={total_max_bytes} bytes total (oldest chunk deleted once the ring exceeds this; override with {MAX_TOTAL_BYTES_VAR}), sanitize={sanitize}",
         path.display()
     );
     let mut written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
     let mut out = BufWriter::new(file);
     let mut first_ts_ms: Option<u64> = None;
+    let mut sanitizer = sanitize.then(bpsr_protocol::sanitize::Sanitizer::new);
     while let Ok(record) = rx.recv() {
+        let record = match sanitizer.as_mut() {
+            Some(sanitizer) => match sanitize_record(sanitizer, record) {
+                Some(record) => record,
+                None => continue,
+            },
+            None => record,
+        };
         let line = Line::from(&record);
         let json = match serde_json::to_string(&line) {
             Ok(json) => json,
@@ -324,6 +367,32 @@ fn run_writer(rx: Receiver<Record>, path: &Path, chunk_max_bytes: u64, total_max
         }
     }
     let _ = out.flush();
+}
+
+/// Runs `record` through `sanitizer`, converting to/from
+/// `bpsr_protocol::dump_format::DumpRecord` (field-for-field identical to
+/// `Record`, but owned by the protocol crate so the library-side
+/// `Sanitizer` doesn't need to depend back on this crate) — `None` means
+/// drop the record entirely rather than write it (see
+/// `Sanitizer::sanitize_record`'s doc comment for when that happens).
+fn sanitize_record(
+    sanitizer: &mut bpsr_protocol::sanitize::Sanitizer,
+    record: Record,
+) -> Option<Record> {
+    let clean = sanitizer.sanitize_record(&bpsr_protocol::dump_format::DumpRecord {
+        ts_ms: record.ts_ms,
+        service_uuid: record.service_uuid,
+        method_id: record.method_id,
+        payload: record.payload,
+        payload_decoded: record.payload_decoded,
+    })?;
+    Some(Record {
+        ts_ms: clean.ts_ms,
+        service_uuid: clean.service_uuid,
+        method_id: clean.method_id,
+        payload: clean.payload,
+        payload_decoded: clean.payload_decoded,
+    })
 }
 
 /// Applies one rotation attempt's outcome to the writer's live file and byte
@@ -545,6 +614,81 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// Issue #346: `spawn_sanitized` must never let a raw player name reach
+    /// disk — every record is run through `bpsr_protocol::sanitize::Sanitizer`
+    /// before it's written.
+    #[test]
+    fn spawn_sanitized_writes_no_raw_names_to_disk() {
+        use prost::Message;
+
+        let path = temp_path("sanitized");
+        let payload = bpsr_protocol::pb::SyncContainerData {
+            v_data: Some(bpsr_protocol::pb::CharSerialize {
+                char_id: 1_646_812,
+                char_base: Some(bpsr_protocol::pb::CharBaseInfo {
+                    char_id: 1_646_812,
+                    name: "TotallyRealPlayerName".to_string(),
+                    fight_point: 12345,
+                }),
+                scene_data: None,
+                profession_list: None,
+            }),
+        }
+        .encode_to_vec();
+
+        let writer = DumpWriter::spawn_sanitized(path.clone());
+        writer.sender().send(Record {
+            ts_ms: 1,
+            service_uuid: bpsr_protocol::frame::SERVICE_UUID,
+            method_id: bpsr_protocol::decode::opcode::SYNC_CONTAINER_DATA,
+            payload,
+            payload_decoded: true,
+        });
+        writer.shutdown();
+
+        let contents = fs::read_to_string(&path).expect("dump file should exist");
+        assert!(
+            !contents.contains("TotallyRealPlayerName"),
+            "the raw name must never reach disk when sanitize is on"
+        );
+        // The hex-encoded payload still round-trips to a `PlayerNNNNN`
+        // placeholder — this isn't just an empty/dropped record.
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let record = bpsr_protocol::dump_format::parse_record(lines[0]).unwrap();
+        let decoded =
+            bpsr_protocol::pb::SyncContainerData::decode(record.payload.as_slice()).unwrap();
+        let name = decoded.v_data.unwrap().char_base.unwrap().name;
+        assert!(name.starts_with("Player"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// An unmodeled opcode (nothing `pb.rs` knows how to whitelist-by-
+    /// re-encode) must be dropped entirely rather than written raw when
+    /// sanitize is on — the same safety property `sanitize-dump` enforces
+    /// offline.
+    #[test]
+    fn spawn_sanitized_drops_unmodeled_records() {
+        let path = temp_path("sanitized-unmodeled");
+        let writer = DumpWriter::spawn_sanitized(path.clone());
+        writer.sender().send(Record {
+            ts_ms: 1,
+            service_uuid: 0xDEAD,
+            method_id: 0x1234, // not one of the seven modeled opcodes
+            payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            payload_decoded: true,
+        });
+        writer.shutdown();
+
+        let contents = fs::read_to_string(&path).expect("dump file should exist");
+        assert!(
+            contents.is_empty(),
+            "an unmodeled record must be dropped, not written raw"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn writer_creates_missing_parent_directory() {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -665,7 +809,7 @@ mod tests {
         };
         let max_bytes = line_len(&record1) + line_len(&record2);
 
-        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes, u64::MAX);
+        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes, u64::MAX, false);
         writer.sender().send(record1);
         writer.sender().send(record2);
         writer.shutdown();
@@ -700,7 +844,7 @@ mod tests {
         };
         let max_bytes = existing_len + line_len(&record);
 
-        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes, u64::MAX);
+        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes, u64::MAX, false);
         writer.sender().send(record);
         writer.shutdown();
 
@@ -730,7 +874,7 @@ mod tests {
         };
         let max_bytes = line_len(&record(1));
 
-        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes, u64::MAX);
+        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes, u64::MAX, false);
         writer.sender().send(record(1));
         writer.sender().send(record(2));
         writer.sender().send(record(3));
@@ -769,7 +913,8 @@ mod tests {
         // the oldest one.
         let total_bytes = chunk_bytes * 2;
 
-        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), chunk_bytes, total_bytes);
+        let writer =
+            DumpWriter::spawn_with_max_bytes(path.clone(), chunk_bytes, total_bytes, false);
         writer.sender().send(record(1));
         writer.sender().send(record(2));
         writer.sender().send(record(3));
@@ -929,7 +1074,7 @@ mod tests {
         fs::write(&path, b"stale-oversized-content").unwrap();
         let max_bytes = fs::metadata(&path).unwrap().len();
 
-        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes, u64::MAX);
+        let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes, u64::MAX, false);
         writer.shutdown();
 
         assert_eq!(
@@ -1037,7 +1182,7 @@ mod tests {
             let (first_ts, last_ts) = (932_411_001_u64, 932_411_002_u64);
             let max_bytes = line_len(&record(first_ts)) + line_len(&record(last_ts));
 
-            let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes, u64::MAX);
+            let writer = DumpWriter::spawn_with_max_bytes(path.clone(), max_bytes, u64::MAX, false);
             writer.sender().send(record(first_ts));
             writer.sender().send(record(last_ts));
             writer.shutdown();
@@ -1065,7 +1210,8 @@ mod tests {
             let chunk_bytes = 123_456_u64;
             let total_bytes = 654_321_u64;
 
-            let writer = DumpWriter::spawn_with_max_bytes(path.clone(), chunk_bytes, total_bytes);
+            let writer =
+                DumpWriter::spawn_with_max_bytes(path.clone(), chunk_bytes, total_bytes, false);
             writer.shutdown();
 
             assert!(
@@ -1098,7 +1244,8 @@ mod tests {
             let chunk_bytes = line_len(&record(1));
             let total_bytes = chunk_bytes; // room for exactly one rotated chunk
 
-            let writer = DumpWriter::spawn_with_max_bytes(path.clone(), chunk_bytes, total_bytes);
+            let writer =
+                DumpWriter::spawn_with_max_bytes(path.clone(), chunk_bytes, total_bytes, false);
             writer.sender().send(record(1));
             writer.sender().send(record(2));
             writer.shutdown();

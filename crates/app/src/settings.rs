@@ -384,6 +384,19 @@ pub struct Settings {
     /// to the same loading, opacity and failure rules. See `header_image`.
     #[serde(default)]
     pub backdrop_image: Option<PathBuf>,
+    /// Whether packet-inspection dumps (`SHINRA_INSPECT`, `crate::dump`)
+    /// scrub player names/ids on write (issue #346), via
+    /// `bpsr_protocol::sanitize::Sanitizer` — see
+    /// `dump::DumpWriter::spawn_sanitized`. On by default: it's what lets
+    /// diagnostics default on too (`inspect::enabled`) without shipping raw
+    /// player traffic in every dump. `#[serde(default = "default_dump_sanitize")]`
+    /// rather than plain `#[serde(default)]`, for the same reason as
+    /// `always_on_top`/`history_enabled`: `bool::default()` is `false`,
+    /// which would silently turn sanitization *off* for every existing
+    /// settings.json the instant this field was added — the opposite of
+    /// the safe default this field exists to guarantee.
+    #[serde(default = "default_dump_sanitize")]
+    pub dump_sanitize: bool,
 }
 
 /// The `opacity` default (issue #233): restores the panel to the ~78%
@@ -441,6 +454,12 @@ fn default_history_min_duration_ms() -> u64 {
     5_000
 }
 
+/// `Settings::dump_sanitize`'s serde default (issue #346) — see that
+/// field's doc comment for why this can't just be `#[serde(default)]`.
+fn default_dump_sanitize() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         // `Deaths` joins the out-of-the-box set (issue #49) because the
@@ -470,6 +489,7 @@ impl Default for Settings {
             // defaults, and `reset_to_defaults` puts them back.
             header_image: None,
             backdrop_image: None,
+            dump_sanitize: default_dump_sanitize(),
         }
     }
 }

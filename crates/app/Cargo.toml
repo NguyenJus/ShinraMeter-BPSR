@@ -80,3 +80,7 @@ bpsr-test-support = { workspace = true }
 # integration tests. Already a workspace dependency of bpsr-protocol itself
 # (frame decompression), so this adds no new entry to the lockfile.
 zstd = { workspace = true }
+# Only for encoding a real `pb::SyncContainerData` payload in dump.rs's
+# sanitize-on-write test (issue #346). Already a direct dependency of
+# bpsr-protocol (`src/pb.rs`), so this adds no new entry to the lockfile.
+prost = { workspace = true }

@@ -1,7 +1,14 @@
 //! Packet-inspection diagnostic mode (issue #25 slice A).
 //!
-//! Off by default (issue #122) — set `SHINRA_INSPECT=1` (`true`, `on`, or
-//! `yes` also work, case-insensitively) to opt in. When on:
+//! On by default since issue #346, now that the dump writer sanitizes
+//! every record as it's written (see `settings::Settings::dump_sanitize`,
+//! `crate::dump::DumpWriter::spawn_sanitized`) — a fresh dump is safe to
+//! attach to a bug report without a separate post-process step. Was off by
+//! default from issue #122 (when the only way to get a shareable dump was
+//! that separate `sanitize-dump` step) through issue #346. Set
+//! `SHINRA_INSPECT=0` (`false` or `off` also work, case-insensitively) to
+//! opt back out, or `SHINRA_INSPECT=1` (`true`/`on`/`yes`) to force it on
+//! regardless of a build's default. When on:
 //!
 //! - every Notify-shaped fragment observed — recognized service or not, and
 //!   including one whose payload would not decompress (dumped as its raw
@@ -40,8 +47,10 @@
 //! size, the total ring budget, and the `SHINRA_INSPECT_MAX_BYTES`
 //! override.
 //!
-//! Dumps contain player names and other identifying traffic — never attach
-//! one to an issue or PR (see `.gitignore`).
+//! A dump written with `settings.dump_sanitize` off (or one predating issue
+//! #346) contains player names and other identifying traffic — never attach
+//! one of those to an issue or PR (see `.gitignore`). A sanitized dump is
+//! safe to share.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -65,9 +74,13 @@ const HEX_PREFIX_LEN: usize = 32;
 /// says so instead of silently under-reporting.
 const MAX_TRACKED_UIDS_PER_ATTR: usize = 16;
 
-/// False unless `SHINRA_INSPECT` is set to an explicit opt-in value (`1`,
-/// `true`, `on`, or `yes`, case-insensitively) — diagnostics are off by
-/// default (issue #122).
+/// True unless `SHINRA_INSPECT` is set to an explicit opt-out value (`0`,
+/// `false`, or `off`, case-insensitively) — diagnostics default on since
+/// issue #346 (sanitized on write, so a fresh dump is safe to share; was
+/// opt-in-only, defaulting off, from issue #122 through #346). An explicit
+/// opt-in value (`1`, `true`, `on`, or `yes`) also reads as true, so a
+/// build that ever flips the unset default back off can still be forced on
+/// per-run.
 pub fn enabled() -> bool {
     enabled_from(std::env::var("SHINRA_INSPECT").ok().as_deref())
 }
@@ -75,12 +88,11 @@ pub fn enabled() -> bool {
 fn enabled_from(var: Option<&str>) -> bool {
     match var {
         Some(v) => {
-            v.eq_ignore_ascii_case("1")
-                || v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("on")
-                || v.eq_ignore_ascii_case("yes")
+            !(v.eq_ignore_ascii_case("0")
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off"))
         }
-        None => false,
+        None => true,
     }
 }
 
@@ -154,19 +166,27 @@ impl Handle {
 /// or carry a stale value from a previous process.
 static DROPPED_COUNTER: OnceLock<dump::RecordSender> = OnceLock::new();
 
-/// Turns diagnostics on when opted in via `SHINRA_INSPECT`, spawning the
-/// dump-writer thread and returning a `Handle`; `None` (zero cost beyond the
-/// env check) unless opted in.
-pub fn init() -> Option<Handle> {
+/// Spawns the dump-writer thread and returns a `Handle` unless diagnostics
+/// are off (see [`enabled`]); `None` costs nothing beyond the env check.
+/// `sanitize` is `settings::Settings::dump_sanitize` (issue #346) — when
+/// set, every record is scrubbed of player names/ids on write (see
+/// `dump::DumpWriter::spawn_sanitized`) so the resulting dump is safe to
+/// attach to a bug report or session bundle without a separate
+/// `sanitize-dump` pass.
+pub fn init(sanitize: bool) -> Option<Handle> {
     if !enabled() {
         return None;
     }
     let path = dump_path();
     log::info!(
-        "packet inspection enabled via SHINRA_INSPECT; dumping to {}",
+        "packet inspection enabled; dumping to {} (sanitize={sanitize}; opt out with SHINRA_INSPECT=0)",
         path.display()
     );
-    let writer = dump::DumpWriter::spawn(path);
+    let writer = if sanitize {
+        dump::DumpWriter::spawn_sanitized(path)
+    } else {
+        dump::DumpWriter::spawn(path)
+    };
     let _ = DROPPED_COUNTER.set(writer.sender());
     let sink: Arc<dyn InspectSink> = Arc::new(DiagnosticSink::new(writer.sender()));
     Some(Handle { sink, writer })
@@ -376,9 +396,11 @@ mod tests {
 
     // -- enabled ------------------------------------------------------
 
+    /// Issue #346: dumps are sanitized on write now, so diagnostics default
+    /// on rather than requiring an explicit opt-in.
     #[test]
-    fn enabled_is_false_when_unset() {
-        assert!(!enabled_from(None));
+    fn enabled_is_true_when_unset() {
+        assert!(enabled_from(None));
     }
 
     #[test]
@@ -393,17 +415,19 @@ mod tests {
     }
 
     #[test]
-    fn enabled_is_false_for_0_or_any_other_unrecognized_value() {
-        assert!(!enabled_from(Some("0")));
-        assert!(!enabled_from(Some("false")));
-        assert!(!enabled_from(Some("off")));
-        assert!(!enabled_from(Some("2")));
-        assert!(!enabled_from(Some("enabled")));
+    fn enabled_is_true_for_any_value_that_is_not_an_explicit_opt_out() {
+        assert!(enabled_from(Some("2")));
+        assert!(enabled_from(Some("enabled")));
+        assert!(enabled_from(Some("")));
     }
 
     #[test]
-    fn enabled_is_false_for_an_empty_value_since_only_the_named_tokens_opt_in() {
-        assert!(!enabled_from(Some("")));
+    fn enabled_is_false_for_0_false_or_off_case_insensitively() {
+        assert!(!enabled_from(Some("0")));
+        assert!(!enabled_from(Some("false")));
+        assert!(!enabled_from(Some("FALSE")));
+        assert!(!enabled_from(Some("off")));
+        assert!(!enabled_from(Some("OFF")));
     }
 
     // -- dump_path ------------------------------------------------------
