@@ -24,6 +24,7 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bpsr_meter::{
@@ -66,6 +67,7 @@ mod header;
 mod history_view;
 mod menu;
 mod opacity;
+mod repaint;
 mod settings;
 mod skill_window;
 mod status;
@@ -75,6 +77,7 @@ pub(crate) use header::*;
 pub(crate) use history_view::*;
 pub(crate) use menu::*;
 pub(crate) use opacity::Opacity;
+pub(crate) use repaint::{RepaintInputs, repaint_policy};
 pub(crate) use settings::*;
 pub(crate) use skill_window::*;
 pub(crate) use status::*;
@@ -1301,10 +1304,17 @@ impl OverlayApp {
     /// game-not-running) snapshots every frame, which is exactly the bug
     /// this skip avoids. Split out of `ui()` so the guard is unit-testable
     /// without an `egui::Context`.
-    fn drain_snapshots(&mut self) {
+    ///
+    /// Issue #349: returns whether a snapshot actually landed this frame —
+    /// fed into `RepaintInputs::snapshot_activity` alongside `rx_snapshot`'s
+    /// own emptiness, so the repaint cadence keeps pace with the pipeline
+    /// thread while it is actively producing rather than waiting out the
+    /// idle heartbeat.
+    fn drain_snapshots(&mut self) -> bool {
         if self.demo_mode {
-            return;
+            return false;
         }
+        let mut drained = false;
         loop {
             match self.rx_snapshot.try_recv() {
                 Ok(snap) => {
@@ -1318,6 +1328,7 @@ impl OverlayApp {
                         self.raise_capture_dead_status();
                     }
                     self.snapshot = snap;
+                    drained = true;
                 }
                 // Nothing new this frame — the overwhelmingly common case.
                 Err(TryRecvError::Empty) => break,
@@ -1348,6 +1359,7 @@ impl OverlayApp {
                 }
             }
         }
+        drained
     }
 
     /// Raises the *permanent* banner for a dead pipeline thread (#214).
@@ -1595,7 +1607,10 @@ impl eframe::App for OverlayApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_snapshots();
+        // Issue #349: whether a snapshot actually landed this frame, fed
+        // into the repaint decision at the end of this function alongside
+        // whether `rx_snapshot` still holds one queued up.
+        let snapshot_drained = self.drain_snapshots();
         self.poll_update_check(ui.ctx());
         // Issue #39: drained unconditionally, regardless of whether the
         // history view is open — see `poll_history`'s doc comment.
@@ -1772,16 +1787,20 @@ impl eframe::App for OverlayApp {
         // breakdown window.
         let mut opened_skill_uid: Option<i64> = None;
         // Issue #39: the open historical fight — its id, header text and
-        // rebuilt `Snapshot` — cloned once per frame *before* the panel body
-        // — the two short strings and the ~10-row snapshot are cheap next
-        // to a per-frame egui repaint, and cloning them here (rather than
-        // borrowing `self.view` for the rest of the frame) is what lets the
-        // panel closure below still take `&mut self.settings` for
+        // rebuilt `Snapshot` — read once per frame *before* the panel body,
+        // since cloning `self.view` for the rest of the frame is what lets
+        // the panel closure below still take `&mut self.settings` for
         // `draw_header` without the borrow checker seeing that as aliasing
         // the same historical data. `None` in the `Live` case, and whenever
-        // the history view is open but nothing has been loaded yet, costs
-        // no clone at all.
-        let history_open: Option<OpenEncounter> = match &self.view {
+        // the history view is open but nothing has been loaded yet.
+        //
+        // Issue #350: `HistoryUi::open` is an `Arc<OpenEncounter>`, so this
+        // is a refcount bump, not a deep clone of the held `Snapshot` — and
+        // `state.open` is only ever reassigned on a `Loaded`/`Missing`
+        // reply or a "← Back"/"← Live" click (see its own doc comment), so
+        // consecutive frames between those events hand out the exact same
+        // `Arc` allocation.
+        let history_open: Option<Arc<OpenEncounter>> = match &self.view {
             OverlayView::History(state) => state.open.clone(),
             OverlayView::Live => None,
         };
@@ -2177,8 +2196,35 @@ impl eframe::App for OverlayApp {
             self.last_sent_skill_focus = live_skill_focus;
         }
 
-        // ~10 Hz.
-        ctx.request_repaint_after(Duration::from_millis(100));
+        // Issue #349: gated on actual activity rather than an unconditional
+        // ~10 Hz — see `repaint::repaint_policy`'s doc comment for the
+        // decision table and why each input is gathered here rather than
+        // inside the pure function itself.
+        let snapshot_activity = snapshot_drained || !self.rx_snapshot.is_empty();
+        let gif_next_wakeup = icons.custom.borrow().next_wakeup(&ctx);
+        let input_active =
+            ctx.input(|i| i.pointer.any_down() || i.pointer.is_moving() || !i.events.is_empty());
+        // Issue #349: the same three background-thread requests
+        // `poll_update_check`/`poll_history` exist to drain — none of them
+        // wake the overlay on their own, so the repaint clock is the only
+        // thing that ever notices their reply landed.
+        let transient_timer_active = self.status_expires_at.is_some()
+            || matches!(
+                self.update_check,
+                UpdateCheckState::Checking { .. } | UpdateCheckState::Installing { .. }
+            )
+            || matches!(
+                &self.view,
+                OverlayView::History(state) if state.pending || state.pending_load_id.is_some()
+            );
+        if let Some(delay) = repaint_policy(RepaintInputs {
+            snapshot_activity,
+            gif_next_wakeup,
+            input_active,
+            transient_timer_active,
+        }) {
+            ctx.request_repaint_after(delay);
+        }
     }
 }
 
@@ -5951,7 +5997,7 @@ mod tests {
         let name = open.snapshot.rows[0].name.clone();
 
         let mut state = HistoryUi {
-            open: Some(open),
+            open: Some(Arc::new(open)),
             ..HistoryUi::default()
         };
         let mut back_to_live = false;

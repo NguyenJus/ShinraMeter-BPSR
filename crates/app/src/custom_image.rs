@@ -912,6 +912,35 @@ impl CustomImages {
         }
     }
 
+    /// Issue #349: the soonest either slot's cached entry wants its next
+    /// animation frame painted, or `None` if neither slot is presently
+    /// showing a live multi-frame GIF. Read *after* this frame's `texture`
+    /// calls have populated/advanced both slots (`OverlayApp::ui` calls it
+    /// once, near the end of the frame, alongside the header/backdrop
+    /// paint calls that populate `header`/`backdrop` above), so this
+    /// reflects what was actually on screen this frame rather than a stale
+    /// entry left over from a slot no longer configured.
+    ///
+    /// This duplicates `texture`'s own `ctx.request_repaint_after(position.
+    /// remaining)` call rather than replacing it — that call is what keeps
+    /// playback correct (and tested) on its own; this accessor only feeds
+    /// the same number into `repaint::repaint_policy`'s decision table so
+    /// an animated background is visible in the *reasons* `ui()` chose to
+    /// repaint, not just as a side effect buried inside the image cache.
+    pub fn next_wakeup(&self, ctx: &egui::Context) -> Option<Duration> {
+        let now = ctx.input(|input| input.time);
+        [&self.header, &self.backdrop]
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.result.is_ok() && entry.frames.len() > 1)
+            .map(|entry| {
+                let elapsed = Duration::from_secs_f64((now - entry.started_at).max(0.0));
+                let delays: Vec<Duration> = entry.frames.iter().map(|frame| frame.delay).collect();
+                animation_position_at(&delays, elapsed).remaining
+            })
+            .min()
+    }
+
     /// Drops `slot`'s cached texture (and any cached failure). Called when
     /// the user picks a new file, clears one, or resets to defaults —
     /// anything that makes the current entry meaningless — and also every
@@ -1765,6 +1794,75 @@ mod tests {
             before, after,
             "advancing to the next frame must re-`set` the existing texture, not allocate a new one"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Issue #349/#350's repaint gate (`ui::repaint::repaint_policy`) reads
+    /// `CustomImages::next_wakeup` to fold an animated background's own
+    /// timing into its decision. `None` with nothing loaded is the "no
+    /// GIF is active" case that decision table falls back on.
+    #[test]
+    fn next_wakeup_is_none_with_no_slot_configured() {
+        let ctx = egui::Context::default();
+        let cache = CustomImages::default();
+        assert_eq!(cache.next_wakeup(&ctx), None);
+    }
+
+    /// A live two-frame animation reports the exact remaining time
+    /// `animation_position_at` computes for whichever frame is showing —
+    /// not a rounded bucket, and not `None` just because nothing repainted
+    /// since the load.
+    #[test]
+    fn next_wakeup_matches_the_loaded_animations_own_remaining_time() {
+        let path = std::env::temp_dir().join("shinra-custom-image-next-wakeup.gif");
+        std::fs::write(&path, animated_gif(&[[255, 0, 0], [0, 255, 0]], &[50, 50]))
+            .expect("write the fixture");
+
+        let ctx = egui::Context::default();
+        let mut cache = CustomImages::default();
+
+        ctx.begin_pass(egui::RawInput {
+            time: Some(0.0),
+            ..Default::default()
+        });
+        cache
+            .texture(&ctx, ImageSlot::Header, &path, [8, 8])
+            .expect("a valid animated gif must upload");
+        ctx.end_pass().drop_without_applying_deltas();
+
+        // 30ms into frame 0's 50ms window: 20ms left before frame 1 is due.
+        ctx.begin_pass(egui::RawInput {
+            time: Some(0.03),
+            ..Default::default()
+        });
+        assert_eq!(cache.next_wakeup(&ctx), Some(Duration::from_millis(20)));
+        ctx.end_pass().drop_without_applying_deltas();
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A slot holding a *static* (single-frame) image must not count as
+    /// animated — `next_wakeup` is `None`, same as an empty cache, so a
+    /// static background never keeps the repaint clock hot.
+    #[test]
+    fn next_wakeup_is_none_for_a_static_single_frame_image() {
+        let path = std::env::temp_dir().join("shinra-custom-image-next-wakeup-static.gif");
+        std::fs::write(&path, animated_gif(&[[9, 9, 9]], &[50])).expect("write the fixture");
+
+        let ctx = egui::Context::default();
+        let mut cache = CustomImages::default();
+
+        ctx.begin_pass(egui::RawInput {
+            time: Some(0.0),
+            ..Default::default()
+        });
+        cache
+            .texture(&ctx, ImageSlot::Header, &path, [8, 8])
+            .expect("a valid single-frame gif must upload");
+        ctx.end_pass().drop_without_applying_deltas();
+
+        assert_eq!(cache.next_wakeup(&ctx), None);
 
         let _ = std::fs::remove_file(&path);
     }
