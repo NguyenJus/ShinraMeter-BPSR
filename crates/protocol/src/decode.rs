@@ -2710,4 +2710,237 @@ mod tests {
             ProtocolEvent::EnemyGone { reason: None, .. }
         ));
     }
+
+    // -- full-uuid identity (issue #335) -----------------------------------
+
+    /// A mirrored/summoned copy of `TARGET_UUID`: same `uuid >> 16`, one
+    /// extra flag bit. The pre-#335 boundary truncated these to one number.
+    const MIRROR_TARGET_UUID: i64 = TARGET_UUID | (1 << 15);
+
+    /// The events the meter keys on must carry the whole uuid, not the
+    /// truncated display number — that truncation is what let two entities
+    /// blend (issue #335).
+    #[test]
+    fn damage_events_carry_the_full_attacker_and_target_uuid() {
+        let n = notify_for_damage(base_damage());
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        let ev = only_damage(out);
+        assert_eq!(ev.attacker, EntityId::from_uuid(ATTACKER_UUID));
+        assert_eq!(ev.target, EntityId::from_uuid(TARGET_UUID));
+        // ...and the display numbers are unchanged.
+        assert_eq!(ev.attacker_uid, uid_of(ATTACKER_UUID));
+        assert_eq!(ev.target_uid, uid_of(TARGET_UUID));
+    }
+
+    /// Pet/summon damage is attributed to the top summoner on both fields,
+    /// so the identity and the display number never disagree about who it
+    /// belongs to.
+    #[test]
+    fn pet_damage_carries_the_summoners_own_identity() {
+        let n = notify_for_damage(pb::SyncDamageInfo {
+            top_summoner_id: SUMMONER_UUID,
+            ..base_damage()
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        let ev = only_damage(out);
+        assert_eq!(ev.attacker, EntityId::from_uuid(SUMMONER_UUID));
+        assert_eq!(ev.attacker_uid, uid_of(SUMMONER_UUID));
+    }
+
+    /// Two entities sharing a display uid stay distinct all the way out of
+    /// the decoder: same `target_uid`, different `target`.
+    #[test]
+    fn a_mirror_entity_keeps_its_own_identity_under_a_shared_display_uid() {
+        let mut entities = EntityTable::new();
+        let mut out = Vec::new();
+        super::decode_notify(
+            &notify_for_damage(base_damage()),
+            0,
+            &mut out,
+            None,
+            &mut entities,
+        );
+        let plain = only_damage(std::mem::take(&mut out));
+
+        let delta = AoiSyncDelta {
+            uuid: MIRROR_TARGET_UUID,
+            attrs: None,
+            skill_effects: Some(SkillEffect {
+                damages: vec![base_damage()],
+            }),
+            buff_effect: None,
+        };
+        let msg = SyncNearDeltaInfo {
+            delta_infos: vec![delta],
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let n = Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id: opcode::SYNC_NEAR_DELTA_INFO,
+            payload,
+        };
+        super::decode_notify(&n, 1, &mut out, None, &mut entities);
+        let mirrored = only_damage(out);
+
+        assert_eq!(plain.target_uid, mirrored.target_uid);
+        assert_ne!(plain.target, mirrored.target);
+        assert_eq!(entities.len(), 3, "attacker plus both targets");
+    }
+
+    /// `SyncNearEntities.appear` is what populates the table, and the
+    /// `EnemyHp` it emits carries the same identity the table filed.
+    #[test]
+    fn appearing_entities_are_filed_in_the_table_with_their_monster_id() {
+        let mut entities = EntityTable::new();
+        let n = near_entities_notify(
+            vec![pb::Entity {
+                uuid: TARGET_UUID,
+                ent_type: 0,
+                attrs: Some(AttrCollection {
+                    uuid: 0,
+                    attrs: vec![pb::Attr {
+                        id: crate::attrs::attr_id::MONSTER_ID,
+                        raw_data: vec![0xB9, 0x92, 0x06],
+                    }],
+                }),
+            }],
+            vec![],
+        );
+        let mut out = Vec::new();
+        super::decode_notify(&n, 4_000, &mut out, None, &mut entities);
+        let id = EntityId::from_uuid(TARGET_UUID);
+        let rec = entities.get(id).expect("appear list populates the table");
+        assert_eq!(rec.first_seen_ms, 4_000);
+        assert_eq!(rec.monster_id, Some(100_665));
+        match &out[0] {
+            ProtocolEvent::EnemyHp(e) => {
+                assert_eq!(e.entity, id);
+                assert_eq!(e.uid, uid_of(TARGET_UUID));
+            }
+            other => panic!("expected EnemyHp, got {other:?}"),
+        }
+    }
+
+    /// `CharSerialize.char_id` is a bare uid, so the shadow map is what ties
+    /// it back to the uuid the AOI channel already used for that player —
+    /// including its flag bits, which the bare uid cannot express.
+    #[test]
+    fn container_data_char_id_resolves_through_the_shadow_map() {
+        let client_side_player = ATTACKER_UUID | (1 << 14);
+        let mut entities = EntityTable::new();
+        let mut out = Vec::new();
+        super::decode_notify(
+            &near_entities_notify(
+                vec![pb::Entity {
+                    uuid: client_side_player,
+                    ent_type: 0,
+                    attrs: Some(AttrCollection {
+                        uuid: 0,
+                        attrs: vec![],
+                    }),
+                }],
+                vec![],
+            ),
+            0,
+            &mut out,
+            None,
+            &mut entities,
+        );
+        out.clear();
+
+        super::decode_notify(
+            &container_notify(pb::CharSerialize {
+                char_id: uid_of(ATTACKER_UUID),
+                char_base: Some(pb::CharBaseInfo {
+                    char_id: uid_of(ATTACKER_UUID),
+                    name: "Ari".to_string(),
+                    fight_point: 0,
+                }),
+                scene_data: None,
+                profession_list: None,
+            }),
+            0,
+            &mut out,
+            None,
+            &mut entities,
+        );
+        match &out[0] {
+            ProtocolEvent::Player(p) => {
+                assert_eq!(p.entity, EntityId::from_uuid(client_side_player));
+                assert_eq!(p.uid, uid_of(ATTACKER_UUID));
+            }
+            other => panic!("expected Player, got {other:?}"),
+        }
+    }
+
+    /// With no AOI sighting to resolve against, a bare `char_id` still gets
+    /// a usable identity — the canonical reconstruction, never `UNKNOWN`.
+    #[test]
+    fn container_data_char_id_falls_back_to_the_canonical_identity() {
+        let n = container_notify(pb::CharSerialize {
+            char_id: 8,
+            char_base: Some(pb::CharBaseInfo {
+                char_id: 8,
+                name: "Ari".to_string(),
+                fight_point: 0,
+            }),
+            scene_data: None,
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        match &out[0] {
+            ProtocolEvent::Player(p) => {
+                assert_eq!(
+                    p.entity,
+                    EntityId::from_display_uid(8, EntityKind::Player)
+                );
+                assert_eq!(p.entity.display_uid(), 8);
+            }
+            other => panic!("expected Player, got {other:?}"),
+        }
+    }
+
+    /// Zoning drops the table: none of the previous scene's entities is in
+    /// AOI range afterwards, and a stale shadow mapping would resolve the
+    /// next scene's bare `char_id` onto a uuid that is gone.
+    #[test]
+    fn entering_a_scene_clears_the_entity_table() {
+        let mut entities = EntityTable::new();
+        let mut out = Vec::new();
+        super::decode_notify(
+            &notify_for_damage(base_damage()),
+            0,
+            &mut out,
+            None,
+            &mut entities,
+        );
+        assert!(!entities.is_empty());
+
+        let msg = pb::EnterScene {
+            info: Some(pb::EnterSceneInfo {
+                attrs: Some(AttrCollection {
+                        uuid: 0,
+                        attrs: vec![],
+                    }),
+            }),
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        super::decode_notify(
+            &Notify {
+                service_uuid: crate::frame::SERVICE_UUID,
+                method_id: opcode::ENTER_SCENE,
+                payload,
+            },
+            0,
+            &mut out,
+            None,
+            &mut entities,
+        );
+        assert!(entities.is_empty());
+    }
 }
