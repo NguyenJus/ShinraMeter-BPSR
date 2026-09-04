@@ -511,7 +511,11 @@ fn team_ntf_notify_join_team_decodes_roster_end_to_end() {
     let events = decoder.push_stream(&stream, 5);
     // 2 `Player` events (the bot-like member yields no `Player` event) plus
     // one trailing `TeamRoster` naming all three resolved uids (issue #343).
-    assert_eq!(events.len(), 3, "the bot-like member must yield no Player event");
+    assert_eq!(
+        events.len(),
+        3,
+        "the bot-like member must yield no Player event"
+    );
     match &events[0] {
         ProtocolEvent::Player(p) => {
             assert_eq!(p.uid, 101);
