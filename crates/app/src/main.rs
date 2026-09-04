@@ -40,26 +40,6 @@ fn names_cache_path() -> PathBuf {
     path
 }
 
-/// Where the encounter-history database (issue #39) lives:
-/// `%APPDATA%\ShinraMeter-BPSR\history.sqlite`. `SHINRA_HISTORY_DB` overrides
-/// it outright, because it is the file a developer most often wants pointed
-/// at a scratch copy — though it is no longer the only override among the
-/// app's on-disk files: the single-instance lock (issue #277) has its own,
-/// `SHINRA_INSTANCE_LOCK` (see `single_instance::lock_file_path`).
-fn history_db_path() -> PathBuf {
-    let (path, warning) = paths::resolve(
-        std::env::var("SHINRA_HISTORY_DB").ok().as_deref(),
-        std::env::var("APPDATA").ok().as_deref(),
-        &["ShinraMeter-BPSR", "history.sqlite"],
-        "ShinraMeter-BPSR-history.sqlite",
-        "APPDATA is not set; falling back to a working-directory file for the encounter history",
-    );
-    if let Some(warning) = warning {
-        log::warn!("{warning}");
-    }
-    path
-}
-
 /// Issue #89: how the overlay window and its swapchain get created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowComposition {
@@ -346,7 +326,10 @@ fn main() -> eframe::Result {
     let history = settings
         .history_enabled
         .then(|| {
-            history::writer::HistoryHandle::spawn(history_db_path(), settings.retention_policy())
+            history::writer::HistoryHandle::spawn(
+                history::history_db_path(),
+                settings.retention_policy(),
+            )
         })
         .flatten();
     let (history_handle, history_thread) = match history {
