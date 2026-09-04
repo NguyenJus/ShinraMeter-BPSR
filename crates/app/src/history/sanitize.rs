@@ -9,8 +9,10 @@
 //! `100_000` (clear of any real uid range), in first-seen order — so the
 //! same real player gets the same replacement uid *and* the same
 //! `Player<n>` name everywhere in one sanitized copy, and repeated runs
-//! over the same source produce the same mapping (first-seen order is
-//! deterministic for a given source file).
+//! over the same source produce the same mapping: rows are visited in
+//! `(encounter_id, slot)` order, which is fixed by the source file's own
+//! data rather than by anything nondeterministic like statement order or
+//! disk layout, so the mapping is reproducible run to run.
 //!
 //! `encounters.boss_name`/`scene_name`/`title`/`subtitle` are left
 //! untouched: they name monsters and zones, not players, and `sanitize-dump`
@@ -19,9 +21,10 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io;
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use super::HistoryError;
 
@@ -73,30 +76,76 @@ impl Remap {
     }
 
     /// The pseudonym for `old_uid`'s (already-remapped) replacement —
-    /// `Player<n>`, matching `sanitize-dump`'s `name_for` exactly, so a
-    /// name seen in a sanitized dump and a sanitized history export for the
-    /// same session reads as the same player.
+    /// `Player<n>`, matching `sanitize-dump`'s `name_for` exactly.
     fn name_for(&mut self, old_uid: i64) -> String {
         format!("Player{}", self.uid(old_uid))
     }
 }
 
-/// Copies the history database at `src` to `dst`, then rewrites every
+/// Snapshots the history database at `src` into `dst`, then rewrites every
 /// `encounter_players` row's `uid` and `name` in the copy to a stable
 /// pseudonym pair (see [`Remap`]) — the same uid always yields the same
 /// pseudonym within the copy, so a reader can still tell two rows are the
 /// same player without learning who that player is.
 ///
-/// `src` is copied byte-for-byte first (cheap, and means the rewrite below
-/// only ever touches `dst` — `src`, e.g. the live `history.sqlite`, is never
-/// opened for writing). Every other column — `encounters.boss_name`,
+/// `src` is opened read-only and snapshotted with SQLite's own `VACUUM
+/// INTO` rather than `fs::copy`: that's a consistent, transactionally-safe
+/// snapshot straight from SQLite (no free pages carried over either) built
+/// without ever taking a write lock on `src` — this is what makes it safe
+/// to run against the live `history.sqlite` while the writer thread is
+/// still active; a concurrent commit on `src` is covered by rusqlite's
+/// default 5-second busy timeout. The rewrite then runs against `dst`
+/// alone; `src` is never opened for writing. After the rewrite, `dst` gets
+/// `secure_delete` turned on for the `UPDATE`s and a final `VACUUM`, so the
+/// real names/uids the `UPDATE`s overwrote don't linger as stale bytes in
+/// `dst`'s free pages. Every other column — `encounters.boss_name`,
 /// `scene_name`, `title`, `subtitle`, all of `encounter_player_skills` — is
 /// left exactly as copied: none of them name a player.
+///
+/// On any error, `dst` (and a `<dst>-journal` sibling, if SQLite left one
+/// behind) is removed before returning — a half-sanitized copy must never
+/// be mistaken for a finished one by a caller that only checks whether the
+/// file exists.
 pub fn sanitize_copy(src: &Path, dst: &Path) -> Result<SanitizeReport, HistoryError> {
-    crate::paths::ensure_parent_dir(dst).map_err(HistoryError::Copy)?;
-    fs::copy(src, dst).map_err(HistoryError::Copy)?;
+    match sanitize_into(src, dst) {
+        Ok(report) => Ok(report),
+        Err(err) => {
+            let _ = fs::remove_file(dst);
+            let mut journal = dst.as_os_str().to_owned();
+            journal.push("-journal");
+            let _ = fs::remove_file(journal);
+            Err(err)
+        }
+    }
+}
 
-    let conn = Connection::open(dst)?;
+/// Does the actual work of [`sanitize_copy`] — split out so that function
+/// can wrap it in one place with the on-error cleanup every path through
+/// this needs, rather than every early return remembering to clean up
+/// after itself.
+fn sanitize_into(src: &Path, dst: &Path) -> Result<SanitizeReport, HistoryError> {
+    crate::paths::ensure_parent_dir(dst).map_err(HistoryError::Copy)?;
+    // `VACUUM INTO` refuses to write over an existing file.
+    let _ = fs::remove_file(dst);
+
+    let dst_str = dst.to_str().ok_or_else(|| {
+        HistoryError::Copy(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("destination path {} is not valid UTF-8", dst.display()),
+        ))
+    })?;
+
+    {
+        let src_conn = Connection::open_with_flags(
+            src,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        src_conn.execute("VACUUM INTO ?1", [dst_str])?;
+    }
+
+    let mut conn = Connection::open(dst)?;
+    conn.pragma_update(None, "secure_delete", "ON")?;
+
     let mut report = SanitizeReport::default();
 
     let encounters: i64 =
@@ -104,7 +153,9 @@ pub fn sanitize_copy(src: &Path, dst: &Path) -> Result<SanitizeReport, HistoryEr
     report.encounters = encounters.max(0) as u64;
 
     let rows: Vec<(i64, i64, i64)> = {
-        let mut stmt = conn.prepare("SELECT encounter_id, slot, uid FROM encounter_players")?;
+        let mut stmt = conn.prepare(
+            "SELECT encounter_id, slot, uid FROM encounter_players ORDER BY encounter_id, slot",
+        )?;
         stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -116,15 +167,21 @@ pub fn sanitize_copy(src: &Path, dst: &Path) -> Result<SanitizeReport, HistoryEr
     };
 
     let mut remap = Remap::new();
-    for (encounter_id, slot, uid) in rows {
-        let new_uid = remap.uid(uid);
-        let new_name = remap.name_for(uid);
-        conn.execute(
-            "UPDATE encounter_players SET uid = ?1, name = ?2 WHERE encounter_id = ?3 AND slot = ?4",
-            rusqlite::params![new_uid, new_name, encounter_id, slot],
-        )?;
-        report.players_remapped += 1;
+    {
+        let tx = conn.transaction()?;
+        for (encounter_id, slot, uid) in rows {
+            let new_uid = remap.uid(uid);
+            let new_name = remap.name_for(uid);
+            tx.execute(
+                "UPDATE encounter_players SET uid = ?1, name = ?2 WHERE encounter_id = ?3 AND slot = ?4",
+                rusqlite::params![new_uid, new_name, encounter_id, slot],
+            )?;
+            report.players_remapped += 1;
+        }
+        tx.commit()?;
     }
+
+    conn.execute_batch("VACUUM")?;
 
     Ok(report)
 }
@@ -315,5 +372,90 @@ mod tests {
 
         let _ = fs::remove_file(&src);
         let _ = fs::remove_file(&dst);
+    }
+
+    /// A corrupt/non-database `src` must not leave a half-written `dst`
+    /// behind for a caller that only checks whether the file exists.
+    #[test]
+    fn sanitize_copy_leaves_no_dst_behind_on_a_corrupt_source() {
+        let src = temp_db_path("corrupt-src");
+        fs::write(&src, b"not a database").unwrap();
+        let dst = temp_db_path("corrupt-dst");
+
+        let result = sanitize_copy(&src, &dst);
+
+        assert!(result.is_err(), "{result:?}");
+        assert!(!dst.exists());
+
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&dst);
+    }
+
+    /// A deleted encounter's players must never survive into the sanitized
+    /// copy — not as remapped rows, and not as leftover byte garbage in
+    /// `dst`'s free pages, which `VACUUM`/`secure_delete` are what rule
+    /// out.
+    #[test]
+    fn sanitize_copy_leaves_no_trace_of_a_deleted_players_name() {
+        let src = temp_db_path("deleted-src");
+        let mut store = SqliteHistory::open(&src, RetentionPolicy::default()).unwrap();
+        store
+            .insert(&sample_record(
+                1_000,
+                10_000,
+                vec![sample_player(1, "Alice")],
+            ))
+            .unwrap();
+        store
+            .insert(&sample_record(
+                2_000,
+                10_000,
+                vec![sample_player(1, "Alice"), sample_player(2, "Bob")],
+            ))
+            .unwrap();
+        let carol_id = store
+            .insert(&sample_record(
+                3_000,
+                10_000,
+                vec![sample_player(3, "Carol")],
+            ))
+            .unwrap()
+            .unwrap();
+        store.delete(carol_id).unwrap();
+        drop(store);
+
+        let dst = temp_db_path("deleted-dst");
+        sanitize_copy(&src, &dst).unwrap();
+
+        let bytes = fs::read(&dst).unwrap();
+        for needle in [b"Alice".as_slice(), b"Bob".as_slice(), b"Carol".as_slice()] {
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle),
+                "found {:?} in sanitized bytes",
+                std::str::from_utf8(needle)
+            );
+        }
+
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&dst);
+    }
+
+    /// Two sanitized copies of the same source must assign the same
+    /// pseudonyms in the same rows — the whole point of a *stable* remap.
+    #[test]
+    fn sanitize_copy_is_deterministic_across_runs_over_the_same_source() {
+        let src = seed_history();
+        let dst_a = temp_db_path("determinism-a");
+        let dst_b = temp_db_path("determinism-b");
+
+        sanitize_copy(&src, &dst_a).unwrap();
+        sanitize_copy(&src, &dst_b).unwrap();
+
+        assert_eq!(all_uids(&dst_a), all_uids(&dst_b));
+        assert_eq!(all_names(&dst_a), all_names(&dst_b));
+
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&dst_a);
+        let _ = fs::remove_file(&dst_b);
     }
 }

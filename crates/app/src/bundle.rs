@@ -251,11 +251,12 @@ pub fn bundle_entries(
 /// through `crate::history::sanitize::sanitize_copy` (issue #347) into
 /// `dest_dir/`[`SANITIZED_HISTORY_FILE_NAME`] — the one way `history.sqlite`
 /// data ever reaches a bundle, real names replaced by stable pseudonyms.
-/// `include_history` exists so a future settings toggle (or a caller that
-/// simply has no history database, e.g. history disabled in settings) can
-/// skip it outright; every current caller passes `true`. A missing source
-/// file or a sanitize failure is logged and left out of the bundle, same
-/// as any other best-effort entry — it does not fail the whole export.
+/// `include_history` lets a caller skip it outright when there is no
+/// history to hand over — the UI passes `Settings::history_enabled`, so a
+/// user who has turned history off never has it sanitized into a bundle
+/// either. A missing source file or a sanitize failure is logged and left
+/// out of the bundle, same as any other best-effort entry — it does not
+/// fail the whole export.
 pub fn export_bundle_to(
     dest_dir: &Path,
     entries: &[(String, PathBuf)],
@@ -786,6 +787,35 @@ mod tests {
         assert!(!dir.join(SANITIZED_HISTORY_FILE_NAME).exists());
         assert!(dir.join("manifest.json").exists());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A `history_source` that exists but isn't a readable database
+    /// (`sanitize_copy` fails) must not leave a sanitized file behind, and
+    /// the manifest must say so — same contract as a missing source, just
+    /// reached via a different `sanitize_copy` failure mode.
+    #[test]
+    fn export_bundle_to_leaves_out_the_sanitized_history_file_when_sanitizing_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "ShinraMeter-BPSR-bundle-export-sanitize-corrupt-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let corrupt_history = std::env::temp_dir().join(format!(
+            "ShinraMeter-BPSR-bundle-corrupt-history-{}.sqlite",
+            std::process::id()
+        ));
+        fs::write(&corrupt_history, b"not a database").unwrap();
+
+        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None);
+        let missing = export_bundle_to(&dir, &[], &manifest, Some(&corrupt_history), true).unwrap();
+
+        assert!(missing.is_empty());
+        assert!(!dir.join(SANITIZED_HISTORY_FILE_NAME).exists());
+        let manifest_json = fs::read_to_string(dir.join("manifest.json")).unwrap();
+        assert!(manifest_json.contains("\"sanitized_history_included\": false"));
+
+        let _ = fs::remove_file(&corrupt_history);
         let _ = fs::remove_dir_all(&dir);
     }
 }

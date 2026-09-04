@@ -5058,7 +5058,7 @@ fn draw_header_menu(
                 if let Some(dest) = crate::platform::choose_bundle_export_path(
                     bundle::EXPORT_BUNDLE_DEFAULT_DIRNAME,
                 ) {
-                    start_bundle_export(dest, tx_log_export.clone());
+                    start_bundle_export(dest, settings.history_enabled, tx_log_export.clone());
                 }
                 ui.close();
             }
@@ -5423,7 +5423,7 @@ fn start_log_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
 /// same as `start_log_export`: cheap either way, but keeping it off the
 /// frame thread means a slow `APPDATA` lookup or a stalled disk (the copy
 /// itself, `bundle::export_bundle_to`) can never stall a frame.
-fn start_bundle_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
+fn start_bundle_export(dest: PathBuf, include_history: bool, tx: Sender<LogExportOutcome>) {
     std::thread::Builder::new()
         .name("export-bundle".to_string())
         .spawn(move || {
@@ -5450,18 +5450,18 @@ fn start_bundle_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
                 crate::inspect::dropped_count(),
             );
 
-            // Issue #347: `true` — a sanitized copy is included by default,
-            // since it is the only way `history.sqlite` data reaches a
-            // bundle at all (`export_bundle_to`'s doc comment). No settings
-            // toggle exists yet to turn it off; the parameter is there for
-            // when one does.
+            // Issue #347: the bundle follows `Settings::history_enabled` —
+            // a sanitized copy is the only way `history.sqlite` data
+            // reaches a bundle at all (`export_bundle_to`'s doc comment),
+            // and a user who has turned history off should not have it
+            // sanitized into a bundle either.
             let history_source = crate::history::history_db_path();
             let outcome = match bundle::export_bundle_to(
                 &dest,
                 &entries,
                 &manifest,
                 Some(&history_source),
-                true,
+                include_history,
             ) {
                 Ok(missing) => Ok((dest, missing)),
                 Err(err) => Err((dest, err.to_string())),
