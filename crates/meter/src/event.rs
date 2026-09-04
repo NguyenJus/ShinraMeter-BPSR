@@ -316,6 +316,15 @@ pub enum ProtocolEvent {
         removes_layer: bool,
         timestamp_ms: u64,
     },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::LocalPlayer` (issue #344):
+    /// the local player's own uid, decoded from
+    /// `SyncContainerData.v_data.char_id`. Session-scoped, not
+    /// fight-scoped — `Meter::apply` stores it outside anything `reset`
+    /// touches, and clears it only on `ServerChanged` (a new server
+    /// session hands out fresh uids). See `Meter::local_uid`.
+    LocalPlayer {
+        uid: i64,
+    },
 }
 
 #[cfg(test)]
