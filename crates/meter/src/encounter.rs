@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::event::{
-    CastEvent, Class, DamageEvent, DisappearReason, EDungeonState, EnemyHp, EntityKind, PlayerInfo,
-    ProtocolEvent,
+    CastEvent, Class, DamageEvent, DisappearReason, EDungeonState, EnemyHp, EntityId, EntityKind,
+    PlayerInfo, ProtocolEvent,
 };
 use crate::fight::{FightConfig, FightEndCause, FightState};
 use crate::phase;
@@ -917,6 +917,7 @@ impl Meter {
             }
             ProtocolEvent::EnemyHp(e) => self.apply_enemy_hp(e),
             ProtocolEvent::BuffApply {
+                host: _,
                 host_uid,
                 buff_uuid,
                 base_id,
@@ -927,6 +928,7 @@ impl Meter {
                 None
             }
             ProtocolEvent::BuffRemove {
+                host: _,
                 host_uid,
                 buff_uuid,
                 removes_layer,
@@ -1269,7 +1271,11 @@ impl Meter {
             // see `apply_enemy_gone` for the cases where it is allowed to
             // stand in for a death signal that never arrived, including the
             // server's own `DisappearReason::Dead` (issue #276).
-            ProtocolEvent::EnemyGone { uid, reason } => {
+            ProtocolEvent::EnemyGone {
+                entity: _,
+                uid,
+                reason,
+            } => {
                 self.apply_enemy_gone(*uid, *reason);
                 None
             }
@@ -3808,6 +3814,7 @@ mod tests {
 
     fn cast(caster_uid: i64, skill_id: i32, ts: u64) -> ProtocolEvent {
         ProtocolEvent::Cast(CastEvent {
+            caster: EntityId::from_display_uid(caster_uid, EntityKind::Player),
             caster_uid,
             skill_id,
             timestamp_ms: ts,
@@ -3873,6 +3880,7 @@ mod tests {
 
     fn buff_apply(host_uid: i64, buff_uuid: i32, base_id: Option<i32>, ts: u64) -> ProtocolEvent {
         ProtocolEvent::BuffApply {
+            host: EntityId::from_display_uid(host_uid, EntityKind::Player),
             host_uid,
             buff_uuid,
             base_id,
@@ -3885,6 +3893,7 @@ mod tests {
     /// is already up.
     fn buff_stack(host_uid: i64, buff_uuid: i32, ts: u64) -> ProtocolEvent {
         ProtocolEvent::BuffApply {
+            host: EntityId::from_display_uid(host_uid, EntityKind::Player),
             host_uid,
             buff_uuid,
             base_id: None,
@@ -3896,6 +3905,7 @@ mod tests {
     /// The full `Remove`: the whole instance, however many layers.
     fn buff_remove(host_uid: i64, buff_uuid: i32, ts: u64) -> ProtocolEvent {
         ProtocolEvent::BuffRemove {
+            host: EntityId::from_display_uid(host_uid, EntityKind::Player),
             host_uid,
             buff_uuid,
             removes_layer: false,
@@ -3907,6 +3917,7 @@ mod tests {
     /// instance is the whole thing.
     fn buff_remove_layer(host_uid: i64, buff_uuid: i32, ts: u64) -> ProtocolEvent {
         ProtocolEvent::BuffRemove {
+            host: EntityId::from_display_uid(host_uid, EntityKind::Player),
             host_uid,
             buff_uuid,
             removes_layer: true,
@@ -4437,6 +4448,7 @@ mod tests {
         let mut m = Meter::new();
         m.apply(&dmg(5, 100, 1000));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(5, EntityKind::Player),
             uid: 5,
             name: Some("Foo".to_string()),
             class: Some(Class::Stormblade),
@@ -4452,6 +4464,7 @@ mod tests {
 
     fn player_info(uid: i64, name: &str) -> ProtocolEvent {
         ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(uid, EntityKind::Player),
             uid,
             name: Some(name.to_string()),
             class: Some(Class::Stormblade),
@@ -4804,6 +4817,7 @@ mod tests {
         let mut m = Meter::new();
         m.apply(&dmg(7, 100, 1000));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(7, EntityKind::Player),
             uid: 7,
             name: None,
             class: None,
@@ -4820,6 +4834,7 @@ mod tests {
     fn ability_score_survives_reset_like_name_and_class() {
         let mut m = Meter::new();
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(3, EntityKind::Player),
             uid: 3,
             name: Some("Foo".to_string()),
             class: None,
@@ -4843,6 +4858,7 @@ mod tests {
         let mut m = Meter::new();
         m.apply(&dmg(9, 100, 1000));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(9, EntityKind::Player),
             uid: 9,
             name: None,
             class: None,
@@ -4863,6 +4879,7 @@ mod tests {
         let mut m = Meter::new();
         m.apply(&dmg(9, 100, 1000));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(9, EntityKind::Player),
             uid: 9,
             name: None,
             class: None,
@@ -4872,6 +4889,7 @@ mod tests {
             imagine_tiers: None,
         }));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(9, EntityKind::Player),
             uid: 9,
             name: None,
             class: None,
@@ -4892,6 +4910,7 @@ mod tests {
         let mut m = Meter::new();
         m.apply(&dmg(9, 100, 1000));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(9, EntityKind::Player),
             uid: 9,
             name: None,
             class: None,
@@ -4901,6 +4920,7 @@ mod tests {
             imagine_tiers: None,
         }));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(9, EntityKind::Player),
             uid: 9,
             name: None,
             class: None,
@@ -4928,6 +4948,7 @@ mod tests {
         let mut m = Meter::new();
         m.apply(&dmg(8, 100, 1000));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(8, EntityKind::Player),
             uid: 8,
             name: None,
             class: None,
@@ -4944,6 +4965,7 @@ mod tests {
     fn season_strength_survives_reset_like_name_and_class() {
         let mut m = Meter::new();
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(4, EntityKind::Player),
             uid: 4,
             name: Some("Foo".to_string()),
             class: None,
@@ -5026,6 +5048,7 @@ mod tests {
 
         // A boss-HP sync/regen tick arrives long after combat stopped.
         m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+            entity: EntityId::from_display_uid(10, EntityKind::Monster),
             uid: 10,
             curr_hp: Some(100),
             max_hp: Some(100),
@@ -5270,6 +5293,7 @@ mod tests {
             let mut m = Meter::with_names_cache(cache);
 
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(5, EntityKind::Player),
                 uid: 5,
                 name: Some("Fresh".to_string()),
                 class: Some(Class::FrostMage),
@@ -5292,6 +5316,7 @@ mod tests {
 
             // Live packet only carries a name this time, no class.
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(5, EntityKind::Player),
                 uid: 5,
                 name: Some("Renamed".to_string()),
                 class: None,
@@ -5319,6 +5344,7 @@ mod tests {
         fn class_none_packet_preserves_a_previously_known_class() {
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(5, EntityKind::Player),
                 uid: 5,
                 name: Some("Ren".to_string()),
                 class: Some(Class::Stormblade),
@@ -5332,6 +5358,7 @@ mod tests {
             // A simulated Imagine-transform packet: profession id decoded to
             // no class at all (see `bpsr_protocol::pb::class_of_profession_id`).
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(5, EntityKind::Player),
                 uid: 5,
                 name: None,
                 class: None,
@@ -5384,6 +5411,7 @@ mod tests {
 
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(1, EntityKind::Player),
                 uid: 1,
                 name: Some("A".to_string()),
                 class: None,
@@ -5393,6 +5421,7 @@ mod tests {
                 imagine_tiers: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(2, EntityKind::Player),
                 uid: 2,
                 name: Some("B".to_string()),
                 class: None,
@@ -5402,6 +5431,7 @@ mod tests {
                 imagine_tiers: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(3, EntityKind::Player),
                 uid: 3,
                 name: Some("C".to_string()),
                 class: None,
@@ -5413,6 +5443,7 @@ mod tests {
             // Re-touch uid 1 so it becomes the most recently used, ahead of
             // 3 and 2 (in that order).
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(1, EntityKind::Player),
                 uid: 1,
                 name: Some("A".to_string()),
                 class: None,
@@ -5441,6 +5472,7 @@ mod tests {
         fn names_for_save_orders_most_recently_touched_first() {
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(1, EntityKind::Player),
                 uid: 1,
                 name: Some("First".to_string()),
                 class: None,
@@ -5450,6 +5482,7 @@ mod tests {
                 imagine_tiers: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(2, EntityKind::Player),
                 uid: 2,
                 name: Some("Second".to_string()),
                 class: None,
@@ -5468,6 +5501,7 @@ mod tests {
         fn server_change_reset_preserves_names_for_save() {
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(1, EntityKind::Player),
                 uid: 1,
                 name: Some("Foo".to_string()),
                 class: None,
@@ -5516,6 +5550,7 @@ mod tests {
 
         fn hp(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(100),
                 max_hp: Some(100),
@@ -5668,6 +5703,7 @@ mod tests {
 
         fn identified(uid: i64, curr: u64, max: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(max),
@@ -5692,6 +5728,7 @@ mod tests {
         /// the shape a meter started mid-pull gets (issue #76).
         fn curr_hp_only(uid: i64, curr: u64, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: None,
@@ -5753,6 +5790,7 @@ mod tests {
 
             fn curr_only(uid: i64, curr: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
                 ProtocolEvent::EnemyHp(EnemyHp {
+                    entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                     uid,
                     curr_hp: Some(curr),
                     max_hp: None,
@@ -6074,6 +6112,7 @@ mod tests {
         fn manual_reset_keeps_name_cache_for_late_damage() {
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(1, EntityKind::Player),
                 uid: 1,
                 name: Some("Foo".to_string()),
                 class: None,
@@ -6118,6 +6157,7 @@ mod tests {
 
         fn hp(uid: i64, curr: u64, monster_id: Option<u32>, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(100),
@@ -6764,6 +6804,7 @@ mod tests {
         fn names_survive_the_new_fight_reset() {
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(1, EntityKind::Player),
                 uid: 1,
                 name: Some("Foo".to_string()),
                 class: None,
@@ -7139,6 +7180,7 @@ mod tests {
                 m.tick(1_000 + idle());
 
                 m.apply(&ProtocolEvent::Cast(CastEvent {
+                    caster: EntityId::from_display_uid(1, EntityKind::Player),
                     caster_uid: 1,
                     skill_id: 1550,
                     timestamp_ms: 1_000 + 500,
@@ -7154,6 +7196,7 @@ mod tests {
                 let mut m = Meter::new();
                 m.apply(&dmg(1, 100, 1_000));
                 m.apply(&ProtocolEvent::BuffApply {
+                    host: EntityId::from_display_uid(1, EntityKind::Player),
                     host_uid: 1,
                     buff_uuid: 417,
                     base_id: Some(3_210_031),
@@ -7164,6 +7207,7 @@ mod tests {
 
                 // The buff closes 500ms into the grace window.
                 m.apply(&ProtocolEvent::BuffRemove {
+                    host: EntityId::from_display_uid(1, EntityKind::Player),
                     host_uid: 1,
                     buff_uuid: 417,
                     removes_layer: false,
@@ -7220,6 +7264,7 @@ mod tests {
 
         fn enemy_hp(uid: i64, curr: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(1_000_000),
@@ -7972,6 +8017,7 @@ mod tests {
 
         fn hp(uid: i64, curr: u64, max: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(max),
@@ -8212,6 +8258,7 @@ mod tests {
 
         fn hp(uid: i64, curr: u64, max: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(max),
@@ -8224,6 +8271,7 @@ mod tests {
         /// was never observed at all.
         fn hp_unknown(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: None,
                 max_hp: None,
@@ -8247,12 +8295,17 @@ mod tests {
         /// A despawn carrying no tag 2 at all — the fallback path, and what
         /// every pre-#276 test in this module means by "gone".
         fn gone(uid: i64) -> ProtocolEvent {
-            ProtocolEvent::EnemyGone { uid, reason: None }
+            ProtocolEvent::EnemyGone {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
+                uid,
+                reason: None,
+            }
         }
 
         /// A despawn carrying the server's own reason (issue #276).
         fn gone_because(uid: i64, reason: DisappearReason) -> ProtocolEvent {
             ProtocolEvent::EnemyGone {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 reason: Some(reason),
             }
@@ -9004,6 +9057,7 @@ mod tests {
 
         fn hp(uid: i64, curr: u64, max: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(max),
@@ -9076,6 +9130,7 @@ mod tests {
             let mut m = Meter::new();
             m.apply(&hp(10, 900, 1_000, ORIGIN, 0));
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(11, EntityKind::Monster),
                 uid: 11,
                 curr_hp: None,
                 max_hp: None,
@@ -9783,6 +9838,7 @@ mod tests {
 
         fn hp(uid: i64, curr: u64, max: u64, monster_id: Option<u32>, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(max),
@@ -9835,6 +9891,7 @@ mod tests {
             let mut m = Meter::new();
             m.apply(&boss_hit(10, 0));
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(10, EntityKind::Monster),
                 uid: 10,
                 curr_hp: Some(5_000_000),
                 max_hp: None,
@@ -9861,6 +9918,7 @@ mod tests {
             m.apply(&hp(10, 100, 100, Some(103), 0));
             // Trash caught mid-delta with a huge current HP and no max.
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(11, EntityKind::Monster),
                 uid: 11,
                 curr_hp: Some(9_000_000),
                 max_hp: None,
@@ -9882,6 +9940,7 @@ mod tests {
             m.apply(&boss_hit(11, 0));
             // Real boss, damaged down to 2M of a pool we never saw.
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(10, EntityKind::Monster),
                 uid: 10,
                 curr_hp: Some(2_000_000),
                 max_hp: None,
@@ -9890,6 +9949,7 @@ mod tests {
             }));
             // Untouched trash add with a bigger raw number, same tier.
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(11, EntityKind::Monster),
                 uid: 11,
                 curr_hp: Some(3_000_000),
                 max_hp: None,
@@ -9910,6 +9970,7 @@ mod tests {
             m.apply(&boss_hit(10, 0));
             m.apply(&boss_hit(11, 0));
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(10, EntityKind::Monster),
                 uid: 10,
                 curr_hp: Some(2_000_000),
                 max_hp: None,
@@ -9931,6 +9992,7 @@ mod tests {
             m.apply(&boss_hit(11, 0));
             // Mid-pull boss, no `max_hp` but a real current HP.
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(10, EntityKind::Monster),
                 uid: 10,
                 curr_hp: Some(5_000_000),
                 max_hp: None,
@@ -10104,6 +10166,7 @@ mod tests {
 
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(10, EntityKind::Monster),
                 uid: 10,
                 curr_hp: Some(500_000),
                 max_hp: Some(1_000_000),
@@ -10232,6 +10295,7 @@ mod tests {
             });
 
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(DIAG_UID, EntityKind::Monster),
                 uid: DIAG_UID,
                 curr_hp: Some(100),
                 max_hp: Some(100),
@@ -10448,6 +10512,7 @@ mod tests {
 
         fn hp(monster_id: u32, curr: u64, max: u64, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(UID, EntityKind::Monster),
                 uid: UID,
                 curr_hp: Some(curr),
                 max_hp: Some(max),
@@ -10560,6 +10625,7 @@ mod tests {
             assert_eq!(m.enemies[&UID].pct(), Some(40.0));
 
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(UID, EntityKind::Monster),
                 uid: UID,
                 curr_hp: None,
                 max_hp: None,
@@ -10608,6 +10674,7 @@ mod tests {
 
         fn hp(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(100),
                 max_hp: Some(100),
@@ -10621,6 +10688,7 @@ mod tests {
         /// idle timeout off for as long as an engaged boss is still up).
         fn killed(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(0),
                 max_hp: Some(100),
@@ -10759,6 +10827,7 @@ mod tests {
 
         fn hp(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(100),
                 max_hp: Some(100),

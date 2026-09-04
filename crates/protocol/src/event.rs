@@ -3,6 +3,7 @@
 //! `ProtocolEvent` is consumed as-is by `bpsr-meter` and the app; freeze the
 //! shape here before Phase 2 starts.
 
+use crate::entity::EntityId;
 use crate::pb::Class;
 
 /// `EEntityType::EntChar`, the entity-type value for a player.
@@ -65,6 +66,16 @@ pub fn kind_of(uuid: i64) -> EntityKind {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DamageEvent {
+    /// Who dealt this hit, as a whole-uuid identity (issue #335). This is
+    /// the key a consumer must file per-entity state under; `attacker_uid`
+    /// below is the same entity's *display* number and is not unique.
+    ///
+    /// Pet/summon damage is already attributed to the top summoner here,
+    /// exactly as `attacker_uid` is.
+    pub attacker: EntityId,
+    /// `attacker.display_uid()` — the short `uuid >> 16` every display
+    /// surface, name cache and golden file uses. Two different entities can
+    /// share one (issue #335), so never key stats on it.
     pub attacker_uid: i64,
     pub attacker_kind: EntityKind,
     pub skill_id: i32,
@@ -74,6 +85,10 @@ pub struct DamageEvent {
     pub hp_lessen: i64,
     pub is_miss: bool,
     pub is_heal: bool,
+    /// Who was hit, as a whole-uuid identity (issue #335) — the counterpart
+    /// of `attacker` above.
+    pub target: EntityId,
+    /// `target.display_uid()`. Display only; see `attacker_uid`.
     pub target_uid: i64,
     pub target_kind: EntityKind,
     pub timestamp_ms: u64,
@@ -90,6 +105,9 @@ pub struct DamageEvent {
 /// counts.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CastEvent {
+    /// Who cast, as a whole-uuid identity (issue #335).
+    pub caster: EntityId,
+    /// `caster.display_uid()`. Display only; see [`DamageEvent::attacker_uid`].
     pub caster_uid: i64,
     pub skill_id: i32,
     pub timestamp_ms: u64,
@@ -113,6 +131,13 @@ pub struct CastEvent {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlayerInfo {
+    /// This player's whole-uuid identity (issue #335). The two wire sources
+    /// that carry a bare `char_id` and no uuid — `SyncContainerData` and
+    /// `NotifyJoinTeam` — resolve theirs through
+    /// [`crate::entity::EntityTable::resolve_uid`], so every `PlayerInfo`
+    /// carries a usable one however it was sourced.
+    pub entity: EntityId,
+    /// `entity.display_uid()`. Display only; see [`DamageEvent::attacker_uid`].
     pub uid: i64,
     pub name: Option<String>,
     pub class: Option<Class>,
@@ -160,6 +185,9 @@ pub struct PlayerInfo {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EnemyHp {
+    /// This enemy's whole-uuid identity (issue #335).
+    pub entity: EntityId,
+    /// `entity.display_uid()`. Display only; see [`DamageEvent::attacker_uid`].
     pub uid: i64,
     pub curr_hp: Option<u64>,
     pub max_hp: Option<u64>,
@@ -351,6 +379,9 @@ pub enum ProtocolEvent {
     /// job, under the rule documented on
     /// `bpsr_meter::Meter::apply_enemy_gone`.
     EnemyGone {
+        /// The departing enemy's whole-uuid identity (issue #335).
+        entity: EntityId,
+        /// `entity.display_uid()`. Display only.
         uid: i64,
         reason: Option<DisappearReason>,
     },
@@ -374,6 +405,9 @@ pub enum ProtocolEvent {
     /// pairs with [`ProtocolEvent::BuffRemove::removes_layer`] so a consumer
     /// can tell a partial teardown from a full one.
     BuffApply {
+        /// The buffed entity's whole-uuid identity (issue #335).
+        host: EntityId,
+        /// `host.display_uid()`. Display only.
         host_uid: i64,
         buff_uuid: i32,
         base_id: Option<i32>,
@@ -393,6 +427,9 @@ pub enum ProtocolEvent {
     /// `AddTo`/`RemoveLayer` counts documented on `pb::EBuffEventType` is
     /// not a contradiction.
     BuffRemove {
+        /// The buffed entity's whole-uuid identity (issue #335).
+        host: EntityId,
+        /// `host.display_uid()`. Display only.
         host_uid: i64,
         buff_uuid: i32,
         removes_layer: bool,

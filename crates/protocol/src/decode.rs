@@ -14,6 +14,7 @@ use crate::attrs::{
     skill_cast_metadata_from_attrs,
 };
 use crate::blob;
+use crate::entity::{EntityId, EntityTable};
 use crate::event::{
     CastEvent, DamageEvent, DisappearReason, EDungeonState, EntityKind, PlayerInfo, ProtocolEvent,
     kind_of, uid_of,
@@ -102,22 +103,23 @@ pub fn decode_notify(
     now_ms: u64,
     out: &mut Vec<ProtocolEvent>,
     sink: Option<&dyn InspectSink>,
+    entities: &mut EntityTable,
 ) {
     match (n.service_uuid, n.method_id) {
         (SERVICE_UUID, opcode::SYNC_NEAR_ENTITIES) => {
             match pb::SyncNearEntities::decode(n.payload.as_slice()) {
-                Ok(msg) => on_sync_near_entities(&msg, now_ms, out, sink),
+                Ok(msg) => on_sync_near_entities(&msg, now_ms, out, sink, entities),
                 Err(_) => log::debug!("bpsr-protocol: SyncNearEntities decode failed"),
             }
         }
         (SERVICE_UUID, opcode::SYNC_CONTAINER_DATA) => {
             match pb::SyncContainerData::decode(n.payload.as_slice()) {
-                Ok(msg) => on_sync_container_data(&msg, out),
+                Ok(msg) => on_sync_container_data(&msg, out, entities),
                 Err(_) => log::debug!("bpsr-protocol: SyncContainerData decode failed"),
             }
         }
         (SERVICE_UUID, opcode::ENTER_SCENE) => match pb::EnterScene::decode(n.payload.as_slice()) {
-            Ok(msg) => on_enter_scene(&msg, out, sink),
+            Ok(msg) => on_enter_scene(&msg, out, sink, entities),
             Err(_) => log::debug!("bpsr-protocol: EnterScene decode failed"),
         },
         (SERVICE_UUID, opcode::SYNC_DUNGEON_DATA) => {
@@ -136,7 +138,7 @@ pub fn decode_notify(
             match pb::SyncNearDeltaInfo::decode(n.payload.as_slice()) {
                 Ok(msg) => {
                     for delta in &msg.delta_infos {
-                        on_aoi_sync_delta(delta, delta.uuid, now_ms, out, sink);
+                        on_aoi_sync_delta(delta, delta.uuid, now_ms, out, sink, entities);
                     }
                 }
                 Err(_) => log::debug!("bpsr-protocol: SyncNearDeltaInfo decode failed"),
@@ -155,7 +157,7 @@ pub fn decode_notify(
                             } else {
                                 delta.uuid
                             };
-                            on_aoi_sync_delta(delta, uuid, now_ms, out, sink);
+                            on_aoi_sync_delta(delta, uuid, now_ms, out, sink, entities);
                         }
                     }
                 }
@@ -164,7 +166,7 @@ pub fn decode_notify(
         }
         (TEAM_NTF_SERVICE_UUID, team_opcode::NOTIFY_JOIN_TEAM) => {
             match pb::NotifyJoinTeam::decode(n.payload.as_slice()) {
-                Ok(msg) => on_notify_join_team(&msg, out),
+                Ok(msg) => on_notify_join_team(&msg, out, entities),
                 Err(_) => log::debug!("bpsr-protocol: NotifyJoinTeam decode failed"),
             }
         }
@@ -192,27 +194,30 @@ fn on_sync_near_entities(
     now_ms: u64,
     out: &mut Vec<ProtocolEvent>,
     sink: Option<&dyn InspectSink>,
+    entities: &mut EntityTable,
 ) {
     for entity in &msg.appear {
         let Some(attrs) = &entity.attrs else {
             continue;
         };
-        let uid = uid_of(entity.uuid);
-        match kind_of(entity.uuid) {
+        // The AOI appear list is the authoritative population source for the
+        // entity table (issue #335): it is where a uuid is first seen, and so
+        // where a recycled display uid gets its second, separate record.
+        let id = entities.observe(entity.uuid, now_ms);
+        match id.kind() {
             EntityKind::Player => {
                 out.push(ProtocolEvent::Player(player_info_from_attrs(
-                    uid,
+                    id,
                     &attrs.attrs,
                     sink,
                 )));
             }
             EntityKind::Monster => {
-                out.push(ProtocolEvent::EnemyHp(enemy_hp_from_attrs(
-                    uid,
-                    &attrs.attrs,
-                    now_ms,
-                    sink,
-                )));
+                let hp = enemy_hp_from_attrs(id, &attrs.attrs, now_ms, sink);
+                if let Some(monster_id) = hp.monster_id {
+                    entities.set_monster_id(id, monster_id);
+                }
+                out.push(ProtocolEvent::EnemyHp(hp));
             }
             EntityKind::Unknown => {}
         }
@@ -229,6 +234,7 @@ fn on_sync_near_entities(
     for entity in &msg.disappear {
         if kind_of(entity.uuid) == EntityKind::Monster {
             out.push(ProtocolEvent::EnemyGone {
+                entity: EntityId::from_uuid(entity.uuid),
                 uid: uid_of(entity.uuid),
                 reason: entity.disappear_type.map(DisappearReason::from),
             });
@@ -245,14 +251,19 @@ fn on_aoi_sync_delta(
     now_ms: u64,
     out: &mut Vec<ProtocolEvent>,
     sink: Option<&dyn InspectSink>,
+    entities: &mut EntityTable,
 ) {
-    let target_uid = uid_of(uuid);
-    let target_kind = kind_of(uuid);
+    // Observed, not merely looked up: a delta can be the first mention of an
+    // entity this session (its appear list arrived before the meter attached,
+    // or was lost), and the table has to know about it either way.
+    let target = entities.observe(uuid, now_ms);
+    let target_uid = target.display_uid();
+    let target_kind = target.kind();
     if let Some(attrs) = &delta.attrs {
         match target_kind {
             EntityKind::Player => {
                 out.push(ProtocolEvent::Player(player_info_from_attrs(
-                    target_uid,
+                    target,
                     &attrs.attrs,
                     sink,
                 )));
@@ -271,6 +282,7 @@ fn on_aoi_sync_delta(
                 let meta = skill_cast_metadata_from_attrs(&attrs.attrs);
                 if let Some(skill_id) = meta.skill_id {
                     out.push(ProtocolEvent::Cast(CastEvent {
+                        caster: target,
                         caster_uid: target_uid,
                         skill_id,
                         timestamp_ms: now_ms,
@@ -283,12 +295,11 @@ fn on_aoi_sync_delta(
                 }
             }
             EntityKind::Monster => {
-                out.push(ProtocolEvent::EnemyHp(enemy_hp_from_attrs(
-                    target_uid,
-                    &attrs.attrs,
-                    now_ms,
-                    sink,
-                )));
+                let hp = enemy_hp_from_attrs(target, &attrs.attrs, now_ms, sink);
+                if let Some(monster_id) = hp.monster_id {
+                    entities.set_monster_id(target, monster_id);
+                }
+                out.push(ProtocolEvent::EnemyHp(hp));
             }
             EntityKind::Unknown => {}
         }
@@ -333,9 +344,14 @@ fn on_aoi_sync_delta(
             } else {
                 value
             };
+            // The attacker need never have appeared in this client's AOI (a
+            // summoner off-screen, a raid member across the room), so this is
+            // the table's other population point.
+            let attacker = entities.observe(attacker_uuid, now_ms);
             out.push(ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: uid_of(attacker_uuid),
-                attacker_kind: kind_of(attacker_uuid),
+                attacker,
+                attacker_uid: attacker.display_uid(),
+                attacker_kind: attacker.kind(),
                 skill_id: dmg.owner_id,
                 value,
                 crit: dmg.type_flag & 1 != 0,
@@ -343,6 +359,7 @@ fn on_aoi_sync_delta(
                 hp_lessen: dmg.hp_lessen_value,
                 is_miss: dmg.is_miss || dmg.r#type == EDamageType::Miss as i32,
                 is_heal,
+                target,
                 target_uid,
                 target_kind,
                 timestamp_ms: now_ms,
@@ -366,6 +383,7 @@ fn on_aoi_sync_delta(
         for be in &buff_effect.buff_effects {
             if is_buff_apply_event(be.r#type) {
                 out.push(ProtocolEvent::BuffApply {
+                    host: target,
                     host_uid: target_uid,
                     buff_uuid: be.buff_uuid,
                     base_id: buff_base_id_from_logic_effects(&be.logic_effect),
@@ -374,6 +392,7 @@ fn on_aoi_sync_delta(
                 });
             } else if is_buff_remove_event(be.r#type) {
                 out.push(ProtocolEvent::BuffRemove {
+                    host: target,
                     host_uid: target_uid,
                     buff_uuid: be.buff_uuid,
                     removes_layer: be.r#type == pb::EBuffEventType::RemoveLayer as i32,
@@ -433,7 +452,11 @@ fn buff_base_id_from_logic_effects(logic_effect: &[pb::BuffEffectLogicInfo]) -> 
 /// zero id is treated the same as an absent field — `scene_id_from_attrs`'s
 /// zero-is-absent guard, mirrored here rather than shared, since this path
 /// has no `AttrCollection` to route through.
-fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEvent>) {
+fn on_sync_container_data(
+    msg: &pb::SyncContainerData,
+    out: &mut Vec<ProtocolEvent>,
+    entities: &EntityTable,
+) {
     let Some(v_data) = &msg.v_data else {
         return;
     };
@@ -465,7 +488,11 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
     } else {
         None
     };
+    // `CharSerialize.char_id` is a bare uid with no type bits or flags, so the
+    // table's shadow map is what ties it back to the uuid the AOI channel is
+    // already using for this player (issue #335).
     out.push(ProtocolEvent::Player(PlayerInfo {
+        entity: entities.resolve_uid(v_data.char_id, EntityKind::Player),
         uid: v_data.char_id,
         name,
         class,
@@ -501,7 +528,11 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
 /// `TeamBasicData.level` is decoded onto the pb struct (see its doc
 /// comment) but deliberately never read here: `PlayerInfo` has no `level`
 /// field and nothing downstream consumes one (issue #146 spec decision 3).
-fn on_notify_join_team(msg: &pb::NotifyJoinTeam, out: &mut Vec<ProtocolEvent>) {
+fn on_notify_join_team(
+    msg: &pb::NotifyJoinTeam,
+    out: &mut Vec<ProtocolEvent>,
+    entities: &EntityTable,
+) {
     let Some(request) = &msg.v_request else {
         return;
     };
@@ -547,6 +578,10 @@ fn on_notify_join_team(msg: &pb::NotifyJoinTeam, out: &mut Vec<ProtocolEvent>) {
             continue;
         }
         out.push(ProtocolEvent::Player(PlayerInfo {
+            // Same bare-uid resolution `on_sync_container_data` does (issue
+            // #335): a roster member is a player, so a shadow-map hit of any
+            // other kind is refused by `resolve_uid`.
+            entity: entities.resolve_uid(uid, EntityKind::Player),
             uid,
             name,
             class,
@@ -572,7 +607,13 @@ fn on_enter_scene(
     msg: &pb::EnterScene,
     out: &mut Vec<ProtocolEvent>,
     sink: Option<&dyn InspectSink>,
+    entities: &mut EntityTable,
 ) {
+    // Zoning invalidates every entity the previous scene put in the table:
+    // none of them is in AOI range any more, and a stale shadow mapping would
+    // resolve the next scene's bare `char_id` onto a uuid that is gone.
+    // Mirrors the meter's own `enemies` clear on dungeon entry.
+    entities.clear();
     let Some(attrs) = msg.info.as_ref().and_then(|i| i.attrs.as_ref()) else {
         return;
     };
@@ -677,6 +718,11 @@ pub struct Decoder {
     /// to — both outlive a single `push_stream` call across the capture
     /// thread's lifetime.
     sink: Option<Arc<dyn InspectSink>>,
+    /// Every entity this server session has named (issue #335), and the
+    /// shadow map that resolves a bare `char_id` onto one of them. Lives on
+    /// the decoder rather than being rebuilt per packet because cross-packet
+    /// identity is exactly the state a single packet cannot have.
+    entities: EntityTable,
 }
 
 impl Decoder {
@@ -685,6 +731,7 @@ impl Decoder {
             tail: Vec::new(),
             skip: 0,
             sink: None,
+            entities: EntityTable::new(),
         }
     }
 
@@ -698,7 +745,13 @@ impl Decoder {
             tail: Vec::new(),
             skip: 0,
             sink: Some(sink),
+            entities: EntityTable::new(),
         }
+    }
+
+    /// The entity table this decoder has built so far (issue #335).
+    pub fn entities(&self) -> &EntityTable {
+        &self.entities
     }
 
     /// Bytes currently buffered waiting for a frame to complete. Never
@@ -728,6 +781,7 @@ impl Decoder {
         }
         self.tail.extend_from_slice(bytes);
         let sink = self.sink.as_deref();
+        let entities = &mut self.entities;
         let mut out = Vec::new();
         let (consumed, desync) = {
             let result = split_frames(&self.tail);
@@ -736,7 +790,7 @@ impl Decoder {
                 parse_frame(f, 0, &mut notifies, sink, now_ms);
             }
             for n in &notifies {
-                decode_notify(n, now_ms, &mut out, sink);
+                decode_notify(n, now_ms, &mut out, sink, entities);
             }
             (result.consumed, result.desync)
         };
@@ -776,6 +830,9 @@ impl Decoder {
     pub fn reset(&mut self) {
         self.tail.clear();
         self.skip = 0;
+        // The new server session re-issues uuids, so nothing the old one said
+        // about an entity describes anything after this point.
+        self.entities.clear();
     }
 }
 
@@ -788,6 +845,22 @@ impl Default for Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four-argument `decode_notify` these tests were written against.
+    /// Shadows the crate function (an explicit item beats a glob import) and
+    /// gives each call its own throwaway entity table — every one of these
+    /// tests feeds a single `Notify`, so there is no cross-packet table state
+    /// for them to share. The tests that *are* about the table live in
+    /// `crate::entity`, or drive a real `Decoder` (which owns a persistent
+    /// one).
+    fn decode_notify(
+        n: &Notify,
+        now_ms: u64,
+        out: &mut Vec<ProtocolEvent>,
+        sink: Option<&dyn InspectSink>,
+    ) {
+        super::decode_notify(n, now_ms, out, sink, &mut EntityTable::new());
+    }
     use crate::pb::{AttrCollection, SkillEffect, SyncNearDeltaInfo};
 
     const ATTACKER_UUID: i64 = (10i64 << 16) | 640; // player uid 10
@@ -1266,6 +1339,7 @@ mod tests {
         match out {
             [
                 ProtocolEvent::BuffApply {
+                    host: _,
                     host_uid,
                     buff_uuid,
                     base_id,
@@ -1374,6 +1448,7 @@ mod tests {
             match out.as_slice() {
                 [
                     ProtocolEvent::BuffRemove {
+                        host: _,
                         host_uid,
                         buff_uuid,
                         removes_layer: layer,
@@ -1750,6 +1825,7 @@ mod tests {
         assert_eq!(
             out,
             vec![ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(8, EntityKind::Player),
                 uid: 8,
                 name: Some("Ari".to_string()),
                 class: None,
@@ -2434,7 +2510,11 @@ mod tests {
         decode_notify(&n, 0, &mut out, None);
         assert_eq!(out.len(), 1);
         match &out[0] {
-            ProtocolEvent::EnemyGone { uid, reason } => {
+            ProtocolEvent::EnemyGone {
+                entity: _,
+                uid,
+                reason,
+            } => {
                 assert_eq!(*uid, uid_of(TARGET_UUID));
                 assert_eq!(
                     *reason, None,
@@ -2550,7 +2630,11 @@ mod tests {
             decode_notify(&n, 0, &mut out, None);
             assert_eq!(out.len(), 1, "{wire:?}");
             match &out[0] {
-                ProtocolEvent::EnemyGone { uid, reason } => {
+                ProtocolEvent::EnemyGone {
+                entity: _,
+                uid,
+                reason,
+            } => {
                     assert_eq!(*uid, uid_of(TARGET_UUID), "{wire:?}");
                     assert_eq!(*reason, Some(expected), "{wire:?}");
                 }

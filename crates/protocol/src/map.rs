@@ -6,6 +6,7 @@
 //! (`bpsr-protocol`'s `sanitize-dump` binary) translate between the two, so
 //! a future field or enum variant only needs fixing once.
 
+use crate::entity::EntityId;
 use crate::event::{DisappearReason, EDungeonState, EntityKind, ProtocolEvent};
 use crate::pb::Class;
 use bpsr_meter as meter;
@@ -34,6 +35,12 @@ pub fn map_disappear_reason(reason: DisappearReason) -> meter::DisappearReason {
         DisappearReason::TransferPassLineLeave => meter::DisappearReason::TransferPassLineLeave,
         DisappearReason::Unknown(v) => meter::DisappearReason::Unknown(v),
     }
+}
+
+/// Maps a protocol entity id onto the meter's mirror type (issue #335).
+/// Both are the whole wire uuid; only the crate they live in differs.
+pub fn map_entity_id(id: EntityId) -> meter::EntityId {
+    meter::EntityId(id.0)
 }
 
 /// Maps a protocol entity kind onto the meter's mirror type.
@@ -89,11 +96,13 @@ pub fn map_event(
 ) -> meter::ProtocolEvent {
     match ev {
         ProtocolEvent::Cast(c) => meter::ProtocolEvent::Cast(meter::CastEvent {
+            caster: map_entity_id(c.caster),
             caster_uid: c.caster_uid,
             skill_id: c.skill_id,
             timestamp_ms: c.timestamp_ms,
         }),
         ProtocolEvent::Damage(d) => meter::ProtocolEvent::Damage(meter::DamageEvent {
+            attacker: map_entity_id(d.attacker),
             attacker_uid: d.attacker_uid,
             attacker_kind: map_kind(d.attacker_kind),
             skill_id: d.skill_id,
@@ -103,12 +112,14 @@ pub fn map_event(
             hp_lessen: d.hp_lessen,
             is_miss: d.is_miss,
             is_heal: d.is_heal,
+            target: map_entity_id(d.target),
             target_uid: d.target_uid,
             target_kind: map_kind(d.target_kind),
             timestamp_ms: d.timestamp_ms,
             is_dead: d.is_dead,
         }),
         ProtocolEvent::Player(p) => meter::ProtocolEvent::Player(meter::PlayerInfo {
+            entity: map_entity_id(p.entity),
             uid: p.uid,
             name: p.name,
             class: p.class.map(map_class),
@@ -118,6 +129,7 @@ pub fn map_event(
             imagine_tiers,
         }),
         ProtocolEvent::EnemyHp(e) => meter::ProtocolEvent::EnemyHp(meter::EnemyHp {
+            entity: map_entity_id(e.entity),
             uid: e.uid,
             curr_hp: e.curr_hp,
             max_hp: e.max_hp,
@@ -147,17 +159,24 @@ pub fn map_event(
         ProtocolEvent::DungeonVar { name, value } => {
             meter::ProtocolEvent::DungeonVar { name, value }
         }
-        ProtocolEvent::EnemyGone { uid, reason } => meter::ProtocolEvent::EnemyGone {
+        ProtocolEvent::EnemyGone {
+            entity,
+            uid,
+            reason,
+        } => meter::ProtocolEvent::EnemyGone {
+            entity: map_entity_id(entity),
             uid,
             reason: reason.map(map_disappear_reason),
         },
         ProtocolEvent::BuffApply {
+            host,
             host_uid,
             buff_uuid,
             base_id,
             adds_layer,
             timestamp_ms,
         } => meter::ProtocolEvent::BuffApply {
+            host: map_entity_id(host),
             host_uid,
             buff_uuid,
             base_id,
@@ -165,11 +184,13 @@ pub fn map_event(
             timestamp_ms,
         },
         ProtocolEvent::BuffRemove {
+            host,
             host_uid,
             buff_uuid,
             removes_layer,
             timestamp_ms,
         } => meter::ProtocolEvent::BuffRemove {
+            host: map_entity_id(host),
             host_uid,
             buff_uuid,
             removes_layer,
@@ -218,12 +239,14 @@ mod tests {
     #[test]
     fn map_event_enemy_gone_carries_reason_through() {
         let ev = ProtocolEvent::EnemyGone {
+            entity: EntityId::from_display_uid(7, EntityKind::Monster),
             uid: 7,
             reason: Some(DisappearReason::TransferLeave),
         };
         assert_eq!(
             map_event(ev, 0, None, None),
             meter::ProtocolEvent::EnemyGone {
+                entity: meter::EntityId::from_display_uid(7, meter::EntityKind::Monster),
                 uid: 7,
                 reason: Some(meter::DisappearReason::TransferLeave),
             }
@@ -233,12 +256,14 @@ mod tests {
     #[test]
     fn map_event_enemy_gone_with_no_reason() {
         let ev = ProtocolEvent::EnemyGone {
+            entity: EntityId::from_display_uid(9, EntityKind::Monster),
             uid: 9,
             reason: None,
         };
         assert_eq!(
             map_event(ev, 0, None, None),
             meter::ProtocolEvent::EnemyGone {
+                entity: meter::EntityId::from_display_uid(9, meter::EntityKind::Monster),
                 uid: 9,
                 reason: None,
             }
@@ -248,12 +273,14 @@ mod tests {
     #[test]
     fn map_event_enemy_gone_with_unrecognized_wire_reason() {
         let ev = ProtocolEvent::EnemyGone {
+            entity: EntityId::from_display_uid(3, EntityKind::Monster),
             uid: 3,
             reason: Some(DisappearReason::Unknown(99)),
         };
         assert_eq!(
             map_event(ev, 0, None, None),
             meter::ProtocolEvent::EnemyGone {
+                entity: meter::EntityId::from_display_uid(3, meter::EntityKind::Monster),
                 uid: 3,
                 reason: Some(meter::DisappearReason::Unknown(99)),
             }

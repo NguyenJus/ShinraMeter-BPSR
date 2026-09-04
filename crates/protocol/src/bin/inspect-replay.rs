@@ -207,6 +207,9 @@ fn build_histogram(
     until: Option<u64>,
 ) -> Histogram {
     let sink = HistogramSink::new();
+    // Cross-packet entity identity (issue #335), kept for the whole replay
+    // the same way a live `Decoder` keeps it for the whole session.
+    let mut entities = bpsr_protocol::EntityTable::new();
     for record in records {
         if since.is_some_and(|s| record.ts_ms < s) || until.is_some_and(|u| record.ts_ms > u) {
             continue;
@@ -240,7 +243,13 @@ fn build_histogram(
             payload: record.payload,
         };
         let mut discarded_events = Vec::new();
-        decode_notify(&notify, record.ts_ms, &mut discarded_events, Some(&sink));
+        decode_notify(
+            &notify,
+            record.ts_ms,
+            &mut discarded_events,
+            Some(&sink),
+            &mut entities,
+        );
     }
     sink.into_histogram()
 }

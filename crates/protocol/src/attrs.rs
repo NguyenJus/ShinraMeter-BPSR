@@ -8,6 +8,7 @@ use std::io::Cursor;
 
 use prost::Message;
 
+use crate::entity::EntityId;
 use crate::event::{EnemyHp, PlayerInfo};
 use crate::inspect::InspectSink;
 use crate::pb;
@@ -504,10 +505,11 @@ pub fn cast_skill_id_from_attrs(attrs: &[pb::Attr]) -> Option<i32> {
 }
 
 pub fn player_info_from_attrs(
-    uid: i64,
+    entity: EntityId,
     attrs: &[pb::Attr],
     sink: Option<&dyn InspectSink>,
 ) -> PlayerInfo {
+    let uid = entity.display_uid();
     let mut name = None;
     let mut class = None;
     let mut ability_score = None;
@@ -589,6 +591,7 @@ pub fn player_info_from_attrs(
         }
     }
     PlayerInfo {
+        entity,
         uid,
         name,
         class,
@@ -609,11 +612,12 @@ pub fn player_info_from_attrs(
 /// whether we decode it, exactly as `player_info_from_attrs` does: an attr
 /// id is no less worth discovering for sitting on an enemy entity.
 pub fn enemy_hp_from_attrs(
-    uid: i64,
+    entity: EntityId,
     attrs: &[pb::Attr],
     now_ms: u64,
     sink: Option<&dyn InspectSink>,
 ) -> EnemyHp {
+    let uid = entity.display_uid();
     let mut curr_hp = None;
     let mut max_hp = None;
     let mut monster_id = None;
@@ -664,6 +668,7 @@ pub fn enemy_hp_from_attrs(
         }
     }
     EnemyHp {
+        entity,
         uid,
         curr_hp,
         max_hp,
@@ -713,6 +718,18 @@ pub fn scene_id_from_attrs(attrs: &[pb::Attr], sink: Option<&dyn InspectSink>) -
 
 #[cfg(test)]
 mod tests {
+    /// A player's whole-uuid identity for display uid `u` — these tests
+    /// only care about the attr walk, so the canonical reconstruction is
+    /// exactly as good as a captured uuid here.
+    fn pid(u: i64) -> EntityId {
+        EntityId::from_display_uid(u, crate::event::EntityKind::Player)
+    }
+
+    /// The monster counterpart of `pid`.
+    fn mid(u: i64) -> EntityId {
+        EntityId::from_display_uid(u, crate::event::EntityKind::Monster)
+    }
+
     use super::*;
 
     #[test]
@@ -774,7 +791,7 @@ mod tests {
             id: attr_id::HP,
             raw_data: Vec::new(),
         }];
-        let hp = enemy_hp_from_attrs(1, &attrs, 0, None);
+        let hp = enemy_hp_from_attrs(mid(1), &attrs, 0, None);
         assert_eq!(hp.curr_hp, None);
     }
 
@@ -802,7 +819,7 @@ mod tests {
             id: attr_id::HP,
             raw_data: varint(u64::MAX),
         }];
-        let hp = enemy_hp_from_attrs(1, &attrs, 0, None);
+        let hp = enemy_hp_from_attrs(mid(1), &attrs, 0, None);
         assert_eq!(hp.curr_hp, Some(u64::MAX));
     }
 
@@ -812,7 +829,7 @@ mod tests {
             id: attr_id::PROFESSION_ID,
             raw_data: varint(0x1_0000_0001),
         }];
-        assert_eq!(player_info_from_attrs(1, &attrs, None).class, None);
+        assert_eq!(player_info_from_attrs(pid(1), &attrs, None).class, None);
     }
 
     // -- Imagine profession ids (issue #37) --------------------------------
@@ -823,7 +840,7 @@ mod tests {
             id: attr_id::PROFESSION_ID,
             raw_data: varint(8), // Dorothy
         }];
-        assert_eq!(player_info_from_attrs(1, &attrs, None).class, None);
+        assert_eq!(player_info_from_attrs(pid(1), &attrs, None).class, None);
     }
 
     #[test]
@@ -839,7 +856,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            player_info_from_attrs(1, &attrs, None).class,
+            player_info_from_attrs(pid(1), &attrs, None).class,
             Some(pb::Class::Stormblade)
         );
     }
@@ -870,7 +887,7 @@ mod tests {
             },
         ];
 
-        let hp = enemy_hp_from_attrs(42, &attrs, 7, None);
+        let hp = enemy_hp_from_attrs(mid(42), &attrs, 7, None);
 
         assert_eq!(hp.uid, 42);
         assert_eq!(hp.monster_id, Some(103));
@@ -891,7 +908,7 @@ mod tests {
             raw_data: varint(9_000_000_000),
         }];
         assert_eq!(
-            enemy_hp_from_attrs(1, &attrs, 0, None).max_hp,
+            enemy_hp_from_attrs(mid(1), &attrs, 0, None).max_hp,
             Some(9_000_000_000)
         );
     }
@@ -902,7 +919,7 @@ mod tests {
             id: attr_id::MONSTER_ID,
             raw_data: varint(u64::from(u32::MAX) + 1),
         }];
-        assert_eq!(enemy_hp_from_attrs(1, &attrs, 0, None).monster_id, None);
+        assert_eq!(enemy_hp_from_attrs(mid(1), &attrs, 0, None).monster_id, None);
     }
 
     #[test]
@@ -926,7 +943,7 @@ mod tests {
             raw_data: varint(123_456),
         }];
         assert_eq!(
-            player_info_from_attrs(1, &attrs, None).ability_score,
+            player_info_from_attrs(pid(1), &attrs, None).ability_score,
             Some(123_456)
         );
     }
@@ -937,7 +954,7 @@ mod tests {
             id: attr_id::FIGHT_POINT,
             raw_data: varint(0),
         }];
-        assert_eq!(player_info_from_attrs(1, &attrs, None).ability_score, None);
+        assert_eq!(player_info_from_attrs(pid(1), &attrs, None).ability_score, None);
     }
 
     #[test]
@@ -946,7 +963,7 @@ mod tests {
             id: attr_id::PROFESSION_ID,
             raw_data: varint(1),
         }];
-        assert_eq!(player_info_from_attrs(1, &attrs, None).ability_score, None);
+        assert_eq!(player_info_from_attrs(pid(1), &attrs, None).ability_score, None);
     }
 
     #[test]
@@ -955,7 +972,7 @@ mod tests {
             id: attr_id::FIGHT_POINT,
             raw_data: varint(0x1_0000_0001),
         }];
-        assert_eq!(player_info_from_attrs(1, &attrs, None).ability_score, None);
+        assert_eq!(player_info_from_attrs(pid(1), &attrs, None).ability_score, None);
     }
 
     #[test]
@@ -966,7 +983,7 @@ mod tests {
             id: 0x9999,
             raw_data: raw,
         }];
-        let info = player_info_from_attrs(1, &attrs, None);
+        let info = player_info_from_attrs(pid(1), &attrs, None);
         assert_eq!(info.name, None);
         assert_eq!(info.class, None);
     }
@@ -1086,7 +1103,7 @@ mod tests {
             raw_data: encode_skill_list(&[(3905, 0), (102640, 4)]),
         }];
         assert_eq!(
-            player_info_from_attrs(1, &attrs, None).skill_ids,
+            player_info_from_attrs(pid(1), &attrs, None).skill_ids,
             vec![(3905, 0), (102640, 4)]
         );
     }
@@ -1098,7 +1115,7 @@ mod tests {
             raw_data: varint(1),
         }];
         assert_eq!(
-            player_info_from_attrs(1, &attrs, None).skill_ids,
+            player_info_from_attrs(pid(1), &attrs, None).skill_ids,
             Vec::<(i32, i32)>::new()
         );
     }
@@ -1150,7 +1167,7 @@ mod tests {
         }];
         let sink = RecordingSink::new();
 
-        let info = player_info_from_attrs(7, &attrs, Some(&sink));
+        let info = player_info_from_attrs(pid(7), &attrs, Some(&sink));
 
         assert_eq!(info.name, None);
         assert_eq!(*sink.attrs.lock().unwrap(), vec![(7, 0x9999, raw, false)]);
@@ -1164,7 +1181,7 @@ mod tests {
         }];
         let sink = RecordingSink::new();
 
-        let info = player_info_from_attrs(1, &attrs, Some(&sink));
+        let info = player_info_from_attrs(pid(1), &attrs, Some(&sink));
 
         assert_eq!(info.name.as_deref(), Some("Hi"));
         assert_eq!(
@@ -1187,7 +1204,7 @@ mod tests {
         ];
         let sink = RecordingSink::new();
 
-        let _ = player_info_from_attrs(1, &attrs, Some(&sink));
+        let _ = player_info_from_attrs(pid(1), &attrs, Some(&sink));
 
         assert!(sink.attrs.lock().unwrap().is_empty());
     }
@@ -1206,7 +1223,7 @@ mod tests {
         }];
         let sink = RecordingSink::new();
 
-        let hp = enemy_hp_from_attrs(7, &attrs, 0, Some(&sink));
+        let hp = enemy_hp_from_attrs(mid(7), &attrs, 0, Some(&sink));
 
         assert_eq!(hp.curr_hp, None);
         assert_eq!(*sink.attrs.lock().unwrap(), vec![(7, 0x9999, raw, false)]);
@@ -1220,7 +1237,7 @@ mod tests {
         }];
         let sink = RecordingSink::new();
 
-        let hp = enemy_hp_from_attrs(1, &attrs, 0, Some(&sink));
+        let hp = enemy_hp_from_attrs(mid(1), &attrs, 0, Some(&sink));
 
         assert_eq!(hp.curr_hp, Some(1234));
         assert_eq!(
@@ -1243,7 +1260,7 @@ mod tests {
         ];
         let sink = RecordingSink::new();
 
-        let _ = enemy_hp_from_attrs(1, &attrs, 0, Some(&sink));
+        let _ = enemy_hp_from_attrs(mid(1), &attrs, 0, Some(&sink));
 
         assert!(sink.attrs.lock().unwrap().is_empty());
     }
@@ -1339,7 +1356,7 @@ mod tests {
                 raw_data: encode_position(Some(4.0), Some(5.0), Some(6.0)),
             },
         ];
-        let info = player_info_from_attrs(1, &attrs, None);
+        let info = player_info_from_attrs(pid(1), &attrs, None);
         assert_eq!(info.position, Some([1.0, 2.0, 3.0]));
         assert_eq!(info.target_position, Some([4.0, 5.0, 6.0]));
     }
@@ -1350,7 +1367,7 @@ mod tests {
             id: attr_id::POSITION,
             raw_data: encode_position(Some(7.0), Some(8.0), Some(9.0)),
         }];
-        let hp = enemy_hp_from_attrs(1, &attrs, 0, None);
+        let hp = enemy_hp_from_attrs(mid(1), &attrs, 0, None);
         assert_eq!(hp.position, Some([7.0, 8.0, 9.0]));
         assert_eq!(hp.target_position, None);
     }
@@ -1362,7 +1379,7 @@ mod tests {
             raw_data: encode_position(Some(1.0), Some(1.0), Some(1.0)),
         }];
         let sink = RecordingSink::new();
-        let _ = player_info_from_attrs(1, &attrs, Some(&sink));
+        let _ = player_info_from_attrs(pid(1), &attrs, Some(&sink));
         assert!(sink.attrs.lock().unwrap()[0].3, "POSITION must be known");
     }
 

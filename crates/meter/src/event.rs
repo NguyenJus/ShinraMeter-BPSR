@@ -25,6 +25,79 @@ pub fn uid_of(uuid: i64) -> i64 {
     uuid >> 16
 }
 
+/// Bit offset of the entity-type field inside a uuid, and the two type
+/// values this meter models. Mirrors `bpsr_protocol::entity`'s copy — see
+/// `bpsr_protocol::event::kind_of` for the layout and its sourcing.
+const ENT_TYPE_SHIFT: u32 = 6;
+const ENT_CHAR: i64 = 10;
+const ENT_MONSTER: i64 = 1;
+
+/// One entity's stable identity: the whole wire `uuid`, not the truncated
+/// `uuid >> 16` this meter used to key on (issue #335). Mirrors
+/// `bpsr_protocol::entity::EntityId` exactly.
+///
+/// The truncation is lossy in two ways that corrupt damage attribution: a
+/// server session recycles a `uuid >> 16` onto an unrelated entity, and a
+/// shadow/mirror entity (a summon, a client-side copy) differs from its
+/// original only in the flag bits the shift discards. Either way two
+/// entities collapse onto one key and their stats blend. Every per-entity
+/// map in this crate is therefore keyed on this type, while every *display*
+/// surface — rows, the name cache, history — keeps showing
+/// [`EntityId::display_uid`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EntityId(pub u64);
+
+impl EntityId {
+    /// The identity of an entity nothing has named. `uuid == 0` is not a
+    /// valid entity on the wire, so this can never collide with a real one.
+    pub const UNKNOWN: EntityId = EntityId(0);
+
+    pub fn from_uuid(uuid: i64) -> Self {
+        EntityId(uuid as u64)
+    }
+
+    pub fn uuid(self) -> i64 {
+        self.0 as i64
+    }
+
+    /// The short number every display surface shows. Not unique — that is
+    /// the whole reason this type exists — so never key state on it.
+    pub fn display_uid(self) -> i64 {
+        uid_of(self.uuid())
+    }
+
+    /// The canonical identity for a source that knows only a display uid and
+    /// a kind, reconstructing the uuid such a uid would have with both flag
+    /// bits clear. Mirrors `bpsr_protocol::entity::EntityId::from_display_uid`,
+    /// so a uid-only source and the AOI channel agree on the same id for any
+    /// entity that is neither a summon nor client-side.
+    pub fn from_display_uid(uid: i64, kind: EntityKind) -> Self {
+        let type_bits = match kind {
+            EntityKind::Player => ENT_CHAR,
+            EntityKind::Monster => ENT_MONSTER,
+            EntityKind::Unknown => 0,
+        };
+        EntityId::from_uuid((uid << 16) | (type_bits << ENT_TYPE_SHIFT))
+    }
+
+    /// This identity if it is a real one, else the canonical reconstruction
+    /// for `uid`/`kind`.
+    ///
+    /// Every event the decoder produces carries a real `EntityId`, so in
+    /// production this always returns `self`. It exists for events built by
+    /// hand from a display uid alone — this crate's own unit tests, and any
+    /// future source with no uuid to offer: the reconstruction is then the
+    /// most specific stable key that source can honestly supply, and it is
+    /// the same one `bpsr_protocol` would synthesise for it.
+    pub fn or_display(self, uid: i64, kind: EntityKind) -> EntityId {
+        if self == EntityId::UNKNOWN {
+            EntityId::from_display_uid(uid, kind)
+        } else {
+            self
+        }
+    }
+}
+
 /// `entity_kind = uuid & 0xFFFF`; `640` = player, `64` = monster.
 pub fn kind_of(uuid: i64) -> EntityKind {
     match uuid & 0xFFFF {
@@ -133,6 +206,12 @@ pub enum Role {
 /// `Instant::now()` inside this pure crate.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DamageEvent {
+    /// Who dealt this hit (issue #335). Mirrors
+    /// `bpsr_protocol::DamageEvent::attacker`; this — not `attacker_uid` —
+    /// is what the meter keys the attacker's row on.
+    pub attacker: EntityId,
+    /// `attacker.display_uid()`: the number the row prints and the name
+    /// cache is keyed on. Not unique; never key stats on it.
     pub attacker_uid: i64,
     pub attacker_kind: EntityKind,
     pub skill_id: i32,
@@ -142,6 +221,10 @@ pub struct DamageEvent {
     pub hp_lessen: i64,
     pub is_miss: bool,
     pub is_heal: bool,
+    /// Who was hit (issue #335) — the counterpart of `attacker` above, and
+    /// what the meter keys enemy state on.
+    pub target: EntityId,
+    /// `target.display_uid()`. Display only; see `attacker_uid`.
     pub target_uid: i64,
     pub target_kind: EntityKind,
     pub timestamp_ms: u64,
@@ -156,6 +239,9 @@ pub struct DamageEvent {
 /// activation, with no amount attached. See that type for the wire source.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CastEvent {
+    /// Who cast (issue #335).
+    pub caster: EntityId,
+    /// `caster.display_uid()`. Display only.
     pub caster_uid: i64,
     pub skill_id: i32,
     pub timestamp_ms: u64,
@@ -163,6 +249,9 @@ pub struct CastEvent {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PlayerInfo {
+    /// This player's stable identity (issue #335).
+    pub entity: EntityId,
+    /// `entity.display_uid()`. Display only.
     pub uid: i64,
     pub name: Option<String>,
     pub class: Option<Class>,
@@ -196,6 +285,9 @@ pub struct PlayerInfo {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EnemyHp {
+    /// This enemy's stable identity (issue #335).
+    pub entity: EntityId,
+    /// `entity.display_uid()`. Display only.
     pub uid: i64,
     pub curr_hp: Option<u64>,
     pub max_hp: Option<u64>,
@@ -296,12 +388,18 @@ pub enum ProtocolEvent {
     /// [`DisappearReason::Dead`] says the enemy died, and a `None` falls
     /// back to the HP/engagement heuristic. See `Meter::apply_enemy_gone`.
     EnemyGone {
+        /// The departing enemy's stable identity (issue #335).
+        entity: EntityId,
+        /// `entity.display_uid()`. Display only.
         uid: i64,
         reason: Option<DisappearReason>,
     },
     /// Mirrors `bpsr_protocol::ProtocolEvent::BuffApply` (issue #267). See
     /// `Meter::apply_buff_apply` for what the meter does with it.
     BuffApply {
+        /// The buffed entity's stable identity (issue #335).
+        host: EntityId,
+        /// `host.display_uid()`. Display only.
         host_uid: i64,
         buff_uuid: i32,
         base_id: Option<i32>,
@@ -311,6 +409,9 @@ pub enum ProtocolEvent {
     /// Mirrors `bpsr_protocol::ProtocolEvent::BuffRemove` (issue #267). See
     /// `Meter::apply_buff_remove`.
     BuffRemove {
+        /// The buffed entity's stable identity (issue #335).
+        host: EntityId,
+        /// `host.display_uid()`. Display only.
         host_uid: i64,
         buff_uuid: i32,
         removes_layer: bool,
