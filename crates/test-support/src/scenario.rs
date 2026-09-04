@@ -58,6 +58,14 @@ pub struct Hit {
     pub heal: bool,
     /// `is_dead`.
     pub kills_target: bool,
+    /// Issue #338: sets `r#type = EDamageType::Absorbed`. Mutually
+    /// exclusive with `immune`/`miss`/`heal` — `wire::damage_info` reads
+    /// them in `miss > heal > absorbed > immune > normal` priority order,
+    /// so a `Hit` should only ever set one.
+    pub absorbed: bool,
+    /// Issue #338: sets `r#type = EDamageType::Immune`. See `absorbed`'s
+    /// doc comment for the priority order.
+    pub immune: bool,
 }
 
 impl Hit {
@@ -72,6 +80,8 @@ impl Hit {
             miss: false,
             heal: false,
             kills_target: false,
+            absorbed: false,
+            immune: false,
         }
     }
 
@@ -87,6 +97,20 @@ impl Hit {
 
     pub fn kill(mut self) -> Self {
         self.kills_target = true;
+        self
+    }
+
+    /// Marks this hit as fully absorbed by the target's shield (issue
+    /// #338): `r#type = EDamageType::Absorbed`.
+    pub fn absorbed(mut self) -> Self {
+        self.absorbed = true;
+        self
+    }
+
+    /// Marks this hit as blocked by the target's immunity (issue #338):
+    /// `r#type = EDamageType::Immune`.
+    pub fn immune(mut self) -> Self {
+        self.immune = true;
         self
     }
 
