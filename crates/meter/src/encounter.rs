@@ -935,6 +935,14 @@ impl Meter {
                 self.apply_buff_remove(*host_uid, *buff_uuid, *removes_layer, *timestamp_ms);
                 None
             }
+            ProtocolEvent::TeamMemberLeft { uid } => {
+                self.apply_team_member_left(*uid);
+                None
+            }
+            ProtocolEvent::TeamRoster { members } => {
+                self.apply_team_roster(members);
+                None
+            }
             ProtocolEvent::Scene { level_map_id } => {
                 // Sparse, transition-only diagnostic (issue #69): a scene
                 // sync packet can repeat while the player stays in the same
@@ -2772,6 +2780,49 @@ impl Meter {
             log::info!("{msg}");
         }
         self.preload_count = 0;
+    }
+
+    /// `ProtocolEvent::TeamMemberLeft` (issue #343): `uid` left the party
+    /// or was kicked, so the row is dropped outright — the roster is
+    /// `players` (doc on `party_is_wiped`), and this is the one signal
+    /// that says a uid is no longer part of it. This also drops whatever
+    /// fight stats `uid` had accumulated this encounter; the alternative
+    /// (keeping the row but hiding it from the roster) would need a
+    /// separate "in party" flag nothing else in this crate has, and the
+    /// issue this fixes is specifically about a departed member lingering
+    /// in the party view and the wipe-fraction count — not about
+    /// preserving a former member's numbers after they leave.
+    ///
+    /// A uid this meter never had a row for (never preloaded, never dealt
+    /// damage) is a silent no-op: `HashMap::remove` on a missing key.
+    fn apply_team_member_left(&mut self, uid: i64) {
+        self.players.remove(&uid);
+    }
+
+    /// `ProtocolEvent::TeamRoster` (issue #343): the authoritative
+    /// party/raid roster as of the `NotifyJoinTeam` push `members` was
+    /// decoded from. Drops every row in `players` whose uid is not in
+    /// `members` — the counterpart to `apply_team_member_left` for a
+    /// departure this meter never saw an explicit `NotifyLeaveTeam` for
+    /// (e.g. it happened while attached to a different scene).
+    ///
+    /// Deliberately does **not** touch rows that *are* still in `members`:
+    /// this must not reset or recreate them, only decide whether they stay
+    /// — a naive "clear then reinsert every member fresh" implementation
+    /// would silently zero out accumulated stats for everyone still in the
+    /// party, which is the opposite of this fix. New members are handled
+    /// by the `Player` events `on_notify_join_team` emits alongside this
+    /// one, via `apply_player`'s ordinary insert/preload path — not here.
+    ///
+    /// A no-op on an empty `members`: `ProtocolEvent::TeamRoster`'s doc
+    /// comment on why the decode layer never emits one, kept as a second,
+    /// defensive check here too, so a malformed/adversarial roster can
+    /// never wipe every party row in one shot.
+    fn apply_team_roster(&mut self, members: &[i64]) {
+        if members.is_empty() {
+            return;
+        }
+        self.players.retain(|uid, _| members.contains(uid));
     }
 
     fn apply_enemy_hp(&mut self, e: &EnemyHp) -> Option<ResetReason> {
@@ -7351,6 +7402,25 @@ mod tests {
             assert_eq!(m.fight_state(6_500), FightState::Active);
         }
 
+        /// Issue #343: without `TeamMemberLeft`, "Cypress" above would hold
+        /// the wipe open forever — `party_is_wiped` needs every row down,
+        /// and a stale straggler nobody ever removes from `players` is
+        /// permanently `alive`. Kicking/leaving must free the fight to
+        /// wipe on the two players actually still fighting.
+        #[test]
+        fn a_member_who_left_no_longer_holds_the_wipe_open() {
+            let mut m = pull();
+            m.apply(&player_info(3, "Cypress"));
+            m.apply(&ProtocolEvent::TeamMemberLeft { uid: 3 });
+            m.apply(&killing_blow(1, 5_000));
+            m.apply(&killing_blow(2, 6_000));
+            assert_eq!(
+                m.fight_state(6_500),
+                FightState::Ended,
+                "the departed straggler must not hold the wipe open"
+            );
+        }
+
         /// Issue #254: nobody revives after a wipe, so the last death of
         /// the pull stays open forever. It is counted up to the fight's
         /// *end*, not to the caller's clock, so a held attempt's death time
@@ -7938,6 +8008,104 @@ mod tests {
             assert_eq!(reason, Some(ResetReason::BossHpRollback));
             assert_eq!(m.fight_end_ms, None, "a reset, not a fight end");
             assert_eq!(m.snapshot(6_500).total_damage, 0);
+        }
+    }
+
+    /// Issue #343: `NotifyJoinTeam` is not purely additive — BPSR-ZDPS
+    /// resends the whole roster on every team change, so this crate treats
+    /// it as a full-roster sync (`ProtocolEvent::TeamRoster`) as well as a
+    /// source of `Player` events. These tests exercise `Meter::apply`
+    /// directly with `TeamMemberLeft`/`TeamRoster`, independent of the
+    /// `bpsr-protocol` decode that produces them (covered separately in
+    /// `bpsr-protocol`'s own decode tests).
+    mod team_roster {
+        use super::*;
+
+        /// A real dungeon id (see `player_event_in_dungeon_preloads_a_zero_stat_row`
+        /// above) — `player_info` only preloads a row inside one.
+        const RAID_SCENE: u32 = 40001;
+
+        fn in_dungeon(m: &mut Meter) {
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: RAID_SCENE,
+            });
+        }
+
+        #[test]
+        fn team_member_left_drops_the_row() {
+            let mut m = Meter::new();
+            in_dungeon(&mut m);
+            m.apply(&player_info(1, "Alpha"));
+            m.apply(&player_info(2, "Bravo"));
+            m.apply(&ProtocolEvent::TeamMemberLeft { uid: 2 });
+            let snap = m.snapshot(1_000);
+            assert_eq!(snap.rows.iter().map(|r| r.uid).collect::<Vec<_>>(), vec![1]);
+        }
+
+        /// A uid this meter never opened a row for is a silent no-op — no
+        /// panic, no stray row created.
+        #[test]
+        fn team_member_left_for_an_unknown_uid_is_a_no_op() {
+            let mut m = Meter::new();
+            in_dungeon(&mut m);
+            m.apply(&player_info(1, "Alpha"));
+            m.apply(&ProtocolEvent::TeamMemberLeft { uid: 999 });
+            let snap = m.snapshot(1_000);
+            assert_eq!(snap.rows.iter().map(|r| r.uid).collect::<Vec<_>>(), vec![1]);
+        }
+
+        #[test]
+        fn team_roster_prunes_rows_not_in_the_new_roster() {
+            let mut m = Meter::new();
+            in_dungeon(&mut m);
+            m.apply(&player_info(1, "Alpha"));
+            m.apply(&player_info(2, "Bravo"));
+            m.apply(&player_info(3, "Cypress"));
+            m.apply(&ProtocolEvent::TeamRoster {
+                members: vec![1, 2],
+            });
+            let mut uids: Vec<i64> = m.snapshot(1_000).rows.iter().map(|r| r.uid).collect();
+            uids.sort();
+            assert_eq!(uids, vec![1, 2]);
+        }
+
+        /// The full-sync must not reset stats for a member who is still in
+        /// the roster — only decide who stays (issue #343's design note:
+        /// "keep their fight stats; only the roster/party flag changes").
+        #[test]
+        fn team_roster_keeps_stats_for_a_continuing_member() {
+            let mut m = Meter::new();
+            in_dungeon(&mut m);
+            m.apply(&player_info(1, "Alpha"));
+            m.apply(&player_info(2, "Bravo"));
+            m.apply(&ProtocolEvent::Damage(DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: 100,
+                target_kind: EntityKind::Monster,
+                value: 5_000,
+                timestamp_ms: 1_000,
+                ..Default::default()
+            }));
+            m.apply(&ProtocolEvent::TeamRoster {
+                members: vec![1, 2],
+            });
+            let snap = m.snapshot(2_000);
+            let alpha = snap.rows.iter().find(|r| r.uid == 1).unwrap();
+            assert_eq!(alpha.damage, 5_000);
+        }
+
+        /// A degenerate empty roster must never wipe every party row in one
+        /// shot — `on_notify_join_team` never emits one, but the meter
+        /// defends against it independently (issue #343).
+        #[test]
+        fn an_empty_team_roster_is_a_no_op() {
+            let mut m = Meter::new();
+            in_dungeon(&mut m);
+            m.apply(&player_info(1, "Alpha"));
+            m.apply(&ProtocolEvent::TeamRoster { members: vec![] });
+            let snap = m.snapshot(1_000);
+            assert_eq!(snap.rows.iter().map(|r| r.uid).collect::<Vec<_>>(), vec![1]);
         }
     }
 

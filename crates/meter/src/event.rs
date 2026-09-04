@@ -316,6 +316,18 @@ pub enum ProtocolEvent {
         removes_layer: bool,
         timestamp_ms: u64,
     },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::TeamMemberLeft` (issue #343):
+    /// one party member left or was kicked. See
+    /// `Meter::apply_team_member_left`.
+    TeamMemberLeft {
+        uid: i64,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::TeamRoster` (issue #343): the
+    /// authoritative party/raid roster as of the `NotifyJoinTeam` push this
+    /// was decoded alongside. See `Meter::apply_team_roster`.
+    TeamRoster {
+        members: Vec<i64>,
+    },
 }
 
 #[cfg(test)]
