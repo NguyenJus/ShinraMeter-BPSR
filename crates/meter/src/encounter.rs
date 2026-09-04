@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::event::{
-    CastEvent, Class, DamageEvent, DisappearReason, EDungeonState, EnemyHp, EntityKind, PlayerInfo,
-    ProtocolEvent,
+    CastEvent, Class, DamageEvent, DamageKind, DisappearReason, EDungeonState, EnemyHp, EntityKind,
+    PlayerInfo, ProtocolEvent,
 };
 use crate::fight::{FightConfig, FightEndCause, FightState};
 use crate::phase;
@@ -1795,24 +1795,45 @@ impl Meter {
         stats.hits += 1;
         // Per-skill `hits` is bumped outside the `!d.is_miss` guard below so
         // it stays definitionally identical to the player-level `hits` above
-        // — a miss is a swing on some skill, not a non-event.
+        // — a miss is a swing on some skill, not a non-event. Issue #338:
+        // this also counts an absorbed/immune hit as a swing, same as a
+        // miss does — only which *total* the value lands in changes below.
         let skill = stats.skills.entry(d.skill_id).or_default();
         skill.hits += 1;
         if !d.is_miss {
-            stats.total_damage += d.value;
-            skill.total_damage += d.value;
-            if d.crit {
-                stats.crit_hits += 1;
-                stats.crit_damage += d.value;
-                skill.crit_hits += 1;
-                skill.crit_damage += d.value;
-                skill.max_crit = skill.max_crit.max(d.value);
-            }
-            if d.lucky {
-                stats.lucky_hits += 1;
-                stats.lucky_damage += d.value;
-                skill.lucky_hits += 1;
-                skill.lucky_damage += d.value;
+            // Issue #338: an absorbed hit's value is shield damage, and an
+            // immune hit's is (usually zero) blocked damage — neither is a
+            // change to the target's HP, so neither may fold into
+            // `total_damage`/DPS. Each gets its own channel instead; only a
+            // `Normal`-kind hit touches `total_damage` and the crit/lucky
+            // breakdowns, which are damage-specific concepts an
+            // absorbed/immune hit has no analogue of.
+            match d.kind {
+                DamageKind::Absorbed => {
+                    stats.absorbed_total += d.value;
+                    skill.absorbed_total += d.value;
+                }
+                DamageKind::Immune => {
+                    stats.immune_total += d.value;
+                    skill.immune_total += d.value;
+                }
+                DamageKind::Normal => {
+                    stats.total_damage += d.value;
+                    skill.total_damage += d.value;
+                    if d.crit {
+                        stats.crit_hits += 1;
+                        stats.crit_damage += d.value;
+                        skill.crit_hits += 1;
+                        skill.crit_damage += d.value;
+                        skill.max_crit = skill.max_crit.max(d.value);
+                    }
+                    if d.lucky {
+                        stats.lucky_hits += 1;
+                        stats.lucky_damage += d.value;
+                        skill.lucky_hits += 1;
+                        skill.lucky_damage += d.value;
+                    }
+                }
             }
         }
     }
@@ -2706,6 +2727,15 @@ impl Meter {
         );
         if let Some(stats) = self.players.get_mut(&p.uid) {
             apply_cached_attrs(stats, merged);
+            // Issue #338: unlike the identity fields above, `shield` is not
+            // routed through `name_upsert`'s cross-session cache — it is a
+            // live, per-encounter gauge, not something worth remembering
+            // once the player leaves AOI range. `None` means this delta
+            // carried no shield-list update at all, so the last known value
+            // stands; only a `Some` overwrites it, even down to `Some(0)`.
+            if let Some(shield) = p.shield {
+                stats.shield = Some(shield);
+            }
         } else if self.in_dungeon_scene()
             && merged.name.is_some()
             && self.preload_count < MAX_PRELOADED_PLAYERS
@@ -2724,6 +2754,9 @@ impl Meter {
             // rows.
             let mut stats = PlayerStats::new(p.uid);
             apply_cached_attrs(&mut stats, merged);
+            if let Some(shield) = p.shield {
+                stats.shield = Some(shield);
+            }
             self.players.insert(p.uid, stats);
             // issue #69/#12: no per-player log here by design (would flood
             // a raid); just tally, and let `prune_stale_preloads` emit one
@@ -3319,6 +3352,9 @@ impl Meter {
                     crit_pct: p.crit_pct(),
                     lucky_pct: p.lucky_pct(),
                     hits: p.hits,
+                    absorbed_total: p.absorbed_total,
+                    immune_total: p.immune_total,
+                    shield: p.shield,
                     deaths: p.deaths,
                     // Issue #254: `effective_now_ms`, not `now_ms` — an
                     // ended fight's rows are frozen as of its end, and a
@@ -3406,10 +3442,15 @@ impl Meter {
             multi_boss_scene,
         };
 
+        let total_absorbed: i64 = rows.iter().map(|r| r.absorbed_total).sum();
+        let total_immune: i64 = rows.iter().map(|r| r.immune_total).sum();
+
         Snapshot {
             duration_ms: display_duration_ms,
             total_damage,
             total_dps,
+            total_absorbed,
+            total_immune,
             rows,
             encounter,
             // The meter has no notion of capture; `bpsr_app::pipeline` is
@@ -3480,6 +3521,8 @@ pub fn skill_row_from_stats(
         hits: skill.hits,
         crit_hits: skill.crit_hits,
         hits_per_min,
+        absorbed: skill.absorbed_total,
+        immune: skill.immune_total,
     }
 }
 
@@ -3605,6 +3648,8 @@ fn buff_rows(stats: &PlayerStats, dps_duration_ms: u64) -> Vec<SkillRow> {
             hits: buff.apply_count as u64,
             crit_hits: 0,
             hits_per_min: 0.0,
+            absorbed: 0,
+            immune: 0,
         })
         .collect();
     rows.sort_by_key(|s| std::cmp::Reverse(s.damage));
@@ -4444,6 +4489,7 @@ mod tests {
             season_strength: None,
             imagines: None,
             imagine_tiers: None,
+            shield: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].name, "Foo");
@@ -4459,6 +4505,7 @@ mod tests {
             season_strength: None,
             imagines: None,
             imagine_tiers: None,
+            shield: None,
         })
     }
 
@@ -4811,6 +4858,7 @@ mod tests {
             season_strength: None,
             imagines: None,
             imagine_tiers: None,
+            shield: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].ability_score, Some(45_000));
@@ -4827,6 +4875,7 @@ mod tests {
             season_strength: None,
             imagines: None,
             imagine_tiers: None,
+            shield: None,
         }));
         m.apply(&dmg(3, 100, 0));
         m.reset(ResetReason::Manual, 1000);
@@ -4850,6 +4899,7 @@ mod tests {
             season_strength: None,
             imagines: Some([Some(3905), None]),
             imagine_tiers: None,
+            shield: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].imagines, [Some(3905), None]);
@@ -4870,6 +4920,7 @@ mod tests {
             season_strength: None,
             imagines: Some([Some(3905), Some(102640)]),
             imagine_tiers: None,
+            shield: None,
         }));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
             uid: 9,
@@ -4879,6 +4930,7 @@ mod tests {
             season_strength: None,
             imagines: None,
             imagine_tiers: None,
+            shield: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].imagines, [Some(3905), Some(102640)]);
@@ -4899,6 +4951,7 @@ mod tests {
             season_strength: None,
             imagines: Some([Some(3905), Some(102640)]),
             imagine_tiers: None,
+            shield: None,
         }));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
             uid: 9,
@@ -4908,6 +4961,7 @@ mod tests {
             season_strength: None,
             imagines: Some([None, None]),
             imagine_tiers: None,
+            shield: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].imagines, [None, None]);
@@ -4935,6 +4989,7 @@ mod tests {
             season_strength: Some(12_345),
             imagines: None,
             imagine_tiers: None,
+            shield: None,
         }));
         let snap = m.snapshot(2000);
         assert_eq!(snap.rows[0].season_strength, Some(12_345));
@@ -4951,6 +5006,7 @@ mod tests {
             season_strength: Some(999),
             imagines: None,
             imagine_tiers: None,
+            shield: None,
         }));
         m.apply(&dmg(4, 100, 0));
         m.reset(ResetReason::Manual, 1000);
@@ -5277,6 +5333,7 @@ mod tests {
                 season_strength: None,
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             }));
             m.apply(&dmg(5, 100, 1000));
 
@@ -5299,6 +5356,7 @@ mod tests {
                 season_strength: None,
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             }));
             m.apply(&dmg(5, 100, 1000));
 
@@ -5326,6 +5384,7 @@ mod tests {
                 season_strength: None,
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             }));
             m.apply(&dmg(5, 100, 1000));
 
@@ -5339,6 +5398,7 @@ mod tests {
                 season_strength: None,
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             }));
 
             let snap = m.snapshot(2000);
@@ -5391,6 +5451,7 @@ mod tests {
                 season_strength: None,
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
                 uid: 2,
@@ -5400,6 +5461,7 @@ mod tests {
                 season_strength: None,
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
                 uid: 3,
@@ -5409,6 +5471,7 @@ mod tests {
                 season_strength: None,
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             }));
             // Re-touch uid 1 so it becomes the most recently used, ahead of
             // 3 and 2 (in that order).
@@ -5420,6 +5483,7 @@ mod tests {
                 season_strength: None,
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             }));
 
             let before = m.names_for_save();
@@ -5448,6 +5512,7 @@ mod tests {
                 season_strength: None,
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
                 uid: 2,
@@ -5457,6 +5522,7 @@ mod tests {
                 season_strength: None,
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             }));
 
             let saved = m.names_for_save();
@@ -5475,6 +5541,7 @@ mod tests {
                 season_strength: None,
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             }));
             m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 1000 });
 
@@ -6081,6 +6148,7 @@ mod tests {
                 season_strength: None,
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             }));
             m.apply(&dmg(1, 100, 0));
             m.reset(ResetReason::Manual, 1000);
@@ -6771,6 +6839,7 @@ mod tests {
                 season_strength: None,
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             }));
             m.apply(&dmg(1, 100, 0));
             m.apply(&dmg(1, 100, 100_000));
@@ -11093,5 +11162,101 @@ mod tests {
 
             assert_eq!(m.fight_state(2_100), FightState::Ended);
         }
+    }
+
+    // -- issue #338: absorbed/immune damage channels ------------------------
+
+    fn absorbed_dmg(attacker_uid: i64, value: i64, ts: u64) -> ProtocolEvent {
+        ProtocolEvent::Damage(DamageEvent {
+            attacker_uid,
+            attacker_kind: EntityKind::Player,
+            value,
+            timestamp_ms: ts,
+            kind: DamageKind::Absorbed,
+            ..Default::default()
+        })
+    }
+
+    fn immune_dmg(attacker_uid: i64, value: i64, ts: u64) -> ProtocolEvent {
+        ProtocolEvent::Damage(DamageEvent {
+            attacker_uid,
+            attacker_kind: EntityKind::Player,
+            value,
+            timestamp_ms: ts,
+            kind: DamageKind::Immune,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn an_absorbed_hit_adds_to_absorbed_total_not_damage() {
+        let mut m = Meter::new();
+        m.apply(&absorbed_dmg(1, 500, 1_000));
+        let snap = m.snapshot(2_000);
+        let row = &snap.rows[0];
+        assert_eq!(
+            row.damage, 0,
+            "shield damage must not count as dealt damage"
+        );
+        assert_eq!(row.absorbed_total, 500);
+        assert_eq!(row.hits, 1, "an absorbed hit still counts as a swing");
+        assert_eq!(snap.total_damage, 0);
+        assert_eq!(snap.total_absorbed, 500);
+    }
+
+    #[test]
+    fn an_immune_hit_adds_to_immune_total_not_damage() {
+        let mut m = Meter::new();
+        m.apply(&immune_dmg(1, 0, 1_000));
+        let snap = m.snapshot(2_000);
+        let row = &snap.rows[0];
+        assert_eq!(row.damage, 0);
+        assert_eq!(row.immune_total, 0);
+        assert_eq!(row.hits, 1);
+        assert_eq!(snap.total_immune, 0);
+    }
+
+    #[test]
+    fn a_normal_hit_still_counts_as_damage_alongside_absorbed_hits() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 1_000));
+        m.apply(&absorbed_dmg(1, 500, 1_100));
+        let snap = m.snapshot(2_000);
+        let row = &snap.rows[0];
+        assert_eq!(row.damage, 100);
+        assert_eq!(row.absorbed_total, 500);
+        assert_eq!(row.hits, 2);
+    }
+
+    #[test]
+    fn absorbed_total_is_tracked_per_skill_too() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::Damage(DamageEvent {
+            attacker_uid: 1,
+            attacker_kind: EntityKind::Player,
+            skill_id: 42,
+            value: 500,
+            timestamp_ms: 1_000,
+            kind: DamageKind::Absorbed,
+            ..Default::default()
+        }));
+        let snap = m.snapshot(2_000);
+        let skill = &snap.rows[0].skills[0];
+        assert_eq!(skill.skill_id, 42);
+        assert_eq!(skill.damage, 0);
+        assert_eq!(skill.absorbed, 500);
+    }
+
+    #[test]
+    fn player_info_shield_populates_the_row() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 1_000));
+        m.apply(&ProtocolEvent::Player(PlayerInfo {
+            uid: 1,
+            shield: Some(750),
+            ..Default::default()
+        }));
+        let snap = m.snapshot(2_000);
+        assert_eq!(snap.rows[0].shield, Some(750));
     }
 }

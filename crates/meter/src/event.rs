@@ -127,6 +127,21 @@ pub enum Role {
     Damage,
 }
 
+/// Mirrors `bpsr_protocol::event::DamageKind` (issue #338): which of the
+/// (evidenced) absorbed/immune channels a hit's `value` belongs to, beyond
+/// the existing `is_miss`/`is_heal` booleans.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DamageKind {
+    #[default]
+    Normal,
+    /// The target's shield (`AttrShieldList`) fully absorbed this hit —
+    /// `value` is shield damage, not a change to the target's HP, so it
+    /// must not be folded into `damage`/DPS.
+    Absorbed,
+    /// The target was immune to this hit.
+    Immune,
+}
+
 /// A single damage (or miss/heal) event, already fully resolved by the
 /// protocol layer (pet -> summoner attribution, crit/lucky bits, effective
 /// value) per plan §0.6. All timestamps are supplied by the caller — no
@@ -142,6 +157,8 @@ pub struct DamageEvent {
     pub hp_lessen: i64,
     pub is_miss: bool,
     pub is_heal: bool,
+    /// Mirrors `bpsr_protocol::DamageEvent::kind` (issue #338).
+    pub kind: DamageKind,
     pub target_uid: i64,
     pub target_kind: EntityKind,
     pub timestamp_ms: u64,
@@ -192,6 +209,11 @@ pub struct PlayerInfo {
     /// element type to leave that already-established `[Option<i32>; 2]`
     /// id shape (and its many existing callers/tests) undisturbed.
     pub imagine_tiers: Option<[Option<i32>; 2]>,
+    /// Current total shield value. Mirrors
+    /// `bpsr_protocol::PlayerInfo::shield` (issue #338) — see there for the
+    /// `None` (attr absent from this delta) vs `Some(0)` (known to be no
+    /// shield right now) distinction.
+    pub shield: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
