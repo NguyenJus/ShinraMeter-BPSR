@@ -167,6 +167,7 @@ impl From<&Record> for Line {
 pub struct RecordSender {
     tx: Sender<Record>,
     dropped: Arc<AtomicU64>,
+    sanitized_out: Arc<AtomicU64>,
 }
 
 impl RecordSender {
@@ -175,6 +176,7 @@ impl RecordSender {
         Self {
             tx,
             dropped: Arc::new(AtomicU64::new(0)),
+            sanitized_out: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -195,6 +197,15 @@ impl RecordSender {
     /// in-progress dump might be without joining the writer thread first.
     pub fn dropped_count(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// How many records the sanitizer (issue #346) has rejected and left
+    /// out of the dump so far, safe to read from any clone at any time —
+    /// same shape as [`dropped_count`](Self::dropped_count), but for
+    /// records that were never queue-dropped, just judged unsafe to write.
+    /// Used by `crate::inspect::sanitized_out_count`.
+    pub fn sanitized_out_count(&self) -> u64 {
+        self.sanitized_out.load(Ordering::Relaxed)
     }
 }
 
@@ -239,12 +250,23 @@ impl DumpWriter {
         sanitize: bool,
     ) -> Self {
         let (tx, rx) = bounded::<Record>(CAPACITY);
+        let tx = RecordSender::new(tx);
+        let sanitized_out = Arc::clone(&tx.sanitized_out);
         let handle = std::thread::Builder::new()
             .name("inspect-dump-writer".to_string())
-            .spawn(move || run_writer(rx, &path, chunk_max_bytes, total_max_bytes, sanitize))
+            .spawn(move || {
+                run_writer(
+                    rx,
+                    &path,
+                    chunk_max_bytes,
+                    total_max_bytes,
+                    sanitize,
+                    sanitized_out,
+                )
+            })
             .expect("failed to spawn the inspect-dump-writer thread");
         Self {
-            tx: RecordSender::new(tx),
+            tx,
             handle: Some(handle),
         }
     }
@@ -267,14 +289,16 @@ impl DumpWriter {
         // The counter outlives `self` so the tally is read *after* the join,
         // catching anything a still-live sender clone dropped on the way out.
         let dropped = Arc::clone(&self.tx.dropped);
+        let sanitized_out = Arc::clone(&self.tx.sanitized_out);
         drop(self);
         if let Some(handle) = handle {
             let _ = handle.join();
         }
         let dropped = dropped.load(Ordering::Relaxed);
-        if dropped > 0 {
+        let sanitized_out = sanitized_out.load(Ordering::Relaxed);
+        if dropped > 0 || sanitized_out > 0 {
             log::warn!(
-                "packet-inspect summary: inspect dump is INCOMPLETE — dropped {dropped} record(s), the writer thread could not keep up"
+                "packet-inspect summary: inspect dump is INCOMPLETE — dropped {dropped} record(s) (writer thread could not keep up), sanitized-out {sanitized_out} record(s) (sanitizer rejected them)"
             );
         }
     }
@@ -307,6 +331,7 @@ fn run_writer(
     chunk_max_bytes: u64,
     total_max_bytes: u64,
     sanitize: bool,
+    sanitized_out: Arc<AtomicU64>,
 ) {
     let file = match open(path, chunk_max_bytes, total_max_bytes) {
         Some(f) => f,
@@ -327,7 +352,10 @@ fn run_writer(
         let record = match sanitizer.as_mut() {
             Some(sanitizer) => match sanitize_record(sanitizer, record) {
                 Some(record) => record,
-                None => continue,
+                None => {
+                    sanitized_out.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
             },
             None => record,
         };
@@ -672,7 +700,8 @@ mod tests {
     fn spawn_sanitized_drops_unmodeled_records() {
         let path = temp_path("sanitized-unmodeled");
         let writer = DumpWriter::spawn_sanitized(path.clone());
-        writer.sender().send(Record {
+        let sender = writer.sender();
+        sender.send(Record {
             ts_ms: 1,
             service_uuid: 0xDEAD,
             method_id: 0x1234, // not one of the seven modeled opcodes
@@ -686,6 +715,8 @@ mod tests {
             contents.is_empty(),
             "an unmodeled record must be dropped, not written raw"
         );
+        assert_eq!(sender.sanitized_out_count(), 1);
+        assert_eq!(sender.dropped_count(), 0);
         let _ = fs::remove_file(&path);
     }
 

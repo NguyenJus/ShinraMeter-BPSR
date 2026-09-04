@@ -57,6 +57,23 @@ pub(crate) const SANITIZED_HISTORY_FILE_NAME: &str = "history.sanitized.sqlite";
 pub(crate) const HISTORY_EXCLUSION_REASON: &str = "holds plaintext party member names; the raw file never leaves this machine — a sanitized \
      copy with names replaced by stable pseudonyms is included instead, see sanitized_history_included";
 
+/// Why the dump ring is left out of a bundle when `settings.dump_sanitize`
+/// was off for this session (issue #346) — surfaced in `manifest.json`'s
+/// `excluded` list the same way [`HISTORY_EXCLUSION_REASON`] is, so a
+/// missing dump is a documented decision rather than something a reader has
+/// to notice and guess about. A dump written with sanitization off holds
+/// raw player names/ids the same way `history.sqlite` does, and there is no
+/// sanitized-copy fallback for it the way there is for history — it simply
+/// never leaves this machine as part of a bug report.
+pub(crate) const DUMP_UNSANITIZED_EXCLUSION_REASON: &str =
+    "written with dump_sanitize off; holds raw player names/ids — never leaves this machine as part of a bug report";
+
+/// The name [`build_manifest`] lists in `excluded` for the dump ring when
+/// [`DUMP_UNSANITIZED_EXCLUSION_REASON`] applies — not a single on-disk
+/// file name (the ring can be several numbered chunks), just what a reader
+/// of `manifest.json` sees.
+const DUMP_EXCLUDED_NAME: &str = "inspect dump ring";
+
 /// One entry in `manifest.json`'s `excluded` list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExcludedFile {
@@ -87,6 +104,19 @@ pub struct Manifest {
     /// genuinely isn't available (mirrors `dump::DumpWriter::shutdown`'s
     /// own "count if available" reporting).
     pub dropped_records: Option<u64>,
+    /// Whether this session's dump writer was sanitizing on write (issue
+    /// #346, `settings::Settings::dump_sanitize`) — `false` (and the dump
+    /// ring excluded, see [`DUMP_UNSANITIZED_EXCLUSION_REASON`]) whenever
+    /// `inspect_enabled` is `false` too, since there is no dump to speak
+    /// of either way.
+    pub dump_sanitized: bool,
+    /// How many records the sanitizer (issue #346) rejected and left out of
+    /// the dump, if that count could be determined — `None` when
+    /// `inspect_enabled` is `false`, or when it's `true` but the count
+    /// genuinely isn't available. Mirrors [`dropped_records`](Self::dropped_records)'s
+    /// "count if available" shape, but for records the sanitizer judged
+    /// unsafe rather than ones the writer thread fell behind on.
+    pub sanitized_out_records: Option<u64>,
     pub excluded: Vec<ExcludedFile>,
     /// Files the export was told to collect but couldn't copy — the name
     /// each *would* have had inside the bundle. Empty when everything
@@ -115,7 +145,19 @@ pub fn build_manifest(
     inspect_enabled: bool,
     dump_byte_budget: u64,
     dropped_records: Option<u64>,
+    dump_sanitized: bool,
+    sanitized_out_records: Option<u64>,
 ) -> Manifest {
+    let mut excluded = vec![ExcludedFile {
+        name: HISTORY_FILE_NAME.to_string(),
+        reason: HISTORY_EXCLUSION_REASON.to_string(),
+    }];
+    if inspect_enabled && !dump_sanitized {
+        excluded.push(ExcludedFile {
+            name: DUMP_EXCLUDED_NAME.to_string(),
+            reason: DUMP_UNSANITIZED_EXCLUSION_REASON.to_string(),
+        });
+    }
     Manifest {
         session_id: session_id.to_string(),
         app_version: app_version.to_string(),
@@ -127,10 +169,13 @@ pub fn build_manifest(
         } else {
             None
         },
-        excluded: vec![ExcludedFile {
-            name: HISTORY_FILE_NAME.to_string(),
-            reason: HISTORY_EXCLUSION_REASON.to_string(),
-        }],
+        dump_sanitized: inspect_enabled && dump_sanitized,
+        sanitized_out_records: if inspect_enabled {
+            sanitized_out_records
+        } else {
+            None
+        },
+        excluded,
         // Only `export_bundle_to`'s copy loop can know this.
         missing: Vec::new(),
         // Only `export_bundle_to`'s sanitize step can know this.
@@ -333,6 +378,8 @@ mod tests {
             true,
             512 * 1024 * 1024,
             Some(7),
+            true,
+            Some(3),
         );
         assert_eq!(manifest.session_id, "1234-1700000000");
         assert_eq!(manifest.app_version, "0.2.6");
@@ -340,9 +387,35 @@ mod tests {
         assert!(manifest.inspect_enabled);
         assert_eq!(manifest.dump_byte_budget, 512 * 1024 * 1024);
         assert_eq!(manifest.dropped_records, Some(7));
+        assert!(manifest.dump_sanitized);
+        assert_eq!(manifest.sanitized_out_records, Some(3));
         assert_eq!(manifest.excluded.len(), 1);
         assert_eq!(manifest.excluded[0].name, "history.sqlite");
         assert_eq!(manifest.excluded[0].reason, HISTORY_EXCLUSION_REASON);
+    }
+
+    /// Issue #346: when a session's dump writer was not sanitizing on
+    /// write, the dump ring must show up in `excluded` — a raw dump has no
+    /// sanitized fallback the way `history.sqlite` does.
+    #[test]
+    fn build_manifest_excludes_the_dump_ring_when_not_sanitized() {
+        let manifest = build_manifest(
+            "1234-1700000000",
+            "0.2.6",
+            1_700_000_000,
+            true,
+            512 * 1024 * 1024,
+            Some(7),
+            false,
+            None,
+        );
+        assert!(!manifest.dump_sanitized);
+        assert_eq!(manifest.excluded.len(), 2);
+        assert_eq!(manifest.excluded[1].name, "inspect dump ring");
+        assert_eq!(
+            manifest.excluded[1].reason,
+            DUMP_UNSANITIZED_EXCLUSION_REASON
+        );
     }
 
     /// When inspect was off, the byte budget and dropped count must not
@@ -356,6 +429,8 @@ mod tests {
             false,
             512 * 1024 * 1024,
             Some(7),
+            false,
+            None,
         );
         assert!(!manifest.inspect_enabled);
         assert_eq!(manifest.dump_byte_budget, 0);
@@ -364,13 +439,13 @@ mod tests {
 
     #[test]
     fn build_manifest_reports_unavailable_dropped_count_as_none() {
-        let manifest = build_manifest("1234-1700000000", "0.2.6", 1_700_000_000, true, 100, None);
+        let manifest = build_manifest("1234-1700000000", "0.2.6", 1_700_000_000, true, 100, None, true, None);
         assert_eq!(manifest.dropped_records, None);
     }
 
     #[test]
     fn build_manifest_always_lists_history_sqlite_as_excluded() {
-        let manifest = build_manifest("1-1", "0.0.0", 0, false, 0, None);
+        let manifest = build_manifest("1-1", "0.0.0", 0, false, 0, None, false, None);
         assert_eq!(manifest.excluded.len(), 1);
         assert_eq!(manifest.excluded[0].name, "history.sqlite");
     }
@@ -544,7 +619,7 @@ mod tests {
         ));
         fs::write(&source, b"log contents").unwrap();
 
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None);
+        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None, false, None);
         let entries = vec![("session.log".to_string(), source.clone())];
 
         let missing = export_bundle_to(&dir, &entries, &manifest, None, true).unwrap();
@@ -584,7 +659,7 @@ mod tests {
         // under the export after `dump_ring_parts` listed it.
         fs::remove_file(&evicted).unwrap();
 
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, true, 100, Some(0));
+        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, true, 100, Some(0), true, None);
         let missing = export_bundle_to(&dir, &entries, &manifest, None, true).unwrap();
 
         assert_eq!(missing, vec!["dump.jsonl.1".to_string()]);
@@ -621,7 +696,7 @@ mod tests {
         fs::write(&log, b"log contents").unwrap();
 
         let entries = bundle_entries(&[history.clone(), log.clone()], &[], None);
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None);
+        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None, false, None);
         let missing = export_bundle_to(&dir, &entries, &manifest, None, true).unwrap();
 
         assert!(missing.is_empty());
@@ -649,7 +724,7 @@ mod tests {
             "ShinraMeter-BPSR-bundle-export-does-not-exist-{}.jsonl",
             std::process::id()
         ));
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, true, 100, Some(0));
+        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, true, 100, Some(0), true, None);
         let entries = vec![("dump.jsonl".to_string(), missing)];
 
         let missing_names = export_bundle_to(&dir, &entries, &manifest, None, true).unwrap();
@@ -725,7 +800,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let history_db = seeded_history_db("include");
 
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None);
+        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None, false, None);
         let missing = export_bundle_to(&dir, &[], &manifest, Some(&history_db), true).unwrap();
 
         assert!(missing.is_empty());
@@ -753,7 +828,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let history_db = seeded_history_db("excluded");
 
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None);
+        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None, false, None);
         export_bundle_to(&dir, &[], &manifest, Some(&history_db), false).unwrap();
 
         assert!(!dir.join(SANITIZED_HISTORY_FILE_NAME).exists());
@@ -780,7 +855,7 @@ mod tests {
         ));
         let _ = fs::remove_file(&missing_history);
 
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None);
+        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None, false, None);
         let missing = export_bundle_to(&dir, &[], &manifest, Some(&missing_history), true).unwrap();
 
         assert!(missing.is_empty());
@@ -807,7 +882,7 @@ mod tests {
         ));
         fs::write(&corrupt_history, b"not a database").unwrap();
 
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None);
+        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None, false, None);
         let missing = export_bundle_to(&dir, &[], &manifest, Some(&corrupt_history), true).unwrap();
 
         assert!(missing.is_empty());

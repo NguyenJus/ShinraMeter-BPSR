@@ -5431,7 +5431,8 @@ fn start_bundle_export(dest: PathBuf, include_history: bool, tx: Sender<LogExpor
             let log_parts = crate::logging::files_to_export(&log_path);
 
             let inspect_enabled = crate::inspect::enabled();
-            let dump_parts = if inspect_enabled {
+            let dump_sanitized = crate::inspect::sanitized().unwrap_or(false);
+            let dump_parts = if inspect_enabled && dump_sanitized {
                 bundle::dump_ring_parts(&crate::inspect::dump_path())
             } else {
                 Vec::new()
@@ -5448,6 +5449,8 @@ fn start_bundle_export(dest: PathBuf, include_history: bool, tx: Sender<LogExpor
                 inspect_enabled,
                 crate::dump::max_total_ring_bytes(),
                 crate::inspect::dropped_count(),
+                dump_sanitized,
+                crate::inspect::sanitized_out_count(),
             );
 
             // Issue #347: the bundle follows `Settings::history_enabled` —
