@@ -172,24 +172,30 @@ BOSS_ID_MANUAL_OVERRIDES: dict[int, str] = {
     # its own encounter, so it is kept rather than silently losing its header
     # display when the source of truth switched to MonsterType.
     61_220: "Storm Goblin King",
-    # The World Dominator daily rotation (issue #313). Scene 7152 cycles a
-    # different world boss each night; two consecutive sessions
-    # (2026-08-25 23:37 and 2026-08-26 23:21) ended their pull against
-    # 3000022 and 3000063 respectively, both unrecognized, both wiping the
-    # meter mid-pull with `reset reason=NewFight` at 35.7% / 41.8% boss HP.
-    #
-    # `MonsterTable.json` marks both `MonsterType == 0`, but that block's
-    # classification is stale rather than considered: 3000000..=3000081 is
-    # the World Dominator registry — 81 rows, of which only 5 carry
-    # `MonsterType == 2` (those 5 are already in the generated set) and the
-    # remaining 76 carry `MonsterType == 0` *and* `BloodTubeCount == 0`. A
-    # world boss with no health bars at all is not a plain monster; the field
-    # was simply never filled in for these rows. 3000063's own base template,
-    # 1701 "Denvel", *is* `MonsterType == 2` and is already in the set, which
-    # is the tell.
-    3_000_063: "Denvel",
-    3_000_022: "Muku Chief - Resonance",
 }
+
+# World Dominator / Resonance registry range (issue #313, generalized by
+# #315). Scene 7152 cycles a different world boss each night, drawn from a
+# contiguous id block: `MonsterTable.json` rows 3000000..=3000081 (82 ids;
+# upstream itself leaves 3000005 unfilled, so 81 rows actually exist), of
+# which only 5 carry `MonsterType == 2` (already in the generated set). The
+# remaining 76 carry `MonsterType == 0` *and* `BloodTubeCount == 0` — a world
+# boss with no health bars at all is not a plain monster, the field was simply
+# never filled in for these rows.
+#
+# #313/#314 first patched this by hand-adding the two rotation ids two
+# consecutive sessions actually hit (3000022, 3000063) to
+# `BOSS_ID_MANUAL_OVERRIDES` above — whack-a-mole by construction, since the
+# rotation draws from all 81 ids and only the ones with direct log evidence
+# were covered. #315 replaces that with the registry range itself, so every
+# id in the block is recognized regardless of which one the rotation lands on
+# tonight. This is a range, not a `BOSS_ID_MANUAL_OVERRIDES` entry, because it
+# is a *derived* rule (the whole registry block, upstream-attested by
+# `MonsterTable.json` row presence) rather than a one-off correction to a
+# single misclassified id — see the docstring on `BOSS_ID_MANUAL_OVERRIDES`.
+# Unioned into the generated boss-id set the same way: can only ever add ids,
+# never suppress one `MonsterType == 2` already includes.
+WORLD_DOMINATOR_BOSS_ID_RANGE = range(3_000_000, 3_000_082)  # 3_000_000..=3_000_081
 
 # Manual overrides (issue #313): dungeon scene ids `DungeonsTable.json`'s
 # `SceneID` column omits but that behave as instances in the logs. Same idiom
@@ -358,18 +364,44 @@ mod tests {
     }
 
     #[test]
-    fn is_boss_monster_true_for_the_world_dominator_rotation() {
-        // Issue #313: scene 7152 rotates its world boss nightly, and two
-        // consecutive sessions ended on these two ids. `MonsterTable.json`
-        // marks both `MonsterType == 0`, but so is every one of the 76
-        // non-boss rows in the 3000000..=3000081 World Dominator registry,
-        // and all 76 also carry `BloodTubeCount == 0` — a world boss with no
-        // health bars is an unfilled row, not a classification. Unrecognized,
-        // they cost the meter a full wipe mid-pull: `is_engaged_recognized_boss`
-        // went false, issue #151's fight hold dropped, and a 9s immunity
-        // window ended the encounter at 41.8% boss HP.
-        assert!(is_boss_monster(3_000_063)); // Denvel; base template 1701 is MonsterType 2
-        assert!(is_boss_monster(3_000_022)); // Muku Chief - Resonance
+    fn is_boss_monster_true_for_the_entire_world_dominator_registry() {
+        // Issue #313 first covered only the two rotation ids two consecutive
+        // sessions happened to hit (3000022, 3000063) via
+        // `BOSS_ID_MANUAL_OVERRIDES` — whack-a-mole, since the nightly
+        // rotation draws from all 81 populated rows of the registry. Issue
+        // #315 replaces that with `WORLD_DOMINATOR_BOSS_ID_RANGE`
+        // (3000000..=3000081) in `scripts/gen-name-tables.py`, so every id in
+        // the block is recognized regardless of which one rotates in
+        // tonight — including the 76 rows `MonsterTable.json` marks
+        // `MonsterType == 0` with `BloodTubeCount == 0` (an unfilled
+        // classification field, not a real non-boss monster; see the range's
+        // doc comment).
+        for id in 3_000_000..=3_000_081u32 {
+            assert!(is_boss_monster(id), "expected {id} to be a boss");
+        }
+        // Just outside the registry block: must not be swept in.
+        assert!(!is_boss_monster(2_999_999));
+        assert!(!is_boss_monster(3_000_082));
+
+        // Every id the registry actually populates also has a name — upstream
+        // itself leaves 3000005 unfilled (no row at all in
+        // `MonsterTable.json`, in any community file), so that one id is
+        // excluded here rather than asserted to have a name nothing upstream
+        // gives it.
+        for id in 3_000_000..=3_000_081u32 {
+            if id == 3_000_005 {
+                assert_eq!(monster_name(id), None);
+                continue;
+            }
+            assert!(
+                monster_name(id).is_some_and(|n| !n.is_empty()),
+                "expected {id} to have a non-empty name"
+            );
+        }
+        // Denvel (3000063) and Muku Chief - Resonance (3000022) are the two
+        // ids issue #313 had direct log evidence for; still pinned by name.
+        assert_eq!(monster_name(3_000_063), Some("Denvel"));
+        assert_eq!(monster_name(3_000_022), Some("Muku Chief - Resonance"));
     }
 
     #[test]
@@ -689,6 +721,54 @@ def _keyed(raw: dict) -> dict[int, str]:
     return {int(k): v for k, v in raw.items()}
 
 
+def check_monster_name_collisions(
+    monsters: dict[int, str], community: dict[int, str], authoritative: dict[int, str]
+) -> None:
+    """Guard the id collisions between the curated community table
+    (`MonsterName.json`) and the authoritative client table
+    (`MonsterTableNames.json`) that issue #314 only partially addressed
+    (issue #315).
+
+    59 ids currently carry a different name in the two tables. 4 of them (the
+    Ignisor family) are flipped to the client's own name by
+    `MONSTER_NAME_MANUAL_OVERRIDES`, because #313's reporter read that name
+    off their own screen mid-fight — the curated name turned out to be a
+    pre-release one the live client no longer renders. The other 55 have no
+    such evidence either way (most are cosmetic, "Boss - X" vs "Boss: X"), so
+    #315's decision is to leave the general curated-wins precedence
+    (`merge_names`, see `HEADER`) in place for them rather than guess.
+    "Address" for those 55 means exactly this: reviewed, decision recorded,
+    and pinned here so a future `--refresh` that changes the collision set —
+    a new id starts disagreeing, or a resolved name silently stops being the
+    curated one — fails loudly instead of shipping an unreviewed name change.
+    """
+    collisions = {
+        cid
+        for cid, name in community.items()
+        if cid in authoritative and authoritative[cid] != name
+    }
+    overridden = set(MONSTER_NAME_MANUAL_OVERRIDES)
+    if len(collisions) != 59:
+        sys.exit(
+            "expected 59 MonsterName.json/MonsterTableNames.json id collisions "
+            f"(issue #315), found {len(collisions)} -- review the new/removed "
+            "ids, decide each one, and update this check"
+        )
+    for cid in collisions - overridden:
+        if monsters.get(cid) != community[cid]:
+            sys.exit(
+                f"monster {cid}: resolved name {monsters.get(cid)!r} is not the "
+                f"curated MonsterName.json value {community[cid]!r} -- did the "
+                "merge precedence change? (issue #315)"
+            )
+    for cid in collisions & overridden:
+        if monsters.get(cid) != MONSTER_NAME_MANUAL_OVERRIDES[cid]:
+            sys.exit(
+                f"monster {cid}: expected the manual override "
+                f"{MONSTER_NAME_MANUAL_OVERRIDES[cid]!r}, got {monsters.get(cid)!r}"
+            )
+
+
 def _self_test() -> None:
     """Fast synthetic checks run on every generation. There is no Python
     test harness elsewhere in this repo (no pytest config, no CI job that
@@ -858,8 +938,14 @@ BOSS_IDS_DOC = """/// Boss-monster template ids (issue #42): the top-bar encount
 /// A short manual-override list in `scripts/gen-name-tables.py`
 /// (`BOSS_ID_MANUAL_OVERRIDES`) adds back ids the previous hand-curated list
 /// carried that `MonsterType` does not mark as 2 but that community trackers
-/// fought and flagged as bosses, plus ids whose `MonsterType` is demonstrably
-/// stale (issue #313's World Dominator rotation); see its per-id comments.
+/// fought and flagged as bosses; see its per-id comments.
+///
+/// The World Dominator / Resonance registry, `3000000..=3000081`
+/// (`WORLD_DOMINATOR_BOSS_ID_RANGE`), is unioned in as a range rather than a
+/// per-id override: issue #313 first hand-added the two rotation ids two
+/// sessions happened to hit, and #315 replaced that with the whole registry
+/// block, since the nightly rotation draws from all of it and `MonsterType`
+/// is stale for every row that isn't already `== 2`.
 ///
 /// Previously hand-curated from `crates/meter/data/MonsterNameBoss.json`
 /// (community-tracker data, GPL-3.0); see `THIRD_PARTY_NOTICES.md` for the
@@ -1090,15 +1176,18 @@ def render() -> str:
     load = lambda name: json.loads((DATA / name).read_text(encoding="utf-8-sig"))  # noqa: E731
 
     # Least authoritative layer first in every call below.
+    monster_table_names = _keyed(load("MonsterTableNames.json"))
+    monster_name = _keyed(load("MonsterName.json"))
     monsters = merge_names(
-        _keyed(load("MonsterTableNames.json")),
-        _keyed(load("MonsterName.json")),
+        monster_table_names,
+        monster_name,
         _keyed(load("MonsterNameCrowdsource.json")),
         # Issue #313: the final word, above even the curated community layer.
         # See `MONSTER_NAME_MANUAL_OVERRIDES` for why a handful of ids need
         # the client's own name back.
         _keyed(MONSTER_NAME_MANUAL_OVERRIDES),
     )
+    check_monster_name_collisions(monsters, monster_name, monster_table_names)
     scenes = merge_names(
         # `DungeonsTableNames` is currently a strict id-subset of
         # `SceneTableNames` carrying coarser names — "Tina's Mindrealm" where
@@ -1110,7 +1199,9 @@ def render() -> str:
         _keyed(load("SceneName.json")),
     )
     boss_ids = sorted(
-        {int(x) for x in load("MonsterTableBossIds.json")} | set(BOSS_ID_MANUAL_OVERRIDES)
+        {int(x) for x in load("MonsterTableBossIds.json")}
+        | set(BOSS_ID_MANUAL_OVERRIDES)
+        | set(WORLD_DOMINATOR_BOSS_ID_RANGE)
     )
     dungeon_scene_ids = sorted(
         {int(x) for x in load("DungeonSceneIds.json")}
