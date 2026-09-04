@@ -395,6 +395,20 @@ impl Pipeline {
         self.meter.tick(now_ms)
     }
 
+    /// Why the currently-held (or most recently ended) fight ended (issue
+    /// #336 step 2) — a thin pass-through to `Meter::fight_end_cause`, so a
+    /// caller outside this crate never has to reach into `self.meter`
+    /// directly.
+    pub fn fight_end_cause(&self) -> Option<meter::FightEndCause> {
+        self.meter.fight_end_cause()
+    }
+
+    /// Which hold, if any, is keeping an ended fight's events withheld
+    /// (issue #336 step 2) — a thin pass-through to `Meter::hold_kind`.
+    pub fn hold_kind(&self) -> Option<meter::HoldKind> {
+        self.meter.hold_kind()
+    }
+
     /// Records the encounter that just ended, exactly once (issue #39).
     ///
     /// Called from `publish` immediately after `tick`/`snapshot`, on the

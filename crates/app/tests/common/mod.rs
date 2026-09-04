@@ -24,7 +24,7 @@ use bpsr_app::history::writer::HistoryHandle;
 use bpsr_app::history::{EncounterRecord, EncounterSummary, RetentionPolicy};
 use bpsr_app::pipeline::Pipeline;
 use bpsr_capture::tcp::TcpReassembler;
-use bpsr_meter::{FightState, PlayerRow, ResetReason, Snapshot};
+use bpsr_meter::{FightEndCause, FightState, HoldKind, PlayerRow, ResetReason, Snapshot};
 use bpsr_protocol::Decoder;
 use bpsr_test_support::scenario::{Delivery, Scenario, Step};
 
@@ -53,6 +53,14 @@ pub struct Capture {
     pub at_ms: u64,
     pub snapshot: Snapshot,
     pub fight_state: FightState,
+    /// Why the currently-held (or most recently ended) fight ended (issue
+    /// #336 step 2) — pins `Meter::fight_end_cause` for every existing
+    /// capture, so step 3's enum state machine can be verified against
+    /// unchanged goldens.
+    pub fight_end_cause: Option<FightEndCause>,
+    /// Which hold, if any, is keeping an ended fight's events withheld
+    /// (issue #336 step 2) — pins `Meter::hold_kind` the same way.
+    pub hold_kind: Option<HoldKind>,
     /// Every reset observed since the scenario started, in order.
     pub resets: Vec<(u64, ResetReason)>,
 }
@@ -127,6 +135,8 @@ impl Rig {
                         at_ms: *at_ms,
                         snapshot: self.pipeline.snapshot(*at_ms),
                         fight_state: self.fight_state,
+                        fight_end_cause: self.pipeline.fight_end_cause(),
+                        hold_kind: self.pipeline.hold_kind(),
                         resets: self.resets.clone(),
                     });
                 }
@@ -189,6 +199,18 @@ impl Rig {
     /// called).
     pub fn fight_state(&self) -> FightState {
         self.fight_state
+    }
+
+    /// The live `Pipeline`'s `fight_end_cause` (issue #336 step 2), for a
+    /// `feed_notify`-driven test building its own `Capture`.
+    pub fn fight_end_cause(&self) -> Option<FightEndCause> {
+        self.pipeline.fight_end_cause()
+    }
+
+    /// The live `Pipeline`'s `hold_kind` (issue #336 step 2), for a
+    /// `feed_notify`-driven test building its own `Capture`.
+    pub fn hold_kind(&self) -> Option<HoldKind> {
+        self.pipeline.hold_kind()
     }
 
     fn run_bytes(&mut self, at_ms: u64, bytes: &[u8], delivery: &Delivery) {
@@ -389,6 +411,11 @@ fn render(capture: &Capture) -> String {
     out.push_str(&format!("scenario={}\n", capture.label));
     out.push_str(&format!("at_ms={}\n", capture.at_ms));
     out.push_str(&format!("fight_state={:?}\n", capture.fight_state));
+    out.push_str(&format!(
+        "fight_end_cause={}\n",
+        opt_dbg(capture.fight_end_cause)
+    ));
+    out.push_str(&format!("hold_kind={}\n", opt_dbg(capture.hold_kind)));
     out.push_str(&format!("duration_ms={}\n", snap.duration_ms));
     out.push_str(&format!("total_damage={}\n", snap.total_damage));
     out.push_str(&format!("total_dps={}\n", fmt_f64(snap.total_dps)));
@@ -460,6 +487,16 @@ fn render_row(row: &PlayerRow) -> String {
 fn opt<T: std::fmt::Display>(v: Option<T>) -> String {
     match v {
         Some(v) => v.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+/// Same as `opt`, but for a type with only `Debug` (issue #336 step 2:
+/// `FightEndCause`/`HoldKind`) — `{:?}` on the inner value, not on the
+/// `Option` itself, so this reads e.g. `BossDeath`, not `Some(BossDeath)`.
+fn opt_dbg<T: std::fmt::Debug>(v: Option<T>) -> String {
+    match v {
+        Some(v) => format!("{v:?}"),
         None => "-".to_string(),
     }
 }
