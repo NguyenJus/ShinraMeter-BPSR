@@ -509,7 +509,9 @@ fn team_ntf_notify_join_team_decodes_roster_end_to_end() {
 
     let mut decoder = Decoder::new();
     let events = decoder.push_stream(&stream, 5);
-    assert_eq!(events.len(), 2, "the bot-like member must yield no event");
+    // 2 `Player` events (the bot-like member yields no `Player` event) plus
+    // one trailing `TeamRoster` naming all three resolved uids (issue #343).
+    assert_eq!(events.len(), 3, "the bot-like member must yield no Player event");
     match &events[0] {
         ProtocolEvent::Player(p) => {
             assert_eq!(p.uid, 101);
@@ -527,5 +529,11 @@ fn team_ntf_notify_join_team_decodes_roster_end_to_end() {
             assert_eq!(p.ability_score, None);
         }
         other => panic!("expected Player, got {other:?}"),
+    }
+    match &events[2] {
+        ProtocolEvent::TeamRoster { members } => {
+            assert_eq!(members, &vec![101, 102, 103]);
+        }
+        other => panic!("expected TeamRoster, got {other:?}"),
     }
 }
