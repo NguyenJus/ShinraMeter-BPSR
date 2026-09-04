@@ -316,6 +316,24 @@ pub enum ProtocolEvent {
         removes_layer: bool,
         timestamp_ms: u64,
     },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::EntityState` (issue
+    /// #339/#272): an entity's decoded `AttrState`, `is_dead` boiled down
+    /// from the wire's full `EActorState` enum. Emitted for both players and
+    /// monsters. See `Meter::apply` for how each side folds it in.
+    EntityState {
+        uid: i64,
+        kind: EntityKind,
+        is_dead: bool,
+        timestamp_ms: u64,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::Revive` (issue #272): the
+    /// dedicated `WorldNtf.NotifyReviveUser` (opcode `0x27`) signal — the
+    /// exact revive moment, replacing the inferred "next action implies
+    /// alive" fallback for any player whose revive this actually observes.
+    Revive {
+        uid: i64,
+        timestamp_ms: u64,
+    },
 }
 
 #[cfg(test)]

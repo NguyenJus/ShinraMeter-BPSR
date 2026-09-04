@@ -10,7 +10,7 @@ use prost::Message;
 use std::sync::Arc;
 
 use crate::attrs::{
-    enemy_hp_from_attrs, player_info_from_attrs, scene_id_from_attrs,
+    enemy_hp_from_attrs, entity_state_from_attrs, player_info_from_attrs, scene_id_from_attrs,
     skill_cast_metadata_from_attrs,
 };
 use crate::blob;
@@ -60,6 +60,10 @@ pub mod opcode {
     /// `docs/specs/2026-08-23-issue-139-dungeon-state-spec.md` and
     /// `decode::on_sync_dungeon_dirty_data`.
     pub const SYNC_DUNGEON_DIRTY_DATA: u32 = 0x0000_0018;
+    /// `WorldNtf.NotifyReviveUser` (issue #272/#339) — see
+    /// `pb::NotifyReviveUser`'s doc comment for the full sourcing and the
+    /// live-capture caveat.
+    pub const NOTIFY_REVIVE_USER: u32 = 0x0000_0027;
 }
 
 /// Method ids on `frame::TEAM_NTF_SERVICE_UUID` (`EServiceId.GrpcTeamNtf`,
@@ -130,6 +134,12 @@ pub fn decode_notify(
             match pb::SyncDungeonDirtyData::decode(n.payload.as_slice()) {
                 Ok(msg) => on_sync_dungeon_dirty_data(&msg, out),
                 Err(_) => log::debug!("bpsr-protocol: SyncDungeonDirtyData decode failed"),
+            }
+        }
+        (SERVICE_UUID, opcode::NOTIFY_REVIVE_USER) => {
+            match pb::NotifyReviveUser::decode(n.payload.as_slice()) {
+                Ok(msg) => on_notify_revive_user(&msg, now_ms, out),
+                Err(_) => log::debug!("bpsr-protocol: NotifyReviveUser decode failed"),
             }
         }
         (SERVICE_UUID, opcode::SYNC_NEAR_DELTA_INFO) => {
@@ -291,6 +301,22 @@ fn on_aoi_sync_delta(
                 )));
             }
             EntityKind::Unknown => {}
+        }
+        // Issue #339/#272: `AttrState` rides the same attr channel as every
+        // other field above and is decoded for both players and monsters —
+        // a boss's own dead state is one of the two explicit death signals
+        // this issue adds (the other is `Revive`/`SyncDamageInfo.is_dead`).
+        // `Unknown`-kind entities are dropped everywhere else in this
+        // function, so no event is emitted for them here either.
+        if target_kind != EntityKind::Unknown
+            && let Some(is_dead) = entity_state_from_attrs(&attrs.attrs)
+        {
+            out.push(ProtocolEvent::EntityState {
+                uid: target_uid,
+                kind: target_kind,
+                is_dead,
+                timestamp_ms: now_ms,
+            });
         }
     }
     if let Some(effects) = &delta.skill_effects {
@@ -501,6 +527,21 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
 /// `TeamBasicData.level` is decoded onto the pb struct (see its doc
 /// comment) but deliberately never read here: `PlayerInfo` has no `level`
 /// field and nothing downstream consumes one (issue #146 spec decision 3).
+/// `WorldNtf.NotifyReviveUser` (issue #272/#339): emits `ProtocolEvent::
+/// Revive` for the actor the notify names. See `pb::NotifyReviveUser`'s
+/// doc comment for the wire sourcing. `v_actor_uuid` missing entirely
+/// drops the packet — there is no uid to key a revive on — matching this
+/// module's non-panicking, nothing-to-report-is-not-an-error convention.
+fn on_notify_revive_user(msg: &pb::NotifyReviveUser, now_ms: u64, out: &mut Vec<ProtocolEvent>) {
+    let Some(actor_uuid) = msg.v_actor_uuid else {
+        return;
+    };
+    out.push(ProtocolEvent::Revive {
+        uid: uid_of(actor_uuid),
+        timestamp_ms: now_ms,
+    });
+}
+
 fn on_notify_join_team(msg: &pb::NotifyJoinTeam, out: &mut Vec<ProtocolEvent>) {
     let Some(request) = &msg.v_request else {
         return;
@@ -2625,5 +2666,118 @@ mod tests {
             &out[2],
             ProtocolEvent::EnemyGone { reason: None, .. }
         ));
+    }
+
+    // -- NotifyReviveUser / AttrState (issue #272/#339) -----------------
+
+    #[test]
+    fn notify_revive_user_emits_revive_for_actor() {
+        let msg = pb::NotifyReviveUser {
+            v_actor_uuid: Some(ATTACKER_UUID),
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let n = Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id: opcode::NOTIFY_REVIVE_USER,
+            payload,
+        };
+        let mut out = Vec::new();
+        decode_notify(&n, 4242, &mut out, None);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ProtocolEvent::Revive { uid, timestamp_ms } => {
+                assert_eq!(*uid, uid_of(ATTACKER_UUID));
+                assert_eq!(*timestamp_ms, 4242);
+            }
+            other => panic!("expected Revive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_revive_user_missing_actor_uuid_emits_nothing() {
+        let msg = pb::NotifyReviveUser { v_actor_uuid: None };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let n = Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id: opcode::NOTIFY_REVIVE_USER,
+            payload,
+        };
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.is_empty());
+    }
+
+    fn attr_state_notify(uuid: i64, state: u64) -> Notify {
+        let mut raw_data = Vec::new();
+        prost::encoding::encode_varint(state, &mut raw_data);
+        let delta = AoiSyncDelta {
+            uuid,
+            attrs: Some(AttrCollection {
+                uuid,
+                attrs: vec![pb::Attr {
+                    id: crate::attrs::attr_id::STATE,
+                    raw_data,
+                }],
+            }),
+            skill_effects: None,
+            buff_effect: None,
+        };
+        let msg = SyncNearDeltaInfo {
+            delta_infos: vec![delta],
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id: opcode::SYNC_NEAR_DELTA_INFO,
+            payload,
+        }
+    }
+
+    #[test]
+    fn attr_state_dead_on_player_emits_entity_state_dead() {
+        let mut out = Vec::new();
+        decode_notify(&attr_state_notify(ATTACKER_UUID, 9), 100, &mut out, None);
+        let ev = out
+            .iter()
+            .find_map(|ev| match ev {
+                ProtocolEvent::EntityState {
+                    uid,
+                    kind,
+                    is_dead,
+                    timestamp_ms,
+                } => Some((*uid, *kind, *is_dead, *timestamp_ms)),
+                _ => None,
+            })
+            .expect("expected an EntityState event");
+        assert_eq!(ev, (uid_of(ATTACKER_UUID), EntityKind::Player, true, 100));
+    }
+
+    #[test]
+    fn attr_state_non_dead_on_monster_emits_entity_state_alive() {
+        let mut out = Vec::new();
+        decode_notify(&attr_state_notify(TARGET_UUID, 8), 0, &mut out, None);
+        let ev = out
+            .iter()
+            .find_map(|ev| match ev {
+                ProtocolEvent::EntityState {
+                    uid, kind, is_dead, ..
+                } => Some((*uid, *kind, *is_dead)),
+                _ => None,
+            })
+            .expect("expected an EntityState event");
+        assert_eq!(ev, (uid_of(TARGET_UUID), EntityKind::Monster, false));
+    }
+
+    #[test]
+    fn no_attr_state_attr_emits_no_entity_state_event() {
+        let mut out = Vec::new();
+        decode_notify(&skill_attr_notify(ATTACKER_UUID, 1550), 0, &mut out, None);
+        assert!(
+            !out.iter()
+                .any(|ev| matches!(ev, ProtocolEvent::EntityState { .. }))
+        );
     }
 }

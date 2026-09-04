@@ -1,0 +1,16 @@
+scenario=death_and_revive
+at_ms=7500
+fight_state=Ended
+duration_ms=5000
+total_damage=50000
+total_dps=12500.00
+encounter.boss_monster_id=103
+encounter.boss_name=Ignisor
+encounter.is_boss=true
+encounter.scene_id=1101
+encounter.scene_name=Towering Ruin
+encounter.scene_boss_name=-
+resets=
+rows=2
+row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=40000 dps=10000.00 share=80.00 crit=0.00 lucky=0.00 hits=1 deaths=0
+row uid=1002 name=Brin class=FrostMage ability_score=11500 season_strength=- imagines=[-,-] damage=10000 dps=2500.00 share=20.00 crit=0.00 lucky=0.00 hits=1 deaths=1

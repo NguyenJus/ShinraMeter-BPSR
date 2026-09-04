@@ -261,6 +261,19 @@ pub fn damage_notify_frame(target_uuid: i64, dmg: pb::SyncDamageInfo, compressed
     )
 }
 
+/// Prost-encodes a `NotifyReviveUser` payload (not wrapped in a frame,
+/// issue #272/#339): a bare `v_actor_uuid` naming the revived actor —
+/// `wire::player_uuid(uid)` for a player revive, matching real traffic
+/// (`pb::NotifyReviveUser`'s doc comment).
+pub fn revive_payload(actor_uuid: i64) -> Vec<u8> {
+    let msg = pb::NotifyReviveUser {
+        v_actor_uuid: Some(actor_uuid),
+    };
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+    buf
+}
+
 /// Builds an `Attr` carrying a name, with the stray leading tag byte the
 /// server always prepends (see `attrs::decode_name`).
 pub fn name_attr(name: &str) -> pb::Attr {

@@ -935,6 +935,19 @@ impl Meter {
                 self.apply_buff_remove(*host_uid, *buff_uuid, *removes_layer, *timestamp_ms);
                 None
             }
+            ProtocolEvent::EntityState {
+                uid,
+                kind,
+                is_dead,
+                timestamp_ms,
+            } => {
+                self.apply_entity_state(*uid, *kind, *is_dead, *timestamp_ms);
+                None
+            }
+            ProtocolEvent::Revive { uid, timestamp_ms } => {
+                self.apply_revive(*uid, *timestamp_ms);
+                None
+            }
             ProtocolEvent::Scene { level_map_id } => {
                 // Sparse, transition-only diagnostic (issue #69): a scene
                 // sync packet can repeat while the player stays in the same
@@ -1594,7 +1607,11 @@ impl Meter {
         if d.attacker_kind == EntityKind::Player
             && let Some(stats) = self.players.get_mut(&d.attacker_uid)
         {
-            stats.set_alive(true, d.timestamp_ms);
+            // issue #339/#272: `explicit = false` — this is the inferred
+            // fallback (see `PlayerStats::set_alive`'s doc comment), kept
+            // only for a player whose actual revive (`Revive`/`AttrState`)
+            // this meter never observed.
+            stats.set_alive(true, d.timestamp_ms, false);
         }
 
         // `d.is_dead` flags that `target_uid` (the victim, not the
@@ -2681,7 +2698,10 @@ impl Meter {
         // a retransmitted packet cannot count one death twice, and a
         // duplicate still reports a player who is down. The bit is
         // idempotent, so there is nothing there to protect it from.
-        stats.set_alive(false, timestamp_ms);
+        // Both callers of `record_death` (`DamageEvent::is_dead` and
+        // `AttrState`'s decoded dead state, issue #339/#272) are explicit
+        // death signals, never the inferred fallback.
+        stats.set_alive(false, timestamp_ms, true);
         let debounced = stats
             .last_death_ms
             .is_some_and(|last| timestamp_ms.saturating_sub(last) < DEATH_DEBOUNCE_MS);
@@ -2690,6 +2710,76 @@ impl Meter {
         }
         stats.deaths += 1;
         stats.last_death_ms = Some(timestamp_ms);
+    }
+
+    /// Routes a decoded `AttrState` (issue #339/#272) into the same
+    /// explicit death/revive machinery `DamageEvent::is_dead` and `Revive`
+    /// use. Players and monsters take different paths — a player's death
+    /// count and dead-time pill read `PlayerStats`, a monster's fight-end
+    /// decision reads `EnemyState`/`recompute_boss` — but `is_dead` means
+    /// the same thing on both.
+    ///
+    /// `record_death`'s own debounce (`DEATH_DEBOUNCE_MS`) already protects
+    /// against double-counting when this and a `DamageEvent::is_dead` on the
+    /// same kill both land close together, so no extra guard is needed here.
+    fn apply_entity_state(&mut self, uid: i64, kind: EntityKind, is_dead: bool, timestamp_ms: u64) {
+        match kind {
+            EntityKind::Player => {
+                if is_dead {
+                    self.record_death(uid, timestamp_ms);
+                } else if let Some(stats) = self.players.get_mut(&uid) {
+                    // Explicit signal, not the inferred "next action" path —
+                    // see `PlayerStats::set_alive`'s `explicit` parameter.
+                    stats.set_alive(true, timestamp_ms, true);
+                    self.release_wipe_hold_if_recovered();
+                }
+            }
+            EntityKind::Monster => {
+                if is_dead && self.enemies.contains_key(&uid) {
+                    self.mark_enemy_dead(uid);
+                    self.recompute_boss();
+                    self.end_fight_on_boss_death(uid, timestamp_ms);
+                }
+                // A monster's `AttrState` going alive again (a respawn, or a
+                // false-negative on an earlier dead reading) is not handled
+                // here — `apply_enemy_hp`'s `curr_hp > 0 && !took_damage`
+                // rule is the existing un-kill signal for enemies, and nothing
+                // in this issue's scope needs a second one.
+            }
+            EntityKind::Unknown => {}
+        }
+    }
+
+    /// Routes a decoded `WorldNtf.NotifyReviveUser` (issue #272) into the
+    /// same explicit-revive path `apply_entity_state`'s alive arm uses.
+    ///
+    /// `get_mut`, not `entry`: a revive is proof of life for a row the
+    /// roster already holds, the same rule `apply_damage`'s heal-side revive
+    /// inference follows — it must never *open* a row for a uid this meter
+    /// has not otherwise seen. A revive for an unknown uid (or one that was
+    /// never recorded dead) is therefore a no-op.
+    fn apply_revive(&mut self, uid: i64, timestamp_ms: u64) {
+        if let Some(stats) = self.players.get_mut(&uid) {
+            stats.set_alive(true, timestamp_ms, true);
+            self.release_wipe_hold_if_recovered();
+        }
+    }
+
+    /// Lifts the wipe hold (issue #154) early once enough of the roster has
+    /// come back up that the party no longer reads as wiped (issue
+    /// #339/#272) — an explicit revive/`AttrState`-alive signal is exactly
+    /// the evidence `party_mostly_down` needs that didn't exist before this
+    /// issue. Without this the hold only ever lifted on a timeout
+    /// ([`WIPE_HOLD_RELEASE_MS`]) or a hit landing on a recognized boss
+    /// (`withholds_after_wipe`), even after a battle rez had genuinely
+    /// ended the wipe.
+    ///
+    /// A no-op when no hold is latched, so every explicit-alive call site
+    /// can call it unconditionally.
+    fn release_wipe_hold_if_recovered(&mut self) {
+        if self.wipe_hold && !self.party_mostly_down() {
+            self.wipe_hold = false;
+        }
     }
 
     fn apply_player(&mut self, p: &PlayerInfo) {
@@ -5151,6 +5241,87 @@ mod tests {
             assert_eq!(row.dead_ms, Some(7_000));
         }
 
+        /// Issue #272/#339: a decoded `WorldNtf.NotifyReviveUser` closes the
+        /// dead interval at the *exact* revive moment, not at whatever
+        /// later timestamp this player happens to next act on — unlike
+        /// `a_death_and_the_next_action_bound_one_dead_interval` above,
+        /// nothing here depends on the player ever swinging again.
+        #[test]
+        fn a_death_and_an_explicit_revive_close_the_interval_exactly() {
+            let mut m = Meter::new();
+            m.apply(&dmg(2, 100, 1_000));
+            m.apply(&death_hit(1, 2, 2_000));
+            m.apply(&ProtocolEvent::Revive {
+                uid: 2,
+                timestamp_ms: 4_500,
+            });
+            let snap = m.snapshot(10_000);
+            let row = snap.rows.iter().find(|r| r.uid == 2).unwrap();
+            assert_eq!(
+                row.dead_ms,
+                Some(2_500),
+                "closed at the revive (4_500), not the snapshot clock"
+            );
+        }
+
+        /// Issue #272/#339: a `Revive` for a player never recorded dead is
+        /// a no-op — it must not open a row (`Meter::apply_revive`'s
+        /// `get_mut`, not `entry`) or otherwise disturb the roster.
+        #[test]
+        fn a_revive_without_a_prior_death_is_a_no_op() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Revive {
+                uid: 99,
+                timestamp_ms: 1_000,
+            });
+            let snap = m.snapshot(2_000);
+            assert!(snap.rows.iter().all(|r| r.uid != 99));
+
+            // A known-but-never-dead player's revive is equally a no-op on
+            // their dead time.
+            let mut m2 = Meter::new();
+            m2.apply(&dmg(2, 100, 1_000));
+            m2.apply(&ProtocolEvent::Revive {
+                uid: 2,
+                timestamp_ms: 1_500,
+            });
+            let snap2 = m2.snapshot(2_000);
+            assert_eq!(
+                snap2.rows.iter().find(|r| r.uid == 2).unwrap().dead_ms,
+                Some(0)
+            );
+        }
+
+        /// Issue #339/#272: `AttrState`'s decoded dead value drives the same
+        /// death machinery `DamageEvent::is_dead` does, and its alive value
+        /// closes the interval exactly like `Revive`.
+        #[test]
+        fn attr_state_dead_then_alive_closes_the_interval_exactly() {
+            let mut m = Meter::new();
+            m.apply(&dmg(2, 100, 1_000));
+            m.apply(&ProtocolEvent::EntityState {
+                uid: 2,
+                kind: EntityKind::Player,
+                is_dead: true,
+                timestamp_ms: 2_000,
+            });
+            let snap = m.snapshot(3_000);
+            assert_eq!(
+                snap.rows.iter().find(|r| r.uid == 2).unwrap().deaths,
+                1,
+                "AttrState dead counts as a death"
+            );
+            m.apply(&ProtocolEvent::EntityState {
+                uid: 2,
+                kind: EntityKind::Player,
+                is_dead: false,
+                timestamp_ms: 4_500,
+            });
+            let snap = m.snapshot(10_000);
+            let row = snap.rows.iter().find(|r| r.uid == 2).unwrap();
+            assert_eq!(row.dead_ms, Some(2_500));
+        }
+
         /// Two deaths in one pull sum, rather than the second overwriting
         /// the first.
         #[test]
@@ -6647,6 +6818,42 @@ mod tests {
             assert_eq!(m.snapshot(60_000).duration_ms, 1_000);
         }
 
+        /// Issue #339/#272: a recognized boss's decoded `AttrState` going
+        /// dead ends the fight exactly like `SyncDamageInfo.is_dead` or an
+        /// HP sync to 0 already do — see `Meter::apply_entity_state`'s
+        /// monster arm.
+        #[test]
+        fn a_recognized_boss_attr_state_dead_ends_the_fight_immediately() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0, false));
+            m.apply(&hp(10, 50, Some(103), 0)); // 103 = a catalogued boss
+            m.apply(&ProtocolEvent::EntityState {
+                uid: 10,
+                kind: EntityKind::Monster,
+                is_dead: true,
+                timestamp_ms: 1_000,
+            });
+
+            assert_eq!(m.fight_state(1_100), FightState::Ended);
+            assert_eq!(m.snapshot(60_000).duration_ms, 1_000);
+        }
+
+        /// The same signal for an enemy this meter has never otherwise seen
+        /// (no prior `EnemyHp`) is dropped rather than fabricating an
+        /// enemy row from nothing — mirrors `apply_enemy_gone`'s
+        /// `self.enemies.get(&uid)` guard.
+        #[test]
+        fn attr_state_dead_for_an_unseen_enemy_does_nothing() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::EntityState {
+                uid: 999,
+                kind: EntityKind::Monster,
+                is_dead: true,
+                timestamp_ms: 1_000,
+            });
+            assert_eq!(m.fight_state(1_100), FightState::Idle);
+        }
+
         #[test]
         fn a_trash_mob_dying_does_not_end_the_fight() {
             let mut m = Meter::new();
@@ -7405,6 +7612,33 @@ mod tests {
             assert_eq!(r, None);
             assert_eq!(m.snapshot(21_000).total_damage, 10_000);
             assert_eq!(m.fight_state(21_000), FightState::Ended);
+        }
+
+        /// Issue #339/#272: an explicit revive is evidence the wipe hold
+        /// didn't have before this issue — enough of the roster coming
+        /// back up (`party_mostly_down` reading false again) lifts the
+        /// hold early, rather than making the next real fight wait for
+        /// `WIPE_HOLD_RELEASE_MS` or a hit on the recognized boss.
+        #[test]
+        fn reviving_enough_of_the_party_releases_the_wipe_hold() {
+            let mut m = wiped();
+            assert!(m.wipe_hold, "sanity: the wipe latched a hold");
+            // One of the two players revives — `party_mostly_down`'s 80%
+            // threshold no longer holds for a 2-player roster with only one
+            // down.
+            m.apply(&ProtocolEvent::Revive {
+                uid: 1,
+                timestamp_ms: 6_500,
+            });
+            assert!(!m.wipe_hold, "enough of the roster is back up");
+
+            // The hold no longer applies: an ordinary trash hit now reads as
+            // the start of the next fight instead of being silently folded
+            // into the frozen attempt (contrast
+            // `hitting_trash_during_the_wipe_hold_does_not_clear_the_held_rows`).
+            m.apply(&enemy_hp(ADD_UID, 50_000, TRASH, 7_000));
+            let r = m.apply(&hit(1, ADD_UID, 900, 7_500));
+            assert_eq!(r, Some(ResetReason::NewFight));
         }
 
         #[test]
