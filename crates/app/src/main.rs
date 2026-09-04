@@ -313,11 +313,21 @@ fn main() -> eframe::Result {
     let (tx_events, rx_events) = bounded::<ProtocolEvent>(EVENT_CAPACITY);
     let (tx_command, rx_command) = bounded::<UiCommand>(COMMAND_CAPACITY);
 
-    // Opt-in packet-inspection diagnostics (issue #25 slice A, opt-in default
-    // since issue #122); `None` unless `SHINRA_INSPECT` opts in (see
-    // `inspect::enabled`), in which case `start_capture` below wires the
-    // sink into its decoder.
-    let inspect_handle = inspect::init();
+    // Loaded once, here, rather than inside `OverlayApp::new`: issue #27
+    // needs this same value before `OverlayApp` exists, to seed
+    // `ui::viewport`'s starting position, so the single load is hoisted up
+    // to cover both uses instead of loading twice — and the history thread
+    // needs the retention policy before the pipeline is spawned (issue #39).
+    // Also needed by `inspect::init` below (issue #346), which is why this
+    // moved ahead of it.
+    let settings = settings::load();
+
+    // Packet-inspection diagnostics (issue #25 slice A; on by default since
+    // issue #346, now that `settings.dump_sanitize` keeps a shared dump
+    // free of player names/ids — `SHINRA_INSPECT=0`/`false`/`off` still
+    // opts out, see `inspect::enabled`), in which case `start_capture`
+    // below wires the sink into its decoder.
+    let inspect_handle = inspect::init(settings.dump_sanitize);
     let inspect_sink = inspect_handle.as_ref().map(|h| Arc::clone(&h.sink));
 
     // Capture is best-effort: on failure `tx_events` is dropped, the pipeline
@@ -329,13 +339,6 @@ fn main() -> eframe::Result {
             (StatusLine::Error(err.user_message().to_string()), None)
         }
     };
-
-    // Loaded once, here, rather than inside `OverlayApp::new`: issue #27
-    // needs this same value before `OverlayApp` exists, to seed
-    // `ui::viewport`'s starting position, so the single load is hoisted up
-    // to cover both uses instead of loading twice — and the history thread
-    // needs the retention policy before the pipeline is spawned (issue #39).
-    let settings = settings::load();
 
     // Issue #39: `None` when history is switched off in settings.json, or when
     // the database cannot be opened (already logged by `HistoryHandle::spawn`) —

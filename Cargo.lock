@@ -21,6 +21,7 @@ dependencies = [
  "image",
  "log",
  "pollster",
+ "prost",
  "raw-window-handle",
  "rusqlite",
  "serde",
