@@ -25,6 +25,12 @@ way `main.rs` wires it.
   damage), a server change landing in a *new* dungeon mid-pull, a party wipe
   followed by a re-pull, a world boss holding a pull open through a long
   lull, and a curated multi-phase boss transition.
+- `crates/app/tests/replay_scenarios_2.rs` — issue #342's second batch: a
+  monster uid recycled onto an unrelated boss for the next pull, a
+  dungeon's own enter/leave flow signals (`SyncDungeonData`) alongside an
+  ordinary scene change out to the open world, two dungeons pulled back to
+  back with no open-world stop in between, and an app shutdown (the whole
+  `Pipeline`/`HistoryHandle` dropped, no explicit flush) mid-pull.
 
 Each synthetic scenario is built from the `Scenario`/`Step` DSL in
 `crates/test-support/src/scenario.rs` (byte payloads via

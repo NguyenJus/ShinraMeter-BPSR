@@ -1,0 +1,15 @@
+scenario=uid_recycle_pull2_denvel_fresh
+at_ms=120000
+fight_state=Active
+duration_ms=1
+total_damage=35000
+total_dps=35000.00
+encounter.boss_monster_id=3000063
+encounter.boss_name=Denvel
+encounter.is_boss=true
+encounter.scene_id=1101
+encounter.scene_name=Towering Ruin
+encounter.scene_boss_name=-
+resets=NewFight@120000
+rows=1
+row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=35000 dps=35000.00 share=100.00 crit=0.00 lucky=0.00 hits=1 deaths=0
