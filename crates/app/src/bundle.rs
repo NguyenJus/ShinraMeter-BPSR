@@ -5,12 +5,15 @@
 //! in it, so an agent can find every bug in the session without the
 //! maintainer's help.
 //!
-//! `history.sqlite` is deliberately never part of the bundle: it holds
-//! plaintext party-member names (`crate::history`'s module doc comment),
-//! and handing that over as part of a routine bug report is not something
-//! this export does silently — [`Manifest::excluded`] says so explicitly,
-//! rather than a reader having to notice the file is simply missing and
-//! guess why.
+//! The raw `history.sqlite` is deliberately never part of the bundle: it
+//! holds plaintext party-member names (`crate::history`'s module doc
+//! comment), and handing that over as part of a routine bug report is not
+//! something this export does silently — [`Manifest::excluded`] says so
+//! explicitly, rather than a reader having to notice the file is simply
+//! missing and guess why. A sanitized copy (issue #347,
+//! `crate::history::sanitize::sanitize_copy`, `history.sanitized.sqlite`)
+//! with names replaced by stable pseudonyms is included in its place —
+//! see [`Manifest::sanitized_history_included`].
 //!
 //! Mirrors `logging::export_logs_to`'s shape (best-effort per file: a
 //! partially-written bundle is more useful to whoever's debugging than
@@ -37,11 +40,22 @@ pub(crate) const EXPORT_BUNDLE_DEFAULT_DIRNAME: &str = "ShinraMeter-BPSR-session
 /// the history database over.
 pub(crate) const HISTORY_FILE_NAME: &str = "history.sqlite";
 
-/// Why `history.sqlite` never appears in a bundle — surfaced verbatim in
-/// `manifest.json`'s `excluded` list so a reader never has to guess whether
-/// the omission was deliberate or a bug in the export.
-pub(crate) const HISTORY_EXCLUSION_REASON: &str =
-    "holds plaintext party member names; never leaves this machine as part of a bug report";
+/// The name a sanitized history copy (issue #347, `crate::history::sanitize`)
+/// gets inside the bundle directory — never [`HISTORY_FILE_NAME`] itself, so
+/// the "a bundle never contains `history.sqlite`" guarantee
+/// [`bundle_entries`] enforces for its own sources stays true regardless of
+/// this file sitting right next to it.
+pub(crate) const SANITIZED_HISTORY_FILE_NAME: &str = "history.sanitized.sqlite";
+
+/// Why the *raw* `history.sqlite` never appears in a bundle — surfaced
+/// verbatim in `manifest.json`'s `excluded` list so a reader never has to
+/// guess whether the omission was deliberate or a bug in the export. A
+/// sanitized copy with real names replaced by stable pseudonyms
+/// ([`SANITIZED_HISTORY_FILE_NAME`]) is included in its place when history
+/// export is requested and a history database exists — see
+/// [`Manifest::sanitized_history_included`].
+pub(crate) const HISTORY_EXCLUSION_REASON: &str = "holds plaintext party member names; the raw file never leaves this machine — a sanitized \
+     copy with names replaced by stable pseudonyms is included instead, see sanitized_history_included";
 
 /// One entry in `manifest.json`'s `excluded` list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -83,6 +97,13 @@ pub struct Manifest {
     /// silently came up a file short is exactly the thing a reader must not
     /// have to guess at.
     pub missing: Vec<String>,
+    /// Whether [`SANITIZED_HISTORY_FILE_NAME`] was written into this bundle
+    /// (issue #347) — `false` when the caller asked to skip history
+    /// entirely, when no history database exists yet (a fresh install), or
+    /// when sanitizing it failed. Filled in by [`export_bundle_to`] for the
+    /// same reason [`Manifest::missing`] is: only the copy/sanitize step
+    /// knows.
+    pub sanitized_history_included: bool,
 }
 
 /// Builds `manifest.json`'s contents — pure, so it's unit-tested without
@@ -112,6 +133,8 @@ pub fn build_manifest(
         }],
         // Only `export_bundle_to`'s copy loop can know this.
         missing: Vec::new(),
+        // Only `export_bundle_to`'s sanitize step can know this.
+        sanitized_history_included: false,
     }
 }
 
@@ -223,10 +246,22 @@ pub fn bundle_entries(
 /// [`dump_ring_parts`] listed can be renamed out from under `fs::copy`
 /// milliseconds later, and "the bundle is one chunk short" is a very
 /// different thing to hand a debugger than "the ring was that short".
+///
+/// `history_source`, when `Some` and `include_history` is `true`, is run
+/// through `crate::history::sanitize::sanitize_copy` (issue #347) into
+/// `dest_dir/`[`SANITIZED_HISTORY_FILE_NAME`] — the one way `history.sqlite`
+/// data ever reaches a bundle, real names replaced by stable pseudonyms.
+/// `include_history` exists so a future settings toggle (or a caller that
+/// simply has no history database, e.g. history disabled in settings) can
+/// skip it outright; every current caller passes `true`. A missing source
+/// file or a sanitize failure is logged and left out of the bundle, same
+/// as any other best-effort entry — it does not fail the whole export.
 pub fn export_bundle_to(
     dest_dir: &Path,
     entries: &[(String, PathBuf)],
     manifest: &Manifest,
+    history_source: Option<&Path>,
+    include_history: bool,
 ) -> io::Result<Vec<String>> {
     fs::create_dir_all(dest_dir)?;
     let mut missing = Vec::new();
@@ -241,11 +276,39 @@ pub fn export_bundle_to(
             missing.push(name.clone());
         }
     }
+
+    let sanitized_history_included = match (include_history, history_source) {
+        (true, Some(history_source)) => {
+            let dest = dest_dir.join(SANITIZED_HISTORY_FILE_NAME);
+            match crate::history::sanitize::sanitize_copy(history_source, &dest) {
+                Ok(report) => {
+                    log::info!(
+                        "session bundle: sanitized {} encounter(s), {} player row(s) into {}",
+                        report.encounters,
+                        report.players_remapped,
+                        dest.display()
+                    );
+                    true
+                }
+                Err(err) => {
+                    log::warn!(
+                        "session bundle: failed to sanitize {} into {}: {err}",
+                        history_source.display(),
+                        dest.display()
+                    );
+                    false
+                }
+            }
+        }
+        _ => false,
+    };
+
     // The manifest handed in was built before the copies ran, so it can't
     // know what didn't land: written out with this run's failures folded
     // in, leaving the caller's copy untouched.
     let manifest = Manifest {
         missing: missing.clone(),
+        sanitized_history_included,
         ..manifest.clone()
     };
     let json = serde_json::to_string_pretty(&manifest)
@@ -483,7 +546,7 @@ mod tests {
         let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None);
         let entries = vec![("session.log".to_string(), source.clone())];
 
-        let missing = export_bundle_to(&dir, &entries, &manifest).unwrap();
+        let missing = export_bundle_to(&dir, &entries, &manifest, None, true).unwrap();
 
         assert!(missing.is_empty());
         assert_eq!(fs::read(dir.join("session.log")).unwrap(), b"log contents");
@@ -521,7 +584,7 @@ mod tests {
         fs::remove_file(&evicted).unwrap();
 
         let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, true, 100, Some(0));
-        let missing = export_bundle_to(&dir, &entries, &manifest).unwrap();
+        let missing = export_bundle_to(&dir, &entries, &manifest, None, true).unwrap();
 
         assert_eq!(missing, vec!["dump.jsonl.1".to_string()]);
         assert_eq!(fs::read(dir.join("dump.jsonl")).unwrap(), b"live chunk");
@@ -558,7 +621,7 @@ mod tests {
 
         let entries = bundle_entries(&[history.clone(), log.clone()], &[], None);
         let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None);
-        let missing = export_bundle_to(&dir, &entries, &manifest).unwrap();
+        let missing = export_bundle_to(&dir, &entries, &manifest, None, true).unwrap();
 
         assert!(missing.is_empty());
         assert!(
@@ -588,10 +651,139 @@ mod tests {
         let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, true, 100, Some(0));
         let entries = vec![("dump.jsonl".to_string(), missing)];
 
-        let missing_names = export_bundle_to(&dir, &entries, &manifest).unwrap();
+        let missing_names = export_bundle_to(&dir, &entries, &manifest, None, true).unwrap();
 
         assert_eq!(missing_names, vec!["dump.jsonl".to_string()]);
         assert!(!dir.join("dump.jsonl").exists());
+        assert!(dir.join("manifest.json").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- history sanitizing (issue #347) -----------------------------------
+
+    fn seeded_history_db(tag: &str) -> PathBuf {
+        use bpsr_meter::Class;
+
+        use crate::history::sqlite::SqliteHistory;
+        use crate::history::{EncounterRecord, HistoryStore, PlayerRecord, RetentionPolicy};
+
+        let path = std::env::temp_dir().join(format!(
+            "ShinraMeter-BPSR-bundle-history-db-{tag}-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let mut store = SqliteHistory::open(&path, RetentionPolicy::default()).unwrap();
+        store
+            .insert(&EncounterRecord {
+                ended_at_ms: 1_000,
+                duration_ms: 10_000,
+                total_damage: 10_000,
+                total_dps: 1_000.0,
+                boss_monster_id: Some(7),
+                boss_name: Some("Boss".to_string()),
+                is_boss: true,
+                scene_id: Some(3),
+                scene_name: Some("Scene".to_string()),
+                title: "Boss".to_string(),
+                subtitle: Some("Scene".to_string()),
+                meter_version: "0.2.2".to_string(),
+                players: vec![PlayerRecord {
+                    uid: 1,
+                    name: "Alice".to_string(),
+                    class: Some(Class::FrostMage),
+                    ability_score: Some(999),
+                    season_strength: Some(42),
+                    imagines: [None, None],
+                    imagine_tiers: [None, None],
+                    damage: 5_000,
+                    dps: 500.0,
+                    share_pct: 100.0,
+                    crit_pct: 12.5,
+                    lucky_pct: 6.25,
+                    hits: 40,
+                    deaths: 0,
+                    skills: Vec::new(),
+                }],
+            })
+            .unwrap();
+        path
+    }
+
+    /// End to end over `export_bundle_to`'s history-sanitizing step: a real
+    /// `history.sqlite` handed in as `history_source` lands in the bundle
+    /// as `history.sanitized.sqlite` with its player name gone, the raw
+    /// file itself never appears, and the manifest says sanitizing
+    /// happened.
+    #[test]
+    fn export_bundle_to_includes_a_sanitized_history_copy_by_default() {
+        let dir = std::env::temp_dir().join(format!(
+            "ShinraMeter-BPSR-bundle-export-sanitize-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let history_db = seeded_history_db("include");
+
+        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None);
+        let missing = export_bundle_to(&dir, &[], &manifest, Some(&history_db), true).unwrap();
+
+        assert!(missing.is_empty());
+        assert!(!dir.join(HISTORY_FILE_NAME).exists());
+        let sanitized_path = dir.join(SANITIZED_HISTORY_FILE_NAME);
+        assert!(sanitized_path.exists());
+        let contents = fs::read(&sanitized_path).unwrap();
+        assert!(
+            !contents.windows(5).any(|w| w == b"Alice"),
+            "sanitized copy must not contain the real player name"
+        );
+        let manifest_json = fs::read_to_string(dir.join("manifest.json")).unwrap();
+        assert!(manifest_json.contains("\"sanitized_history_included\": true"));
+
+        let _ = fs::remove_file(&history_db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_bundle_to_skips_history_when_include_history_is_false() {
+        let dir = std::env::temp_dir().join(format!(
+            "ShinraMeter-BPSR-bundle-export-sanitize-off-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let history_db = seeded_history_db("excluded");
+
+        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None);
+        export_bundle_to(&dir, &[], &manifest, Some(&history_db), false).unwrap();
+
+        assert!(!dir.join(SANITIZED_HISTORY_FILE_NAME).exists());
+        let manifest_json = fs::read_to_string(dir.join("manifest.json")).unwrap();
+        assert!(manifest_json.contains("\"sanitized_history_included\": false"));
+
+        let _ = fs::remove_file(&history_db);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh install with no history database yet must not fail the
+    /// whole export — sanitizing is simply skipped, same as any other
+    /// best-effort entry that isn't there.
+    #[test]
+    fn export_bundle_to_tolerates_a_missing_history_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "ShinraMeter-BPSR-bundle-export-sanitize-missing-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let missing_history = std::env::temp_dir().join(format!(
+            "ShinraMeter-BPSR-bundle-no-such-history-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&missing_history);
+
+        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None);
+        let missing = export_bundle_to(&dir, &[], &manifest, Some(&missing_history), true).unwrap();
+
+        assert!(missing.is_empty());
+        assert!(!dir.join(SANITIZED_HISTORY_FILE_NAME).exists());
         assert!(dir.join("manifest.json").exists());
 
         let _ = fs::remove_dir_all(&dir);

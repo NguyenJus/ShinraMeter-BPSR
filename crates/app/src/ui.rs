@@ -5046,8 +5046,10 @@ fn draw_header_menu(
             // needs to find a bug without the maintainer's help, in one folder
             // rather than the log-only file "Export logs" above hands over.
             // `crate::bundle`'s module doc comment has the full shape;
-            // `history.sqlite` is deliberately never included (it holds
-            // plaintext party member names) and `manifest.json` says so.
+            // the raw `history.sqlite` is deliberately never included (it
+            // holds plaintext party member names) — a sanitized copy with
+            // stable pseudonyms in place of names is included instead
+            // (issue #347), and `manifest.json` says so either way.
             //
             // Same dialog-inline / copy-on-a-spawned-thread split as "Export
             // logs" just above, and the same reply channel (see this module's
@@ -5448,7 +5450,19 @@ fn start_bundle_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
                 crate::inspect::dropped_count(),
             );
 
-            let outcome = match bundle::export_bundle_to(&dest, &entries, &manifest) {
+            // Issue #347: `true` — a sanitized copy is included by default,
+            // since it is the only way `history.sqlite` data reaches a
+            // bundle at all (`export_bundle_to`'s doc comment). No settings
+            // toggle exists yet to turn it off; the parameter is there for
+            // when one does.
+            let history_source = crate::history::history_db_path();
+            let outcome = match bundle::export_bundle_to(
+                &dest,
+                &entries,
+                &manifest,
+                Some(&history_source),
+                true,
+            ) {
                 Ok(missing) => Ok((dest, missing)),
                 Err(err) => Err((dest, err.to_string())),
             };
