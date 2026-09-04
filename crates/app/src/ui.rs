@@ -5446,11 +5446,13 @@ fn start_bundle_export(dest: PathBuf, include_history: bool, tx: Sender<LogExpor
                 session_id,
                 env!("CARGO_PKG_VERSION"),
                 bundle::started_at_from_session_id(session_id),
-                inspect_enabled,
-                crate::dump::max_total_ring_bytes(),
-                crate::inspect::dropped_count(),
-                dump_sanitized,
-                crate::inspect::sanitized_out_count(),
+                bundle::DumpStatus {
+                    inspect_enabled,
+                    dump_byte_budget: crate::dump::max_total_ring_bytes(),
+                    dropped_records: crate::inspect::dropped_count(),
+                    dump_sanitized,
+                    sanitized_out_records: crate::inspect::sanitized_out_count(),
+                },
             );
 
             // Issue #347: the bundle follows `Settings::history_enabled` —

@@ -135,18 +135,34 @@ pub struct Manifest {
     pub sanitized_history_included: bool,
 }
 
+/// The packet-inspection/dump-ring half of `manifest.json`'s fields,
+/// grouped into one value so [`build_manifest`] doesn't take one parameter
+/// per field (clippy's `too_many_arguments`) — every field here mirrors the
+/// identically-named [`Manifest`] field it fills in.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DumpStatus {
+    pub inspect_enabled: bool,
+    pub dump_byte_budget: u64,
+    pub dropped_records: Option<u64>,
+    pub dump_sanitized: bool,
+    pub sanitized_out_records: Option<u64>,
+}
+
 /// Builds `manifest.json`'s contents — pure, so it's unit-tested without
 /// touching a real session, the filesystem, or the global logger.
 pub fn build_manifest(
     session_id: &str,
     app_version: &str,
     started_at_unix_secs: u64,
-    inspect_enabled: bool,
-    dump_byte_budget: u64,
-    dropped_records: Option<u64>,
-    dump_sanitized: bool,
-    sanitized_out_records: Option<u64>,
+    dump: DumpStatus,
 ) -> Manifest {
+    let DumpStatus {
+        inspect_enabled,
+        dump_byte_budget,
+        dropped_records,
+        dump_sanitized,
+        sanitized_out_records,
+    } = dump;
     let mut excluded = vec![ExcludedFile {
         name: HISTORY_FILE_NAME.to_string(),
         reason: HISTORY_EXCLUSION_REASON.to_string(),
@@ -374,11 +390,13 @@ mod tests {
             "1234-1700000000",
             "0.2.6",
             1_700_000_000,
-            true,
-            512 * 1024 * 1024,
-            Some(7),
-            true,
-            Some(3),
+            DumpStatus {
+                inspect_enabled: true,
+                dump_byte_budget: 512 * 1024 * 1024,
+                dropped_records: Some(7),
+                dump_sanitized: true,
+                sanitized_out_records: Some(3),
+            },
         );
         assert_eq!(manifest.session_id, "1234-1700000000");
         assert_eq!(manifest.app_version, "0.2.6");
@@ -402,11 +420,13 @@ mod tests {
             "1234-1700000000",
             "0.2.6",
             1_700_000_000,
-            true,
-            512 * 1024 * 1024,
-            Some(7),
-            false,
-            None,
+            DumpStatus {
+                inspect_enabled: true,
+                dump_byte_budget: 512 * 1024 * 1024,
+                dropped_records: Some(7),
+                dump_sanitized: false,
+                sanitized_out_records: None,
+            },
         );
         assert!(!manifest.dump_sanitized);
         assert_eq!(manifest.excluded.len(), 2);
@@ -425,11 +445,13 @@ mod tests {
             "1234-1700000000",
             "0.2.6",
             1_700_000_000,
-            false,
-            512 * 1024 * 1024,
-            Some(7),
-            false,
-            None,
+            DumpStatus {
+                inspect_enabled: false,
+                dump_byte_budget: 512 * 1024 * 1024,
+                dropped_records: Some(7),
+                dump_sanitized: false,
+                sanitized_out_records: None,
+            },
         );
         assert!(!manifest.inspect_enabled);
         assert_eq!(manifest.dump_byte_budget, 0);
@@ -442,18 +464,31 @@ mod tests {
             "1234-1700000000",
             "0.2.6",
             1_700_000_000,
-            true,
-            100,
-            None,
-            true,
-            None,
+            DumpStatus {
+                inspect_enabled: true,
+                dump_byte_budget: 100,
+                dropped_records: None,
+                dump_sanitized: true,
+                sanitized_out_records: None,
+            },
         );
         assert_eq!(manifest.dropped_records, None);
     }
 
     #[test]
     fn build_manifest_always_lists_history_sqlite_as_excluded() {
-        let manifest = build_manifest("1-1", "0.0.0", 0, false, 0, None, false, None);
+        let manifest = build_manifest(
+            "1-1",
+            "0.0.0",
+            0,
+            DumpStatus {
+                inspect_enabled: false,
+                dump_byte_budget: 0,
+                dropped_records: None,
+                dump_sanitized: false,
+                sanitized_out_records: None,
+            },
+        );
         assert_eq!(manifest.excluded.len(), 1);
         assert_eq!(manifest.excluded[0].name, "history.sqlite");
     }
@@ -631,11 +666,13 @@ mod tests {
             "1-1700000000",
             "0.2.6",
             1_700_000_000,
-            false,
-            0,
-            None,
-            false,
-            None,
+            DumpStatus {
+                inspect_enabled: false,
+                dump_byte_budget: 0,
+                dropped_records: None,
+                dump_sanitized: false,
+                sanitized_out_records: None,
+            },
         );
         let entries = vec![("session.log".to_string(), source.clone())];
 
@@ -680,11 +717,13 @@ mod tests {
             "1-1700000000",
             "0.2.6",
             1_700_000_000,
-            true,
-            100,
-            Some(0),
-            true,
-            None,
+            DumpStatus {
+                inspect_enabled: true,
+                dump_byte_budget: 100,
+                dropped_records: Some(0),
+                dump_sanitized: true,
+                sanitized_out_records: None,
+            },
         );
         let missing = export_bundle_to(&dir, &entries, &manifest, None, true).unwrap();
 
@@ -726,11 +765,13 @@ mod tests {
             "1-1700000000",
             "0.2.6",
             1_700_000_000,
-            false,
-            0,
-            None,
-            false,
-            None,
+            DumpStatus {
+                inspect_enabled: false,
+                dump_byte_budget: 0,
+                dropped_records: None,
+                dump_sanitized: false,
+                sanitized_out_records: None,
+            },
         );
         let missing = export_bundle_to(&dir, &entries, &manifest, None, true).unwrap();
 
@@ -763,11 +804,13 @@ mod tests {
             "1-1700000000",
             "0.2.6",
             1_700_000_000,
-            true,
-            100,
-            Some(0),
-            true,
-            None,
+            DumpStatus {
+                inspect_enabled: true,
+                dump_byte_budget: 100,
+                dropped_records: Some(0),
+                dump_sanitized: true,
+                sanitized_out_records: None,
+            },
         );
         let entries = vec![("dump.jsonl".to_string(), missing)];
 
@@ -848,11 +891,13 @@ mod tests {
             "1-1700000000",
             "0.2.6",
             1_700_000_000,
-            false,
-            0,
-            None,
-            false,
-            None,
+            DumpStatus {
+                inspect_enabled: false,
+                dump_byte_budget: 0,
+                dropped_records: None,
+                dump_sanitized: false,
+                sanitized_out_records: None,
+            },
         );
         let missing = export_bundle_to(&dir, &[], &manifest, Some(&history_db), true).unwrap();
 
@@ -885,11 +930,13 @@ mod tests {
             "1-1700000000",
             "0.2.6",
             1_700_000_000,
-            false,
-            0,
-            None,
-            false,
-            None,
+            DumpStatus {
+                inspect_enabled: false,
+                dump_byte_budget: 0,
+                dropped_records: None,
+                dump_sanitized: false,
+                sanitized_out_records: None,
+            },
         );
         export_bundle_to(&dir, &[], &manifest, Some(&history_db), false).unwrap();
 
@@ -921,11 +968,13 @@ mod tests {
             "1-1700000000",
             "0.2.6",
             1_700_000_000,
-            false,
-            0,
-            None,
-            false,
-            None,
+            DumpStatus {
+                inspect_enabled: false,
+                dump_byte_budget: 0,
+                dropped_records: None,
+                dump_sanitized: false,
+                sanitized_out_records: None,
+            },
         );
         let missing = export_bundle_to(&dir, &[], &manifest, Some(&missing_history), true).unwrap();
 
@@ -957,11 +1006,13 @@ mod tests {
             "1-1700000000",
             "0.2.6",
             1_700_000_000,
-            false,
-            0,
-            None,
-            false,
-            None,
+            DumpStatus {
+                inspect_enabled: false,
+                dump_byte_budget: 0,
+                dropped_records: None,
+                dump_sanitized: false,
+                sanitized_out_records: None,
+            },
         );
         let missing = export_bundle_to(&dir, &[], &manifest, Some(&corrupt_history), true).unwrap();
 
