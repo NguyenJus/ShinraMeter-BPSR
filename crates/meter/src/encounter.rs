@@ -1,5 +1,14 @@
 //! Encounter state machine: routes protocol events into per-player stats and
 //! produces the UI-facing `Snapshot` (plan §T2.1/T2.2).
+//!
+//! Where the *fight* is in its lifecycle — running, ended, held after a
+//! wipe — is stored in one place, [`Meter::lifecycle`]'s
+//! [`crate::fight::FightLifecycle`], and moved only by that type's named
+//! transitions (issue #336 step 3). Read it through the accessors
+//! (`fight_start_ms`, `fight_end_ms`, `is_held`, `fight_end_cause`, …) or
+//! through the `now_ms`-relative [`Meter::lifecycle`]/[`Meter::fight_state`]
+//! views, which additionally fold in the idle-timeout end that
+//! [`Meter::fight_ended_at`] derives before anything latches it.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -7,7 +16,7 @@ use crate::event::{
     CastEvent, Class, DamageEvent, DisappearReason, EDungeonState, EnemyHp, EntityKind, PlayerInfo,
     ProtocolEvent,
 };
-use crate::fight::{FightConfig, FightEndCause, FightState, HoldKind, Lifecycle};
+use crate::fight::{FightConfig, FightEndCause, FightLifecycle, FightState, HoldKind, Lifecycle};
 use crate::phase;
 use crate::reset::{EnemyState, ResetConfig, ResetReason, check_hp_rollback};
 use crate::stats::{
@@ -306,7 +315,6 @@ pub struct Meter {
     /// backs the recency order returned by [`Meter::names_for_save`].
     names_seq: u64,
     enemies: HashMap<i64, EnemyState>,
-    fight_start_ms: Option<u64>,
     /// Timestamp of the most recent event seen (damage or enemy-hp). Used as
     /// the DPS-window end and as the reference point for the boss-HP-rollback
     /// cooldown gate.
@@ -336,91 +344,31 @@ pub struct Meter {
     /// real combat (`NewFight`) or that dungeon's own `Playing` packet
     /// (`DungeonStarted`) eventually caught it, sometimes minutes later.
     last_known_scene_id: Option<u32>,
-    /// When the current fight ended, if it has (issue #78). `Some(t)` puts
-    /// the meter in [`FightState::Ended`]: the snapshot is rendered as of
-    /// `t` rather than the caller's `now_ms`, so rows, totals and the
-    /// elapsed timer all hold still until the next fight (or a manual reset
-    /// / server change) clears them. Latched by an explicit end signal (a
-    /// boss death) or by [`Meter::tick`] once the idle timeout has elapsed;
-    /// cleared by `reset`.
-    fight_end_ms: Option<u64>,
-    /// When the fight end recorded in `fight_end_ms` was actually *latched*
-    /// — i.e. the argument `now_ms`/`d.timestamp_ms` the call into
-    /// [`Meter::latch_fight_end`] carried — as opposed to `fight_end_ms`
-    /// itself, which for an idle-timeout end is the last *player* hit, not
-    /// "now" (issue #316).
+    /// Where this encounter is in the fight lifecycle (issue #336 step 3),
+    /// and the only place that answer is stored.
     ///
-    /// Those two used to be the same value everywhere `phase_resume_window_ms`
-    /// read from, and that coupling made phase resumption structurally
-    /// unreachable for a recognized boss's idle-timeout end: idle detection
-    /// is suppressed for as long as [`Meter::engaged_boss_still_up`] holds
-    /// (up to [`BOSS_ENGAGEMENT_WINDOW_MS`] past the last hit), so by the
-    /// time the end is actually observed and latched, `fight_end_ms` is
-    /// already `BOSS_ENGAGEMENT_WINDOW_MS` in the past — and at stock config
-    /// the two windows are equal, leaving zero budget for
-    /// `FightConfig::phase_resume_window_ms` to ever still be open.
-    /// Anchoring the resume window on *this* field instead — when the end
-    /// was observed, not when the fight clock says it happened — fixes that
-    /// without touching either window's size or default. `ServerChanged`,
-    /// `Wipe`, `BossDeath` and `DungeonEnded` ends are all latched
-    /// immediately (their `end_ms` already *is* "now"), so this only ever
-    /// diverges from `fight_end_ms` on the idle-timeout path.
+    /// Replaces six separate fields — `fight_start_ms`, `fight_end_ms`,
+    /// `fight_end_observed_ms`, `fight_end_boss_id`, `fight_end_cause` and
+    /// `wipe_hold` — which between them could spell states no code path
+    /// could produce (an end time with no start, a phase-resume arming with
+    /// no end, a wipe hold on a running fight), leaving every guard in this
+    /// file to re-establish by hand that it was not looking at one. Each of
+    /// those fields now lives on the [`FightLifecycle`] arm that owns it,
+    /// and every former write site is a named transition rather than a
+    /// store — see that type's doc comment for the legal set, and for why
+    /// an illegal one logs at `debug` and no-ops instead of panicking.
     ///
-    /// Cleared everywhere `fight_end_ms` is.
-    fight_end_observed_ms: Option<u64>,
-    /// The monster id whose death latched `fight_end_ms`, if that is what
-    /// ended the fight (issue #124). This is what arms phase resumption: a
-    /// dungeon's final boss can move through several phases, each a distinct
-    /// monster id whose predecessor really dies, and the first hit on the
-    /// next phase must resume the held fight rather than reset it.
-    ///
-    /// Also set by an idle-timeout end (issue #316), naming whichever
-    /// recognized boss this fight had engaged and not seen die — see
-    /// [`Meter::engaged_boss_monster_id`]. Before #316 this was left `None`
-    /// on that path, on the theory that walking away from a pull and coming
-    /// back to a same-family boss should start a new fight; in practice a
-    /// recognized boss's idle-timeout end is only reachable once
-    /// `engaged_boss_still_up` releases it, which already means the party
-    /// hasn't touched it in `BOSS_ENGAGEMENT_WINDOW_MS` — leaving this
-    /// unarmed made every idle-timeout end on a phased boss indistinguishable
-    /// from truly walking away, so a mid-transition hit on the next phase
-    /// (immunity phase, add wave, cutscene) reset the encounter instead of
-    /// continuing it. Cleared by `reset` (and so by the `ServerChanged`
-    /// path, which resets first), and by `ServerChanged`/dungeon-entry
-    /// directly wherever `enemies` is cleared (issue #316) — those clear the
-    /// map `Self::target_monster_id` reads to decide whether a post-reconnect
-    /// hit is a phase change, and a stale armed id there withheld every hit
-    /// until the window lapsed on its own.
-    fight_end_boss_id: Option<u32>,
-    /// Whether the fight was ended by a **party wipe** and the attempt is
-    /// being held for review (issue #154). A wipe is the end of a pull, not
-    /// a reset: the rows freeze exactly as they do on a boss kill, and this
-    /// flag is what makes the hold ignore *everything* until the party is
-    /// truly re-engaged — the boss's bar refilling, its swings at the
-    /// corpses, an AoE tick clipping an add on the run-back. Only a player
-    /// damaging a recognized boss again lifts it, through the ordinary
-    /// `NewFight` path (see `withholds_after_wipe`) — or, once the attempt
-    /// has been held for [`WIPE_HOLD_RELEASE_MS`], any player damage at all,
-    /// so a re-pull the meter cannot recognize can never wedge the hold open
-    /// forever (issue #204).
-    ///
-    /// Cleared by `reset` — so by that same `NewFight` — and by a server
-    /// change, which invalidates the entity state the re-engagement test
-    /// reads and hands the hold back to issue #78's ordinary rule.
-    wipe_hold: bool,
-    /// Why the fight recorded in `fight_end_ms` ended, if it has (issue
-    /// #336 step 2). Set exactly once per latch, alongside `fight_end_ms`,
-    /// by [`Meter::latch_fight_end`] — the only place a [`FightEndCause`]
-    /// is ever known — and cleared everywhere `fight_end_ms` is: `reset`
-    /// and the phase-resume branch of `apply_damage`.
-    ///
-    /// Before this field existed, [`Meter::fight_end_cause`] could only
-    /// recover a wipe from the still-live `wipe_hold` flag; every other
-    /// cause was logged once by `latch_fight_end` and then lost. This
-    /// stores the value itself instead of re-deriving a lossy subset of it,
-    /// so the accessor (and `Lifecycle::Ended`'s `cause`) can report every
-    /// variant faithfully.
-    fight_end_cause: Option<FightEndCause>,
+    /// The accessors below ([`Self::fight_start_ms`],
+    /// [`Self::fight_end_ms`], [`Self::fight_end_observed_ms`],
+    /// [`Self::fight_end_boss_id`], [`Self::fight_end_cause`],
+    /// [`Self::is_held`], [`Self::hold_kind`]) are unchanged in name,
+    /// signature and meaning; they pattern-match this instead of reading a
+    /// field. [`Self::fight_state`] and [`Self::lifecycle`] stay
+    /// `now_ms`-relative on top of it, because the idle-timeout end is
+    /// still *derived* ([`Self::fight_ended_at`]) rather than latched at
+    /// the instant it becomes true — a caller that only ever calls
+    /// `snapshot` must still see the hold.
+    lifecycle: FightLifecycle,
     /// Identity of the fight currently on the board (issue #152): the
     /// recognized boss it is against and the scene it is being fought in,
     /// captured while the fight is *live* by `recompute_boss`.
@@ -516,17 +464,12 @@ impl Meter {
             names: HashMap::new(),
             names_seq: 0,
             enemies: HashMap::new(),
-            fight_start_ms: None,
             last_event_ms: 0,
             last_reset_ms: None,
             boss_uid: None,
             scene_id: None,
             last_known_scene_id: None,
-            fight_end_ms: None,
-            fight_end_observed_ms: None,
-            fight_end_boss_id: None,
-            wipe_hold: false,
-            fight_end_cause: None,
+            lifecycle: FightLifecycle::Idle,
             fight_identity: None,
             deaths_seen: 0,
             reset_cfg: ResetConfig::default(),
@@ -873,7 +816,7 @@ impl Meter {
     /// deterministic. Callers persisting this as a timestamp are relying on that
     /// and on nothing else.
     pub fn fight_end_ms(&self) -> Option<u64> {
-        self.fight_end_ms
+        self.lifecycle.end_ms()
     }
 
     /// When the currently-running (or currently-held) fight started, in the
@@ -888,7 +831,7 @@ impl Meter {
     /// `bpsr_app::pipeline::Pipeline::record_fight_end` is exactly that
     /// caller.
     pub fn fight_start_ms(&self) -> Option<u64> {
-        self.fight_start_ms
+        self.lifecycle.start_ms()
     }
 
     /// The monster id whose death latched the currently-held fight's end,
@@ -897,29 +840,30 @@ impl Meter {
     /// field doc for the full arming story. `None` while a fight is
     /// running, or once it ended some other way.
     fn fight_end_boss_id(&self) -> Option<u32> {
-        self.fight_end_boss_id
+        self.lifecycle.phase_resume_boss_id()
     }
 
     /// When the currently-held fight's end was actually latched, as
     /// opposed to when it happened (`fight_end_ms`) — see the
     /// `fight_end_observed_ms` field doc for why those two can diverge.
     fn fight_end_observed_ms(&self) -> Option<u64> {
-        self.fight_end_observed_ms
+        self.lifecycle.end_observed_ms()
     }
 
     /// Whether the current (or most recently held) fight ended in a party
-    /// wipe that is still being held open for a possible re-pull — the raw
-    /// `wipe_hold` flag, with no [`WIPE_HOLD_RELEASE_MS`] time check (see
-    /// [`Self::wipe_hold_released`] for that half). Cleared by `reset` and
-    /// by leaving the instance, same as the flag itself.
+    /// wipe that is still being held open for a possible re-pull — the
+    /// hold `FightLifecycle` carries, with no [`WIPE_HOLD_RELEASE_MS`]
+    /// time check (see [`Self::wipe_hold_released`] for that half).
+    /// Cleared by `reset` and by leaving the instance, same as the hold
+    /// itself.
     pub fn is_held(&self) -> bool {
-        self.wipe_hold
+        self.lifecycle.hold_kind().is_some()
     }
 
     /// Which hold, if any, [`Self::is_held`] names. Only one exists today
     /// (issue #336): [`HoldKind::Wipe`].
     pub fn hold_kind(&self) -> Option<HoldKind> {
-        self.is_held().then_some(HoldKind::Wipe)
+        self.lifecycle.hold_kind()
     }
 
     /// Why the currently-held (or most recently ended) fight ended — the
@@ -934,7 +878,7 @@ impl Meter {
     /// every [`FightEndCause`] variant survives to this point, not only the
     /// one the wipe hold happens to also track.
     pub fn fight_end_cause(&self) -> Option<FightEndCause> {
-        self.fight_end_cause
+        self.lifecycle.end_cause()
     }
 
     /// Whether a fight is currently running, as of `now_ms` — the `Active`
@@ -1232,7 +1176,7 @@ impl Meter {
                         // withheld by `withholds_new_fight` until the window
                         // lapsed on its own, dropping every event in
                         // between. Mirrors the `ServerChanged` arm below.
-                        self.fight_end_boss_id = None;
+                        self.lifecycle.disarm_phase_resume();
                         self.clear_dungeon_instance_state();
                     }
 
@@ -1257,7 +1201,7 @@ impl Meter {
                     // destination whose reset *did* run has already had it
                     // cleared by `reset` itself.
                     if !tables::is_dungeon_scene(*level_map_id) {
-                        self.wipe_hold = false;
+                        self.lifecycle.release_hold();
                     }
                 }
                 self.scene_id = Some(*level_map_id);
@@ -1320,7 +1264,7 @@ impl Meter {
                 // (and every one after it) as "undecided" until the resume
                 // window expired on its own, instead of starting the next
                 // fight immediately.
-                self.fight_end_boss_id = None;
+                self.lifecycle.disarm_phase_resume();
                 // issue #139: as invalid across a reconnect as
                 // `enemies`/`boss_uid` — the new server session may not
                 // even land back in the same dungeon, let alone the same
@@ -1337,7 +1281,7 @@ impl Meter {
                 // recognize anything. Leaving the instance hands the hold
                 // back to issue #78's ordinary rule, where the next real
                 // hit clears it.
-                self.wipe_hold = false;
+                self.lifecycle.release_hold();
 
                 None
             }
@@ -1603,10 +1547,7 @@ impl Meter {
         // `ProtocolEvent::EnemyHp`, so looking it up here sees exactly what
         // looking it up after the bookkeeping would.
         if self.resumes_held_fight(d) {
-            self.fight_end_ms = None;
-            self.fight_end_observed_ms = None;
-            self.fight_end_boss_id = None;
-            self.fight_end_cause = None;
+            self.lifecycle.resume();
         }
 
         // Real combat activity — a player landing a hit — is the *only*
@@ -1732,7 +1673,7 @@ impl Meter {
                     d.timestamp_ms,
                     self.boss_monster_id(),
                 );
-                self.wipe_hold = true;
+                self.lifecycle.hold(HoldKind::Wipe);
             }
         }
 
@@ -1812,7 +1753,7 @@ impl Meter {
         self.last_event_ms = self.last_event_ms.max(d.timestamp_ms);
 
         if self.fight_start_ms().is_none() {
-            self.fight_start_ms = Some(d.timestamp_ms);
+            self.lifecycle.start(d.timestamp_ms);
         }
 
         self.accumulate_damage_stats(d);
@@ -1842,8 +1783,9 @@ impl Meter {
     ///   And the enemy/boss bookkeeping (`took_damage`, `recompute_boss`,
     ///   `end_fight_on_boss_death`, the wipe latch) is skipped outright:
     ///   `end_fight_on_boss_death` already no-ops once `fight_end_ms` is
-    ///   `Some`, but the wipe latch's `self.wipe_hold = true` does not, and
-    ///   letting a grace-window player death set it would change what
+    ///   `Some`, but the wipe latch's `FightLifecycle::hold` does not (an
+    ///   ended fight is exactly the state it is legal in), and letting a
+    ///   grace-window player death take it would change what
     ///   `withholds_after_wipe` sees on the *next* genuinely new fight —
     ///   exactly the "same inputs" invariant this window must not disturb.
     fn apply_damage_grace(&mut self, d: &DamageEvent) -> Option<ResetReason> {
@@ -1975,7 +1917,12 @@ impl Meter {
         let objective_holds = self.dungeon_objective_still_running();
         if other_boss.is_none() && !objective_holds {
             self.latch_fight_end(FightEndCause::BossDeath, now_ms, now_ms, monster_id);
-            self.fight_end_boss_id = monster_id;
+            // issue #210/#211: *this* dying boss's id, which is why the
+            // arming is a separate transition rather than something
+            // `latch_fight_end` works out for itself — `boss_uid` may
+            // already have moved onto a living boss this very death
+            // promoted.
+            self.lifecycle.arm_phase_resume(monster_id);
             return;
         }
         // issue #256: the two guards above are the *only* way a recognized
@@ -2061,12 +2008,13 @@ impl Meter {
     ///
     /// Every path that ends a fight goes through here — boss death, idle
     /// timeout, party wipe, server change — so the line fires exactly once
-    /// per fight end: a fight already latched returns untouched, which is
-    /// also what makes the repeated "pin the end" calls in `apply_damage`
-    /// and `tick` idempotent. That same guard is why an `IdleTimeout` end
-    /// arming `fight_end_boss_id` below is safe to do unconditionally here
-    /// rather than at each of its two call sites: it only ever runs on the
-    /// call that performs the actual latch.
+    /// per fight end: a fight already latched is left untouched by
+    /// [`FightLifecycle::end`], which is also what makes the repeated "pin
+    /// the end" calls in `apply_damage` and `tick` idempotent. That same
+    /// refusal is why an `IdleTimeout` end arming phase resumption below
+    /// is safe to do unconditionally here rather than at each of its two
+    /// call sites: it only ever runs on the call that performs the actual
+    /// latch.
     fn latch_fight_end(
         &mut self,
         cause: FightEndCause,
@@ -2074,19 +2022,25 @@ impl Meter {
         observed_ms: u64,
         boss_monster_id: Option<u32>,
     ) {
-        if self.fight_end_ms().is_some() {
-            return;
-        }
-        self.fight_end_ms = Some(end_ms);
-        self.fight_end_observed_ms = Some(observed_ms);
-        self.fight_end_cause = Some(cause);
         // issue #316: arm phase resumption on an idle-timeout end too, not
         // only a boss death. `end_fight_on_boss_death` names the dying
         // boss's own uid because `boss_uid` may already have moved on by the
         // time it runs; nothing has moved on here, so the currently engaged
         // recognized boss is the right (and only sensible) answer.
-        if cause == FightEndCause::IdleTimeout {
-            self.fight_end_boss_id = self.engaged_boss_monster_id();
+        let armed = match cause {
+            FightEndCause::IdleTimeout => self.engaged_boss_monster_id(),
+            _ => None,
+        };
+        // Issue #336 step 3: the `FightLifecycle::Active` -> `Ended`
+        // transition is what makes this idempotent now — it refuses an
+        // end on an already-ended fight, which is what the removed
+        // `fight_end_ms().is_some()` early return used to do, and
+        // additionally refuses one on a fight that never started (every
+        // caller already guards for that; none of them has to be trusted
+        // to). The log line is below the transition so it still fires
+        // exactly once per fight end.
+        if !self.lifecycle.end(end_ms, observed_ms, cause, armed) {
+            return;
         }
         log::info!("{}", fight_end_log(cause, boss_monster_id));
     }
@@ -3049,7 +3003,7 @@ impl Meter {
                         e.timestamp_ms,
                         self.boss_monster_id(),
                     );
-                    self.wipe_hold = true;
+                    self.lifecycle.hold(HoldKind::Wipe);
                 }
                 // issue #78: while the last fight's stats are held, a boss HP
                 // bar refilling (the corpse resyncing, or the next party
@@ -3296,26 +3250,21 @@ impl Meter {
             // `recompute_boss`. `apply_enemy_hp` clears the rank instead,
             // when a sync above zero shows the entity actually respawned.
         }
-        self.fight_start_ms = None;
         // issue #152: the held fight's identity is released with the hold
         // itself, never before it and never after — every reset reason below
         // is also a reason the header should follow live state again.
         self.fight_identity = None;
         // Every reset reason (manual, boss-HP rollback, server change, and
-        // the next fight's first hit) drops the post-fight hold: the numbers
-        // being held belong to the encounter that is being cleared.
-        self.fight_end_ms = None;
-        self.fight_end_observed_ms = None;
-        // ...and with it the phase-resume arming (issue #124): the fight
-        // whose boss died is gone, so nothing can be a continuation of it.
-        self.fight_end_boss_id = None;
-        // ...and its recorded cause (issue #336 step 2): a stale cause
-        // surviving a reset would misreport whatever ends the *next* fight
-        // until that fight's own end latches a fresh one.
-        self.fight_end_cause = None;
-        // ...and the wipe hold (issue #154): the attempt it was protecting
-        // is what just got cleared.
-        self.wipe_hold = false;
+        // the next fight's first hit) drops the whole fight lifecycle back
+        // to `Idle`: the fight clock, the frozen end and its cause, the
+        // phase-resume arming (issue #124 — the fight whose boss died is
+        // gone, so nothing can be a continuation of it) and the wipe hold
+        // (issue #154 — the attempt it was protecting is what just got
+        // cleared) all belong to the encounter being cleared. One
+        // transition rather than six stores, which is exactly the
+        // cleared-only-some-of-them defect class issue #336 step 3
+        // removes.
+        self.lifecycle.reset();
         self.last_reset_ms = Some(now_ms);
         // No enemy has `took_damage` anymore, so this clears `boss_uid`.
         // Otherwise a stale `boss_uid` from the previous pull would still
@@ -7011,7 +6960,7 @@ mod tests {
             // (issue #210/#211) — past that bound an untouched boss reads as
             // abandoned rather than as a lull, pair or not.
             m.apply(&boss_hit(10, 2_000, true));
-            assert_eq!(m.fight_end_ms, None, "the pull is not over");
+            assert_eq!(m.fight_end_ms(), None, "the pull is not over");
             assert_eq!(m.fight_state(2_000 + 6 * idle()), FightState::Active);
 
             // ...and once the twin falls too, the fight ends on the kill.
@@ -7817,8 +7766,8 @@ mod tests {
             m.apply(&killing_blow(1, 2_000));
             m.apply(&killing_blow(2, 2_500));
 
-            assert_eq!(m.fight_end_ms, None, "no wipe latch outside an instance");
-            assert!(!m.wipe_hold, "and no hold to have to lift");
+            assert_eq!(m.fight_end_ms(), None, "no wipe latch outside an instance");
+            assert!(!m.is_held(), "and no hold to have to lift");
             assert_eq!(m.fight_state(3_000), FightState::Active);
         }
 
@@ -8178,7 +8127,8 @@ mod tests {
                 m.apply(&killing_blow(uid, 5_000 + uid as u64 * 100));
             }
             assert_eq!(
-                m.fight_end_ms, None,
+                m.fight_end_ms(),
+                None,
                 "four of five down is not the unanimous wipe the death path demands, \
                  which is exactly why this case used to be lost"
             );
@@ -8190,11 +8140,11 @@ mod tests {
                 "the attempt is ended and kept, not thrown away as a reset"
             );
             assert_eq!(
-                m.fight_end_ms,
+                m.fight_end_ms(),
                 Some(6_000),
                 "latched as a wipe at the rollback"
             );
-            assert!(m.wipe_hold, "held for review like any other wipe");
+            assert!(m.is_held(), "held for review like any other wipe");
             assert_eq!(m.fight_state(6_500), FightState::Ended);
             assert_eq!(
                 m.snapshot(6_500).total_damage,
@@ -8218,7 +8168,7 @@ mod tests {
             let reason = m.apply(&rollback(6_000));
 
             assert_eq!(reason, Some(ResetReason::BossHpRollback));
-            assert_eq!(m.fight_end_ms, None, "a reset, not a fight end");
+            assert_eq!(m.fight_end_ms(), None, "a reset, not a fight end");
             assert_eq!(m.snapshot(6_500).total_damage, 0);
         }
     }
@@ -8289,7 +8239,7 @@ mod tests {
                 "the kill should end the fight immediately"
             );
             assert_eq!(
-                m.fight_end_boss_id,
+                m.fight_end_boss_id(),
                 Some(ORIGIN),
                 "cause=boss_death: only end_fight_on_boss_death ever sets this"
             );
@@ -8335,7 +8285,8 @@ mod tests {
             let far_later = 1_000 + BOSS_ENGAGEMENT_WINDOW_MS + idle() + 1;
             assert_eq!(m.fight_state(far_later), FightState::Ended);
             assert_eq!(
-                m.fight_end_boss_id, None,
+                m.fight_end_boss_id(),
+                None,
                 "an idle-timeout end, not a boss-death end"
             );
         }
@@ -8382,11 +8333,11 @@ mod tests {
             m.apply(&hit(10, kill_ts, true));
 
             assert_eq!(
-                m.fight_end_ms,
+                m.fight_end_ms(),
                 Some(kill_ts),
                 "Origin's death must still end the fight"
             );
-            assert_eq!(m.fight_end_boss_id, Some(ORIGIN));
+            assert_eq!(m.fight_end_boss_id(), Some(ORIGIN));
         }
 
         #[test]
@@ -8424,7 +8375,8 @@ mod tests {
             m.apply(&hit(10, 2_000, true));
 
             assert_eq!(
-                m.fight_end_ms, None,
+                m.fight_end_ms(),
+                None,
                 "the twin is still up and recently engaged"
             );
             assert_eq!(m.fight_state(2_100), FightState::Active);
@@ -8562,11 +8514,11 @@ mod tests {
 
             assert_eq!(reason, None, "a despawn never reports a reset itself");
             assert_eq!(
-                m.fight_end_ms,
+                m.fight_end_ms(),
                 Some(1_000),
                 "stamped at the last real damage, not at the despawn packet"
             );
-            assert_eq!(m.fight_end_boss_id, Some(ORIGIN));
+            assert_eq!(m.fight_end_boss_id(), Some(ORIGIN));
             assert_eq!(m.fight_state(2_000), FightState::Ended);
             assert!(
                 !m.enemies[&BOSS_UID].is_alive(),
@@ -8586,7 +8538,7 @@ mod tests {
 
             m.apply(&gone(BOSS_UID));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert_eq!(m.fight_state(1_100), FightState::Active);
             assert!(m.enemies[&BOSS_UID].is_alive());
         }
@@ -8601,7 +8553,7 @@ mod tests {
 
             m.apply(&gone(BOSS_UID));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert!(m.enemies[&BOSS_UID].is_alive());
         }
 
@@ -8615,7 +8567,7 @@ mod tests {
 
             m.apply(&gone(BOSS_UID));
 
-            assert_eq!(m.fight_end_ms, Some(1_000));
+            assert_eq!(m.fight_end_ms(), Some(1_000));
         }
 
         #[test]
@@ -8630,7 +8582,7 @@ mod tests {
 
             m.apply(&gone(BOSS_UID));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert!(m.enemies[&BOSS_UID].is_alive());
         }
 
@@ -8644,7 +8596,7 @@ mod tests {
 
             m.apply(&gone(BOSS_UID));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert!(m.enemies[&BOSS_UID].is_alive());
         }
 
@@ -8659,7 +8611,7 @@ mod tests {
 
             m.apply(&gone(OTHER_UID));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert!(m.enemies[&OTHER_UID].is_alive());
         }
 
@@ -8678,7 +8630,7 @@ mod tests {
 
             m.apply(&gone(OTHER_UID));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert!(m.enemies[&OTHER_UID].is_alive());
             assert_eq!(m.fight_state(1_300), FightState::Active);
         }
@@ -8702,7 +8654,7 @@ mod tests {
 
             m.apply(&gone(BOSS_UID));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert!(m.enemies[&BOSS_UID].is_alive());
         }
 
@@ -8724,13 +8676,13 @@ mod tests {
                 timestamp_ms: 2_000,
                 ..Default::default()
             }));
-            assert_eq!(m.fight_end_ms, Some(2_000));
+            assert_eq!(m.fight_end_ms(), Some(2_000));
             let rank = m.enemies[&BOSS_UID].death_order;
             let seen = m.deaths_seen;
 
             m.apply(&gone(BOSS_UID));
 
-            assert_eq!(m.fight_end_ms, Some(2_000));
+            assert_eq!(m.fight_end_ms(), Some(2_000));
             assert_eq!(m.enemies[&BOSS_UID].death_order, rank);
             assert_eq!(m.deaths_seen, seen, "the corpse must not die twice");
         }
@@ -8742,7 +8694,7 @@ mod tests {
 
             m.apply(&gone(9_999));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert_eq!(m.enemies.len(), before, "no phantom enemy row");
         }
 
@@ -8756,7 +8708,7 @@ mod tests {
 
             m.apply(&gone(BOSS_UID));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert!(m.enemies[&BOSS_UID].is_alive());
         }
 
@@ -8785,7 +8737,7 @@ mod tests {
                  the guard downstream of that, not about refusing the despawn"
             );
             assert!(m.enemies[&OTHER_UID].is_alive());
-            assert_eq!(m.fight_end_ms, None, "the twin is still being fought");
+            assert_eq!(m.fight_end_ms(), None, "the twin is still being fought");
             assert_eq!(m.fight_state(1_200), FightState::Active);
         }
 
@@ -8817,7 +8769,8 @@ mod tests {
                  the guard downstream of that, not about refusing the despawn"
             );
             assert_eq!(
-                m.fight_end_ms, None,
+                m.fight_end_ms(),
+                None,
                 "the instance's own objective says the run is still going"
             );
             assert_eq!(m.fight_state(1_600), FightState::Active);
@@ -8842,7 +8795,7 @@ mod tests {
 
             m.apply(&gone(BOSS_UID));
 
-            assert_eq!(m.fight_end_ms, Some(1_000));
+            assert_eq!(m.fight_end_ms(), Some(1_000));
             assert_eq!(m.fight_state(1_600), FightState::Ended);
         }
 
@@ -8867,11 +8820,11 @@ mod tests {
 
             assert_eq!(reason, None, "a despawn never reports a reset itself");
             assert_eq!(
-                m.fight_end_ms,
+                m.fight_end_ms(),
                 Some(1_000),
                 "stamped at the last real damage, exactly as the #215 path is"
             );
-            assert_eq!(m.fight_end_boss_id, Some(ORIGIN));
+            assert_eq!(m.fight_end_boss_id(), Some(ORIGIN));
             assert_eq!(m.fight_state(2_000), FightState::Ended);
             assert!(!m.enemies[&BOSS_UID].is_alive());
         }
@@ -8891,7 +8844,7 @@ mod tests {
 
             m.apply(&gone_because(BOSS_UID, DisappearReason::Dead));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert!(m.enemies[&BOSS_UID].is_alive());
         }
 
@@ -8908,7 +8861,8 @@ mod tests {
             m.apply(&gone_because(BOSS_UID, DisappearReason::Destroy));
 
             assert_eq!(
-                m.fight_end_ms, None,
+                m.fight_end_ms(),
+                None,
                 "the server said eviction, which outranks our HP inference"
             );
             assert!(m.enemies[&BOSS_UID].is_alive());
@@ -8924,7 +8878,7 @@ mod tests {
 
             m.apply(&gone_because(BOSS_UID, DisappearReason::TransferLeave));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert!(m.enemies[&BOSS_UID].is_alive());
         }
 
@@ -8937,7 +8891,7 @@ mod tests {
                 DisappearReason::TransferPassLineLeave,
             ));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert!(m.enemies[&BOSS_UID].is_alive());
         }
 
@@ -8950,7 +8904,7 @@ mod tests {
 
             m.apply(&gone_because(BOSS_UID, DisappearReason::Normal));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert!(m.enemies[&BOSS_UID].is_alive());
         }
 
@@ -8963,7 +8917,7 @@ mod tests {
 
             m.apply(&gone_because(BOSS_UID, DisappearReason::Unknown(99)));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert!(m.enemies[&BOSS_UID].is_alive());
         }
 
@@ -8977,7 +8931,7 @@ mod tests {
 
             m.apply(&gone_because(OTHER_UID, DisappearReason::Dead));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert!(m.enemies[&OTHER_UID].is_alive());
         }
 
@@ -8991,7 +8945,7 @@ mod tests {
 
             m.apply(&gone_because(BOSS_UID, DisappearReason::Dead));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert!(m.enemies[&BOSS_UID].is_alive());
         }
 
@@ -9004,7 +8958,7 @@ mod tests {
             let mut low = pull();
             low.apply(&gone(BOSS_UID));
             assert_eq!(
-                low.fight_end_ms,
+                low.fight_end_ms(),
                 Some(1_000),
                 "3% of the bar, no reason given: the heuristic still fires"
             );
@@ -9014,7 +8968,8 @@ mod tests {
             full.apply(&hit(BOSS_UID, 1_000));
             full.apply(&gone(BOSS_UID));
             assert_eq!(
-                full.fight_end_ms, None,
+                full.fight_end_ms(),
+                None,
                 "full bar, no reason given: still a range-out"
             );
         }
@@ -9054,12 +9009,12 @@ mod tests {
             m.apply(&gone(BOSS_UID));
 
             assert_eq!(
-                m.fight_end_ms,
+                m.fight_end_ms(),
                 Some(1_000),
                 "the selection's death ends the fight at the last hit"
             );
             assert_eq!(
-                m.fight_end_boss_id,
+                m.fight_end_boss_id(),
                 Some(ORIGIN),
                 "a boss-death end -- only `end_fight_on_boss_death` sets this, \
                  so an idle-timeout end would leave it `None`"
@@ -9237,7 +9192,7 @@ mod tests {
                 !m.enemies[&BOSS_UID].is_alive(),
                 "the despawn itself was still read as a death"
             );
-            assert_eq!(m.fight_end_ms, None, "the twin is still being fought");
+            assert_eq!(m.fight_end_ms(), None, "the twin is still being fought");
             assert_eq!(m.fight_state(1_300), FightState::Active);
         }
     }
@@ -9310,7 +9265,7 @@ mod tests {
 
             m.apply(&hit(10, 100, 300, true));
 
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
             assert_eq!(m.fight_state(400), FightState::Active);
         }
 
@@ -9327,7 +9282,7 @@ mod tests {
             m.apply(&hit(11, 100, 200, true));
             m.apply(&hit(10, 100, 300, true));
 
-            assert_eq!(m.fight_end_ms, Some(300));
+            assert_eq!(m.fight_end_ms(), Some(300));
             assert_eq!(m.fight_state(400), FightState::Ended);
         }
 
@@ -9342,7 +9297,7 @@ mod tests {
             m.apply(&hit(10, 100, 100, false));
             m.apply(&hit(10, 100, 300, true));
 
-            assert_eq!(m.fight_end_ms, Some(300));
+            assert_eq!(m.fight_end_ms(), Some(300));
         }
 
         #[test]
@@ -9369,7 +9324,7 @@ mod tests {
             m.apply(&hit(10, 100, 300, true));
 
             assert_eq!(m.boss_uid, Some(10), "the other boss is unrankable");
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_end_ms(), None);
         }
 
         // -- Part B: resume across a latched end ----------------------------
@@ -9382,7 +9337,7 @@ mod tests {
             m.apply(&hit(10, 500, 1_000, true));
             // Nothing else was damaged, so the kill does latch the end.
             assert_eq!(m.fight_state(1_100), FightState::Ended);
-            assert_eq!(m.fight_end_boss_id, Some(ORIGIN));
+            assert_eq!(m.fight_end_boss_id(), Some(ORIGIN));
 
             // The next phase spawns afterwards, so it had no `took_damage`
             // when the previous one died — Part A cannot see it, and only the
@@ -9391,9 +9346,13 @@ mod tests {
             let reason = m.apply(&hit(11, 700, 21_000, false));
 
             assert_eq!(reason, None, "a phase change is not a new fight");
-            assert_eq!(m.fight_start_ms, Some(100), "the fight clock keeps running");
-            assert_eq!(m.fight_end_ms, None);
-            assert_eq!(m.fight_end_boss_id, None);
+            assert_eq!(
+                m.fight_start_ms(),
+                Some(100),
+                "the fight clock keeps running"
+            );
+            assert_eq!(m.fight_end_ms(), None);
+            assert_eq!(m.fight_end_boss_id(), None);
             assert_eq!(m.fight_state(21_100), FightState::Active);
             assert_eq!(
                 m.snapshot(21_100).total_damage,
@@ -9416,7 +9375,7 @@ mod tests {
             let reason = m.apply(&hit(11, 700, 21_000, false));
 
             assert_eq!(reason, Some(ResetReason::NewFight));
-            assert_eq!(m.fight_start_ms, Some(21_000));
+            assert_eq!(m.fight_start_ms(), Some(21_000));
             assert_eq!(m.snapshot(21_100).total_damage, 700);
         }
 
@@ -9449,7 +9408,7 @@ mod tests {
             let reason = m.apply(&hit(11, 700, edge, false));
 
             assert_eq!(reason, None);
-            assert_eq!(m.fight_start_ms, Some(100));
+            assert_eq!(m.fight_start_ms(), Some(100));
         }
 
         #[test]
@@ -9479,7 +9438,7 @@ mod tests {
                 "idle timeout latches once engagement lapses"
             );
             assert_eq!(
-                m.fight_end_boss_id,
+                m.fight_end_boss_id(),
                 Some(ORIGIN),
                 "the engaged boss must be recorded so phase resume can arm"
             );
@@ -9491,9 +9450,13 @@ mod tests {
                 reason, None,
                 "a phase change on an idle-timed-out boss resumes the held fight"
             );
-            assert_eq!(m.fight_start_ms, Some(100), "the fight clock keeps running");
-            assert_eq!(m.fight_end_ms, None);
-            assert_eq!(m.fight_end_boss_id, None);
+            assert_eq!(
+                m.fight_start_ms(),
+                Some(100),
+                "the fight clock keeps running"
+            );
+            assert_eq!(m.fight_end_ms(), None);
+            assert_eq!(m.fight_end_boss_id(), None);
             assert_eq!(m.fight_state(observed + 200), FightState::Active);
             assert_eq!(
                 m.snapshot(observed + 200).total_damage,
@@ -9535,7 +9498,7 @@ mod tests {
             m.apply(&hit(10, 100, 100, false));
             assert_eq!(m.snapshot(100).encounter.boss_monster_id, Some(ORIGIN));
             m.apply(&hit(10, 100, 1_000, true));
-            assert_eq!(m.fight_end_boss_id, Some(ORIGIN));
+            assert_eq!(m.fight_end_boss_id(), Some(ORIGIN));
 
             m.apply(&hp(11, 1_000, 1_000, CONTINUATION, 5_000));
             m.apply(&hit(11, 100, 5_000, false));
@@ -9545,12 +9508,12 @@ mod tests {
                 "the header follows the living phase, not the bigger corpse"
             );
             m.apply(&hit(11, 100, 6_000, true));
-            assert_eq!(m.fight_end_boss_id, Some(CONTINUATION));
+            assert_eq!(m.fight_end_boss_id(), Some(CONTINUATION));
 
             m.apply(&hp(12, 500, 500, FINAL, 10_000));
             m.apply(&hit(12, 100, 10_000, false));
             assert_eq!(m.snapshot(10_000).encounter.boss_monster_id, Some(FINAL));
-            assert_eq!(m.fight_start_ms, Some(100), "one encounter throughout");
+            assert_eq!(m.fight_start_ms(), Some(100), "one encounter throughout");
             assert_eq!(m.fight_state(10_100), FightState::Active);
 
             // The final phase's death latches through the ordinary
@@ -9558,7 +9521,7 @@ mod tests {
             // timeout — and the header holds on the phase just killed rather
             // than snapping back to the larger-max-hp corpse.
             m.apply(&hit(12, 100, 11_000, true));
-            assert_eq!(m.fight_end_ms, Some(11_000));
+            assert_eq!(m.fight_end_ms(), Some(11_000));
             assert_eq!(m.fight_state(11_100), FightState::Ended);
             assert_eq!(m.snapshot(11_100).encounter.boss_monster_id, Some(FINAL));
             assert_eq!(m.snapshot(11_100).total_damage, 600);
@@ -9635,20 +9598,20 @@ mod tests {
             m.apply(&hp(10, 900, 1_000, ORIGIN, 0));
             m.apply(&hit(10, 500, 100, false));
             m.apply(&hit(10, 500, 1_000, true));
-            assert_eq!(m.fight_end_boss_id, Some(ORIGIN));
+            assert_eq!(m.fight_end_boss_id(), Some(ORIGIN));
 
             m.apply(&hp(12, 100, 100, TRASH, 2_000));
             let reason = m.apply(&hit(12, 50, 3_000, false));
 
             assert_eq!(reason, None, "an add is not the next pull");
-            assert_eq!(m.fight_end_ms, Some(1_000), "the hold stays armed");
-            assert_eq!(m.fight_end_boss_id, Some(ORIGIN));
+            assert_eq!(m.fight_end_ms(), Some(1_000), "the hold stays armed");
+            assert_eq!(m.fight_end_boss_id(), Some(ORIGIN));
 
             // ...and the real next phase still resumes into the same fight.
             m.apply(&hp(11, 500, 500, CONTINUATION, 20_000));
             m.apply(&hit(11, 700, 21_000, false));
 
-            assert_eq!(m.fight_start_ms, Some(100));
+            assert_eq!(m.fight_start_ms(), Some(100));
             assert_eq!(m.snapshot(21_100).total_damage, 1_700);
         }
 
@@ -9667,13 +9630,13 @@ mod tests {
             let reason = m.apply(&hit(11, 700, 21_000, false));
 
             assert_eq!(reason, None, "an unidentified target decides nothing");
-            assert_eq!(m.fight_end_boss_id, Some(ORIGIN), "still resumable");
+            assert_eq!(m.fight_end_boss_id(), Some(ORIGIN), "still resumable");
 
             m.apply(&hp(11, 500, 500, CONTINUATION, 21_100));
             let reason = m.apply(&hit(11, 700, 21_200, false));
 
             assert_eq!(reason, None);
-            assert_eq!(m.fight_start_ms, Some(100));
+            assert_eq!(m.fight_start_ms(), Some(100));
             assert_eq!(
                 m.snapshot(21_300).total_damage,
                 1_700,
@@ -9706,8 +9669,8 @@ mod tests {
             }));
 
             assert_eq!(reason, None, "a miss is still the party engaging");
-            assert_eq!(m.fight_start_ms, Some(100));
-            assert_eq!(m.fight_end_ms, None);
+            assert_eq!(m.fight_start_ms(), Some(100));
+            assert_eq!(m.fight_end_ms(), None);
             assert_eq!(m.snapshot(21_100).total_damage, 1_000);
             assert_eq!(m.snapshot(21_100).rows[0].hits, 3);
         }
@@ -9727,7 +9690,7 @@ mod tests {
             let reason = m.apply(&hit(12, 50, late, false));
 
             assert_eq!(reason, Some(ResetReason::NewFight));
-            assert_eq!(m.fight_start_ms, Some(late));
+            assert_eq!(m.fight_start_ms(), Some(late));
             assert_eq!(m.snapshot(late + 100).total_damage, 50);
         }
 
@@ -9740,7 +9703,7 @@ mod tests {
             m.apply(&hp(10, 900, 1_000, OTHER_BOSS, 0));
             m.apply(&hit(10, 500, 100, false));
             m.apply(&hit(10, 500, 1_000, true));
-            assert_eq!(m.fight_end_boss_id, Some(OTHER_BOSS));
+            assert_eq!(m.fight_end_boss_id(), Some(OTHER_BOSS));
 
             m.apply(&hp(12, 100, 100, TRASH, 2_000));
             let reason = m.apply(&hit(12, 50, 3_000, false));
@@ -9766,20 +9729,20 @@ mod tests {
 
             let observed = 100 + BOSS_ENGAGEMENT_WINDOW_MS + 1;
             assert_eq!(m.tick(observed), FightState::Ended);
-            assert_eq!(m.fight_end_boss_id, Some(ORIGIN));
+            assert_eq!(m.fight_end_boss_id(), Some(ORIGIN));
 
             m.apply(&hp(12, 100, 100, TRASH, observed + 100));
             let reason = m.apply(&hit(12, 50, observed + 200, false));
 
             assert_eq!(reason, None, "an add is not the next pull");
-            assert_eq!(m.fight_end_ms, Some(100), "the hold stays armed");
-            assert_eq!(m.fight_end_boss_id, Some(ORIGIN));
+            assert_eq!(m.fight_end_ms(), Some(100), "the hold stays armed");
+            assert_eq!(m.fight_end_boss_id(), Some(ORIGIN));
 
             // ...and the real next phase still resumes into the same fight.
             m.apply(&hp(11, 500, 500, CONTINUATION, observed + 300));
             m.apply(&hit(11, 700, observed + 400, false));
 
-            assert_eq!(m.fight_start_ms, Some(100));
+            assert_eq!(m.fight_start_ms(), Some(100));
             assert_eq!(
                 m.snapshot(observed + 500).total_damage,
                 1_200,
@@ -9806,7 +9769,7 @@ mod tests {
             m.apply(&hit(10, 500, 100, false));
             m.apply(&hit(10, 500, 1_000, true));
             assert_eq!(
-                m.fight_end_boss_id,
+                m.fight_end_boss_id(),
                 Some(ORIGIN),
                 "sanity check: the kill armed the hold"
             );
@@ -9815,7 +9778,8 @@ mod tests {
                 timestamp_ms: 2_000,
             });
             assert_eq!(
-                m.fight_end_boss_id, None,
+                m.fight_end_boss_id(),
+                None,
                 "the reconnect must drop the stale arming"
             );
             assert_eq!(
@@ -9834,7 +9798,7 @@ mod tests {
                 Some(ResetReason::NewFight),
                 "must start the next fight, not sit withheld forever"
             );
-            assert_eq!(m.fight_start_ms, Some(2_100));
+            assert_eq!(m.fight_start_ms(), Some(2_100));
             assert_eq!(
                 m.snapshot(2_200).total_damage,
                 700,
@@ -9864,7 +9828,7 @@ mod tests {
             m.apply(&hit(10, 500, 100, false));
             m.apply(&hit(10, 500, 1_000, true));
             assert_eq!(
-                m.fight_end_boss_id,
+                m.fight_end_boss_id(),
                 Some(ORIGIN),
                 "sanity check: the kill armed the hold"
             );
@@ -9878,7 +9842,8 @@ mod tests {
                 "sanity check: this is the dungeon-to-dungeon transition"
             );
             assert_eq!(
-                m.fight_end_boss_id, None,
+                m.fight_end_boss_id(),
+                None,
                 "the dungeon-to-dungeon transition must drop the stale arming"
             );
 
@@ -9897,7 +9862,7 @@ mod tests {
                 reason, None,
                 "no reset fires here — the Scene arm's own reset already ran"
             );
-            assert_eq!(m.fight_start_ms, Some(2_100));
+            assert_eq!(m.fight_start_ms(), Some(2_100));
             assert_eq!(
                 m.snapshot(2_200).total_damage,
                 700,
@@ -9918,7 +9883,7 @@ mod tests {
             m.apply(&hp(10, 900, 1_000, ORIGIN, 0));
             m.apply(&hit(10, 100, 100, false));
             m.apply(&hit(10, 100, 200, true));
-            assert_eq!(m.fight_end_ms, Some(200));
+            assert_eq!(m.fight_end_ms(), Some(200));
             assert_eq!(m.enemies[&10].curr_hp, Some(900), "no sync ever hit 0");
 
             m.reset(ResetReason::Manual, 300);
@@ -9934,7 +9899,7 @@ mod tests {
             assert_eq!(m.boss_uid, Some(11), "the living boss keeps the header");
 
             m.apply(&hit(11, 100, 600, true));
-            assert_eq!(m.fight_end_ms, Some(600), "and its death still latches");
+            assert_eq!(m.fight_end_ms(), Some(600), "and its death still latches");
         }
 
         #[test]
@@ -9955,7 +9920,7 @@ mod tests {
 
             m.apply(&hit(10, 100, 500, false));
             m.apply(&hit(10, 100, 600, true));
-            assert_eq!(m.fight_end_ms, Some(600), "the re-pull ends on its kill");
+            assert_eq!(m.fight_end_ms(), Some(600), "the re-pull ends on its kill");
         }
 
         #[test]
@@ -9970,13 +9935,13 @@ mod tests {
             m.apply(&hit(10, 100, 100, false));
             m.apply(&hit(11, 100, 150, false));
             m.apply(&hit(10, 100, 200, true));
-            assert_eq!(m.fight_end_ms, None, "the other phase is still up");
+            assert_eq!(m.fight_end_ms(), None, "the other phase is still up");
 
             m.apply(&hp(10, 1_500, 2_000, ORIGIN, 250));
             assert!(!m.enemies[&10].is_alive(), "a resync is not a respawn");
 
             m.apply(&hit(11, 100, 300, true));
-            assert_eq!(m.fight_end_ms, Some(300));
+            assert_eq!(m.fight_end_ms(), Some(300));
         }
 
         // -- boss selection (issue #124 extends `recompute_boss`) -----------
@@ -9997,7 +9962,11 @@ mod tests {
 
             assert_eq!(m.boss_uid, Some(10));
             assert_eq!(m.snapshot(300).encounter.boss_monster_id, Some(ORIGIN));
-            assert_eq!(m.fight_end_ms, Some(200), "the add cannot block the latch");
+            assert_eq!(
+                m.fight_end_ms(),
+                Some(200),
+                "the add cannot block the latch"
+            );
         }
 
         #[test]
@@ -10406,7 +10375,7 @@ mod tests {
             m.apply(&ProtocolEvent::ServerChanged {
                 timestamp_ms: 2_000,
             });
-            assert_eq!(m.fight_end_ms, Some(2_000), "the fight is frozen");
+            assert_eq!(m.fight_end_ms(), Some(2_000), "the fight is frozen");
 
             assert!(
                 logged(&format!("cause=server_changed boss_monster_id={DIAG_BOSS}")),
@@ -10543,7 +10512,8 @@ mod tests {
             }));
 
             assert_eq!(
-                m.fight_end_ms, None,
+                m.fight_end_ms(),
+                None,
                 "the still-running objective must hold the fight open"
             );
             assert!(
