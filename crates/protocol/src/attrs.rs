@@ -919,7 +919,10 @@ mod tests {
             id: attr_id::MONSTER_ID,
             raw_data: varint(u64::from(u32::MAX) + 1),
         }];
-        assert_eq!(enemy_hp_from_attrs(mid(1), &attrs, 0, None).monster_id, None);
+        assert_eq!(
+            enemy_hp_from_attrs(mid(1), &attrs, 0, None).monster_id,
+            None
+        );
     }
 
     #[test]
@@ -954,7 +957,10 @@ mod tests {
             id: attr_id::FIGHT_POINT,
             raw_data: varint(0),
         }];
-        assert_eq!(player_info_from_attrs(pid(1), &attrs, None).ability_score, None);
+        assert_eq!(
+            player_info_from_attrs(pid(1), &attrs, None).ability_score,
+            None
+        );
     }
 
     #[test]
@@ -963,7 +969,10 @@ mod tests {
             id: attr_id::PROFESSION_ID,
             raw_data: varint(1),
         }];
-        assert_eq!(player_info_from_attrs(pid(1), &attrs, None).ability_score, None);
+        assert_eq!(
+            player_info_from_attrs(pid(1), &attrs, None).ability_score,
+            None
+        );
     }
 
     #[test]
@@ -972,7 +981,10 @@ mod tests {
             id: attr_id::FIGHT_POINT,
             raw_data: varint(0x1_0000_0001),
         }];
-        assert_eq!(player_info_from_attrs(pid(1), &attrs, None).ability_score, None);
+        assert_eq!(
+            player_info_from_attrs(pid(1), &attrs, None).ability_score,
+            None
+        );
     }
 
     #[test]

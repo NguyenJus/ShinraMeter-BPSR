@@ -162,16 +162,13 @@ impl EntityTable {
     pub fn observe(&mut self, uuid: i64, now_ms: u64) -> EntityId {
         let id = EntityId::from_uuid(uuid);
         let display_uid = id.display_uid();
-        if !self.entries.contains_key(&id) {
-            self.entries.insert(
-                id,
-                EntityRecord {
-                    kind: id.kind(),
-                    display_uid,
-                    first_seen_ms: now_ms,
-                    monster_id: None,
-                },
-            );
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.entries.entry(id) {
+            slot.insert(EntityRecord {
+                kind: id.kind(),
+                display_uid,
+                first_seen_ms: now_ms,
+                monster_id: None,
+            });
             self.order.push_back(id);
             self.evict_if_full();
         }
@@ -396,7 +393,11 @@ mod tests {
         assert_eq!(table.len(), MAX_ENTITIES);
         // The first ten are gone; the newest are still there.
         assert_eq!(table.live_for_display_uid(0), None);
-        assert!(table.live_for_display_uid(MAX_ENTITIES as i64 + 9).is_some());
+        assert!(
+            table
+                .live_for_display_uid(MAX_ENTITIES as i64 + 9)
+                .is_some()
+        );
     }
 
     /// Eviction must not tear down a shadow mapping that has since moved on

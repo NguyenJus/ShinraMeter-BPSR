@@ -2631,10 +2631,10 @@ mod tests {
             assert_eq!(out.len(), 1, "{wire:?}");
             match &out[0] {
                 ProtocolEvent::EnemyGone {
-                entity: _,
-                uid,
-                reason,
-            } => {
+                    entity: _,
+                    uid,
+                    reason,
+                } => {
                     assert_eq!(*uid, uid_of(TARGET_UUID), "{wire:?}");
                     assert_eq!(*reason, Some(expected), "{wire:?}");
                 }
@@ -2894,10 +2894,7 @@ mod tests {
         decode_notify(&n, 0, &mut out, None);
         match &out[0] {
             ProtocolEvent::Player(p) => {
-                assert_eq!(
-                    p.entity,
-                    EntityId::from_display_uid(8, EntityKind::Player)
-                );
+                assert_eq!(p.entity, EntityId::from_display_uid(8, EntityKind::Player));
                 assert_eq!(p.entity.display_uid(), 8);
             }
             other => panic!("expected Player, got {other:?}"),
@@ -2923,9 +2920,9 @@ mod tests {
         let msg = pb::EnterScene {
             info: Some(pb::EnterSceneInfo {
                 attrs: Some(AttrCollection {
-                        uuid: 0,
-                        attrs: vec![],
-                    }),
+                    uuid: 0,
+                    attrs: vec![],
+                }),
             }),
         };
         let mut payload = Vec::new();

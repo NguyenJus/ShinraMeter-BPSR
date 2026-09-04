@@ -1538,6 +1538,10 @@ mod tests {
         /// uid; the phase tests need two distinct boss entities.
         fn hit_on(target_uid: i64, value: i64, ts: u64, is_dead: bool) -> proto::ProtocolEvent {
             proto::ProtocolEvent::Damage(proto::DamageEvent {
+                // Overridden together with `target_uid` (issue #335): the
+                // identity is what the meter keys on, so leaving the base
+                // helper's would file every hit under one enemy.
+                target: proto::EntityId::from_display_uid(target_uid, proto::EntityKind::Monster),
                 target_uid,
                 is_dead,
                 ..damage(1, value, ts)

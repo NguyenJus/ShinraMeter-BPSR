@@ -159,13 +159,7 @@ impl Rig {
             payload: payload.to_vec(),
         };
         let mut events = Vec::new();
-        bpsr_protocol::decode::decode_notify(
-            &notify,
-            ts_ms,
-            &mut events,
-            None,
-            &mut self.entities,
-        );
+        bpsr_protocol::decode::decode_notify(&notify, ts_ms, &mut events, None, &mut self.entities);
         for ev in events {
             if let Some(reason) = self.pipeline.step(ev, ts_ms) {
                 self.resets.push((ts_ms, reason));
