@@ -639,6 +639,32 @@ pub struct TeamUserAttrData {
     pub season_strength: i32,
 }
 
+/// `GrpcTeamNtf.NotifyLeaveTeam` (`decode::team_opcode::NOTIFY_LEAVE_TEAM`,
+/// issue #343): sent to the remaining roster whenever one member leaves —
+/// voluntarily or by being kicked, see `NotifyLeaveTeamRequest::leave_type`.
+/// Same provenance discipline as `NotifyJoinTeam` above: tags read directly
+/// off BPSR-ZDPS's protoc-generated `FieldNumber` constants
+/// (`StruNotifyLeaveTeamRequest.cs`), not inferred.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NotifyLeaveTeam {
+    #[prost(message, optional, tag = "1")]
+    pub v_request: Option<NotifyLeaveTeamRequest>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NotifyLeaveTeamRequest {
+    /// The departing member's uid directly (same as `TeamMemData.char_id`
+    /// — `Utils.EntityIdToUuid`/`uid_of` round-trip, issue #146).
+    #[prost(int64, tag = "1")]
+    pub char_id: i64,
+    /// Voluntary leave vs. kicked — decoded but unread by
+    /// `decode::on_notify_leave_team`: this crate treats both the same
+    /// way (the uid is simply no longer in the roster), so nothing
+    /// downstream needs to tell them apart.
+    #[prost(int32, tag = "2")]
+    pub leave_type: i32,
+}
+
 // -- Dungeon state / objectives (issue #139) --------------------------------
 //
 // Every tag below was read directly off BPSR-ZDPS's protoc-generated
