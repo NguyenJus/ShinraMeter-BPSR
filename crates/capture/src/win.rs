@@ -32,6 +32,7 @@ use crate::backoff::recv_error_backoff;
 use crate::detect::{Conn, ServerDetector, decide_packet};
 use crate::driver::{Api, WinDivertAddress};
 use crate::error::CaptureError;
+use crate::owner::{self, SystemOwnerLookup};
 use crate::restart::CaptureRestart;
 use crate::tcp::TcpReassembler;
 use crate::throughput::{
@@ -51,6 +52,14 @@ const RECV_BUFFER_SIZE: usize = 10 * 1024 * 1024;
 /// no longer spins the thread at 100% CPU.
 const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 const MAX_RECV_ERROR_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Issue #337: how often the capture loop retries `owner::find_game_pid`
+/// while it has not yet found the game's pid (e.g. capture started before
+/// the game process did). Once found, the pid is cached for the rest of the
+/// loop's life — the game is not expected to restart mid-session — so this
+/// only bounds the cost of the "not running yet" window, not the steady
+/// state.
+const GAME_PID_LOOKUP_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Consecutive `WinDivertRecv` failures tolerated before the capture thread
 /// concludes the handle is dead and exits. Exiting drops `tx`, which closes
@@ -345,6 +354,14 @@ fn recv_loop(
     // block this thread behind a full channel and back the kernel WinDivert
     // queue up with it. See `crate::backpressure`.
     let mut drop_counter = crate::backpressure::DropCounter::new();
+    // Issue #337: process-ownership filter for candidate streams. `game_pid`
+    // starts unknown and is (re)resolved at most every
+    // `GAME_PID_LOOKUP_INTERVAL` until found; `owner_allows_adoption` (in
+    // `crate::detect`) fails open on `None`, so capture behaves exactly as
+    // it did before #337 until the game's pid is located.
+    let owner_lookup = SystemOwnerLookup::new();
+    let mut game_pid: Option<u32> = None;
+    let mut last_game_pid_lookup: Option<Instant> = None;
 
     log::info!("capture: WinDivert sniff loop started on filter {FILTER:?}");
 
@@ -408,6 +425,16 @@ fn recv_loop(
         monitor.record_observed();
         let now = Instant::now();
 
+        // Issue #337: resolve the game's own pid, at most once every
+        // `GAME_PID_LOOKUP_INTERVAL`, until found — see the field doc above.
+        if game_pid.is_none()
+            && last_game_pid_lookup
+                .is_none_or(|at| now.duration_since(at) >= GAME_PID_LOOKUP_INTERVAL)
+        {
+            last_game_pid_lookup = Some(now);
+            game_pid = owner::find_game_pid();
+        }
+
         let Ok(sliced) = SlicedPacket::from_ip(packet) else {
             continue;
         };
@@ -438,6 +465,10 @@ fn recv_loop(
             payload,
             tcp.fin(),
             tcp.rst(),
+            &crate::detect::OwnershipFilter {
+                lookup: &owner_lookup,
+                game_pid,
+            },
         );
         // A FIN or RST on either direction of the tracked flow means it is
         // tearing down naturally. `decide_packet` already cleared
@@ -481,8 +512,19 @@ fn recv_loop(
             reassembler.resync(resync_seq);
             decoder.reset();
             monitor.note_adopted(conn);
-            if tx.send(ProtocolEvent::ServerChanged).is_err() {
-                break;
+            // Issue #337: only a genuine server-endpoint change gets a
+            // `ServerChanged` — a reconnect (or a secondary stream) to the
+            // same server still resyncs/resets above, but must not wipe the
+            // in-progress meter.
+            if decision.emit_server_changed {
+                if tx.send(ProtocolEvent::ServerChanged).is_err() {
+                    break;
+                }
+            } else {
+                log::info!(
+                    "capture: reconnected to the same server endpoint on {conn}; suppressing \
+                     ServerChanged (issue #337)"
+                );
             }
         }
 
