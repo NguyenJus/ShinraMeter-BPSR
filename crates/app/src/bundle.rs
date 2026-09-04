@@ -65,8 +65,7 @@ pub(crate) const HISTORY_EXCLUSION_REASON: &str = "holds plaintext party member 
 /// raw player names/ids the same way `history.sqlite` does, and there is no
 /// sanitized-copy fallback for it the way there is for history — it simply
 /// never leaves this machine as part of a bug report.
-pub(crate) const DUMP_UNSANITIZED_EXCLUSION_REASON: &str =
-    "written with dump_sanitize off; holds raw player names/ids — never leaves this machine as part of a bug report";
+pub(crate) const DUMP_UNSANITIZED_EXCLUSION_REASON: &str = "written with dump_sanitize off; holds raw player names/ids — never leaves this machine as part of a bug report";
 
 /// The name [`build_manifest`] lists in `excluded` for the dump ring when
 /// [`DUMP_UNSANITIZED_EXCLUSION_REASON`] applies — not a single on-disk
@@ -439,7 +438,16 @@ mod tests {
 
     #[test]
     fn build_manifest_reports_unavailable_dropped_count_as_none() {
-        let manifest = build_manifest("1234-1700000000", "0.2.6", 1_700_000_000, true, 100, None, true, None);
+        let manifest = build_manifest(
+            "1234-1700000000",
+            "0.2.6",
+            1_700_000_000,
+            true,
+            100,
+            None,
+            true,
+            None,
+        );
         assert_eq!(manifest.dropped_records, None);
     }
 
@@ -619,7 +627,16 @@ mod tests {
         ));
         fs::write(&source, b"log contents").unwrap();
 
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None, false, None);
+        let manifest = build_manifest(
+            "1-1700000000",
+            "0.2.6",
+            1_700_000_000,
+            false,
+            0,
+            None,
+            false,
+            None,
+        );
         let entries = vec![("session.log".to_string(), source.clone())];
 
         let missing = export_bundle_to(&dir, &entries, &manifest, None, true).unwrap();
@@ -659,7 +676,16 @@ mod tests {
         // under the export after `dump_ring_parts` listed it.
         fs::remove_file(&evicted).unwrap();
 
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, true, 100, Some(0), true, None);
+        let manifest = build_manifest(
+            "1-1700000000",
+            "0.2.6",
+            1_700_000_000,
+            true,
+            100,
+            Some(0),
+            true,
+            None,
+        );
         let missing = export_bundle_to(&dir, &entries, &manifest, None, true).unwrap();
 
         assert_eq!(missing, vec!["dump.jsonl.1".to_string()]);
@@ -696,7 +722,16 @@ mod tests {
         fs::write(&log, b"log contents").unwrap();
 
         let entries = bundle_entries(&[history.clone(), log.clone()], &[], None);
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None, false, None);
+        let manifest = build_manifest(
+            "1-1700000000",
+            "0.2.6",
+            1_700_000_000,
+            false,
+            0,
+            None,
+            false,
+            None,
+        );
         let missing = export_bundle_to(&dir, &entries, &manifest, None, true).unwrap();
 
         assert!(missing.is_empty());
@@ -724,7 +759,16 @@ mod tests {
             "ShinraMeter-BPSR-bundle-export-does-not-exist-{}.jsonl",
             std::process::id()
         ));
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, true, 100, Some(0), true, None);
+        let manifest = build_manifest(
+            "1-1700000000",
+            "0.2.6",
+            1_700_000_000,
+            true,
+            100,
+            Some(0),
+            true,
+            None,
+        );
         let entries = vec![("dump.jsonl".to_string(), missing)];
 
         let missing_names = export_bundle_to(&dir, &entries, &manifest, None, true).unwrap();
@@ -800,7 +844,16 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let history_db = seeded_history_db("include");
 
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None, false, None);
+        let manifest = build_manifest(
+            "1-1700000000",
+            "0.2.6",
+            1_700_000_000,
+            false,
+            0,
+            None,
+            false,
+            None,
+        );
         let missing = export_bundle_to(&dir, &[], &manifest, Some(&history_db), true).unwrap();
 
         assert!(missing.is_empty());
@@ -828,7 +881,16 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let history_db = seeded_history_db("excluded");
 
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None, false, None);
+        let manifest = build_manifest(
+            "1-1700000000",
+            "0.2.6",
+            1_700_000_000,
+            false,
+            0,
+            None,
+            false,
+            None,
+        );
         export_bundle_to(&dir, &[], &manifest, Some(&history_db), false).unwrap();
 
         assert!(!dir.join(SANITIZED_HISTORY_FILE_NAME).exists());
@@ -855,7 +917,16 @@ mod tests {
         ));
         let _ = fs::remove_file(&missing_history);
 
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None, false, None);
+        let manifest = build_manifest(
+            "1-1700000000",
+            "0.2.6",
+            1_700_000_000,
+            false,
+            0,
+            None,
+            false,
+            None,
+        );
         let missing = export_bundle_to(&dir, &[], &manifest, Some(&missing_history), true).unwrap();
 
         assert!(missing.is_empty());
@@ -882,7 +953,16 @@ mod tests {
         ));
         fs::write(&corrupt_history, b"not a database").unwrap();
 
-        let manifest = build_manifest("1-1700000000", "0.2.6", 1_700_000_000, false, 0, None, false, None);
+        let manifest = build_manifest(
+            "1-1700000000",
+            "0.2.6",
+            1_700_000_000,
+            false,
+            0,
+            None,
+            false,
+            None,
+        );
         let missing = export_bundle_to(&dir, &[], &manifest, Some(&corrupt_history), true).unwrap();
 
         assert!(missing.is_empty());

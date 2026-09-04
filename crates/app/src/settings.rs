@@ -389,7 +389,11 @@ pub struct Settings {
     /// `bpsr_protocol::sanitize::Sanitizer` — see
     /// `dump::DumpWriter::spawn_sanitized`. On by default: it's what lets
     /// diagnostics default on too (`inspect::enabled`) without shipping raw
-    /// player traffic in every dump. `#[serde(default = "default_dump_sanitize")]`
+    /// player traffic in every dump. With it on, only the seven modeled
+    /// opcodes on the recognized service reach the dump; undecoded fragments
+    /// and unmodeled opcodes are dropped and counted. Set it to `false` to
+    /// capture the raw stream for protocol discovery (that dump is then
+    /// unsafe to share). `#[serde(default = "default_dump_sanitize")]`
     /// rather than plain `#[serde(default)]`, for the same reason as
     /// `always_on_top`/`history_enabled`: `bool::default()` is `false`,
     /// which would silently turn sanitization *off* for every existing

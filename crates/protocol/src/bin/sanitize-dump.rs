@@ -300,6 +300,21 @@ fn check_no_residual_strings(clean: &[DumpRecord]) -> Result<(), String> {
                     check_attrs(ac, &ctx)?;
                 }
             }
+            // Issue #139 verified all six real captures of `DungeonSyncData`
+            // and all 392 real `SyncDungeonDirtyData` payloads carry no
+            // player-identifying strings (dungeon flow/timer/target state
+            // only) -- there's nothing here for `check_attrs`/
+            // `check_char_base` to walk, just a re-decode to confirm the
+            // sanitized bytes are still a well-formed instance of the
+            // modeled message.
+            opcode::SYNC_DUNGEON_DATA => {
+                proto::pb::DungeonSyncData::decode(r.payload.as_slice())
+                    .map_err(|e| format!("{ctx}: re-decode failed: {e}"))?;
+            }
+            opcode::SYNC_DUNGEON_DIRTY_DATA => {
+                proto::pb::SyncDungeonDirtyData::decode(r.payload.as_slice())
+                    .map_err(|e| format!("{ctx}: re-decode failed: {e}"))?;
+            }
             other => {
                 return Err(format!(
                     "{ctx}: unexpected unmodeled opcode 0x{other:08x} in sanitized output                      (should have been dropped by `sanitize::is_modeled` already)"
@@ -543,6 +558,53 @@ mod tests {
             payload_decoded: true,
         };
         assert!(check_no_residual_strings(&[record]).is_ok());
+    }
+
+    #[test]
+    fn check_no_residual_strings_accepts_sanitized_dungeon_records() {
+        // Issue #139 verified neither dungeon opcode carries player strings
+        // -- `check_no_residual_strings` just needs to re-decode them
+        // successfully rather than reject them as unmodeled.
+        let mut r = sanitize::Remap::new();
+
+        let dungeon_sync_payload = proto::pb::DungeonSyncData {
+            scene_uuid: 42,
+            flow_info: Some(proto::pb::DungeonFlowInfo { state: 1 }),
+            target: None,
+            dungeon_var: None,
+        }
+        .encode_to_vec();
+        let dungeon_sync_sanitized =
+            sanitize::sanitize(opcode::SYNC_DUNGEON_DATA, &dungeon_sync_payload, &mut r).unwrap();
+
+        let dirty_data_payload = proto::pb::SyncDungeonDirtyData {
+            v_data: Some(proto::pb::BufferStream {
+                stream_type: 0,
+                buffer: vec![],
+            }),
+        }
+        .encode_to_vec();
+        let dirty_data_sanitized =
+            sanitize::sanitize(opcode::SYNC_DUNGEON_DIRTY_DATA, &dirty_data_payload, &mut r)
+                .unwrap();
+
+        let records = [
+            DumpRecord {
+                ts_ms: 1,
+                service_uuid: proto::frame::SERVICE_UUID,
+                method_id: opcode::SYNC_DUNGEON_DATA,
+                payload: dungeon_sync_sanitized,
+                payload_decoded: true,
+            },
+            DumpRecord {
+                ts_ms: 2,
+                service_uuid: proto::frame::SERVICE_UUID,
+                method_id: opcode::SYNC_DUNGEON_DIRTY_DATA,
+                payload: dirty_data_sanitized,
+                payload_decoded: true,
+            },
+        ];
+        assert!(check_no_residual_strings(&records).is_ok());
     }
 
     #[test]

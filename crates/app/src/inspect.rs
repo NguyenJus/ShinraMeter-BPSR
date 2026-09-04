@@ -10,13 +10,21 @@
 //! to opt back out, or `SHINRA_INSPECT=1` (`true`/`on`/`yes`) to force it on
 //! regardless of a build's default. When on:
 //!
-//! - every Notify-shaped fragment observed — recognized service or not, and
-//!   including one whose payload would not decompress (dumped as its raw
-//!   bytes with `payload_decoded: false`) — is appended to a JSONL dump file
+//! - every Notify-shaped fragment observed is appended to a JSONL dump file
 //!   on a dedicated writer thread, so a session can be replayed offline
-//!   (slice B item 4). See [`crate::dump`] for the exact on-disk format, and
-//!   for the drop-on-full policy that can make a dump incomplete under a
-//!   stalled disk (reported at shutdown).
+//!   (slice B item 4) — but with `settings.dump_sanitize` on (the default),
+//!   only the seven `pb.rs`-modeled opcodes on the recognized service are
+//!   actually written, each re-encoded through that partial schema; every
+//!   undecoded fragment and every unmodeled opcode is dropped instead of
+//!   written raw, and counted rather than silently lost (see
+//!   `dump::RecordSender::sanitized_out_count`). Set
+//!   `settings.dump_sanitize: false` to capture the unfiltered raw stream
+//!   instead — needed for protocol discovery (a new opcode can't be
+//!   modeled in `pb.rs` before it's been seen), but the result contains
+//!   player names and other identifying traffic and must never be shared.
+//!   See [`crate::dump`] for the exact on-disk format, and for the
+//!   drop-on-full policy that can make a dump incomplete under a stalled
+//!   disk (reported at shutdown).
 //! - the first time a given unrecognized service uuid is seen it is logged
 //!   at `info` level with its method id, payload length, and a truncated
 //!   hex prefix; a running count and first-seen timestamp are kept and
@@ -204,6 +212,11 @@ pub fn init(sanitize: bool) -> Option<Handle> {
         return None;
     }
     let path = dump_path();
+    dump::sweep_prior_sessions(
+        &path,
+        dump::max_total_ring_bytes(),
+        std::time::Duration::from_secs(7 * 24 * 3600),
+    );
     log::info!(
         "packet inspection enabled; dumping to {} (sanitize={sanitize}; opt out with SHINRA_INSPECT=0)",
         path.display()

@@ -263,7 +263,10 @@ impl Sanitizer {
     /// about it has been verified free of identifying data. This is the
     /// same drop-what-isn't-whitelisted behavior `sanitize-dump` applies in
     /// its pre-filter, just record-at-a-time instead of over a whole window
-    /// up front.
+    /// up front. The consequence for a sanitized dump (the app's default) is
+    /// that it holds only the seven modeled opcodes on the recognized
+    /// service — the raw stream needed for protocol discovery requires
+    /// `dump_sanitize: false`.
     pub fn sanitize_record(&mut self, rec: &DumpRecord) -> Option<DumpRecord> {
         if !rec.payload_decoded {
             return None;

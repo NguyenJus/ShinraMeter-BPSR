@@ -40,9 +40,14 @@
 //!
 //! One record is written per `bpsr_protocol::InspectSink::on_notify` call —
 //! for *every* service uuid seen, not only the recognized one, and including
-//! fragments whose payload would not decompress — which is what makes this
-//! dump sufficient for slice B to rebuild service/method/attr id histograms
-//! without a live game session.
+//! fragments whose payload would not decompress — when sanitization
+//! (issue #346, `settings::Settings::dump_sanitize`) is off. That made an
+//! unsanitized dump sufficient for slice B to rebuild service/method/attr
+//! id histograms without a live game session; a *sanitized* dump (the
+//! default) only ever contains the seven `pb.rs`-modeled opcodes on the
+//! recognized service, each re-encoded through that partial schema, so it
+//! is safe to share but no longer complete enough for histogram rebuilding
+//! — use `dump_sanitize: false` for that.
 //!
 //! Blocking file IO happens entirely on a dedicated writer thread fed over a
 //! channel (mirrors `crate::settings::spawn_writer`'s dedicated-writer-thread
@@ -93,6 +98,13 @@ const MAX_CHUNK_BYTES: u64 = 50 * 1024 * 1024;
 /// old 2-chunk / 100 MiB ceiling this replaces (issue #322): at the #285
 /// raid's measured ~2.5 MB/min, 512 MiB holds a bit over 3 hours — well
 /// past one raid — while keeping disk use bounded rather than unbounded.
+///
+/// This is also the budget [`sweep_prior_sessions`] enforces against every
+/// *other* session's dump files combined (issue #346) — otherwise a
+/// machine that's run many past sessions accumulates their dumps forever
+/// on top of the current session's own ring. Prior-session files older
+/// than seven days are swept unconditionally; anything newer is kept
+/// oldest-evicted-first until the survivors fit this budget.
 const DEFAULT_MAX_TOTAL_RING_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Overrides [`DEFAULT_MAX_TOTAL_RING_BYTES`] when set to a positive
@@ -114,6 +126,132 @@ fn max_total_ring_bytes_from(var: Option<&str>) -> u64 {
     var.and_then(|v| v.parse::<u64>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(DEFAULT_MAX_TOTAL_RING_BYTES)
+}
+
+/// Extracts the `<pid>-<secs>` session segment from a dump file name
+/// (`...dump-<digits>-<digits>.jsonl`, optionally followed by a ring
+/// chunk's `.<digits>` suffix — see [`bpsr_protocol::dump_format::numbered_sibling`]).
+/// `None` for anything that doesn't match, which [`sweep_prior_sessions`]
+/// treats as "not a dump file, leave it alone" rather than guessing.
+fn dump_session_segment(name: &str) -> Option<&str> {
+    let idx = name.find("dump-")?;
+    let after = &name[idx + "dump-".len()..];
+    let jsonl_pos = after.find(".jsonl")?;
+    let session = &after[..jsonl_pos];
+    let ring_suffix = &after[jsonl_pos + ".jsonl".len()..];
+    if !ring_suffix.is_empty() {
+        let digits = ring_suffix.strip_prefix('.')?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    let (pid, secs) = session.split_once('-')?;
+    let valid = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    (valid(pid) && valid(secs)).then_some(session)
+}
+
+/// Deletes prior sessions' inspect dump files (the live file and every
+/// numbered ring chunk from a run other than `current`'s) that have either
+/// aged past `max_age` or that push the *other* sessions' combined size
+/// over `budget_bytes` — issue #346's dump directory otherwise accumulates
+/// every past session's dump forever, on top of the current session's own
+/// ring budget ([`DEFAULT_MAX_TOTAL_RING_BYTES`]).
+///
+/// Age-based eviction runs first (anything older than `max_age` is removed
+/// outright, regardless of the budget), then the remaining prior-session
+/// files are deleted oldest-mtime-first until what's left fits in
+/// `budget_bytes`. `current`'s own chunks, and any file whose name doesn't
+/// match the `dump-<pid>-<secs>[.n].jsonl` shape, are never touched. Best
+/// effort throughout: a single file's metadata read or delete failing only
+/// warns and moves on, never aborts the sweep. One `info` line summarizes
+/// how many files/bytes were removed, only when at least one was.
+pub(crate) fn sweep_prior_sessions(
+    current: &Path,
+    budget_bytes: u64,
+    max_age: std::time::Duration,
+) {
+    let Some(parent) = current.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return;
+    };
+    let Some(current_name) = current.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let Some(current_session) = dump_session_segment(current_name) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+
+    let now = std::time::SystemTime::now();
+    let mut candidates: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let mut removed_files: u64 = 0;
+    let mut removed_bytes: u64 = 0;
+
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|ty| ty.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(session) = dump_session_segment(name) else {
+            continue;
+        };
+        if session == current_session {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        let len = meta.len();
+        let modified = meta.modified().unwrap_or(now);
+        let age = now
+            .duration_since(modified)
+            .unwrap_or(std::time::Duration::ZERO);
+        if age > max_age {
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    removed_files += 1;
+                    removed_bytes += len;
+                }
+                Err(err) => log::warn!(
+                    "failed to delete stale prior-session inspect dump {}: {err}",
+                    path.display()
+                ),
+            }
+            continue;
+        }
+        candidates.push((path, len, modified));
+    }
+
+    candidates.sort_by_key(|(_, _, modified)| *modified);
+    let mut total: u64 = candidates.iter().map(|(_, len, _)| *len).sum();
+    let mut idx = 0;
+    while total > budget_bytes && idx < candidates.len() {
+        let (path, len, _) = &candidates[idx];
+        match fs::remove_file(path) {
+            Ok(()) => {
+                total = total.saturating_sub(*len);
+                removed_files += 1;
+                removed_bytes += *len;
+                idx += 1;
+            }
+            Err(err) => {
+                log::warn!(
+                    "failed to delete prior-session inspect dump {} over budget: {err}",
+                    path.display()
+                );
+                break;
+            }
+        }
+    }
+
+    if removed_files > 0 {
+        log::info!(
+            "swept {removed_files} prior-session inspect dump file(s) totaling {removed_bytes} bytes"
+        );
+    }
 }
 
 /// How many records may queue up ahead of the writer thread. Bounded because
@@ -1138,6 +1276,107 @@ mod tests {
             max_total_ring_bytes_from(Some("not-a-number")),
             DEFAULT_MAX_TOTAL_RING_BYTES
         );
+    }
+
+    // -- sweep_prior_sessions (issue #346): the prior-session dump sweep. --
+
+    fn sweep_test_dir(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ShinraMeter-BPSR-inspect-sweep-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_file_with_len(path: &Path, len: usize) {
+        fs::write(path, vec![b'a'; len]).unwrap();
+    }
+
+    fn set_mtime(path: &Path, age: std::time::Duration) {
+        let when = std::time::SystemTime::now()
+            .checked_sub(age)
+            .expect("age should be representable");
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    #[test]
+    fn sweep_prior_sessions_removes_a_prior_session_file_older_than_max_age() {
+        let dir = sweep_test_dir("age");
+        let current = dir.join("dump-100-1000.jsonl");
+        write_file_with_len(&current, 10);
+
+        let old = dir.join("dump-200-2000.jsonl");
+        write_file_with_len(&old, 10);
+        set_mtime(&old, std::time::Duration::from_secs(8 * 24 * 3600));
+
+        sweep_prior_sessions(
+            &current,
+            u64::MAX,
+            std::time::Duration::from_secs(7 * 24 * 3600),
+        );
+
+        assert!(current.exists());
+        assert!(!old.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_prior_sessions_evicts_over_budget_prior_sessions_oldest_first() {
+        let dir = sweep_test_dir("budget");
+        let current = dir.join("dump-100-1000.jsonl");
+        write_file_with_len(&current, 10);
+
+        let older = dir.join("dump-200-2000.jsonl");
+        write_file_with_len(&older, 10);
+        set_mtime(&older, std::time::Duration::from_secs(60));
+
+        let newer = dir.join("dump-300-3000.jsonl");
+        write_file_with_len(&newer, 10);
+        set_mtime(&newer, std::time::Duration::from_secs(30));
+
+        // Budget only fits one of the two 10-byte prior-session files.
+        sweep_prior_sessions(&current, 10, std::time::Duration::from_secs(7 * 24 * 3600));
+
+        assert!(current.exists());
+        assert!(
+            !older.exists(),
+            "the older-mtime file should be evicted first"
+        );
+        assert!(newer.exists(), "the newer-mtime file should survive");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_prior_sessions_never_touches_current_chunks_or_non_matching_names() {
+        let dir = sweep_test_dir("current");
+        let current = dir.join("dump-100-1000.jsonl");
+        write_file_with_len(&current, 10);
+        let current_chunk = numbered_sibling(&current, 1);
+        write_file_with_len(&current_chunk, 10);
+        set_mtime(
+            &current_chunk,
+            std::time::Duration::from_secs(8 * 24 * 3600),
+        );
+
+        let unrelated = dir.join("not-a-dump-file.txt");
+        write_file_with_len(&unrelated, 10);
+        set_mtime(&unrelated, std::time::Duration::from_secs(8 * 24 * 3600));
+
+        // Zero budget and zero max-age would evict everything eligible.
+        sweep_prior_sessions(&current, 0, std::time::Duration::from_secs(0));
+
+        assert!(current.exists());
+        assert!(current_chunk.exists());
+        assert!(unrelated.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // -- rotation log signal (issue #322: a routine rotation used to leave
