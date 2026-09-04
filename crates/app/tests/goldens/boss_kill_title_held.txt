@@ -1,6 +1,8 @@
 scenario=boss_kill_title_held
 at_ms=48000
 fight_state=Ended
+fight_end_cause=BossDeath
+hold_kind=-
 duration_ms=1000
 total_damage=100000
 total_dps=100000.00

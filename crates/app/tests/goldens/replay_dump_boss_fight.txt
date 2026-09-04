@@ -1,6 +1,8 @@
 scenario=replay_dump_boss_fight
 at_ms=227880
 fight_state=Ended
+fight_end_cause=BossDeath
+hold_kind=-
 duration_ms=139826
 total_damage=477564479
 total_dps=3415419.73

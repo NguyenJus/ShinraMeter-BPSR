@@ -1,6 +1,8 @@
 scenario=idle_timeout_freeze_held
 at_ms=121000
 fight_state=Ended
+fight_end_cause=IdleTimeout
+hold_kind=-
 duration_ms=3500
 total_damage=80000
 total_dps=22857.14

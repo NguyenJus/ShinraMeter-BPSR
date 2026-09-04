@@ -1,6 +1,8 @@
 scenario=server_change_reset
 at_ms=13000
 fight_state=Idle
+fight_end_cause=ServerChanged
+hold_kind=-
 duration_ms=10000
 total_damage=65000
 total_dps=65000.00

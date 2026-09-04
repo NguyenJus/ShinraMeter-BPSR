@@ -1,6 +1,8 @@
 scenario=multi_player_pull
 at_ms=30000
 fight_state=Idle
+fight_end_cause=-
+hold_kind=-
 duration_ms=28000
 total_damage=173000
 total_dps=115333.33

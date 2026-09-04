@@ -1,6 +1,8 @@
 scenario=pet_damage_to_owner
 at_ms=3000
 fight_state=Idle
+fight_end_cause=-
+hold_kind=-
 duration_ms=1000
 total_damage=75000
 total_dps=75000.00
