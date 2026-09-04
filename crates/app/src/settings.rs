@@ -81,6 +81,30 @@ impl ColumnKind {
         }
     }
 
+    /// A representative value for this column, shown greyed out beside its
+    /// checkbox on the header menu's Columns page (issue #120). The labels
+    /// alone ("Share %", "Lucky %") say what a column is *called* but not
+    /// what it actually puts in a row — a one-glance sample does, and it is
+    /// what makes the grouped page readable without turning columns on to
+    /// find out. Deliberately hard-coded rather than sampled from the live
+    /// snapshot: the menu has to read the same on an idle overlay with no
+    /// encounter at all, and every sample here is shaped like what
+    /// `ColumnKind::spec`'s formatter would really produce
+    /// (`fmt_short`/`fmt_share`/`fmt_pct0`).
+    pub fn sample_text(self) -> &'static str {
+        match self {
+            ColumnKind::AbilityScore => "1234",
+            ColumnKind::SeasonStrength => "+12",
+            ColumnKind::Damage => "1.23M",
+            ColumnKind::Dps => "12.3k",
+            ColumnKind::SharePct => "34.5%",
+            ColumnKind::CritPct => "48.2%",
+            ColumnKind::LuckyPct => "9.1%",
+            ColumnKind::Hits => "1,204",
+            ColumnKind::Deaths => "2",
+        }
+    }
+
     /// Whether this column renders its value inline with the player's name
     /// (issue #168) rather than in its own reserved stat-column slot. Only
     /// `AbilityScore`/`SeasonStrength` do — the doc comment on `ALL` above
