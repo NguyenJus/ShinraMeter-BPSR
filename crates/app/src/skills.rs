@@ -725,6 +725,9 @@ mod tests {
             received: Vec::new(),
             casts: Vec::new(),
             buffs: Vec::new(),
+            absorbed_total: 0,
+            immune_total: 0,
+            shield: None,
         }
     }
 
@@ -741,6 +744,8 @@ mod tests {
             hits: 0,
             crit_hits: 0,
             hits_per_min: 0.0,
+            absorbed: 0,
+            immune: 0,
         }
     }
 

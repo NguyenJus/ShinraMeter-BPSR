@@ -1114,6 +1114,11 @@ fn demo_snapshot() -> Snapshot {
                     // untracked-until-now tab was before its own issue
                     // seeded one.
                     buffs: Vec::new(),
+                    // Issue #338: no demo seed for the absorbed/immune
+                    // channels either — same rationale as `buffs` above.
+                    absorbed_total: 0,
+                    immune_total: 0,
+                    shield: None,
                 }
             },
         )
@@ -1122,6 +1127,8 @@ fn demo_snapshot() -> Snapshot {
         duration_ms,
         total_damage: row_damage_sum,
         total_dps: row_damage_sum as f64 / (duration_ms as f64 / 1000.0),
+        total_absorbed: 0,
+        total_immune: 0,
         rows,
         encounter: EncounterInfo {
             boss_monster_id: Some(103_309),
@@ -1151,6 +1158,8 @@ fn initial_snapshot(demo_mode: bool) -> Snapshot {
             duration_ms: 0,
             total_damage: 0,
             total_dps: 0.0,
+            total_absorbed: 0,
+            total_immune: 0,
             rows: Vec::new(),
             encounter: EncounterInfo::default(),
             capture_alive: true,
@@ -10220,6 +10229,8 @@ mod tests {
             duration_ms: 90_000,
             total_damage,
             total_dps: 12_345.0,
+            total_absorbed: 0,
+            total_immune: 0,
             rows: Vec::new(),
             encounter: EncounterInfo {
                 boss_monster_id: Some(1),
@@ -13377,6 +13388,9 @@ mod tests {
             received: Vec::new(),
             casts: Vec::new(),
             buffs: Vec::new(),
+            absorbed_total: 0,
+            immune_total: 0,
+            shield: None,
         }
     }
 
@@ -14509,6 +14523,9 @@ mod tests {
             received: Vec::new(),
             casts: Vec::new(),
             buffs: Vec::new(),
+            absorbed_total: 0,
+            immune_total: 0,
+            shield: None,
         };
 
         for (kind, column) in ColumnKind::ALL
@@ -16341,6 +16358,8 @@ mod tests {
             duration_ms: 90_000,
             total_damage: 1_000 * n as i64,
             total_dps: 12_345.0,
+            total_absorbed: 0,
+            total_immune: 0,
             rows: (0..n)
                 .map(|i| PlayerRow {
                     name: format!("P{i}"),
@@ -16625,6 +16644,8 @@ mod tests {
             rows: vec![row.clone()],
             encounter: EncounterInfo::default(),
             capture_alive: true,
+            total_absorbed: 0,
+            total_immune: 0,
         };
 
         let frame = rows_painted_boxes_with(
@@ -19794,6 +19815,8 @@ mod tests {
             hits: 10,
             crit_hits: 1,
             hits_per_min: 5.0,
+            absorbed: 0,
+            immune: 0,
         }
     }
 
