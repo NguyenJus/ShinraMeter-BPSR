@@ -557,6 +557,13 @@ pub struct OverlayApp {
     /// failure mode) — only the latter should log at ERROR and raise the
     /// permanent "frozen" banner.
     quit_requested: bool,
+    /// Issue #340: the rect `draw_header` actually painted on the last
+    /// frame, or `None` before the first one. Measured once per frame at
+    /// the single `draw_header` call site in `ui` and read back through
+    /// `measured_header_band_height`, so the sizing math follows the real
+    /// header instead of a constant that has to be kept in step with it by
+    /// hand.
+    header_rect: Option<egui::Rect>,
 }
 
 /// All icon textures the overlay paints, bundled so `OverlayApp` has exactly
@@ -1219,6 +1226,7 @@ impl OverlayApp {
             last_dpi_probe: None,
             pending_screenshot_bound: None,
             screenshot_capturing: false,
+            header_rect: None,
             update_check: UpdateCheckState::Idle,
             rx_log_export,
             tx_log_export,
@@ -1738,6 +1746,11 @@ impl eframe::App for OverlayApp {
         // Read before the `self.icons` borrow below, which holds `&mut self`
         // for the rest of the frame.
         let opacity = self.opacity();
+        // Issue #340: last frame's measured header band, and the slot this
+        // frame's measurement lands in — both locals for the same reason,
+        // `self` being borrowed for the whole panel closure below.
+        let previous_header_rect = self.header_rect;
+        let mut measured_header_rect: Option<egui::Rect> = None;
         let icons = self.icons.get_or_insert_with(|| Icons::load(&ctx));
 
         // Issue #16 (D1): set by `draw_rows` (via `draw_row`) when a row is
@@ -1807,9 +1820,11 @@ impl eframe::App for OverlayApp {
                 // defaults" item already uses for its own (width-and-
                 // height) resize.
                 let viewport_rect = ctx.input(|i| i.viewport_rect());
-                if let Some(target_height) =
-                    resize_double_click_command(resize_double_clicked, viewport_rect.height())
-                {
+                if let Some(target_height) = resize_double_click_command(
+                    resize_double_clicked,
+                    viewport_rect.height(),
+                    measured_header_band_height(previous_header_rect),
+                ) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                         viewport_rect.width(),
                         target_height,
@@ -1854,6 +1869,14 @@ impl eframe::App for OverlayApp {
                     header_history,
                     &mut self.quit_requested,
                 );
+                // Issue #340: the header's real extent, measured the one place
+                // it can be — right after it painted, before anything else
+                // has been added to this `Ui`, so `min_rect` is the header
+                // band and nothing more (`draw_resize_handles` above only
+                // `interact`s, it allocates no space). Stashed on `self`
+                // below for the *next* frame's sizing math, the earliest a
+                // measurement can reach the code that needs it.
+                measured_header_rect = Some(ui.min_rect());
                 // Issue #156: whether this frame's wait for the reply has
                 // gone on long enough that it's never coming — computed
                 // before the guard call below so a timeout is fed into
@@ -2045,6 +2068,10 @@ impl eframe::App for OverlayApp {
         // Re-borrowed here rather than reusing the binding above: that one's
         // borrow of `self.icons` has to end before `open_history` can take
         // `&mut self`, so the child-viewport loop below takes a fresh one.
+        // Issue #340: the panel closure has released its borrow of `self`,
+        // so this frame's header measurement can finally be recorded. Kept
+        // from the previous frame if the header did not paint at all.
+        self.header_rect = measured_header_rect.or(self.header_rect);
         let icons = self.icons.as_ref().expect("loaded on the first frame");
         let mut closed_skill_windows: Vec<i64> = Vec::new();
         // Issue #216: every open window resolves against the fight it was
@@ -2928,7 +2955,7 @@ const MIN_COLUMN_SCALE: f32 = 0.6;
 /// this window's "no scrolling needed" promise and the wash's reach can
 /// never drift back out of sync with each other.
 fn default_inner_height() -> f32 {
-    inner_height_for_rows(DEFAULT_VISIBLE_ROWS)
+    inner_height_for_rows(DEFAULT_VISIBLE_ROWS, header_band_height(BUTTON_ROW_HEIGHT))
 }
 
 /// Number of player rows the header dropdown's "Reset to defaults" item
@@ -2947,7 +2974,10 @@ const RESET_TO_DEFAULTS_VISIBLE_ROWS: usize = 5;
 /// the `Settings::default()` column set this reset also restores, with no
 /// dependence on row count — so only height needs its own helper here.
 fn reset_to_defaults_inner_height() -> f32 {
-    inner_height_for_rows(RESET_TO_DEFAULTS_VISIBLE_ROWS)
+    inner_height_for_rows(
+        RESET_TO_DEFAULTS_VISIBLE_ROWS,
+        header_band_height(BUTTON_ROW_HEIGHT),
+    )
 }
 
 /// Shared formula behind both `default_inner_height` and
@@ -2956,9 +2986,9 @@ fn reset_to_defaults_inner_height() -> f32 {
 /// it. Pulling this out means the two callers can never drift from each
 /// other by editing the top-level math in one and not the other — only the
 /// row count differs between them, and that lives in their own constants.
-fn inner_height_for_rows(rows: usize) -> f32 {
+fn inner_height_for_rows(rows: usize, band_height: f32) -> f32 {
     let rows = rows as f32 * ROW_HEIGHT;
-    first_player_row_top_offset(header_band_height(BUTTON_ROW_HEIGHT)) + rows
+    first_player_row_top_offset(band_height) + rows
 }
 
 /// Issue #300: the inner height a resize-border double-click should snap
@@ -2976,9 +3006,9 @@ fn inner_height_for_rows(rows: usize) -> f32 {
 /// always the other one. It also means a window resized by hand to some
 /// arbitrary height resolves its first double-click sensibly, with
 /// nothing to initialize.
-fn resize_double_click_preset_height(current_height: f32) -> f32 {
-    let five_rows = reset_to_defaults_inner_height();
-    let twenty_rows = default_inner_height();
+fn resize_double_click_preset_height(current_height: f32, band_height: f32) -> f32 {
+    let five_rows = inner_height_for_rows(RESET_TO_DEFAULTS_VISIBLE_ROWS, band_height);
+    let twenty_rows = inner_height_for_rows(DEFAULT_VISIBLE_ROWS, band_height);
     let midpoint = (five_rows + twenty_rows) / 2.0;
     if current_height < midpoint {
         twenty_rows
@@ -2997,8 +3027,12 @@ fn resize_double_click_preset_height(current_height: f32) -> f32 {
 /// without it, every ordinary frame (no double-click at all) would need
 /// its own `current_height` threaded through the preset math just to
 /// throw the answer away.
-fn resize_double_click_command(double_clicked: bool, current_height: f32) -> Option<f32> {
-    double_clicked.then(|| resize_double_click_preset_height(current_height))
+fn resize_double_click_command(
+    double_clicked: bool,
+    current_height: f32,
+    band_height: f32,
+) -> Option<f32> {
+    double_clicked.then(|| resize_double_click_preset_height(current_height, band_height))
 }
 
 /// Extra width folded into `default_inner_width` on top of the row-column
@@ -4773,6 +4807,35 @@ mod tests {
         );
     }
 
+    /// Issue #340: the presets are built from the header band the overlay
+    /// has actually painted, not from the constant budget — a header that
+    /// measured taller pushes both snap targets down by exactly that much,
+    /// so a double-click still lands the requested row count instead of
+    /// clipping the last row.
+    #[test]
+    fn resize_double_click_presets_track_the_measured_header_band() {
+        let budget = header_band_height(BUTTON_ROW_HEIGHT);
+        let taller = budget + 12.0;
+        let five = inner_height_for_rows(RESET_TO_DEFAULTS_VISIBLE_ROWS, taller);
+        let twenty = inner_height_for_rows(DEFAULT_VISIBLE_ROWS, taller);
+        assert_eq!(five, reset_to_defaults_inner_height() + 12.0);
+        assert_eq!(twenty, default_inner_height() + 12.0);
+        assert_eq!(resize_double_click_preset_height(five, taller), twenty);
+        assert_eq!(resize_double_click_preset_height(twenty, taller), five);
+    }
+
+    /// The gate stays a separate decision from the math, and passes the
+    /// measured band straight through.
+    #[test]
+    fn resize_double_click_command_uses_the_measured_band_when_it_fires() {
+        let band = header_band_height(BUTTON_ROW_HEIGHT) + 5.0;
+        assert_eq!(resize_double_click_command(false, 400.0, band), None);
+        assert_eq!(
+            resize_double_click_command(true, 400.0, band),
+            Some(resize_double_click_preset_height(400.0, band))
+        );
+    }
+
     /// Issue #300: double-clicking a resize border snaps the window
     /// straight to whichever of the two presets it isn't already at — so a
     /// window already sitting exactly on one preset always flips to the
@@ -4780,10 +4843,11 @@ mod tests {
     /// for.
     #[test]
     fn resize_double_click_preset_height_alternates_between_the_two_presets() {
+        let band = header_band_height(BUTTON_ROW_HEIGHT);
         let five = reset_to_defaults_inner_height();
         let twenty = default_inner_height();
-        assert_eq!(resize_double_click_preset_height(five), twenty);
-        assert_eq!(resize_double_click_preset_height(twenty), five);
+        assert_eq!(resize_double_click_preset_height(five, band), twenty);
+        assert_eq!(resize_double_click_preset_height(twenty, band), five);
     }
 
     /// From any height that isn't already sitting on a preset (a window
@@ -4794,9 +4858,16 @@ mod tests {
     fn resize_double_click_preset_height_picks_the_farther_preset_from_an_arbitrary_height() {
         let five = reset_to_defaults_inner_height();
         let twenty = default_inner_height();
+        let band = header_band_height(BUTTON_ROW_HEIGHT);
         let midpoint = (five + twenty) / 2.0;
-        assert_eq!(resize_double_click_preset_height(midpoint - 1.0), twenty);
-        assert_eq!(resize_double_click_preset_height(midpoint + 1.0), five);
+        assert_eq!(
+            resize_double_click_preset_height(midpoint - 1.0, band),
+            twenty
+        );
+        assert_eq!(
+            resize_double_click_preset_height(midpoint + 1.0, band),
+            five
+        );
     }
 
     /// A frame with no resize-border double-click this frame must never
@@ -4806,9 +4877,10 @@ mod tests {
     /// at.
     #[test]
     fn resize_double_click_command_is_none_without_a_double_click() {
-        assert_eq!(resize_double_click_command(false, 100.0), None);
+        let band = header_band_height(BUTTON_ROW_HEIGHT);
+        assert_eq!(resize_double_click_command(false, 100.0, band), None);
         assert_eq!(
-            resize_double_click_command(false, reset_to_defaults_inner_height()),
+            resize_double_click_command(false, reset_to_defaults_inner_height(), band),
             None
         );
     }
@@ -4818,10 +4890,11 @@ mod tests {
     /// current height.
     #[test]
     fn resize_double_click_command_uses_the_preset_height_when_double_clicked() {
+        let band = header_band_height(BUTTON_ROW_HEIGHT);
         let five = reset_to_defaults_inner_height();
         let twenty = default_inner_height();
-        assert_eq!(resize_double_click_command(true, five), Some(twenty));
-        assert_eq!(resize_double_click_command(true, twenty), Some(five));
+        assert_eq!(resize_double_click_command(true, five, band), Some(twenty));
+        assert_eq!(resize_double_click_command(true, twenty, band), Some(five));
     }
 
     /// Every row shares the same damage, so `row_bar_frac` (relative to the

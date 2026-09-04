@@ -1434,6 +1434,26 @@ pub(crate) const HEADER_STAT_ROW_INSET_X: f32 = HEADER_GUTTER_WIDTH + HEADER_TEX
 ///
 /// A constant `68.0` at the real `BUTTON_ROW_HEIGHT`, with no dependence on
 /// whether an area name is known — see `header_text_band_height`.
+/// The header band height the window-sizing math should use: the height
+/// `draw_header` *measured* on the last painted frame, or
+/// `header_band_height`'s constant budget when there is no measurement yet.
+///
+/// Issue #340: every consumer outside `draw_header` used to re-derive the
+/// band from `header_band_height(BUTTON_ROW_HEIGHT)`, i.e. from two
+/// constants that only agree with the painted header as long as nothing
+/// (a restyled `Spacing::interact_size`, a taller text row, a future
+/// header element) changes what the header actually occupies. The header
+/// now records the rect it really painted once per frame
+/// (`OverlayApp::header_rect`), and this is the single place that turns
+/// that measurement — or its absence, on the very first frame — into the
+/// number those consumers size against.
+pub(crate) fn measured_header_band_height(header_rect: Option<egui::Rect>) -> f32 {
+    header_rect.map_or_else(
+        || header_band_height(BUTTON_ROW_HEIGHT),
+        |rect| rect.height(),
+    )
+}
+
 pub(crate) fn header_band_height(button_row_height: f32) -> f32 {
     header_text_band_height() + HEADER_STAT_ROW_GAP + button_row_height
 }
@@ -3802,6 +3822,28 @@ mod tests {
     }
 
     // -- header_band_height (drag band must cover the rendered header) ----
+
+    /// Issue #340: before the first frame has painted there is nothing to
+    /// measure, so the sizing math keeps using the constant budget.
+    #[test]
+    fn measured_header_band_height_falls_back_to_the_budget_before_the_first_frame() {
+        assert_eq!(
+            measured_header_band_height(None),
+            header_band_height(BUTTON_ROW_HEIGHT)
+        );
+    }
+
+    /// Once `draw_header` has painted, its *measured* rect is what every
+    /// dependent sizes against — a header that came out taller or shorter
+    /// than the budget (a restyled `interact_size`, a longer text row) moves
+    /// the sizing with it instead of leaving it pinned to the constant.
+    #[test]
+    fn measured_header_band_height_uses_the_rect_the_header_actually_painted() {
+        let painted = egui::Rect::from_min_size(egui::pos2(4.0, 7.0), egui::vec2(300.0, 81.0));
+        assert_eq!(measured_header_band_height(Some(painted)), 81.0);
+        let shorter = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 50.0));
+        assert_eq!(measured_header_band_height(Some(shorter)), 50.0);
+    }
 
     /// egui stacks title + subtitle + stat row, so the band pays two gaps,
     /// not one, and they are not the same size: title -> subtitle pays
