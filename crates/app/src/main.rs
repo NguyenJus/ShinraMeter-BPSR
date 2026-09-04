@@ -272,7 +272,20 @@ fn decide_instance(acquisition: single_instance::Acquisition) -> InstanceDecisio
     }
 }
 
+/// `--version`/`-V` early exit (issue #341): CI's Windows smoke job needs a
+/// way to prove the built exe actually starts, without a window, an admin
+/// prompt, or the single-instance lock getting in the way — so this is
+/// checked before any of that in `main`, not folded into the eframe loop.
+fn version_requested(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--version" || arg == "-V")
+}
+
 fn main() -> eframe::Result {
+    if version_requested(&std::env::args().collect::<Vec<_>>()) {
+        println!("ShinraMeter-BPSR {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // `env_logger::init()` alone defaults to `error`-only and, since this
     // binary carries `windows_subsystem = "windows"`, has no console for
     // stderr to land on in a shipped build — so it was effectively silent.
@@ -596,5 +609,24 @@ mod tests {
             }
             InstanceDecision::Exit => panic!("a broken guard must not stop the app (issue #277)"),
         }
+    }
+
+    // -- version_requested (issue #341) --------------------------------------
+
+    #[test]
+    fn version_flag_variants_are_recognized() {
+        for flag in ["--version", "-V"] {
+            let args = vec!["ShinraMeter-BPSR".to_string(), flag.to_string()];
+            assert!(version_requested(&args), "{flag} should be recognized");
+        }
+    }
+
+    #[test]
+    fn missing_or_unrelated_flags_are_not_recognized() {
+        assert!(!version_requested(&["ShinraMeter-BPSR".to_string()]));
+        assert!(!version_requested(&[
+            "ShinraMeter-BPSR".to_string(),
+            "--other".to_string(),
+        ]));
     }
 }
