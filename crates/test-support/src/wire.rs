@@ -155,6 +155,34 @@ pub fn damage_delta(target_uuid: i64, dmg: pb::SyncDamageInfo) -> Vec<u8> {
     damage_delta_multi(target_uuid, vec![dmg])
 }
 
+/// A `SyncDamageInfo` describing a monster's hit on a player — the reverse
+/// attacker/target direction from [`damage_info`], which always models a
+/// player attacking a monster (`attacker_uuid` packed as a player uuid). No
+/// scenario verb needed one until the wipe scenario (issue #342): scripting
+/// a party wipe requires a *player* to die, which means the attacker is the
+/// monster and the target (the `AoiSyncDelta.uuid` the caller wraps this
+/// in) is the player. `skill_id` becomes `owner_id`; per `decode.rs`, a
+/// zero there makes the decoder drop the entry, same as [`damage_info`].
+pub fn monster_damage_info(
+    attacker_monster_uid: i64,
+    skill_id: i32,
+    value: i64,
+    kills_target: bool,
+) -> pb::SyncDamageInfo {
+    pb::SyncDamageInfo {
+        is_miss: false,
+        r#type: pb::EDamageType::Normal as i32,
+        type_flag: 0,
+        value,
+        lucky_value: 0,
+        hp_lessen_value: value,
+        attacker_uuid: monster_uuid(attacker_monster_uid),
+        owner_id: skill_id,
+        is_dead: kills_target,
+        top_summoner_id: 0,
+    }
+}
+
 /// Prost-encodes a `SyncNearDeltaInfo` payload (not wrapped in a frame)
 /// carrying N damage entries against `target_uuid`, in order.
 pub fn damage_delta_multi(target_uuid: i64, dmgs: Vec<pb::SyncDamageInfo>) -> Vec<u8> {
@@ -483,5 +511,15 @@ mod tests {
         let hit = Hit::new(500, 101, 1_000).crit();
         let info = damage_info(&hit);
         assert_eq!(info.type_flag, 1);
+    }
+
+    #[test]
+    fn monster_damage_info_packs_a_monster_attacker_and_can_kill_the_target() {
+        let info = monster_damage_info(2001, 999, 80_000, true);
+        assert_eq!(info.attacker_uuid, monster_uuid(2001));
+        assert_eq!(info.owner_id, 999);
+        assert_eq!(info.value, 80_000);
+        assert!(info.is_dead);
+        assert_eq!(info.top_summoner_id, 0);
     }
 }

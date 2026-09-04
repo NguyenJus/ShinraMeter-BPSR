@@ -20,6 +20,11 @@ way `main.rs` wires it.
 - `crates/app/tests/replay_dump.rs` — replays a real, sanitized packet
   capture (not a hand-built scenario) through the same pipeline. See
   "Replaying a real capture" below.
+- `crates/app/tests/replay_scenarios.rs` — issue #342's first batch of
+  scenarios not covered above: starting mid-instance (no `EnterScene` before
+  damage), a server change landing in a *new* dungeon mid-pull, a party wipe
+  followed by a re-pull, a world boss holding a pull open through a long
+  lull, and a curated multi-phase boss transition.
 
 Each synthetic scenario is built from the `Scenario`/`Step` DSL in
 `crates/test-support/src/scenario.rs` (byte payloads via
