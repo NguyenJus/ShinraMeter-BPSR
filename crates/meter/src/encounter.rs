@@ -408,6 +408,19 @@ pub struct Meter {
     /// change, which invalidates the entity state the re-engagement test
     /// reads and hands the hold back to issue #78's ordinary rule.
     wipe_hold: bool,
+    /// Why the fight recorded in `fight_end_ms` ended, if it has (issue
+    /// #336 step 2). Set exactly once per latch, alongside `fight_end_ms`,
+    /// by [`Meter::latch_fight_end`] — the only place a [`FightEndCause`]
+    /// is ever known — and cleared everywhere `fight_end_ms` is: `reset`
+    /// and the phase-resume branch of `apply_damage`.
+    ///
+    /// Before this field existed, [`Meter::fight_end_cause`] could only
+    /// recover a wipe from the still-live `wipe_hold` flag; every other
+    /// cause was logged once by `latch_fight_end` and then lost. This
+    /// stores the value itself instead of re-deriving a lossy subset of it,
+    /// so the accessor (and `Lifecycle::Ended`'s `cause`) can report every
+    /// variant faithfully.
+    fight_end_cause: Option<FightEndCause>,
     /// Identity of the fight currently on the board (issue #152): the
     /// recognized boss it is against and the scene it is being fought in,
     /// captured while the fight is *live* by `recompute_boss`.
@@ -513,6 +526,7 @@ impl Meter {
             fight_end_observed_ms: None,
             fight_end_boss_id: None,
             wipe_hold: false,
+            fight_end_cause: None,
             fight_identity: None,
             deaths_seen: 0,
             reset_cfg: ResetConfig::default(),
@@ -908,16 +922,19 @@ impl Meter {
         self.is_held().then_some(HoldKind::Wipe)
     }
 
-    /// Why the currently-held fight ended, when today's stored fields can
-    /// still tell it apart after the fact — right now, only whether it was
-    /// a wipe. `None` while a fight is running, and also `None` for an
-    /// ended fight whose cause was something other than a wipe: every
-    /// [`FightEndCause`] is logged at [`Self::latch_fight_end`] but only the
-    /// wipe flag survives past that log line today (issue #336 step 2 widens
-    /// this to every cause).
+    /// Why the currently-held (or most recently ended) fight ended — the
+    /// stored counterpart of [`Self::fight_end_ms`], set by the same
+    /// [`Self::latch_fight_end`] call and cleared everywhere that field is.
+    /// `None` while a fight is running, or once no fight has ended since
+    /// the last reset.
+    ///
+    /// Issue #336 step 2: this used to re-derive a lossy subset of the
+    /// answer from `is_held()` — every cause but `Wipe` was logged once and
+    /// then unrecoverable. It now just reads back what was latched, so
+    /// every [`FightEndCause`] variant survives to this point, not only the
+    /// one the wipe hold happens to also track.
     pub fn fight_end_cause(&self) -> Option<FightEndCause> {
-        self.fight_end_ms()?;
-        self.is_held().then_some(FightEndCause::Wipe)
+        self.fight_end_cause
     }
 
     /// Whether a fight is currently running, as of `now_ms` — the `Active`
@@ -1589,6 +1606,7 @@ impl Meter {
             self.fight_end_ms = None;
             self.fight_end_observed_ms = None;
             self.fight_end_boss_id = None;
+            self.fight_end_cause = None;
         }
 
         // Real combat activity — a player landing a hit — is the *only*
@@ -2061,6 +2079,7 @@ impl Meter {
         }
         self.fight_end_ms = Some(end_ms);
         self.fight_end_observed_ms = Some(observed_ms);
+        self.fight_end_cause = Some(cause);
         // issue #316: arm phase resumption on an idle-timeout end too, not
         // only a boss death. `end_fight_on_boss_death` names the dying
         // boss's own uid because `boss_uid` may already have moved on by the
@@ -3290,6 +3309,10 @@ impl Meter {
         // ...and with it the phase-resume arming (issue #124): the fight
         // whose boss died is gone, so nothing can be a continuation of it.
         self.fight_end_boss_id = None;
+        // ...and its recorded cause (issue #336 step 2): a stale cause
+        // surviving a reset would misreport whatever ends the *next* fight
+        // until that fight's own end latches a fresh one.
+        self.fight_end_cause = None;
         // ...and the wipe hold (issue #154): the attempt it was protecting
         // is what just got cleared.
         self.wipe_hold = false;
@@ -7283,23 +7306,134 @@ mod tests {
             }
 
             #[test]
-            fn ended_by_idle_timeout_has_no_known_cause_yet() {
-                // The idle timeout is not a wipe, and today's stored state
-                // (issue #336 step 1) has no other way to name a cause —
-                // step 2 is what widens this to `Some(IdleTimeout)`.
+            fn ended_by_idle_timeout_reports_the_cause() {
+                // Issue #336 step 2: the cause is now stored at the moment
+                // `latch_fight_end` runs, so it survives past the log line
+                // it used to be limited to. `tick` is what actually runs
+                // that latch for an idle-timeout end (`lifecycle` itself
+                // only *derives* that the window has elapsed — see its doc
+                // comment — so a caller has to have driven the clock first,
+                // same as production's per-frame `tick` does before
+                // `snapshot`).
                 let mut m = Meter::new();
                 m.apply(&dmg(1, 100, 1_000));
                 let ended_at = 1_000 + idle();
+                m.tick(ended_at);
                 assert_eq!(
                     m.lifecycle(ended_at),
                     Lifecycle::Ended {
                         at_ms: 1_000,
-                        cause: None,
+                        cause: Some(FightEndCause::IdleTimeout),
                     }
                 );
                 assert!(!m.is_fight_active(ended_at));
                 assert!(!m.is_held());
                 assert_eq!(m.hold_kind(), None);
+                assert_eq!(m.fight_end_cause(), Some(FightEndCause::IdleTimeout));
+            }
+        }
+
+        /// Issue #336 step 2: `fight_end_cause` used to only be able to
+        /// report `Wipe` (from the surviving `wipe_hold` flag) or `None` —
+        /// every other `FightEndCause` `latch_fight_end` logs was lost the
+        /// instant the log line printed. These pin that every end path now
+        /// reports its own cause back through the accessor, with the
+        /// goldens unchanged (widened, not altered) as the regression net
+        /// for step 3's enum state machine.
+        mod fight_end_cause_storage {
+            use super::*;
+
+            #[test]
+            fn boss_death_reports_its_cause() {
+                let mut m = Meter::new();
+                m.apply(&boss_hit(10, 0, false));
+                m.apply(&hp(10, 50, Some(103), 0)); // 103 = a catalogued boss
+                m.apply(&boss_hit(10, 1_000, true));
+
+                assert_eq!(m.fight_end_cause(), Some(FightEndCause::BossDeath));
+            }
+
+            #[test]
+            fn server_changed_reports_its_cause() {
+                let mut m = Meter::new();
+                m.apply(&dmg(1, 100, 1_000));
+                m.apply(&ProtocolEvent::ServerChanged {
+                    timestamp_ms: 2_000,
+                });
+
+                assert_eq!(m.fight_end_cause(), Some(FightEndCause::ServerChanged));
+            }
+
+            #[test]
+            fn scene_changed_reports_its_cause() {
+                let mut m = Meter::new();
+                // An initial scene learn never counts as a transition, so
+                // this only establishes `scene_id` — it must not itself
+                // latch anything.
+                m.apply(&ProtocolEvent::Scene { level_map_id: 100 });
+                m.apply(&dmg(1, 100, 1_000));
+                m.apply(&ProtocolEvent::Scene { level_map_id: 200 });
+
+                assert_eq!(m.fight_end_cause(), Some(FightEndCause::SceneChanged));
+            }
+
+            #[test]
+            fn dungeon_state_end_reports_dungeon_ended() {
+                let mut m = Meter::new();
+                m.apply(&dmg(1, 100, 1_000));
+                m.apply(&ProtocolEvent::DungeonState {
+                    state: EDungeonState::End,
+                    scene_uuid: None,
+                });
+
+                assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+            }
+
+            #[test]
+            fn dungeon_var_is_finish_target_reports_dungeon_ended() {
+                let mut m = Meter::new();
+                m.apply(&dmg(1, 100, 1_000));
+                m.apply(&ProtocolEvent::DungeonVar {
+                    name: "IsFinishTarget".to_string(),
+                    value: 1,
+                });
+
+                assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+            }
+
+            /// The phase-resume path (issue #124) clears `fight_end_ms` and
+            /// friends together — the cause must be cleared right alongside
+            /// them, or a resumed fight would read back a stale end cause
+            /// from before it resumed.
+            #[test]
+            fn a_phase_resume_clears_the_stale_cause() {
+                let mut m = Meter::new();
+                m.apply(&boss_hit(10, 0, false));
+                m.apply(&hp(10, 50, Some(203), 0)); // Goblin King, Aegis form
+                m.apply(&boss_hit(10, 1_000, true));
+                assert_eq!(m.fight_end_cause(), Some(FightEndCause::BossDeath));
+
+                // The next phase spawns as a new entity; a hit on it within
+                // the resume window resumes the fight instead of resetting
+                // it — same phase group (`crate::phase::BOSS_PHASE_GROUPS`),
+                // different monster id.
+                m.apply(&hp(20, 100, Some(204), 1_500)); // Goblin King, Staff form
+                m.apply(&boss_hit(20, 2_000, false));
+                assert_eq!(m.fight_end_cause(), None);
+            }
+
+            /// `reset` clears every lifecycle field together — the cause
+            /// must not outlive it.
+            #[test]
+            fn a_reset_clears_the_stale_cause() {
+                let mut m = Meter::new();
+                m.apply(&dmg(1, 100, 1_000));
+                m.apply(&ProtocolEvent::ServerChanged {
+                    timestamp_ms: 2_000,
+                });
+                assert_eq!(m.fight_end_cause(), Some(FightEndCause::ServerChanged));
+
+                m.reset(ResetReason::Manual, 3_000);
                 assert_eq!(m.fight_end_cause(), None);
             }
         }

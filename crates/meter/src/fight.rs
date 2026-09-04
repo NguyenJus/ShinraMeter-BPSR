@@ -100,11 +100,10 @@ pub enum Lifecycle {
     /// A fight is in progress, started at `since_ms`.
     Active { since_ms: u64 },
     /// The fight is over and its stats are frozen as of `at_ms`. `cause` is
-    /// `Some` only when today's stored fields can still tell it apart after
-    /// the fact — right now, just a wipe (`HoldKind::Wipe`/`wipe_hold`);
-    /// every other cause is logged (`FightEndCause`) the moment it happens
-    /// but not retained, so it reads back `None` here. Issue #336 step 2
-    /// widens the stored state so every cause survives to this point.
+    /// `Some` for every fight end (issue #336 step 2 stores the
+    /// `FightEndCause` `latch_fight_end` is given, alongside the timestamp
+    /// fields it always latched) — `None` only when no fight has ended
+    /// since the last reset, which this arm is never reached for anyway.
     Ended {
         at_ms: u64,
         cause: Option<FightEndCause>,
