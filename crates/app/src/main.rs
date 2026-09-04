@@ -273,15 +273,19 @@ fn decide_instance(acquisition: single_instance::Acquisition) -> InstanceDecisio
 }
 
 /// `--version`/`-V` early exit (issue #341): CI's Windows smoke job needs a
-/// way to prove the built exe actually starts, without a window, an admin
-/// prompt, or the single-instance lock getting in the way — so this is
-/// checked before any of that in `main`, not folded into the eframe loop.
-fn version_requested(args: &[String]) -> bool {
+/// way to prove the built exe actually starts, without a window or the
+/// single-instance lock getting in the way — so this is checked before any
+/// of that in `main`, not folded into the eframe loop. This cannot avoid the
+/// admin prompt: the shipped manifest's `requireAdministrator` is honored by
+/// the Windows loader at `CreateProcess`, before `main` ever runs, so
+/// elevation has already happened (or the process has already failed to
+/// launch) by the time this code executes.
+fn version_requested(args: &[std::ffi::OsString]) -> bool {
     args.iter().any(|arg| arg == "--version" || arg == "-V")
 }
 
 fn main() -> eframe::Result {
-    if version_requested(&std::env::args().collect::<Vec<_>>()) {
+    if version_requested(&std::env::args_os().collect::<Vec<_>>()) {
         println!("ShinraMeter-BPSR {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
@@ -616,17 +620,22 @@ mod tests {
     #[test]
     fn version_flag_variants_are_recognized() {
         for flag in ["--version", "-V"] {
-            let args = vec!["ShinraMeter-BPSR".to_string(), flag.to_string()];
+            let args = vec![
+                std::ffi::OsString::from("ShinraMeter-BPSR"),
+                std::ffi::OsString::from(flag),
+            ];
             assert!(version_requested(&args), "{flag} should be recognized");
         }
     }
 
     #[test]
     fn missing_or_unrelated_flags_are_not_recognized() {
-        assert!(!version_requested(&["ShinraMeter-BPSR".to_string()]));
+        assert!(!version_requested(&[std::ffi::OsString::from(
+            "ShinraMeter-BPSR"
+        )]));
         assert!(!version_requested(&[
-            "ShinraMeter-BPSR".to_string(),
-            "--other".to_string(),
+            std::ffi::OsString::from("ShinraMeter-BPSR"),
+            std::ffi::OsString::from("--other"),
         ]));
     }
 }

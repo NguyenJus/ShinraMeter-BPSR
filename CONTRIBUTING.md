@@ -75,21 +75,23 @@ runtime is packaged.
 
 ## Code style and local checks
 
-Run `scripts/check.sh` before opening a PR — it runs the same lint, test and
-cross-check steps as CI's `fmt`, `clippy`, `test` and `build-windows` jobs:
+Run `scripts/check.sh` before opening a PR — it mirrors CI's fmt, clippy and
+test jobs; the cross `cargo check --target x86_64-pc-windows-gnu` approximates
+build-windows without the release link or its manifest/DLL assertions:
 
 ```sh
 ./scripts/check.sh
 ```
 
-This runs, in order: `cargo fmt --all --check`, `cargo clippy -q --workspace
---all-targets --target x86_64-pc-windows-gnu -- -D warnings`, `cargo test -q
---workspace`, and `cargo check -q --workspace --target
-x86_64-pc-windows-gnu` — a locally green run means the lint jobs pass too, so
-CI shouldn't surprise you with a fmt/clippy failure it caught first. CI also
-runs `windows-latest` build of the app and a smoke run with `--version`, and
-a `cargo-deny` check (`deny.toml`) for advisories/licenses/bans/sources;
-`cargo deny check` reproduces the latter locally if `cargo-deny` is
+This runs, in order: `cargo fmt --all --check`, `scripts/package-release.test.sh`,
+`cargo clippy -q --workspace --all-targets --target x86_64-pc-windows-gnu --
+-D warnings`, `cargo test -q --workspace`, and `cargo check -q --workspace
+--target x86_64-pc-windows-gnu` — a locally green run means the lint jobs
+pass too, so CI shouldn't surprise you with a fmt/clippy failure it caught
+first. CI also runs `windows-latest` build of the app and a smoke run with
+`--version`, and a `cargo-deny` check (`deny.toml`) for
+advisories/licenses/bans/sources; `cargo deny check` reproduces the latter
+locally if `cargo-deny` is
 installed.
 
 **Note:** CI on this repo may be queued or triggered manually rather than
