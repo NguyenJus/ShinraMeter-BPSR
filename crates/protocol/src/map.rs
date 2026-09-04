@@ -175,6 +175,7 @@ pub fn map_event(
             removes_layer,
             timestamp_ms,
         },
+        ProtocolEvent::LocalPlayer { uid } => meter::ProtocolEvent::LocalPlayer { uid },
     }
 }
 

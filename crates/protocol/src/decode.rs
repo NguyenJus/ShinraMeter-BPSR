@@ -437,6 +437,19 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
     let Some(v_data) = &msg.v_data else {
         return;
     };
+    // issue #344: `SyncContainerData` is the full-state push the server
+    // sends about *this client's own session* (see this function's doc
+    // comment for why it — unlike `Player`/`EnemyHp` — always describes the
+    // local player), so `v_data.char_id` alone identifies who "you" is.
+    // Emitted ahead of (and independently of) `Scene`/`Player` below: it
+    // needs neither `scene_data` nor `char_base` to be meaningful. Zero is
+    // treated as absent, mirroring `scene_id_from_attrs`'s convention just
+    // below.
+    if v_data.char_id != 0 {
+        out.push(ProtocolEvent::LocalPlayer {
+            uid: v_data.char_id,
+        });
+    }
     if let Some(level_map_id) = v_data
         .scene_data
         .as_ref()
@@ -1695,11 +1708,62 @@ mod tests {
         });
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
-        assert_eq!(out.len(), 1);
-        match &out[0] {
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], ProtocolEvent::LocalPlayer { uid: 8 });
+        match &out[1] {
             ProtocolEvent::Player(p) => assert_eq!(p.class, None),
             other => panic!("expected Player, got {other:?}"),
         }
+    }
+
+    // -- LocalPlayer (issue #344) --------------------------------------
+
+    #[test]
+    fn container_data_char_id_yields_local_player() {
+        let n = container_notify(pb::CharSerialize {
+            char_id: 12345,
+            char_base: None,
+            scene_data: None,
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out, vec![ProtocolEvent::LocalPlayer { uid: 12345 }]);
+    }
+
+    #[test]
+    fn container_data_char_id_is_not_shifted_like_a_packed_uuid() {
+        // Trap guard (issue #344): `char_id` is a bare uid, not a packed
+        // `uuid` — a value that would look like a plausible packed uuid
+        // (i.e. `uid_of` would change it) must still come through verbatim.
+        let packed_looking = 8i64 << 16;
+        let n = container_notify(pb::CharSerialize {
+            char_id: packed_looking,
+            char_base: None,
+            scene_data: None,
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(
+            out,
+            vec![ProtocolEvent::LocalPlayer {
+                uid: packed_looking
+            }]
+        );
+    }
+
+    #[test]
+    fn container_data_zero_char_id_yields_no_local_player() {
+        let n = container_notify(pb::CharSerialize {
+            char_id: 0,
+            char_base: None,
+            scene_data: Some(pb::SceneData { level_map_id: 8 }),
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out, vec![ProtocolEvent::Scene { level_map_id: 8 }]);
     }
 
     // -- SyncContainerData.scene_data (issue #293: mid-instance attach) -----
@@ -1749,17 +1813,20 @@ mod tests {
         decode_notify(&n, 0, &mut out, None);
         assert_eq!(
             out,
-            vec![ProtocolEvent::Player(PlayerInfo {
-                uid: 8,
-                name: Some("Ari".to_string()),
-                class: None,
-                ability_score: None,
-                season_level: None,
-                season_strength: None,
-                skill_ids: Vec::new(),
-                position: None,
-                target_position: None,
-            })]
+            vec![
+                ProtocolEvent::LocalPlayer { uid: 8 },
+                ProtocolEvent::Player(PlayerInfo {
+                    uid: 8,
+                    name: Some("Ari".to_string()),
+                    class: None,
+                    ability_score: None,
+                    season_level: None,
+                    season_strength: None,
+                    skill_ids: Vec::new(),
+                    position: None,
+                    target_position: None,
+                })
+            ]
         );
     }
 
@@ -1779,14 +1846,15 @@ mod tests {
         });
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
-        assert_eq!(out.len(), 2);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], ProtocolEvent::LocalPlayer { uid: 8 });
         assert_eq!(
-            out[0],
+            out[1],
             ProtocolEvent::Scene {
                 level_map_id: 40001
             }
         );
-        match &out[1] {
+        match &out[2] {
             ProtocolEvent::Player(p) => assert_eq!(p.uid, 8),
             other => panic!("expected Player, got {other:?}"),
         }

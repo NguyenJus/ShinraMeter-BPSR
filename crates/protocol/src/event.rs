@@ -398,6 +398,20 @@ pub enum ProtocolEvent {
         removes_layer: bool,
         timestamp_ms: u64,
     },
+    /// The local player's own uid (issue #344), decoded from
+    /// `SyncContainerData.v_data.char_id` — see
+    /// `decode::on_sync_container_data`. `char_id` is a **bare** uid, not a
+    /// packed `uuid`; unlike `Entity`/`AoiSyncDelta`/`SyncDamageInfo` ids it
+    /// must never be shifted through `uid_of` (that trap is what sank the
+    /// field's first pass in `bin/sanitize-dump.rs`, whose module doc
+    /// documents the same distinction for `CharSerialize.char_id`/
+    /// `CharBaseInfo.char_id`). Emitted independently of `Player`: a
+    /// `CharSerialize` with only `char_id` (no `char_base`) still says who
+    /// the local player is, even though `on_sync_container_data` has
+    /// nothing to build a `Player` event from in that case.
+    LocalPlayer {
+        uid: i64,
+    },
 }
 
 #[cfg(test)]
