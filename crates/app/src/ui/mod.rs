@@ -66,6 +66,7 @@ use crate::update_check::{self, CheckOutcome};
 mod header;
 mod history_view;
 mod menu;
+mod opacity;
 mod settings;
 mod skill_window;
 mod status;
@@ -74,6 +75,7 @@ mod table;
 pub(crate) use header::*;
 pub(crate) use history_view::*;
 pub(crate) use menu::*;
+pub(crate) use opacity::Opacity;
 pub(crate) use settings::*;
 pub(crate) use skill_window::*;
 pub(crate) use status::*;
@@ -303,25 +305,21 @@ fn paint_skill_icon_placeholder(
     center: egui::Pos2,
     skill_id: i32,
     name: &str,
-    opacity: f32,
+    opacity: Opacity,
 ) {
     let Some(glyph) = skills::skill_monogram(name) else {
         painter.circle_filled(center, SKILL_ICON_PLACEHOLDER_RADIUS, SKILL_ICON_EMPTY);
         return;
     };
     let (bg, fg) = skill_placeholder_colors(skill_id);
-    painter.circle_filled(
-        center,
-        SKILL_ICON_PLACEHOLDER_RADIUS,
-        bg.gamma_multiply(opacity),
-    );
+    painter.circle_filled(center, SKILL_ICON_PLACEHOLDER_RADIUS, opacity.apply(bg));
     paint_bold_text(
         painter,
         center,
         egui::Align2::CENTER_CENTER,
         &glyph,
         SKILL_ICON_MONOGRAM_FONT_SIZE,
-        fg.gamma_multiply(opacity),
+        opacity.apply(fg),
     );
 }
 
@@ -655,8 +653,8 @@ const BACKGROUND_IMAGE_SCRIM: egui::Color32 =
 /// regions get it and neither can quietly stop applying it. `Color32`
 /// stores channels premultiplied, so scaling white this way scales the
 /// blit's alpha, which is exactly "fade the image with the slider".
-fn background_image_tint(opacity: f32) -> egui::Color32 {
-    egui::Color32::WHITE.gamma_multiply(opacity)
+fn background_image_tint(opacity: Opacity) -> egui::Color32 {
+    opacity.apply(egui::Color32::WHITE)
 }
 
 /// Resolves the texture to paint for `slot` over `rect` — together with
@@ -723,12 +721,12 @@ fn paint_background_image(
         texture,
         rect,
         crate::custom_image::cover_uv(content, rect.size()),
-        background_image_tint(settings.opacity),
+        background_image_tint(Opacity::new(settings.opacity)),
     );
     painter.rect_filled(
         rect,
         0.0,
-        BACKGROUND_IMAGE_SCRIM.gamma_multiply(settings.opacity),
+        Opacity::new(settings.opacity).apply(BACKGROUND_IMAGE_SCRIM),
     );
     true
 }
@@ -1175,6 +1173,15 @@ fn initial_snapshot(demo_mode: bool) -> Snapshot {
 }
 
 impl OverlayApp {
+    /// The overlay's current window opacity.
+    ///
+    /// The one place `Settings::opacity`'s raw `f32` is turned into an
+    /// [`Opacity`]; every paint path takes the typed value from here rather
+    /// than reading (and re-clamping) the setting itself.
+    pub(crate) fn opacity(&self) -> Opacity {
+        Opacity::new(self.settings.opacity)
+    }
+
     /// `settings` is loaded by the caller (`main.rs`) rather than via
     /// `settings::load()` in here, because issue #27 needs the same loaded
     /// value before this exists too — to build `ui::viewport`'s starting
@@ -1728,6 +1735,9 @@ impl eframe::App for OverlayApp {
         // Loaded once, lazily: the `egui::Context` above isn't available yet
         // at `OverlayApp::new`, so the first frame is what actually uploads
         // the icon textures (issues #9, #41); every later frame reuses them.
+        // Read before the `self.icons` borrow below, which holds `&mut self`
+        // for the rest of the frame.
+        let opacity = self.opacity();
         let icons = self.icons.get_or_insert_with(|| Icons::load(&ctx));
 
         // Issue #16 (D1): set by `draw_rows` (via `draw_row`) when a row is
@@ -1778,10 +1788,10 @@ impl eframe::App for OverlayApp {
                     // scaling correctly (see its doc comment on `Color32`
                     // storing channels premultiplied), so there is no need
                     // for a hand-rolled equivalent here.
-                    .fill(PANEL_FILL.gamma_multiply(self.settings.opacity))
+                    .fill(opacity.apply(PANEL_FILL))
                     .stroke(egui::Stroke::new(
                         PANEL_BORDER_WIDTH,
-                        PANEL_BORDER_COLOR.gamma_multiply(self.settings.opacity),
+                        opacity.apply(PANEL_BORDER_COLOR),
                     ))
                     .corner_radius(egui::CornerRadius::same(PANEL_CORNER_RADIUS)),
             )
@@ -2036,7 +2046,6 @@ impl eframe::App for OverlayApp {
         // borrow of `self.icons` has to end before `open_history` can take
         // `&mut self`, so the child-viewport loop below takes a fresh one.
         let icons = self.icons.as_ref().expect("loaded on the first frame");
-        let opacity = self.settings.opacity;
         let mut closed_skill_windows: Vec<i64> = Vec::new();
         // Issue #216: every open window resolves against the fight it was
         // opened from (`SkillWindowState::source`), not against whichever
@@ -3176,14 +3185,14 @@ mod tests {
     // -- Skill-icon monogram placeholder colors (issue #275) ----------------
 
     #[test]
-    pub(crate) fn placeholder_colors_are_deterministic_per_id() {
+    fn placeholder_colors_are_deterministic_per_id() {
         for id in [2031103, 2203291, 35107, -5, 0] {
             assert_eq!(skill_placeholder_colors(id), skill_placeholder_colors(id));
         }
     }
 
     #[test]
-    pub(crate) fn different_ids_sharing_a_monogram_can_still_land_on_different_swatches() {
+    fn different_ids_sharing_a_monogram_can_still_land_on_different_swatches() {
         // Every Lucky Strike weapon variant collapses to the same "LS"
         // glyph (they are literally the same base skill), so the id-keyed
         // background is the only thing that can still tell the rows apart.
@@ -3202,8 +3211,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn every_placeholder_swatch_clears_wcag_normal_text_contrast_with_its_chosen_glyph_color()
-     {
+    fn every_placeholder_swatch_clears_wcag_normal_text_contrast_with_its_chosen_glyph_color() {
         // Exercises the legibility rule this placeholder encodes: whichever
         // of near-black or white `skill_placeholder_colors` picks must clear
         // WCAG AA's 4.5:1 minimum for normal text against every swatch in
@@ -3237,31 +3245,31 @@ mod tests {
     // -- demo_enabled_from (issue #91) --------------------------------------
 
     #[test]
-    pub(crate) fn demo_enabled_from_unset_is_off() {
+    fn demo_enabled_from_unset_is_off() {
         assert!(!demo_enabled_from(None));
     }
 
     #[test]
-    pub(crate) fn demo_enabled_from_empty_is_off() {
+    fn demo_enabled_from_empty_is_off() {
         assert!(!demo_enabled_from(Some("")));
     }
 
     #[test]
-    pub(crate) fn demo_enabled_from_explicit_off_values() {
+    fn demo_enabled_from_explicit_off_values() {
         for value in ["0", "false", "off"] {
             assert!(!demo_enabled_from(Some(value)), "SHINRA_DEMO={value:?}");
         }
     }
 
     #[test]
-    pub(crate) fn demo_enabled_from_on_values_case_insensitive() {
+    fn demo_enabled_from_on_values_case_insensitive() {
         for value in ["1", "true", "TRUE", "on"] {
             assert!(demo_enabled_from(Some(value)), "SHINRA_DEMO={value:?}");
         }
     }
 
     #[test]
-    pub(crate) fn demo_enabled_from_garbage_is_off() {
+    fn demo_enabled_from_garbage_is_off() {
         assert!(!demo_enabled_from(Some("banana")));
     }
 
@@ -3269,7 +3277,7 @@ mod tests {
     /// state — no rows, no resolved boss — matching a game that has not
     /// reported an encounter yet.
     #[test]
-    pub(crate) fn initial_snapshot_is_empty_when_demo_mode_is_off() {
+    fn initial_snapshot_is_empty_when_demo_mode_is_off() {
         let snapshot = initial_snapshot(false);
         assert!(snapshot.rows.is_empty());
         assert_eq!(snapshot.encounter.boss_name, None);
@@ -3285,7 +3293,7 @@ mod tests {
     /// show, with nothing failing to say so. This is the test a typo'd id
     /// would have caught.
     #[test]
-    pub(crate) fn every_demo_row_imagine_id_resolves_to_a_known_icon_with_bytes() {
+    fn every_demo_row_imagine_id_resolves_to_a_known_icon_with_bytes() {
         for &(name, _, _, _, _, _, _, ids, _, _) in &DEMO_ROWS {
             for id in ids.into_iter().flatten() {
                 let imagine = imagines::imagine_of_skill_id(id)
@@ -3306,7 +3314,7 @@ mod tests {
     /// leftover empty `skills: Vec::new()` (the placeholder T1 left for
     /// this task) would silently produce a blank window.
     #[test]
-    pub(crate) fn every_demo_row_has_a_skill_breakdown() {
+    fn every_demo_row_has_a_skill_breakdown() {
         let snapshot = demo_snapshot();
         for row in &snapshot.rows {
             assert!(
@@ -3319,7 +3327,7 @@ mod tests {
 
     /// Same consistency requirement as damage, for hit counts.
     #[test]
-    pub(crate) fn demo_skill_hits_sum_to_the_row_hits() {
+    fn demo_skill_hits_sum_to_the_row_hits() {
         let snapshot = demo_snapshot();
         for row in &snapshot.rows {
             let skill_hits_sum: u64 = row.skills.iter().map(|s| s.hits).sum();
@@ -3335,7 +3343,7 @@ mod tests {
     /// worthless for eyeballing the breakdown window — issue #16 requires
     /// real ids picked from the vendored, curated skill-name table.
     #[test]
-    pub(crate) fn every_demo_skill_id_resolves_to_a_real_name() {
+    fn every_demo_skill_id_resolves_to_a_real_name() {
         let snapshot = demo_snapshot();
         for row in &snapshot.rows {
             for skill in &row.skills {
@@ -3356,7 +3364,7 @@ mod tests {
     /// hits, and the running max crit can never be smaller than the mean
     /// crit it's a max of.
     #[test]
-    pub(crate) fn demo_skill_numbers_are_internally_consistent() {
+    fn demo_skill_numbers_are_internally_consistent() {
         let snapshot = demo_snapshot();
         for row in &snapshot.rows {
             for skill in &row.skills {
@@ -3393,7 +3401,7 @@ mod tests {
     /// ~100% the same way `demo_snapshot_header_and_rows_are_internally_
     /// consistent` checks the damage rows.
     #[test]
-    pub(crate) fn demo_heal_breakdown_is_populated_only_for_the_healer_role_and_sums_correctly() {
+    fn demo_heal_breakdown_is_populated_only_for_the_healer_role_and_sums_correctly() {
         let snapshot = demo_snapshot();
         for row in &snapshot.rows {
             let class = row.class.expect("every demo row has a class");
@@ -3430,7 +3438,7 @@ mod tests {
     /// there is no per-class variation the way heals has — so every row's
     /// `received` must be non-empty and sum to `demo_received_total`.
     #[test]
-    pub(crate) fn demo_received_breakdown_is_populated_for_every_row_and_sums_to_its_total() {
+    fn demo_received_breakdown_is_populated_for_every_row_and_sums_to_its_total() {
         let snapshot = demo_snapshot();
         let total = demo_received_total();
         for row in &snapshot.rows {
@@ -3454,7 +3462,7 @@ mod tests {
     /// this is the "populated" half of finding 3's coverage gap for the
     /// Skill casts tab.
     #[test]
-    pub(crate) fn demo_cast_breakdown_is_populated_and_derives_from_the_skill_hits() {
+    fn demo_cast_breakdown_is_populated_and_derives_from_the_skill_hits() {
         let snapshot = demo_snapshot();
         for row in &snapshot.rows {
             assert!(
@@ -3496,7 +3504,7 @@ mod tests {
     /// `demo_dealt_rows_merges_a_shared_skill_id_instead_of_duplicating_it`
     /// below is what actually exercises the merge itself.
     #[test]
-    pub(crate) fn demo_dealt_breakdown_sums_to_damage_plus_heals() {
+    fn demo_dealt_breakdown_sums_to_damage_plus_heals() {
         let snapshot = demo_snapshot();
         for row in &snapshot.rows {
             let heal_sum: i64 = row.heals.iter().map(|s| s.damage).sum();
@@ -3528,7 +3536,7 @@ mod tests {
     /// against the old chain-based implementation (two rows, wrong per-row
     /// damage) the same way it would against a real collision.
     #[test]
-    pub(crate) fn demo_dealt_rows_merges_a_shared_skill_id_instead_of_duplicating_it() {
+    fn demo_dealt_rows_merges_a_shared_skill_id_instead_of_duplicating_it() {
         let skills: &[DemoSkill] = &[
             (9001, 1_000, 10, 2, 400, 200), // shared id
             (9002, 500, 5, 1, 200, 150),
@@ -3569,7 +3577,7 @@ mod tests {
     /// synthetic capture with the pipeline's real (empty, game-not-running)
     /// snapshot the moment one arrives on the channel.
     #[test]
-    pub(crate) fn drain_snapshots_leaves_the_demo_snapshot_intact_when_demo_mode_is_on() {
+    fn drain_snapshots_leaves_the_demo_snapshot_intact_when_demo_mode_is_on() {
         let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
@@ -3597,7 +3605,7 @@ mod tests {
     /// the channel must still win, or the overlay would never leave "No
     /// target" once a real encounter starts.
     #[test]
-    pub(crate) fn drain_snapshots_replaces_the_snapshot_when_demo_mode_is_off() {
+    fn drain_snapshots_replaces_the_snapshot_when_demo_mode_is_off() {
         let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
@@ -3625,8 +3633,7 @@ mod tests {
     /// sites, is what tells the two apart: a disconnect seen after it must
     /// leave the status alone rather than raising that banner.
     #[test]
-    pub(crate) fn drain_snapshots_disconnected_after_quit_does_not_raise_the_dead_pipeline_status()
-    {
+    fn drain_snapshots_disconnected_after_quit_does_not_raise_the_dead_pipeline_status() {
         let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
@@ -3660,7 +3667,7 @@ mod tests {
     /// it. Exercises `OverlayApp`'s own state rather than an egui round
     /// trip, the same way the `pending_screenshot_bound` test does.
     #[test]
-    pub(crate) fn a_transient_status_error_clears_itself_but_a_permanent_one_never_does() {
+    fn a_transient_status_error_clears_itself_but_a_permanent_one_never_does() {
         let new_app = || {
             let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
             let (tx_command, _rx_command) = crossbeam_channel::unbounded();
@@ -3718,7 +3725,7 @@ mod tests {
     /// the same transient banner the Share failure uses, a success on the
     /// log alone (`StatusLine` has no non-error state to say it with).
     #[test]
-    pub(crate) fn a_failed_log_export_raises_a_transient_banner_and_a_successful_one_stays_quiet() {
+    fn a_failed_log_export_raises_a_transient_banner_and_a_successful_one_stays_quiet() {
         let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
@@ -3771,33 +3778,33 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn fmt_short_below_thousand_is_plain() {
+    fn fmt_short_below_thousand_is_plain() {
         assert_eq!(fmt_short(999), "999");
     }
 
     #[test]
-    pub(crate) fn fmt_short_thousands() {
+    fn fmt_short_thousands() {
         assert_eq!(fmt_short(1_000), "1.00K");
     }
 
     #[test]
-    pub(crate) fn fmt_short_millions() {
+    fn fmt_short_millions() {
         assert_eq!(fmt_short(1_234_567), "1.23M");
     }
 
     #[test]
-    pub(crate) fn fmt_short_negative() {
+    fn fmt_short_negative() {
         assert_eq!(fmt_short(-1_500), "-1.50K");
     }
 
     #[test]
-    pub(crate) fn fmt_short_billions() {
+    fn fmt_short_billions() {
         assert_eq!(fmt_short(2_500_000_000), "2.50B");
     }
 
     /// Issue #118: the full table from the issue, verbatim.
     #[test]
-    pub(crate) fn fmt_short_issue_118_table() {
+    fn fmt_short_issue_118_table() {
         let cases: [(i64, &str); 8] = [
             (1234, "1.23K"),
             (12345, "12.34K"),
@@ -3814,12 +3821,12 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn fmt_duration_zero() {
+    fn fmt_duration_zero() {
         assert_eq!(fmt_duration(0), "00:00");
     }
 
     #[test]
-    pub(crate) fn fmt_duration_minute_and_seconds() {
+    fn fmt_duration_minute_and_seconds() {
         assert_eq!(fmt_duration(65_000), "01:05");
     }
 
@@ -3827,7 +3834,7 @@ mod tests {
     /// digits below ten, matching the reference render's `02:39` — the
     /// exact value it shows.
     #[test]
-    pub(crate) fn fmt_duration_pads_single_digit_minutes() {
+    fn fmt_duration_pads_single_digit_minutes() {
         assert_eq!(fmt_duration(159_000), "02:39");
         assert_eq!(fmt_duration(9_000), "00:09");
         assert_eq!(fmt_duration(599_000), "09:59");
@@ -3837,7 +3844,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn fmt_duration_no_hour_rollover() {
+    fn fmt_duration_no_hour_rollover() {
         assert_eq!(fmt_duration(3_600_000), "60:00");
         // Issue #91's minute padding must not have introduced one either:
         // three-digit minute counts keep counting, and `120:00` stays the
@@ -3850,7 +3857,7 @@ mod tests {
     // window being dragged --------------------------------------------------
 
     #[test]
-    pub(crate) fn gesture_pointer_a_moving_window_cannot_drag_the_os_cursor_along_with_it() {
+    fn gesture_pointer_a_moving_window_cannot_drag_the_os_cursor_along_with_it() {
         // The bug: `window.min + local` re-derives screen position from the
         // very window the gesture just moved, so the reconstructed pointer
         // drifts with the window even though the real cursor hasn't moved.
@@ -3875,7 +3882,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn gesture_pointer_falls_back_to_the_window_origin_without_an_os_cursor() {
+    fn gesture_pointer_falls_back_to_the_window_origin_without_an_os_cursor() {
         // Non-Windows dev hosts have no `GetCursorPos` equivalent wired up
         // (`platform::cursor_position` returns `None` there), so this
         // fallback just preserves the previous, pre-#68 behaviour on those
@@ -4200,7 +4207,7 @@ mod tests {
     /// everywhere else — `snapshot.total_damage` existed but was never
     /// painted before this change.
     #[test]
-    pub(crate) fn draw_header_shows_total_damage_abbreviated() {
+    fn draw_header_shows_total_damage_abbreviated() {
         let texts = header_rendered_texts(&header_test_snapshot(30_100_000_000));
         let expected = fmt_short(30_100_000_000);
         assert_eq!(expected, "30.10B");
@@ -4218,7 +4225,7 @@ mod tests {
     /// == FONT_SIZE_COUNTER`), so there is no "largest to smallest" chain
     /// left to assert.
     #[test]
-    pub(crate) fn font_scale_matches_the_source_metrics() {
+    fn font_scale_matches_the_source_metrics() {
         // Walked as a slice rather than asserted pair by pair: comparing a
         // constant directly to a literal is fine at runtime, but doing it
         // one-by-one for five constants is what this loop avoids repeating.
@@ -4235,7 +4242,7 @@ mod tests {
 
     /// `regular` is always the plain proportional family.
     #[test]
-    pub(crate) fn regular_is_the_proportional_family() {
+    fn regular_is_the_proportional_family() {
         assert_eq!(regular(12.0).family, egui::FontFamily::Proportional);
         assert_eq!(regular(12.0).size, 12.0);
     }
@@ -4260,24 +4267,24 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn fmt_share_zero() {
+    fn fmt_share_zero() {
         assert_eq!(fmt_share(0.0), "0.0%");
     }
 
     #[test]
-    pub(crate) fn fmt_share_rounds_to_one_decimal() {
+    fn fmt_share_rounds_to_one_decimal() {
         assert_eq!(fmt_share(12.34), "12.3%");
     }
 
     #[test]
-    pub(crate) fn fmt_share_full() {
+    fn fmt_share_full() {
         assert_eq!(fmt_share(100.0), "100.0%");
     }
 
     /// Issue #80.2: `fmt_pct0` is `fmt_share` minus the decimal place —
     /// same rounding, same trailing `%`, just `{:.0}` instead of `{:.1}`.
     #[test]
-    pub(crate) fn fmt_pct0_drops_the_decimal_place() {
+    fn fmt_pct0_drops_the_decimal_place() {
         let cases = [(0.0, "0%"), (12.34, "12%"), (12.6, "13%"), (100.0, "100%")];
         for (input, expected) in cases {
             assert_eq!(fmt_pct0(input), expected, "fmt_pct0({input})");
@@ -4296,7 +4303,7 @@ mod tests {
     /// column budgets 5 chars for the digit run alone, excluding the
     /// trailing K/M/B suffix and any leading `-`.
     #[test]
-    pub(crate) fn fmt_short_rounds_before_choosing_the_decimal_branch() {
+    fn fmt_short_rounds_before_choosing_the_decimal_branch() {
         let cases: [(i64, &str); 6] = [
             (999_499, "999.4K"),
             (999_500, "1000K"),
@@ -4352,14 +4359,14 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn ability_score_column_blank_when_none() {
+    fn ability_score_column_blank_when_none() {
         let row = sample_row(None);
         let column = ColumnKind::AbilityScore.spec();
         assert_eq!((column.text)(&row), "");
     }
 
     #[test]
-    pub(crate) fn ability_score_column_formats_value_when_some() {
+    fn ability_score_column_formats_value_when_some() {
         // A value that `fmt_short` would abbreviate to "12.3M" — the full
         // digit string must be rendered instead (owner requirement: ability
         // score and season strength always show the complete figure).
@@ -4369,14 +4376,14 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn season_strength_column_blank_when_none() {
+    fn season_strength_column_blank_when_none() {
         let row = sample_season_row(None);
         let column = ColumnKind::SeasonStrength.spec();
         assert_eq!((column.text)(&row), "");
     }
 
     #[test]
-    pub(crate) fn season_strength_column_formats_value_when_some() {
+    fn season_strength_column_formats_value_when_some() {
         // Same full-digit requirement as ability score above.
         let row = sample_season_row(Some(12_345_678));
         let column = ColumnKind::SeasonStrength.spec();
@@ -4401,7 +4408,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn resize_zones_cover_every_direction() {
+    fn resize_zones_cover_every_direction() {
         let dirs: Vec<_> = resize_zones(window())
             .map(|(_, d, _)| d)
             .into_iter()
@@ -4422,7 +4429,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn resize_zones_stay_inside_the_window() {
+    fn resize_zones_stay_inside_the_window() {
         let win = window();
         for (zone, dir, _) in resize_zones(win) {
             assert!(win.contains_rect(zone), "{dir:?} escapes the window");
@@ -4432,7 +4439,7 @@ mod tests {
     /// Corners must be registered after the edges they overlap, so the later
     /// widget wins the hit test and a corner grab resizes both axes.
     #[test]
-    pub(crate) fn corners_are_registered_after_edges() {
+    fn corners_are_registered_after_edges() {
         let zones = resize_zones(window());
         let first_corner = zones
             .iter()
@@ -4479,24 +4486,24 @@ mod tests {
     /// slider is asserted at both endpoints and in between rather than
     /// assumed.
     #[test]
-    pub(crate) fn background_image_tint_tracks_the_opacity_slider() {
+    fn background_image_tint_tracks_the_opacity_slider() {
         assert_eq!(
-            background_image_tint(1.0),
+            background_image_tint(Opacity::OPAQUE),
             egui::Color32::WHITE,
             "a full-opacity overlay must paint the image untouched"
         );
         assert_eq!(
-            background_image_tint(Settings::OPACITY_MIN).a(),
+            background_image_tint(Opacity::new(Settings::OPACITY_MIN)).a(),
             0,
             "a zero-opacity overlay must paint no image at all"
         );
-        let half = background_image_tint(0.5).a();
+        let half = background_image_tint(Opacity::new(0.5)).a();
         assert!(
             half > 0 && half < 255,
             "a mid-slider overlay must paint a partly-faded image, got alpha {half}"
         );
         assert!(
-            background_image_tint(0.25).a() < half,
+            background_image_tint(Opacity::new(0.25)).a() < half,
             "dragging the slider down must fade the image further"
         );
     }
@@ -4506,7 +4513,7 @@ mod tests {
     /// so a 0% overlay is genuinely empty rather than showing a dark
     /// rectangle where the artwork was.
     #[test]
-    pub(crate) fn background_image_scrim_tracks_the_opacity_slider() {
+    fn background_image_scrim_tracks_the_opacity_slider() {
         assert_eq!(
             BACKGROUND_IMAGE_SCRIM.gamma_multiply(1.0),
             BACKGROUND_IMAGE_SCRIM
@@ -4528,7 +4535,7 @@ mod tests {
     /// fully opaque scrim would hide the artwork entirely and a fully
     /// transparent one would guarantee nothing.
     #[test]
-    pub(crate) fn background_image_scrim_matches_the_panel_fill_color() {
+    fn background_image_scrim_matches_the_panel_fill_color() {
         // Unmultiplied on both sides: `Color32` stores premultiplied
         // channels, so the scrim's raw `.r()` is already scaled by its own
         // alpha and would never equal the opaque `PANEL_FILL`'s.
@@ -4579,7 +4586,7 @@ mod tests {
     /// function twice with identical inputs (standing in for "row before"
     /// vs. "row after" a digit-count change) must yield identical anchors.
     #[test]
-    pub(crate) fn column_anchors_are_stable_across_repeated_calls() {
+    fn column_anchors_are_stable_across_repeated_calls() {
         let first = column_anchors(0.0, 300.0, &TEST_COLUMNS, 4.0);
         let second = column_anchors(0.0, 300.0, &TEST_COLUMNS, 4.0);
         assert_eq!(first, second);
@@ -4601,7 +4608,7 @@ mod tests {
     /// `assertions_on_constants`) — same trick
     /// `font_scale_matches_the_source_metrics` uses.
     #[test]
-    pub(crate) fn chrome_border_is_translucent_but_the_fill_is_not() {
+    fn chrome_border_is_translucent_but_the_fill_is_not() {
         assert_eq!(PANEL_BORDER_COLOR.a(), 128);
         // Issue #182: no baked-in baseline left to multiply against, so the
         // slider owns the panel's transparency outright.
@@ -4612,7 +4619,7 @@ mod tests {
     /// full-range drag must land on a completely solid and a completely
     /// absent backdrop, with nothing baked in to cap either end.
     #[test]
-    pub(crate) fn panel_opacity_endpoints_are_solid_and_gone() {
+    fn panel_opacity_endpoints_are_solid_and_gone() {
         assert_eq!(
             PANEL_FILL.gamma_multiply(Settings::OPACITY_MAX).a(),
             255,
@@ -4675,7 +4682,7 @@ mod tests {
     /// The panel is deliberately *not* the source's slate `#232830` — that
     /// reads as washed-out grey over game footage. Lock the near-black.
     #[test]
-    pub(crate) fn panel_fill_is_near_black_not_slate() {
+    fn panel_fill_is_near_black_not_slate() {
         // Compare through the same constructor: `Color32` stores premultiplied
         // channels, so `to_tuple()` would not round-trip the (18, 18, 22).
         assert_eq!(PANEL_FILL, egui::Color32::from_rgb(18, 18, 22));
@@ -4722,7 +4729,7 @@ mod tests {
     // to *some* icon lookup outcome without panicking, and `Unknown`
     // resolves to none.
     #[test]
-    pub(crate) fn class_icons_get_is_defined_for_every_class_including_unknown() {
+    fn class_icons_get_is_defined_for_every_class_including_unknown() {
         let ctx = egui::Context::default();
         let icons = ClassIcons::load(&ctx);
 
@@ -4743,7 +4750,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn default_size_stays_above_the_min_inner_size() {
+    fn default_size_stays_above_the_min_inner_size() {
         // `with_min_inner_size` is [220.0, 90.0] (unaffected by issue #26);
         // the default opening size must never start below its own floor.
         assert!(default_inner_width() >= 220.0);
@@ -4751,7 +4758,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn reset_to_defaults_inner_height_is_shorter_than_the_twenty_row_default_by_exactly_the_row_delta()
+    fn reset_to_defaults_inner_height_is_shorter_than_the_twenty_row_default_by_exactly_the_row_delta()
      {
         // Both heights derive from the same `inner_height_for_rows` formula
         // now, so the *only* thing that can differ between them is the row
@@ -4772,7 +4779,7 @@ mod tests {
     /// other on the next double-click, the "alternating" the issue asks
     /// for.
     #[test]
-    pub(crate) fn resize_double_click_preset_height_alternates_between_the_two_presets() {
+    fn resize_double_click_preset_height_alternates_between_the_two_presets() {
         let five = reset_to_defaults_inner_height();
         let twenty = default_inner_height();
         assert_eq!(resize_double_click_preset_height(five), twenty);
@@ -4784,8 +4791,7 @@ mod tests {
     /// whichever preset is farther away — the midpoint between the two
     /// presets is where that flips.
     #[test]
-    pub(crate) fn resize_double_click_preset_height_picks_the_farther_preset_from_an_arbitrary_height()
-     {
+    fn resize_double_click_preset_height_picks_the_farther_preset_from_an_arbitrary_height() {
         let five = reset_to_defaults_inner_height();
         let twenty = default_inner_height();
         let midpoint = (five + twenty) / 2.0;
@@ -4799,7 +4805,7 @@ mod tests {
     /// command against whatever height a manual drag last left the window
     /// at.
     #[test]
-    pub(crate) fn resize_double_click_command_is_none_without_a_double_click() {
+    fn resize_double_click_command_is_none_without_a_double_click() {
         assert_eq!(resize_double_click_command(false, 100.0), None);
         assert_eq!(
             resize_double_click_command(false, reset_to_defaults_inner_height()),
@@ -4811,7 +4817,7 @@ mod tests {
     /// `resize_double_click_preset_height` computes from the window's
     /// current height.
     #[test]
-    pub(crate) fn resize_double_click_command_uses_the_preset_height_when_double_clicked() {
+    fn resize_double_click_command_uses_the_preset_height_when_double_clicked() {
         let five = reset_to_defaults_inner_height();
         let twenty = default_inner_height();
         assert_eq!(resize_double_click_command(true, five), Some(twenty));
@@ -4997,7 +5003,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn no_scrolling_needed_when_the_default_window_fits_every_row() {
+    fn no_scrolling_needed_when_the_default_window_fits_every_row() {
         let snapshot = rows_test_snapshot(DEFAULT_VISIBLE_ROWS);
         let content = rows_content_size(&snapshot, default_inner_width(), default_inner_height());
         assert!(
@@ -5013,7 +5019,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn scrolling_is_needed_once_rows_exceed_the_viewport_height() {
+    fn scrolling_is_needed_once_rows_exceed_the_viewport_height() {
         let snapshot = rows_test_snapshot(DEFAULT_VISIBLE_ROWS + 5);
         let viewport_height = DEFAULT_VISIBLE_ROWS as f32 * ROW_HEIGHT;
         let content = rows_content_size(&snapshot, default_inner_width(), viewport_height);
@@ -5024,7 +5030,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn each_rows_name_text_is_vertically_centered_in_its_row() {
+    fn each_rows_name_text_is_vertically_centered_in_its_row() {
         let snapshot = rows_test_snapshot(DEFAULT_VISIBLE_ROWS);
         let frame = rows_painted_boxes(&snapshot, default_inner_width(), default_inner_height());
         let rows = frame.row_rects();
@@ -5068,7 +5074,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn track_window_position_persists_a_moved_window() {
+    fn track_window_position_persists_a_moved_window() {
         let mut settings = Settings::default();
 
         let sent = track_one_frame(&mut settings, outer_rect_at(100.0, 200.0), Some(false));
@@ -5079,7 +5085,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn track_window_position_stays_quiet_when_the_window_has_not_moved() {
+    fn track_window_position_stays_quiet_when_the_window_has_not_moved() {
         let mut settings = Settings {
             window_position: Some([100.0, 200.0]),
             ..Settings::default()
@@ -5095,7 +5101,7 @@ mod tests {
     /// nothing reported while minimized is persisted — not even a position
     /// that looks perfectly ordinary.
     #[test]
-    pub(crate) fn track_window_position_ignores_a_minimized_window() {
+    fn track_window_position_ignores_a_minimized_window() {
         let mut settings = Settings {
             window_position: Some([100.0, 200.0]),
             ..Settings::default()
@@ -5110,7 +5116,7 @@ mod tests {
     /// Same parking spot, but reported before the `minimized` flag catches
     /// up — the plausibility floor is what rejects it.
     #[test]
-    pub(crate) fn track_window_position_ignores_an_absurd_off_screen_position() {
+    fn track_window_position_ignores_an_absurd_off_screen_position() {
         let mut settings = Settings {
             window_position: Some([100.0, 200.0]),
             ..Settings::default()
@@ -5148,7 +5154,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn track_window_size_persists_a_resized_window() {
+    fn track_window_size_persists_a_resized_window() {
         let mut settings = Settings::default();
 
         let sent = track_size_one_frame(&mut settings, inner_rect_of(640.0, 480.0), Some(false));
@@ -5159,7 +5165,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn track_window_size_stays_quiet_when_the_window_has_not_resized() {
+    fn track_window_size_stays_quiet_when_the_window_has_not_resized() {
         let mut settings = Settings {
             window_size: Some([640.0, 480.0]),
             ..Settings::default()
@@ -5174,7 +5180,7 @@ mod tests {
     /// A minimized window may report a meaningless (e.g. zeroed) inner
     /// size, so nothing reported while minimized is persisted.
     #[test]
-    pub(crate) fn track_window_size_ignores_a_minimized_window() {
+    fn track_window_size_ignores_a_minimized_window() {
         let mut settings = Settings {
             window_size: Some([640.0, 480.0]),
             ..Settings::default()
@@ -5189,7 +5195,7 @@ mod tests {
     /// Same zeroed-size failure mode, but reported before the `minimized`
     /// flag catches up — the plausibility floor is what rejects it.
     #[test]
-    pub(crate) fn track_window_size_ignores_an_absurd_zeroed_size() {
+    fn track_window_size_ignores_an_absurd_zeroed_size() {
         let mut settings = Settings {
             window_size: Some([640.0, 480.0]),
             ..Settings::default()
@@ -5204,14 +5210,14 @@ mod tests {
     // -- viewport() restore + sanity clamp (issue #134) --------------------
 
     #[test]
-    pub(crate) fn viewport_applies_a_restored_size_when_some() {
+    fn viewport_applies_a_restored_size_when_some() {
         let built = viewport(None, Some([640.0, 480.0]));
 
         assert_eq!(built.inner_size, Some(egui::vec2(640.0, 480.0)));
     }
 
     #[test]
-    pub(crate) fn viewport_applies_the_default_size_when_none() {
+    fn viewport_applies_the_default_size_when_none() {
         let built = viewport(None, None);
 
         assert_eq!(
@@ -5221,7 +5227,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn viewport_falls_back_to_default_size_for_a_too_small_persisted_value() {
+    fn viewport_falls_back_to_default_size_for_a_too_small_persisted_value() {
         // Below `MIN_INNER_SIZE` on both axes; the restored size must still
         // be clamped up to the floor rather than opening an unusable sliver.
         let built = viewport(None, Some([1.0, 1.0]));
@@ -5233,7 +5239,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn viewport_falls_back_to_default_size_for_a_non_finite_persisted_value() {
+    fn viewport_falls_back_to_default_size_for_a_non_finite_persisted_value() {
         let built = viewport(None, Some([f32::NAN, 480.0]));
 
         assert_eq!(
@@ -5244,7 +5250,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn viewport_falls_back_to_default_size_for_an_absurdly_large_persisted_value() {
+    fn viewport_falls_back_to_default_size_for_an_absurdly_large_persisted_value() {
         let built = viewport(None, Some([1.0e9, 480.0]));
 
         assert_eq!(
@@ -5255,8 +5261,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn viewport_falls_back_to_default_size_for_an_oversize_area_within_per_axis_bounds()
-    {
+    fn viewport_falls_back_to_default_size_for_an_oversize_area_within_per_axis_bounds() {
         // Each axis alone is under `MAX_INNER_SIZE_DIMENSION` (20,000), but
         // the product is ~400 million points — the total-area bound is what
         // must reject this, not the per-axis one.
@@ -5270,7 +5275,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn viewport_reset_ignores_any_persisted_size() {
+    fn viewport_reset_ignores_any_persisted_size() {
         // `main.rs`'s tray "Reset Window" action calls `viewport(None,
         // None)` regardless of what's persisted — this just pins that the
         // default-size call path is unaffected by a persisted size.
@@ -5484,7 +5489,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn a_move_offsets_the_origin_by_the_whole_pointer_delta() {
+    fn a_move_offsets_the_origin_by_the_whole_pointer_delta() {
         assert_eq!(
             moved_window_origin(window_rect(), egui::vec2(20.0, -10.0)),
             egui::pos2(120.0, 40.0)
@@ -5492,7 +5497,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn dragging_the_east_edge_moves_only_the_right_edge() {
+    fn dragging_the_east_edge_moves_only_the_right_edge() {
         let start = window_rect();
         let resized = resized_window_rect(
             start,
@@ -5505,7 +5510,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn dragging_the_west_edge_moves_the_origin_and_anchors_the_right_edge() {
+    fn dragging_the_west_edge_moves_the_origin_and_anchors_the_right_edge() {
         let start = window_rect();
         let resized = resized_window_rect(
             start,
@@ -5518,7 +5523,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn dragging_a_corner_resizes_on_both_axes_at_once() {
+    fn dragging_a_corner_resizes_on_both_axes_at_once() {
         let resized = resized_window_rect(
             window_rect(),
             egui::ResizeDirection::NorthEast,
@@ -5532,7 +5537,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn a_trailing_edge_drag_never_shrinks_past_the_minimum_inner_size() {
+    fn a_trailing_edge_drag_never_shrinks_past_the_minimum_inner_size() {
         let start = window_rect();
         let resized = resized_window_rect(
             start,
@@ -5547,7 +5552,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn clamping_a_leading_edge_drag_leaves_the_anchored_edges_put() {
+    fn clamping_a_leading_edge_drag_leaves_the_anchored_edges_put() {
         let start = window_rect();
         let resized = resized_window_rect(
             start,
@@ -5563,7 +5568,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn a_gesture_stays_active_until_it_is_ended() {
+    fn a_gesture_stays_active_until_it_is_ended() {
         let mut gesture = WindowGesture::default();
         assert_eq!(gesture.kind(), None);
         gesture.begin(GestureKind::Move, egui::pos2(10.0, 10.0), window_rect());
@@ -5573,7 +5578,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn beginning_a_gesture_supersedes_one_still_running() {
+    fn beginning_a_gesture_supersedes_one_still_running() {
         let mut gesture = WindowGesture::default();
         gesture.begin(GestureKind::Move, egui::pos2(10.0, 10.0), window_rect());
         let resize = GestureKind::Resize(egui::ResizeDirection::West);
@@ -5584,7 +5589,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn ending_an_idle_gesture_is_a_no_op() {
+    fn ending_an_idle_gesture_is_a_no_op() {
         // `end` runs on several exit paths (pointer released, focus lost,
         // drag cancelled), so it has to be safely repeatable — a second
         // release must not drop the exemption guard twice.
@@ -5597,7 +5602,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn a_finished_resize_needs_a_frame_recompute() {
+    fn a_finished_resize_needs_a_frame_recompute() {
         // Issue #74: a resize is the gesture kind that can leave DWM's frame
         // stale, so its end must trigger `platform::force_frame_recompute`.
         let resize = GestureKind::Resize(egui::ResizeDirection::West);
@@ -5608,7 +5613,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn a_finished_move_does_not_need_a_frame_recompute() {
+    fn a_finished_move_does_not_need_a_frame_recompute() {
         // A pure move never changes the window's size, so there is nothing
         // for a DWM frame recompute to fix.
         assert!(!gesture_end_needs_frame_recompute(
@@ -5618,7 +5623,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn a_resize_finished_in_a_child_viewport_needs_no_frame_recompute() {
+    fn a_resize_finished_in_a_child_viewport_needs_no_frame_recompute() {
         // Issue #218: the breakdown windows share this driver, but
         // `platform::force_frame_recompute` can only reach the root `HWND`
         // it cached at startup. A child's resize must not fire a
@@ -5767,7 +5772,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn a_right_click_on_a_row_opens_that_players_breakdown() {
+    fn a_right_click_on_a_row_opens_that_players_breakdown() {
         let snapshot = rows_test_snapshot(1);
         let uid = snapshot.rows[0].uid;
         let opened = opened_uid_after_click(&snapshot, egui::PointerButton::Secondary);
@@ -5775,7 +5780,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn a_left_click_on_a_row_opens_nothing() {
+    fn a_left_click_on_a_row_opens_nothing() {
         let snapshot = rows_test_snapshot(1);
         let opened = opened_uid_after_click(&snapshot, egui::PointerButton::Primary);
         assert_eq!(opened, None);
@@ -5934,7 +5939,7 @@ mod tests {
                     tabs,
                     SkillWindowSource::Live,
                     &icons,
-                    1.0,
+                    Opacity::OPAQUE,
                     &mut WindowGesture::default(),
                 );
             },
@@ -5962,7 +5967,7 @@ mod tests {
                     tabs,
                     SkillWindowSource::Live,
                     &icons,
-                    1.0,
+                    Opacity::OPAQUE,
                     &mut WindowGesture::default(),
                 );
             },
@@ -6013,7 +6018,7 @@ mod tests {
     /// life. The dropped `Sender` it leaves behind is the signal, and the
     /// banner is what makes it visible.
     #[test]
-    pub(crate) fn a_dead_pipeline_thread_raises_an_error_banner() {
+    fn a_dead_pipeline_thread_raises_an_error_banner() {
         let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
@@ -6046,7 +6051,7 @@ mod tests {
     /// nothing new to say — must leave the banner alone, or the overlay
     /// would cry wolf on every quiet frame.
     #[test]
-    pub(crate) fn an_idle_pipeline_leaves_the_status_alone() {
+    fn an_idle_pipeline_leaves_the_status_alone() {
         let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
@@ -6075,7 +6080,7 @@ mod tests {
     /// pipeline disconnect at shutdown must not overwrite it with the
     /// vaguer message.
     #[test]
-    pub(crate) fn a_dead_pipeline_does_not_overwrite_an_existing_error_banner() {
+    fn a_dead_pipeline_does_not_overwrite_an_existing_error_banner() {
         let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded::<Snapshot>();
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
@@ -6107,7 +6112,7 @@ mod tests {
     /// the stale clipboard message for up to `TRANSIENT_STATUS_LINGER`
     /// instead of raising the fatal banner immediately.
     #[test]
-    pub(crate) fn a_dead_pipeline_overwrites_a_transient_error_banner() {
+    fn a_dead_pipeline_overwrites_a_transient_error_banner() {
         let (tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded::<Snapshot>();
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();

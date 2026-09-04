@@ -774,13 +774,13 @@ pub(crate) fn draw_skill_window(
     tabs: &mut SkillTabs,
     source: SkillWindowSource,
     icons: &Icons,
-    opacity: f32,
+    opacity: Opacity,
     gesture: &mut WindowGesture,
 ) -> bool {
     let rect = ui.max_rect();
     let ctx = ui.ctx().clone();
     let painter = ui.painter().clone();
-    painter.rect_filled(rect, 0.0, SKILL_CHROME_FILL.gamma_multiply(opacity));
+    painter.rect_filled(rect, 0.0, opacity.apply(SKILL_CHROME_FILL));
 
     // Issue #218: this window is `with_decorations(false)` like the root, so
     // winit cancels `WS_SIZEBOX` and hands back no OS resize frame — the
@@ -864,7 +864,7 @@ pub(crate) fn draw_skill_window(
         // Issue #184: every filled surface in this window takes `opacity`,
         // the pill included — it used to be the one chrome element that
         // stayed solid while the window around it faded.
-        fill: SKILL_PANEL_FILL.gamma_multiply(opacity),
+        fill: opacity.apply(SKILL_PANEL_FILL),
         stroke: None,
     };
     // Issue #254: the same chrome as the Deaths pill — one cluster, one
@@ -1026,7 +1026,7 @@ pub(crate) fn draw_skill_window(
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         if selected || response.hovered() {
-            painter.rect_filled(tab_rect, 0.0, SKILL_PANEL_FILL.gamma_multiply(opacity));
+            painter.rect_filled(tab_rect, 0.0, opacity.apply(SKILL_PANEL_FILL));
         }
         // An untracked tab (issue #245: Buff) is drawn muted
         // rather than hidden — the reference has it, this build cannot
@@ -1058,7 +1058,7 @@ pub(crate) fn draw_skill_window(
     painter.rect_filled(
         col_header_rect,
         0.0,
-        SKILL_COLUMN_HEADER_FILL.gamma_multiply(opacity),
+        opacity.apply(SKILL_COLUMN_HEADER_FILL),
     );
     // Issue #245: the narrower tabs would otherwise pack against the
     // window's right edge (`column_anchors_from_widths` lays out
@@ -1111,7 +1111,7 @@ pub(crate) fn draw_skill_window(
     // chrome fill. Measured at x=860 the reference's rows band is exactly
     // `SKILL_PANEL_FILL - SKILL_CHROME_FILL` (16 per channel) brighter than
     // the header above it.
-    painter.rect_filled(rows_rect, 0.0, SKILL_PANEL_FILL.gamma_multiply(opacity));
+    painter.rect_filled(rows_rect, 0.0, opacity.apply(SKILL_PANEL_FILL));
     let mut skill_rows = tab.rows(row).to_vec();
     skills::sort_rows(&mut skill_rows, *sort);
 
@@ -1168,11 +1168,8 @@ pub(crate) fn draw_skill_window(
                 if response.hovered() {
                     // Issue #184: fades with the rest of the chrome, same
                     // as the tab strip and the header pill.
-                    ui.painter().rect_filled(
-                        skill_rect,
-                        0.0,
-                        SKILL_ROW_HOVER_FILL.gamma_multiply(opacity),
-                    );
+                    ui.painter()
+                        .rect_filled(skill_rect, 0.0, opacity.apply(SKILL_ROW_HOVER_FILL));
                 }
                 for ((&anchor_x, kind), &width) in
                     anchors.iter().zip(columns.iter()).zip(widths.iter())
@@ -1257,7 +1254,7 @@ pub(crate) fn draw_skill_window(
         painter.rect_filled(
             thumb,
             egui::CornerRadius::same((SKILL_SCROLL_BAR_WIDTH / 2.0) as u8),
-            SKILL_SCROLL_THUMB_FILL.gamma_multiply(opacity),
+            opacity.apply(SKILL_SCROLL_THUMB_FILL),
         );
     }
 
@@ -1335,7 +1332,7 @@ mod tests {
                     &mut tabs_state,
                     SkillWindowSource::Live,
                     &icons,
-                    1.0,
+                    Opacity::OPAQUE,
                     &mut WindowGesture::default(),
                 );
             },
@@ -1969,7 +1966,7 @@ mod tests {
                     &mut tabs_state,
                     SkillWindowSource::Live,
                     &icons,
-                    1.0,
+                    Opacity::OPAQUE,
                     &mut WindowGesture::default(),
                 );
             },
@@ -2127,7 +2124,7 @@ mod tests {
                             &mut tabs,
                             SkillWindowSource::Live,
                             &icons,
-                            1.0,
+                            Opacity::OPAQUE,
                             &mut WindowGesture::default(),
                         );
                     },
@@ -2188,7 +2185,7 @@ mod tests {
                         &mut tabs,
                         SkillWindowSource::Live,
                         &icons,
-                        1.0,
+                        Opacity::OPAQUE,
                         &mut WindowGesture::default(),
                     );
                 },
@@ -2207,7 +2204,7 @@ mod tests {
                     &mut tabs,
                     SkillWindowSource::Live,
                     &icons,
-                    1.0,
+                    Opacity::OPAQUE,
                     &mut WindowGesture::default(),
                 );
             },
@@ -2335,7 +2332,7 @@ mod tests {
                     &mut tabs,
                     SkillWindowSource::Live,
                     &icons,
-                    1.0,
+                    Opacity::OPAQUE,
                     &mut gesture,
                 );
             },

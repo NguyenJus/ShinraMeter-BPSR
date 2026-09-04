@@ -131,7 +131,7 @@ pub(crate) fn draw_header(
     // painted from this same slider, matching the `PANEL_FILL`/
     // `PANEL_BORDER_COLOR` gamma-multiply above and the skill window's own
     // opacity threading (issue #184).
-    let opacity = settings.settings.opacity;
+    let opacity = Opacity::new(settings.settings.opacity);
     draw_header_wash(ui, panel, icons, wash_height, settings.settings);
 
     // Issue #183: pinning the overlay locks its *position* as well as its
@@ -180,7 +180,7 @@ pub(crate) fn draw_header(
             emblem.id(),
             header_emblem_rect(title_row, text_band_height),
             UV_FULL,
-            HEADER_EMBLEM_COLOR.gamma_multiply(opacity),
+            opacity.apply(HEADER_EMBLEM_COLOR),
         );
     }
     for (segment_rect, color) in title_separator_segments(title_separator_rect(title_row)) {
@@ -1726,13 +1726,12 @@ pub(crate) fn draw_header_wash(
 
     // Issue #252: the default artwork fades with the same slider the header
     // image above is already painted at.
-    let opacity = settings.opacity;
+    let opacity = Opacity::new(settings.opacity);
 
     // Top-left brightest, fading to zero at the bottom-right — the source's
     // `LinearGradientBrush` with no explicit start/end points defaults to
     // that diagonal.
-    let slate =
-        |a: u8| egui::Color32::from_rgba_unmultiplied(0x70, 0x80, 0x90, a).gamma_multiply(opacity);
+    let slate = |a: u8| opacity.apply(egui::Color32::from_rgba_unmultiplied(0x70, 0x80, 0x90, a));
     let mid_alpha = HEADER_WASH_TOP_ALPHA / 2;
     painter.add(egui::Shape::mesh(gradient_mesh(
         wash_rect,
@@ -1748,7 +1747,7 @@ pub(crate) fn draw_header_wash(
             emblem.id(),
             emblem_rect,
             UV_FULL,
-            HEADER_WASH_EMBLEM_COLOR.gamma_multiply(opacity),
+            opacity.apply(HEADER_WASH_EMBLEM_COLOR),
         );
     }
 }

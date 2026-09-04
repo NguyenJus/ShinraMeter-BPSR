@@ -501,7 +501,10 @@ pub(crate) fn draw_header_menu(
             // Issue #182: the rail spans the full 0%-100%, floor included. Nothing
             // here has to guard the bottom end — `Settings::OPACITY_MIN` documents
             // why a fully transparent backdrop stays recoverable.
-            let mut opacity = settings.opacity;
+            // The one place an `Opacity` goes back to a bare `f32`: `Slider` edits
+            // the raw fraction in place, and `Settings::set_opacity` re-clamps it on
+            // the way back out.
+            let mut opacity = Opacity::new(settings.opacity).as_f32();
             // Issue #235: `Slider` has no width-builder of its own — its rail is
             // sized entirely off `Spacing::slider_width` (a fixed ~100pt default),
             // unlike the Columns checkboxes and buttons below, which already stretch
