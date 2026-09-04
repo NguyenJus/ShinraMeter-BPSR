@@ -197,6 +197,44 @@ BOSS_ID_MANUAL_OVERRIDES: dict[int, str] = {
 # never suppress one `MonsterType == 2` already includes.
 WORLD_DOMINATOR_BOSS_ID_RANGE = range(3_000_000, 3_000_082)  # 3_000_000..=3_000_081
 
+# Issue #315 review: the registry range above is not uniformly bosses. A
+# weapon/role variant of a common mob family (Sword, Crossbow, Axe, Archer,
+# Scout, Warrior, Vanguard, Hunter, Mage, Sergeant, Shaman, Trickster,
+# Swordsman, Scholar, Foxen, Lizard) is an ordinary add that happens to be
+# drawn into the nightly rotation, not a rotation boss in its own right;
+# chiefs, kings, leaders, tyrants, captains, named characters and
+# base-template bosses stay in. An id excluded here that later turns up with
+# log evidence of actually rotating in as the night's boss gets moved back
+# out of this set (see the two ids issue #313/#314 hand-added to
+# `BOSS_ID_MANUAL_OVERRIDES` above, both of which are *not* in this set).
+# Names below are from `crates/meter/data/MonsterTableNames.json`.
+WORLD_DOMINATOR_NON_BOSS_IDS = frozenset(
+    {
+        3_000_010,  # Goblin Sword - Resonance
+        3_000_011,  # Goblin Crossbow - Resonance
+        3_000_012,  # Brigand Archer - Resonance
+        3_000_014,  # Goblin Axe - Resonance
+        3_000_015,  # Great Muku Axe - Resonance
+        3_000_028,  # Muku Warrior - Resonance
+        3_000_029,  # Lizardman Hunter - Resonance
+        3_000_030,  # Muku Scout - Resonance
+        3_000_031,  # Brigand Scout - Resonance
+        3_000_037,  # Muku Vanguard - Resonance
+        3_000_039,  # Goblin Fire Mage - Resonance
+        3_000_040,  # storm Goblin Axe - Resonance
+        3_000_042,  # Lizardman Mage - Resonance
+        3_000_047,  # Blackstone Sergeant - Resonance
+        3_000_049,  # Crimson Foxen - Resonance
+        3_000_050,  # Blackstone Sergeant - Resonance
+        3_000_054,  # Bluespine Lizard - Resonance
+        3_000_057,  # Goblin Shaman - Resonance
+        3_000_058,  # Goblin Trickster - Resonance
+        3_000_059,  # Mutant Foxen - Resonance
+        3_000_060,  # Cabbage Mission Swordsman - Resonance
+        3_000_061,  # Cabbage Mission Scholar - Resonance
+    }
+)
+
 # Manual overrides (issue #313): dungeon scene ids `DungeonsTable.json`'s
 # `SceneID` column omits but that behave as instances in the logs. Same idiom
 # and same one-way guarantee as `BOSS_ID_MANUAL_OVERRIDES` above — unioned on
@@ -370,18 +408,28 @@ mod tests {
         // `BOSS_ID_MANUAL_OVERRIDES` — whack-a-mole, since the nightly
         // rotation draws from all 81 populated rows of the registry. Issue
         // #315 replaces that with `WORLD_DOMINATOR_BOSS_ID_RANGE`
-        // (3000000..=3000081) in `scripts/gen-name-tables.py`, so every id in
-        // the block is recognized regardless of which one rotates in
-        // tonight — including the 76 rows `MonsterTable.json` marks
-        // `MonsterType == 0` with `BloodTubeCount == 0` (an unfilled
-        // classification field, not a real non-boss monster; see the range's
-        // doc comment).
+        // (3000000..=3000081) in `scripts/gen-name-tables.py`, minus
+        // `WORLD_DOMINATOR_NON_BOSS_IDS` — the ordinary weapon/role variant
+        // adds the rotation also draws from, not rotation bosses in their own
+        // right (see that constant's doc comment for the criterion).
+        // `EXCLUDED` below is rendered straight from
+        // `WORLD_DOMINATOR_NON_BOSS_IDS` at generation time.
+__WD_EXCLUDED_ARRAY__
         for id in 3_000_000..=3_000_081u32 {
-            assert!(is_boss_monster(id), "expected {id} to be a boss");
+            assert_eq!(
+                is_boss_monster(id),
+                !EXCLUDED.contains(&id),
+                "expected {id} boss status to match WORLD_DOMINATOR_NON_BOSS_IDS"
+            );
         }
-        // Just outside the registry block: must not be swept in.
-        assert!(!is_boss_monster(2_999_999));
-        assert!(!is_boss_monster(3_000_082));
+        // Named pin: a weapon/role variant add, not a rotation boss.
+        assert!(!is_boss_monster(3_000_010));
+        // Just outside the registry block: must not be swept in. Each assert
+        // is only emitted when the id is absent from both
+        // `MonsterTableBossIds.json` and `BOSS_ID_MANUAL_OVERRIDES` at
+        // generation time, so this can never assert the opposite of what a
+        // future upstream refresh actually classifies the boundary id as.
+__WD_BOUNDARY_ASSERTS__
 
         // Every id the registry actually populates also has a name — upstream
         // itself leaves 3000005 unfilled (no row at all in
@@ -529,6 +577,43 @@ mod tests {
     }
 }
 """
+
+# Marker substituted in `FOOTER` (see `_render_footer`) with a Rust array
+# literal of `WORLD_DOMINATOR_NON_BOSS_IDS`, rendered straight from the
+# Python constant so the test can never drift from it.
+_WD_EXCLUDED_ARRAY_MARKER = "__WD_EXCLUDED_ARRAY__"
+# Marker substituted with the boundary-id assertions that are only valid to
+# emit for ids the generated tables do not otherwise classify as bosses.
+_WD_BOUNDARY_ASSERTS_MARKER = "__WD_BOUNDARY_ASSERTS__"
+
+
+def _render_footer(raw_boss_ids: set[int]) -> str:
+    """Fill in `FOOTER`'s two generation-time markers.
+
+    Plain `str.replace`, not `str.format`: the surrounding text is Rust
+    source riddled with `{`/`}` braces, which `.format()` would choke on.
+    """
+    excluded_sorted = sorted(WORLD_DOMINATOR_NON_BOSS_IDS)
+    ids_line = ", ".join(f"{n:_}" for n in excluded_sorted)
+    # `#[rustfmt::skip]` keeps this a single line regardless of width, same
+    # idiom as `emit_boss_ids`/`emit_dungeon_scene_ids` above, so a `--check`
+    # comparing this raw render against the `cargo fmt`-passed committed file
+    # can't disagree with rustfmt over how to wrap it.
+    excluded_array = (
+        "        #[rustfmt::skip]\n        const EXCLUDED: &[u32] = &[" + ids_line + "];"
+    )
+
+    boundary_ids = (WORLD_DOMINATOR_BOSS_ID_RANGE.start - 1, WORLD_DOMINATOR_BOSS_ID_RANGE.stop)
+    boundary_lines = [
+        f"        assert!(!is_boss_monster({x:_}));"
+        for x in boundary_ids
+        if x not in raw_boss_ids and x not in BOSS_ID_MANUAL_OVERRIDES
+    ]
+    boundary_asserts = "\n".join(boundary_lines)
+
+    footer = FOOTER.replace(_WD_EXCLUDED_ARRAY_MARKER, excluded_array)
+    footer = footer.replace(_WD_BOUNDARY_ASSERTS_MARKER, boundary_asserts)
+    return footer
 
 
 def esc(s: str) -> str:
@@ -721,51 +806,70 @@ def _keyed(raw: dict) -> dict[int, str]:
     return {int(k): v for k, v in raw.items()}
 
 
+# The 59 ids `MonsterName.json` (curated community) and `MonsterTableNames.json`
+# (authoritative client) currently disagree on, reviewed by issue #315. 4 of
+# them (the Ignisor family) are flipped to the client's own name by
+# `MONSTER_NAME_MANUAL_OVERRIDES`, because #313's reporter read that name off
+# their own screen mid-fight — the curated name turned out to be a pre-release
+# one the live client no longer renders. The other 55 have no such evidence
+# either way (most are cosmetic, "Boss - X" vs "Boss: X"), so #315's decision
+# is to leave the general curated-wins precedence (`merge_names`, see
+# `HEADER`) in place for them rather than guess. Compared by set equality
+# (not just cardinality) in `check_monster_name_collisions`, so a future
+# `--refresh` that changes *which* ids collide — even while holding the count
+# at 59 — fails loudly instead of shipping an unreviewed name change.
+EXPECTED_MONSTER_NAME_COLLISIONS = frozenset(
+    {
+        103, 107, 109, 112, 1_013, 10_041, 11_007, 11_014, 11_019, 11_024,
+        11_031, 11_032, 11_037, 11_038, 11_043, 11_044, 17_001, 17_004,
+        17_008, 17_010, 20_004, 20_029, 20_073, 20_088, 33_201, 33_301,
+        35_000, 35_050, 40_026, 60_021, 60_151, 60_216, 60_237, 60_416,
+        60_742, 60_745, 61_220, 61_221, 70_063, 70_064, 70_065, 70_066,
+        70_067, 70_068, 70_070, 70_071, 70_072, 70_073, 70_173, 70_174,
+        70_175, 70_266, 920_011, 920_012, 920_013, 2_004_109, 2_004_126,
+        2_004_131, 2_004_152,
+    }
+)
+
+
 def check_monster_name_collisions(
-    monsters: dict[int, str], community: dict[int, str], authoritative: dict[int, str]
+    monsters: dict[int, str],
+    community: dict[int, str],
+    authoritative: dict[int, str],
+    crowdsource: dict[int, str],
 ) -> None:
     """Guard the id collisions between the curated community table
     (`MonsterName.json`) and the authoritative client table
     (`MonsterTableNames.json`) that issue #314 only partially addressed
-    (issue #315).
-
-    59 ids currently carry a different name in the two tables. 4 of them (the
-    Ignisor family) are flipped to the client's own name by
-    `MONSTER_NAME_MANUAL_OVERRIDES`, because #313's reporter read that name
-    off their own screen mid-fight — the curated name turned out to be a
-    pre-release one the live client no longer renders. The other 55 have no
-    such evidence either way (most are cosmetic, "Boss - X" vs "Boss: X"), so
-    #315's decision is to leave the general curated-wins precedence
-    (`merge_names`, see `HEADER`) in place for them rather than guess.
-    "Address" for those 55 means exactly this: reviewed, decision recorded,
-    and pinned here so a future `--refresh` that changes the collision set —
-    a new id starts disagreeing, or a resolved name silently stops being the
-    curated one — fails loudly instead of shipping an unreviewed name change.
+    (issue #315). See `EXPECTED_MONSTER_NAME_COLLISIONS` for the review
+    itself.
     """
     collisions = {
         cid
         for cid, name in community.items()
         if cid in authoritative and authoritative[cid] != name
     }
-    overridden = set(MONSTER_NAME_MANUAL_OVERRIDES)
-    if len(collisions) != 59:
+    if collisions != EXPECTED_MONSTER_NAME_COLLISIONS:
+        added = sorted(collisions - EXPECTED_MONSTER_NAME_COLLISIONS)
+        removed = sorted(EXPECTED_MONSTER_NAME_COLLISIONS - collisions)
         sys.exit(
-            "expected 59 MonsterName.json/MonsterTableNames.json id collisions "
-            f"(issue #315), found {len(collisions)} -- review the new/removed "
-            "ids, decide each one, and update this check"
+            "MonsterName.json/MonsterTableNames.json id collisions changed "
+            f"(issue #315) -- new: {added}, resolved: {removed} -- review the "
+            "changed ids, decide each one, and update EXPECTED_MONSTER_NAME_COLLISIONS"
         )
-    for cid in collisions - overridden:
-        if monsters.get(cid) != community[cid]:
+    for cid in collisions:
+        # Same precedence `merge_names` applies in `render()`: manual override,
+        # then crowdsource, then the curated community table.
+        expected = (
+            MONSTER_NAME_MANUAL_OVERRIDES.get(cid)
+            or crowdsource.get(cid)
+            or community[cid]
+        )
+        if monsters.get(cid) != expected:
             sys.exit(
-                f"monster {cid}: resolved name {monsters.get(cid)!r} is not the "
-                f"curated MonsterName.json value {community[cid]!r} -- did the "
+                f"monster {cid}: resolved name {monsters.get(cid)!r} does not "
+                f"match the expected precedence result {expected!r} -- did the "
                 "merge precedence change? (issue #315)"
-            )
-    for cid in collisions & overridden:
-        if monsters.get(cid) != MONSTER_NAME_MANUAL_OVERRIDES[cid]:
-            sys.exit(
-                f"monster {cid}: expected the manual override "
-                f"{MONSTER_NAME_MANUAL_OVERRIDES[cid]!r}, got {monsters.get(cid)!r}"
             )
 
 
@@ -944,8 +1048,9 @@ BOSS_IDS_DOC = """/// Boss-monster template ids (issue #42): the top-bar encount
 /// (`WORLD_DOMINATOR_BOSS_ID_RANGE`), is unioned in as a range rather than a
 /// per-id override: issue #313 first hand-added the two rotation ids two
 /// sessions happened to hit, and #315 replaced that with the whole registry
-/// block, since the nightly rotation draws from all of it and `MonsterType`
-/// is stale for every row that isn't already `== 2`.
+/// block minus `WORLD_DOMINATOR_NON_BOSS_IDS` — the ordinary weapon/role
+/// variant adds the rotation also draws from, not rotation bosses in their
+/// own right; see that constant's doc comment for the criterion.
 ///
 /// Previously hand-curated from `crates/meter/data/MonsterNameBoss.json`
 /// (community-tracker data, GPL-3.0); see `THIRD_PARTY_NOTICES.md` for the
@@ -1178,16 +1283,19 @@ def render() -> str:
     # Least authoritative layer first in every call below.
     monster_table_names = _keyed(load("MonsterTableNames.json"))
     monster_name = _keyed(load("MonsterName.json"))
+    monster_name_crowdsource = _keyed(load("MonsterNameCrowdsource.json"))
     monsters = merge_names(
         monster_table_names,
         monster_name,
-        _keyed(load("MonsterNameCrowdsource.json")),
+        monster_name_crowdsource,
         # Issue #313: the final word, above even the curated community layer.
         # See `MONSTER_NAME_MANUAL_OVERRIDES` for why a handful of ids need
         # the client's own name back.
         _keyed(MONSTER_NAME_MANUAL_OVERRIDES),
     )
-    check_monster_name_collisions(monsters, monster_name, monster_table_names)
+    check_monster_name_collisions(
+        monsters, monster_name, monster_table_names, monster_name_crowdsource
+    )
     scenes = merge_names(
         # `DungeonsTableNames` is currently a strict id-subset of
         # `SceneTableNames` carrying coarser names — "Tina's Mindrealm" where
@@ -1198,10 +1306,21 @@ def render() -> str:
         _keyed(load("SceneTableNames.json")),
         _keyed(load("SceneName.json")),
     )
+    raw_boss_ids = {int(x) for x in load("MonsterTableBossIds.json")}
+    # Issue #315 review: the exclusion set must be a genuine carve-out of the
+    # registry range, never a way to suppress a real `MonsterType == 2` boss
+    # that range happens to overlap.
+    assert WORLD_DOMINATOR_NON_BOSS_IDS <= set(WORLD_DOMINATOR_BOSS_ID_RANGE), (
+        "WORLD_DOMINATOR_NON_BOSS_IDS must be a subset of WORLD_DOMINATOR_BOSS_ID_RANGE"
+    )
+    assert WORLD_DOMINATOR_NON_BOSS_IDS.isdisjoint(raw_boss_ids), (
+        "WORLD_DOMINATOR_NON_BOSS_IDS must never exclude a MonsterType == 2 boss: "
+        f"{sorted(WORLD_DOMINATOR_NON_BOSS_IDS & raw_boss_ids)}"
+    )
     boss_ids = sorted(
-        {int(x) for x in load("MonsterTableBossIds.json")}
+        raw_boss_ids
         | set(BOSS_ID_MANUAL_OVERRIDES)
-        | set(WORLD_DOMINATOR_BOSS_ID_RANGE)
+        | (set(WORLD_DOMINATOR_BOSS_ID_RANGE) - WORLD_DOMINATOR_NON_BOSS_IDS)
     )
     dungeon_scene_ids = sorted(
         {int(x) for x in load("DungeonSceneIds.json")}
@@ -1257,7 +1376,7 @@ def render() -> str:
     emit_boss_ids(out, boss_ids)
     emit_dungeon_scene_ids(out, dungeon_scene_ids)
     emit_scene_final_bosses(out, scene_final_bosses, scenes, monsters)
-    out.write(FOOTER)
+    out.write(_render_footer(raw_boss_ids))
     print(
         f"{len(monsters)} monsters, {len(scenes)} scenes, {len(skills)} skills, "
         f"{len(boss_ids)} boss ids, {len(dungeon_scene_ids)} dungeon scene ids, "
