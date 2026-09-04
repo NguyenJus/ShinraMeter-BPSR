@@ -846,6 +846,16 @@ mod tests {
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
             payload_decoded: true,
         });
+        // `shutdown` only returns once the writer thread's `rx.recv()` sees
+        // every sender dropped (its own doc comment says so) — holding this
+        // clone alive past the call would keep the channel open and hang
+        // `shutdown`'s `join` forever, so the counters it backs are read via
+        // their own `Arc` clones (safe from any clone at any time, per
+        // `dropped_count`/`sanitized_out_count`'s doc comments) instead of
+        // through `sender` itself.
+        let dropped = Arc::clone(&sender.dropped);
+        let sanitized_out = Arc::clone(&sender.sanitized_out);
+        drop(sender);
         writer.shutdown();
 
         let contents = fs::read_to_string(&path).expect("dump file should exist");
@@ -853,8 +863,8 @@ mod tests {
             contents.is_empty(),
             "an unmodeled record must be dropped, not written raw"
         );
-        assert_eq!(sender.sanitized_out_count(), 1);
-        assert_eq!(sender.dropped_count(), 0);
+        assert_eq!(sanitized_out.load(Ordering::Relaxed), 1);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
         let _ = fs::remove_file(&path);
     }
 
