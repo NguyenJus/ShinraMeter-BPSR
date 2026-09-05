@@ -81,12 +81,14 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-// `map_kind`/`map_class` are shared, byte-identical with the offline
-// sanitizer's copy — see `bpsr_protocol::map`'s doc comment (issue #146's
-// finding 2). Re-exported (rather than called via `proto::map::` at each
-// use site below) so this module's own call sites and unit tests keep
-// referring to them as plain `map_kind`/`map_class`.
-pub use bpsr_protocol::map::{map_class, map_kind};
+// `map_class` is shared, byte-identical with the offline sanitizer's copy —
+// see `bpsr_protocol::map`'s doc comment (issue #146's finding 2).
+// Re-exported (rather than called via `proto::map::` at each use site below)
+// so this module's own call sites and unit tests keep referring to it as
+// plain `map_class`. `EntityKind` no longer needs a `map_kind`: since issue
+// #371, `bpsr_protocol::EntityKind` and `bpsr_meter::EntityKind` are the same
+// type, so a protocol-side kind already *is* the meter-side kind.
+pub use bpsr_protocol::map::map_class;
 
 // IMAGINE-TAKEDOWN: classifies raw skill ids into up to two equipped-Imagine
 // slots. See `crates/app/src/imagines.rs` and the plan's D2/D4 and the spec's
@@ -947,22 +949,6 @@ mod tests {
             timestamp_ms: ts,
             is_dead: false,
         }
-    }
-
-    #[test]
-    fn maps_every_entity_kind() {
-        assert_eq!(
-            map_kind(proto::EntityKind::Player),
-            meter::EntityKind::Player
-        );
-        assert_eq!(
-            map_kind(proto::EntityKind::Monster),
-            meter::EntityKind::Monster
-        );
-        assert_eq!(
-            map_kind(proto::EntityKind::Unknown),
-            meter::EntityKind::Unknown
-        );
     }
 
     #[test]
