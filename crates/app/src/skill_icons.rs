@@ -15,15 +15,16 @@
 //! row paints a blank placeholder instead of panicking.
 //!
 //! Issue #348: some basenames below share byte-identical PNGs. Rather than
-//! compiling in the same bytes twice, only the alphabetically-first basename
-//! in each such group gets its own `include_bytes!`; every other member's
+//! compiling in the same bytes twice, only the alphabetically-first committed
+//! basename in each such group gets its own `include_bytes!`; every other member's
 //! `SKILL_ICON_BYTES` entry reuses that group leader's `static`. A basename
 //! whose own PNG was deleted once this was discovered (so it no longer has a
-//! file under `crates/app/assets/skills/` at all) is listed in this script's
-//! `DUPLICATE_ALIASES` and still appears below, still resolving to bytes.
+//! file under `crates/app/assets/skills/` at all) is listed in
+//! `scripts/_skill_aliases.py`'s `DUPLICATE_ALIASES` and still appears below,
+//! still resolving to bytes.
 
 /// Generates `SKILL_ICON_FILES` (every committed-or-aliased icon basename).
-/// production code only ever needs `SKILL_ICON_BYTES` below, so this is
+/// Production code only ever needs `SKILL_ICON_BYTES` below, so this is
 /// `#[cfg(test)]`-gated the same way `imagine_icons!` in `crate::imagines`
 /// gates `IMAGINE_ICON_FILES`.
 macro_rules! skill_icon_names {
@@ -424,8 +425,8 @@ skill_icon_names! {
 
 // Content-duplicate groups (issue #348): every name below shares
 // byte-identical PNG content with at least one other committed or
-// aliased basename. Each group's alphabetically-first member is the
-// only one `include_bytes!`d; see `SKILL_ICON_BYTES` below for how the
+// aliased basename. Each group's alphabetically-first committed member
+// is the only one `include_bytes!`d; see `SKILL_ICON_BYTES` below for how the
 // rest reuse it.
 static ICON_WEAPON_SF_01_KX05: &[u8] = include_bytes!("../assets/skills/weapon_sf-01_kx05.png");
 
@@ -2008,23 +2009,46 @@ mod tests {
     }
 
     #[test]
+    fn skill_icon_files_matches_skill_icon_bytes() {
+        // Issue #348: `SKILL_ICON_FILES` and `SKILL_ICON_BYTES` are emitted
+        // by two separate loops over the same `all_names` list, so nothing
+        // structurally guarantees they stay in the same order or even name
+        // the same set. Assert it here instead.
+        let names: Vec<&str> = SKILL_ICON_BYTES.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, SKILL_ICON_FILES);
+        assert!(
+            SKILL_ICON_FILES.windows(2).all(|w| w[0] < w[1]),
+            "SKILL_ICON_FILES must be strictly ascending"
+        );
+    }
+
+    // Basename pairs whose alias (first) had its own PNG deleted as a
+    // byte-identical duplicate of its canonical name (second) — see
+    // `DUPLICATE_ALIASES` in `scripts/gen-skill-icons.py` / `_skill_aliases.py`.
+    #[cfg(test)]
+    const DELETED_ALIASES: &[(&str, &str)] = &[("weapon_sf-01_skill_03", "weapon_sf-01_kx05")];
+
+    #[test]
     fn deleted_duplicate_alias_still_resolves() {
-        // Issue #348: `weapon_sf-01_skill_03.png` was deleted as a
-        // byte-identical duplicate of `weapon_sf-01_kx05.png`, but skill id
-        // 2900603 (`crates/meter/data/SkillOverridesIcons.json`) still names
-        // the basename directly, so it must keep resolving to the shared
-        // bytes rather than dropping out of `SKILL_ICON_BYTES`.
-        let kx05 = SKILL_ICON_BYTES
-            .iter()
-            .find(|(n, _)| *n == "weapon_sf-01_kx05")
-            .unwrap()
-            .1;
-        let skill_03 = SKILL_ICON_BYTES
-            .iter()
-            .find(|(n, _)| *n == "weapon_sf-01_skill_03")
-            .unwrap()
-            .1;
-        assert_eq!(kx05, skill_03);
-        assert_eq!(kx05.as_ptr(), skill_03.as_ptr());
+        // Issue #348: an alias's own PNG was deleted once content hashing
+        // confirmed it was byte-identical to its canonical name's, but
+        // `crates/meter/data/SkillTableIcons.json` may still name the alias
+        // directly (e.g. skill id 2900603 -> `weapon_sf-01_skill_03`), so it
+        // must keep resolving to the canonical's shared bytes rather than
+        // dropping out of `SKILL_ICON_BYTES`.
+        for &(alias, canonical) in DELETED_ALIASES {
+            let canonical_bytes = SKILL_ICON_BYTES
+                .iter()
+                .find(|(n, _)| *n == canonical)
+                .unwrap()
+                .1;
+            let alias_bytes = SKILL_ICON_BYTES
+                .iter()
+                .find(|(n, _)| *n == alias)
+                .unwrap()
+                .1;
+            assert_eq!(canonical_bytes, alias_bytes);
+            assert_eq!(canonical_bytes.as_ptr(), alias_bytes.as_ptr());
+        }
     }
 }

@@ -18,7 +18,7 @@ placeholder art saved under two different basenames (all so far within this
 one directory — see `DUPLICATE_ALIASES` below for basenames whose own PNG was
 removed once that was confirmed). This script content-hashes every committed
 PNG and, for any two that are byte-identical, emits only one `include_bytes!`
-(for the alphabetically-first basename) and has every other basename in the
+(for the alphabetically-first committed basename) and has every other basename in the
 group's `SKILL_ICON_BYTES` entry reuse that same `static` instead of
 compiling in its own copy of the same bytes.
 
@@ -39,6 +39,9 @@ import pathlib
 import re
 import sys
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _skill_aliases import DUPLICATE_ALIASES
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 ASSETS = ROOT / "crates" / "app" / "assets" / "skills"
 OUT = ROOT / "crates" / "app" / "src" / "skill_icons.rs"
@@ -49,19 +52,6 @@ OUT = ROOT / "crates" / "app" / "src" / "skill_icons.rs"
 # `scripts/gen-name-tables.py`'s `_ICON_BASENAME_RE` enforces the same shape on
 # the table side.
 BASENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-
-# Basenames whose own PNG has been deleted from `crates/app/assets/skills/`
-# because, at deletion time, this script's content hashing confirmed it was
-# byte-identical to another committed icon's PNG (issue #348). Recorded here
-# explicitly, rather than just deleting the file, so the basename keeps
-# resolving to (shared) bytes instead of silently vanishing from
-# `SKILL_ICON_FILES`/`SKILL_ICON_BYTES` — `crates/meter/data/
-# SkillOverridesIcons.json` names some of these aliases directly (e.g. skill
-# id 2900603 -> `weapon_sf-01_skill_03`), so dropping the name outright would
-# regress that skill's icon to the blank placeholder.
-DUPLICATE_ALIASES: dict[str, str] = {
-    "weapon_sf-01_skill_03": "weapon_sf-01_kx05",
-}
 
 HEADER = '''//! The vendored skill-row icon basenames, compiled into the executable via
 //! `include_bytes!` (issue #192).
@@ -80,15 +70,16 @@ HEADER = '''//! The vendored skill-row icon basenames, compiled into the executa
 //! row paints a blank placeholder instead of panicking.
 //!
 //! Issue #348: some basenames below share byte-identical PNGs. Rather than
-//! compiling in the same bytes twice, only the alphabetically-first basename
-//! in each such group gets its own `include_bytes!`; every other member's
+//! compiling in the same bytes twice, only the alphabetically-first committed
+//! basename in each such group gets its own `include_bytes!`; every other member's
 //! `SKILL_ICON_BYTES` entry reuses that group leader's `static`. A basename
 //! whose own PNG was deleted once this was discovered (so it no longer has a
-//! file under `crates/app/assets/skills/` at all) is listed in this script's
-//! `DUPLICATE_ALIASES` and still appears below, still resolving to bytes.
+//! file under `crates/app/assets/skills/` at all) is listed in
+//! `scripts/_skill_aliases.py`'s `DUPLICATE_ALIASES` and still appears below,
+//! still resolving to bytes.
 
 /// Generates `SKILL_ICON_FILES` (every committed-or-aliased icon basename).
-/// production code only ever needs `SKILL_ICON_BYTES` below, so this is
+/// Production code only ever needs `SKILL_ICON_BYTES` below, so this is
 /// `#[cfg(test)]`-gated the same way `imagine_icons!` in `crate::imagines`
 /// gates `IMAGINE_ICON_FILES`.
 macro_rules! skill_icon_names {
@@ -106,8 +97,8 @@ DUPLICATE_GROUP_COMMENT = (
     "\n"
     "// Content-duplicate groups (issue #348): every name below shares\n"
     "// byte-identical PNG content with at least one other committed or\n"
-    "// aliased basename. Each group's alphabetically-first member is the\n"
-    "// only one `include_bytes!`d; see `SKILL_ICON_BYTES` below for how the\n"
+    "// aliased basename. Each group's alphabetically-first committed member\n"
+    "// is the only one `include_bytes!`d; see `SKILL_ICON_BYTES` below for how the\n"
     "// rest reuse it.\n"
 )
 
@@ -149,26 +140,19 @@ mod tests {
     }
 
     #[test]
-    fn deleted_duplicate_alias_still_resolves() {
-        // Issue #348: `weapon_sf-01_skill_03.png` was deleted as a
-        // byte-identical duplicate of `weapon_sf-01_kx05.png`, but skill id
-        // 2900603 (`crates/meter/data/SkillOverridesIcons.json`) still names
-        // the basename directly, so it must keep resolving to the shared
-        // bytes rather than dropping out of `SKILL_ICON_BYTES`.
-        let kx05 = SKILL_ICON_BYTES
-            .iter()
-            .find(|(n, _)| *n == "weapon_sf-01_kx05")
-            .unwrap()
-            .1;
-        let skill_03 = SKILL_ICON_BYTES
-            .iter()
-            .find(|(n, _)| *n == "weapon_sf-01_skill_03")
-            .unwrap()
-            .1;
-        assert_eq!(kx05, skill_03);
-        assert_eq!(kx05.as_ptr(), skill_03.as_ptr());
+    fn skill_icon_files_matches_skill_icon_bytes() {
+        // Issue #348: `SKILL_ICON_FILES` and `SKILL_ICON_BYTES` are emitted
+        // by two separate loops over the same `all_names` list, so nothing
+        // structurally guarantees they stay in the same order or even name
+        // the same set. Assert it here instead.
+        let names: Vec<&str> = SKILL_ICON_BYTES.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, SKILL_ICON_FILES);
+        assert!(
+            SKILL_ICON_FILES.windows(2).all(|w| w[0] < w[1]),
+            "SKILL_ICON_FILES must be strictly ascending"
+        );
     }
-}
+ALIAS_TEST_PLACEHOLDER}
 '''
 
 
@@ -177,10 +161,17 @@ def _mangle(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "_", name).upper()
 
 
-def group_leaders(committed_contents: dict[str, bytes]) -> dict[str, str]:
+def group_leaders(
+    committed_contents: dict[str, bytes], aliases: dict[str, str] | None = None
+) -> dict[str, str]:
     """Map every committed name to its content group's leader (itself, if its
     content is unique among `committed_contents`), using the
-    alphabetically-first name in a group as that group's leader.
+    alphabetically-first committed name in a group as that group's leader.
+
+    `aliases` (basename -> canonical basename) is folded in on top: each
+    alias resolves through whatever group its canonical name landed in
+    (normally just itself, but this chains correctly even if the canonical
+    name is itself later found to duplicate a third file).
     """
     by_hash: dict[bytes, list[str]] = {}
     for name in sorted(committed_contents):
@@ -191,18 +182,41 @@ def group_leaders(committed_contents: dict[str, bytes]) -> dict[str, str]:
         leader = min(members)
         for member in members:
             leaders[member] = leader
+    for alias, canonical in (aliases or {}).items():
+        leaders[alias] = leaders.get(canonical, canonical)
     return leaders
 
 
-def render(committed: list[str], committed_contents: dict[str, bytes]) -> str:
-    leaders = group_leaders(committed_contents)
-    for alias, canonical in DUPLICATE_ALIASES.items():
-        # An alias resolves through whatever group its canonical name landed
-        # in (normally just itself, but this chains correctly even if the
-        # canonical name is itself later found to duplicate a third file).
-        leaders[alias] = leaders.get(canonical, canonical)
+def validate_aliases(aliases: dict[str, str], committed: list[str]) -> None:
+    """Raise `ValueError` if `aliases` (basename -> canonical basename) is
+    inconsistent with what's actually committed under `ASSETS`: an alias
+    whose own PNG is still committed, an alias pointing at a canonical name
+    that isn't committed, or an alias unfit for an `include_bytes!` path.
+    """
+    committed_set = set(committed)
+    for alias, canonical in aliases.items():
+        if alias in committed_set:
+            raise ValueError(
+                f"{alias}.png is still committed under {ASSETS} but its alias entry "
+                f"says its file was deleted as a duplicate of {canonical} — delete the "
+                f"PNG or drop the alias entry"
+            )
+        if canonical not in committed_set:
+            raise ValueError(
+                f"an alias entry maps {alias} -> {canonical}, but {canonical}.png is "
+                f"not committed under {ASSETS}"
+            )
+        if not BASENAME_RE.match(alias):
+            raise ValueError(f"alias {alias!r} is unfit for an include_bytes! path")
 
-    all_names = sorted(set(committed) | set(DUPLICATE_ALIASES))
+
+def render(
+    committed: list[str], committed_contents: dict[str, bytes], aliases: dict[str, str]
+) -> str:
+    validate_aliases(aliases, committed)
+    leaders = group_leaders(committed_contents, aliases)
+
+    all_names = sorted(set(committed) | set(aliases))
 
     # A name needs its own named `static` only if something else points at
     # it — i.e. it leads a group with more than one member.
@@ -212,6 +226,15 @@ def render(committed: list[str], committed_contents: dict[str, bytes]) -> str:
     leaders_with_followers = sorted(
         leader for leader, size in group_sizes.items() if size > 1
     )
+    ident_for = {leader: f"ICON_{_mangle(leader)}" for leader in leaders_with_followers}
+    if len(set(ident_for.values())) != len(ident_for):
+        by_ident: dict[str, list[str]] = {}
+        for leader, ident in ident_for.items():
+            by_ident.setdefault(ident, []).append(leader)
+        colliding = [leaders for leaders in by_ident.values() if len(leaders) > 1]
+        raise ValueError(
+            f"group leader basenames collide once mangled into a Rust ident: {colliding}"
+        )
 
     out = io.StringIO()
     out.write(HEADER)
@@ -222,9 +245,8 @@ def render(committed: list[str], committed_contents: dict[str, bytes]) -> str:
     if leaders_with_followers:
         out.write(DUPLICATE_GROUP_COMMENT)
         for leader in leaders_with_followers:
-            const_name = f"ICON_{_mangle(leader)}"
             out.write(
-                f'static {const_name}: &[u8] = include_bytes!("../assets/skills/{leader}.png");\n'
+                f'static {ident_for[leader]}: &[u8] = include_bytes!("../assets/skills/{leader}.png");\n'
             )
 
     out.write("\n")
@@ -239,11 +261,60 @@ def render(committed: list[str], committed_contents: dict[str, bytes]) -> str:
                 f'    (\n        "{name}",\n        include_bytes!("../assets/skills/{name}.png"),\n    ),\n'
             )
         else:
-            const_name = f"ICON_{_mangle(leader)}"
-            out.write(f'    ("{name}", {const_name}),\n')
+            out.write(f'    ("{name}", {ident_for[leader]}),\n')
     out.write(BYTES_FOOTER)
-    out.write(TESTS)
+    out.write(TESTS.replace("ALIAS_TEST_PLACEHOLDER", _alias_test(aliases)))
     return out.getvalue()
+
+
+def _alias_test(aliases: dict[str, str]) -> str:
+    """The `DELETED_ALIASES` const and its one generic test, generated from
+    `aliases` (issue #348, O5) — empty when there are no aliases, so a repo
+    with no deleted-duplicate history never carries a vacuous test.
+    """
+    if not aliases:
+        return ""
+    entries = [f'("{alias}", "{canonical}")' for alias, canonical in sorted(aliases.items())]
+    # Match what `cargo fmt` (max_width = 100, the rustfmt default) would do
+    # with this const, since `--check` compares our raw output directly
+    # against the committed file rather than running it through rustfmt.
+    one_line = f'    const DELETED_ALIASES: &[(&str, &str)] = &[{", ".join(entries)}];'
+    if len(one_line) <= 100:
+        array_src = one_line
+    else:
+        rows = "\n".join(f"        {entry}," for entry in entries)
+        array_src = f"    const DELETED_ALIASES: &[(&str, &str)] = &[\n{rows}\n    ];"
+    return f'''
+    // Basename pairs whose alias (first) had its own PNG deleted as a
+    // byte-identical duplicate of its canonical name (second) — see
+    // `DUPLICATE_ALIASES` in `scripts/gen-skill-icons.py` / `_skill_aliases.py`.
+    #[cfg(test)]
+{array_src}
+
+    #[test]
+    fn deleted_duplicate_alias_still_resolves() {{
+        // Issue #348: an alias's own PNG was deleted once content hashing
+        // confirmed it was byte-identical to its canonical name's, but
+        // `crates/meter/data/SkillTableIcons.json` may still name the alias
+        // directly (e.g. skill id 2900603 -> `weapon_sf-01_skill_03`), so it
+        // must keep resolving to the canonical's shared bytes rather than
+        // dropping out of `SKILL_ICON_BYTES`.
+        for &(alias, canonical) in DELETED_ALIASES {{
+            let canonical_bytes = SKILL_ICON_BYTES
+                .iter()
+                .find(|(n, _)| *n == canonical)
+                .unwrap()
+                .1;
+            let alias_bytes = SKILL_ICON_BYTES
+                .iter()
+                .find(|(n, _)| *n == alias)
+                .unwrap()
+                .1;
+            assert_eq!(canonical_bytes, alias_bytes);
+            assert_eq!(canonical_bytes.as_ptr(), alias_bytes.as_ptr());
+        }}
+    }}
+'''
 
 
 def _self_test() -> None:
@@ -259,14 +330,37 @@ def _self_test() -> None:
     leaders = group_leaders({"b": b"x", "a": b"x", "c": b"y"})
     assert leaders == {"a": "a", "b": "a", "c": "c"}, leaders
 
-    rendered = render(["a", "b"], {"a": b"x", "b": b"y"})
+    rendered = render(["a", "b"], {"a": b"x", "b": b"y"}, aliases={})
     assert '"a"' in rendered and '"b"' in rendered, rendered
     assert "static ICON_" not in rendered, "no duplicate content: no static should be emitted"
 
-    dup_rendered = render(["a", "b"], {"a": b"x", "b": b"x"})
+    dup_rendered = render(["a", "b"], {"a": b"x", "b": b"x"}, aliases={})
     assert "static ICON_A: &[u8]" in dup_rendered, dup_rendered
     assert '("b", ICON_A)' in dup_rendered, dup_rendered
     assert 'include_bytes!("../assets/skills/b.png")' not in dup_rendered, dup_rendered
+
+    # An alias whose canonical is absent from the group (never a size > 1
+    # group on its own) must still get a `static` and be reachable through it.
+    alias_rendered = render(["a", "b"], {"a": b"x", "b": b"y"}, aliases={"c": "a"})
+    assert "static ICON_A: &[u8]" in alias_rendered, alias_rendered
+    assert '("a", ICON_A)' in alias_rendered, alias_rendered
+    assert '("c", ICON_A)' in alias_rendered, alias_rendered
+
+    try:
+        render(["a", "b"], {"a": b"x", "b": b"y"}, aliases={"c": "zzz"})
+        raise AssertionError("alias pointing at an uncommitted canonical should raise")
+    except ValueError:
+        pass
+
+    try:
+        render(
+            ["a-b", "a_b"],
+            {"a-b": b"x", "a_b": b"y"},
+            aliases={"c": "a-b", "d": "a_b"},
+        )
+        raise AssertionError("group leaders that mangle to the same ident should raise")
+    except ValueError:
+        pass
 
 
 def main() -> None:
@@ -287,24 +381,12 @@ def main() -> None:
     if bad:
         sys.exit(f"{len(bad)} icon name(s) unfit for an include_bytes! path: {', '.join(bad)}")
 
-    for alias, canonical in DUPLICATE_ALIASES.items():
-        if alias in committed:
-            sys.exit(
-                f"{alias}.png is still committed under {ASSETS} but DUPLICATE_ALIASES "
-                f"says its file was deleted as a duplicate of {canonical} — delete the "
-                f"PNG or drop the alias entry"
-            )
-        if canonical not in committed:
-            sys.exit(
-                f"DUPLICATE_ALIASES maps {alias} -> {canonical}, but {canonical}.png is "
-                f"not committed under {ASSETS}"
-            )
-        if not BASENAME_RE.match(alias):
-            sys.exit(f"DUPLICATE_ALIASES key {alias!r} is unfit for an include_bytes! path")
-
     committed_contents = {n: (ASSETS / f"{n}.png").read_bytes() for n in committed}
 
-    rendered = render(committed, committed_contents)
+    try:
+        rendered = render(committed, committed_contents, aliases=DUPLICATE_ALIASES)
+    except ValueError as exc:
+        sys.exit(str(exc))
     current = OUT.read_text(encoding="utf-8") if OUT.exists() else None
     if current == rendered:
         print(f"skill_icons.rs is up to date ({len(committed) + len(DUPLICATE_ALIASES)} icons)")
