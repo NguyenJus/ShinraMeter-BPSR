@@ -56,6 +56,15 @@ pub mod attr_id {
     /// follow it — see `encounter::Meter::recompute_boss` for why the boss
     /// heuristic must not require it.
     pub const MAX_HP: i32 = 0x2C38;
+    /// `AttrState` (11, `0x0B`) — the entity's current actor state (issue
+    /// #339/#272). Only the "dead" value is meaningful to this crate; see
+    /// [`entity_state_from_attrs`].
+    ///
+    /// Corroborated: BPSR-ZDPS `EnumEAttrType.cs:799` (`AttrState = 11`).
+    /// Reference-derived, **not yet verified against live traffic** — same
+    /// caveat as `SEASON_LEVEL`/`SEASON_STRENGTH` below: no capture on this
+    /// build has been confirmed to carry this attr yet.
+    pub const STATE: i32 = 0x0B;
     pub const PROFESSION_ID: i32 = 0xDC;
     pub const FIGHT_POINT: i32 = 0x272E;
     /// Reference-derived, **not yet verified against live traffic** (issue
@@ -272,6 +281,26 @@ pub fn decode_varint_u32(raw: &[u8]) -> Option<u32> {
 /// malformed/empty varint.
 pub fn decode_varint_i32_truncating(raw: &[u8]) -> Option<i32> {
     decode_varint_u64(raw).map(|v| v as i64 as i32)
+}
+
+/// `EActorState::ActorStateDead` (9) — the only [`attr_id::STATE`] value
+/// this crate treats as "dead"; every other actor state (skill, stiff,
+/// born, resurrection animation, etc.) reads as alive (issue #339/#272).
+/// BPSR-ZDPS `EnumEActorState.cs` (`ActorStateDead = 9`).
+const ACTOR_STATE_DEAD: i32 = 9;
+
+/// Decodes [`attr_id::STATE`] off an entity's `Attr` list (issue #339/#272)
+/// into `is_dead`: `Some(true)` when the decoded state equals
+/// [`ACTOR_STATE_DEAD`], `Some(false)` for any other decoded state, `None`
+/// when the attr is absent or malformed. `decode::on_aoi_sync_delta` treats
+/// `None` as "no signal" rather than "alive" — matching this module's
+/// absent-is-not-a-value convention elsewhere (e.g. `cast_skill_id_from_attrs`).
+pub fn entity_state_from_attrs(attrs: &[pb::Attr]) -> Option<bool> {
+    attrs
+        .iter()
+        .find(|attr| attr.id == attr_id::STATE && !attr.raw_data.is_empty())
+        .and_then(|attr| decode_varint_i32(&attr.raw_data))
+        .map(|state| state == ACTOR_STATE_DEAD)
 }
 
 /// `raw_data` for [`attr_id::POSITION`] / [`attr_id::TARGET_POSITION`]
@@ -1526,6 +1555,46 @@ mod tests {
             skill_cast_metadata_from_attrs(&attrs),
             SkillCastMetadata::default()
         );
+    }
+
+    /// Issue #339/#272: `AttrState == ActorStateDead (9)` decodes to
+    /// `is_dead == true`.
+    #[test]
+    fn entity_state_dead_value_decodes_true() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::STATE,
+            raw_data: vec![0x09],
+        }];
+        assert_eq!(entity_state_from_attrs(&attrs), Some(true));
+    }
+
+    /// Any other decoded actor state (e.g. `ActorStateAction = 8`) reads as
+    /// alive, not just the default state.
+    #[test]
+    fn entity_state_non_dead_value_decodes_false() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::STATE,
+            raw_data: vec![0x08],
+        }];
+        assert_eq!(entity_state_from_attrs(&attrs), Some(false));
+    }
+
+    #[test]
+    fn entity_state_absent_attr_is_none() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::HP,
+            raw_data: vec![0x01],
+        }];
+        assert_eq!(entity_state_from_attrs(&attrs), None);
+    }
+
+    #[test]
+    fn entity_state_malformed_varint_is_none() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::STATE,
+            raw_data: vec![0x80], // continuation bit set, nothing follows
+        }];
+        assert_eq!(entity_state_from_attrs(&attrs), None);
     }
 
     // -- issue #338: AttrShieldList -----------------------------------------

@@ -186,6 +186,20 @@ pub fn map_event(
             removes_layer,
             timestamp_ms,
         },
+        ProtocolEvent::EntityState {
+            uid,
+            kind,
+            is_dead,
+            timestamp_ms,
+        } => meter::ProtocolEvent::EntityState {
+            uid,
+            kind: map_kind(kind),
+            is_dead,
+            timestamp_ms,
+        },
+        ProtocolEvent::Revive { uid, timestamp_ms } => {
+            meter::ProtocolEvent::Revive { uid, timestamp_ms }
+        }
         ProtocolEvent::TeamMemberLeft { uid } => meter::ProtocolEvent::TeamMemberLeft { uid },
         ProtocolEvent::TeamRoster { members } => meter::ProtocolEvent::TeamRoster { members },
         ProtocolEvent::LocalPlayer { uid } => meter::ProtocolEvent::LocalPlayer { uid },

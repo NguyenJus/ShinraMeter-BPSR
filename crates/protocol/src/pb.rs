@@ -415,6 +415,27 @@ pub struct EnterSceneInfo {
     pub attrs: Option<AttrCollection>,
 }
 
+/// `WorldNtf.NotifyReviveUser` (opcode `0x27`, `decode::opcode::
+/// NOTIFY_REVIVE_USER`, issue #272/#339): a single field naming the actor
+/// who was just revived. Reference-derived, **not yet verified against
+/// live traffic** — same caveat as `attrs::attr_id::SEASON_LEVEL` and
+/// `attrs::attr_id::STATE` above: no capture on this build has been
+/// confirmed to carry this opcode yet (issue #272's body records why —
+/// no session with a mid-fight revive was captured with `SHINRA_INSPECT`
+/// on). Corroborated across two independent reference trackers:
+/// BPSR-ZDPS `BPSR-ZDPSLib/ServiceMethods/WorldNtf.cs:43`
+/// (`NotifyReviveUser = 0x27`) and resonance-logs
+/// `src-tauri/src/packets/opcodes.rs:36` (same opcode, same service), with
+/// resonance-logs' generated `blueprotobuf_package.rs:5954` giving the
+/// message shape reproduced here: a single optional `int64` field 1,
+/// `v_actor_uuid` — the standard packed uuid (`event::uid_of` unpacks it
+/// the same way every other entity uuid in this crate does).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NotifyReviveUser {
+    #[prost(int64, optional, tag = "1")]
+    pub v_actor_uuid: Option<i64>,
+}
+
 /// `CharSerialize.scene_data` (field 3, issue #293's reinstated path — see
 /// that field's doc comment). Only `level_map_id` is modeled: it is the
 /// field `decode::on_sync_container_data` reads for

@@ -287,9 +287,28 @@ impl PlayerStats {
     /// apply in arrival order — which is what makes a killing blow a
     /// player deals to themselves land *after* the swing that carried it
     /// and leave them down.
-    pub(crate) fn set_alive(&mut self, alive: bool, timestamp_ms: u64) {
+    ///
+    /// `explicit` (issue #339/#272) distinguishes a real signal
+    /// (`DamageEvent::is_dead`, decoded `AttrState`, or `Revive`) from the
+    /// old inferred fallback: a player's next *acted* event (damage or
+    /// heal) still counts as proof of life for a player whose actual
+    /// revive this meter never observed on the wire (`Meter::apply_damage`
+    /// passes `false` there), but only that call site does — every other
+    /// caller has a real signal and passes `true`. Purely a diagnostic
+    /// distinction: both still move the dead clock identically on a
+    /// `(false, true)`/`(true, false)` edge; the only difference is the
+    /// debug log below, which fires exactly when the estimate this pill
+    /// used to be entirely built on is still the only evidence available.
+    pub(crate) fn set_alive(&mut self, alive: bool, timestamp_ms: u64, explicit: bool) {
         if self.alive_as_of_ms.is_some_and(|last| timestamp_ms < last) {
             return;
+        }
+        if !explicit && !self.alive && alive {
+            log::debug!(
+                "stats: uid={} revive inferred from next action at {timestamp_ms}ms — no \
+                 explicit Revive/AttrState signal was observed for this death (issue #339/#272)",
+                self.uid
+            );
         }
         // Issue #254: the two *edges* — and only the edges — move the dead
         // clock. A repeated `set_alive(false)` while already down (the
@@ -564,10 +583,10 @@ mod tests {
     #[test]
     fn set_alive_edges_accumulate_dead_time() {
         let mut s = PlayerStats::new(1);
-        s.set_alive(false, 1_000);
-        s.set_alive(true, 4_000);
-        s.set_alive(false, 10_000);
-        s.set_alive(true, 10_500);
+        s.set_alive(false, 1_000, true);
+        s.set_alive(true, 4_000, true);
+        s.set_alive(false, 10_000, true);
+        s.set_alive(true, 10_500, true);
         assert_eq!(s.dead_ms, 3_500);
         assert_eq!(s.dead_since_ms, None);
         assert_eq!(s.dead_ms_as_of(60_000), 3_500);
@@ -579,9 +598,9 @@ mod tests {
     #[test]
     fn a_repeated_death_keeps_the_first_start() {
         let mut s = PlayerStats::new(1);
-        s.set_alive(false, 1_000);
-        s.set_alive(false, 1_400);
-        s.set_alive(true, 5_000);
+        s.set_alive(false, 1_000, true);
+        s.set_alive(false, 1_400, true);
+        s.set_alive(true, 5_000, true);
         assert_eq!(s.dead_ms, 4_000);
     }
 
@@ -590,19 +609,19 @@ mod tests {
     #[test]
     fn a_repeated_revive_adds_nothing() {
         let mut s = PlayerStats::new(1);
-        s.set_alive(false, 1_000);
-        s.set_alive(true, 5_000);
-        s.set_alive(true, 6_000);
-        s.set_alive(true, 7_000);
+        s.set_alive(false, 1_000, true);
+        s.set_alive(true, 5_000, true);
+        s.set_alive(true, 6_000, true);
+        s.set_alive(true, 7_000, true);
         assert_eq!(s.dead_ms, 4_000);
     }
 
     #[test]
     fn dead_ms_as_of_adds_the_interval_still_open() {
         let mut s = PlayerStats::new(1);
-        s.set_alive(false, 1_000);
-        s.set_alive(true, 3_000);
-        s.set_alive(false, 8_000);
+        s.set_alive(false, 1_000, true);
+        s.set_alive(true, 3_000, true);
+        s.set_alive(false, 8_000, true);
         assert_eq!(s.dead_ms, 2_000, "only the closed interval is stored");
         assert_eq!(s.dead_ms_as_of(9_500), 3_500);
         assert_eq!(
@@ -617,8 +636,8 @@ mod tests {
     #[test]
     fn a_stale_transition_moves_neither_the_bit_nor_the_dead_clock() {
         let mut s = PlayerStats::new(1);
-        s.set_alive(false, 5_000);
-        s.set_alive(true, 4_000);
+        s.set_alive(false, 5_000, true);
+        s.set_alive(true, 4_000, true);
         assert!(!s.alive);
         assert_eq!(s.dead_ms, 0);
         assert_eq!(s.dead_ms_as_of(9_000), 4_000);

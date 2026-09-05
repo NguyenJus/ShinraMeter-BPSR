@@ -255,6 +255,50 @@ impl Scenario {
         self.hits(target_uid, vec![Hit::new(attacker_uid, skill_id, value)])
     }
 
+    /// A monster's killing blow on a player uid (issue #339/#272): unlike
+    /// [`Self::hits`], which always targets a monster, this targets a
+    /// player — the shape a real death packet has.
+    pub fn player_killed_by(
+        mut self,
+        attacker_monster_uid: i64,
+        target_uid: i64,
+        skill_id: i32,
+        value: i64,
+    ) -> Self {
+        let dmg = pb::SyncDamageInfo {
+            is_dead: true,
+            ..wire::base_damage(wire::monster_uuid(attacker_monster_uid), skill_id, value)
+        };
+        let payload = wire::damage_delta(wire::player_uuid(target_uid), dmg);
+        let bytes = self.wrap_frame(opcode::SYNC_NEAR_DELTA_INFO, &payload);
+        self.push_bytes(bytes);
+        self
+    }
+
+    /// `WorldNtf.NotifyReviveUser` (opcode `0x27`, issue #272/#339) for a
+    /// player uid.
+    pub fn revive(mut self, uid: i64) -> Self {
+        let payload = wire::revive_payload(wire::player_uuid(uid));
+        let bytes = self.wrap_frame(opcode::NOTIFY_REVIVE_USER, &payload);
+        self.push_bytes(bytes);
+        self
+    }
+
+    /// One `SyncNearDeltaInfo` carrying a decoded `AttrState` (issue
+    /// #339/#272) for a player uid: `dead = true` encodes
+    /// `EActorState::ActorStateDead` (9), `dead = false` encodes
+    /// `ActorStateDefault` (0).
+    pub fn player_state(mut self, uid: i64, dead: bool) -> Self {
+        let uuid = wire::player_uuid(uid);
+        let payload = wire::attr_delta_payload(
+            uuid,
+            vec![wire::varint_attr(attr_id::STATE, if dead { 9 } else { 0 })],
+        );
+        let bytes = self.wrap_frame(opcode::SYNC_NEAR_DELTA_INFO, &payload);
+        self.push_bytes(bytes);
+        self
+    }
+
     /// One `NotifyJoinTeam` roster push (issues #146/#343), on
     /// `frame::TEAM_NTF_SERVICE_UUID` rather than the main service. Emits
     /// one `Player` event per named `members` entry, plus a trailing
@@ -266,6 +310,20 @@ impl Scenario {
             bpsr_protocol::decode::team_opcode::NOTIFY_JOIN_TEAM,
             &payload,
         );
+        self.push_bytes(bytes);
+        self
+    }
+
+    /// One `SyncNearDeltaInfo` carrying a decoded `AttrState` (issue
+    /// #339/#272) for a monster uid — see [`Self::player_state`] for the
+    /// wire values.
+    pub fn monster_state(mut self, uid: i64, dead: bool) -> Self {
+        let uuid = wire::monster_uuid(uid);
+        let payload = wire::attr_delta_payload(
+            uuid,
+            vec![wire::varint_attr(attr_id::STATE, if dead { 9 } else { 0 })],
+        );
+        let bytes = self.wrap_frame(opcode::SYNC_NEAR_DELTA_INFO, &payload);
         self.push_bytes(bytes);
         self
     }

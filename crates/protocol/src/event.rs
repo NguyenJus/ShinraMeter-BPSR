@@ -448,6 +448,35 @@ pub enum ProtocolEvent {
         removes_layer: bool,
         timestamp_ms: u64,
     },
+    /// An entity's decoded `AttrState` (issue #339/#272), sourced from
+    /// `attrs::attr_id::STATE` on an `AoiSyncDelta`'s attr channel — see
+    /// `attrs::entity_state_from_attrs` for the wire evidence and
+    /// `decode::on_aoi_sync_delta` for the emit site. Emitted for both
+    /// players and monsters (unlike `Cast`, which is player-only): a boss's
+    /// own `AttrState` transitioning to dead is one of this issue's two
+    /// explicit death signals.
+    ///
+    /// `is_dead` is the only bit this crate extracts from the wire's full
+    /// `EActorState` enum — every non-dead state (skill, stiff, born, the
+    /// resurrection animation, ...) collapses to `false`. Consumers must
+    /// not read `false` as "just revived": it means only "not currently in
+    /// the dead state", which is true on every ordinary delta a live
+    /// entity ever sends.
+    EntityState {
+        uid: i64,
+        kind: EntityKind,
+        is_dead: bool,
+        timestamp_ms: u64,
+    },
+    /// `WorldNtf.NotifyReviveUser` (opcode `0x27`, issue #272), the
+    /// dedicated revive notify — see `decode::opcode::NOTIFY_REVIVE_USER`
+    /// for the wire evidence. Carries only the revived actor's uid and the
+    /// packet-arrival timestamp; unlike the inferred "next action implies
+    /// alive" fallback it replaces, this is the actual revive moment.
+    Revive {
+        uid: i64,
+        timestamp_ms: u64,
+    },
     /// One party member left or was kicked from the team (issue #343),
     /// decoded from `GrpcTeamNtf.NotifyLeaveTeam` — see
     /// `crate::decode::on_notify_leave_team`. The wire's `leaveType` field
