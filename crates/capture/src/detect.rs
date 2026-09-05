@@ -5,6 +5,9 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use crate::owner::{NoOwnerFilter, StreamOwnerLookup};
 
 /// Signature bytes located at [`SERVER_SIGNATURE_OFFSET`] within a
 /// length-prefixed fragment of the TCP payload.
@@ -487,10 +490,11 @@ pub struct AdoptionDecision {
     pub skip: bool,
     /// This call is the one that adopted `conn` as the server connection.
     /// The caller must resync the reassembler to `seq + frame_offset` (see
-    /// [`frame_offset`](Self::frame_offset)), not the packet's bare `seq`,
-    /// reset the decoder, and emit exactly one `ProtocolEvent::ServerChanged`
-    /// — never on any other decision, which is what keeps a still-`Adopted`
-    /// packet from re-triggering the event.
+    /// [`frame_offset`](Self::frame_offset)) — not the packet's bare `seq`
+    /// — reset the decoder, and emit exactly one
+    /// `ProtocolEvent::ServerChanged`, on every `true` here. Never `true` on
+    /// any decision but this one, which is what keeps a still-`Adopted`
+    /// packet from re-triggering either.
     pub newly_adopted: bool,
     /// The payload-relative byte offset of the frame boundary the adopting
     /// packet was matched at (issue #293), meaningful only when
@@ -506,6 +510,65 @@ pub struct AdoptionDecision {
     pub frame_offset: usize,
 }
 
+/// Issue #337's process-ownership filter, bundled into one value so
+/// [`decide_packet`] doesn't need two separate parameters for it (and stays
+/// under clippy's `too_many_arguments`).
+///
+/// `game_pids` is empty when the game's own pid(s) have not (yet) been
+/// identified — e.g. `owner::find_game_pids` hasn't found any, or ownership
+/// lookups are unsupported on this platform — in which case
+/// [`owner_allows_adoption`] always allows adoption; there is nothing to
+/// filter against.
+///
+/// This is a set, not a single pid: [`GAME_PROCESS_NAMES`](crate::owner::GAME_PROCESS_NAMES)
+/// includes generic names (e.g. `Star.exe`) that more than one running
+/// process can share, so `owner::find_game_pids` can legitimately resolve
+/// to several candidates at once. Filtering against the whole set is a
+/// strict superset of filtering against any one of them — it can only
+/// *allow* an adoption a single wrong pick would have rejected — so it
+/// keeps the same fail-open contract.
+pub struct OwnershipFilter<'a> {
+    pub lookup: &'a dyn StreamOwnerLookup,
+    pub game_pids: &'a [u32],
+}
+
+impl OwnershipFilter<'static> {
+    /// No filtering at all: every candidate that clears
+    /// `ServerDetector::detects` still adopts, exactly pre-#337 behavior.
+    /// `&NoOwnerFilter` is promoted to a `'static` reference to a
+    /// zero-sized unit struct, so this needs no lifetime of its own to
+    /// borrow from.
+    pub fn none() -> Self {
+        Self {
+            lookup: &NoOwnerFilter,
+            game_pids: &[],
+        }
+    }
+}
+
+/// Whether ownership evidence permits adopting `conn` — see
+/// [`OwnershipFilter`] for the fail-open contract this implements: an
+/// unknown owner (`owner.owner_pid` returning `None`) or an empty
+/// `game_pids` set never blocks adoption, and only a *known* owner absent
+/// from that set is rejected. This asymmetry is deliberate (issue #337): a
+/// false negative here silently leaves capture dead until a manual restart,
+/// which is worse than the false positive it would take to adopt a stray
+/// secondary stream.
+fn owner_allows_adoption(conn: &Conn, ownership: &OwnershipFilter<'_>) -> bool {
+    if ownership.game_pids.is_empty() {
+        return true;
+    }
+    // The adoption candidate is server→client (`signature_direction_ok`
+    // already gates on this): `dst` is this machine's side, `src` the
+    // server's.
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(conn.dst)), conn.dst_port);
+    let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(conn.src)), conn.src_port);
+    match ownership.lookup.owner_pid(local, remote) {
+        None => true,
+        Some(pid) => ownership.game_pids.contains(&pid),
+    }
+}
+
 /// Decides what a captured packet means for the adopted-server state
 /// machine: role classification, teardown detection, and (for an unrelated
 /// connection) whether it adopts.
@@ -519,8 +582,14 @@ pub struct AdoptionDecision {
 /// recv, etherparse slicing, `TcpReassembler`, `Decoder`, the
 /// `crossbeam_channel::Sender`) stays in win.rs, which only needs to act on
 /// the returned [`AdoptionDecision`]. See win.rs's `sniff_loop` for the call
-/// site and how it maps `torn_down`/`skip`/`newly_adopted` onto those
-/// side effects.
+/// site and how it maps `torn_down`/`skip`/`newly_adopted` onto those side
+/// effects.
+///
+/// `ownership` is issue #337's process-ownership filter — see
+/// [`OwnershipFilter`]/[`owner_allows_adoption`] for its fail-open contract.
+/// Pass [`OwnershipFilter::none`] to disable filtering entirely (every
+/// candidate that passes `detector.detects` still adopts, exactly pre-#337
+/// behavior).
 pub fn decide_packet(
     detector: &mut ServerDetector,
     known_server: &mut Option<Conn>,
@@ -528,6 +597,7 @@ pub fn decide_packet(
     payload: &[u8],
     fin: bool,
     rst: bool,
+    ownership: &OwnershipFilter<'_>,
 ) -> AdoptionDecision {
     let role = classify_connection(conn, known_server.as_ref());
     let torn_down = is_teardown_of_known(role, fin, rst);
@@ -550,7 +620,20 @@ pub fn decide_packet(
             frame_offset: 0,
         },
         ConnStreamRole::Unrelated => {
-            if !detector.detects(conn, payload, known_server.is_some()) {
+            // Ownership is checked *before* `detector.detects`: `detects`
+            // has the side effect of inserting a subnet-path candidate into
+            // `subnet_candidates` (see its docs), which permanently spends
+            // one of `MAX_SUBNET_CONNECTIONS` slots on that connection.
+            // Running it first meant a candidate that ownership goes on to
+            // reject was blacklisted forever — it could never be
+            // reconsidered even after ownership later allowed it (e.g. the
+            // game's pid changes, or `find_game_pids` resolves to a
+            // different, correct set). Checking ownership first, which
+            // has no state of its own to spend, avoids burning that slot on
+            // a candidate that never had a chance of being adopted anyway.
+            if !owner_allows_adoption(conn, ownership)
+                || !detector.detects(conn, payload, known_server.is_some())
+            {
                 AdoptionDecision {
                     role,
                     torn_down,
@@ -1194,6 +1277,7 @@ mod tests {
             &payload,
             false,
             false,
+            &OwnershipFilter::none(),
         );
         assert_eq!(first.role, ConnStreamRole::Unrelated);
         assert!(!first.skip);
@@ -1209,6 +1293,7 @@ mod tests {
             b"more bytes",
             false,
             false,
+            &OwnershipFilter::none(),
         );
         assert_eq!(second.role, ConnStreamRole::Adopted);
         assert!(!second.skip);
@@ -1237,6 +1322,7 @@ mod tests {
             b"client bytes",
             false,
             false,
+            &OwnershipFilter::none(),
         );
         assert_eq!(decision.role, ConnStreamRole::Reverse);
         assert!(decision.skip);
@@ -1252,7 +1338,15 @@ mod tests {
         let mut known_server = Some(adopted);
         detector.adopt(&adopted);
 
-        let decision = decide_packet(&mut detector, &mut known_server, &adopted, b"", true, false);
+        let decision = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &adopted,
+            b"",
+            true,
+            false,
+            &OwnershipFilter::none(),
+        );
         assert_eq!(decision.role, ConnStreamRole::Adopted);
         assert!(decision.torn_down);
         assert!(!decision.skip);
@@ -1271,6 +1365,7 @@ mod tests {
             b"not a signature",
             false,
             false,
+            &OwnershipFilter::none(),
         );
         assert_eq!(decision.role, ConnStreamRole::Unrelated);
         assert!(decision.skip);
@@ -1306,6 +1401,7 @@ mod tests {
             joined_mid_stream,
             false,
             false,
+            &OwnershipFilter::none(),
         );
 
         assert!(decision.newly_adopted);
@@ -1331,6 +1427,7 @@ mod tests {
             &login_return_payload(),
             false,
             false,
+            &OwnershipFilter::none(),
         );
 
         assert!(decision.newly_adopted);
@@ -1379,5 +1476,242 @@ mod tests {
         assert_eq!(d.size_capped_candidates.len(), 1);
         assert!(!d.detects(&candidate, &big_payload, false));
         assert_eq!(d.size_capped_candidates.len(), 1);
+    }
+
+    // --- issue #337: process-ownership filter ---
+
+    /// A [`StreamOwnerLookup`] fake that reports a fixed pid for every
+    /// lookup (or `None`, for "unknown owner") — the fail-open/known-other-
+    /// owner contract `owner_allows_adoption` implements is otherwise
+    /// untestable off Windows, where the only real implementation lives.
+    struct FakeOwnerLookup(Option<u32>);
+
+    impl StreamOwnerLookup for FakeOwnerLookup {
+        fn owner_pid(&self, _local: SocketAddr, _remote: SocketAddr) -> Option<u32> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn reconnect_to_the_same_endpoint_after_teardown_still_adopts() {
+        // A teardown followed by a fresh TCP connection to the *same*
+        // server address:port (a plain reconnect, e.g. the client's own
+        // ephemeral port changed but the server did not) must still adopt
+        // — the reassembler/decoder need to resync onto the new stream.
+        // encounter.rs's `ProtocolEvent::ServerChanged` arm keeps
+        // players/totals and only performs the session invalidation a
+        // reconnect requires either way, so `decide_packet` does not need
+        // to (and no longer does) distinguish a reconnect from a genuine
+        // server switch here.
+        let mut detector = ServerDetector::new();
+        let mut known_server = None;
+        let first_conn = server_to_client([203, 0, 113, 7], 5000);
+
+        let first = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &first_conn,
+            &login_return_payload(),
+            false,
+            false,
+            &OwnershipFilter::none(),
+        );
+        assert!(first.newly_adopted);
+
+        // Torn down, then a new connection reconnects to the same server
+        // address but a different client-side (ephemeral) port.
+        let teardown = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &first_conn,
+            b"",
+            true,
+            false,
+            &OwnershipFilter::none(),
+        );
+        assert!(teardown.torn_down);
+        assert_eq!(known_server, None);
+
+        let reconnect_conn = Conn {
+            src: first_conn.src,
+            src_port: first_conn.src_port,
+            dst: first_conn.dst,
+            dst_port: first_conn.dst_port.wrapping_add(1),
+        };
+        let reconnect = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &reconnect_conn,
+            &login_return_payload(),
+            false,
+            false,
+            &OwnershipFilter::none(),
+        );
+        assert!(
+            reconnect.newly_adopted,
+            "must still resync the reassembler/decoder"
+        );
+    }
+
+    #[test]
+    fn a_candidate_stream_owned_by_a_non_game_process_is_not_adopted() {
+        // issue #337: a secondary stream that satisfies the payload
+        // signature but is demonstrably owned by some other process (a
+        // known, non-game pid) must not be adopted at all.
+        let mut detector = ServerDetector::new();
+        let mut known_server = None;
+        let conn = server_to_client([203, 0, 113, 7], 5000);
+        let owner = FakeOwnerLookup(Some(9999));
+        let game_pids = [1234u32];
+
+        let decision = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &conn,
+            &login_return_payload(),
+            false,
+            false,
+            &OwnershipFilter {
+                lookup: &owner,
+                game_pids: &game_pids,
+            },
+        );
+        assert!(!decision.newly_adopted);
+        assert!(decision.skip);
+        assert_eq!(known_server, None);
+    }
+
+    #[test]
+    fn a_candidate_stream_with_an_unknown_owner_is_still_adopted() {
+        // The ownership filter must fail open: `owner_pid` returning `None`
+        // (a lookup race, an unsupported platform, ...) must never itself
+        // block an otherwise-valid adoption.
+        let mut detector = ServerDetector::new();
+        let mut known_server = None;
+        let conn = server_to_client([203, 0, 113, 7], 5000);
+        let owner = FakeOwnerLookup(None);
+        let game_pids = [1234u32];
+
+        let decision = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &conn,
+            &login_return_payload(),
+            false,
+            false,
+            &OwnershipFilter {
+                lookup: &owner,
+                game_pids: &game_pids,
+            },
+        );
+        assert!(decision.newly_adopted);
+        assert_eq!(known_server, Some(conn));
+    }
+
+    #[test]
+    fn a_candidate_stream_owned_by_the_game_process_is_adopted() {
+        let mut detector = ServerDetector::new();
+        let mut known_server = None;
+        let conn = server_to_client([203, 0, 113, 7], 5000);
+        let owner = FakeOwnerLookup(Some(1234));
+        let game_pids = [1234u32];
+
+        let decision = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &conn,
+            &login_return_payload(),
+            false,
+            false,
+            &OwnershipFilter {
+                lookup: &owner,
+                game_pids: &game_pids,
+            },
+        );
+        assert!(decision.newly_adopted);
+        assert_eq!(known_server, Some(conn));
+    }
+
+    #[test]
+    fn a_candidate_stream_owned_by_any_pid_in_the_game_pid_set_is_adopted() {
+        // Issue #337 (O5): `GAME_PROCESS_NAMES` includes generic names that
+        // more than one running process can match, so `game_pids` can carry
+        // several candidates at once. Ownership must allow a connection
+        // owned by *any* of them, not just the first one resolved.
+        let mut detector = ServerDetector::new();
+        let mut known_server = None;
+        let conn = server_to_client([203, 0, 113, 7], 5000);
+        let owner = FakeOwnerLookup(Some(5678));
+        let game_pids = [1234u32, 5678u32];
+
+        let decision = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &conn,
+            &login_return_payload(),
+            false,
+            false,
+            &OwnershipFilter {
+                lookup: &owner,
+                game_pids: &game_pids,
+            },
+        );
+        assert!(decision.newly_adopted);
+        assert_eq!(known_server, Some(conn));
+    }
+
+    #[test]
+    fn a_subnet_candidate_rejected_by_ownership_is_later_adoptable() {
+        // Issue #337 (O3): `detects` records every subnet-path candidate it
+        // sees in `subnet_candidates` so the same connection is never
+        // re-adopted twice — but that record must not be made for a
+        // candidate the ownership filter is about to reject anyway, or the
+        // connection is permanently blacklisted (and burns one of
+        // `MAX_SUBNET_CONNECTIONS` slots) even though ownership would allow
+        // it moments later, e.g. once `find_game_pids` resolves correctly.
+        let known_conn = server_to_client([203, 0, 113, 7], 5000);
+        let mut detector = detector_knowing(&known_conn);
+        let mut known_server = None; // torn down; the subnet-reconnect path is armed
+        let candidate = server_to_client([203, 0, 113, 9], 5001);
+        let payload = b"payload";
+
+        let owner = FakeOwnerLookup(Some(9999));
+        let game_pids = [1234u32];
+        let rejected = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &candidate,
+            payload,
+            false,
+            false,
+            &OwnershipFilter {
+                lookup: &owner,
+                game_pids: &game_pids,
+            },
+        );
+        assert!(!rejected.newly_adopted);
+        assert!(rejected.skip);
+        assert_eq!(known_server, None);
+
+        // Ownership now allows it (e.g. the owning pid now matches). The
+        // exact same candidate must still be adoptable.
+        let owner = FakeOwnerLookup(Some(1234));
+        let allowed = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &candidate,
+            payload,
+            false,
+            false,
+            &OwnershipFilter {
+                lookup: &owner,
+                game_pids: &game_pids,
+            },
+        );
+        assert!(
+            allowed.newly_adopted,
+            "a candidate rejected only by ownership must remain adoptable once ownership allows it"
+        );
+        assert_eq!(known_server, Some(candidate));
     }
 }

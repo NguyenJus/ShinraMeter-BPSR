@@ -177,6 +177,7 @@ pub fn map_event(
         },
         ProtocolEvent::TeamMemberLeft { uid } => meter::ProtocolEvent::TeamMemberLeft { uid },
         ProtocolEvent::TeamRoster { members } => meter::ProtocolEvent::TeamRoster { members },
+        ProtocolEvent::LocalPlayer { uid } => meter::ProtocolEvent::LocalPlayer { uid },
     }
 }
 

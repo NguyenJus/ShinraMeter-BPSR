@@ -155,6 +155,22 @@ pub fn damage_delta(target_uuid: i64, dmg: pb::SyncDamageInfo) -> Vec<u8> {
     damage_delta_multi(target_uuid, vec![dmg])
 }
 
+/// A `SyncDamageInfo` describing a monster's hit on a player — the reverse
+/// attacker/target direction from [`damage_info`], which always models a
+/// player attacking a monster (`attacker_uuid` packed as a player uuid). No
+/// scenario verb needed one until the wipe scenario (issue #342): scripting
+/// a party wipe requires a *player* to die, which means the attacker is the
+/// monster and the target (the `AoiSyncDelta.uuid` the caller wraps this
+/// in) is the player. Reuses [`damage_info`]'s flag mapping (crit/lucky/miss/
+/// heal/kill), only repacking `attacker_uuid` via [`monster_uuid`] instead of
+/// [`player_uuid`] — `hit.attacker_uid` is the monster's uid here.
+pub fn monster_damage_info(hit: &Hit) -> pb::SyncDamageInfo {
+    pb::SyncDamageInfo {
+        attacker_uuid: monster_uuid(hit.attacker_uid),
+        ..damage_info(hit)
+    }
+}
+
 /// Prost-encodes a `SyncNearDeltaInfo` payload (not wrapped in a frame)
 /// carrying N damage entries against `target_uuid`, in order.
 pub fn damage_delta_multi(target_uuid: i64, dmgs: Vec<pb::SyncDamageInfo>) -> Vec<u8> {
@@ -499,5 +515,18 @@ mod tests {
         let hit = Hit::new(500, 101, 1_000).crit();
         let info = damage_info(&hit);
         assert_eq!(info.type_flag, 1);
+    }
+
+    #[test]
+    fn monster_damage_info_packs_a_monster_attacker_and_can_kill_the_target() {
+        let hit = Hit::new(2001, 999, 80_000).kill();
+        let info = monster_damage_info(&hit);
+        assert_eq!(info.attacker_uuid, monster_uuid(2001));
+        assert_eq!(info.owner_id, 999);
+        assert_eq!(info.value, 80_000);
+        assert_eq!(info.hp_lessen_value, 80_000);
+        assert_eq!(info.r#type, pb::EDamageType::Normal as i32);
+        assert!(info.is_dead);
+        assert_eq!(info.top_summoner_id, 0);
     }
 }

@@ -272,6 +272,22 @@ impl Scenario {
         self
     }
 
+    /// A monster's hit on a player — the reverse attacker/target direction
+    /// from `hit`/`hits` (which always model a player attacking a monster).
+    /// `hit.attacker_uid` is the monster's uid (packed via
+    /// `wire::monster_uuid`, not `wire::player_uuid`); `hit.kill()` sets
+    /// `is_dead` on the wire `SyncDamageInfo`, which is how
+    /// `Meter::record_death` learns a player went down — the way to script a
+    /// party wipe.
+    pub fn monster_hits_player(mut self, target_player_uid: i64, hit: Hit) -> Self {
+        let target_uuid = wire::player_uuid(target_player_uid);
+        let info = wire::monster_damage_info(&hit);
+        let payload = wire::damage_delta(target_uuid, info);
+        let bytes = self.wrap_frame(opcode::SYNC_NEAR_DELTA_INFO, &payload);
+        self.push_bytes(bytes);
+        self
+    }
+
     // --- non-wire verbs ---
 
     pub fn inject(mut self, event: ProtocolEvent) -> Self {

@@ -629,7 +629,7 @@ impl Settings {
 
     /// The image configured for `slot` (issues #121, #253), or `None` for
     /// "paint the default artwork". One accessor over the two fields rather
-    /// than two call-site `match`es: `ui.rs` builds the settings dropdown's
+    /// than two call-site `match`es: `ui/settings.rs` builds the settings dropdown's
     /// two rows, and paints the two regions, from the same code
     /// parameterized by `ImageSlot`.
     pub fn background_image(&self, slot: ImageSlot) -> Option<&Path> {

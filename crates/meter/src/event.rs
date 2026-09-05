@@ -118,7 +118,7 @@ impl Class {
 }
 
 /// Combat role a `Class` fills (issue #44): drives the row share-bar's hue
-/// in the UI (`crates/app/src/ui.rs`). See `Class::role` for the mapping and
+/// in the UI (`crates/app/src/ui/table.rs`). See `Class::role` for the mapping and
 /// its source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
@@ -327,6 +327,17 @@ pub enum ProtocolEvent {
     /// was decoded alongside. See `Meter::apply_team_roster`.
     TeamRoster {
         members: Vec<i64>,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::LocalPlayer` (issue #344):
+    /// the local player's own uid, decoded from
+    /// `SyncContainerData.v_data.char_id`. Session-scoped like
+    /// `dungeon_state`/`objectives`: survives both `Meter::reset` and
+    /// `ServerChanged`, since `char_id` is the persistent character id
+    /// (not a per-session entity uuid) and stays valid across a server
+    /// change. A later `LocalPlayer` event simply overwrites the stored
+    /// value. Never cleared. See `Snapshot::local_uid`.
+    LocalPlayer {
+        uid: i64,
     },
 }
 

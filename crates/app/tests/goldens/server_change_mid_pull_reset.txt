@@ -1,0 +1,14 @@
+scenario=server_change_mid_pull_reset
+at_ms=11000
+fight_state=Idle
+duration_ms=0
+total_damage=0
+total_dps=0.00
+encounter.boss_monster_id=-
+encounter.boss_name=-
+encounter.is_boss=false
+encounter.scene_id=1001
+encounter.scene_name=Tina's Mindrealm
+encounter.scene_boss_name=-
+resets=SceneChanged@11000
+rows=0

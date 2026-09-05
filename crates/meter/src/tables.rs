@@ -14662,7 +14662,7 @@ pub fn is_dungeon_scene(id: u32) -> bool {
 /// `EncounterInfo::scene_boss_name`, i.e. the header caption *before* — or
 /// without — a boss hit. The moment a recognized boss is actually engaged the
 /// live lock in `Meter::recompute_boss` takes over and `encounter_title`
-/// (`crates/app/src/ui.rs`) prefers it, so a multi-boss dungeon has nothing to
+/// (`crates/app/src/ui/header.rs`) prefers it, so a multi-boss dungeon has nothing to
 /// gain here and everything to get wrong. Raid scenes
 /// (`phase::is_boss_select_scene`) are suppressed outright and must never
 /// appear.
