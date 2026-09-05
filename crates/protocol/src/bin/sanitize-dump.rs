@@ -43,11 +43,12 @@ use bpsr_protocol::dump_format::{self, DumpRecord};
 use bpsr_protocol::frame::Notify;
 use bpsr_protocol::sanitize;
 
-// `map_class`/`map_kind`/`map_event` used to be duplicated here field-for-
-// field with `crates/app/src/pipeline.rs` (issue #146's finding 2); both
-// now share `bpsr_protocol::map`, called directly at `drive`'s one call
-// site below (this binary has no Imagine catalog, so it always passes
-// `None`).
+// `map_class`/`map_event` used to be duplicated here field-for-field with
+// `crates/app/src/pipeline.rs` (issue #146's finding 2); both now share
+// `bpsr_protocol::map`, called directly at `drive`'s one call site below
+// (this binary has no Imagine catalog, so it always passes `None`).
+// `EntityKind` is now the one shared type between `bpsr-protocol` and
+// `bpsr-meter` too (issue #371).
 
 /// Drives the meter over `records` (assumed already time-ordered) and
 /// returns every fight-end snapshot plus the snapshot as of the last record.

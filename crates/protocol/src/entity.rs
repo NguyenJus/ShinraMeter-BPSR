@@ -171,17 +171,12 @@ impl EntityTable {
 mod tests {
     use super::*;
 
-    // `EEntityType::EntChar`/`EntMonster` shifted into a uuid's type field —
-    // see `bpsr_meter::event::kind_of` for the bit layout this mirrors.
-    const PLAYER_KIND_BITS: i64 = 10 << 6;
-    const MONSTER_KIND_BITS: i64 = 1 << 6;
-
     fn player_uuid(uid: i64) -> i64 {
-        (uid << 16) | PLAYER_KIND_BITS
+        EntityId::from_display_uid(uid, EntityKind::Player).uuid()
     }
 
     fn monster_uuid(uid: i64) -> i64 {
-        (uid << 16) | MONSTER_KIND_BITS
+        EntityId::from_display_uid(uid, EntityKind::Monster).uuid()
     }
 
     #[test]

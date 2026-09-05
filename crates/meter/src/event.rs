@@ -16,8 +16,9 @@
 //! `crate::map`, so that direction adds nothing new) rather than each crate
 //! keeping its own hand-written copy of the wire's uuid bit layout.
 
-/// Entity kind derived from the low 16 bits of a wire `uuid` (plan §0.6):
-/// `640` = player, `64` = monster, anything else = unknown.
+/// Entity kind unpacked from bits 6-10 of a wire `uuid`; see [`kind_of`] for
+/// the full layout (`EntChar` = 10 -> `Player`, `EntMonster` = 1 ->
+/// `Monster`, anything else -> `Unknown`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum EntityKind {
     Player,
@@ -643,6 +644,10 @@ mod tests {
         let monster = EntityId::from_display_uid(7, EntityKind::Monster);
         assert_eq!(monster.uuid(), (7i64 << 16) | (1 << 6));
         assert_eq!(kind_of(monster.uuid()), EntityKind::Monster);
+
+        let unknown = EntityId::from_display_uid(5, EntityKind::Unknown);
+        assert_eq!(unknown.uuid(), 5i64 << 16);
+        assert_eq!(kind_of(unknown.uuid()), EntityKind::Unknown);
     }
 
     // -- kind_of / uid_of (issue #371, migrated from bpsr-protocol's
