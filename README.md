@@ -258,7 +258,9 @@ The binaries live in `crates/capture/vendor/windivert/`, taken verbatim from the
   where the transparent window fails to paint.
 - `SHINRA_INSPECT` / `SHINRA_INSPECT_DUMP` / `SHINRA_INSPECT_MAX_BYTES` —
   diagnostic packet-dump tooling used to confirm new protocol constants
-  against live traffic; off by default. `SHINRA_INSPECT_MAX_BYTES`
+  against live traffic; on by default (sanitized) since issue #346,
+  `SHINRA_INSPECT=0` opts out, and `dump_sanitize` in `settings.json`
+  controls scrubbing. `SHINRA_INSPECT_MAX_BYTES`
   overrides the dump ring's total byte budget (512 MiB default). See
   `docs/packet-inspection.md`.
 - `SHINRA_DEMO=1` — seed a fixed synthetic encounter for UI work when no

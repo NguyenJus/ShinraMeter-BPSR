@@ -250,7 +250,11 @@ pub(crate) fn start_log_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
 /// same as `start_log_export`: cheap either way, but keeping it off the
 /// frame thread means a slow `APPDATA` lookup or a stalled disk (the copy
 /// itself, `bundle::export_bundle_to`) can never stall a frame.
-pub(crate) fn start_bundle_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
+pub(crate) fn start_bundle_export(
+    dest: PathBuf,
+    include_history: bool,
+    tx: Sender<LogExportOutcome>,
+) {
     std::thread::Builder::new()
         .name("export-bundle".to_string())
         .spawn(move || {
@@ -258,7 +262,8 @@ pub(crate) fn start_bundle_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
             let log_parts = crate::logging::files_to_export(&log_path);
 
             let inspect_enabled = crate::inspect::enabled();
-            let dump_parts = if inspect_enabled {
+            let dump_sanitized = crate::inspect::sanitized().unwrap_or(false);
+            let dump_parts = if inspect_enabled && dump_sanitized {
                 bundle::dump_ring_parts(&crate::inspect::dump_path())
             } else {
                 Vec::new()
@@ -272,12 +277,28 @@ pub(crate) fn start_bundle_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
                 session_id,
                 env!("CARGO_PKG_VERSION"),
                 bundle::started_at_from_session_id(session_id),
-                inspect_enabled,
-                crate::dump::max_total_ring_bytes(),
-                crate::inspect::dropped_count(),
+                bundle::DumpStatus {
+                    inspect_enabled,
+                    dump_byte_budget: crate::dump::max_total_ring_bytes(),
+                    dropped_records: crate::inspect::dropped_count(),
+                    dump_sanitized,
+                    sanitized_out_records: crate::inspect::sanitized_out_count(),
+                },
             );
 
-            let outcome = match bundle::export_bundle_to(&dest, &entries, &manifest) {
+            // Issue #347: the bundle follows `Settings::history_enabled` —
+            // a sanitized copy is the only way `history.sqlite` data
+            // reaches a bundle at all (`export_bundle_to`'s doc comment),
+            // and a user who has turned history off should not have it
+            // sanitized into a bundle either.
+            let history_source = crate::history::history_db_path();
+            let outcome = match bundle::export_bundle_to(
+                &dest,
+                &entries,
+                &manifest,
+                Some(&history_source),
+                include_history,
+            ) {
                 Ok(missing) => Ok((dest, missing)),
                 Err(err) => Err((dest, err.to_string())),
             };

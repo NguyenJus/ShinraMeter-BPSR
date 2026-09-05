@@ -15,12 +15,35 @@
 //! JSONL fallback — replaces one file and nothing else in this module or its
 //! callers.
 
+pub mod sanitize;
 pub mod sqlite;
 pub mod writer;
 
 use std::path::PathBuf;
 
 use bpsr_meter::{Class, EncounterInfo, PlayerRow, SkillRow, Snapshot};
+
+/// Where the encounter-history database (issue #39) lives:
+/// `%APPDATA%\ShinraMeter-BPSR\history.sqlite`. `SHINRA_HISTORY_DB` overrides
+/// it outright. Lives here — rather than staying a `main.rs`-local helper —
+/// so both `main`'s `HistoryHandle::spawn` and the lib-side session-bundle
+/// export (`crate::bundle`, driven from `crate::ui`) name the exact same
+/// file without the lib crate depending back on the bin crate for it.
+/// Mirrors `settings::settings_path`/`inspect::dump_path`/
+/// `logging::log_file_path`'s own `paths::resolve` calls.
+pub fn history_db_path() -> PathBuf {
+    let (path, warning) = crate::paths::resolve(
+        std::env::var("SHINRA_HISTORY_DB").ok().as_deref(),
+        std::env::var("APPDATA").ok().as_deref(),
+        &["ShinraMeter-BPSR", "history.sqlite"],
+        "ShinraMeter-BPSR-history.sqlite",
+        "APPDATA is not set; falling back to a working-directory file for the encounter history",
+    );
+    if let Some(warning) = warning {
+        log::warn!("{warning}");
+    }
+    path
+}
 
 /// Schema version this build writes and reads (spec §5.4). Bumped whenever
 /// the DDL in `sqlite::init_schema` changes.
@@ -259,6 +282,8 @@ pub enum HistoryError {
     },
     #[error("failed to move the unreadable history file aside: {0}")]
     RenameAside(std::io::Error),
+    #[error("failed to copy the history database for sanitizing: {0}")]
+    Copy(std::io::Error),
 }
 
 /// The narrow seam the storage backend lives behind (spec §10): swapping

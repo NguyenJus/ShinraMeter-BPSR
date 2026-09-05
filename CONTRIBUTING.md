@@ -75,19 +75,24 @@ runtime is packaged.
 
 ## Code style and local checks
 
-Run `scripts/check.sh` before opening a PR — it runs the same test and
-cross-check steps as CI:
+Run `scripts/check.sh` before opening a PR — it mirrors CI's fmt, clippy and
+test jobs; the cross `cargo check --target x86_64-pc-windows-gnu` approximates
+build-windows without the release link or its manifest/DLL assertions:
 
 ```sh
 ./scripts/check.sh
 ```
 
-This runs `cargo test -q --workspace` followed by `cargo check -q --workspace
---target x86_64-pc-windows-gnu`. CI additionally runs `cargo fmt --all
---check` and `cargo clippy --workspace --all-targets --target
-x86_64-pc-windows-gnu` with warnings denied — run `cargo fmt --all` and
-`cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu`
-locally as well before pushing.
+This runs, in order: `cargo fmt --all --check`, `scripts/package-release.test.sh`,
+`cargo clippy -q --workspace --all-targets --target x86_64-pc-windows-gnu --
+-D warnings`, `cargo test -q --workspace`, and `cargo check -q --workspace
+--target x86_64-pc-windows-gnu` — a locally green run means the lint jobs
+pass too, so CI shouldn't surprise you with a fmt/clippy failure it caught
+first. CI also runs `windows-latest` build of the app and a smoke run with
+`--version`, and a `cargo-deny` check (`deny.toml`) for
+advisories/licenses/bans/sources; `cargo deny check` reproduces the latter
+locally if `cargo-deny` is
+installed.
 
 **Note:** CI on this repo may be queued or triggered manually rather than
 running immediately on every push. Please run the checks above locally before
@@ -100,8 +105,8 @@ been checked locally may sit longer before review.
   harder to review and more likely to stall.
 - Link the issue your PR addresses (`Fixes #123`) rather than duplicating its
   description.
-- Make sure `scripts/check.sh`, `cargo fmt --all --check`, and `cargo clippy`
-  pass locally before requesting review.
+- Make sure `scripts/check.sh` (which now includes `cargo fmt --all --check`
+  and `cargo clippy -- -D warnings`) passes locally before requesting review.
 - Describe what you tested and how, especially for anything that touches
   packet decoding or capture — a synthetic repro or the meter simulator is
   preferred over attaching real capture data.
