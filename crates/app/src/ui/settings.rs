@@ -359,6 +359,7 @@ mod tests {
                 true,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 false,
                 &mut false,
                 None,
@@ -431,6 +432,7 @@ mod tests {
                 true,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 false,
                 &mut false,
                 None,
@@ -588,6 +590,7 @@ mod tests {
                     &icons,
                     update_check,
                     &unused_log_export_sender(),
+                    &mut 0,
                     &mut false,
                 );
             });
@@ -645,6 +648,7 @@ mod tests {
                 &icons,
                 &mut update_check,
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut false,
             );
         });
@@ -690,6 +694,7 @@ mod tests {
                 &icons,
                 &mut update_check,
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut false,
             );
         });
@@ -741,6 +746,7 @@ mod tests {
                 &icons,
                 &mut update_check,
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut false,
             );
         });
@@ -1088,6 +1094,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut quit_requested,
             );
         });
@@ -1117,6 +1124,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut quit_requested,
             );
         });
@@ -1184,6 +1192,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut false,
             );
         });
@@ -1216,6 +1225,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut false,
             );
         });
@@ -1252,6 +1262,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut false,
             );
         });
@@ -1305,6 +1316,7 @@ mod tests {
                     &icons,
                     &mut UpdateCheckState::default(),
                     &unused_log_export_sender(),
+                    &mut 0,
                     &mut false,
                 );
             });
@@ -1368,6 +1380,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut false,
             );
         });
@@ -1393,6 +1406,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut false,
             );
         });
@@ -1462,6 +1476,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut false,
             );
         });
@@ -1487,6 +1502,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut false,
             );
         });
@@ -1542,6 +1558,7 @@ mod tests {
                     &icons,
                     &mut UpdateCheckState::default(),
                     &unused_log_export_sender(),
+                    &mut 0,
                     &mut false,
                 );
             });
@@ -1648,6 +1665,7 @@ mod tests {
                     true,
                     &mut update_check,
                     &unused_log_export_sender(),
+                    &mut 0,
                     false,
                     &mut false,
                     None,
@@ -1833,6 +1851,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut false,
             );
         });
@@ -1857,6 +1876,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut false,
             );
         });

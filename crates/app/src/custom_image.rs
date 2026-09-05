@@ -759,6 +759,13 @@ struct Entry {
     /// re-`set` a later frame's already-decoded pixels without re-reading
     /// or re-decoding the file.
     frames: Vec<AnimationFrame>,
+    /// `frames`' delays, in the same order — the exact slice shape
+    /// [`animation_position_at`] takes. Built once, here, because both
+    /// [`CustomImages::texture`] and [`CustomImages::next_wakeup`] ask for
+    /// this entry's position on the *same* frame, and each collecting its
+    /// own `Vec` meant two heap allocations per animated slot per frame for
+    /// a list that never changes after the load. Empty for the `Err` arm.
+    delays: Vec<Duration>,
     /// Index into `frames` currently uploaded into `result`'s texture.
     showing: usize,
     /// `egui::Context`'s own logical time ([`egui::InputState::time`]) the
@@ -859,6 +866,7 @@ impl CustomImages {
                 src,
                 content,
                 result,
+                delays: frames.iter().map(|frame| frame.delay).collect(),
                 frames,
                 showing: 0,
                 started_at,
@@ -872,8 +880,7 @@ impl CustomImages {
         if entry.result.is_ok() && entry.frames.len() > 1 {
             let now = ctx.input(|input| input.time);
             let elapsed = Duration::from_secs_f64((now - entry.started_at).max(0.0));
-            let delays: Vec<Duration> = entry.frames.iter().map(|frame| frame.delay).collect();
-            let position = animation_position_at(&delays, elapsed);
+            let position = animation_position_at(&entry.delays, elapsed);
             if position.index != entry.showing {
                 let image = entry.frames[position.index].image.clone();
                 if let Ok(texture) = &mut entry.result {
@@ -935,8 +942,7 @@ impl CustomImages {
             .filter(|entry| entry.result.is_ok() && entry.frames.len() > 1)
             .map(|entry| {
                 let elapsed = Duration::from_secs_f64((now - entry.started_at).max(0.0));
-                let delays: Vec<Duration> = entry.frames.iter().map(|frame| frame.delay).collect();
-                animation_position_at(&delays, elapsed).remaining
+                animation_position_at(&entry.delays, elapsed).remaining
             })
             .min()
     }

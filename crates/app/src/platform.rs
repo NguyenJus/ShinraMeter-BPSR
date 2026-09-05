@@ -1804,10 +1804,13 @@ fn click_through_button_rect() -> Option<Rect> {
 /// the flag is reconciled *every frame against the OS cursor's own
 /// position*, so while the cursor is inside the published button hit box
 /// the answer is `false` and the button is reachable exactly as before, and
-/// it flips back to `true` the moment the cursor leaves. `OverlayApp::ui`
-/// repaints at ~10Hz unconditionally, which is what keeps that
-/// reconciliation running while the window itself receives no mouse input
-/// at all.
+/// it flips back to `true` the moment the cursor leaves. The overlay stops
+/// receiving mouse input entirely while click-through is on, so nothing
+/// about the cursor moving can schedule a frame; what keeps this
+/// reconciliation running is that `OverlayApp::ui` feeds
+/// `Settings::click_through` into `ui::repaint::RepaintInputs`'
+/// `click_through_active`, which holds the 100 ms transient cadence for as
+/// long as click-through is on (issues #349, #350).
 ///
 /// The decision is `click_through_hit_test`'s, not a second copy of it: a
 /// point that would hit-test `Transparent` is exactly a point the window

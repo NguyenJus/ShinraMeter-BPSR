@@ -495,6 +495,15 @@ pub struct OverlayApp {
     rx_log_export: Receiver<LogExportOutcome>,
     /// The sender half of `rx_log_export`, cloned into each export thread.
     tx_log_export: Sender<LogExportOutcome>,
+    /// Issue #350 (S2): how many "Export logs"/"Export session bundle"
+    /// threads are currently between being spawned (`start_log_export`/
+    /// `start_bundle_export`, in `draw_header_menu`) and having their
+    /// outcome drained by `poll_log_export`. Fed into `repaint::RepaintInputs`
+    /// as part of `transient_timer_active` — without it, an in-flight
+    /// export's result could sit in `rx_log_export` for up to the idle
+    /// heartbeat before the status banner it raises gets painted, since
+    /// nothing else about a spawned copy thread wakes the overlay.
+    log_exports_in_flight: usize,
     /// Issue #156: consecutive frames `screenshot_capturing` has been
     /// held `true` with neither a new request nor a landed reply this
     /// frame — reset to `0` by `advance_screenshot_capture_wait` the
@@ -1246,6 +1255,7 @@ impl OverlayApp {
             update_check: UpdateCheckState::Idle,
             rx_log_export,
             tx_log_export,
+            log_exports_in_flight: 0,
             screenshot_capture_frames_waited: 0,
             demo_mode,
             startup_toggles_applied: false,
@@ -1290,8 +1300,11 @@ impl OverlayApp {
 
     /// The same clear on a timer rather than on a success, for the failure
     /// no later Share ever follows. Called once per frame from `ui()`,
-    /// which is tick enough: the app repaints unconditionally at ~10Hz
-    /// (`ctx.request_repaint_after` at the end of `ui()`).
+    /// which is tick enough: a raised banner sets `status_expires_at`,
+    /// which is itself one of `repaint::RepaintInputs`'
+    /// `transient_timer_active` signals, so the frames that have to run for
+    /// this to fire are exactly the ones the banner schedules for itself
+    /// (issue #349).
     fn expire_transient_status(&mut self, now: Instant) {
         if self.status_expires_at.is_some_and(|at| now >= at) {
             self.clear_transient_status();
@@ -1570,6 +1583,12 @@ impl OverlayApp {
         // `self.rx_log_export` would rule out.
         let landed: Vec<LogExportOutcome> = self.rx_log_export.try_iter().collect();
         for outcome in landed {
+            // Issue #350 (S2): every outcome drained here corresponds to
+            // exactly one increment in `draw_header_menu` when the export
+            // was spawned — decremented per-outcome rather than reset to
+            // `0` after the loop so a second export started while this one
+            // was still running is not undercounted.
+            self.log_exports_in_flight = self.log_exports_in_flight.saturating_sub(1);
             match outcome {
                 Ok((dest, missing)) if missing.is_empty() => {
                     log::info!("export finished: {}", dest.display())
@@ -1661,8 +1680,8 @@ impl eframe::App for OverlayApp {
         // out — but couldn't rule out a runtime DPI effect on the
         // reporter's real Windows box; no screenshot was obtainable in this
         // environment to compare directly. Logged only when the value
-        // changes, so a stuck-open overlay repainting at ~10Hz doesn't spam
-        // the log file. A suspicious reading looks like `pixels_per_point`
+        // changes, so a stuck-open overlay repainting at the activity
+        // cadence doesn't spam the log file. A suspicious reading looks like `pixels_per_point`
         // not matching the display's actual OS scaling (e.g. staying `1.0`
         // on a 150%-scaled monitor) or a `zoom_factor` other than `1.0` —
         // either would shrink everything the overlay paints, rows included,
@@ -1748,8 +1767,9 @@ impl eframe::App for OverlayApp {
         // carve-out alone could never hand a click to the game underneath,
         // and how the toggle button stays reachable anyway. Sent only when
         // the answer changes: `MousePassthrough` is a real window-style
-        // write, not something worth queueing ~10 times a second for a value
-        // that almost never moves.
+        // write, not something worth queueing on every frame the repaint
+        // policy schedules (issue #349) for a value that almost never
+        // moves.
         let passthrough = crate::platform::click_through_passthrough_wanted();
         if passthrough != self.mouse_passthrough {
             self.mouse_passthrough = passthrough;
@@ -1892,6 +1912,7 @@ impl eframe::App for OverlayApp {
                     share_active,
                     &mut self.update_check,
                     &self.tx_log_export,
+                    &mut self.log_exports_in_flight,
                     self.history.is_some(),
                     &mut open_history_clicked,
                     header_history,
@@ -2091,8 +2112,10 @@ impl eframe::App for OverlayApp {
         // window. `show_viewport_immediate` runs the child's UI on this
         // same frame/thread — exactly what lets `skill_windows`' state
         // live as a plain field instead of behind an `Arc<Mutex<..>>` —
-        // and the app already repaints at ~10Hz (`request_repaint_after`
-        // below), so the extra viewport per open player costs nothing.
+        // and these run only on frames `repaint::repaint_policy` already
+        // scheduled (`request_repaint_after` below), which since issue #349
+        // is the idle heartbeat unless something is actually happening, so
+        // the extra viewport per open player costs nothing.
         // Re-borrowed here rather than reusing the binding above: that one's
         // borrow of `self.icons` has to end before `open_history` can take
         // `&mut self`, so the child-viewport loop below takes a fresh one.
@@ -2206,6 +2229,14 @@ impl eframe::App for OverlayApp {
         // `poll_update_check`/`poll_history` exist to drain — none of them
         // wake the overlay on their own, so the repaint clock is the only
         // thing that ever notices their reply landed.
+        //
+        // Issue #350: the Share screenshot round trip (O3) and an in-flight
+        // "Export logs"/"Export session bundle" copy thread (S2) belong to
+        // the same family and are folded in here: both are answered by a
+        // reply that arrives with no egui event attached, and the
+        // screenshot one additionally advances a per-frame counter
+        // (`SCREENSHOT_CAPTURE_TIMEOUT_FRAMES`) that only ticks on frames
+        // that actually happen.
         let transient_timer_active = self.status_expires_at.is_some()
             || matches!(
                 self.update_check,
@@ -2214,15 +2245,22 @@ impl eframe::App for OverlayApp {
             || matches!(
                 &self.view,
                 OverlayView::History(state) if state.pending || state.pending_load_id.is_some()
-            );
-        if let Some(delay) = repaint_policy(RepaintInputs {
+            )
+            || self.screenshot_capturing
+            || self.log_exports_in_flight > 0;
+        // Issue #350 (O4): read from settings rather than
+        // `platform::click_through_passthrough_wanted`'s own
+        // `CLICK_THROUGH_ENABLED` atomic — see `RepaintInputs::
+        // click_through_active`'s doc comment for why the atomic would stop
+        // scheduling exactly the frame the tray escape hatch needs one.
+        let click_through_active = self.settings.click_through;
+        ctx.request_repaint_after(repaint_policy(RepaintInputs {
             snapshot_activity,
             gif_next_wakeup,
             input_active,
             transient_timer_active,
-        }) {
-            ctx.request_repaint_after(delay);
-        }
+            click_through_active,
+        }));
     }
 }
 
@@ -4135,6 +4173,7 @@ mod tests {
                 true,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 false,
                 &mut false,
                 None,
@@ -4300,6 +4339,7 @@ mod tests {
                 true,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 false,
                 &mut false,
                 None,
@@ -5654,6 +5694,7 @@ mod tests {
                 &icons,
                 &mut update_check,
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut false,
             );
         });
