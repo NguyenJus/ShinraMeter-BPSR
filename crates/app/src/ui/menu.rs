@@ -924,6 +924,7 @@ pub(crate) fn draw_header_menu(
                     icons,
                     update_check,
                     tx_log_export,
+                    log_exports_in_flight,
                     quit_requested,
                 ),
                 MenuPage::Columns => draw_columns_page(ui, settings, tx_settings),
@@ -956,6 +957,7 @@ fn draw_menu_root(
     icons: &Icons,
     update_check: &mut UpdateCheckState,
     tx_log_export: &Sender<LogExportOutcome>,
+    log_exports_in_flight: &mut usize,
     quit_requested: &mut bool,
 ) -> Option<MenuNav> {
     let mut nav = None;
@@ -1470,6 +1472,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut false,
             );
         });
