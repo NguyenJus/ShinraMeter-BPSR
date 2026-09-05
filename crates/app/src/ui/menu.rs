@@ -9,12 +9,12 @@ use super::*;
 /// `button_padding.y` on both sides, this lands on
 /// `egui::Style::default().spacing.interact_size.y` (18.0) — see this
 /// module's own `toolbar_icon_button_height_matches_interact_size`.
-pub(crate) const TOOLBAR_ICON_SIZE: f32 = 14.0;
+pub(super) const TOOLBAR_ICON_SIZE: f32 = 14.0;
 
 /// Tint applied to every toolbar/stat icon — the source's footer buttons are
 /// `Fill="White"` at content `Opacity=".5"`, i.e. white at half alpha, not a
 /// slate-blue-gray recolor.
-pub(crate) const TOOLBAR_ICON_TINT: egui::Color32 =
+pub(super) const TOOLBAR_ICON_TINT: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 128);
 
 /// Builds an `egui::Image` for a loaded toolbar icon texture at the fixed
@@ -22,7 +22,7 @@ pub(crate) const TOOLBAR_ICON_TINT: egui::Color32 =
 /// carries (`SizedTexture::from_handle` would use the PNG's native 48x48
 /// instead), and multiplied by `TOOLBAR_ICON_TINT` so every icon reads at
 /// the same half-white opacity regardless of its source color.
-pub(crate) fn toolbar_icon_image(handle: &egui::TextureHandle) -> egui::Image<'static> {
+pub(super) fn toolbar_icon_image(handle: &egui::TextureHandle) -> egui::Image<'static> {
     egui::Image::from_texture(egui::load::SizedTexture::new(
         handle.id(),
         egui::Vec2::splat(TOOLBAR_ICON_SIZE),
@@ -41,23 +41,23 @@ pub(crate) fn toolbar_icon_image(handle: &egui::TextureHandle) -> egui::Image<'s
 
 /// Side of the chevron's square hit/paint box, matched to `TOOLBAR_ICON_SIZE`
 /// so it reads as one of the window controls rather than as decoration.
-pub(crate) const CHEVRON_SIZE: f32 = TOOLBAR_ICON_SIZE;
+pub(super) const CHEVRON_SIZE: f32 = TOOLBAR_ICON_SIZE;
 
 /// Painted width of the V. The source's `ComboBoxToggleButton` chevron is a
 /// `Path Width="10"`; the hit box stays `CHEVRON_SIZE` so the target is still
 /// comfortable.
-pub(crate) const CHEVRON_PAINT_WIDTH: f32 = 10.0;
+pub(super) const CHEVRON_PAINT_WIDTH: f32 = 10.0;
 
 /// Painted height of the V — a wide, shallow chevron, not an arrowhead.
-pub(crate) const CHEVRON_PAINT_HEIGHT: f32 = 5.0;
+pub(super) const CHEVRON_PAINT_HEIGHT: f32 = 5.0;
 
 /// The source's `Fill="#cfff"`.
-pub(crate) const CHEVRON_COLOR: egui::Color32 =
+pub(super) const CHEVRON_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0xCC);
 
 /// Stroke width of the chevron. Thin, matching the reference's hairline
 /// strokes, and a touch heavier than a hairline so it survives at 14pt.
-pub(crate) const CHEVRON_STROKE: f32 = 1.5;
+pub(super) const CHEVRON_STROKE: f32 = 1.5;
 
 /// The chevron's square control box inside the title row's reserved
 /// right-hand strip (`HEADER_RIGHT_CONTROL_WIDTH`, which `header_text_rect`
@@ -68,7 +68,7 @@ pub(crate) const CHEVRON_STROKE: f32 = 1.5;
 /// `header_text_rect`: the strip is clamped against the row's left edge, and
 /// the box is then clamped against the strip, so a hopeless width yields a
 /// small-or-empty box inside the row instead of a backwards one.
-pub(crate) fn chevron_rect(title_row: egui::Rect) -> egui::Rect {
+pub(super) fn chevron_rect(title_row: egui::Rect) -> egui::Rect {
     let left = (title_row.right() - HEADER_RIGHT_CONTROL_WIDTH).max(title_row.left());
     let strip = egui::Rect::from_min_max(
         egui::pos2(left, title_row.top()),
@@ -92,7 +92,7 @@ pub(crate) fn chevron_rect(title_row: egui::Rect) -> egui::Rect {
 /// `chevron_rect` and `header_text_rect`: both edges are clamped against the
 /// row's left edge, so a hopeless width yields a small-or-empty pill inside
 /// the row instead of a backwards one.
-pub(crate) fn title_toggle_pill_rect(title_row: egui::Rect, height: f32) -> egui::Rect {
+pub(super) fn title_toggle_pill_rect(title_row: egui::Rect, height: f32) -> egui::Rect {
     let right =
         (title_row.right() - HEADER_RIGHT_CONTROL_WIDTH - TITLE_TOGGLE_GAP_X).max(title_row.left());
     let left = (right - TITLE_TOGGLE_PILL_WIDTH).max(title_row.left());
@@ -109,7 +109,7 @@ pub(crate) fn title_toggle_pill_rect(title_row: egui::Rect, height: f32) -> egui
 /// state, which is what the reference render shows); up means "click to
 /// unfold" (collapsed). Pure, so the mirroring is unit-testable without a
 /// painter — same reasoning as `pill_content_layout`.
-pub(crate) fn chevron_points(rect: egui::Rect, pointing_down: bool) -> [egui::Pos2; 3] {
+pub(super) fn chevron_points(rect: egui::Rect, pointing_down: bool) -> [egui::Pos2; 3] {
     let half_width = CHEVRON_PAINT_WIDTH / 2.0;
     let half_height = CHEVRON_PAINT_HEIGHT / 2.0;
     let center = rect.center();
@@ -139,7 +139,7 @@ pub(crate) fn chevron_points(rect: egui::Rect, pointing_down: bool) -> [egui::Po
 /// `WidgetInfo` from anywhere. Always points down (`chevron_points(rect,
 /// true)`) — a menu affordance, not a collapse-state indicator — so the
 /// label names what a click does ("Menu"), not a state.
-pub(crate) fn menu_chevron(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
+pub(super) fn menu_chevron(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
     let label = "Menu";
     let response = ui.interact(rect, ui.id().with("menu_chevron"), egui::Sense::click());
     if ui.is_rect_visible(rect) {
@@ -162,7 +162,7 @@ pub(crate) fn menu_chevron(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Respons
 /// opens below the header rather than at the very top of the screen, this
 /// margin's practical effect is clearance at the bottom, the same margin
 /// the popup already keeps clear of a screen edge horizontally.
-pub(crate) const HEADER_MENU_SCROLL_MARGIN: f32 = 48.0;
+pub(super) const HEADER_MENU_SCROLL_MARGIN: f32 = 48.0;
 
 /// Issue #231: caps how tall the header dropdown's `ScrollArea` (wrapped
 /// around `draw_header_menu`'s body) may grow, so a long Columns list
@@ -177,7 +177,7 @@ pub(crate) const HEADER_MENU_SCROLL_MARGIN: f32 = 48.0;
 /// the menu, the same way this module's other pixel-math helpers
 /// (`pill_size`, `row_content_width`, …) stay unit-testable without a live
 /// egui frame.
-pub(crate) fn header_menu_scroll_max_height(screen_height: f32, margin: f32) -> f32 {
+pub(super) fn header_menu_scroll_max_height(screen_height: f32, margin: f32) -> f32 {
     (screen_height - margin).max(0.0)
 }
 
@@ -214,7 +214,7 @@ const HEADER_MENU_WIDTH: f32 = 248.0;
 /// Height of every clickable row in the dropdown. Uniform on purpose —
 /// the rows are a list, and a list whose items are sized by their own
 /// content reads as an accident.
-pub(crate) const MENU_ROW_HEIGHT: f32 = 24.0;
+pub(super) const MENU_ROW_HEIGHT: f32 = 24.0;
 
 /// Vertical space above a section label, separating a group of rows from
 /// the one before it (`menu_section`).
@@ -249,7 +249,7 @@ const _: () = assert!(MENU_FIRST_SECTION_GAP >= 0.0);
 
 /// Left/right padding inside a row, between the popup's content edge and
 /// the row's own ink.
-pub(crate) const MENU_ROW_INSET: f32 = 8.0;
+pub(super) const MENU_ROW_INSET: f32 = 8.0;
 
 /// Width reserved for a row's leading icon, whether or not this
 /// particular row has one — that reservation is exactly what makes an
@@ -291,7 +291,7 @@ const MENU_COLUMNS_RESET_WIDTH: f32 = 48.0;
 /// resets it to `Root` on every frame the popup is closed
 /// (`reset_menu_page`), so reopening the menu always lands on the root.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub(crate) enum MenuPage {
+pub(super) enum MenuPage {
     #[default]
     Root,
     Columns,
@@ -300,7 +300,7 @@ pub(crate) enum MenuPage {
 
 /// A navigation request produced by one frame of a page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MenuNav {
+pub(super) enum MenuNav {
     /// Drill down into `MenuPage`.
     Open(MenuPage),
     /// The back row. Always returns to the root — see `next_page`.
@@ -313,7 +313,7 @@ pub(crate) enum MenuNav {
 /// pointer: the hierarchy is exactly one level deep by design (§1 of the
 /// redesign — no nested popups, no nested pages), so a back row needs no
 /// wiring of its own and a third page can be added without touching this.
-pub(crate) fn next_page(nav: MenuNav) -> MenuPage {
+pub(super) fn next_page(nav: MenuNav) -> MenuPage {
     match nav {
         MenuNav::Back => MenuPage::Root,
         MenuNav::Open(page) => page,
@@ -326,7 +326,7 @@ pub(crate) fn next_page(nav: MenuNav) -> MenuPage {
 /// (outside the popup entirely) clears it — which a `Ui`-derived,
 /// salted id could not address from both sides. There is exactly one
 /// header dropdown in the process, so a global key is unambiguous.
-pub(crate) fn menu_page_id() -> egui::Id {
+pub(super) fn menu_page_id() -> egui::Id {
     egui::Id::new("header_menu_page")
 }
 
@@ -335,21 +335,21 @@ pub(crate) fn menu_page_id() -> egui::Id {
 /// drilled into Columns does not reopen there: a dropdown that remembers
 /// a sub-page is a dropdown whose first click lands somewhere the user
 /// did not ask for.
-pub(crate) fn reset_menu_page(ctx: &egui::Context) {
+pub(super) fn reset_menu_page(ctx: &egui::Context) {
     ctx.data_mut(|data| data.insert_temp(menu_page_id(), MenuPage::Root));
 }
 
 /// The three horizontal bands one dropdown row is painted into.
-pub(crate) struct MenuRowRects {
+pub(super) struct MenuRowRects {
     /// The reserved leading-icon slot, `icon_slot` wide and vertically
     /// centered in the row.
-    pub icon: egui::Rect,
+    pub(super) icon: egui::Rect,
     /// Where the label paints, from just past the icon slot up to the
     /// trailing element.
-    pub label: egui::Rect,
+    pub(super) label: egui::Rect,
     /// Right-aligned trailing band, `trailing_width` wide — an empty rect
     /// pinned to the right content edge when there is nothing trailing.
-    pub trailing: egui::Rect,
+    pub(super) trailing: egui::Rect,
 }
 
 /// Splits a row rect into icon / label / trailing bands.
@@ -360,7 +360,7 @@ pub(crate) struct MenuRowRects {
 /// way this box can check it. Degrades to non-inverted (possibly
 /// zero-width) rects in a row too narrow to hold everything, rather than
 /// producing an inverted rect egui would then paint inside out.
-pub(crate) fn menu_row_layout(
+pub(super) fn menu_row_layout(
     row: egui::Rect,
     inset: f32,
     icon_slot: f32,
@@ -390,7 +390,7 @@ pub(crate) fn menu_row_layout(
 }
 
 /// What sits at the right-hand end of a `menu_row`.
-pub(crate) enum Trailing<'a> {
+pub(super) enum Trailing<'a> {
     /// Nothing — the label runs to the row's right inset.
     None,
     /// A right-aligned monospace value, e.g. `"78%"`.
@@ -406,15 +406,15 @@ pub(crate) enum Trailing<'a> {
 }
 
 /// One row of the header dropdown.
-pub(crate) struct MenuRow<'a> {
+pub(super) struct MenuRow<'a> {
     /// Optional leading icon; the slot is reserved either way.
-    pub icon: Option<&'a egui::TextureHandle>,
-    pub label: &'a str,
-    pub trailing: Trailing<'a>,
+    pub(super) icon: Option<&'a egui::TextureHandle>,
+    pub(super) label: &'a str,
+    pub(super) trailing: Trailing<'a>,
     /// A disabled row senses hover only (so a tooltip still works) and
     /// paints its label weak, with no hover fill — it must read as inert,
     /// not merely dim.
-    pub enabled: bool,
+    pub(super) enabled: bool,
 }
 
 /// Paints one dropdown row and returns its `Response`.
@@ -426,7 +426,7 @@ pub(crate) struct MenuRow<'a> {
 /// `widget_info` is what puts the row in the AccessKit tree under its
 /// painted name, which is both the accessibility story and how the
 /// header tests locate a row to click.
-pub(crate) fn menu_row(ui: &mut egui::Ui, row: MenuRow<'_>) -> egui::Response {
+pub(super) fn menu_row(ui: &mut egui::Ui, row: MenuRow<'_>) -> egui::Response {
     let sense = if row.enabled {
         egui::Sense::click()
     } else {
@@ -638,15 +638,15 @@ fn menu_hint(ui: &mut egui::Ui, text: &str) {
 }
 
 /// One labelled group of column checkboxes on the Columns page.
-pub(crate) struct ColumnGroup {
-    pub title: &'static str,
+pub(super) struct ColumnGroup {
+    pub(super) title: &'static str,
     /// One line saying what the group's columns have in common — the
     /// labels alone don't distinguish "shown beside the name" from "its
     /// own stat column", which is exactly the distinction
     /// `renders_inline_with_name` (and therefore the `LastStatColumn`
     /// guard) turns on.
-    pub hint: &'static str,
-    pub columns: &'static [ColumnKind],
+    pub(super) hint: &'static str,
+    pub(super) columns: &'static [ColumnKind],
 }
 
 /// The Columns page's grouping of `ColumnKind::ALL`.
@@ -658,7 +658,7 @@ pub(crate) struct ColumnGroup {
 /// holds both properties, which is what makes adding a `ColumnKind`
 /// without listing it here a test failure rather than a silently
 /// unreachable checkbox.
-pub(crate) fn column_groups() -> &'static [ColumnGroup] {
+pub(super) fn column_groups() -> &'static [ColumnGroup] {
     const GROUPS: &[ColumnGroup] = &[
         ColumnGroup {
             title: "Player",
@@ -690,7 +690,7 @@ pub(crate) fn column_groups() -> &'static [ColumnGroup] {
 
 /// Why a column's checkbox is held on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ColumnLock {
+pub(super) enum ColumnLock {
     /// Issue #13's guard: this is the only visible column left.
     LastVisible,
     /// Issue #168's guard: this is the only column left that occupies a
@@ -708,7 +708,7 @@ pub(crate) enum ColumnLock {
 /// a `Settings` method: `toggle` stays the enforcement point (a caller
 /// that skips the menu still cannot break the invariant), and this stays
 /// the presentation point.
-pub(crate) fn column_toggle_lock(settings: &Settings, col: ColumnKind) -> Option<ColumnLock> {
+pub(super) fn column_toggle_lock(settings: &Settings, col: ColumnKind) -> Option<ColumnLock> {
     // Turning a column *on* is never guarded — both rules are about
     // removals.
     if !settings.is_visible(col) {
@@ -732,7 +732,7 @@ fn column_lock_hint(lock: ColumnLock) -> &'static str {
 }
 
 /// The root page's trailing summary for the Columns row, e.g. `"4 of 9"`.
-pub(crate) fn visible_count_text(settings: &Settings) -> String {
+pub(super) fn visible_count_text(settings: &Settings) -> String {
     format!(
         "{} of {}",
         settings.visible_columns.len(),
@@ -743,12 +743,12 @@ pub(crate) fn visible_count_text(settings: &Settings) -> String {
 /// The root page's trailing summary for the Opacity row. Rounded, not
 /// truncated — a slider parked a hair under 0.8 reading "79%" would look
 /// like an off-by-one to the user dragging it.
-pub(crate) fn opacity_percent_text(opacity: f32) -> String {
+pub(super) fn opacity_percent_text(opacity: f32) -> String {
     format!("{}%", (opacity * 100.0).round() as i32)
 }
 
 /// The root page's trailing summary for the Background images row.
-pub(crate) fn backgrounds_summary_text(settings: &Settings) -> String {
+pub(super) fn backgrounds_summary_text(settings: &Settings) -> String {
     let configured = ImageSlot::ALL
         .iter()
         .filter(|slot| settings.background_image(**slot).is_some())
@@ -788,7 +788,7 @@ fn reset_columns_to_default(settings: &mut Settings) {
 /// it — with the full path on the row's hover tooltip instead (see
 /// `background_image_row`). Pure, and split out for the same reason
 /// `title_separator_segments` is: unit-testable without a live `egui::Ui`.
-pub(crate) fn background_image_status(path: &Path, error: Option<&ImageError>) -> String {
+pub(super) fn background_image_status(path: &Path, error: Option<&ImageError>) -> String {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -817,7 +817,7 @@ pub(crate) fn background_image_status(path: &Path, error: Option<&ImageError>) -
 /// to hand back a cached failure whose `Entry.path` doesn't match the path
 /// being asked about — see its doc comment — so a stale error can never be
 /// attributed to a different file no matter which order things repaint in.
-pub(crate) fn background_image_row(
+pub(super) fn background_image_row(
     ui: &mut egui::Ui,
     slot: ImageSlot,
     settings: &mut Settings,
@@ -910,7 +910,7 @@ pub(crate) fn background_image_row(
 // Issue #39: same reasoning as `draw_header`'s identical allow — one more
 // history-view parameter tips this over clippy's default limit.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn draw_header_menu(
+pub(super) fn draw_header_menu(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     tx_command: &Sender<UiCommand>,

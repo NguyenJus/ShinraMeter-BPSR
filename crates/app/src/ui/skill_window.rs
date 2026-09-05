@@ -15,23 +15,23 @@ use super::*;
 /// transparency in `settings.opacity`, so a given slider value reads the same
 /// on each. Only the *colors* stay distinct (see the block comment above) —
 /// #184 is about the opacity response, not about unifying the palettes.
-pub(crate) const SKILL_CHROME_FILL: egui::Color32 = egui::Color32::from_rgb(0x11, 0x11, 0x17);
+pub(super) const SKILL_CHROME_FILL: egui::Color32 = egui::Color32::from_rgb(0x11, 0x11, 0x17);
 /// Panel/tab background, and the Deaths pill's fill — the reference's
 /// `#212127`. Same opaque-baseline rule as `SKILL_CHROME_FILL`.
-pub(crate) const SKILL_PANEL_FILL: egui::Color32 = egui::Color32::from_rgb(0x21, 0x21, 0x27);
+pub(super) const SKILL_PANEL_FILL: egui::Color32 = egui::Color32::from_rgb(0x21, 0x21, 0x27);
 /// Dps column-header text — the reference's `#ef5350`.
-pub(crate) const SKILL_HEADER_RGB: egui::Color32 = egui::Color32::from_rgb(0xef, 0x53, 0x50);
+pub(super) const SKILL_HEADER_RGB: egui::Color32 = egui::Color32::from_rgb(0xef, 0x53, 0x50);
 /// An unselected tab's label (issue #245). The reference's tab strip
 /// leaves unselected headers on the header band with dimmer text; this is
 /// the same read at egui's flat alpha — bright enough to be obviously
 /// clickable, clearly behind the selected tab's pure white.
-pub(crate) const SKILL_TAB_IDLE_RGB: egui::Color32 = egui::Color32::from_rgb(0x9a, 0x9a, 0xa4);
+pub(super) const SKILL_TAB_IDLE_RGB: egui::Color32 = egui::Color32::from_rgb(0x9a, 0x9a, 0xa4);
 /// A tab this build cannot fill (issue #245: Buff). Dimmer
 /// again than `SKILL_TAB_IDLE_RGB`, so the strip reads honestly at a
 /// glance, but still selectable — the body explains the gap.
-pub(crate) const SKILL_TAB_UNTRACKED_RGB: egui::Color32 = egui::Color32::from_rgb(0x5e, 0x5e, 0x68);
+pub(super) const SKILL_TAB_UNTRACKED_RGB: egui::Color32 = egui::Color32::from_rgb(0x5e, 0x5e, 0x68);
 /// Close glyph — the reference's `LightRed #ff5555`.
-pub(crate) const SKILL_CLOSE_RGB: egui::Color32 = egui::Color32::from_rgb(0xff, 0x55, 0x55);
+pub(super) const SKILL_CLOSE_RGB: egui::Color32 = egui::Color32::from_rgb(0xff, 0x55, 0x55);
 /// Translucent-white row hover — the reference's `#10FFFFFF`. Its alpha is
 /// the highlight's own weight; issue #184 multiplies `settings.opacity` in on
 /// top of it at the paint site, because this fill is part of the window's
@@ -40,7 +40,7 @@ pub(crate) const SKILL_CLOSE_RGB: egui::Color32 = egui::Color32::from_rgb(0xff, 
 /// the window faded. The main row list's `row_hover_quads` gradient is
 /// knowingly *not* treated this way: it belongs to the row-content layer that
 /// #166 keeps at full alpha.
-pub(crate) const SKILL_ROW_HOVER_FILL: egui::Color32 =
+pub(super) const SKILL_ROW_HOVER_FILL: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(0xff, 0xff, 0xff, 0x10);
 
 /// Column-header band fill (issue #200). The reference paints three
@@ -52,7 +52,7 @@ pub(crate) const SKILL_ROW_HOVER_FILL: egui::Color32 =
 /// the window's alpha as ~0.90, which puts this band a further ~0x09 above
 /// `SKILL_PANEL_FILL`. Kept on the same opaque baseline as the other two so
 /// `settings.opacity` still reads identically across all of them.
-pub(crate) const SKILL_COLUMN_HEADER_FILL: egui::Color32 =
+pub(super) const SKILL_COLUMN_HEADER_FILL: egui::Color32 =
     egui::Color32::from_rgb(0x2a, 0x2a, 0x30);
 
 /// Band heights, all measured off `docs/reference/shinra-skills-ex.webp`
@@ -62,22 +62,22 @@ pub(crate) const SKILL_COLUMN_HEADER_FILL: egui::Color32 =
 /// Header: content top y=2 to y=70. Tab strip: y=71..92. Column header:
 /// y=93..132. Rows: a 44px pitch from y=133 (ten row text centers, 156
 /// through 553, evenly spaced 44.1px apart).
-pub(crate) const SKILL_HEADER_HEIGHT: f32 = 70.0;
-pub(crate) const SKILL_TAB_HEIGHT: f32 = 22.0;
-pub(crate) const SKILL_COLUMN_HEADER_HEIGHT: f32 = 40.0;
+pub(super) const SKILL_HEADER_HEIGHT: f32 = 70.0;
+pub(super) const SKILL_TAB_HEIGHT: f32 = 22.0;
+pub(super) const SKILL_COLUMN_HEADER_HEIGHT: f32 = 40.0;
 /// The reference's measured 44px row pitch (issue #200) — taller than the
 /// main row list's `ROW_HEIGHT` (30.0), so this is its own constant rather
 /// than reusing that one. D5/D14 read `Skills.xaml`'s `MinHeight` of 40 as
 /// the row height; the rendered capture shows 44 once the row's own padding
 /// is included, and the pitch is what the eye actually reads.
-pub(crate) const SKILL_ROW_HEIGHT: f32 = 44.0;
+pub(super) const SKILL_ROW_HEIGHT: f32 = 44.0;
 /// The per-skill row icon (issue #192), measured off the reference (issue
 /// #200): row 1's disc spans x 32..69 and y 136..173, i.e. 38px across in a
 /// 44px row — the icon dominates its row rather than sitting as a small
 /// bullet beside the name, which 24.0 made it. The vendored PNGs are 48px
 /// (`scripts/prep-skill-icons.py`), so this is still a downscale at 100%
 /// display scaling.
-pub(crate) const SKILL_ICON_SIZE: f32 = 38.0;
+pub(super) const SKILL_ICON_SIZE: f32 = 38.0;
 /// Per-side inset the issue #275 monogram placeholder disc (and the
 /// `SKILL_ICON_EMPTY` fallback beside it) is drawn at, versus the full
 /// `SKILL_ICON_SIZE / 2.0` radius vendored skill-icon PNGs occupy in code.
@@ -90,11 +90,11 @@ pub(crate) const SKILL_ICON_SIZE: f32 = 38.0;
 /// uniform inset that closes the weight gap without shrinking the disc so
 /// far it stops looking like it belongs in the same size class as the
 /// other 38px slot content.
-pub(crate) const SKILL_ICON_PLACEHOLDER_INSET: f32 = 2.5;
+pub(super) const SKILL_ICON_PLACEHOLDER_INSET: f32 = 2.5;
 /// Radius the issue #275 monogram placeholder disc and the
 /// `SKILL_ICON_EMPTY` fallback are painted at — see
 /// `SKILL_ICON_PLACEHOLDER_INSET`.
-pub(crate) const SKILL_ICON_PLACEHOLDER_RADIUS: f32 =
+pub(super) const SKILL_ICON_PLACEHOLDER_RADIUS: f32 =
     SKILL_ICON_SIZE / 2.0 - SKILL_ICON_PLACEHOLDER_INSET;
 /// Fill for a row whose skill has no icon to paint *and* no name to derive
 /// a monogram placeholder from (issue #275 — see
@@ -105,14 +105,14 @@ pub(crate) const SKILL_ICON_PLACEHOLDER_RADIUS: f32 =
 /// (`skills::skill_display_name`), so this now only fires for a
 /// hypothetically blank/punctuation-only name — kept rather than removed,
 /// since "no derivable glyph" is still a real (if unobserved) case.
-pub(crate) const SKILL_ICON_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x3B);
+pub(super) const SKILL_ICON_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x3B);
 /// Font size of the issue #275 monogram placeholder's 1-2 character glyph,
 /// centered on the `SKILL_ICON_PLACEHOLDER_RADIUS` disc (33pt across, since
 /// issue #281 inset it off the full `SKILL_ICON_SIZE` slot) — large enough
 /// to read at a glance as a letterform rather than a texture artifact,
 /// small enough that two characters ("LS", "FF") stay clear of the disc's
 /// edge.
-pub(crate) const SKILL_ICON_MONOGRAM_FONT_SIZE: f32 = 15.0;
+pub(super) const SKILL_ICON_MONOGRAM_FONT_SIZE: f32 = 15.0;
 /// `Skills.xaml:151-154` draws the class icon at 50x50. Issue #190 could
 /// only fit 40 of that, because `SKILL_HEADER_HEIGHT` was a made-up 56 and
 /// 50 would have overflowed its padded content area. Issue #200 measured
@@ -120,9 +120,9 @@ pub(crate) const SKILL_ICON_MONOGRAM_FONT_SIZE: f32 = 15.0;
 /// lands verbatim *and* keeps the "icon exactly fills the padded row"
 /// relationship #190 was reaching for
 /// (`SKILL_HEADER_HEIGHT - 2 * SKILL_HEADER_PAD_Y` = 50).
-pub(crate) const SKILL_HEADER_ICON_SIZE: f32 = 50.0;
-pub(crate) const SKILL_HEADER_PAD_X: f32 = 12.0;
-pub(crate) const SKILL_HEADER_PAD_Y: f32 = 10.0;
+pub(super) const SKILL_HEADER_ICON_SIZE: f32 = 50.0;
+pub(super) const SKILL_HEADER_PAD_X: f32 = 12.0;
+pub(super) const SKILL_HEADER_PAD_Y: f32 = 10.0;
 /// The close button's clickable square, which is also the diameter of its
 /// circular hover wash (issue #218).
 ///
@@ -133,49 +133,49 @@ pub(crate) const SKILL_HEADER_PAD_Y: f32 = 10.0;
 /// was nothing to aim at and no feedback once you got there. The family's
 /// icon buttons use radius = half the side (`MainWindow.xaml:49-55`'s
 /// `CornerRadius="18"` on a 36x36 button), i.e. a circle.
-pub(crate) const SKILL_CLOSE_HIT_SIZE: f32 = 32.0;
+pub(super) const SKILL_CLOSE_HIT_SIZE: f32 = 32.0;
 /// The side of the cross's own box inside that target — the reference's
 /// `Path … Width="16"`. Painted as two strokes rather than set as text:
 /// `U+2715` is not covered by `fonts::bold_family`'s chain and came out as
 /// tofu (an empty box), which is what issue #218 called a "square" close
 /// button, and the reference's `Svg.Close` is vector art anyway.
-pub(crate) const SKILL_CLOSE_GLYPH_SIZE: f32 = 16.0;
+pub(super) const SKILL_CLOSE_GLYPH_SIZE: f32 = 16.0;
 /// Stroke weight of those two strokes. `Svg.Close` is a filled path with no
 /// nominal weight; 1.6pt is what reads as the same visual density at 16pt
 /// against `SKILL_CLOSE_RGB`.
-pub(crate) const SKILL_CLOSE_STROKE_WIDTH: f32 = 1.6;
+pub(super) const SKILL_CLOSE_STROKE_WIDTH: f32 = 1.6;
 /// The scroll thumb's fill: white at ~20% over the panel, the same read as
 /// the reference's thin light thumb. Faded with the rest of the chrome
 /// (issue #184).
-pub(crate) const SKILL_SCROLL_THUMB_FILL: egui::Color32 =
+pub(super) const SKILL_SCROLL_THUMB_FILL: egui::Color32 =
     egui::Color32::from_rgba_premultiplied(0x33, 0x33, 0x33, 0x33);
 /// The thumb never gets shorter than this, however long the list — a
 /// two-pixel nub is not a grabbable or readable position indicator.
-pub(crate) const SKILL_SCROLL_THUMB_MIN_HEIGHT: f32 = 24.0;
+pub(super) const SKILL_SCROLL_THUMB_MIN_HEIGHT: f32 = 24.0;
 /// Width of the row list's scrollbar, thumb and track alike (issue #218) —
 /// the reference's persistent thin thumb. Also the gutter
 /// `skill_rows_content_rect` reserves for it.
-pub(crate) const SKILL_SCROLL_BAR_WIDTH: f32 = 6.0;
+pub(super) const SKILL_SCROLL_BAR_WIDTH: f32 = 6.0;
 /// The hover wash `ButtonMainStyle`'s `hl` border flips to on `IsMouseOver`:
 /// WPF's 4-digit ARGB `#1fff` — white at alpha `0x11`. Spelled premultiplied
 /// because `Color32::from_white_alpha`, which is exactly this, is not `const`.
-pub(crate) const SKILL_CLOSE_HOVER_FILL: egui::Color32 =
+pub(super) const SKILL_CLOSE_HOVER_FILL: egui::Color32 =
     egui::Color32::from_rgba_premultiplied(0x11, 0x11, 0x11, 0x11);
 /// The reference's `CornerRadius="17"` header pill.
-pub(crate) const SKILL_PILL_CORNER_RADIUS: u8 = 17;
+pub(super) const SKILL_PILL_CORNER_RADIUS: u8 = 17;
 /// Header pill height, measured at 34px in the reference (issue #200) —
 /// exactly `2 * SKILL_PILL_CORNER_RADIUS`, i.e. a true stadium. It used to
 /// be derived from the header band instead, which made it 40 tall against a
 /// 17 radius: a rounded rectangle with flat sides, not the reference's pill.
-pub(crate) const SKILL_PILL_HEIGHT: f32 = 34.0;
+pub(super) const SKILL_PILL_HEIGHT: f32 = 34.0;
 /// Gap between two adjacent header pills (issue #254) — the reference's
 /// `Margin="0,0,10,0"` on every `Border` in the header's pill `StackPanel`
 /// (`Skills.xaml`), which is what separates its Deaths, death-time, aggro
 /// and aggro-time capsules.
-pub(crate) const SKILL_HEADER_PILL_GAP: f32 = 10.0;
+pub(super) const SKILL_HEADER_PILL_GAP: f32 = 10.0;
 /// The reference's 24pt player name — the one size in this window with no
 /// equivalent in the main row scale (`FONT_SIZE_ROW` tops out at 13.0).
-pub(crate) const FONT_SIZE_SKILL_HEADER_NAME: f32 = 24.0;
+pub(super) const FONT_SIZE_SKILL_HEADER_NAME: f32 = 24.0;
 
 /// Per-tab selection and sort state for one breakdown window (issue #245).
 ///
@@ -187,9 +187,9 @@ pub(crate) const FONT_SIZE_SKILL_HEADER_NAME: f32 = 24.0;
 /// own tab's `default_sort`, and `sort_mut` can only ever hand back the
 /// selected tab's own entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SkillTabs {
-    pub(crate) selected: skills::SkillTab,
-    pub(crate) sorts: [skills::SkillSort; skills::SKILL_TABS.len()],
+pub(super) struct SkillTabs {
+    pub(super) selected: skills::SkillTab,
+    pub(super) sorts: [skills::SkillSort; skills::SKILL_TABS.len()],
 }
 
 impl Default for SkillTabs {
@@ -204,7 +204,7 @@ impl Default for SkillTabs {
 impl SkillTabs {
     /// This tab's index into `sorts`. `SKILL_TABS` is the single source of
     /// tab order, so the array and the strip can never disagree.
-    pub(crate) fn index(tab: skills::SkillTab) -> usize {
+    pub(super) fn index(tab: skills::SkillTab) -> usize {
         skills::SKILL_TABS
             .iter()
             .position(|t| *t == tab)
@@ -212,7 +212,7 @@ impl SkillTabs {
     }
 
     /// The selected tab's own sort state.
-    pub(crate) fn sort_mut(&mut self) -> &mut skills::SkillSort {
+    pub(super) fn sort_mut(&mut self) -> &mut skills::SkillSort {
         let index = Self::index(self.selected);
         &mut self.sorts[index]
     }
@@ -250,7 +250,7 @@ impl SkillTabs {
 // again, 832 -> 856, which 864 no longer clears by the required 2 *
 // `SKILL_HEADER_PAD_X`. 888 keeps the same 8pt of slack over the new sum
 // that 864 kept over the old one, and is still inside that 928x574 box.
-pub(crate) const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(888.0, 572.0);
+pub(super) const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(888.0, 572.0);
 /// Floor on the skill breakdown viewport's inner size (issue #181) so a
 /// resize can't shrink it into uselessness — tall enough for the header, tab
 /// strip and column-header row plus a couple of rows before the list
@@ -282,7 +282,7 @@ pub(crate) const SKILL_WINDOW_SIZE: egui::Vec2 = egui::vec2(888.0, 572.0);
 /// `SKILL_WINDOW_SIZE`: re-measuring the `Name` column grew the widest
 /// tab's sum 832 -> 856, and this floor — that sum plus the same 24.0
 /// inset — grows with it.
-pub(crate) const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(880.0, 220.0);
+pub(super) const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(880.0, 220.0);
 
 /// One open breakdown window's own state (issue #16, D9): its sort column/
 /// direction, the screen position it was placed at when opened, and the
@@ -300,19 +300,19 @@ pub(crate) const SKILL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(880.0, 220.0);
 /// opened from Live would silently repaint itself with historical numbers
 /// (and back again) as the user moves between the two surfaces, for any uid
 /// that happens to exist in both.
-pub(crate) struct SkillWindowState {
+pub(super) struct SkillWindowState {
     /// Issue #245: which breakdown tab is showing, and each tab's own sort.
-    pub(crate) tabs: SkillTabs,
-    pub(crate) pos: egui::Pos2,
-    pub(crate) size: egui::Vec2,
-    pub(crate) source: SkillWindowSource,
+    pub(super) tabs: SkillTabs,
+    pub(super) pos: egui::Pos2,
+    pub(super) size: egui::Vec2,
+    pub(super) source: SkillWindowSource,
     /// Issue #218: this window's own in-flight move/resize. Per-window
     /// rather than shared with the root's, because two viewports can be
     /// dragged in two different (non-overlapping) sessions and because
     /// `drive_window_gesture` sends its viewport commands to whichever
     /// context is live — inside `show_viewport_immediate`'s callback that
     /// is this child, not the root.
-    pub(crate) gesture: WindowGesture,
+    pub(super) gesture: WindowGesture,
 }
 
 /// Which fight one breakdown window is showing (issue #216, PR #221
@@ -324,7 +324,7 @@ pub(crate) struct SkillWindowState {
 /// same "skipped for this frame, never closed" tolerance
 /// `skill_windows_to_draw` already applies to a uid missing from the rows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum SkillWindowSource {
+pub(super) enum SkillWindowSource {
     Live,
     History(i64),
 }
@@ -350,7 +350,7 @@ pub(crate) enum SkillWindowSource {
 /// breakdown", so the open window retargets onto the fight the gesture came
 /// from rather than raising itself still showing the other one. Placement,
 /// size and sort are per-window state the user set, and stay untouched.
-pub(crate) fn open_skill_window(
+pub(super) fn open_skill_window(
     windows: &mut std::collections::BTreeMap<i64, SkillWindowState>,
     uid: i64,
     source: SkillWindowSource,
@@ -368,14 +368,14 @@ pub(crate) fn open_skill_window(
 /// rather than an inline `from_hash_of` at each site so the open gesture's
 /// focus command and the draw loop's viewport can never drift apart onto
 /// two different ids for the same uid.
-pub(crate) fn skill_viewport_id(uid: i64) -> egui::ViewportId {
+pub(super) fn skill_viewport_id(uid: i64) -> egui::ViewportId {
     egui::ViewportId::from_hash_of(("skills", uid))
 }
 
 /// The only two paths that may drop a uid from the open-window set (D2):
 /// the in-window `X` and an OS-level close request. Never called for a uid
 /// merely missing from the current snapshot — see `skill_windows_to_draw`.
-pub(crate) fn close_skill_window(
+pub(super) fn close_skill_window(
     windows: &mut std::collections::BTreeMap<i64, SkillWindowState>,
     uid: i64,
 ) {
@@ -394,7 +394,7 @@ pub(crate) fn close_skill_window(
 /// fed straight back into the next frame's builder, and forwarding
 /// sub-pixel DPI jitter there would have egui resizing the window at itself
 /// on every repaint.
-pub(crate) fn track_skill_window_size(size: &mut egui::Vec2, inner_rect: Option<egui::Rect>) {
+pub(super) fn track_skill_window_size(size: &mut egui::Vec2, inner_rect: Option<egui::Rect>) {
     let Some(rect) = inner_rect else {
         return;
     };
@@ -416,7 +416,7 @@ pub(crate) fn track_skill_window_size(size: &mut egui::Vec2, inner_rect: Option<
 /// `SIZE_EPSILON` uses for the root window. Its own constant here because
 /// that one is private to `settings.rs` and gates a disk write, while this
 /// one gates a viewport command.
-pub(crate) const SKILL_WINDOW_SIZE_EPSILON: f32 = 1.0;
+pub(super) const SKILL_WINDOW_SIZE_EPSILON: f32 = 1.0;
 
 /// Which rows *one* breakdown window searches this frame (issue #216, PR
 /// #221 review): its own `source`'s, never whichever surface happens to be
@@ -431,7 +431,7 @@ pub(crate) const SKILL_WINDOW_SIZE_EPSILON: f32 = 1.0;
 /// list, opened a different fight, or returned to Live). The window is left
 /// open and simply skipped for the frame, the same way
 /// `skill_windows_to_draw` skips a uid missing from the rows.
-pub(crate) fn skill_window_rows<'a>(
+pub(super) fn skill_window_rows<'a>(
     source: SkillWindowSource,
     live: &'a [PlayerRow],
     history_open: Option<(i64, &'a [PlayerRow])>,
@@ -452,7 +452,7 @@ pub(crate) fn skill_window_rows<'a>(
 /// player can rejoin mid-encounter, and closing on their behalf here would
 /// orphan the window state the moment they reappeared. Only
 /// `close_skill_window` may remove an entry.
-pub(crate) fn skill_windows_to_draw<'a>(
+pub(super) fn skill_windows_to_draw<'a>(
     windows: &std::collections::BTreeMap<i64, SkillWindowState>,
     live: &'a [PlayerRow],
     history_open: Option<(i64, &'a [PlayerRow])>,
@@ -489,7 +489,7 @@ pub(crate) fn skill_windows_to_draw<'a>(
 /// `SKILL_PANEL_FILL`, in a box flush with the window's left edge that hugs
 /// the label with one `SKILL_HEADER_PAD_X` of padding on each side — the
 /// measured `Dps` box runs x 2..51 against a label starting at x≈17.
-pub(crate) fn skill_tab_rects(tabs_rect: egui::Rect, text_widths: &[f32]) -> Vec<egui::Rect> {
+pub(super) fn skill_tab_rects(tabs_rect: egui::Rect, text_widths: &[f32]) -> Vec<egui::Rect> {
     let mut x = tabs_rect.left();
     text_widths
         .iter()
@@ -516,7 +516,7 @@ pub(crate) fn skill_tab_rects(tabs_rect: egui::Rect, text_widths: &[f32]) -> Vec
 /// explanatory text rather than as a header. Collapsing the rect — rather
 /// than special-casing the paint — also lifts `skill_rows_rect`, so the
 /// explanation sits where the rows would, directly under the tab strip.
-pub(crate) fn skill_column_header_rect(
+pub(super) fn skill_column_header_rect(
     rect: egui::Rect,
     tabs_rect: egui::Rect,
     columns: &[skills::SkillColumn],
@@ -535,7 +535,7 @@ pub(crate) fn skill_column_header_rect(
 /// The scrollable row-list band's rect (issue #200): everything below the
 /// column header down to the window's bottom edge. Painted with
 /// `SKILL_PANEL_FILL`, not the window's `SKILL_CHROME_FILL`.
-pub(crate) fn skill_rows_rect(rect: egui::Rect, col_header_rect: egui::Rect) -> egui::Rect {
+pub(super) fn skill_rows_rect(rect: egui::Rect, col_header_rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_max(egui::pos2(rect.left(), col_header_rect.bottom()), rect.max)
 }
 
@@ -554,7 +554,7 @@ pub(crate) fn skill_rows_rect(rect: egui::Rect, col_header_rect: egui::Rect) -> 
 /// healer can sit there for a whole fight — telling that user "nothing was
 /// recorded for this fight" would be plainly wrong while the fight is still
 /// running, so the live wording promises the rows are coming.
-pub(crate) fn skill_window_empty_message(
+pub(super) fn skill_window_empty_message(
     source: SkillWindowSource,
     tab: skills::SkillTab,
     skill_row_count: usize,
@@ -588,7 +588,7 @@ pub(crate) fn skill_window_empty_message(
 /// The header band: full width, `SKILL_HEADER_HEIGHT` tall, flush with the
 /// window's top. Pulled out of `draw_skill_window` (issue #218) so the drag
 /// band and close button derived from it are testable without a live `Ui`.
-pub(crate) fn skill_header_rect(rect: egui::Rect) -> egui::Rect {
+pub(super) fn skill_header_rect(rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), SKILL_HEADER_HEIGHT))
 }
 
@@ -607,7 +607,7 @@ pub(crate) fn skill_header_rect(rect: egui::Rect) -> egui::Rect {
 /// "a drag surface spanning it would win the hit test and swallow every
 /// north-edge resize" note there. No bottom inset is needed: the south
 /// strip is a window height away.
-pub(crate) fn skill_drag_band(header_rect: egui::Rect) -> egui::Rect {
+pub(super) fn skill_drag_band(header_rect: egui::Rect) -> egui::Rect {
     let mut band = header_rect;
     band.min.y += RESIZE_EDGE;
     band.min.x += RESIZE_EDGE;
@@ -618,7 +618,7 @@ pub(crate) fn skill_drag_band(header_rect: egui::Rect) -> egui::Rect {
 /// The close button's hit square (issue #218), top-right of the window
 /// inside the header's padding. `SKILL_CLOSE_HIT_SIZE` wide, so it is also
 /// the bounding box of the circular hover wash painted at its centre.
-pub(crate) fn skill_close_rect(rect: egui::Rect) -> egui::Rect {
+pub(super) fn skill_close_rect(rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(
         egui::pos2(
             rect.right() - SKILL_HEADER_PAD_X - SKILL_CLOSE_HIT_SIZE,
@@ -631,7 +631,7 @@ pub(crate) fn skill_close_rect(rect: egui::Rect) -> egui::Rect {
 /// The close cross's two strokes, as endpoint pairs: the diagonals of a
 /// `SKILL_CLOSE_GLYPH_SIZE` box centred in the button (issue #218). Pure so
 /// the shape survives without a font and is checkable without a `Ui`.
-pub(crate) fn skill_close_cross(close_rect: egui::Rect) -> [[egui::Pos2; 2]; 2] {
+pub(super) fn skill_close_cross(close_rect: egui::Rect) -> [[egui::Pos2; 2]; 2] {
     let arms = egui::Rect::from_center_size(
         close_rect.center(),
         egui::Vec2::splat(SKILL_CLOSE_GLYPH_SIZE),
@@ -649,7 +649,7 @@ pub(crate) fn skill_close_cross(close_rect: egui::Rect) -> [[egui::Pos2; 2]; 2] 
 /// row's own painting across the strip the bar lives in — a solid bar has
 /// to take its width out of the content, and content that ignores that just
 /// paints over it.
-pub(crate) fn skill_rows_content_rect(rows_rect: egui::Rect) -> egui::Rect {
+pub(super) fn skill_rows_content_rect(rows_rect: egui::Rect) -> egui::Rect {
     let mut content = rows_rect;
     content.max.x -= SKILL_SCROLL_BAR_WIDTH;
     content
@@ -665,7 +665,7 @@ pub(crate) fn skill_rows_content_rect(rows_rect: egui::Rect) -> egui::Rect {
 /// chrome anyway, not egui's hover-faded floating bar. Driven off the
 /// `ScrollAreaOutput` egui already hands back, so it cannot drift out of
 /// step with where the list actually is.
-pub(crate) fn skill_scroll_thumb(
+pub(super) fn skill_scroll_thumb(
     rows_rect: egui::Rect,
     content_height: f32,
     offset_y: f32,
@@ -698,7 +698,7 @@ pub(crate) fn skill_scroll_thumb(
 /// after the name — the 6px difference from the pixel read is font-metric
 /// slop between the reference's rendered text and the raw XAML number, not
 /// a second, disagreeing source.
-pub(crate) const SKILL_DEATHS_PILL_GAP: f32 = 26.0;
+pub(super) const SKILL_DEATHS_PILL_GAP: f32 = 26.0;
 
 /// Where the header's pill cluster starts — the Deaths pill's left edge,
 /// and with it every pill that follows it: immediately after the player
@@ -721,7 +721,7 @@ pub(crate) const SKILL_DEATHS_PILL_GAP: f32 = 26.0;
 /// Takes the *cluster's* width, not the Deaths pill's alone (issue #254):
 /// the death-time pill sits to the Deaths pill's right, so clamping on the
 /// first pill only would push the last one under the close button.
-pub(crate) fn skill_deaths_pill_left(name_right: f32, close_left: f32, cluster_width: f32) -> f32 {
+pub(super) fn skill_deaths_pill_left(name_right: f32, close_left: f32, cluster_width: f32) -> f32 {
     let preferred = name_right + SKILL_DEATHS_PILL_GAP;
     let max_left = close_left - SKILL_HEADER_PAD_X - cluster_width;
     preferred.min(max_left)
@@ -731,7 +731,7 @@ pub(crate) fn skill_deaths_pill_left(name_right: f32, close_left: f32, cluster_w
 /// death-time pill and the gap before it when there is one to draw (issue
 /// #254). One helper so the cluster is measured in exactly one place
 /// whether it holds one pill or two.
-pub(crate) fn skill_header_pill_cluster_width(
+pub(super) fn skill_header_pill_cluster_width(
     deaths_width: f32,
     death_time_width: Option<f32>,
 ) -> f32 {
@@ -761,7 +761,7 @@ pub(crate) fn skill_header_pill_cluster_width(
 /// Formatted `mm:ss` through `fmt_duration`, matching the reference's
 /// `interval.ToString(@"mm\:ss")` (`Skills.xaml.cs`) and the fight timer in
 /// the main window's header.
-pub(crate) fn skill_death_time_text(dead_ms: Option<u64>) -> Option<String> {
+pub(super) fn skill_death_time_text(dead_ms: Option<u64>) -> Option<String> {
     let ms = dead_ms?;
     Some(if ms == 0 {
         fmt_duration(0)
@@ -770,7 +770,7 @@ pub(crate) fn skill_death_time_text(dead_ms: Option<u64>) -> Option<String> {
     })
 }
 
-pub(crate) fn draw_skill_window(
+pub(super) fn draw_skill_window(
     ui: &mut egui::Ui,
     row: &PlayerRow,
     tabs: &mut SkillTabs,

@@ -20,14 +20,14 @@ use super::*;
 /// at a very low alpha. Spelled premultiplied — white at alpha `a`
 /// premultiplied is `(a, a, a, a)` — because `from_rgba_unmultiplied` is not
 /// `const fn` in ecolor.
-pub(crate) const PILL_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(9, 9, 9, 9);
+pub(super) const PILL_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(9, 9, 9, 9);
 
 /// Fill of the timer pill — the source's `#1aaaaaaa`, a light gray at very
 /// low alpha. Deliberately not `PILL_FILL`: the duration is the stat row's
 /// lead readout and its capsule sits a shade lighter than the two value
 /// pills beside it, which is what lets the eye separate "how long" from
 /// "how much" without a divider between them.
-pub(crate) const TIMER_PILL_FILL: egui::Color32 =
+pub(super) const TIMER_PILL_FILL: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(0xAA, 0xAA, 0xAA, 0x11);
 
 /// Value text color inside a header/DPS/damage pill — the source's `#afff`:
@@ -37,79 +37,79 @@ pub(crate) const TIMER_PILL_FILL: egui::Color32 =
 /// title as the header's visually heaviest element and steps the stat values
 /// down behind it, so painting the pills in full white would flatten that
 /// hierarchy.
-pub(crate) const PILL_VALUE_COLOR: egui::Color32 =
+pub(super) const PILL_VALUE_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0xAA);
 
 /// Glyph tint inside a header/DPS/damage pill — the source's `#5bdf`, a
 /// light steel blue distinct from `TOOLBAR_ICON_TINT`'s grayer slate: the
 /// stat icons read as an accent, the window controls as chrome.
-pub(crate) const PILL_ICON_COLOR: egui::Color32 =
+pub(super) const PILL_ICON_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(0xBB, 0xDD, 0xFF, 0x55);
 
 /// Side of a header/DPS/damage pill's glyph box, in points — the source's
 /// `GeneralStatPathStyle` `14x14`.
-pub(crate) const PILL_GLYPH_SIDE: f32 = 14.0;
+pub(super) const PILL_GLYPH_SIDE: f32 = 14.0;
 
 /// Counter (death) pill fill — `MetricBorderStyle`'s `#1fff`.
-pub(crate) const COUNTER_PILL_FILL: egui::Color32 =
+pub(super) const COUNTER_PILL_FILL: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x11);
 
 /// Counter (death) pill glyph tint — `MetricPathStyle`'s `#5fff`. Dimmer,
 /// via alpha rather than a darker gray, than the (now white)
 /// `DEATH_COUNT_RGB` digits beside it.
-pub(crate) const COUNTER_ICON_COLOR: egui::Color32 =
+pub(super) const COUNTER_ICON_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x55);
 
 /// Side of a counter pill's glyph box, in points — the source's
 /// `MetricPathStyle` `12x12`.
-pub(crate) const COUNTER_GLYPH_SIDE: f32 = 12.0;
+pub(super) const COUNTER_GLYPH_SIDE: f32 = 12.0;
 
 /// Horizontal padding inside a pill, on both ends. Generous on purpose —
 /// it is most of what makes the oval read as a container rather than as a
 /// highlight behind the text.
-pub(crate) const PILL_PAD_X: f32 = 8.0;
+pub(super) const PILL_PAD_X: f32 = 8.0;
 
 /// Vertical padding above and below a pill's text. Small: the pill's height
 /// is capped at the button row's height (`pill_size`) so the header band
 /// budget (`header_band_height`) stays correct, and the text is what should
 /// consume that budget.
-pub(crate) const PILL_PAD_Y: f32 = 2.0;
+pub(super) const PILL_PAD_Y: f32 = 2.0;
 
 /// Gap between a pill's value text and its icon.
-pub(crate) const PILL_ICON_GAP: f32 = 5.0;
+pub(super) const PILL_ICON_GAP: f32 = 5.0;
 
 /// One stat pill's content. A struct rather than a long argument list
 /// because issue #49's death counter and issue #59's timer readout need
 /// the same layout with different sizes, colors, glyph sides and corner
 /// radii — a positional call would be unreadable at every call site.
-pub(crate) struct StatPill<'a> {
-    pub(crate) value: &'a str,
+pub(super) struct StatPill<'a> {
+    pub(super) value: &'a str,
     /// The glyph texture, or `None` when its PNG failed to decode (never
     /// expected — the bytes are compile-time constants). `None` paints an
     /// empty icon box so the pill keeps the same width either way, exactly
     /// like `draw_row` reserves a class-icon slot for a class with no icon.
-    pub(crate) icon: Option<egui::TextureId>,
+    pub(super) icon: Option<egui::TextureId>,
     /// Side of the icon's square box, in points. Explicit rather than
     /// derived from the text's line height: the source fixes these per call
     /// site (`GeneralStatPathStyle` 14x14, `MetricPathStyle` 12x12).
-    pub(crate) icon_side: f32,
+    pub(super) icon_side: f32,
     /// Point size of `value`.
-    pub(crate) size: f32,
-    pub(crate) value_color: egui::Color32,
-    pub(crate) icon_color: egui::Color32,
+    pub(super) size: f32,
+    pub(super) value_color: egui::Color32,
+    pub(super) icon_color: egui::Color32,
     /// Icon before the value instead of after it. Every header pill —
     /// timer, DPS and damage alike — reads value-then-icon, matching the
     /// reference render's `02:39 ⏱ | 188.0M/s ☁ | 30.10B ♡`; only issue #49's
     /// per-row death counter reads icon-then-value (skull, then count).
-    pub(crate) icon_first: bool,
+    pub(super) icon_first: bool,
     /// Per-corner radius. Every pill is a full oval — all four corners at
     /// half the button row's height, never a flattened pair. The timer used
     /// to be a half-pill (`CornerRadius="0 13 13 0"`, welded to the panel's
     /// left border), which is the shape issue #91 fixed.
-    pub(crate) corner_radius: egui::CornerRadius,
+    pub(super) corner_radius: egui::CornerRadius,
     /// Fill behind the pill. The timer's (`TIMER_PILL_FILL`) is a shade
     /// lighter than the value pills' `PILL_FILL`.
-    pub(crate) fill: egui::Color32,
+    pub(super) fill: egui::Color32,
     /// Optional 1pt outline. No pill has one: the header's timer, DPS and
     /// damage ovals and the per-row counter are all fill-only. The timer
     /// carried the source's hairline `#2fff` border until issue #91 — ringed
@@ -118,14 +118,14 @@ pub(crate) struct StatPill<'a> {
     /// `TIMER_PILL_FILL` carries that distinction alone now. Kept as a field
     /// because the chrome is per-call-site and a stroked pill elsewhere
     /// stays a one-line change.
-    pub(crate) stroke: Option<egui::Stroke>,
+    pub(super) stroke: Option<egui::Stroke>,
 }
 
 impl<'a> StatPill<'a> {
     /// A header stat pill (DPS or total damage): bold value in a light
     /// white, accent icon trailing it — the two ovals right of the timer in
     /// the reference's stat row.
-    pub(crate) fn header(value: &'a str, icon: Option<egui::TextureId>) -> Self {
+    pub(super) fn header(value: &'a str, icon: Option<egui::TextureId>) -> Self {
         Self {
             value,
             icon,
@@ -159,7 +159,7 @@ impl<'a> StatPill<'a> {
     /// `HEADER_STAT_ROW_INSET_X` holds the whole row clear of the border so
     /// nothing crops it. Those two together are the fix; the chrome itself
     /// is the source's and stays.
-    pub(crate) fn timer(value: &'a str, icon: Option<egui::TextureId>) -> Self {
+    pub(super) fn timer(value: &'a str, icon: Option<egui::TextureId>) -> Self {
         Self {
             value,
             icon,
@@ -183,7 +183,7 @@ impl<'a> StatPill<'a> {
     /// than being fixed here, so the one place a column's color is declared
     /// stays `ColumnKind::spec` for the pill column too, exactly as it is
     /// for every text column.
-    pub(crate) fn counter(
+    pub(super) fn counter(
         value: &'a str,
         icon: Option<egui::TextureId>,
         value_color: egui::Color32,
@@ -218,7 +218,7 @@ pub(crate) const DEATH_COUNT_RGB: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
 /// `draw_header`'s button row, whose height `header_band_height` budgets as
 /// `BUTTON_ROW_HEIGHT`. A pill taller than that would silently grow the
 /// header band past the drag surface `draw_header` registered for it.
-pub(crate) fn pill_size(text_size: egui::Vec2, icon_side: f32, max_height: f32) -> egui::Vec2 {
+pub(super) fn pill_size(text_size: egui::Vec2, icon_side: f32, max_height: f32) -> egui::Vec2 {
     let width = 2.0 * PILL_PAD_X + text_size.x + PILL_ICON_GAP + icon_side;
     let height = (text_size.y + 2.0 * PILL_PAD_Y).min(max_height);
     egui::vec2(width, height)
@@ -228,7 +228,7 @@ pub(crate) fn pill_size(text_size: egui::Vec2, icon_side: f32, max_height: f32) 
 /// `Align2::LEFT_CENTER` anchor, and the icon's (square, vertically
 /// centered) box. Pure geometry so both orderings are unit-testable without
 /// a live `egui::Ui` — same reasoning as `icon_slots`.
-pub(crate) fn pill_content_layout(
+pub(super) fn pill_content_layout(
     rect: egui::Rect,
     text_size: egui::Vec2,
     icon_side: f32,
@@ -254,7 +254,7 @@ pub(crate) fn pill_content_layout(
 /// these are click targets — the reference's three *circular* buttons at the
 /// right of the same row are inert status toggles for features this app
 /// doesn't have; see `toggle_cluster`).
-pub(crate) fn stat_pill(ui: &mut egui::Ui, pill: StatPill<'_>) -> egui::Response {
+pub(super) fn stat_pill(ui: &mut egui::Ui, pill: StatPill<'_>) -> egui::Response {
     let text_size = pill_text_size(ui.painter(), &pill);
     let size = pill_size(text_size, pill.icon_side, ui.spacing().interact_size.y);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -270,7 +270,7 @@ pub(crate) fn stat_pill(ui: &mut egui::Ui, pill: StatPill<'_>) -> egui::Response
 /// `Painter` too — `draw_row`'s counter pill (issue #49) has no `Ui` of its
 /// own to allocate from, it paints into a row rect that was already
 /// allocated, at an x the column anchors dictate.
-pub(crate) fn pill_text_size(painter: &egui::Painter, pill: &StatPill<'_>) -> egui::Vec2 {
+pub(super) fn pill_text_size(painter: &egui::Painter, pill: &StatPill<'_>) -> egui::Vec2 {
     let mut size = painter
         .layout_no_wrap(pill.value.to_owned(), bold(pill.size), pill.value_color)
         .rect
@@ -290,7 +290,7 @@ pub(crate) fn pill_text_size(painter: &egui::Painter, pill: &StatPill<'_>) -> eg
 /// Paints a pill's fill, optional stroke, value and icon into `rect`. The
 /// layout half of `stat_pill`, with no `Ui` and therefore no allocation —
 /// see `pill_text_size` for why the two are separate.
-pub(crate) fn paint_stat_pill(
+pub(super) fn paint_stat_pill(
     painter: &egui::Painter,
     rect: egui::Rect,
     text_size: egui::Vec2,
@@ -317,7 +317,7 @@ pub(crate) fn paint_stat_pill(
 
 /// The whole of a texture, in normalized texture coordinates — the `uv`
 /// argument every full-texture `Painter::image` blit in this module passes.
-pub(crate) const UV_FULL: egui::Rect =
+pub(super) const UV_FULL: egui::Rect =
     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
 
 #[cfg(test)]

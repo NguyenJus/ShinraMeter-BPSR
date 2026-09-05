@@ -73,15 +73,27 @@ mod skill_window;
 mod status;
 mod table;
 
-pub(crate) use header::*;
-pub(crate) use history_view::*;
-pub(crate) use menu::*;
-pub(crate) use opacity::Opacity;
-pub(crate) use repaint::{RepaintInputs, repaint_policy};
-pub(crate) use settings::*;
-pub(crate) use skill_window::*;
-pub(crate) use status::*;
-pub(crate) use table::*;
+use header::*;
+use history_view::*;
+use menu::*;
+use opacity::Opacity;
+use repaint::{RepaintInputs, repaint_policy};
+use settings::*;
+use skill_window::*;
+use status::*;
+use table::*;
+
+// Explicit re-exports of the handful of `ui`-internal items genuinely used
+// outside `crate::ui` (issue #374) — everything else the child modules
+// expose is at most `pub(super)`, reachable only within `crate::ui` via `use
+// super::*`.
+//
+// These names are also pulled in by the globs above; the explicit
+// `pub(crate) use` shadows the glob binding, so removing a name here changes
+// what external callers see, not what `ui` sees.
+pub(crate) use header::{encounter_subtitle, encounter_title};
+pub(crate) use status::DEATH_COUNT_RGB;
+pub(crate) use table::{CRIT_PCT_RGB, LUCKY_PCT_RGB, STAT_TEXT_RGB, StatColumn};
 
 /// Boss/encounter title — the source's `FontSize="13" FontWeight="DemiBold"`.
 const FONT_SIZE_TITLE: f32 = 13.0;
@@ -585,15 +597,15 @@ pub struct OverlayApp {
 /// Every set here is `include_bytes!`-ed at compile time (issue #123), so
 /// `Icons::load` has nothing to resolve or warn about — it just decodes and
 /// uploads a texture for each set.
-pub(crate) struct Icons {
-    pub(crate) classes: ClassIcons,
-    pub(crate) toolbar: ToolbarIcons,
-    pub(crate) glyphs: GlyphIcons,
+struct Icons {
+    classes: ClassIcons,
+    toolbar: ToolbarIcons,
+    glyphs: GlyphIcons,
     // IMAGINE-TAKEDOWN: one of five sites — see
     // `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
-    pub(crate) imagines: ImagineIcons,
+    imagines: ImagineIcons,
     /// Per-skill row icons for the breakdown window (issue #192).
-    pub(crate) skills: SkillIcons,
+    skills: SkillIcons,
     /// Issues #121/#253: the one exception to this struct's doc comment —
     /// the user's own header background and row backdrop, read off disk at
     /// runtime rather than `include_bytes!`-ed, and therefore loaded lazily
@@ -610,7 +622,7 @@ pub(crate) struct Icons {
     /// every borrow taken in this module is released before the next —
     /// `custom_image_texture` in particular drops its guard before it
     /// paints — so the runtime check never actually fires.
-    pub(crate) custom: RefCell<CustomImages>,
+    custom: RefCell<CustomImages>,
 }
 
 impl Icons {
@@ -618,7 +630,7 @@ impl Icons {
     /// re-uploads every icon), but nothing does: this module's
     /// `get_or_insert_with` call site only ever calls this on `OverlayApp`'s
     /// first `ui()` frame.
-    pub(crate) fn load(ctx: &egui::Context) -> Self {
+    fn load(ctx: &egui::Context) -> Self {
         Self {
             classes: ClassIcons::load(ctx),
             toolbar: ToolbarIcons::load(ctx),
@@ -1212,7 +1224,7 @@ impl OverlayApp {
     /// take the typed value from here. Sites that only have `&Settings`
     /// (not `&OverlayApp`) call `Opacity::new(settings.opacity)` directly
     /// instead — this is not the sole call site of `Opacity::new`.
-    pub(crate) fn opacity(&self) -> Opacity {
+    fn opacity(&self) -> Opacity {
         Opacity::new(self.settings.opacity)
     }
 
@@ -2374,9 +2386,9 @@ fn is_plausible_size(size: egui::Vec2) -> bool {
 /// `tx_settings` would silently drop the change instead of writing it (see
 /// `draw_header_menu`). Also what keeps `draw_header` under clippy's
 /// too-many-arguments limit now that it takes a `WindowGesture` too.
-pub(crate) struct SettingsHandle<'a> {
-    pub(crate) settings: &'a mut Settings,
-    pub(crate) tx_settings: &'a Sender<Settings>,
+struct SettingsHandle<'a> {
+    settings: &'a mut Settings,
+    tx_settings: &'a Sender<Settings>,
 }
 
 /// Smallest inner size the overlay may be resized to, in points. Shared by
@@ -2413,7 +2425,7 @@ enum GestureKind {
 /// egui only ever drags one widget at a time — which also means there is
 /// exactly one owner of the reposition exemption.
 #[derive(Debug, Default)]
-pub struct WindowGesture {
+struct WindowGesture {
     active: Option<ActiveGesture>,
 }
 
@@ -2884,7 +2896,7 @@ fn draw_resize_handles(
 /// does not always land on the exact decimal `12.345`, so an
 /// integer-vs-integer comparison replaces what would otherwise be a
 /// binary-representation-dependent truncation.
-pub fn fmt_short(v: i64) -> String {
+pub(crate) fn fmt_short(v: i64) -> String {
     let sign = if v < 0 { "-" } else { "" };
     let av = v.unsigned_abs();
 
@@ -2932,7 +2944,7 @@ pub fn fmt_short(v: i64) -> String {
 /// (`the_stat_pills_fit_the_default_window_width`) is measured against the
 /// `120:00` worst case. `{:02}` only ever pads, never truncates, so those
 /// long durations are unaffected.
-pub fn fmt_duration(ms: u64) -> String {
+pub(crate) fn fmt_duration(ms: u64) -> String {
     let total_secs = ms / 1000;
     let mins = total_secs / 60;
     let secs = total_secs % 60;
@@ -2940,14 +2952,14 @@ pub fn fmt_duration(ms: u64) -> String {
 }
 
 /// Damage-share percentage as `12.3%`.
-pub fn fmt_share(share_pct: f32) -> String {
+pub(crate) fn fmt_share(share_pct: f32) -> String {
     format!("{share_pct:.1}%")
 }
 
 /// Crit/Lucky percentage as a whole number, `73%` (issue #80.2) — unlike
 /// `fmt_share`'s one decimal, the reference render
 /// (`docs/reference/new-shinra-ex.webp`) shows these two with none.
-pub fn fmt_pct0(pct: f32) -> String {
+pub(crate) fn fmt_pct0(pct: f32) -> String {
     format!("{pct:.0}%")
 }
 
@@ -4049,7 +4061,7 @@ mod tests {
     /// boss name (so `encounter_title` returns non-empty text) and a
     /// distinctive `total_damage` so the formatted figure is unambiguous in
     /// assertions below.
-    pub(crate) fn header_test_snapshot(total_damage: i64) -> Snapshot {
+    pub(super) fn header_test_snapshot(total_damage: i64) -> Snapshot {
         Snapshot {
             duration_ms: 90_000,
             total_damage,
@@ -4076,7 +4088,7 @@ mod tests {
     /// child shapes (e.g. `ui.horizontal`'s row) that way. `Galley`
     /// dereferences to `str` (`Deref<Target = str>`), so `galley.text()`
     /// hands back exactly the string that was laid out.
-    pub(crate) fn collect_text_shapes(shape: &egui::Shape, out: &mut Vec<String>) {
+    pub(super) fn collect_text_shapes(shape: &egui::Shape, out: &mut Vec<String>) {
         match shape {
             egui::Shape::Text(text_shape) => out.push(text_shape.galley.text().to_string()),
             egui::Shape::Vec(shapes) => {
@@ -4092,7 +4104,7 @@ mod tests {
     /// `(texture_id, tint)` — `Painter::image` bakes its `tint` directly
     /// into every vertex (`Mesh::add_rect_with_uv`), so a mesh's first
     /// vertex color is exactly the tint the blit was painted with.
-    pub(crate) fn collect_image_texture_tints(
+    pub(super) fn collect_image_texture_tints(
         shape: &egui::Shape,
         out: &mut Vec<(egui::TextureId, egui::Color32)>,
     ) {
@@ -4115,7 +4127,7 @@ mod tests {
     /// color — how `toggle_button`'s hover wash (`ui.painter().circle_
     /// filled(..., TOGGLE_HOVER_FILL)`) is found in issue #156's
     /// suppression tests, since it's the only circle either button paints.
-    pub(crate) fn collect_circle_fills(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+    pub(super) fn collect_circle_fills(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
         match shape {
             egui::Shape::Circle(circle) => out.push(circle.fill),
             egui::Shape::Vec(shapes) => {
@@ -4131,7 +4143,7 @@ mod tests {
     /// `(center, radius)` — like `collect_circle_fills` but keeping the
     /// geometry instead of the fill, for a caller that needs to check
     /// *where* and *how big* a circle painted, not just what color.
-    pub(crate) fn collect_circle_geometry(shape: &egui::Shape, out: &mut Vec<(egui::Pos2, f32)>) {
+    pub(super) fn collect_circle_geometry(shape: &egui::Shape, out: &mut Vec<(egui::Pos2, f32)>) {
         match shape {
             egui::Shape::Circle(circle) => out.push((circle.center, circle.radius)),
             egui::Shape::Vec(shapes) => {
@@ -4150,7 +4162,7 @@ mod tests {
     /// never reaches accesskit, so this reads the same ground truth for
     /// both painter-drawn and widget-drawn text instead of two different
     /// mechanisms.
-    pub(crate) fn header_rendered_texts(snapshot: &Snapshot) -> Vec<String> {
+    pub(super) fn header_rendered_texts(snapshot: &Snapshot) -> Vec<String> {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
@@ -4198,18 +4210,22 @@ mod tests {
     /// geometry away, and the pure-geometry pill tests only prove
     /// `pill_size` and `pill_content_layout` agree with *each other*, not
     /// that the paint agrees with them or that nothing else lands on top.
-    pub(crate) struct HeaderFrame {
-        pub(crate) texts: Vec<(String, egui::Rect)>,
-        pub(crate) images: Vec<(egui::TextureId, egui::Rect)>,
-        pub(crate) rects: Vec<(egui::Color32, egui::Rect)>,
-        pub(crate) glyphs: Vec<(GlyphIcon, egui::TextureId)>,
+    ///
+    /// Fields are intentionally private; tests go through this struct's
+    /// accessor methods (unlike `RowFrame::texts`, which tests index
+    /// directly for z-order).
+    pub(super) struct HeaderFrame {
+        texts: Vec<(String, egui::Rect)>,
+        images: Vec<(egui::TextureId, egui::Rect)>,
+        rects: Vec<(egui::Color32, egui::Rect)>,
+        glyphs: Vec<(GlyphIcon, egui::TextureId)>,
     }
 
     impl HeaderFrame {
         /// The union of every text shape painted for `value` — plural
         /// because the faux-bold pass paints the same string twice, and both
         /// passes together are what the eye sees.
-        pub(crate) fn text_box(&self, value: &str) -> egui::Rect {
+        pub(super) fn text_box(&self, value: &str) -> egui::Rect {
             self.texts
                 .iter()
                 .filter(|(painted, _)| painted == value)
@@ -4221,7 +4237,7 @@ mod tests {
         /// Every *visible* box `glyph` was blitted into — blits clipped away
         /// entirely are dropped, since an empty intersection is exactly what
         /// "this never reached the screen" looks like.
-        pub(crate) fn glyph_boxes(&self, glyph: GlyphIcon) -> Vec<egui::Rect> {
+        pub(super) fn glyph_boxes(&self, glyph: GlyphIcon) -> Vec<egui::Rect> {
             let id = self
                 .glyphs
                 .iter()
@@ -4240,7 +4256,7 @@ mod tests {
         /// the only near-panel-wide mesh in the band carrying no texture of
         /// its own (glyph blits all carry one; every other fill in the
         /// header is a `Shape::Rect`).
-        pub(crate) fn gradient_box(&self) -> egui::Rect {
+        pub(super) fn gradient_box(&self) -> egui::Rect {
             self.images
                 .iter()
                 .filter(|(id, rect)| *id == egui::TextureId::default() && rect.is_positive())
@@ -4254,7 +4270,7 @@ mod tests {
         /// `PILL_FILL` is the stat row's, which is what
         /// `a_missing_area_name_does_not_collapse_the_header_or_lift_the_stat_row`
         /// measures the row's position by.
-        pub(crate) fn fill_box(&self, fill: egui::Color32) -> egui::Rect {
+        pub(super) fn fill_box(&self, fill: egui::Color32) -> egui::Rect {
             self.rects
                 .iter()
                 .find(|(painted, _)| *painted == fill)
@@ -4267,11 +4283,7 @@ mod tests {
     /// filled rect in it, clipped to `clip` — the clip rect is half the
     /// geometry for anything painted through `Painter::with_clip_rect`, so
     /// ignoring it would measure boxes the screen never shows.
-    pub(crate) fn collect_painted_boxes(
-        shape: &egui::Shape,
-        clip: egui::Rect,
-        frame: &mut HeaderFrame,
-    ) {
+    fn collect_painted_boxes(shape: &egui::Shape, clip: egui::Rect, frame: &mut HeaderFrame) {
         match shape {
             egui::Shape::Text(text) => frame.texts.push((
                 text.galley.text().to_string(),
@@ -4294,7 +4306,7 @@ mod tests {
     /// back everything it painted. The size matters: the header's decoration
     /// is positioned off the panel's own edges, so the unbounded width a
     /// bare `RawInput` implies would put it where the app never paints it.
-    pub(crate) fn header_painted_boxes(snapshot: &Snapshot) -> HeaderFrame {
+    pub(super) fn header_painted_boxes(snapshot: &Snapshot) -> HeaderFrame {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
@@ -4405,14 +4417,14 @@ mod tests {
     /// `TITLE_LINE_HEIGHT` of whatever space the test's `Ui` has, which is
     /// exactly the rect `draw_title_line` allocates and hands over in the
     /// real call path.
-    pub(crate) fn test_title_row(ui: &egui::Ui) -> egui::Rect {
+    pub(super) fn test_title_row(ui: &egui::Ui) -> egui::Rect {
         egui::Rect::from_min_size(
             ui.available_rect_before_wrap().min,
             egui::vec2(ui.available_width(), TITLE_LINE_HEIGHT),
         )
     }
 
-    pub(crate) fn crop_test_image(width: usize, height: usize) -> std::sync::Arc<egui::ColorImage> {
+    pub(super) fn crop_test_image(width: usize, height: usize) -> std::sync::Arc<egui::ColorImage> {
         let pixels = (0..width * height)
             .map(|i| egui::Color32::from_gray((i % 256) as u8))
             .collect();
@@ -4478,7 +4490,7 @@ mod tests {
         }
     }
 
-    pub(crate) fn sample_row(ability_score: Option<u32>) -> PlayerRow {
+    pub(super) fn sample_row(ability_score: Option<u32>) -> PlayerRow {
         PlayerRow {
             uid: 1,
             entity: 1,
@@ -4508,7 +4520,7 @@ mod tests {
         }
     }
 
-    pub(crate) fn sample_season_row(season_strength: Option<u32>) -> PlayerRow {
+    fn sample_season_row(season_strength: Option<u32>) -> PlayerRow {
         PlayerRow {
             season_strength,
             ..sample_row(None)
@@ -4550,7 +4562,7 @@ mod tests {
     // -- name_suffix (issue #168): AbilityScore/SeasonStrength inline with
     // the name instead of their own stat column ---------------------------
 
-    pub(crate) fn sample_score_row(
+    pub(super) fn sample_score_row(
         ability_score: Option<u32>,
         season_strength: Option<u32>,
     ) -> PlayerRow {
@@ -4560,7 +4572,7 @@ mod tests {
         }
     }
 
-    pub(crate) fn window() -> egui::Rect {
+    pub(super) fn window() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(340.0, 220.0))
     }
 
@@ -4629,7 +4641,7 @@ mod tests {
 
     /// A stand-in central-panel rect for the wash geometry tests — wider and
     /// far taller than the wash itself, like the real panel.
-    pub(crate) fn wash_test_panel() -> egui::Rect {
+    pub(super) fn wash_test_panel() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(12.0, 30.0), egui::vec2(400.0, 300.0))
     }
 
@@ -4712,14 +4724,14 @@ mod tests {
     /// this the caller's to choose (`draw_header` derives it from
     /// `header_text_band_height`) rather than a fixed constant, so these
     /// tests exercise the geometry with an arbitrary value of their own.
-    pub(crate) const WASH_TEST_HEIGHT: f32 = 34.0;
+    pub(super) const WASH_TEST_HEIGHT: f32 = 34.0;
 
     // -- column_anchors (issue #8) --------------------------------------
 
     /// A stand-in three-column layout (same widths the old fixed
     /// `STAT_COLUMNS` array used) for tests that exercise `column_anchors`'
     /// pure math and don't care where the widths came from.
-    pub(crate) const TEST_COLUMNS: [StatColumn; 3] = [
+    pub(super) const TEST_COLUMNS: [StatColumn; 3] = [
         StatColumn {
             width: 56.0,
             text: |row| fmt_short(row.damage),
@@ -4751,13 +4763,13 @@ mod tests {
 
     // -- icon slot geometry (issue #9, issue #33) --------------------------
 
-    pub(crate) fn row_rect() -> egui::Rect {
+    pub(super) fn row_rect() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(10.0, 100.0), egui::vec2(300.0, ROW_HEIGHT))
     }
 
     // -- damage-share bar paints (issue #43) --------------------------------
 
-    pub(crate) fn share_bar_rect() -> egui::Rect {
+    pub(super) fn share_bar_rect() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(300.0, ROW_HEIGHT))
     }
 
@@ -4793,7 +4805,7 @@ mod tests {
 
     /// The window rect these gesture tests measure against — off-origin so
     /// an accidental `0.0` in the maths cannot pass by coincidence.
-    pub(crate) fn skill_window_rect() -> egui::Rect {
+    pub(super) fn skill_window_rect() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(120.0, 80.0), egui::vec2(880.0, 520.0))
     }
 
@@ -4801,7 +4813,7 @@ mod tests {
     /// shape whose galley text is exactly `name` — the same clip-aware
     /// extraction `collect_painted_boxes` does for the main header's tests,
     /// scoped down to just the one string this test cares about.
-    pub(crate) fn collect_name_text_boxes(
+    pub(super) fn collect_name_text_boxes(
         shape: &egui::Shape,
         clip: egui::Rect,
         name: &str,
@@ -4824,7 +4836,7 @@ mod tests {
     /// Every `Shape::Rect` a frame painted, flattened out of the `Vec`
     /// nesting -- `collect_row_boxes` deliberately keeps only text and
     /// meshes, and a scrollbar is neither.
-    pub(crate) fn painted_rects(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+    pub(super) fn painted_rects(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
         match shape {
             egui::Shape::Rect(rect) => out.push(rect.rect),
             egui::Shape::Vec(shapes) => {
@@ -4862,7 +4874,7 @@ mod tests {
     /// the comparison exact, and — since both expected colors are built
     /// from the one `expected_rgb` — directly proves "same RGB, alpha
     /// differs only by the fixed fill/accent split".
-    pub(crate) fn assert_bar_hue(class: Option<Class>, expected_rgb: (u8, u8, u8)) {
+    pub(super) fn assert_bar_hue(class: Option<Class>, expected_rgb: (u8, u8, u8)) {
         let paints = share_bar_paints(share_bar_rect(), 0.5, class);
         let (r, g, b) = expected_rgb;
         let expected_fill_bottom =
@@ -5044,7 +5056,7 @@ mod tests {
     /// `fill_rect` therefore equals the *full* row rect for every row — the
     /// only painted shape wide enough to use as each row's ground-truth
     /// rect in `RowFrame::row_rects`.
-    pub(crate) fn rows_test_snapshot(n: usize) -> Snapshot {
+    pub(super) fn rows_test_snapshot(n: usize) -> Snapshot {
         Snapshot {
             duration_ms: 90_000,
             total_damage: 1_000 * n as i64,
@@ -5069,21 +5081,21 @@ mod tests {
     /// list (issue #83's regression harness): meshes rather than filled
     /// rects, because `draw_row` paints the share bar and hover highlight
     /// as gradient meshes (`Shape::Mesh`), never a flat `Shape::Rect`.
-    pub(crate) struct RowFrame {
+    pub(super) struct RowFrame {
         /// In paint order, so a test can compare two texts' indices to pin
         /// z-order (egui paints shapes in call order) — that is how the
         /// inline name suffix is proven to paint *before* the stat-column
         /// loop. The `Color32` is the galley's own text color, which is
         /// what makes the suffix's dimming (`NAME_SUFFIX_ALPHA`) checkable
         /// from the painted output rather than from the call site.
-        pub(crate) texts: Vec<(String, egui::Rect, egui::Color32)>,
-        pub(crate) meshes: Vec<egui::Rect>,
+        pub(super) texts: Vec<(String, egui::Rect, egui::Color32)>,
+        meshes: Vec<egui::Rect>,
     }
 
     impl RowFrame {
         /// The union of every text shape painted for `value` (a player
         /// name here).
-        pub(crate) fn text_box(&self, value: &str) -> egui::Rect {
+        pub(super) fn text_box(&self, value: &str) -> egui::Rect {
             self.texts
                 .iter()
                 .filter(|(painted, ..)| painted == value)
@@ -5094,7 +5106,7 @@ mod tests {
 
         /// The index in paint order of the first text shape painted for
         /// `value`, plus the color it was painted in.
-        pub(crate) fn text_paint(&self, value: &str) -> (usize, egui::Color32) {
+        pub(super) fn text_paint(&self, value: &str) -> (usize, egui::Color32) {
             self.texts
                 .iter()
                 .enumerate()
@@ -5112,7 +5124,7 @@ mod tests {
         /// `IMAGINE_SIZE` — a filled slot's `Shape::Mesh` and an empty
         /// slot's `Shape::Circle` are both filtered out the same way.
         /// Sorted top-to-bottom so index `i` here really is row `i`.
-        pub(crate) fn row_rects(&self) -> Vec<egui::Rect> {
+        pub(super) fn row_rects(&self) -> Vec<egui::Rect> {
             let mut rects: Vec<egui::Rect> = self
                 .meshes
                 .iter()
@@ -5124,7 +5136,7 @@ mod tests {
         }
     }
 
-    pub(crate) fn collect_row_boxes(shape: &egui::Shape, clip: egui::Rect, frame: &mut RowFrame) {
+    fn collect_row_boxes(shape: &egui::Shape, clip: egui::Rect, frame: &mut RowFrame) {
         match shape {
             egui::Shape::Text(text) => frame.texts.push((
                 text.galley.text().to_string(),
@@ -5158,7 +5170,7 @@ mod tests {
     /// *inside* the `ScrollArea`'s own viewport clip, since
     /// `collect_row_boxes` intersects every shape with the clip rect it was
     /// actually painted under — exactly like `collect_painted_boxes` does.
-    pub(crate) fn rows_painted_boxes(snapshot: &Snapshot, width: f32, height: f32) -> RowFrame {
+    pub(super) fn rows_painted_boxes(snapshot: &Snapshot, width: f32, height: f32) -> RowFrame {
         rows_painted_boxes_with(snapshot, &Settings::default(), width, height)
     }
 
@@ -5166,7 +5178,7 @@ mod tests {
     /// needed by anything that has to render a non-default column set
     /// (issue #168's inline `AbilityScore`/`SeasonStrength`, which
     /// `Settings::default` does not enable).
-    pub(crate) fn rows_painted_boxes_with(
+    pub(super) fn rows_painted_boxes_with(
         snapshot: &Snapshot,
         settings: &Settings,
         width: f32,
@@ -5201,7 +5213,7 @@ mod tests {
     /// x `height` — the numeric half of the harness above, for tests that
     /// only care whether scrolling was needed (issue #84), not the painted
     /// geometry.
-    pub(crate) fn rows_content_size(snapshot: &Snapshot, width: f32, height: f32) -> egui::Vec2 {
+    pub(super) fn rows_content_size(snapshot: &Snapshot, width: f32, height: f32) -> egui::Vec2 {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
@@ -5275,7 +5287,7 @@ mod tests {
     /// once by the caller and shared with `track_window_size`, rather than
     /// each tracker re-reading `ctx.input` itself). Returns everything it
     /// sent on the settings-writer channel.
-    pub(crate) fn track_one_frame(
+    fn track_one_frame(
         settings: &mut Settings,
         outer_rect: Option<egui::Rect>,
         minimized: Option<bool>,
@@ -5286,7 +5298,7 @@ mod tests {
         rx.try_iter().collect()
     }
 
-    pub(crate) fn outer_rect_at(x: f32, y: f32) -> Option<egui::Rect> {
+    fn outer_rect_at(x: f32, y: f32) -> Option<egui::Rect> {
         Some(egui::Rect::from_min_size(
             egui::pos2(x, y),
             egui::vec2(340.0, 220.0),
@@ -5355,7 +5367,7 @@ mod tests {
     /// by the caller and shared with `track_window_position`, rather than
     /// each tracker re-reading `ctx.input` itself). Returns everything it
     /// sent on the settings-writer channel.
-    pub(crate) fn track_size_one_frame(
+    fn track_size_one_frame(
         settings: &mut Settings,
         inner_rect: Option<egui::Rect>,
         minimized: Option<bool>,
@@ -5366,7 +5378,7 @@ mod tests {
         rx.try_iter().collect()
     }
 
-    pub(crate) fn inner_rect_of(width: f32, height: f32) -> Option<egui::Rect> {
+    fn inner_rect_of(width: f32, height: f32) -> Option<egui::Rect> {
         Some(egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
             egui::vec2(width, height),
@@ -5529,7 +5541,7 @@ mod tests {
     /// accesskit_update`. `None`
     /// covers both "no accesskit update at all" and "a node exists but
     /// carries no label" — both mean a screen-reader user hears nothing.
-    pub(crate) fn accessible_label(
+    pub(super) fn accessible_label(
         update: &egui::accesskit::TreeUpdate,
         id: egui::Id,
     ) -> Option<String> {
@@ -5553,7 +5565,7 @@ mod tests {
     /// `Role::Label` node — puts its text instead; see egui's
     /// `Response::fill_widget_info`, which calls `set_value` rather than
     /// `set_label` specifically for `Role::Label`).
-    pub(crate) fn accessible_rect_for_label(
+    pub(super) fn accessible_rect_for_label(
         update: &egui::accesskit::TreeUpdate,
         label: &str,
     ) -> egui::Rect {
@@ -5587,7 +5599,7 @@ mod tests {
     /// its AccessKit `role`, which egui sets from `WidgetType::Slider` for
     /// every `Slider` regardless of whether it has a label
     /// (`Response::fill_accesskit_node_from_widget_info`).
-    pub(crate) fn accessible_rect_for_role(
+    pub(super) fn accessible_rect_for_role(
         update: &egui::accesskit::TreeUpdate,
         role: egui::accesskit::Role,
     ) -> egui::Rect {
@@ -5607,7 +5619,7 @@ mod tests {
     /// allocated at `pos` during the very frame this `RawInput` drives,
     /// since `Context::run_ui` folds `new_input` into `InputState` before
     /// the paint closure runs.
-    pub(crate) fn click_at(pos: egui::Pos2) -> egui::RawInput {
+    pub(super) fn click_at(pos: egui::Pos2) -> egui::RawInput {
         let modifiers = egui::Modifiers::NONE;
         egui::RawInput {
             events: vec![
@@ -5641,7 +5653,7 @@ mod tests {
     /// presses on one frame and releases several frames later; this
     /// reproduces the press half of that so the drag is live for the
     /// `run_ui` call it's passed to.
-    pub(crate) fn press_at(pos: egui::Pos2) -> egui::RawInput {
+    pub(super) fn press_at(pos: egui::Pos2) -> egui::RawInput {
         egui::RawInput {
             events: vec![
                 egui::Event::PointerMoved(pos),
@@ -5658,7 +5670,7 @@ mod tests {
 
     /// The release half of the gesture `press_at` starts — a separate frame,
     /// same reasoning as `press_at`'s doc comment.
-    pub(crate) fn release_at(pos: egui::Pos2) -> egui::RawInput {
+    pub(super) fn release_at(pos: egui::Pos2) -> egui::RawInput {
         egui::RawInput {
             events: vec![egui::Event::PointerButton {
                 pos,
@@ -5675,7 +5687,7 @@ mod tests {
     /// to that dropdown, and each of them is a line the user has to be able
     /// to read — asserting on the painted text is the only way to check
     /// that from a headless host.
-    pub(crate) fn header_menu_texts(state: UpdateCheckState) -> Vec<String> {
+    pub(super) fn header_menu_texts(state: UpdateCheckState) -> Vec<String> {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
@@ -5709,7 +5721,7 @@ mod tests {
         texts
     }
 
-    pub(crate) fn update_available(asset_url: Option<&str>) -> CheckOutcome {
+    pub(super) fn update_available(asset_url: Option<&str>) -> CheckOutcome {
         CheckOutcome::UpdateAvailable {
             tag: "v0.3.0".to_string(),
             url: "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/tag/v0.3.0".to_string(),
@@ -5721,7 +5733,7 @@ mod tests {
 
     /// A stand-in window rect, deliberately larger than `MIN_INNER_SIZE` on
     /// both axes and off the origin so a drift in either edge shows up.
-    pub(crate) fn window_rect() -> egui::Rect {
+    pub(super) fn window_rect() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(400.0, 300.0))
     }
 
@@ -5873,7 +5885,7 @@ mod tests {
     /// Walks a painted `Shape`, collecting every `Shape::Mesh`'s texture id
     /// — the counterpart to `collect_text_shapes`, for the one pill glyph
     /// that is blitted rather than stroked.
-    pub(crate) fn collect_image_textures(shape: &egui::Shape, out: &mut Vec<egui::TextureId>) {
+    fn collect_image_textures(shape: &egui::Shape, out: &mut Vec<egui::TextureId>) {
         match shape {
             egui::Shape::Mesh(mesh) => out.push(mesh.texture_id),
             egui::Shape::Vec(shapes) => {
@@ -5889,7 +5901,7 @@ mod tests {
     /// it blitted. Text shapes upload through the font atlas, so the pill's
     /// digits show up as the font texture — the assertions below compare
     /// against the specific skull texture rather than counting blits.
-    pub(crate) fn counter_pill_textures(icon: Option<egui::TextureId>) -> Vec<egui::TextureId> {
+    pub(super) fn counter_pill_textures(icon: Option<egui::TextureId>) -> Vec<egui::TextureId> {
         let ctx = egui::Context::default();
         let mut textures = Vec::new();
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -5909,7 +5921,7 @@ mod tests {
 
     // --- the chevron itself (issue #54) ----------------------------------
 
-    pub(crate) fn title_row() -> egui::Rect {
+    pub(super) fn title_row() -> egui::Rect {
         egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
             egui::vec2(default_inner_width(), TITLE_LINE_HEIGHT),
@@ -5920,7 +5932,7 @@ mod tests {
 
     /// The cluster rect the header allocates for `toggle_cluster`, at a
     /// round origin so the expected bounds below are readable.
-    pub(crate) fn toggle_cluster_rect() -> egui::Rect {
+    pub(super) fn toggle_cluster_rect() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(100.0, 10.0), egui::vec2(80.0, 20.0))
     }
 
@@ -5929,10 +5941,7 @@ mod tests {
     /// A single click (move, press, release, all in one frame) at `pos`
     /// with `button` — `click_at`'s shape, generalized to any button, so a
     /// right-click gesture can be synthesized the same way.
-    pub(crate) fn click_at_with_button(
-        pos: egui::Pos2,
-        button: egui::PointerButton,
-    ) -> egui::RawInput {
+    fn click_at_with_button(pos: egui::Pos2, button: egui::PointerButton) -> egui::RawInput {
         let modifiers = egui::Modifiers::NONE;
         egui::RawInput {
             events: vec![
@@ -5965,10 +5974,7 @@ mod tests {
     /// `draw_rows` reported opened this time — the seam `draw_row`'s
     /// widened `Sense::click()` plus its `secondary_clicked()` gate feed
     /// (issue #16, D1).
-    pub(crate) fn opened_uid_after_click(
-        snapshot: &Snapshot,
-        button: egui::PointerButton,
-    ) -> Option<i64> {
+    fn opened_uid_after_click(snapshot: &Snapshot, button: egui::PointerButton) -> Option<i64> {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
@@ -6026,7 +6032,7 @@ mod tests {
     /// Same two-frame click harness as `opened_uid_after_click`, but through
     /// `draw_history`'s open-encounter branch (issue #216) — the seam that
     /// used to swallow every right-click behind a hardcoded `&mut None`.
-    pub(crate) fn opened_uid_after_history_click(
+    pub(super) fn opened_uid_after_history_click(
         open: OpenEncounter,
         button: egui::PointerButton,
     ) -> Option<i64> {
@@ -6095,7 +6101,7 @@ mod tests {
         opened
     }
 
-    pub(crate) fn skill_window_state(pos: egui::Pos2) -> SkillWindowState {
+    pub(super) fn skill_window_state(pos: egui::Pos2) -> SkillWindowState {
         SkillWindowState {
             tabs: SkillTabs::default(),
             pos,
@@ -6105,14 +6111,14 @@ mod tests {
         }
     }
 
-    pub(crate) fn skill_inner_rect_of(size: egui::Vec2) -> Option<egui::Rect> {
+    pub(super) fn skill_inner_rect_of(size: egui::Vec2) -> Option<egui::Rect> {
         Some(egui::Rect::from_min_size(egui::pos2(1.0, 1.0), size))
     }
 
     /// One row per fight for the same uid, told apart by `damage` — the
     /// whole point of issue #216's per-window source is that a uid present
     /// in both fights resolves to the right one.
-    pub(crate) fn skill_source_row(uid: i64, damage: i64) -> PlayerRow {
+    pub(super) fn skill_source_row(uid: i64, damage: i64) -> PlayerRow {
         PlayerRow {
             uid,
             damage,
@@ -6120,7 +6126,7 @@ mod tests {
         }
     }
 
-    pub(crate) fn sample_skill_row(skill_id: i32) -> SkillRow {
+    pub(super) fn sample_skill_row(skill_id: i32) -> SkillRow {
         SkillRow {
             skill_id,
             damage: 1_000,
@@ -6145,7 +6151,7 @@ mod tests {
     /// ids line up) sends a synthesized left click there and returns
     /// whatever this run reports the `X` glyph did, leaving `sort` mutated
     /// in place for the caller to inspect.
-    pub(crate) fn click_skill_window_at(
+    pub(super) fn click_skill_window_at(
         row: &PlayerRow,
         tabs: &mut SkillTabs,
         value: &str,
@@ -6156,7 +6162,7 @@ mod tests {
     /// The same two-frame harness, aimed by an arbitrary `locate` instead of
     /// by a painted string — the close button paints no text at all since
     /// issue #218 turned its `\u{2715}` into two line segments.
-    pub(crate) fn click_skill_window(
+    pub(super) fn click_skill_window(
         row: &PlayerRow,
         tabs: &mut SkillTabs,
         locate: impl FnOnce(&RowFrame) -> egui::Pos2,
@@ -6220,7 +6226,7 @@ mod tests {
     /// Builds a throwaway `OverlayApp` for the history-view tests below —
     /// none of them exercise capture/settings/command plumbing, so every
     /// channel is a fresh, otherwise-unused pair.
-    pub(crate) fn history_test_app() -> OverlayApp {
+    pub(super) fn history_test_app() -> OverlayApp {
         let (_tx_snapshot, rx_snapshot) = crossbeam_channel::unbounded();
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
@@ -6233,7 +6239,7 @@ mod tests {
         )
     }
 
-    pub(crate) fn history_test_record(title: &str) -> history::EncounterRecord {
+    pub(super) fn history_test_record(title: &str) -> history::EncounterRecord {
         history::EncounterRecord {
             ended_at_ms: 2_000,
             duration_ms: 5_000,
