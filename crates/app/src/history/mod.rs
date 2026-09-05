@@ -357,6 +357,13 @@ impl EncounterRecord {
             // A rebuilt-from-history snapshot has no live capture thread to
             // ask; it renders through the same live table path regardless,
             // and is never checked for this (see `Snapshot::capture_alive`).
+            // Separately, the local player's uid is not persisted in
+            // history.sqlite at all — the current schema (SCHEMA_VERSION =
+            // 2) has no column for it, so a rebuilt snapshot can never
+            // identify "you" even if it wanted to. Persisting it needs a
+            // schema bump plus a sanitizer remap (#353); tracked as a
+            // follow-up in #373.
+            local_uid: None,
             capture_alive: true,
         }
     }
@@ -446,6 +453,7 @@ mod tests {
                 scene_boss_name: Some("Test Boss"),
                 multi_boss_scene: false,
             },
+            local_uid: None,
             capture_alive: true,
         }
     }

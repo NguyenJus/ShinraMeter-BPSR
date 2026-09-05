@@ -441,8 +441,9 @@ impl SkillIcons {
     /// in normal operation, not just a decode failure:
     /// `bpsr_meter::tables::skill_icon` names every icon BPSR-ZDPS
     /// references, while `SKILL_ICON_BYTES` carries only the subset whose
-    /// art is committed under `assets/skills/`, and a skill id the table
-    /// does not know yields no basename at all. Every one of those cases
+    /// art is committed under `assets/skills/` (or aliased to a committed
+    /// file), and a skill id the table does not know yields no basename at
+    /// all. Every one of those cases
     /// lands on the caller's blank-placeholder branch — never a panic.
     pub fn get(&self, icon: &'static str) -> Option<&egui::TextureHandle> {
         self.0.get(icon)

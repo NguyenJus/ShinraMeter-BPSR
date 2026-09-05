@@ -1153,6 +1153,7 @@ fn demo_snapshot() -> Snapshot {
             scene_boss_name: None,
             multi_boss_scene: false,
         },
+        local_uid: None,
         capture_alive: true,
     }
 }
@@ -1174,6 +1175,7 @@ fn initial_snapshot(demo_mode: bool) -> Snapshot {
             total_dps: 0.0,
             rows: Vec::new(),
             encounter: EncounterInfo::default(),
+            local_uid: None,
             capture_alive: true,
         }
     }
@@ -3969,6 +3971,7 @@ mod tests {
                 scene_boss_name: None,
                 multi_boss_scene: false,
             },
+            local_uid: None,
             capture_alive: true,
         }
     }
@@ -4953,6 +4956,7 @@ mod tests {
                 })
                 .collect(),
             encounter: EncounterInfo::default(),
+            local_uid: None,
             capture_alive: true,
         }
     }

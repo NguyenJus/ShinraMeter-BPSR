@@ -316,6 +316,17 @@ pub enum ProtocolEvent {
         removes_layer: bool,
         timestamp_ms: u64,
     },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::LocalPlayer` (issue #344):
+    /// the local player's own uid, decoded from
+    /// `SyncContainerData.v_data.char_id`. Session-scoped like
+    /// `dungeon_state`/`objectives`: survives both `Meter::reset` and
+    /// `ServerChanged`, since `char_id` is the persistent character id
+    /// (not a per-session entity uuid) and stays valid across a server
+    /// change. A later `LocalPlayer` event simply overwrites the stored
+    /// value. Never cleared. See `Snapshot::local_uid`.
+    LocalPlayer {
+        uid: i64,
+    },
 }
 
 #[cfg(test)]

@@ -2090,6 +2090,7 @@ mod tests {
             total_dps: row.dps,
             rows: vec![row.clone()],
             encounter: EncounterInfo::default(),
+            local_uid: None,
             capture_alive: true,
         };
 
