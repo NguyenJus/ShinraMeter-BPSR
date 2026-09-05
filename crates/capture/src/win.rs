@@ -28,7 +28,7 @@ use crossbeam_channel::Sender;
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use windows::Win32::Foundation::HANDLE;
 
-use crate::backoff::{next_game_pid_lookup_interval, recv_error_backoff, should_refresh_game_pids};
+use crate::backoff::{next_game_pids, recv_error_backoff, should_refresh_game_pids};
 use crate::detect::{Conn, ServerDetector, decide_packet};
 use crate::driver::{Api, WinDivertAddress};
 use crate::error::CaptureError;
@@ -57,14 +57,22 @@ const MAX_RECV_ERROR_BACKOFF: Duration = Duration::from_millis(500);
 /// `owner::find_game_pids` while it has not yet found any game pid (e.g.
 /// capture started before the game process did). Each miss doubles the wait
 /// up to [`MAX_GAME_PID_LOOKUP_INTERVAL`] (see
-/// [`next_game_pid_lookup_interval`]), so a session where the game never
-/// runs — or has already exited — stops paying for a whole-system Toolhelp
-/// snapshot every couple of seconds forever, while a game that starts
-/// moments after capture is still picked up promptly. Once found, the pids
-/// are cached until the tracked connection tears down or a restart is
-/// requested — both of which clear them *and* reset this interval, so a
-/// game relaunch (new pid) re-resolves quickly instead of filtering every
-/// candidate against pids that no longer own anything.
+/// [`crate::backoff::next_game_pid_lookup_interval`]), so a session where
+/// the game never runs — or has already exited — stops paying for a
+/// whole-system Toolhelp snapshot every couple of seconds forever, while a
+/// game that starts moments after capture is still picked up promptly.
+/// Once found, the pids keep being re-resolved, but on the coarser, fixed
+/// [`MAX_GAME_PID_LOOKUP_INTERVAL`] cadence rather than this backed-off one
+/// (O7's `should_refresh_game_pids`), so a relaunch (new pid) is eventually
+/// picked up without a restart. A lookup while non-empty pids are cached
+/// that comes back empty is treated as a transient failure, not "the game
+/// exited": [`crate::backoff::next_game_pids`] keeps the previous, known-good
+/// set rather than clobbering it, since the real lookup
+/// (`CreateToolhelp32Snapshot` failing) has no way to distinguish the two.
+/// A restart, or any lookup that *does* come back non-empty, resets this
+/// interval back to [`GAME_PID_LOOKUP_INITIAL_INTERVAL`] so a later, genuine
+/// loss of the game's pid is re-checked promptly instead of at whatever
+/// value a long-past initial search had backed off to.
 const GAME_PID_LOOKUP_INITIAL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_GAME_PID_LOOKUP_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -364,10 +372,13 @@ fn recv_loop(
     // Issue #337: process-ownership filter for candidate streams.
     // `game_pids` starts empty and is (re)resolved on a backing-off schedule
     // (`GAME_PID_LOOKUP_INITIAL_INTERVAL`, doubling to
-    // `MAX_GAME_PID_LOOKUP_INTERVAL`) until non-empty;
-    // `owner_allows_adoption` (in `crate::detect`) fails open on an empty
-    // set, so capture behaves exactly as it did before #337 until the game's
-    // pid(s) are located.
+    // `MAX_GAME_PID_LOOKUP_INTERVAL`) while empty; once non-empty, lookups
+    // continue on the fixed `MAX_GAME_PID_LOOKUP_INTERVAL` cadence instead,
+    // and an empty result from one of those keeps the previous, known-good
+    // set rather than clobbering it (O7 — a transient Toolhelp failure is
+    // indistinguishable from "no match"). `owner_allows_adoption` (in
+    // `crate::detect`) fails open on an empty set, so capture behaves
+    // exactly as it did before #337 until the game's pid(s) are located.
     let owner_lookup = SystemOwnerLookup::new();
     let mut game_pids: Vec<u32> = Vec::new();
     let mut last_game_pid_lookup: Option<Instant> = None;
@@ -469,13 +480,15 @@ fn recv_loop(
             MAX_GAME_PID_LOOKUP_INTERVAL,
         ) {
             last_game_pid_lookup = Some(now);
-            game_pids = owner::find_game_pids();
-            if game_pids.is_empty() {
-                game_pid_lookup_interval = next_game_pid_lookup_interval(
-                    game_pid_lookup_interval,
-                    MAX_GAME_PID_LOOKUP_INTERVAL,
-                );
-            }
+            let (next_pids, next_interval) = next_game_pids(
+                std::mem::take(&mut game_pids),
+                owner::find_game_pids(),
+                game_pid_lookup_interval,
+                GAME_PID_LOOKUP_INITIAL_INTERVAL,
+                MAX_GAME_PID_LOOKUP_INTERVAL,
+            );
+            game_pids = next_pids;
+            game_pid_lookup_interval = next_interval;
         }
 
         let Ok(sliced) = SlicedPacket::from_ip(packet) else {

@@ -418,7 +418,10 @@ impl ServerDetector {
     /// the subnet-candidate insertion that return implies), so a candidate
     /// `allow` rejects never consumes a `subnet_candidates` slot -- the same
     /// property the ownership-first ordering in `decide_packet` existed to
-    /// preserve.
+    /// preserve. The size-cap diagnostic below (issue #258) is gated behind
+    /// `allow` the same way, even though it never returns `true` itself: an
+    /// `allow`-rejected oversized candidate is not evidence the size cap is
+    /// wrong, so it must not consume a `size_capped_candidates` slot either.
     pub fn detects_with(
         &mut self,
         conn: &Conn,
@@ -453,6 +456,7 @@ impl ServerDetector {
             // evidence the cap itself is wrong.
             if subnet_adoption_rejected_only_by_size(conn, payload, prefix)
                 && self.size_capped_candidates.len() < Self::MAX_SUBNET_CONNECTIONS
+                && allow()
                 && self.size_capped_candidates.insert(*conn)
             {
                 log::debug!(
@@ -1551,6 +1555,24 @@ mod tests {
         assert!(!d.detects(&candidate, &big_payload, false));
         assert_eq!(d.size_capped_candidates.len(), 1);
         assert!(!d.detects(&candidate, &big_payload, false));
+        assert_eq!(d.size_capped_candidates.len(), 1);
+    }
+
+    /// O5: an oversized subnet-reconnect candidate that `allow` (the
+    /// ownership gate) would reject is not evidence the size cap itself is
+    /// wrong -- it must not consume a `size_capped_candidates` diagnostic
+    /// slot at all.
+    #[test]
+    fn size_capped_rejection_is_gated_behind_allow() {
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        let big_payload = vec![0u8; SUBNET_ADOPTION_MAX_PAYLOAD + 1];
+        let candidate = server_to_client([203, 0, 113, 200], 5001);
+
+        assert!(!d.detects_with(&candidate, &big_payload, false, &|| false));
+        assert_eq!(d.size_capped_candidates.len(), 0);
+
+        // The same connection, now allowed, still gets logged/counted.
+        assert!(!d.detects_with(&candidate, &big_payload, false, &|| true));
         assert_eq!(d.size_capped_candidates.len(), 1);
     }
 

@@ -56,6 +56,46 @@ pub fn should_refresh_game_pids(
     elapsed >= threshold
 }
 
+/// Decides what [`crate::win`]'s capture loop should cache as `game_pids`
+/// (and what lookup interval to use next) after running one
+/// `owner::find_game_pids()` lookup, given the `previous` cached set.
+///
+/// `owner::find_game_pids()` can return an empty `Vec` for two very
+/// different reasons: the game genuinely isn't running yet/anymore, or a
+/// transient `Toolhelp` snapshot failure (`CreateToolhelp32Snapshot`
+/// returning `INVALID_HANDLE_VALUE`) — which the real implementation
+/// reports the same way, as an empty `Vec`, since it has no side channel to
+/// distinguish "no match" from "couldn't ask". Overwriting a known-good,
+/// non-empty `previous` set with that empty result makes the ownership
+/// filter fail open on every candidate until the next successful lookup,
+/// exactly the gap #337 introduced this filter to close. So: a non-empty
+/// `lookup_result` always wins and resets the interval to
+/// `initial_interval` (the loop no longer needs to back off once it has
+/// found something, and a later empty result — the game actually exiting —
+/// should be re-checked promptly rather than at whatever backed-off
+/// interval a long-past initial search settled on); an empty
+/// `lookup_result` keeps `previous` as-is (and its interval) when `previous`
+/// was non-empty, or backs the interval off further when `previous` was
+/// already empty too.
+pub fn next_game_pids(
+    previous: Vec<u32>,
+    lookup_result: Vec<u32>,
+    current_interval: Duration,
+    initial_interval: Duration,
+    cap: Duration,
+) -> (Vec<u32>, Duration) {
+    if !lookup_result.is_empty() {
+        (lookup_result, initial_interval)
+    } else if !previous.is_empty() {
+        (previous, current_interval)
+    } else {
+        (
+            Vec::new(),
+            next_game_pid_lookup_interval(current_interval, cap),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +212,40 @@ mod tests {
             LOOKUP_INITIAL,
             LOOKUP_CAP,
         ));
+    }
+
+    #[test]
+    fn next_game_pids_adopts_a_non_empty_lookup_and_resets_the_interval() {
+        assert_eq!(
+            next_game_pids(vec![], vec![42], LOOKUP_CAP, LOOKUP_INITIAL, LOOKUP_CAP),
+            (vec![42], LOOKUP_INITIAL)
+        );
+        // A relaunch (new pid) also wins over a stale previous set.
+        assert_eq!(
+            next_game_pids(vec![7], vec![42], LOOKUP_CAP, LOOKUP_INITIAL, LOOKUP_CAP),
+            (vec![42], LOOKUP_INITIAL)
+        );
+    }
+
+    /// #337 follow-up (O7): a transient `Toolhelp` failure returns an empty
+    /// `Vec` indistinguishable from "no match" — it must not clobber a
+    /// known-good, non-empty `previous` set.
+    #[test]
+    fn next_game_pids_keeps_a_known_good_set_on_an_empty_lookup() {
+        assert_eq!(
+            next_game_pids(vec![7], vec![], LOOKUP_CAP, LOOKUP_INITIAL, LOOKUP_CAP),
+            (vec![7], LOOKUP_CAP)
+        );
+    }
+
+    #[test]
+    fn next_game_pids_backs_off_further_when_still_nothing_found() {
+        assert_eq!(
+            next_game_pids(vec![], vec![], LOOKUP_INITIAL, LOOKUP_INITIAL, LOOKUP_CAP),
+            (
+                vec![],
+                next_game_pid_lookup_interval(LOOKUP_INITIAL, LOOKUP_CAP)
+            )
+        );
     }
 }
