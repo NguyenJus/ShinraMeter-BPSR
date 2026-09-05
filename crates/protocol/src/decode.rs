@@ -510,6 +510,21 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
     }));
 }
 
+/// `WorldNtf.NotifyReviveUser` (issue #272/#339): emits `ProtocolEvent::
+/// Revive` for the actor the notify names. See `pb::NotifyReviveUser`'s
+/// doc comment for the wire sourcing. `v_actor_uuid` missing entirely
+/// drops the packet — there is no uid to key a revive on — matching this
+/// module's non-panicking, nothing-to-report-is-not-an-error convention.
+fn on_notify_revive_user(msg: &pb::NotifyReviveUser, now_ms: u64, out: &mut Vec<ProtocolEvent>) {
+    let Some(actor_uuid) = msg.v_actor_uuid else {
+        return;
+    };
+    out.push(ProtocolEvent::Revive {
+        uid: uid_of(actor_uuid),
+        timestamp_ms: now_ms,
+    });
+}
+
 /// `GrpcTeamNtf.NotifyJoinTeam` (`team_opcode::NOTIFY_JOIN_TEAM`, issue
 /// #146): the bulk party-roster push, emitting one `ProtocolEvent::Player`
 /// per roster member so party members' names/classes/ability scores arrive
@@ -527,21 +542,6 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
 /// `TeamBasicData.level` is decoded onto the pb struct (see its doc
 /// comment) but deliberately never read here: `PlayerInfo` has no `level`
 /// field and nothing downstream consumes one (issue #146 spec decision 3).
-/// `WorldNtf.NotifyReviveUser` (issue #272/#339): emits `ProtocolEvent::
-/// Revive` for the actor the notify names. See `pb::NotifyReviveUser`'s
-/// doc comment for the wire sourcing. `v_actor_uuid` missing entirely
-/// drops the packet — there is no uid to key a revive on — matching this
-/// module's non-panicking, nothing-to-report-is-not-an-error convention.
-fn on_notify_revive_user(msg: &pb::NotifyReviveUser, now_ms: u64, out: &mut Vec<ProtocolEvent>) {
-    let Some(actor_uuid) = msg.v_actor_uuid else {
-        return;
-    };
-    out.push(ProtocolEvent::Revive {
-        uid: uid_of(actor_uuid),
-        timestamp_ms: now_ms,
-    });
-}
-
 fn on_notify_join_team(msg: &pb::NotifyJoinTeam, out: &mut Vec<ProtocolEvent>) {
     let Some(request) = &msg.v_request else {
         return;

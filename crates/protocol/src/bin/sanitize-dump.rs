@@ -119,7 +119,7 @@ mod sanitize {
     /// every other attr id is dropped by `scrub_attrs`, unconditionally.
     /// This is what keeps self-check 2 (no residual strings) trivially true:
     /// none of these carry text except `NAME`, which is always overwritten.
-    const KEEP_ATTRS: [i32; 10] = [
+    const KEEP_ATTRS: [i32; 11] = [
         0x01,   // NAME
         0x0A,   // MONSTER_ID
         0x2C2E, // HP
@@ -130,6 +130,7 @@ mod sanitize {
         0x2CB0, // SEASON_STRENGTH
         0x74,   // SKILL_LEVEL_ID_LIST
         0x155,  // SCENE_BASIC_ID
+        0x0B,   // STATE (issue #339: death/revive state)
     ];
 
     pub fn scrub_attrs(ac: &mut pb::AttrCollection, r: &mut Remap, owner_uuid: i64) {
@@ -234,11 +235,21 @@ mod sanitize {
                 let m = pb::SyncDungeonDirtyData::decode(payload).ok()?;
                 Some(m.encode_to_vec())
             }
+            opcode::NOTIFY_REVIVE_USER => {
+                // `v_actor_uuid` is a standard packed uuid (see
+                // `pb::NotifyReviveUser`'s doc comment), so it goes through
+                // the same `uuid()` rule as every other entity uuid.
+                let mut m = pb::NotifyReviveUser::decode(payload).ok()?;
+                if let Some(uuid) = m.v_actor_uuid {
+                    m.v_actor_uuid = Some(r.uuid(uuid));
+                }
+                Some(m.encode_to_vec())
+            }
             _ => None,
         }
     }
 
-    /// The seven opcodes `pb.rs` models. Every other opcode is dropped
+    /// The eight opcodes `pb.rs` models. Every other opcode is dropped
     /// entirely by the caller before it ever reaches [`sanitize`].
     pub fn is_modeled(method_id: u32) -> bool {
         matches!(
@@ -250,6 +261,7 @@ mod sanitize {
                 | opcode::ENTER_SCENE
                 | opcode::SYNC_DUNGEON_DATA
                 | opcode::SYNC_DUNGEON_DIRTY_DATA
+                | opcode::NOTIFY_REVIVE_USER
         )
     }
 
@@ -349,17 +361,27 @@ mod sanitize {
                         raw_data: vec![1, 2, 3],
                     },
                     pb::Attr {
+                        id: bpsr_protocol::attrs::attr_id::STATE,
+                        raw_data: vec![9],
+                    },
+                    pb::Attr {
                         id: 0x9999, // not in KEEP_ATTRS
                         raw_data: b"unmodeled".to_vec(),
                     },
                 ],
             };
             scrub_attrs(&mut ac, &mut r, PLAYER_UUID);
-            assert_eq!(ac.attrs.len(), 2, "the unlisted attr id must be dropped");
+            assert_eq!(ac.attrs.len(), 3, "the unlisted attr id must be dropped");
             assert!(
                 ac.attrs
                     .iter()
                     .any(|a| a.id == bpsr_protocol::attrs::attr_id::HP)
+            );
+            assert!(
+                ac.attrs
+                    .iter()
+                    .any(|a| a.id == bpsr_protocol::attrs::attr_id::STATE),
+                "STATE (issue #339) must survive scrub_attrs"
             );
             let name_attr = ac
                 .attrs
@@ -374,7 +396,7 @@ mod sanitize {
         }
 
         #[test]
-        fn is_modeled_accepts_exactly_the_seven_known_opcodes() {
+        fn is_modeled_accepts_exactly_the_eight_known_opcodes() {
             assert!(is_modeled(opcode::SYNC_NEAR_ENTITIES));
             assert!(is_modeled(opcode::SYNC_CONTAINER_DATA));
             assert!(is_modeled(opcode::SYNC_NEAR_DELTA_INFO));
@@ -385,6 +407,10 @@ mod sanitize {
             // comment on these two arms).
             assert!(is_modeled(opcode::SYNC_DUNGEON_DATA));
             assert!(is_modeled(opcode::SYNC_DUNGEON_DIRTY_DATA));
+            // issue #339: NotifyReviveUser carries only a packed uuid,
+            // remapped by `sanitize`'s NOTIFY_REVIVE_USER arm like any
+            // other entity uuid.
+            assert!(is_modeled(opcode::NOTIFY_REVIVE_USER));
             assert!(!is_modeled(0x1234));
         }
 
