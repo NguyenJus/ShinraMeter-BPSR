@@ -10,6 +10,7 @@
 //! thread's timestamp. [`now_ms`] is this crate's only `SystemTime` call site.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,8 +23,54 @@ use crate::history::{self, writer::HistoryHandle};
 use crate::imagines;
 use crate::ui::{UiCommand, encounter_subtitle, encounter_title};
 
-/// Snapshot publication rate (~10 Hz), matching the overlay's repaint cadence.
+/// Snapshot publication rate (~10 Hz) — a ceiling on how often `publish`
+/// re-evaluates the meter, not the overlay's repaint cadence: issue #349
+/// made the overlay wake on its own (via [`RepaintHandle`]) the moment a
+/// *changed* snapshot lands, rather than polling this channel on a fixed
+/// clock.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// A handle `publish` can use to wake the overlay's egui event loop the
+/// moment a changed snapshot is ready, instead of relying on the UI thread
+/// to notice on its own next scheduled repaint (issue #349's root cause:
+/// nothing on the pipeline side ever called `request_repaint`, so the
+/// overlay only picked up a fresh snapshot once a second via the idle
+/// heartbeat).
+///
+/// Backed by an `Arc<OnceLock<egui::Context>>` rather than a plain
+/// `egui::Context` because the pipeline thread is spawned (and needs a
+/// handle to close over) before `eframe::run_native`'s window-creation
+/// closure has run and produced the real `Context` — the `OnceLock` is
+/// filled in from that closure once it does. Every clone shares the same
+/// cell, so filling it anywhere makes every existing handle live.
+#[derive(Clone, Default)]
+pub struct RepaintHandle(Arc<OnceLock<egui::Context>>);
+
+impl RepaintHandle {
+    /// A handle with no `egui::Context` behind it yet — used by
+    /// `main.rs` before the window exists, and by tests that never create
+    /// one at all.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fills the handle with the real context, once `eframe::run_native`'s
+    /// creator closure has one. A no-op (via `OnceLock::set`'s `Err`) if
+    /// called twice; the pipeline thread only ever reads through `wake`, so
+    /// a second call finding the cell already full is harmless.
+    pub fn install(&self, ctx: egui::Context) {
+        let _ = self.0.set(ctx);
+    }
+
+    /// Asks egui to repaint immediately, if a `Context` has been installed.
+    /// Silently does nothing before `install` runs (early snapshots, or the
+    /// window failed to open) and in tests that never install one.
+    fn wake(&self) {
+        if let Some(ctx) = self.0.get() {
+            ctx.request_repaint();
+        }
+    }
+}
 
 /// Wall-clock milliseconds since the Unix epoch — the single `SystemTime` call
 /// site in the app.
@@ -597,6 +644,13 @@ pub fn spawn(
     // channel, so it is where `UiCommand::RestartCapture` has to land — the
     // `CaptureHandle` itself is pinned to `main`'s thread.
     capture_restart: Option<CaptureRestart>,
+    // Issue #349: wakes the overlay's event loop the moment a changed
+    // snapshot is published, rather than leaving it to notice on its own
+    // next scheduled repaint. `main.rs` creates this before spawning (the
+    // real `egui::Context` does not exist yet) and installs the context
+    // once `eframe::run_native`'s creator closure runs; tests pass a fresh,
+    // never-installed handle, in which case `publish`'s wake is a no-op.
+    repaint: RepaintHandle,
 ) -> (Receiver<meter::Snapshot>, JoinHandle<()>) {
     let (tx_snapshot, rx_snapshot) = bounded::<meter::Snapshot>(1);
     let stale = rx_snapshot.clone();
@@ -612,6 +666,7 @@ pub fn spawn(
                 names_cache_path,
                 history,
                 capture_restart,
+                repaint,
             )
         })
         .expect("failed to spawn the pipeline thread");
@@ -679,6 +734,11 @@ fn drain_for_quit(
     false
 }
 
+// The pipeline thread's body: one private, single-call-site function whose
+// arguments are simply the eight channel/handle ends the thread owns, so
+// bundling them into a struct would only move the same list one indirection
+// away (issue #349 added the eighth, `repaint`).
+#[allow(clippy::too_many_arguments)]
 fn run(
     events: Receiver<proto::ProtocolEvent>,
     commands: Receiver<UiCommand>,
@@ -687,6 +747,7 @@ fn run(
     names_cache_path: PathBuf,
     history: Option<HistoryHandle>,
     capture_restart: Option<CaptureRestart>,
+    repaint: RepaintHandle,
 ) {
     let mut pipeline = Pipeline::with_names_cache_path(names_cache_path);
     if let Some(history) = history {
@@ -702,6 +763,11 @@ fn run(
     // means the first tick or two after startup builds no breakdowns —
     // corrected within one 100ms tick once the UI's first frame runs.
     let mut skill_focus: Vec<i64> = Vec::new();
+    // Issue #349: the last snapshot `publish` sent, so it can tell a
+    // genuinely new value (worth waking the overlay for) from a re-publish
+    // of the same one (a tick where nothing changed — the overwhelmingly
+    // common case while the game sits idle).
+    let mut last_published: Option<meter::Snapshot> = None;
 
     loop {
         select! {
@@ -734,7 +800,7 @@ fn run(
                         // Issue #321: flush any fight already sitting in
                         // `FightState::Ended` before the thread exits, same
                         // as the commands arm below.
-                        publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus);
+                        publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus, &repaint, &mut last_published);
                         log::info!(
                             "capture channel closed after a quit was requested; this is an \
                              orderly shutdown"
@@ -769,7 +835,7 @@ fn run(
                 // more ticks left to catch it. One last `publish` below
                 // flushes that final state — and its `record_fight_end`
                 // call — before the thread actually exits. Logged at INFO,
-                // not the ERROR `ui.rs::raise_pipeline_dead_status` used to
+                // not the ERROR `ui/mod.rs::raise_pipeline_dead_status` used to
                 // log for every orderly quit (issue #321's false positive):
                 // this is the pipeline thread's own confirmation that the
                 // shutdown it is about to cause was requested, not a crash.
@@ -796,12 +862,12 @@ fn run(
                     ),
                 };
                 if let Some(reason) = quit_reason {
-                    publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus);
+                    publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus, &repaint, &mut last_published);
                     log::info!("{reason}");
                     break;
                 }
             },
-            recv(ticker) -> _ => publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus),
+            recv(ticker) -> _ => publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus, &repaint, &mut last_published),
         }
     }
 
@@ -820,6 +886,13 @@ fn publish(
     tx_snapshot: &Sender<meter::Snapshot>,
     stale: &Receiver<meter::Snapshot>,
     skill_focus: &[i64],
+    // Issue #349: wakes the overlay the moment a *changed* snapshot lands,
+    // rather than leaving it to notice on its own next scheduled repaint.
+    repaint: &RepaintHandle,
+    // The last snapshot this function sent, so a re-publish of an unchanged
+    // value (the overwhelmingly common case while the game sits idle) does
+    // not needlessly wake the overlay.
+    last_published: &mut Option<meter::Snapshot>,
 ) {
     // One `now` for the whole tick: the fight-state advance and the snapshot
     // it feeds must agree on what time it is.
@@ -827,6 +900,10 @@ fn publish(
     let state = pipeline.tick(now);
     let snap = pipeline.snapshot_focused(now, skill_focus);
     pipeline.record_fight_end(state, now);
+    if last_published.as_ref() != Some(&snap) {
+        repaint.wake();
+        *last_published = Some(snap.clone());
+    }
     if tx_snapshot.try_send(snap).is_err() {
         let _ = stale.try_recv();
         let _ = tx_snapshot.try_send(pipeline.snapshot_focused(now, skill_focus));
@@ -839,6 +916,7 @@ mod tests {
 
     fn damage(attacker_uid: i64, value: i64, ts: u64) -> proto::DamageEvent {
         proto::DamageEvent {
+            attacker: proto::EntityId::from_display_uid(attacker_uid, proto::EntityKind::Player),
             attacker_uid,
             attacker_kind: proto::EntityKind::Player,
             skill_id: 7,
@@ -848,6 +926,8 @@ mod tests {
             hp_lessen: value - 1,
             is_miss: false,
             is_heal: false,
+            kind: proto::DamageKind::Normal,
+            target: proto::EntityId::from_display_uid(500, proto::EntityKind::Monster),
             target_uid: 500,
             target_kind: proto::EntityKind::Monster,
             timestamp_ms: ts,
@@ -929,6 +1009,7 @@ mod tests {
     fn maps_player_info() {
         let mapped = map_event(
             proto::ProtocolEvent::Player(proto::PlayerInfo {
+                entity: proto::EntityId::from_display_uid(42, proto::EntityKind::Player),
                 uid: 42,
                 name: Some("Foo".to_string()),
                 class: Some(proto::Class::Marksman),
@@ -938,12 +1019,14 @@ mod tests {
                 skill_ids: Vec::new(),
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             0,
         );
         assert_eq!(
             mapped,
             meter::ProtocolEvent::Player(meter::PlayerInfo {
+                entity: meter::EntityId::from_display_uid(42, meter::EntityKind::Player),
                 uid: 42,
                 name: Some("Foo".to_string()),
                 class: Some(meter::Class::Marksman),
@@ -951,6 +1034,7 @@ mod tests {
                 season_strength: Some(3_333),
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             })
         );
     }
@@ -964,6 +1048,7 @@ mod tests {
         // wrong-slot or wrong-source tier mixup would fail this assertion.
         let mapped = map_event(
             proto::ProtocolEvent::Player(proto::PlayerInfo {
+                entity: proto::EntityId::from_display_uid(7, proto::EntityKind::Player),
                 uid: 7,
                 name: None,
                 class: None,
@@ -973,6 +1058,7 @@ mod tests {
                 skill_ids: vec![(3905, 1), (102640, 4), (3926, 3), (999_999_999, 9)],
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             0,
         );
@@ -987,6 +1073,7 @@ mod tests {
     fn maps_player_info_leaves_imagines_none_when_skill_ids_is_empty() {
         let mapped = map_event(
             proto::ProtocolEvent::Player(proto::PlayerInfo {
+                entity: proto::EntityId::from_display_uid(8, proto::EntityKind::Player),
                 uid: 8,
                 name: None,
                 class: None,
@@ -996,6 +1083,7 @@ mod tests {
                 skill_ids: Vec::new(),
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             0,
         );
@@ -1010,6 +1098,7 @@ mod tests {
     fn maps_enemy_hp() {
         let mapped = map_event(
             proto::ProtocolEvent::EnemyHp(proto::EnemyHp {
+                entity: proto::EntityId::from_display_uid(10, proto::EntityKind::Monster),
                 uid: 10,
                 curr_hp: Some(55),
                 max_hp: Some(100),
@@ -1023,6 +1112,7 @@ mod tests {
         assert_eq!(
             mapped,
             meter::ProtocolEvent::EnemyHp(meter::EnemyHp {
+                entity: meter::EntityId::from_display_uid(10, meter::EntityKind::Monster),
                 uid: 10,
                 curr_hp: Some(55),
                 max_hp: Some(100),
@@ -1243,6 +1333,7 @@ mod tests {
             let mut p = Pipeline::with_names_cache_path(path.clone());
             p.step(
                 proto::ProtocolEvent::Player(proto::PlayerInfo {
+                    entity: proto::EntityId::from_display_uid(1, proto::EntityKind::Player),
                     uid: 1,
                     name: Some("Foo".to_string()),
                     class: None,
@@ -1252,6 +1343,7 @@ mod tests {
                     skill_ids: Vec::new(),
                     position: None,
                     target_position: None,
+                    shield: None,
                 }),
                 1_000,
             );
@@ -1282,6 +1374,7 @@ mod tests {
             let mut p = Pipeline::with_names_cache_path(path.clone());
             p.step(
                 proto::ProtocolEvent::Player(proto::PlayerInfo {
+                    entity: proto::EntityId::from_display_uid(1, proto::EntityKind::Player),
                     uid: 1,
                     name: Some("Foo".to_string()),
                     class: None,
@@ -1291,6 +1384,7 @@ mod tests {
                     skill_ids: Vec::new(),
                     position: None,
                     target_position: None,
+                    shield: None,
                 }),
                 1_000,
             );
@@ -1320,6 +1414,7 @@ mod tests {
         p.step(proto::ProtocolEvent::Damage(damage(5, 100, 1_000)), 1_000);
         p.step(
             proto::ProtocolEvent::Player(proto::PlayerInfo {
+                entity: proto::EntityId::from_display_uid(5, proto::EntityKind::Player),
                 uid: 5,
                 name: Some("Late".to_string()),
                 class: Some(proto::Class::FrostMage),
@@ -1329,6 +1424,7 @@ mod tests {
                 skill_ids: Vec::new(),
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             1_000,
         );
@@ -1343,6 +1439,7 @@ mod tests {
         p.step(proto::ProtocolEvent::Damage(damage(9, 100, 1_000)), 1_000);
         p.step(
             proto::ProtocolEvent::Player(proto::PlayerInfo {
+                entity: proto::EntityId::from_display_uid(9, proto::EntityKind::Player),
                 uid: 9,
                 name: None,
                 class: None,
@@ -1352,6 +1449,7 @@ mod tests {
                 skill_ids: Vec::new(),
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             1_000,
         );
@@ -1365,6 +1463,7 @@ mod tests {
         p.step(proto::ProtocolEvent::Damage(damage(10, 100, 1_000)), 1_000);
         p.step(
             proto::ProtocolEvent::Player(proto::PlayerInfo {
+                entity: proto::EntityId::from_display_uid(10, proto::EntityKind::Player),
                 uid: 10,
                 name: None,
                 class: None,
@@ -1374,6 +1473,7 @@ mod tests {
                 skill_ids: Vec::new(),
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             1_000,
         );
@@ -1525,6 +1625,10 @@ mod tests {
         /// uid; the phase tests need two distinct boss entities.
         fn hit_on(target_uid: i64, value: i64, ts: u64, is_dead: bool) -> proto::ProtocolEvent {
             proto::ProtocolEvent::Damage(proto::DamageEvent {
+                // Overridden together with `target_uid` (issue #335): the
+                // identity is what the meter keys on, so leaving the base
+                // helper's would file every hit under one enemy.
+                target: proto::EntityId::from_display_uid(target_uid, proto::EntityKind::Monster),
                 target_uid,
                 is_dead,
                 ..damage(1, value, ts)
@@ -1542,6 +1646,7 @@ mod tests {
             ts: u64,
         ) -> proto::ProtocolEvent {
             proto::ProtocolEvent::EnemyHp(proto::EnemyHp {
+                entity: proto::EntityId::from_display_uid(uid, proto::EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(max),
@@ -1756,6 +1861,7 @@ mod tests {
             pipeline.step(proto::ProtocolEvent::Damage(damage(1, 100, 0)), 0);
             pipeline.step(
                 proto::ProtocolEvent::EnemyHp(proto::EnemyHp {
+                    entity: proto::EntityId::from_display_uid(500, proto::EntityKind::Monster),
                     uid: 500,
                     curr_hp: Some(50),
                     max_hp: Some(100),
@@ -1855,6 +1961,7 @@ mod tests {
             // `step`'s own `record_fight_end` call.
             pipeline.step(
                 proto::ProtocolEvent::Cast(proto::event::CastEvent {
+                    caster: proto::EntityId::from_display_uid(1, proto::EntityKind::Player),
                     caster_uid: 1,
                     skill_id: 7,
                     timestamp_ms: after_idle,
@@ -1915,10 +2022,19 @@ mod tests {
             let (tx_snapshot, rx_snapshot) = bounded::<meter::Snapshot>(1);
             let stale = rx_snapshot.clone();
             let skill_focus: Vec<i64> = Vec::new();
+            let repaint = RepaintHandle::new();
+            let mut last_published: Option<meter::Snapshot> = None;
 
             // The call `Ok(UiCommand::Quit)` and `Err(_)` both make just
             // before `break`.
-            publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus);
+            publish(
+                &mut pipeline,
+                &tx_snapshot,
+                &stale,
+                &skill_focus,
+                &repaint,
+                &mut last_published,
+            );
 
             let count = row_count(&handle);
             drop(handle);
@@ -1929,6 +2045,76 @@ mod tests {
             assert_eq!(
                 count, 1,
                 "the final publish at quit must record the already-ended fight"
+            );
+        }
+
+        /// Drives `ctx` through egui passes until it stops asking for a
+        /// repaint of its own accord, so a following
+        /// `has_requested_repaint` reads only what the code under test
+        /// did. A brand-new `egui::Context` starts out *already*
+        /// requesting repaints (it needs a few warm-up passes to upload
+        /// its font texture and settle), and a `request_repaint` made
+        /// between passes stays visible through the pass that consumes it
+        /// — so "run one pass" is not enough to clear the flag in either
+        /// direction. `FullOutput::textures_delta` must be cleared before
+        /// it drops or epaint panics about unapplied deltas.
+        fn settle_repaints(ctx: &egui::Context) {
+            for _ in 0..10 {
+                if !ctx.has_requested_repaint() {
+                    return;
+                }
+                let mut out = ctx.run_ui(Default::default(), |_| {});
+                out.textures_delta.clear();
+            }
+            panic!("egui context never stopped requesting repaints on its own");
+        }
+
+        /// Issue #349: `publish` must wake the overlay the first time it
+        /// has anything to say (there is no prior snapshot to compare
+        /// against), but must not wake it again for a second, unchanged
+        /// publish — the overwhelmingly common case while the game sits
+        /// idle, and exactly the case a fixed-clock heartbeat used to be
+        /// the only thing covering.
+        #[test]
+        fn publish_wakes_only_on_a_changed_snapshot() {
+            let mut pipeline = Pipeline::new();
+            let (tx_snapshot, rx_snapshot) = bounded::<meter::Snapshot>(1);
+            let stale = rx_snapshot.clone();
+            let skill_focus: Vec<i64> = Vec::new();
+            let repaint = RepaintHandle::new();
+            let ctx = egui::Context::default();
+            repaint.install(ctx.clone());
+            let mut last_published: Option<meter::Snapshot> = None;
+
+            settle_repaints(&ctx);
+
+            publish(
+                &mut pipeline,
+                &tx_snapshot,
+                &stale,
+                &skill_focus,
+                &repaint,
+                &mut last_published,
+            );
+            assert!(
+                ctx.has_requested_repaint(),
+                "the first publish has no prior snapshot to compare against, so it must wake \
+                 the overlay"
+            );
+
+            settle_repaints(&ctx);
+
+            publish(
+                &mut pipeline,
+                &tx_snapshot,
+                &stale,
+                &skill_focus,
+                &repaint,
+                &mut last_published,
+            );
+            assert!(
+                !ctx.has_requested_repaint(),
+                "a second publish with nothing new in the pipeline must not wake the overlay again"
             );
         }
 
@@ -2002,6 +2188,7 @@ mod tests {
                 scratch_path("orderly-shutdown"),
                 None,
                 None,
+                RepaintHandle::new(),
             );
 
             tx_command.send(UiCommand::Quit).unwrap();
@@ -2040,6 +2227,7 @@ mod tests {
             scratch_path("restart-capture"),
             None,
             Some(restart.clone()),
+            RepaintHandle::new(),
         );
 
         tx_command.send(UiCommand::RestartCapture).unwrap();
@@ -2078,6 +2266,7 @@ mod tests {
             scratch_path("restart-capture-none"),
             None,
             None,
+            RepaintHandle::new(),
         );
 
         tx_command.send(UiCommand::RestartCapture).unwrap();
@@ -2108,6 +2297,7 @@ mod tests {
             scratch_path("capture-dead-status"),
             None,
             None,
+            RepaintHandle::new(),
         );
 
         // The capture thread panicking or exiting drops its `Sender` half;

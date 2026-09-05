@@ -38,6 +38,11 @@ pub struct Rig {
     decoder: Decoder,
     pipeline: Pipeline,
     seq: u32,
+    /// The entity table `feed_notify` decodes against (issue #335). The
+    /// `Decoder` above owns its own for the byte-stream path; this is the
+    /// same cross-packet state for the path that hands `Notify`s in
+    /// directly.
+    entities: bpsr_protocol::EntityTable,
     resets: Vec<(u64, ResetReason)>,
     fight_state: FightState,
     /// The history thread's handle (issue #39), if `with_history` attached
@@ -69,6 +74,7 @@ impl Rig {
             decoder: Decoder::new(),
             pipeline: Pipeline::new(),
             seq: INITIAL_SEQ,
+            entities: bpsr_protocol::EntityTable::new(),
             resets: Vec::new(),
             fight_state: FightState::Idle,
             history: None,
@@ -153,7 +159,7 @@ impl Rig {
             payload: payload.to_vec(),
         };
         let mut events = Vec::new();
-        bpsr_protocol::decode::decode_notify(&notify, ts_ms, &mut events, None);
+        bpsr_protocol::decode::decode_notify(&notify, ts_ms, &mut events, None, &mut self.entities);
         for ev in events {
             if let Some(reason) = self.pipeline.step(ev, ts_ms) {
                 self.resets.push((ts_ms, reason));

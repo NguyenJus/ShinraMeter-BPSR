@@ -40,26 +40,6 @@ fn names_cache_path() -> PathBuf {
     path
 }
 
-/// Where the encounter-history database (issue #39) lives:
-/// `%APPDATA%\ShinraMeter-BPSR\history.sqlite`. `SHINRA_HISTORY_DB` overrides
-/// it outright, because it is the file a developer most often wants pointed
-/// at a scratch copy — though it is no longer the only override among the
-/// app's on-disk files: the single-instance lock (issue #277) has its own,
-/// `SHINRA_INSTANCE_LOCK` (see `single_instance::lock_file_path`).
-fn history_db_path() -> PathBuf {
-    let (path, warning) = paths::resolve(
-        std::env::var("SHINRA_HISTORY_DB").ok().as_deref(),
-        std::env::var("APPDATA").ok().as_deref(),
-        &["ShinraMeter-BPSR", "history.sqlite"],
-        "ShinraMeter-BPSR-history.sqlite",
-        "APPDATA is not set; falling back to a working-directory file for the encounter history",
-    );
-    if let Some(warning) = warning {
-        log::warn!("{warning}");
-    }
-    path
-}
-
 /// Issue #89: how the overlay window and its swapchain get created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowComposition {
@@ -272,7 +252,24 @@ fn decide_instance(acquisition: single_instance::Acquisition) -> InstanceDecisio
     }
 }
 
+/// `--version`/`-V` early exit (issue #341): CI's Windows smoke job needs a
+/// way to prove the built exe actually starts, without a window or the
+/// single-instance lock getting in the way — so this is checked before any
+/// of that in `main`, not folded into the eframe loop. This cannot avoid the
+/// admin prompt: the shipped manifest's `requireAdministrator` is honored by
+/// the Windows loader at `CreateProcess`, before `main` ever runs, so
+/// elevation has already happened (or the process has already failed to
+/// launch) by the time this code executes.
+fn version_requested(args: &[std::ffi::OsString]) -> bool {
+    args.iter().any(|arg| arg == "--version" || arg == "-V")
+}
+
 fn main() -> eframe::Result {
+    if version_requested(&std::env::args_os().collect::<Vec<_>>()) {
+        println!("ShinraMeter-BPSR {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // `env_logger::init()` alone defaults to `error`-only and, since this
     // binary carries `windows_subsystem = "windows"`, has no console for
     // stderr to land on in a shipped build — so it was effectively silent.
@@ -316,11 +313,21 @@ fn main() -> eframe::Result {
     let (tx_events, rx_events) = bounded::<ProtocolEvent>(EVENT_CAPACITY);
     let (tx_command, rx_command) = bounded::<UiCommand>(COMMAND_CAPACITY);
 
-    // Opt-in packet-inspection diagnostics (issue #25 slice A, opt-in default
-    // since issue #122); `None` unless `SHINRA_INSPECT` opts in (see
-    // `inspect::enabled`), in which case `start_capture` below wires the
-    // sink into its decoder.
-    let inspect_handle = inspect::init();
+    // Loaded once, here, rather than inside `OverlayApp::new`: issue #27
+    // needs this same value before `OverlayApp` exists, to seed
+    // `ui::viewport`'s starting position, so the single load is hoisted up
+    // to cover both uses instead of loading twice — and the history thread
+    // needs the retention policy before the pipeline is spawned (issue #39).
+    // Also needed by `inspect::init` below (issue #346), which is why this
+    // moved ahead of it.
+    let settings = settings::load();
+
+    // Packet-inspection diagnostics (issue #25 slice A; on by default since
+    // issue #346, now that `settings.dump_sanitize` keeps a shared dump
+    // free of player names/ids — `SHINRA_INSPECT=0`/`false`/`off` still
+    // opts out, see `inspect::enabled`), in which case `start_capture`
+    // below wires the sink into its decoder.
+    let inspect_handle = inspect::init(settings.dump_sanitize);
     let inspect_sink = inspect_handle.as_ref().map(|h| Arc::clone(&h.sink));
 
     // Capture is best-effort: on failure `tx_events` is dropped, the pipeline
@@ -333,20 +340,16 @@ fn main() -> eframe::Result {
         }
     };
 
-    // Loaded once, here, rather than inside `OverlayApp::new`: issue #27
-    // needs this same value before `OverlayApp` exists, to seed
-    // `ui::viewport`'s starting position, so the single load is hoisted up
-    // to cover both uses instead of loading twice — and the history thread
-    // needs the retention policy before the pipeline is spawned (issue #39).
-    let settings = settings::load();
-
     // Issue #39: `None` when history is switched off in settings.json, or when
     // the database cannot be opened (already logged by `HistoryHandle::spawn`) —
     // in either case the overlay runs exactly as before, minus history.
     let history = settings
         .history_enabled
         .then(|| {
-            history::writer::HistoryHandle::spawn(history_db_path(), settings.retention_policy())
+            history::writer::HistoryHandle::spawn(
+                history::history_db_path(),
+                settings.retention_policy(),
+            )
         })
         .flatten();
     let (history_handle, history_thread) = match history {
@@ -362,12 +365,19 @@ fn main() -> eframe::Result {
     // why and there is nothing to restart.
     let capture_restart = capture.as_ref().map(|handle| handle.restart_requester());
 
+    // Issue #349: created before the window exists (the real `egui::Context`
+    // is not available until `run_native`'s creator closure below runs), and
+    // installed with it there — `publish` reads through this handle to wake
+    // the overlay's event loop the moment a changed snapshot is ready.
+    let repaint = pipeline::RepaintHandle::new();
+
     let (rx_snapshot, pipeline_thread) = pipeline::spawn(
         rx_events,
         rx_command,
         names_cache_path(),
         history_handle.clone(),
         capture_restart,
+        repaint.clone(),
     );
     let (tx_settings, settings_thread) = settings::spawn_writer();
 
@@ -422,6 +432,7 @@ fn main() -> eframe::Result {
         "ShinraMeter-BPSR",
         native_options,
         Box::new(move |cc| {
+            repaint.install(cc.egui_ctx.clone());
             fonts::install_cjk_fallback(&cc.egui_ctx);
             ui::apply_theme(&cc.egui_ctx);
             platform::disable_aero_snap(cc);
@@ -596,5 +607,29 @@ mod tests {
             }
             InstanceDecision::Exit => panic!("a broken guard must not stop the app (issue #277)"),
         }
+    }
+
+    // -- version_requested (issue #341) --------------------------------------
+
+    #[test]
+    fn version_flag_variants_are_recognized() {
+        for flag in ["--version", "-V"] {
+            let args = vec![
+                std::ffi::OsString::from("ShinraMeter-BPSR"),
+                std::ffi::OsString::from(flag),
+            ];
+            assert!(version_requested(&args), "{flag} should be recognized");
+        }
+    }
+
+    #[test]
+    fn missing_or_unrelated_flags_are_not_recognized() {
+        assert!(!version_requested(&[std::ffi::OsString::from(
+            "ShinraMeter-BPSR"
+        )]));
+        assert!(!version_requested(&[
+            std::ffi::OsString::from("ShinraMeter-BPSR"),
+            std::ffi::OsString::from("--other"),
+        ]));
     }
 }

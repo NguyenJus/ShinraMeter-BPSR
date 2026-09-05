@@ -1,15 +1,30 @@
 //! Packet-inspection diagnostic mode (issue #25 slice A).
 //!
-//! Off by default (issue #122) — set `SHINRA_INSPECT=1` (`true`, `on`, or
-//! `yes` also work, case-insensitively) to opt in. When on:
+//! On by default since issue #346, now that the dump writer sanitizes
+//! every record as it's written (see `settings::Settings::dump_sanitize`,
+//! `crate::dump::DumpWriter::spawn_sanitized`) — a fresh dump is safe to
+//! attach to a bug report without a separate post-process step. Was off by
+//! default from issue #122 (when the only way to get a shareable dump was
+//! that separate `sanitize-dump` step) through issue #346. Set
+//! `SHINRA_INSPECT=0` (`false`, `off`, or `no` also work, case-insensitively)
+//! to opt back out, or `SHINRA_INSPECT=1` (`true`/`on`/`yes`) to force it on
+//! regardless of a build's default. When on:
 //!
-//! - every Notify-shaped fragment observed — recognized service or not, and
-//!   including one whose payload would not decompress (dumped as its raw
-//!   bytes with `payload_decoded: false`) — is appended to a JSONL dump file
+//! - every Notify-shaped fragment observed is appended to a JSONL dump file
 //!   on a dedicated writer thread, so a session can be replayed offline
-//!   (slice B item 4). See [`crate::dump`] for the exact on-disk format, and
-//!   for the drop-on-full policy that can make a dump incomplete under a
-//!   stalled disk (reported at shutdown).
+//!   (slice B item 4) — but with `settings.dump_sanitize` on (the default),
+//!   only the seven `pb.rs`-modeled opcodes on the recognized service are
+//!   actually written, each re-encoded through that partial schema; every
+//!   undecoded fragment and every unmodeled opcode is dropped instead of
+//!   written raw, and counted rather than silently lost (see
+//!   `dump::RecordSender::sanitized_out_count`). Set
+//!   `settings.dump_sanitize: false` to capture the unfiltered raw stream
+//!   instead — needed for protocol discovery (a new opcode can't be
+//!   modeled in `pb.rs` before it's been seen), but the result contains
+//!   player names and other identifying traffic and must never be shared.
+//!   See [`crate::dump`] for the exact on-disk format, and for the
+//!   drop-on-full policy that can make a dump incomplete under a stalled
+//!   disk (reported at shutdown).
 //! - the first time a given unrecognized service uuid is seen it is logged
 //!   at `info` level with its method id, payload length, and a truncated
 //!   hex prefix; a running count and first-seen timestamp are kept and
@@ -24,6 +39,14 @@
 //!   count, distinct uids seen up to a cap, a sample uid, and a sample hex
 //!   prefix) are still kept and logged in the shutdown summary, one line per
 //!   attr id.
+//!
+//! With `settings.dump_sanitize` on (the default), this discovery *logging*
+//! (not just the dump file) also omits raw hex/uids too: a new unrecognized
+//! service's hex prefix logs and stores as `<redacted>`, and a new unknown
+//! attr id's `uid`/`raw_hex` log and store the same way (`sample_uid: 0`,
+//! `sample_raw_hex` empty) — the log line still says a service/attr id was
+//! seen, just without the raw bytes/uid that would otherwise leak into a
+//! log file attached alongside a sanitized dump.
 //!
 //! The dump path defaults to
 //! `%APPDATA%\ShinraMeter-BPSR\inspect\dump-<session_id>.jsonl` (or
@@ -40,8 +63,10 @@
 //! size, the total ring budget, and the `SHINRA_INSPECT_MAX_BYTES`
 //! override.
 //!
-//! Dumps contain player names and other identifying traffic — never attach
-//! one to an issue or PR (see `.gitignore`).
+//! A dump written with `settings.dump_sanitize` off (or one predating issue
+//! #346) contains player names and other identifying traffic — never attach
+//! one of those to an issue or PR (see `.gitignore`). A sanitized dump is
+//! safe to share.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -65,9 +90,13 @@ const HEX_PREFIX_LEN: usize = 32;
 /// says so instead of silently under-reporting.
 const MAX_TRACKED_UIDS_PER_ATTR: usize = 16;
 
-/// False unless `SHINRA_INSPECT` is set to an explicit opt-in value (`1`,
-/// `true`, `on`, or `yes`, case-insensitively) — diagnostics are off by
-/// default (issue #122).
+/// True unless `SHINRA_INSPECT` is set to an explicit opt-out value (`0`,
+/// `false`, `off`, or `no`, case-insensitively) — diagnostics default on
+/// since issue #346 (sanitized on write, so a fresh dump is safe to share;
+/// was opt-in-only, defaulting off, from issue #122 through #346). An
+/// explicit opt-in value (`1`, `true`, `on`, or `yes`) also reads as true,
+/// so a build that ever flips the unset default back off can still be
+/// forced on per-run.
 pub fn enabled() -> bool {
     enabled_from(std::env::var("SHINRA_INSPECT").ok().as_deref())
 }
@@ -75,12 +104,12 @@ pub fn enabled() -> bool {
 fn enabled_from(var: Option<&str>) -> bool {
     match var {
         Some(v) => {
-            v.eq_ignore_ascii_case("1")
-                || v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("on")
-                || v.eq_ignore_ascii_case("yes")
+            !(v.eq_ignore_ascii_case("0")
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no"))
         }
-        None => false,
+        None => true,
     }
 }
 
@@ -146,7 +175,7 @@ impl Handle {
 /// through [`dropped_count`] rather than threading a live [`Handle`]
 /// through `OverlayApp`/`ui::draw_header_menu`'s already-deep call chain
 /// lets the "Export session bundle" menu item report how incomplete the
-/// dump might be with no signature changes anywhere in `ui.rs`.
+/// dump might be with no signature changes anywhere in the `ui` module.
 ///
 /// Only ever set from `init`'s `Some` branch, which nothing in this
 /// module's own unit tests calls (they construct `DumpWriter`/
@@ -154,21 +183,52 @@ impl Handle {
 /// or carry a stale value from a previous process.
 static DROPPED_COUNTER: OnceLock<dump::RecordSender> = OnceLock::new();
 
-/// Turns diagnostics on when opted in via `SHINRA_INSPECT`, spawning the
-/// dump-writer thread and returning a `Handle`; `None` (zero cost beyond the
-/// env check) unless opted in.
-pub fn init() -> Option<Handle> {
+/// Whether the current session's dump writer is sanitizing on write (issue
+/// #346), set once by [`init`] regardless of which branch it takes to
+/// `Some`/`None` for [`enabled`] — see [`sanitized`]. Mirrors
+/// [`DROPPED_COUNTER`]'s process-wide-`OnceLock` shape and the same
+/// never-set-outside-`init` guarantee that keeps it from leaking state
+/// between unit tests.
+static SANITIZED: OnceLock<bool> = OnceLock::new();
+
+/// Whether this session's dump is being sanitized on write, or `None` when
+/// packet inspection was never turned on this run (`init` never ran). Used
+/// by `crate::bundle::build_manifest`'s caller to decide whether the dump
+/// ring is safe to fold into a session bundle (see
+/// `bundle::DUMP_UNSANITIZED_EXCLUSION_REASON`).
+pub(crate) fn sanitized() -> Option<bool> {
+    SANITIZED.get().copied()
+}
+
+/// Spawns the dump-writer thread and returns a `Handle` unless diagnostics
+/// are off (see [`enabled`]); `None` costs nothing beyond the env check.
+/// `sanitize` is `settings::Settings::dump_sanitize` (issue #346) — when
+/// set, every record is scrubbed of player names/ids on write (see
+/// `dump::DumpWriter::spawn_sanitized`) so the resulting dump is safe to
+/// attach to a bug report or session bundle without a separate
+/// `sanitize-dump` pass.
+pub fn init(sanitize: bool) -> Option<Handle> {
     if !enabled() {
         return None;
     }
     let path = dump_path();
+    dump::sweep_prior_sessions(
+        &path,
+        dump::max_total_ring_bytes(),
+        std::time::Duration::from_secs(7 * 24 * 3600),
+    );
     log::info!(
-        "packet inspection enabled via SHINRA_INSPECT; dumping to {}",
+        "packet inspection enabled; dumping to {} (sanitize={sanitize}; opt out with SHINRA_INSPECT=0)",
         path.display()
     );
-    let writer = dump::DumpWriter::spawn(path);
+    let writer = if sanitize {
+        dump::DumpWriter::spawn_sanitized(path)
+    } else {
+        dump::DumpWriter::spawn(path)
+    };
     let _ = DROPPED_COUNTER.set(writer.sender());
-    let sink: Arc<dyn InspectSink> = Arc::new(DiagnosticSink::new(writer.sender()));
+    let _ = SANITIZED.set(sanitize);
+    let sink: Arc<dyn InspectSink> = Arc::new(DiagnosticSink::new(writer.sender(), sanitize));
     Some(Handle { sink, writer })
 }
 
@@ -179,6 +239,17 @@ pub fn init() -> Option<Handle> {
 /// in-progress (or just-finished) dump might be.
 pub(crate) fn dropped_count() -> Option<u64> {
     DROPPED_COUNTER.get().map(dump::RecordSender::dropped_count)
+}
+
+/// Live sanitized-out-record count for the current session's dump (issue
+/// #346's sanitizer rejecting a record entirely, not the queue-drop
+/// [`dropped_count`] reports), or `None` when packet inspection was never
+/// turned on this run. Used by `crate::bundle::build_manifest`'s caller the
+/// same way [`dropped_count`] is.
+pub(crate) fn sanitized_out_count() -> Option<u64> {
+    DROPPED_COUNTER
+        .get()
+        .map(dump::RecordSender::sanitized_out_count)
 }
 
 #[derive(Debug, Clone)]
@@ -210,14 +281,21 @@ struct AttrStat {
 /// behavior described in the module doc comment.
 struct DiagnosticSink {
     tx: dump::RecordSender,
+    sanitize: bool,
     services: Mutex<HashMap<u64, ServiceStat>>,
     attrs: Mutex<HashMap<i32, AttrStat>>,
 }
 
+/// What [`DiagnosticSink::log_summary`] and its callers print in place of a
+/// raw hex/uid value when `sanitize` is on (issue #346's log-side
+/// counterpart to the dump file itself being scrubbed on write).
+const REDACTED: &str = "<redacted>";
+
 impl DiagnosticSink {
-    fn new(tx: dump::RecordSender) -> Self {
+    fn new(tx: dump::RecordSender, sanitize: bool) -> Self {
         Self {
             tx,
+            sanitize,
             services: Mutex::new(HashMap::new()),
             attrs: Mutex::new(HashMap::new()),
         }
@@ -234,12 +312,22 @@ impl DiagnosticSink {
         let (stat, is_new) = match attrs.entry(attr_id) {
             std::collections::hash_map::Entry::Occupied(entry) => (entry.into_mut(), false),
             std::collections::hash_map::Entry::Vacant(entry) => (
-                entry.insert(AttrStat {
-                    count: 0,
-                    uids: HashSet::new(),
-                    uids_saturated: false,
-                    sample_uid: uid,
-                    sample_raw_hex: hex_prefix(raw),
+                entry.insert(if self.sanitize {
+                    AttrStat {
+                        count: 0,
+                        uids: HashSet::new(),
+                        uids_saturated: false,
+                        sample_uid: 0,
+                        sample_raw_hex: String::new(),
+                    }
+                } else {
+                    AttrStat {
+                        count: 0,
+                        uids: HashSet::new(),
+                        uids_saturated: false,
+                        sample_uid: uid,
+                        sample_raw_hex: hex_prefix(raw),
+                    }
                 }),
                 true,
             ),
@@ -255,13 +343,17 @@ impl DiagnosticSink {
 
     fn log_summary(&self) {
         for (uuid, stat) in self.services.lock().unwrap().iter() {
+            let hex_prefix = if self.sanitize {
+                REDACTED
+            } else {
+                stat.hex_prefix.as_str()
+            };
             log::info!(
-                "packet-inspect summary: unrecognized service_uuid=0x{uuid:016x} count={} first_seen_ms={} last_method_id=0x{:08x} last_payload_len={} hex_prefix={}",
+                "packet-inspect summary: unrecognized service_uuid=0x{uuid:016x} count={} first_seen_ms={} last_method_id=0x{:08x} last_payload_len={} hex_prefix={hex_prefix}",
                 stat.count,
                 stat.first_seen_ms,
                 stat.last_method_id,
                 stat.last_payload_len,
-                stat.hex_prefix,
             );
         }
         // One line per distinct attr_id (issue #69), not per (uid, attr_id)
@@ -270,19 +362,25 @@ impl DiagnosticSink {
         // enforce.
         for (attr_id, stat) in self.attrs.lock().unwrap().iter() {
             let uids = stat.uids.len();
+            let sample_uid: std::borrow::Cow<'_, str> = if self.sanitize {
+                REDACTED.into()
+            } else {
+                stat.sample_uid.to_string().into()
+            };
+            let sample_raw_hex = if self.sanitize {
+                REDACTED
+            } else {
+                stat.sample_raw_hex.as_str()
+            };
             if stat.uids_saturated {
                 log::info!(
-                    "packet-inspect summary: unknown attr_id=0x{attr_id:x} count={} uids={uids}+ (capped at {MAX_TRACKED_UIDS_PER_ATTR}) sample_uid={} sample_raw_hex={}",
+                    "packet-inspect summary: unknown attr_id=0x{attr_id:x} count={} uids={uids}+ (capped at {MAX_TRACKED_UIDS_PER_ATTR}) sample_uid={sample_uid} sample_raw_hex={sample_raw_hex}",
                     stat.count,
-                    stat.sample_uid,
-                    stat.sample_raw_hex,
                 );
             } else {
                 log::info!(
-                    "packet-inspect summary: unknown attr_id=0x{attr_id:x} count={} uids={uids} sample_uid={} sample_raw_hex={}",
+                    "packet-inspect summary: unknown attr_id=0x{attr_id:x} count={} uids={uids} sample_uid={sample_uid} sample_raw_hex={sample_raw_hex}",
                     stat.count,
-                    stat.sample_uid,
-                    stat.sample_raw_hex,
                 );
             }
         }
@@ -329,16 +427,24 @@ impl InspectSink for DiagnosticSink {
             first_seen_ms: now_ms,
             last_method_id: method_id,
             last_payload_len: payload.len(),
-            hex_prefix: hex_prefix(payload),
+            hex_prefix: if self.sanitize {
+                String::new()
+            } else {
+                hex_prefix(payload)
+            },
         });
         stat.count += 1;
         stat.last_method_id = method_id;
         stat.last_payload_len = payload.len();
         if is_new {
+            let hex_prefix = if self.sanitize {
+                REDACTED
+            } else {
+                stat.hex_prefix.as_str()
+            };
             log::info!(
-                "packet-inspect: new unrecognized service_uuid=0x{service_uuid:016x} method_id=0x{method_id:08x} payload_len={} payload_decoded={payload_decoded} first_seen_ms={now_ms} hex_prefix={}",
+                "packet-inspect: new unrecognized service_uuid=0x{service_uuid:016x} method_id=0x{method_id:08x} payload_len={} payload_decoded={payload_decoded} first_seen_ms={now_ms} hex_prefix={hex_prefix}",
                 payload.len(),
-                stat.hex_prefix,
             );
         }
     }
@@ -354,10 +460,16 @@ impl InspectSink for DiagnosticSink {
         // Logged once per distinct attr_id, not once per (uid, attr_id) —
         // see the module doc comment and issue #69.
         if self.record_attr(uid, attr_id, raw) {
-            log::info!(
-                "packet-inspect: new unknown attr_id=0x{attr_id:x} uid={uid} raw_hex={}",
-                hex_prefix(raw),
-            );
+            if self.sanitize {
+                log::info!(
+                    "packet-inspect: new unknown attr_id=0x{attr_id:x} uid={REDACTED} raw_hex={REDACTED}",
+                );
+            } else {
+                log::info!(
+                    "packet-inspect: new unknown attr_id=0x{attr_id:x} uid={uid} raw_hex={}",
+                    hex_prefix(raw),
+                );
+            }
         }
     }
 }
@@ -376,9 +488,11 @@ mod tests {
 
     // -- enabled ------------------------------------------------------
 
+    /// Issue #346: dumps are sanitized on write now, so diagnostics default
+    /// on rather than requiring an explicit opt-in.
     #[test]
-    fn enabled_is_false_when_unset() {
-        assert!(!enabled_from(None));
+    fn enabled_is_true_when_unset() {
+        assert!(enabled_from(None));
     }
 
     #[test]
@@ -393,17 +507,21 @@ mod tests {
     }
 
     #[test]
-    fn enabled_is_false_for_0_or_any_other_unrecognized_value() {
-        assert!(!enabled_from(Some("0")));
-        assert!(!enabled_from(Some("false")));
-        assert!(!enabled_from(Some("off")));
-        assert!(!enabled_from(Some("2")));
-        assert!(!enabled_from(Some("enabled")));
+    fn enabled_is_true_for_any_value_that_is_not_an_explicit_opt_out() {
+        assert!(enabled_from(Some("2")));
+        assert!(enabled_from(Some("enabled")));
+        assert!(enabled_from(Some("")));
     }
 
     #[test]
-    fn enabled_is_false_for_an_empty_value_since_only_the_named_tokens_opt_in() {
-        assert!(!enabled_from(Some("")));
+    fn enabled_is_false_for_0_false_off_or_no_case_insensitively() {
+        assert!(!enabled_from(Some("0")));
+        assert!(!enabled_from(Some("false")));
+        assert!(!enabled_from(Some("FALSE")));
+        assert!(!enabled_from(Some("off")));
+        assert!(!enabled_from(Some("OFF")));
+        assert!(!enabled_from(Some("no")));
+        assert!(!enabled_from(Some("NO")));
     }
 
     // -- dump_path ------------------------------------------------------
@@ -445,7 +563,59 @@ mod tests {
 
     fn new_sink() -> (DiagnosticSink, crossbeam_channel::Receiver<dump::Record>) {
         let (tx, rx) = crossbeam_channel::bounded(16);
-        (DiagnosticSink::new(dump::RecordSender::new(tx)), rx)
+        (DiagnosticSink::new(dump::RecordSender::new(tx), false), rx)
+    }
+
+    fn new_sanitized_sink() -> (DiagnosticSink, crossbeam_channel::Receiver<dump::Record>) {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        (DiagnosticSink::new(dump::RecordSender::new(tx), true), rx)
+    }
+
+    /// Issue #346: with sanitize on, the in-memory aggregates never hold raw
+    /// hex/uids either, not just the dump file on disk — `log_summary`
+    /// prints `<redacted>` for them (see `on_notify`/`on_attr`'s direct log
+    /// lines below, and `log_summary` itself for the shutdown-summary
+    /// case).
+    #[test]
+    fn sanitize_on_stores_no_raw_hex_prefix_for_a_new_unrecognized_service() {
+        let (sink, _rx) = new_sanitized_sink();
+        sink.on_notify(0xDEAD, 1, b"secret-bytes", true, 10);
+
+        let services = sink.services.lock().unwrap();
+        let stat = services.get(&0xDEAD).unwrap();
+        assert_eq!(stat.hex_prefix, "");
+    }
+
+    #[test]
+    fn sanitize_off_stores_the_raw_hex_prefix_for_a_new_unrecognized_service() {
+        let (sink, _rx) = new_sink();
+        sink.on_notify(0xDEAD, 1, b"secret-bytes", true, 10);
+
+        let services = sink.services.lock().unwrap();
+        let stat = services.get(&0xDEAD).unwrap();
+        assert_eq!(stat.hex_prefix, hex_prefix(b"secret-bytes"));
+    }
+
+    #[test]
+    fn sanitize_on_stores_no_sample_uid_or_raw_hex_for_a_new_unknown_attr() {
+        let (sink, _rx) = new_sanitized_sink();
+        sink.on_attr(42, 0x99, b"secret-bytes", false);
+
+        let attrs = sink.attrs.lock().unwrap();
+        let stat = attrs.get(&0x99).unwrap();
+        assert_eq!(stat.sample_uid, 0);
+        assert_eq!(stat.sample_raw_hex, "");
+    }
+
+    #[test]
+    fn sanitize_off_stores_the_sample_uid_and_raw_hex_for_a_new_unknown_attr() {
+        let (sink, _rx) = new_sink();
+        sink.on_attr(42, 0x99, b"secret-bytes", false);
+
+        let attrs = sink.attrs.lock().unwrap();
+        let stat = attrs.get(&0x99).unwrap();
+        assert_eq!(stat.sample_uid, 42);
+        assert_eq!(stat.sample_raw_hex, hex_prefix(b"secret-bytes"));
     }
 
     #[test]

@@ -1,23 +1,30 @@
 # Packet inspection: in-game confirmation procedure
 
-Issue #25 built the observation tooling (diagnostic mode — opt-in since issue
-#122 via `SHINRA_INSPECT=1` — unrecognized service/method id logging, unknown
-attr id logging, and a raw frame dump for offline replay).
+Issue #25 built the observation tooling (diagnostic mode — on by default since
+issue #346, opt out with `SHINRA_INSPECT=0` — unrecognized service/method id
+logging, unknown attr id logging, and a frame dump for offline replay).
 That tooling only makes observation *possible* — turning an
 observation into a confirmed constant still requires a deliberate procedure
 against live game traffic on a Windows box running `ShinraMeter-BPSR`. This is
 that procedure. It has not been run yet (no Windows box was available while
 building slice A); this doc is what to follow the first time someone does.
 
-Do not attach a raw dump to the tracking issue or a PR — dumps contain
-player names and other identifying traffic (see `.gitignore`). Extract only
-the minimal bytes needed as a synthetic fixture under
-`crates/protocol/tests/common/` instead.
+Sanitized dumps — the default, `dump_sanitize: true` in `settings.json` —
+contain only the modeled opcodes with player names and ids pseudonymised,
+and are safe to attach to an issue or a session bundle. A dump written with
+`dump_sanitize: false` holds raw player names and identifying traffic (see
+`.gitignore`) and must never be attached; extract only the minimal bytes
+needed as a synthetic fixture under `crates/protocol/tests/common/` instead.
+For protocol discovery (unmodeled opcodes, undecodable payloads) set
+`dump_sanitize: false` and `SHINRA_INSPECT=1`. On startup the app sweeps
+prior sessions' dumps from the inspect directory: anything older than 7 days
+is deleted, and the rest is trimmed oldest-first to the ring's total byte
+budget.
 
 ## Setup
 
-1. Set `SHINRA_INSPECT=1` before launching `ShinraMeter-BPSR.exe` (optionally also
-   `SHINRA_INSPECT_DUMP=<path>` to control where the dump lands; otherwise it
+1. Diagnostics are on unless `SHINRA_INSPECT=0`; launch `ShinraMeter-BPSR.exe`
+   (optionally with `SHINRA_INSPECT_DUMP=<path>` to control where the dump lands; otherwise it
    defaults to `%APPDATA%\ShinraMeter-BPSR\inspect\dump-<session_id>.jsonl`,
    where `<session_id>` is `<pid>-<unix start seconds>`, issue #322 — not a
    bare pid, which gets reused across runs and can't tell two sessions'

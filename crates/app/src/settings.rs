@@ -81,6 +81,30 @@ impl ColumnKind {
         }
     }
 
+    /// A representative value for this column, shown greyed out beside its
+    /// checkbox on the header menu's Columns page (issue #120). The labels
+    /// alone ("Share %", "Lucky %") say what a column is *called* but not
+    /// what it actually puts in a row — a one-glance sample does, and it is
+    /// what makes the grouped page readable without turning columns on to
+    /// find out. Deliberately hard-coded rather than sampled from the live
+    /// snapshot: the menu has to read the same on an idle overlay with no
+    /// encounter at all, and every sample here is shaped like what
+    /// `ColumnKind::spec`'s formatter would really produce
+    /// (`fmt_short`/`fmt_share`/`fmt_pct0`).
+    pub fn sample_text(self) -> &'static str {
+        match self {
+            ColumnKind::AbilityScore => "1234",
+            ColumnKind::SeasonStrength => "12",
+            ColumnKind::Damage => "1.23M",
+            ColumnKind::Dps => "12.3K/s",
+            ColumnKind::SharePct => "34.5%",
+            ColumnKind::CritPct => "48%",
+            ColumnKind::LuckyPct => "9%",
+            ColumnKind::Hits => "1.20K",
+            ColumnKind::Deaths => "2",
+        }
+    }
+
     /// Whether this column renders its value inline with the player's name
     /// (issue #168) rather than in its own reserved stat-column slot. Only
     /// `AbilityScore`/`SeasonStrength` do — the doc comment on `ALL` above
@@ -384,6 +408,23 @@ pub struct Settings {
     /// to the same loading, opacity and failure rules. See `header_image`.
     #[serde(default)]
     pub backdrop_image: Option<PathBuf>,
+    /// Whether packet-inspection dumps (`SHINRA_INSPECT`, `crate::dump`)
+    /// scrub player names/ids on write (issue #346), via
+    /// `bpsr_protocol::sanitize::Sanitizer` — see
+    /// `dump::DumpWriter::spawn_sanitized`. On by default: it's what lets
+    /// diagnostics default on too (`inspect::enabled`) without shipping raw
+    /// player traffic in every dump. With it on, only the seven modeled
+    /// opcodes on the recognized service reach the dump; undecoded fragments
+    /// and unmodeled opcodes are dropped and counted. Set it to `false` to
+    /// capture the raw stream for protocol discovery (that dump is then
+    /// unsafe to share). `#[serde(default = "default_dump_sanitize")]`
+    /// rather than plain `#[serde(default)]`, for the same reason as
+    /// `always_on_top`/`history_enabled`: `bool::default()` is `false`,
+    /// which would silently turn sanitization *off* for every existing
+    /// settings.json the instant this field was added — the opposite of
+    /// the safe default this field exists to guarantee.
+    #[serde(default = "default_dump_sanitize")]
+    pub dump_sanitize: bool,
 }
 
 /// The `opacity` default (issue #233): restores the panel to the ~78%
@@ -441,6 +482,12 @@ fn default_history_min_duration_ms() -> u64 {
     5_000
 }
 
+/// `Settings::dump_sanitize`'s serde default (issue #346) — see that
+/// field's doc comment for why this can't just be `#[serde(default)]`.
+fn default_dump_sanitize() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         // `Deaths` joins the out-of-the-box set (issue #49) because the
@@ -470,6 +517,7 @@ impl Default for Settings {
             // defaults, and `reset_to_defaults` puts them back.
             header_image: None,
             backdrop_image: None,
+            dump_sanitize: default_dump_sanitize(),
         }
     }
 }
@@ -605,7 +653,7 @@ impl Settings {
 
     /// The image configured for `slot` (issues #121, #253), or `None` for
     /// "paint the default artwork". One accessor over the two fields rather
-    /// than two call-site `match`es: `ui.rs` builds the settings dropdown's
+    /// than two call-site `match`es: `ui/settings.rs` builds the settings dropdown's
     /// two rows, and paints the two regions, from the same code
     /// parameterized by `ImageSlot`.
     pub fn background_image(&self, slot: ImageSlot) -> Option<&Path> {
@@ -1885,6 +1933,7 @@ mod tests {
     fn deaths_column_formats_the_plain_count() {
         let row = PlayerRow {
             uid: 7,
+            entity: 7,
             name: String::new(),
             class: None,
             damage: 0,
@@ -1905,6 +1954,9 @@ mod tests {
             received: Vec::new(),
             casts: Vec::new(),
             buffs: Vec::new(),
+            absorbed_total: 0,
+            immune_total: 0,
+            shield: None,
         };
         assert_eq!((ColumnKind::Deaths.spec().text)(&row), "12");
     }
@@ -2118,5 +2170,73 @@ mod tests {
             ),
             (42, 7, 1_234)
         );
+    }
+
+    /// A shape-only fingerprint of a formatted stat: whether it carries a
+    /// decimal point, a thousands separator, a trailing percent sign, a
+    /// trailing "/s", and (if any) its abbreviation suffix letter. Two
+    /// strings with the same fingerprint could plausibly come out of the
+    /// same formatter even though the digits themselves differ — which is
+    /// exactly the level `ColumnKind::sample_text`'s doc comment promises:
+    /// "shaped like" the real formatter's output, not a frozen snapshot of
+    /// one specific value.
+    fn format_shape(s: &str) -> (bool, bool, bool, bool, Option<char>) {
+        let has_dot = s.contains('.');
+        let has_comma = s.contains(',');
+        let has_percent = s.contains('%');
+        let has_slash_s = s.ends_with("/s");
+        let stripped = s.strip_suffix("/s").unwrap_or(s);
+        let suffix = stripped
+            .trim_end_matches('%')
+            .chars()
+            .last()
+            .filter(|c| c.is_ascii_alphabetic());
+        (has_dot, has_comma, has_percent, has_slash_s, suffix)
+    }
+
+    /// Issue #120's samples claim to be shaped like what `ColumnKind::spec`'s
+    /// real formatter would produce. This runs a representative value
+    /// through each column's actual formatter and checks the sample matches
+    /// its shape: same decimal-point/comma/percent/"/s" presence, and (for
+    /// the abbreviated columns) the same K/M/B-style suffix letter.
+    #[test]
+    fn sample_text_matches_the_real_formatters_shape() {
+        let row = PlayerRow {
+            uid: 1,
+            entity: 1,
+            name: "Tester".to_owned(),
+            class: None,
+            ability_score: Some(1234),
+            season_strength: Some(12),
+            imagines: [None, None],
+            imagine_tiers: [None, None],
+            damage: 1_234_567,
+            dps: 12_345.0,
+            share_pct: 34.5,
+            crit_pct: 48.4,
+            lucky_pct: 9.4,
+            hits: 1_204,
+            deaths: 2,
+            dead_ms: None,
+            skills: Vec::new(),
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
+            buffs: Vec::new(),
+            absorbed_total: 0,
+            immune_total: 0,
+            shield: None,
+        };
+
+        for col in ColumnKind::ALL {
+            let sample = col.sample_text();
+            let real = (col.spec().text)(&row);
+            assert_eq!(
+                format_shape(sample),
+                format_shape(&real),
+                "{col:?}: sample {sample:?} does not match real formatter output {real:?} in shape"
+            );
+        }
     }
 }

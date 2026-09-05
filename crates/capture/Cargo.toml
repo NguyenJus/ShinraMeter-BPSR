@@ -17,4 +17,14 @@ bpsr-protocol = { workspace = true }
 # link it through the import table instead, which the Windows loader resolves
 # before `main` runs — that cannot work when the DLL does not exist yet.
 libloading.workspace = true
-windows = { workspace = true }
+# Issue #337: `Win32_NetworkManagement_IpHelper` for `GetExtendedTcpTable`
+# (owning-pid lookup for a candidate stream) and `Win32_Networking_WinSock`
+# for the `AF_INET` it's called with (see `src/owner.rs`).
+# `Win32_System_Diagnostics_ToolHelp` walks a process snapshot to find the
+# game's own pid by executable name, the same "enumerate + filter by name"
+# approach BPSR-ZDPS's `Utils.GetProcessesFromList` uses.
+windows = { workspace = true, features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_Diagnostics_ToolHelp",
+] }

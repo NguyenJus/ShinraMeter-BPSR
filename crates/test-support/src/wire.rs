@@ -131,6 +131,10 @@ pub fn damage_info(hit: &Hit) -> pb::SyncDamageInfo {
             pb::EDamageType::Miss as i32
         } else if hit.heal {
             pb::EDamageType::Heal as i32
+        } else if hit.absorbed {
+            pb::EDamageType::Absorbed as i32
+        } else if hit.immune {
+            pb::EDamageType::Immune as i32
         } else {
             pb::EDamageType::Normal as i32
         },
@@ -138,7 +142,9 @@ pub fn damage_info(hit: &Hit) -> pb::SyncDamageInfo {
         value: if hit.lucky { 0 } else { hit.value },
         lucky_value: if hit.lucky { hit.value } else { 0 },
         hp_lessen_value: hit.value,
-        attacker_uuid: player_uuid(hit.attacker_uid),
+        attacker_uuid: hit
+            .attacker_uuid
+            .unwrap_or_else(|| player_uuid(hit.attacker_uid)),
         owner_id: hit.skill_id,
         is_dead: hit.kills_target,
         top_summoner_id: if hit.summoner_uid != 0 {
@@ -161,25 +167,13 @@ pub fn damage_delta(target_uuid: i64, dmg: pb::SyncDamageInfo) -> Vec<u8> {
 /// scenario verb needed one until the wipe scenario (issue #342): scripting
 /// a party wipe requires a *player* to die, which means the attacker is the
 /// monster and the target (the `AoiSyncDelta.uuid` the caller wraps this
-/// in) is the player. `skill_id` becomes `owner_id`; per `decode.rs`, a
-/// zero there makes the decoder drop the entry, same as [`damage_info`].
-pub fn monster_damage_info(
-    attacker_monster_uid: i64,
-    skill_id: i32,
-    value: i64,
-    kills_target: bool,
-) -> pb::SyncDamageInfo {
+/// in) is the player. Reuses [`damage_info`]'s flag mapping (crit/lucky/miss/
+/// heal/kill), only repacking `attacker_uuid` via [`monster_uuid`] instead of
+/// [`player_uuid`] — `hit.attacker_uid` is the monster's uid here.
+pub fn monster_damage_info(hit: &Hit) -> pb::SyncDamageInfo {
     pb::SyncDamageInfo {
-        is_miss: false,
-        r#type: pb::EDamageType::Normal as i32,
-        type_flag: 0,
-        value,
-        lucky_value: 0,
-        hp_lessen_value: value,
-        attacker_uuid: monster_uuid(attacker_monster_uid),
-        owner_id: skill_id,
-        is_dead: kills_target,
-        top_summoner_id: 0,
+        attacker_uuid: monster_uuid(hit.attacker_uid),
+        ..damage_info(hit)
     }
 }
 
@@ -287,6 +281,19 @@ pub fn damage_notify_frame(target_uuid: i64, dmg: pb::SyncDamageInfo, compressed
         &payload,
         compressed,
     )
+}
+
+/// Prost-encodes a `NotifyReviveUser` payload (not wrapped in a frame,
+/// issue #272/#339): a bare `v_actor_uuid` naming the revived actor —
+/// `wire::player_uuid(uid)` for a player revive, matching real traffic
+/// (`pb::NotifyReviveUser`'s doc comment).
+pub fn revive_payload(actor_uuid: i64) -> Vec<u8> {
+    let msg = pb::NotifyReviveUser {
+        v_actor_uuid: Some(actor_uuid),
+    };
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+    buf
 }
 
 /// Builds an `Attr` carrying a name, with the stray leading tag byte the
@@ -517,6 +524,22 @@ pub fn notify_join_team_payload(members: Vec<pb::TeamMemData>) -> Vec<u8> {
     buf
 }
 
+/// Prost-encodes a `NotifyLeaveTeam` payload (not wrapped in a frame,
+/// issue #343) for one member leaving or being kicked. `leave_type` is
+/// opaque to this crate's decoder (see `pb::NotifyLeaveTeamRequest`'s doc
+/// comment) — pass any value; `0` for a plain test.
+pub fn notify_leave_team_payload(char_id: i64, leave_type: i32) -> Vec<u8> {
+    let msg = pb::NotifyLeaveTeam {
+        v_request: Some(pb::NotifyLeaveTeamRequest {
+            char_id,
+            leave_type,
+        }),
+    };
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,10 +561,13 @@ mod tests {
 
     #[test]
     fn monster_damage_info_packs_a_monster_attacker_and_can_kill_the_target() {
-        let info = monster_damage_info(2001, 999, 80_000, true);
+        let hit = Hit::new(2001, 999, 80_000).kill();
+        let info = monster_damage_info(&hit);
         assert_eq!(info.attacker_uuid, monster_uuid(2001));
         assert_eq!(info.owner_id, 999);
         assert_eq!(info.value, 80_000);
+        assert_eq!(info.hp_lessen_value, 80_000);
+        assert_eq!(info.r#type, pb::EDamageType::Normal as i32);
         assert!(info.is_dead);
         assert_eq!(info.top_summoner_id, 0);
     }

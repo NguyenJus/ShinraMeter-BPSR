@@ -14510,8 +14510,15 @@ pub fn skill_icon(id: u32) -> Option<&'static str> {
 /// A short manual-override list in `scripts/gen-name-tables.py`
 /// (`BOSS_ID_MANUAL_OVERRIDES`) adds back ids the previous hand-curated list
 /// carried that `MonsterType` does not mark as 2 but that community trackers
-/// fought and flagged as bosses, plus ids whose `MonsterType` is demonstrably
-/// stale (issue #313's World Dominator rotation); see its per-id comments.
+/// fought and flagged as bosses; see its per-id comments.
+///
+/// The World Dominator / Resonance registry, `3000000..=3000081`
+/// (`WORLD_DOMINATOR_BOSS_ID_RANGE`), is unioned in as a range rather than a
+/// per-id override: issue #313 first hand-added the two rotation ids two
+/// sessions happened to hit, and #315 replaced that with the whole registry
+/// block minus `WORLD_DOMINATOR_NON_BOSS_IDS` — the ordinary weapon/role
+/// variant adds the rotation also draws from, not rotation bosses in their
+/// own right; see that constant's doc comment for the criterion.
 ///
 /// Previously hand-curated from `crates/meter/data/MonsterNameBoss.json`
 /// (community-tracker data, GPL-3.0); see `THIRD_PARTY_NOTICES.md` for the
@@ -14554,8 +14561,13 @@ const BOSS_MONSTER_IDS: &[u32] = &[
     1100154, 1100155, 1100156, 1100157, 1205001, 2000104, 2000105, 2000109, 2000110, 2000113,
     2000115, 2000116, 2000121, 2000123, 2000124, 2000127, 2000128, 2000129, 2000131, 2000132,
     2000133, 2000134, 2000135, 2000137, 2000138, 2000139, 2000140, 2000141, 2000199, 2004109,
-    2004120, 2004126, 2004131, 2004152, 2004171, 2004172, 3000000, 3000001, 3000003, 3000006,
-    3000007, 3000022, 3000063, 5026001, 6116001, 7700001,
+    2004120, 2004126, 2004131, 2004152, 2004171, 2004172, 3000000, 3000001, 3000002, 3000003,
+    3000004, 3000005, 3000006, 3000007, 3000008, 3000009, 3000013, 3000016, 3000017, 3000018,
+    3000019, 3000020, 3000021, 3000022, 3000023, 3000024, 3000025, 3000026, 3000027, 3000032,
+    3000033, 3000034, 3000035, 3000036, 3000038, 3000041, 3000043, 3000044, 3000045, 3000046,
+    3000048, 3000051, 3000052, 3000053, 3000055, 3000056, 3000062, 3000063, 3000064, 3000065,
+    3000066, 3000067, 3000068, 3000069, 3000070, 3000071, 3000072, 3000073, 3000074, 3000075,
+    3000076, 3000077, 3000078, 3000079, 3000080, 3000081, 5026001, 6116001, 7700001,
 ];
 
 /// Whether `id` is a known boss-monster template id (issue #42) — i.e.
@@ -14650,7 +14662,7 @@ pub fn is_dungeon_scene(id: u32) -> bool {
 /// `EncounterInfo::scene_boss_name`, i.e. the header caption *before* — or
 /// without — a boss hit. The moment a recognized boss is actually engaged the
 /// live lock in `Meter::recompute_boss` takes over and `encounter_title`
-/// (`crates/app/src/ui.rs`) prefers it, so a multi-boss dungeon has nothing to
+/// (`crates/app/src/ui/header.rs`) prefers it, so a multi-boss dungeon has nothing to
 /// gain here and everything to get wrong. Raid scenes
 /// (`phase::is_boss_select_scene`) are suppressed outright and must never
 /// appear.
@@ -14778,18 +14790,56 @@ mod tests {
     }
 
     #[test]
-    fn is_boss_monster_true_for_the_world_dominator_rotation() {
-        // Issue #313: scene 7152 rotates its world boss nightly, and two
-        // consecutive sessions ended on these two ids. `MonsterTable.json`
-        // marks both `MonsterType == 0`, but so is every one of the 76
-        // non-boss rows in the 3000000..=3000081 World Dominator registry,
-        // and all 76 also carry `BloodTubeCount == 0` — a world boss with no
-        // health bars is an unfilled row, not a classification. Unrecognized,
-        // they cost the meter a full wipe mid-pull: `is_engaged_recognized_boss`
-        // went false, issue #151's fight hold dropped, and a 9s immunity
-        // window ended the encounter at 41.8% boss HP.
-        assert!(is_boss_monster(3_000_063)); // Denvel; base template 1701 is MonsterType 2
-        assert!(is_boss_monster(3_000_022)); // Muku Chief - Resonance
+    fn is_boss_monster_true_for_the_entire_world_dominator_registry() {
+        // Issue #313 first covered only the two rotation ids two consecutive
+        // sessions happened to hit (3000022, 3000063) via
+        // `BOSS_ID_MANUAL_OVERRIDES` — whack-a-mole, since the nightly
+        // rotation draws from all 81 populated rows of the registry. Issue
+        // #315 replaces that with `WORLD_DOMINATOR_BOSS_ID_RANGE`
+        // (3000000..=3000081) in `scripts/gen-name-tables.py`, minus
+        // `WORLD_DOMINATOR_NON_BOSS_IDS` — the ordinary weapon/role variant
+        // adds the rotation also draws from, not rotation bosses in their own
+        // right (see that constant's doc comment for the criterion).
+        // `EXCLUDED` below is rendered straight from
+        // `WORLD_DOMINATOR_NON_BOSS_IDS` at generation time.
+        #[rustfmt::skip]
+        const EXCLUDED: &[u32] = &[3_000_010, 3_000_011, 3_000_012, 3_000_014, 3_000_015, 3_000_028, 3_000_029, 3_000_030, 3_000_031, 3_000_037, 3_000_039, 3_000_040, 3_000_042, 3_000_047, 3_000_049, 3_000_050, 3_000_054, 3_000_057, 3_000_058, 3_000_059, 3_000_060, 3_000_061];
+        for id in 3_000_000..=3_000_081u32 {
+            assert_eq!(
+                is_boss_monster(id),
+                !EXCLUDED.contains(&id),
+                "expected {id} boss status to match WORLD_DOMINATOR_NON_BOSS_IDS"
+            );
+        }
+        // Named pin: a weapon/role variant add, not a rotation boss.
+        assert!(!is_boss_monster(3_000_010));
+        // Just outside the registry block: must not be swept in. Each assert
+        // is only emitted when the id is absent from both
+        // `MonsterTableBossIds.json` and `BOSS_ID_MANUAL_OVERRIDES` at
+        // generation time, so this can never assert the opposite of what a
+        // future upstream refresh actually classifies the boundary id as.
+        assert!(!is_boss_monster(2_999_999));
+        assert!(!is_boss_monster(3_000_082));
+
+        // Every id the registry actually populates also has a name — upstream
+        // itself leaves 3000005 unfilled (no row at all in
+        // `MonsterTable.json`, in any community file), so that one id is
+        // excluded here rather than asserted to have a name nothing upstream
+        // gives it.
+        for id in 3_000_000..=3_000_081u32 {
+            if id == 3_000_005 {
+                assert_eq!(monster_name(id), None);
+                continue;
+            }
+            assert!(
+                monster_name(id).is_some_and(|n| !n.is_empty()),
+                "expected {id} to have a non-empty name"
+            );
+        }
+        // Denvel (3000063) and Muku Chief - Resonance (3000022) are the two
+        // ids issue #313 had direct log evidence for; still pinned by name.
+        assert_eq!(monster_name(3_000_063), Some("Denvel"));
+        assert_eq!(monster_name(3_000_022), Some("Muku Chief - Resonance"));
     }
 
     #[test]

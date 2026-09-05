@@ -3,7 +3,7 @@
 //!
 //! Issue #11: Windows' Snap subsystem only engages inside the OS's own
 //! modal move/resize loops, which `ViewportCommand::StartDrag` (`SC_MOVE`)
-//! and `ViewportCommand::BeginResize` (`SC_SIZE`) used to enter. `ui.rs`
+//! and `ViewportCommand::BeginResize` (`SC_SIZE`) used to enter. The `ui` module
 //! no longer uses either: `ui::draw_header` and `ui::draw_resize_handles`
 //! now track the pointer themselves and drive the window with
 //! `ViewportCommand::OuterPosition`/`InnerSize`, so no native loop — and
@@ -32,7 +32,7 @@
 //! from a shell-initiated Snap by an exemption flag with two scopes:
 //! `app_driven_reposition` for a single `SetWindowPos` call (this file's
 //! own `clamp_window_to_visible_area`), and `begin_app_driven_reposition`
-//! for a whole `ui.rs` move/resize gesture, whose queued viewport commands
+//! for a whole `ui` module move/resize gesture, whose queued viewport commands
 //! winit turns into `SetWindowPos` calls of its own long after any closure
 //! would have returned.
 //!
@@ -113,7 +113,7 @@ pub fn disable_aero_snap(cc: &eframe::CreationContext<'_>) {
     // to a pointer on the way in (and back to an integer on the way into
     // `OVERLAY_HWND` below).
     let hwnd = HWND(win32.hwnd.get() as *mut std::ffi::c_void);
-    // Cached so `force_frame_recompute` — called from `ui.rs`, which only
+    // Cached so `force_frame_recompute` — called from the `ui` module, which only
     // ever has an `egui::Context`, never a window handle — can find this
     // window later without resorting to `GetForegroundWindow` or
     // thread-window enumeration, either of which can resolve to the wrong
@@ -209,7 +209,7 @@ pub fn disable_aero_snap(_cc: &eframe::CreationContext<'_>) {}
 /// `force_frame_recompute` treats as a safe no-op.
 ///
 /// A cached value rather than a fresh lookup at call time deliberately:
-/// `force_frame_recompute` runs from `ui.rs` call sites that only have an
+/// `force_frame_recompute` runs from `ui` module call sites that only have an
 /// `egui::Context`, and both `GetForegroundWindow` and enumerating this
 /// thread's windows risk resolving to a *different* window (another
 /// always-on-top overlay, or whatever has focus mid-gesture) instead of this
@@ -231,7 +231,7 @@ static OVERLAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicI
 /// real fix in `main.rs` / `third_party/egui-winit`. What it *does* do is
 /// force a frame/non-client recompute, which remains the correct thing to
 /// do after a resize the window manager didn't drive itself (since issue
-/// #11's rework, `ui.rs`'s manual drag-resize goes through
+/// #11's rework, the `ui` module's manual drag-resize goes through
 /// `ViewportCommand::OuterPosition`/`InnerSize`/`MinInnerSize`, never a raw
 /// `SetWindowPos`, so Win32 is never told the frame moved).
 ///
@@ -239,7 +239,7 @@ static OVERLAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicI
 /// side-effect-free under the no-op flags below, and the honest state of
 /// knowledge is "harmless and probably right", not "proven useless". It
 /// uses the `HWND` `disable_aero_snap` cached in `OVERLAY_HWND` above
-/// rather than a handle of its own — the `ui.rs` call sites don't have one.
+/// rather than a handle of its own — the `ui` module call sites don't have one.
 ///
 /// `SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE` means this
 /// changes nothing but the frame, exactly like `disable_aero_snap`'s own
@@ -379,7 +379,7 @@ impl Rect {
 /// between points and physical pixels or accounts for per-monitor DPI — it
 /// stays entirely in the same physical-pixel, virtual-screen space Win32
 /// itself uses (`GetWindowRect`, `MONITORINFO.rcWork`) — so this is a
-/// deliberately approximate stand-in for `ui.rs`'s point-based header
+/// deliberately approximate stand-in for the `ui` module's point-based header
 /// height, not a scaled match to it; only "comfortably smaller than a real
 /// header" matters here.
 #[cfg(any(windows, test))]
@@ -735,7 +735,7 @@ fn enumerate_monitor_work_areas() -> Vec<Rect> {
 /// position clamp landing on exactly half the screen.
 ///
 /// This closure form is *not* enough for the manual move/resize gestures
-/// in `ui.rs`: those don't call `SetWindowPos` themselves, they queue
+/// in the `ui` module: those don't call `SetWindowPos` themselves, they queue
 /// `ViewportCommand::OuterPosition`/`InnerSize`, which winit applies
 /// later in the frame — long after any closure here would have returned.
 /// Those use `begin_app_driven_reposition` below instead, which holds the
@@ -746,7 +746,7 @@ fn enumerate_monitor_work_areas() -> Vec<Rect> {
 /// not unrelated work that happens to run alongside it.
 ///
 /// Gated the same way the geometry helpers are: every caller is a
-/// `#[cfg(windows)]` `SetWindowPos` site (`ui.rs` uses the guard form
+/// `#[cfg(windows)]` `SetWindowPos` site (the `ui` module uses the guard form
 /// instead), so an ungated definition is dead code on a Linux host build.
 #[cfg(any(windows, test))]
 pub fn app_driven_reposition<R>(f: impl FnOnce() -> R) -> R {
@@ -756,7 +756,7 @@ pub fn app_driven_reposition<R>(f: impl FnOnce() -> R) -> R {
 
 /// Opens an app-driven-reposition exemption that lasts until the returned
 /// guard is dropped, rather than for one closure call. This is what a
-/// manual move/resize gesture in `ui.rs` holds for its whole duration:
+/// manual move/resize gesture in the `ui` module holds for its whole duration:
 /// the `ViewportCommand`s it queues are applied by winit later in the
 /// frame, so every `SetWindowPos` winit issues in between has to be
 /// exempt, not just the moment the command was queued.
@@ -949,7 +949,7 @@ fn oversize_windowpos_patch(response: OversizeResponse) -> OversizeWindowPosPatc
 ///   (enforced by `SetWindowPos`'s doc comment), so `gesture_active` names
 ///   it outright;
 /// - winit — which is what every `ViewportCommand::InnerSize`/
-///   `OuterPosition` from `ui.rs` becomes — always sets
+///   `OuterPosition` from the `ui` module becomes — always sets
 ///   `SWP_ASYNCWINDOWPOS`, and always pins one of `SWP_NOMOVE`/
 ///   `SWP_NOSIZE`, since it never moves and resizes in one call;
 /// - `MoveWindow` expands to `SetWindowPos` with exactly
@@ -973,7 +973,7 @@ fn proposal_origin_hint(flags: u32, gesture_active: bool) -> &'static str {
         return "this process (an app_driven_reposition is in flight)";
     }
     if flags & SWP_ASYNCWINDOWPOS_BIT != 0 {
-        return "winit (SWP_ASYNCWINDOWPOS), i.e. an egui ViewportCommand from ui.rs";
+        return "winit (SWP_ASYNCWINDOWPOS), i.e. an egui ViewportCommand from the ui module";
     }
     let moves_and_resizes = flags & (SWP_NOMOVE_BIT | SWP_NOSIZE_BIT) == 0;
     let move_window_shape = flags & !SWP_NOREDRAW_BIT == SWP_NOZORDER_BIT | SWP_NOACTIVATE_BIT;
@@ -1327,7 +1327,7 @@ fn is_snap_shaped(proposed: Rect, monitors: &[Rect]) -> bool {
 /// positive signal that a Snap gesture is in flight, and none exists for the
 /// paths this has to block: `WM_SYSCOMMAND`/`SC_MOVE`/`SC_SIZE` and
 /// `WM_ENTERSIZEMOVE` mark the OS's modal move/resize loops, which Win+Arrow
-/// and shell maximize never enter (and which `ui.rs`'s pointer-delta header
+/// and shell maximize never enter (and which the `ui` module's pointer-delta header
 /// drag and resize handles deliberately never enter either, so gating on
 /// them would block nothing and break nothing — it would just turn the veto
 /// off). The consequence of the remaining false positive is bounded: the
@@ -1427,7 +1427,7 @@ const SNAP_BLOCKER_SUBCLASS_ID: usize = 1;
 ///   the shell is rescuing it off a monitor that just got unplugged).
 ///   Legitimate app-driven repositioning is exempted via
 ///   `app_driven_reposition` (one `SetWindowPos` call) or
-///   `begin_app_driven_reposition` (a whole `ui.rs` move/resize gesture) —
+///   `begin_app_driven_reposition` (a whole `ui` module move/resize gesture) —
 ///   every such site must hold one, or it risks being vetoed here.
 /// - `WM_SYSCOMMAND` / `SC_MAXIMIZE`: a backstop for the shell's maximize
 ///   command directly, independent of whatever rect it would propose.
@@ -1686,7 +1686,7 @@ unsafe extern "system" fn window_proc(
 
 /// Whether `window_proc`'s `WM_NCHITTEST` branch should carve out the
 /// click-through button (issue #167 rehash). Mirrors `Settings::
-/// click_through` — `ui.rs` calls `set_click_through` every time that
+/// click_through` — `ui/mod.rs` calls `set_click_through` every time that
 /// field changes: on the toggle-cluster button's own click, when
 /// `OverlayApp::ui` re-applies a saved setting on its first frame, and
 /// when a tray-issued turn-off request is synced. A plain atomic for the
@@ -1726,7 +1726,7 @@ static CLICK_THROUGH_BUTTON_RECT_SET: std::sync::atomic::AtomicBool =
 
 /// Set by the tray menu's "Turn off click-through" command
 /// (`request_click_through_off`) and taken (checked and cleared) by
-/// `ui.rs`'s `OverlayApp::ui` once per frame via
+/// `ui/mod.rs`'s `OverlayApp::ui` once per frame via
 /// `take_tray_click_through_off_request`, the same "poll a flag every
 /// frame" shape the deleted `Ctrl+Alt+P` hotkey check used. The actual
 /// OS-level passthrough is already off the instant the tray click lands —
@@ -1784,7 +1784,7 @@ fn click_through_button_rect() -> Option<Rect> {
 }
 
 /// Issue #183: whether the overlay's window should be OS-level
-/// mouse-passthrough *right now* — the value `ui.rs` reconciles into
+/// mouse-passthrough *right now* — the value the `ui` module reconciles into
 /// `egui::ViewportCommand::MousePassthrough` (winit's `WS_EX_TRANSPARENT`)
 /// once per frame.
 ///
@@ -1797,17 +1797,20 @@ fn click_through_button_rect() -> Option<Rect> {
 /// toggle looked enabled while doing nothing. `WS_EX_TRANSPARENT` is the
 /// bit that actually does it.
 ///
-/// `WS_EX_TRANSPARENT` was rejected the first time round (see `ui.rs`'s
+/// `WS_EX_TRANSPARENT` was rejected the first time round (see the `ui` module's
 /// toggle-cluster section comment) because it is a whole-window flag with
 /// no per-region carve-out, so the very button that turns click-through
 /// back off went unclickable with it. That is what this function solves:
 /// the flag is reconciled *every frame against the OS cursor's own
 /// position*, so while the cursor is inside the published button hit box
 /// the answer is `false` and the button is reachable exactly as before, and
-/// it flips back to `true` the moment the cursor leaves. `OverlayApp::ui`
-/// repaints at ~10Hz unconditionally, which is what keeps that
-/// reconciliation running while the window itself receives no mouse input
-/// at all.
+/// it flips back to `true` the moment the cursor leaves. The overlay stops
+/// receiving mouse input entirely while click-through is on, so nothing
+/// about the cursor moving can schedule a frame; what keeps this
+/// reconciliation running is that `OverlayApp::ui` feeds
+/// `Settings::click_through` into `ui::repaint::RepaintInputs`'
+/// `click_through_active`, which holds the 100 ms transient cadence for as
+/// long as click-through is on (issues #349, #350).
 ///
 /// The decision is `click_through_hit_test`'s, not a second copy of it: a
 /// point that would hit-test `Transparent` is exactly a point the window
@@ -2074,14 +2077,14 @@ fn default_window_rect(work_area: Rect, size: (i32, i32)) -> Rect {
 ///
 /// # How the minimize is intercepted
 ///
-/// `ui.rs`'s minimize button queues `ViewportCommand::Minimized(true)`,
+/// `ui/menu.rs`'s minimize button queues `ViewportCommand::Minimized(true)`,
 /// which winit turns into a plain `ShowWindow(SW_MINIMIZE)` — not a
 /// `WM_SYSCOMMAND`/`SC_MINIMIZE`, so hooking that would catch nothing. What
 /// *is* guaranteed to arrive either way is `WM_SIZE` with `SIZE_MINIMIZED`,
 /// so the subclass installed here waits for that, lets winit process it
 /// normally, and only then hides the window. Hooking the message rather than
 /// the button means every route to a minimized overlay (the in-app button,
-/// Win+D, a shell "minimize all") lands in the tray, and `ui.rs` needs no
+/// Win+D, a shell "minimize all") lands in the tray, and the `ui` module needs no
 /// call-site change.
 ///
 /// `ShowWindow(SW_HIDE)` is the part that removes the taskbar entry:
@@ -2184,7 +2187,7 @@ pub fn install_tray(_cc: &eframe::CreationContext<'_>, _default_inner_size: Opti
 /// comment for the overall flow.
 ///
 /// `WM_SIZE`/`SIZE_MINIMIZED` is forwarded to `DefSubclassProc` *before*
-/// hiding, so winit finishes recording the minimize (and `ui.rs`'s
+/// hiding, so winit finishes recording the minimize (and the `ui` module's
 /// `track_window_position` sees the minimized flag and skips persisting
 /// Windows' `-32000` parking coordinates) before the window disappears.
 #[cfg(windows)]
@@ -2669,7 +2672,7 @@ fn show_tray_menu(hwnd: windows::Win32::Foundation::HWND) {
 /// alongside the toggle-cluster button's own always-clickable carve-out.
 ///
 /// Clears `CLICK_THROUGH_ENABLED` directly, here, rather than only raising
-/// `TRAY_CLICK_THROUGH_OFF_REQUESTED` and waiting for `ui.rs` to act on it
+/// `TRAY_CLICK_THROUGH_OFF_REQUESTED` and waiting for the `ui` module to act on it
 /// next frame: this is the fallback for when the carve-out itself might be
 /// unreliable, so the actual OS-level passthrough should stop the instant
 /// the tray command runs, independent of whether or when another frame
@@ -2685,10 +2688,10 @@ fn request_click_through_off() {
 }
 
 /// The pointer's current position in screen space (egui points), sourced
-/// directly from the OS rather than reconstructed from the window `ui.rs` is
+/// directly from the OS rather than reconstructed from the window the `ui` module is
 /// itself moving.
 ///
-/// Issue #68: `ui.rs`'s manual move/resize gestures (issue #11 — see this
+/// Issue #68: the `ui` module's manual move/resize gestures (issue #11 — see this
 /// module's top-level doc comment for why they can't use
 /// `ViewportCommand::StartDrag`/`BeginResize`) used to derive the
 /// screen-space pointer as `outer_rect.min + pointer.latest_pos()`: the
@@ -2708,7 +2711,7 @@ fn request_click_through_off() {
 /// `GetCursorPos` sidesteps this entirely: it reads the OS's own cursor
 /// position, which nothing the window does can perturb. This is the same
 /// call winit itself makes in its own `handle_os_dragging` before entering a
-/// native `SC_MOVE`/`SC_SIZE` loop. `ui.rs`'s `window_and_pointer` calls this
+/// native `SC_MOVE`/`SC_SIZE` loop. `ui/mod.rs`'s `window_and_pointer` calls this
 /// first and only falls back to the old window-relative reconstruction when
 /// it returns `None` — non-Windows dev hosts, where the gesture is cosmetic
 /// and the drift this fixes is harmless.
@@ -2758,7 +2761,7 @@ fn cursor_points(x: i32, y: i32, pixels_per_point: f32) -> egui::Pos2 {
 }
 
 /// Writes `image` to the system clipboard as an image (issue #82's Share
-/// button — `ui.rs`'s `handle_screenshot_events` calls this once an
+/// button — `ui/header.rs`'s `handle_screenshot_events` calls this once an
 /// `Event::Screenshot` reply arrives). Windows-gated like the rest of this
 /// module, per the app's own convention.
 ///
@@ -2828,7 +2831,7 @@ fn wide(s: &str) -> Vec<u16> {
 /// Synchronous and blocking, deliberately unlike `http_get`'s "always call
 /// from a spawned thread" rule: `GetSaveFileNameW` is itself a modal
 /// dialog — the OS already blocks input to its owner window for as long as
-/// it's up — so calling it straight from `ui.rs`'s click handler adds no
+/// it's up — so calling it straight from the `ui` module's click handler adds no
 /// blocking that wasn't already going to happen.
 ///
 /// That reasoning covers this dialog and nothing after it (PR #227
@@ -2945,7 +2948,7 @@ pub fn choose_log_export_path(default_filename: &str) -> Option<std::path::PathB
 
 /// Non-Windows stub — see [`save_as_dialog`]'s doc comment. Dev/CI hosts
 /// for this crate are Linux, so there is no native save dialog to call;
-/// `ui.rs`'s click handler treats `None` as "the user didn't pick a
+/// the `ui` module's click handler treats `None` as "the user didn't pick a
 /// destination" either way, which is also the correct behavior here.
 #[cfg(not(windows))]
 pub fn choose_log_export_path(_default_filename: &str) -> Option<std::path::PathBuf> {
@@ -3490,7 +3493,7 @@ mod tests {
     /// Win32 uses non-positive extents in some proposals (and an
     /// `SWP_NOSIZE` proposal leaves the fields meaningless entirely); this
     /// is a ceiling only, so it must not invent a floor of its own —
-    /// minimum sizing is `MIN_INNER_SIZE`'s job, over in `ui.rs`.
+    /// minimum sizing is `MIN_INNER_SIZE`'s job, over in `ui/mod.rs`.
     #[test]
     fn a_non_positive_extent_is_not_the_clamps_business() {
         assert_eq!(clamped_window_extent(0, -1), None);

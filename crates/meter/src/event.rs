@@ -25,12 +25,59 @@ pub fn uid_of(uuid: i64) -> i64 {
     uuid >> 16
 }
 
-/// `entity_kind = uuid & 0xFFFF`; `640` = player, `64` = monster.
-pub fn kind_of(uuid: i64) -> EntityKind {
-    match uuid & 0xFFFF {
-        640 => EntityKind::Player,
-        64 => EntityKind::Monster,
-        _ => EntityKind::Unknown,
+/// Bit offset of the entity-type field inside a uuid, and the two type
+/// values this meter models. Mirrors `bpsr_protocol::entity`'s copy — see
+/// `bpsr_protocol::event::kind_of` for the layout and its sourcing.
+const ENT_TYPE_SHIFT: u32 = 6;
+const ENT_CHAR: i64 = 10;
+const ENT_MONSTER: i64 = 1;
+
+/// One entity's stable identity: the whole wire `uuid`, not the truncated
+/// `uuid >> 16` this meter used to key on (issue #335). Mirrors
+/// `bpsr_protocol::entity::EntityId` exactly.
+///
+/// The truncation is lossy in two ways that corrupt damage attribution: a
+/// server session recycles a `uuid >> 16` onto an unrelated entity, and a
+/// shadow/mirror entity (a summon, a client-side copy) differs from its
+/// original only in the flag bits the shift discards. Either way two
+/// entities collapse onto one key and their stats blend. Every per-entity
+/// map in this crate is therefore keyed on this type, while every *display*
+/// surface — rows, the name cache, history — keeps showing
+/// [`EntityId::display_uid`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EntityId(pub u64);
+
+impl EntityId {
+    /// The identity of an entity nothing has named. `uuid == 0` is not a
+    /// valid entity on the wire, so this can never collide with a real one.
+    pub const UNKNOWN: EntityId = EntityId(0);
+
+    pub fn from_uuid(uuid: i64) -> Self {
+        EntityId(uuid as u64)
+    }
+
+    pub fn uuid(self) -> i64 {
+        self.0 as i64
+    }
+
+    /// The short number every display surface shows. Not unique — that is
+    /// the whole reason this type exists — so never key state on it.
+    pub fn display_uid(self) -> i64 {
+        uid_of(self.uuid())
+    }
+
+    /// The canonical identity for a source that knows only a display uid and
+    /// a kind, reconstructing the uuid such a uid would have with both flag
+    /// bits clear. Mirrors `bpsr_protocol::entity::EntityId::from_display_uid`,
+    /// so a uid-only source and the AOI channel agree on the same id for any
+    /// entity that is neither a summon nor client-side.
+    pub fn from_display_uid(uid: i64, kind: EntityKind) -> Self {
+        let type_bits = match kind {
+            EntityKind::Player => ENT_CHAR,
+            EntityKind::Monster => ENT_MONSTER,
+            EntityKind::Unknown => 0,
+        };
+        EntityId::from_uuid((uid << 16) | (type_bits << ENT_TYPE_SHIFT))
     }
 }
 
@@ -118,7 +165,7 @@ impl Class {
 }
 
 /// Combat role a `Class` fills (issue #44): drives the row share-bar's hue
-/// in the UI (`crates/app/src/ui.rs`). See `Class::role` for the mapping and
+/// in the UI (`crates/app/src/ui/table.rs`). See `Class::role` for the mapping and
 /// its source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
@@ -127,12 +174,33 @@ pub enum Role {
     Damage,
 }
 
+/// Mirrors `bpsr_protocol::event::DamageKind` (issue #338): which of the
+/// (evidenced) absorbed/immune channels a hit's `value` belongs to, beyond
+/// the existing `is_miss`/`is_heal` booleans.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DamageKind {
+    #[default]
+    Normal,
+    /// The target's shield (`AttrShieldList`) fully absorbed this hit —
+    /// `value` is shield damage, not a change to the target's HP, so it
+    /// must not be folded into `damage`/DPS.
+    Absorbed,
+    /// The target was immune to this hit.
+    Immune,
+}
+
 /// A single damage (or miss/heal) event, already fully resolved by the
 /// protocol layer (pet -> summoner attribution, crit/lucky bits, effective
 /// value) per plan §0.6. All timestamps are supplied by the caller — no
 /// `Instant::now()` inside this pure crate.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DamageEvent {
+    /// Who dealt this hit (issue #335). Mirrors
+    /// `bpsr_protocol::DamageEvent::attacker`; this — not `attacker_uid` —
+    /// is what the meter keys the attacker's row on.
+    pub attacker: EntityId,
+    /// `attacker.display_uid()`: the number the row prints and the name
+    /// cache is keyed on. Not unique; never key stats on it.
     pub attacker_uid: i64,
     pub attacker_kind: EntityKind,
     pub skill_id: i32,
@@ -142,6 +210,12 @@ pub struct DamageEvent {
     pub hp_lessen: i64,
     pub is_miss: bool,
     pub is_heal: bool,
+    /// Mirrors `bpsr_protocol::DamageEvent::kind` (issue #338).
+    pub kind: DamageKind,
+    /// Who was hit (issue #335) — the counterpart of `attacker` above, and
+    /// what the meter keys enemy state on.
+    pub target: EntityId,
+    /// `target.display_uid()`. Display only; see `attacker_uid`.
     pub target_uid: i64,
     pub target_kind: EntityKind,
     pub timestamp_ms: u64,
@@ -152,10 +226,36 @@ pub struct DamageEvent {
     pub is_dead: bool,
 }
 
+#[cfg(test)]
+impl DamageEvent {
+    /// Test-only reconstruction of `attacker`/`target` from the uid/kind
+    /// pair a hand-built event already carries (issue #335).
+    ///
+    /// Every event the decoder produces already carries a real `attacker`/
+    /// `target`, so production code never needs this — it reads those
+    /// fields directly. This crate's own unit tests build events from a
+    /// display uid alone, so this fills in the same canonical
+    /// reconstruction `EntityId::from_display_uid` gives any other uid-only
+    /// source, and it is the same one `bpsr_protocol` would synthesise for
+    /// it.
+    pub(crate) fn test_reconstructed(mut self) -> Self {
+        if self.attacker == EntityId::UNKNOWN {
+            self.attacker = EntityId::from_display_uid(self.attacker_uid, self.attacker_kind);
+        }
+        if self.target == EntityId::UNKNOWN {
+            self.target = EntityId::from_display_uid(self.target_uid, self.target_kind);
+        }
+        self
+    }
+}
+
 /// Mirrors `bpsr_protocol::event::CastEvent` (issue #245): one skill
 /// activation, with no amount attached. See that type for the wire source.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CastEvent {
+    /// Who cast (issue #335).
+    pub caster: EntityId,
+    /// `caster.display_uid()`. Display only.
     pub caster_uid: i64,
     pub skill_id: i32,
     pub timestamp_ms: u64,
@@ -163,6 +263,9 @@ pub struct CastEvent {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PlayerInfo {
+    /// This player's stable identity (issue #335).
+    pub entity: EntityId,
+    /// `entity.display_uid()`. Display only.
     pub uid: i64,
     pub name: Option<String>,
     pub class: Option<Class>,
@@ -192,10 +295,18 @@ pub struct PlayerInfo {
     /// element type to leave that already-established `[Option<i32>; 2]`
     /// id shape (and its many existing callers/tests) undisturbed.
     pub imagine_tiers: Option<[Option<i32>; 2]>,
+    /// Current total shield value. Mirrors
+    /// `bpsr_protocol::PlayerInfo::shield` (issue #338) — see there for the
+    /// `None` (attr absent from this delta) vs `Some(0)` (known to be no
+    /// shield right now) distinction.
+    pub shield: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EnemyHp {
+    /// This enemy's stable identity (issue #335).
+    pub entity: EntityId,
+    /// `entity.display_uid()`. Display only.
     pub uid: i64,
     pub curr_hp: Option<u64>,
     pub max_hp: Option<u64>,
@@ -296,12 +407,18 @@ pub enum ProtocolEvent {
     /// [`DisappearReason::Dead`] says the enemy died, and a `None` falls
     /// back to the HP/engagement heuristic. See `Meter::apply_enemy_gone`.
     EnemyGone {
+        /// The departing enemy's stable identity (issue #335).
+        entity: EntityId,
+        /// `entity.display_uid()`. Display only.
         uid: i64,
         reason: Option<DisappearReason>,
     },
     /// Mirrors `bpsr_protocol::ProtocolEvent::BuffApply` (issue #267). See
     /// `Meter::apply_buff_apply` for what the meter does with it.
     BuffApply {
+        /// The buffed entity's stable identity (issue #335).
+        host: EntityId,
+        /// `host.display_uid()`. Display only.
         host_uid: i64,
         buff_uuid: i32,
         base_id: Option<i32>,
@@ -311,10 +428,61 @@ pub enum ProtocolEvent {
     /// Mirrors `bpsr_protocol::ProtocolEvent::BuffRemove` (issue #267). See
     /// `Meter::apply_buff_remove`.
     BuffRemove {
+        /// The buffed entity's stable identity (issue #335).
+        host: EntityId,
+        /// `host.display_uid()`. Display only.
         host_uid: i64,
         buff_uuid: i32,
         removes_layer: bool,
         timestamp_ms: u64,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::EntityState` (issue
+    /// #339/#272): an entity's decoded `AttrState`, `is_dead` boiled down
+    /// from the wire's full `EActorState` enum. Emitted for both players and
+    /// monsters. See `Meter::apply` for how each side folds it in.
+    EntityState {
+        /// The entity's stable identity (issue #335) — what the meter keys
+        /// player/enemy state on.
+        entity: EntityId,
+        /// `entity.display_uid()`. Display only.
+        uid: i64,
+        kind: EntityKind,
+        is_dead: bool,
+        timestamp_ms: u64,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::Revive` (issue #272): the
+    /// dedicated `WorldNtf.NotifyReviveUser` (opcode `0x27`) signal — the
+    /// exact revive moment, replacing the inferred "next action implies
+    /// alive" fallback for any player whose revive this actually observes.
+    Revive {
+        /// The revived player's stable identity (issue #335).
+        entity: EntityId,
+        /// `entity.display_uid()`. Display only.
+        uid: i64,
+        timestamp_ms: u64,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::TeamMemberLeft` (issue #343):
+    /// one party member left or was kicked. See
+    /// `Meter::apply_team_member_left`.
+    TeamMemberLeft {
+        uid: i64,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::TeamRoster` (issue #343): the
+    /// authoritative party/raid roster as of the `NotifyJoinTeam` push this
+    /// was decoded alongside. See `Meter::apply_team_roster`.
+    TeamRoster {
+        members: Vec<i64>,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::LocalPlayer` (issue #344):
+    /// the local player's own uid, decoded from
+    /// `SyncContainerData.v_data.char_id`. Session-scoped like
+    /// `dungeon_state`/`objectives`: survives both `Meter::reset` and
+    /// `ServerChanged`, since `char_id` is the persistent character id
+    /// (not a per-session entity uuid) and stays valid across a server
+    /// change. A later `LocalPlayer` event simply overwrites the stored
+    /// value. Never cleared. See `Snapshot::local_uid`.
+    LocalPlayer {
+        uid: i64,
     },
 }
 

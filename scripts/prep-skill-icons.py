@@ -15,6 +15,15 @@ curated skill overrides and of the full client skill table, produced by
 `scripts/gen-name-tables.py`) are copied, so the redistributed set stays as small as the feature needs — the
 same discipline the Imagine icons follow.
 
+Issue #348: a basename listed in `scripts/_skill_aliases.py`'s `DUPLICATE_ALIASES`
+is a confirmed byte-identical duplicate of another committed basename, so no PNG
+is written for it here — its own file was deleted deliberately, and
+`scripts/gen-skill-icons.py` keeps the alias resolving to the canonical
+basename's shared bytes. Before skipping it, this script re-prepares both
+upstream sources (through the same downscale-and-mask transform normal icons
+get) and hard-fails if they no longer come out byte-identical, so a re-run
+against a newer client dump cannot silently ship a stale alias.
+
 Upstream splits the icons across two sibling directories, and the `Icon` field
 does not say which: `Data/Images/Skills/` holds the regular skill icons and
 `Data/Images/Skills_Imagines/` the Imagine ones, and referenced basenames land
@@ -42,6 +51,7 @@ placeholder at draw time.
 """
 
 import importlib
+import io
 import json
 import pathlib
 import sys
@@ -63,6 +73,7 @@ OUT = ROOT / "crates" / "app" / "assets" / "skills"
 # never drift into two different maskings of the same source art.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 _imagine = importlib.import_module("prep-imagine-icons")
+from _skill_aliases import DUPLICATE_ALIASES  # noqa: E402 (needs sys.path above)
 
 # Rendered at 24pt (see `SKILL_ICON_SIZE` in `crates/app/src/ui.rs`).
 SIZE = 48
@@ -99,14 +110,45 @@ def main() -> None:
     if not found:
         sys.exit(f"no referenced icon found under {images} — wrong directory?")
 
+    # Issue #348: an alias's own PNG was deleted deliberately as a confirmed
+    # byte-identical duplicate of its canonical basename, and
+    # `scripts/gen-skill-icons.py` keeps it resolving to the canonical's
+    # shared bytes — writing it back here would just recreate the file the
+    # refresh is meant to keep deleted. Re-verify the byte-identity claim
+    # against the current client dump before skipping, so a future client
+    # update that changes one of the two arts fails loudly instead of
+    # silently shipping a stale alias.
+    for alias, canonical in DUPLICATE_ALIASES.items():
+        if alias not in found or canonical not in found:
+            sys.exit(
+                f"alias {alias} -> {canonical} (scripts/_skill_aliases.py) but one or "
+                f"both basenames are missing from {images}"
+            )
+        alias_bytes = io.BytesIO()
+        _imagine.prepare(Image.open(found[alias]), SIZE).save(alias_bytes, format="PNG", optimize=True)
+        canonical_bytes = io.BytesIO()
+        _imagine.prepare(Image.open(found[canonical]), SIZE).save(
+            canonical_bytes, format="PNG", optimize=True
+        )
+        if alias_bytes.getvalue() != canonical_bytes.getvalue():
+            sys.exit(
+                f"alias {alias} -> {canonical} (scripts/_skill_aliases.py) no longer "
+                f"prepares to byte-identical PNGs — the client art diverged; drop the "
+                f"alias entry and let {alias} get its own committed PNG again"
+            )
+        del found[alias]
+
     OUT.mkdir(parents=True, exist_ok=True)
     for name, src in found.items():
         _imagine.prepare(Image.open(src), SIZE).save(OUT / f"{name}.png", optimize=True)
 
     # Drop anything left from a previous run whose basename is no longer
     # referenced, so the committed set never accumulates icons the meter cannot
-    # draw. Mirrors `prep-imagine-icons.py`'s same-purpose sweep.
-    stale = [p for p in OUT.glob("*.png") if p.stem not in found]
+    # draw. Mirrors `prep-imagine-icons.py`'s same-purpose sweep. Alias
+    # basenames are expected-absent (issue #348): their PNG is deliberately
+    # not written above, so their absence here is not staleness.
+    expected = set(found) | set(DUPLICATE_ALIASES)
+    stale = [p for p in OUT.glob("*.png") if p.stem not in expected]
     for path in stale:
         path.unlink()
 

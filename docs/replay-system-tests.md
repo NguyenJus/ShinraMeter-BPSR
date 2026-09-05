@@ -17,6 +17,10 @@ way `main.rs` wires it.
 - `crates/app/tests/replay_lifecycle.rs` — fight-state transitions: a boss
   HP rollback that should auto-reset the fight, a server-change reset, an
   idle-timeout freeze, and pet damage credited to its owner.
+- `crates/app/tests/replay_entities.rs` — entity identity (issue #335): two
+  distinct entities wearing the same display uid (`uuid >> 16`) — a recycled
+  uid, or a shadow/mirror copy — must keep separate rows and totals rather
+  than blending into one.
 - `crates/app/tests/replay_dump.rs` — replays a real, sanitized packet
   capture (not a hand-built scenario) through the same pipeline. See
   "Replaying a real capture" below.
@@ -210,7 +214,7 @@ needed to cover that path for everyone.
 
 ## Limitation: the synthetic scenarios are not a substitute for live verification
 
-Every byte in `replay_pull.rs`/`replay_lifecycle.rs`'s scenarios is built
+Every byte in `replay_pull.rs`/`replay_lifecycle.rs`/`replay_scenarios.rs`'s scenarios is built
 from our own understanding of the protocol (the same builders used in
 `crates/protocol`'s unit tests), not captured from a real client. That means
 this suite proves the pipeline behaves *consistently* with what we believe
