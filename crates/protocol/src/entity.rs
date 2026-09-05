@@ -32,15 +32,8 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 
-use crate::event::{EntityKind, kind_of, uid_of};
-
-/// Bit offset of the entity-type field inside a uuid — see
-/// [`crate::event::kind_of`] for the full layout this mirrors.
-const ENT_TYPE_SHIFT: u32 = 6;
-/// `EEntityType::EntChar`.
-const ENT_CHAR: i64 = 10;
-/// `EEntityType::EntMonster`.
-const ENT_MONSTER: i64 = 1;
+use crate::event::EntityKind;
+pub use bpsr_meter::EntityId;
 
 /// Upper bound on tracked entities. A long session streams through far more
 /// entities than are ever live at once (every mob in every room the client
@@ -49,67 +42,6 @@ const ENT_MONSTER: i64 = 1;
 /// stays connected. Well above any plausible live-AOI population, so the
 /// eviction below only ever reaches entities that have long since despawned.
 const MAX_ENTITIES: usize = 4096;
-
-/// One wire entity's full identity: the `uuid` exactly as the server sent
-/// it, kept whole rather than truncated to `uuid >> 16`.
-///
-/// Stored as `u64` (rather than the wire's `i64`) because this is an opaque
-/// identity — nothing about it is meaningfully ordered or signed, and the
-/// unsigned form makes that explicit. [`EntityId::uuid`] hands the wire
-/// value back when the bit layout actually needs reading.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct EntityId(pub u64);
-
-impl EntityId {
-    /// The identity of an entity nothing has named. `uuid == 0` is not a
-    /// valid entity on the wire (`decode` skips those outright), so this
-    /// value can never collide with a real one.
-    pub const UNKNOWN: EntityId = EntityId(0);
-
-    /// The identity of the entity the wire calls `uuid`.
-    pub fn from_uuid(uuid: i64) -> Self {
-        EntityId(uuid as u64)
-    }
-
-    /// The wire `uuid` this identity was built from.
-    pub fn uuid(self) -> i64 {
-        self.0 as i64
-    }
-
-    /// The short number every display surface shows: `uuid >> 16`. Two
-    /// distinct entities can share one of these — that is the whole reason
-    /// this type exists — so it must never be used as a key for per-entity
-    /// state.
-    pub fn display_uid(self) -> i64 {
-        uid_of(self.uuid())
-    }
-
-    /// The entity type packed into the uuid.
-    pub fn kind(self) -> EntityKind {
-        kind_of(self.uuid())
-    }
-
-    /// The canonical identity for a source that knows only a display uid and
-    /// the entity's kind — `CharSerialize.char_id` and `TeamMemData.char_id`,
-    /// which the server sends unshifted (ZDPS's `EntityIdToUuid(charId,
-    /// EntChar)` is exactly what `uuid >> 16` undoes).
-    ///
-    /// This reconstructs the uuid such a uid *would* have with both flag bits
-    /// clear, so it agrees with the AOI channel's own id for any entity that
-    /// is neither a summon nor client-side. [`EntityTable::resolve_uid`]
-    /// prefers the shadow map over this and only falls back here when the uid
-    /// has never been seen with a uuid attached.
-    pub fn from_display_uid(uid: i64, kind: EntityKind) -> Self {
-        let type_bits = match kind {
-            EntityKind::Player => ENT_CHAR,
-            EntityKind::Monster => ENT_MONSTER,
-            // No type bits to reconstruct: an unknown kind's uuid is only as
-            // good as its uid, which is exactly what this produces.
-            EntityKind::Unknown => 0,
-        };
-        EntityId::from_uuid((uid << 16) | (type_bits << ENT_TYPE_SHIFT))
-    }
-}
 
 /// What the table knows about one entity.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,8 +171,10 @@ impl EntityTable {
 mod tests {
     use super::*;
 
-    const PLAYER_KIND_BITS: i64 = ENT_CHAR << ENT_TYPE_SHIFT;
-    const MONSTER_KIND_BITS: i64 = ENT_MONSTER << ENT_TYPE_SHIFT;
+    // `EEntityType::EntChar`/`EntMonster` shifted into a uuid's type field —
+    // see `bpsr_meter::event::kind_of` for the bit layout this mirrors.
+    const PLAYER_KIND_BITS: i64 = 10 << 6;
+    const MONSTER_KIND_BITS: i64 = 1 << 6;
 
     fn player_uuid(uid: i64) -> i64 {
         (uid << 16) | PLAYER_KIND_BITS

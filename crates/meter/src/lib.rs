@@ -13,7 +13,7 @@ pub mod tables;
 pub use encounter::{Meter, skill_row_from_stats};
 pub use event::{
     CastEvent, Class, DamageEvent, DamageKind, DisappearReason, EDungeonState, EnemyHp, EntityId,
-    EntityKind, PlayerInfo, ProtocolEvent, Role,
+    EntityKind, PlayerInfo, ProtocolEvent, Role, kind_of, uid_of,
 };
 pub use fight::{FightConfig, FightEndCause, FightLifecycle, FightState, HoldKind, Lifecycle};
 pub use reset::{EnemyState, ResetConfig, ResetReason, check_hp_rollback};

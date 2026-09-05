@@ -5,9 +5,14 @@
 //! (`bpsr-app`'s `pipeline::map_event`) and offline replay
 //! (`bpsr-protocol`'s `sanitize-dump` binary) translate between the two, so
 //! a future field or enum variant only needs fixing once.
+//!
+//! `EntityId` and `EntityKind` are no longer mapped here (issue #371): both
+//! are now defined once, in `bpsr-meter`, and `bpsr-protocol` re-exports
+//! them at the same paths, so a protocol-side value already *is* the
+//! meter-side value — every field below that used to route through
+//! `map_entity_id`/`map_kind` is now passed straight through.
 
-use crate::entity::EntityId;
-use crate::event::{DamageKind, DisappearReason, EDungeonState, EntityKind, ProtocolEvent};
+use crate::event::{DamageKind, DisappearReason, EDungeonState, ProtocolEvent};
 use crate::pb::Class;
 use bpsr_meter as meter;
 
@@ -37,27 +42,12 @@ pub fn map_disappear_reason(reason: DisappearReason) -> meter::DisappearReason {
     }
 }
 
-/// Maps a protocol entity id onto the meter's mirror type (issue #335).
-/// Both are the whole wire uuid; only the crate they live in differs.
-pub fn map_entity_id(id: EntityId) -> meter::EntityId {
-    meter::EntityId(id.0)
-}
-
 /// Maps a protocol damage kind onto the meter's mirror type (issue #338).
 pub fn map_damage_kind(kind: DamageKind) -> meter::DamageKind {
     match kind {
         DamageKind::Normal => meter::DamageKind::Normal,
         DamageKind::Absorbed => meter::DamageKind::Absorbed,
         DamageKind::Immune => meter::DamageKind::Immune,
-    }
-}
-
-/// Maps a protocol entity kind onto the meter's mirror type.
-pub fn map_kind(kind: EntityKind) -> meter::EntityKind {
-    match kind {
-        EntityKind::Player => meter::EntityKind::Player,
-        EntityKind::Monster => meter::EntityKind::Monster,
-        EntityKind::Unknown => meter::EntityKind::Unknown,
     }
 }
 
@@ -105,15 +95,15 @@ pub fn map_event(
 ) -> meter::ProtocolEvent {
     match ev {
         ProtocolEvent::Cast(c) => meter::ProtocolEvent::Cast(meter::CastEvent {
-            caster: map_entity_id(c.caster),
+            caster: c.caster,
             caster_uid: c.caster_uid,
             skill_id: c.skill_id,
             timestamp_ms: c.timestamp_ms,
         }),
         ProtocolEvent::Damage(d) => meter::ProtocolEvent::Damage(meter::DamageEvent {
-            attacker: map_entity_id(d.attacker),
+            attacker: d.attacker,
             attacker_uid: d.attacker_uid,
-            attacker_kind: map_kind(d.attacker_kind),
+            attacker_kind: d.attacker_kind,
             skill_id: d.skill_id,
             value: d.value,
             crit: d.crit,
@@ -122,14 +112,14 @@ pub fn map_event(
             is_miss: d.is_miss,
             is_heal: d.is_heal,
             kind: map_damage_kind(d.kind),
-            target: map_entity_id(d.target),
+            target: d.target,
             target_uid: d.target_uid,
-            target_kind: map_kind(d.target_kind),
+            target_kind: d.target_kind,
             timestamp_ms: d.timestamp_ms,
             is_dead: d.is_dead,
         }),
         ProtocolEvent::Player(p) => meter::ProtocolEvent::Player(meter::PlayerInfo {
-            entity: map_entity_id(p.entity),
+            entity: p.entity,
             uid: p.uid,
             name: p.name,
             class: p.class.map(map_class),
@@ -140,7 +130,7 @@ pub fn map_event(
             shield: p.shield,
         }),
         ProtocolEvent::EnemyHp(e) => meter::ProtocolEvent::EnemyHp(meter::EnemyHp {
-            entity: map_entity_id(e.entity),
+            entity: e.entity,
             uid: e.uid,
             curr_hp: e.curr_hp,
             max_hp: e.max_hp,
@@ -175,7 +165,7 @@ pub fn map_event(
             uid,
             reason,
         } => meter::ProtocolEvent::EnemyGone {
-            entity: map_entity_id(entity),
+            entity,
             uid,
             reason: reason.map(map_disappear_reason),
         },
@@ -187,7 +177,7 @@ pub fn map_event(
             adds_layer,
             timestamp_ms,
         } => meter::ProtocolEvent::BuffApply {
-            host: map_entity_id(host),
+            host,
             host_uid,
             buff_uuid,
             base_id,
@@ -201,7 +191,7 @@ pub fn map_event(
             removes_layer,
             timestamp_ms,
         } => meter::ProtocolEvent::BuffRemove {
-            host: map_entity_id(host),
+            host,
             host_uid,
             buff_uuid,
             removes_layer,
@@ -214,9 +204,9 @@ pub fn map_event(
             is_dead,
             timestamp_ms,
         } => meter::ProtocolEvent::EntityState {
-            entity: map_entity_id(entity),
+            entity,
             uid,
-            kind: map_kind(kind),
+            kind,
             is_dead,
             timestamp_ms,
         },
@@ -225,7 +215,7 @@ pub fn map_event(
             uid,
             timestamp_ms,
         } => meter::ProtocolEvent::Revive {
-            entity: map_entity_id(entity),
+            entity,
             uid,
             timestamp_ms,
         },
@@ -238,6 +228,8 @@ pub fn map_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entity::EntityId;
+    use crate::event::EntityKind;
 
     /// Pins every `DisappearReason`/`meter::DisappearReason` pairing
     /// individually (issue #276's finding 2) — a transposed pair of match
