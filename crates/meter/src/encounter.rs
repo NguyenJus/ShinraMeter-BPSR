@@ -2909,7 +2909,7 @@ impl Meter {
                     // would otherwise double-count the same death. Only
                     // route a dead signal through when this player is
                     // currently recorded alive.
-                    if self.players.contains_key(&entity) {
+                    if self.players.get(&entity).is_some_and(|p| p.alive) {
                         self.record_death(entity, entity.display_uid(), timestamp_ms);
                         self.latch_wipe_if_party_down(timestamp_ms);
                     }
