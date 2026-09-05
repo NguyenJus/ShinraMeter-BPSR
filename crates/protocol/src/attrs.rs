@@ -311,7 +311,7 @@ pub fn decode_position(raw: &[u8]) -> Option<[f32; 3]> {
             let wire_type = prost::encoding::WireType::try_from(wire_type).ok()?;
             prost::encoding::skip_field(
                 wire_type,
-                tag as u32,
+                field as u32,
                 &mut cursor,
                 prost::encoding::DecodeContext::default(),
             )
@@ -359,7 +359,7 @@ pub fn decode_shield_total(raw: &[u8]) -> Option<i64> {
         let start = cursor.position() as usize;
         let end = start.checked_add(len as usize)?;
         let chunk = raw.get(start..end)?;
-        total += decode_shield_chunk_value(chunk).unwrap_or(0);
+        total += decode_shield_chunk_value(chunk)?;
         cursor.set_position(end as u64);
     }
     Some(total)
@@ -372,7 +372,7 @@ pub fn decode_shield_total(raw: &[u8]) -> Option<i64> {
 /// same convention as [`decode_position`].
 fn decode_shield_chunk_value(chunk: &[u8]) -> Option<i64> {
     let mut cursor = Cursor::new(chunk);
-    let mut value = None;
+    let mut value: i64 = 0;
     while (cursor.position() as usize) < chunk.len() {
         let tag = prost::encoding::decode_varint(&mut cursor).ok()?;
         let field = tag >> 3;
@@ -380,7 +380,7 @@ fn decode_shield_chunk_value(chunk: &[u8]) -> Option<i64> {
         if wire_type != prost::encoding::WireType::Varint {
             prost::encoding::skip_field(
                 wire_type,
-                tag as u32,
+                field as u32,
                 &mut cursor,
                 prost::encoding::DecodeContext::default(),
             )
@@ -389,10 +389,10 @@ fn decode_shield_chunk_value(chunk: &[u8]) -> Option<i64> {
         }
         let v = prost::encoding::decode_varint(&mut cursor).ok()?;
         if field == 3 {
-            value = Some(v as i64);
+            value = v as i64;
         }
     }
-    value
+    Some(value)
 }
 
 /// Issue #287's skill-cast metadata cluster, decoded alongside
@@ -592,7 +592,7 @@ pub fn player_info_from_attrs(
     let mut target_position = None;
     let mut shield = None;
     for attr in attrs {
-        if attr.raw_data.is_empty() || attr.id == 0 {
+        if attr.id == 0 || (attr.raw_data.is_empty() && attr.id != attr_id::SHIELD_LIST) {
             continue;
         }
         if let Some(sink) = sink {
@@ -1614,5 +1614,49 @@ mod tests {
     fn player_info_from_attrs_shield_absent_when_no_shield_attr() {
         let info = player_info_from_attrs(7, &[], None);
         assert_eq!(info.shield, None);
+    }
+
+    #[test]
+    fn player_info_from_attrs_empty_shield_list_is_zero_not_latched() {
+        // An empty `raw_data` on `SHIELD_LIST` is `isNoValue`'s "expired,
+        // zero shields" convention (see `decode_shield_total`'s doc
+        // comment), not an unseen attr — it must not be skipped by the
+        // generic empty-`raw_data` guard, or an expired shield would keep
+        // reporting the last nonzero total forever.
+        let attrs = vec![pb::Attr {
+            id: attr_id::SHIELD_LIST,
+            raw_data: Vec::new(),
+        }];
+        let info = player_info_from_attrs(7, &attrs, None);
+        assert_eq!(info.shield, Some(0));
+    }
+
+    #[test]
+    fn decode_shield_total_chunk_with_no_value_field_contributes_zero() {
+        // proto3 omits field 3 entirely when its value is the default 0 —
+        // that's absence, not malformed, and must not poison the sum.
+        let chunk = encode_shield_info(1, 0, 0, 1_000, 1_000);
+        // Strip the encoded `value` field (tag 3) to simulate the omission.
+        let mut without_value = Vec::new();
+        let mut cursor = Cursor::new(chunk.as_slice());
+        while (cursor.position() as usize) < chunk.len() {
+            let start = cursor.position() as usize;
+            let tag = prost::encoding::decode_varint(&mut cursor).unwrap();
+            let field = tag >> 3;
+            let _ = prost::encoding::decode_varint(&mut cursor).unwrap();
+            let end = cursor.position() as usize;
+            if field != 3 {
+                without_value.extend_from_slice(&chunk[start..end]);
+            }
+        }
+        let raw = encode_shield_list(&[without_value]);
+        assert_eq!(decode_shield_total(&raw), Some(0));
+    }
+
+    #[test]
+    fn decode_shield_total_truncated_chunk_is_none() {
+        // A chunk with a dangling varint tag and no value byte following.
+        let raw = encode_shield_list(&[vec![0x08]]);
+        assert_eq!(decode_shield_total(&raw), None);
     }
 }

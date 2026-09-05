@@ -119,7 +119,7 @@ mod sanitize {
     /// every other attr id is dropped by `scrub_attrs`, unconditionally.
     /// This is what keeps self-check 2 (no residual strings) trivially true:
     /// none of these carry text except `NAME`, which is always overwritten.
-    const KEEP_ATTRS: [i32; 10] = [
+    const KEEP_ATTRS: [i32; 11] = [
         0x01,   // NAME
         0x0A,   // MONSTER_ID
         0x2C2E, // HP
@@ -130,6 +130,7 @@ mod sanitize {
         0x2CB0, // SEASON_STRENGTH
         0x74,   // SKILL_LEVEL_ID_LIST
         0x155,  // SCENE_BASIC_ID
+        0xEA92, // SHIELD_LIST (issue #338)
     ];
 
     pub fn scrub_attrs(ac: &mut pb::AttrCollection, r: &mut Remap, owner_uuid: i64) {
@@ -349,17 +350,27 @@ mod sanitize {
                         raw_data: vec![1, 2, 3],
                     },
                     pb::Attr {
+                        id: bpsr_protocol::attrs::attr_id::SHIELD_LIST,
+                        raw_data: vec![4, 5, 6],
+                    },
+                    pb::Attr {
                         id: 0x9999, // not in KEEP_ATTRS
                         raw_data: b"unmodeled".to_vec(),
                     },
                 ],
             };
             scrub_attrs(&mut ac, &mut r, PLAYER_UUID);
-            assert_eq!(ac.attrs.len(), 2, "the unlisted attr id must be dropped");
+            assert_eq!(ac.attrs.len(), 3, "the unlisted attr id must be dropped");
             assert!(
                 ac.attrs
                     .iter()
                     .any(|a| a.id == bpsr_protocol::attrs::attr_id::HP)
+            );
+            assert!(
+                ac.attrs
+                    .iter()
+                    .any(|a| a.id == bpsr_protocol::attrs::attr_id::SHIELD_LIST),
+                "SHIELD_LIST (issue #338) must survive scrub_attrs's KEEP_ATTRS filter"
             );
             let name_attr = ac
                 .attrs
