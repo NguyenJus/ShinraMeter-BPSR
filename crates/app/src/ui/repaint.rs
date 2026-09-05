@@ -90,7 +90,12 @@ pub(crate) fn repaint_policy(inputs: RepaintInputs) -> Option<Duration> {
     if inputs.transient_timer_active {
         candidates.push(TRANSIENT_TIMER_REPAINT);
     }
-    Some(candidates.into_iter().min().unwrap_or(IDLE_HEARTBEAT))
+    Some(
+        candidates
+            .into_iter()
+            .min()
+            .map_or(IDLE_HEARTBEAT, |d| d.min(IDLE_HEARTBEAT)),
+    )
 }
 
 #[cfg(test)]
@@ -180,15 +185,28 @@ mod tests {
 
     /// A `Duration::MAX` GIF wakeup (`animation_position_at`'s parked-on-
     /// frame-0 sentinel for a static image) must not win a `min()` against
-    /// real candidates, but is still the answer when it is the only signal
-    /// present — falling back to the heartbeat would repaint sooner than a
-    /// static image ever needs, silently reintroducing idle cost.
+    /// real candidates, and must not be handed to eframe's own unchecked
+    /// `Instant::now() + delay` either — it is clamped down to the idle
+    /// heartbeat like every other candidate.
     #[test]
-    fn a_static_images_duration_max_wakeup_alone_is_returned_as_is() {
+    fn a_static_images_duration_max_wakeup_alone_is_clamped_to_the_heartbeat() {
         let inputs = RepaintInputs {
             gif_next_wakeup: Some(Duration::MAX),
             ..RepaintInputs::default()
         };
-        assert_eq!(repaint_policy(inputs), Some(Duration::MAX));
+        assert_eq!(repaint_policy(inputs), Some(IDLE_HEARTBEAT));
+    }
+
+    /// A GIF wakeup slower than the idle heartbeat (e.g. a 2s delay between
+    /// frames) is clamped down to the heartbeat rather than letting a single
+    /// slow animation replace the overlay's own once-a-second timers for
+    /// that long.
+    #[test]
+    fn a_gif_wakeup_slower_than_the_heartbeat_is_clamped_to_it() {
+        let inputs = RepaintInputs {
+            gif_next_wakeup: Some(Duration::from_secs(2)),
+            ..RepaintInputs::default()
+        };
+        assert_eq!(repaint_policy(inputs), Some(IDLE_HEARTBEAT));
     }
 }

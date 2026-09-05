@@ -1305,16 +1305,16 @@ impl OverlayApp {
     /// this skip avoids. Split out of `ui()` so the guard is unit-testable
     /// without an `egui::Context`.
     ///
-    /// Issue #349: returns whether a snapshot actually landed this frame —
-    /// fed into `RepaintInputs::snapshot_activity` alongside `rx_snapshot`'s
-    /// own emptiness, so the repaint cadence keeps pace with the pipeline
-    /// thread while it is actively producing rather than waiting out the
-    /// idle heartbeat.
-    fn drain_snapshots(&mut self) -> bool {
+    /// Issue #349: the repaint decision no longer depends on this
+    /// function's return value — the pipeline thread now wakes the overlay
+    /// itself the moment it publishes a changed snapshot (see
+    /// `pipeline::RepaintHandle`), so `ui()`'s own repaint gate only needs
+    /// `rx_snapshot`'s current emptiness (`snapshot_activity` below), not
+    /// whether this particular frame happened to drain one.
+    fn drain_snapshots(&mut self) {
         if self.demo_mode {
-            return false;
+            return;
         }
-        let mut drained = false;
         loop {
             match self.rx_snapshot.try_recv() {
                 Ok(snap) => {
@@ -1328,7 +1328,6 @@ impl OverlayApp {
                         self.raise_capture_dead_status();
                     }
                     self.snapshot = snap;
-                    drained = true;
                 }
                 // Nothing new this frame — the overwhelmingly common case.
                 Err(TryRecvError::Empty) => break,
@@ -1359,7 +1358,6 @@ impl OverlayApp {
                 }
             }
         }
-        drained
     }
 
     /// Raises the *permanent* banner for a dead pipeline thread (#214).
@@ -1607,10 +1605,7 @@ impl eframe::App for OverlayApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Issue #349: whether a snapshot actually landed this frame, fed
-        // into the repaint decision at the end of this function alongside
-        // whether `rx_snapshot` still holds one queued up.
-        let snapshot_drained = self.drain_snapshots();
+        self.drain_snapshots();
         self.poll_update_check(ui.ctx());
         // Issue #39: drained unconditionally, regardless of whether the
         // history view is open — see `poll_history`'s doc comment.
@@ -2199,8 +2194,11 @@ impl eframe::App for OverlayApp {
         // Issue #349: gated on actual activity rather than an unconditional
         // ~10 Hz — see `repaint::repaint_policy`'s doc comment for the
         // decision table and why each input is gathered here rather than
-        // inside the pure function itself.
-        let snapshot_activity = snapshot_drained || !self.rx_snapshot.is_empty();
+        // inside the pure function itself. The pipeline thread now wakes
+        // the overlay itself the instant it publishes a changed snapshot
+        // (`pipeline::RepaintHandle`), so this only needs to catch the case
+        // where one is still sitting in the channel un-drained.
+        let snapshot_activity = !self.rx_snapshot.is_empty();
         let gif_next_wakeup = icons.custom.borrow().next_wakeup(&ctx);
         let input_active =
             ctx.input(|i| i.pointer.any_down() || i.pointer.is_moving() || !i.events.is_empty());
