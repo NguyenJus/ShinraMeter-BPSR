@@ -481,6 +481,15 @@ pub struct Snapshot {
     /// What is being fought, if the packet stream has revealed it (issue #9
     /// slice 2).
     pub encounter: EncounterInfo,
+    /// The local player's own uid (issue #344), if a
+    /// `ProtocolEvent::LocalPlayer` has been seen this server session.
+    /// Session-scoped like `dungeon_state`/`objectives`: survives both a
+    /// fight `reset` and `ServerChanged` — the value is `char_id`, the
+    /// persistent character id, not a per-session entity uuid, and a later
+    /// `LocalPlayer` event simply overwrites it. Never cleared. Exposed for
+    /// a future UI "you" highlight / self-only view (neither exists yet;
+    /// follow-up to issue #344).
+    pub local_uid: Option<i64>,
     /// Whether the packet-capture thread is still alive, as far as the
     /// caller publishing this snapshot knows (pipeline-robustness audit,
     /// finding 1). The meter itself has no way to know this — it only ever
