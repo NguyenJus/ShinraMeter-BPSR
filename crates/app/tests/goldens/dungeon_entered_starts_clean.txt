@@ -1,6 +1,8 @@
 scenario=dungeon_entered_starts_clean
 at_ms=2000
 fight_state=Idle
+fight_end_cause=-
+hold_kind=-
 duration_ms=0
 total_damage=0
 total_dps=0.00

@@ -1,6 +1,8 @@
 scenario=dungeon_a_finalized
 at_ms=2100
 fight_state=Ended
+fight_end_cause=boss_death
+hold_kind=-
 duration_ms=100
 total_damage=90000
 total_dps=90000.00

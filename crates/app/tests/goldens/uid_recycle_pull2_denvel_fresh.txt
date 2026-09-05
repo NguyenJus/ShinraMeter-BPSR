@@ -1,6 +1,8 @@
 scenario=uid_recycle_pull2_denvel_fresh
 at_ms=30000
 fight_state=Active
+fight_end_cause=-
+hold_kind=-
 duration_ms=1
 total_damage=35000
 total_dps=35000.00
