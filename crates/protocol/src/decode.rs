@@ -418,7 +418,7 @@ fn buff_base_id_from_logic_effects(logic_effect: &[pb::BuffEffectLogicInfo]) -> 
         .map(|info| info.base_id)
 }
 
-/// Emits `Scene` (issue #293) and `Player`.
+/// Emits `LocalPlayer` (issue #344), `Scene` (issue #293) and `Player`.
 ///
 /// `Scene` comes from `v_data.scene_data.level_map_id` — see
 /// `pb::CharSerialize::scene_data`'s doc comment for why this field, once
@@ -443,8 +443,9 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
     // local player), so `v_data.char_id` alone identifies who "you" is.
     // Emitted ahead of (and independently of) `Scene`/`Player` below: it
     // needs neither `scene_data` nor `char_base` to be meaningful. Zero is
-    // treated as absent, mirroring `scene_id_from_attrs`'s convention just
-    // below.
+    // treated as absent — the same zero-is-absent rule `scene_id_from_attrs`
+    // (crates/protocol/src/attrs.rs) uses, borrowed here and applied to
+    // `scene_data` just below.
     if v_data.char_id != 0 {
         out.push(ProtocolEvent::LocalPlayer {
             uid: v_data.char_id,
@@ -457,6 +458,10 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
         .filter(|&id| id != 0)
     {
         out.push(ProtocolEvent::Scene { level_map_id });
+    }
+    // A zero char_id cannot key a Player row either.
+    if v_data.char_id == 0 {
+        return;
     }
     let Some(char_base) = &v_data.char_base else {
         return;
@@ -1758,6 +1763,24 @@ mod tests {
         let n = container_notify(pb::CharSerialize {
             char_id: 0,
             char_base: None,
+            scene_data: Some(pb::SceneData { level_map_id: 8 }),
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out, vec![ProtocolEvent::Scene { level_map_id: 8 }]);
+    }
+
+    #[test]
+    fn container_data_zero_char_id_with_char_base_yields_no_player() {
+        // A zero char_id cannot key a Player row either, even when
+        // char_base is present.
+        let n = container_notify(pb::CharSerialize {
+            char_id: 0,
+            char_base: Some(pb::CharBaseInfo {
+                name: "Ari".to_string(),
+                ..Default::default()
+            }),
             scene_data: Some(pb::SceneData { level_map_id: 8 }),
             profession_list: None,
         });

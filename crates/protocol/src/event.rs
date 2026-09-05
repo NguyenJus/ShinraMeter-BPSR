@@ -403,9 +403,10 @@ pub enum ProtocolEvent {
     /// `decode::on_sync_container_data`. `char_id` is a **bare** uid, not a
     /// packed `uuid`; unlike `Entity`/`AoiSyncDelta`/`SyncDamageInfo` ids it
     /// must never be shifted through `uid_of` (that trap is what sank the
-    /// field's first pass in `bin/sanitize-dump.rs`, whose module doc
-    /// documents the same distinction for `CharSerialize.char_id`/
-    /// `CharBaseInfo.char_id`). Emitted independently of `Player`: a
+    /// field's first pass in `crate::sanitize`, whose module doc (see
+    /// crates/protocol/src/sanitize.rs:22-23) documents the same
+    /// distinction for `CharSerialize.char_id`/`CharBaseInfo.char_id`).
+    /// Emitted independently of `Player`: a
     /// `CharSerialize` with only `char_id` (no `char_base`) still says who
     /// the local player is, even though `on_sync_container_data` has
     /// nothing to build a `Player` event from in that case.

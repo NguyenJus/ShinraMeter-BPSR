@@ -467,10 +467,12 @@ pub struct Meter {
     current_objective_id: Option<i32>,
     /// The local player's own uid (issue #344), from the most recent
     /// `ProtocolEvent::LocalPlayer`. Session-scoped like `dungeon_state`/
-    /// `objectives`: survives `Meter::reset` (a fight ending says nothing
-    /// about who the local player is), and is cleared only on
-    /// `ServerChanged`, whose new server session hands out fresh uids —
-    /// see [`Meter::local_uid`].
+    /// `objectives`: survives both `Meter::reset` (a fight ending says
+    /// nothing about who the local player is) and `ServerChanged` — the
+    /// value is `char_id`, the persistent character id from
+    /// `SyncContainerData.v_data`, not a per-session entity uuid, so it
+    /// stays valid across a server change. A later `ProtocolEvent::LocalPlayer`
+    /// simply overwrites it. Never cleared — see [`Snapshot::local_uid`].
     local_uid: Option<i64>,
 }
 
@@ -1258,11 +1260,6 @@ impl Meter {
                 // back to issue #78's ordinary rule, where the next real
                 // hit clears it.
                 self.wipe_hold = false;
-
-                // issue #344: a new server session hands out fresh uids —
-                // the old local uid can no longer be trusted to name
-                // anything on the new session's roster.
-                self.local_uid = None;
 
                 None
             }
@@ -3442,13 +3439,6 @@ impl Meter {
     pub fn is_active(&self) -> bool {
         self.fight_start_ms.is_some()
     }
-
-    /// The local player's own uid (issue #344), if a `ProtocolEvent::LocalPlayer`
-    /// has been seen this server session — see the `local_uid` field's doc
-    /// comment for the survives-reset/cleared-on-`ServerChanged` lifetime.
-    pub fn local_uid(&self) -> Option<i64> {
-        self.local_uid
-    }
 }
 
 /// Builds one `SkillRow` from a skill's raw accumulator and the player's
@@ -4763,9 +4753,9 @@ mod tests {
     #[test]
     fn local_player_event_sets_local_uid() {
         let mut m = Meter::new();
-        assert_eq!(m.local_uid(), None);
+        assert_eq!(m.snapshot(0).local_uid, None);
         m.apply(&ProtocolEvent::LocalPlayer { uid: 42 });
-        assert_eq!(m.local_uid(), Some(42));
+        assert_eq!(m.snapshot(0).local_uid, Some(42));
     }
 
     /// `local_uid` appears on the snapshot (issue #344) so the UI layer
@@ -4778,8 +4768,8 @@ mod tests {
         assert_eq!(snap.local_uid, Some(42));
     }
 
-    /// Session-scoped, not fight-scoped (issue #344): a manual reset or a
-    /// boss-HP rollback must not forget who the local player is — mirrors
+    /// Session-scoped, not fight-scoped (issue #344): none of `reset`'s
+    /// triggers say anything about who the local player is — mirrors
     /// `dungeon_state`/`objectives` surviving `reset` for the same reason.
     #[test]
     fn local_uid_survives_a_fight_reset() {
@@ -4787,21 +4777,39 @@ mod tests {
         m.apply(&ProtocolEvent::LocalPlayer { uid: 42 });
         m.apply(&dmg(1, 100, 1000));
         m.reset(ResetReason::Manual, 2000);
-        assert_eq!(m.local_uid(), Some(42));
         assert_eq!(m.snapshot(2000).local_uid, Some(42));
+
+        m.apply(&dmg(1, 100, 3000));
+        m.reset(ResetReason::BossHpRollback, 4000);
+        assert_eq!(m.snapshot(4000).local_uid, Some(42));
+
+        m.apply(&dmg(1, 100, 5000));
+        m.reset(ResetReason::NewFight, 6000);
+        assert_eq!(m.snapshot(6000).local_uid, Some(42));
     }
 
-    /// A new server session hands out fresh uids (issue #138's own
-    /// reasoning, applied to #344): the old local uid can no longer be
-    /// trusted once `ServerChanged` fires, so it is cleared there rather
-    /// than surviving like `dungeon_state`/`objectives` do.
+    /// A new server session's `char_id` is still the same persistent
+    /// character id (issue #344), so it stays valid across `ServerChanged`
+    /// — unlike per-session entity uuids, which is why `enemies`/`boss_uid`/
+    /// `scene_id` *are* cleared there. Keeping a stale value is never worse
+    /// than clearing to `None`: clearing can lose a correct value when no
+    /// `SyncContainerData` follows a re-adopt on the new session.
     #[test]
-    fn local_uid_is_cleared_on_server_changed() {
+    fn local_uid_survives_server_changed() {
         let mut m = Meter::new();
         m.apply(&ProtocolEvent::LocalPlayer { uid: 42 });
         m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 2000 });
-        assert_eq!(m.local_uid(), None);
-        assert_eq!(m.snapshot(2000).local_uid, None);
+        assert_eq!(m.snapshot(2000).local_uid, Some(42));
+    }
+
+    /// A later `LocalPlayer` event simply overwrites the stored uid (issue
+    /// #344) rather than being ignored or merged.
+    #[test]
+    fn later_local_player_event_overwrites_local_uid() {
+        let mut m = Meter::new();
+        m.apply(&ProtocolEvent::LocalPlayer { uid: 42 });
+        m.apply(&ProtocolEvent::LocalPlayer { uid: 43 });
+        assert_eq!(m.snapshot(0).local_uid, Some(43));
     }
 
     /// The per-scene preload cap guards against a misclassified dungeon
