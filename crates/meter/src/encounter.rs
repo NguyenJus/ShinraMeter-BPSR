@@ -7,7 +7,7 @@ use crate::event::{
     CastEvent, Class, DamageEvent, DisappearReason, EDungeonState, EnemyHp, EntityKind, PlayerInfo,
     ProtocolEvent,
 };
-use crate::fight::{FightConfig, FightEndCause, FightState};
+use crate::fight::{FightConfig, FightEndCause, FightState, HoldKind, Lifecycle};
 use crate::phase;
 use crate::reset::{EnemyState, ResetConfig, ResetReason, check_hp_rollback};
 use crate::stats::{
@@ -685,8 +685,8 @@ impl Meter {
     /// timer consistent with the DPS window (which is also last-damage
     /// anchored).
     fn fight_ended_at(&self, now_ms: u64) -> Option<u64> {
-        self.fight_start_ms?;
-        if let Some(end_ms) = self.fight_end_ms {
+        self.fight_start_ms()?;
+        if let Some(end_ms) = self.fight_end_ms() {
             return Some(end_ms);
         }
         let idle = self.fight_cfg.idle_timeout_ms;
@@ -726,7 +726,7 @@ impl Meter {
     /// needs the stronger, target-aware [`Self::damage_in_post_end_grace`]
     /// instead — see its doc comment for why.
     fn in_post_end_grace_window(&self, timestamp_ms: u64) -> bool {
-        self.fight_end_ms.is_some_and(|end_ms| {
+        self.fight_end_ms().is_some_and(|end_ms| {
             timestamp_ms.saturating_sub(end_ms) <= self.fight_cfg.post_end_grace_ms
         })
     }
@@ -846,7 +846,7 @@ impl Meter {
 
     /// Where the meter is in the fight lifecycle as of `now_ms`.
     pub fn fight_state(&self, now_ms: u64) -> FightState {
-        match self.fight_start_ms {
+        match self.fight_start_ms() {
             None => FightState::Idle,
             Some(_) if self.fight_ended_at(now_ms).is_some() => FightState::Ended,
             Some(_) => FightState::Active,
@@ -887,6 +887,81 @@ impl Meter {
         self.fight_start_ms
     }
 
+    /// The monster id whose death latched the currently-held fight's end,
+    /// if that is what ended it (or, since issue #316, the recognized boss
+    /// an idle-timeout end left engaged) — see the `fight_end_boss_id`
+    /// field doc for the full arming story. `None` while a fight is
+    /// running, or once it ended some other way.
+    fn fight_end_boss_id(&self) -> Option<u32> {
+        self.fight_end_boss_id
+    }
+
+    /// When the currently-held fight's end was actually latched, as
+    /// opposed to when it happened (`fight_end_ms`) — see the
+    /// `fight_end_observed_ms` field doc for why those two can diverge.
+    fn fight_end_observed_ms(&self) -> Option<u64> {
+        self.fight_end_observed_ms
+    }
+
+    /// Whether the current (or most recently held) fight ended in a party
+    /// wipe that is still being held open for a possible re-pull — the raw
+    /// `wipe_hold` flag, with no [`WIPE_HOLD_RELEASE_MS`] time check (see
+    /// [`Self::wipe_hold_released`] for that half). Cleared by `reset` and
+    /// by leaving the instance, same as the flag itself.
+    pub fn is_held(&self) -> bool {
+        self.wipe_hold
+    }
+
+    /// Which hold, if any, [`Self::is_held`] names. Only one exists today
+    /// (issue #336): [`HoldKind::Wipe`].
+    pub fn hold_kind(&self) -> Option<HoldKind> {
+        self.is_held().then_some(HoldKind::Wipe)
+    }
+
+    /// Why the currently-held fight ended, when today's stored fields can
+    /// still tell it apart after the fact — right now, only whether it was
+    /// a wipe. `None` while a fight is running, and also `None` for an
+    /// ended fight whose cause was something other than a wipe: every
+    /// [`FightEndCause`] is logged at [`Self::latch_fight_end`] but only the
+    /// wipe flag survives past that log line today (issue #336 step 2 widens
+    /// this to every cause).
+    pub fn fight_end_cause(&self) -> Option<FightEndCause> {
+        self.fight_end_ms()?;
+        self.is_held().then_some(FightEndCause::Wipe)
+    }
+
+    /// Whether a fight is currently running, as of `now_ms` — the `Active`
+    /// half of [`Self::fight_state`], as its own predicate. See
+    /// [`Self::is_active`] for "stats on the board, running or held".
+    pub fn is_fight_active(&self, now_ms: u64) -> bool {
+        matches!(self.lifecycle(now_ms), Lifecycle::Active { .. })
+    }
+
+    /// The full lifecycle view as of `now_ms` (issue #336 step 1): the same
+    /// answer [`Self::fight_state`]/[`Self::fight_end_ms`]/
+    /// [`Self::fight_start_ms`]/[`Self::is_held`]/[`Self::fight_end_cause`]
+    /// already give piecemeal, folded into one copyable value. Nothing here
+    /// is stored — every arm re-derives from the same fields those
+    /// accessors read, so this cannot drift from them.
+    pub fn lifecycle(&self, now_ms: u64) -> Lifecycle {
+        let Some(since_ms) = self.fight_start_ms() else {
+            return Lifecycle::Idle;
+        };
+        let Some(at_ms) = self.fight_ended_at(now_ms) else {
+            return Lifecycle::Active { since_ms };
+        };
+        match self
+            .hold_kind()
+            .filter(|_| !self.wipe_hold_released(now_ms))
+        {
+            Some(kind) => Lifecycle::Held { kind, at_ms },
+            None => Lifecycle::Ended {
+                at_ms,
+                cause: self.fight_end_cause(),
+            },
+        }
+    }
+
     /// Advances wall-clock-driven fight state and returns the resulting
     /// state. Call this once per UI tick before `snapshot`; it latches an
     /// idle-detected end so the held snapshot can never drift afterwards
@@ -905,7 +980,7 @@ impl Meter {
                 self.boss_monster_id(),
             );
             FightState::Ended
-        } else if self.fight_start_ms.is_some() {
+        } else if self.fight_start_ms().is_some() {
             FightState::Active
         } else {
             FightState::Idle
@@ -1007,7 +1082,8 @@ impl Meter {
                     // transition into the open world deserves to freeze and
                     // be recorded too, even when the reset below won't fire
                     // for it.
-                    let cut_short = self.fight_start_ms.is_some() && self.fight_end_ms.is_none();
+                    let cut_short =
+                        self.fight_start_ms().is_some() && self.fight_end_ms().is_none();
                     if cut_short {
                         self.latch_fight_end(
                             FightEndCause::SceneChanged,
@@ -1083,7 +1159,7 @@ impl Meter {
                         && self
                             .last_known_scene_id
                             .is_some_and(|id| id != *level_map_id);
-                    if entering_dungeon && !cut_short && !self.wipe_hold {
+                    if entering_dungeon && !cut_short && !self.is_held() {
                         self.reset(ResetReason::SceneChanged, self.last_event_ms);
                         // PR #198 review, finding 1: `reset` is shared with
                         // every in-instance reason (manual, `NewFight`,
@@ -1223,7 +1299,7 @@ impl Meter {
                 // clearing those first made this diagnostic always say
                 // `boss_monster_id=<unknown>` — losing the one fact it
                 // exists to record about a fight cut short by a reconnect.
-                if self.fight_start_ms.is_some() && self.fight_end_ms.is_none() {
+                if self.fight_start_ms().is_some() && self.fight_end_ms().is_none() {
                     self.latch_fight_end(
                         FightEndCause::ServerChanged,
                         *timestamp_ms,
@@ -1297,8 +1373,8 @@ impl Meter {
                 // for `music_value`, `cur_qinshi`, etc.
                 if name == "IsFinishTarget"
                     && *value != 0
-                    && self.fight_start_ms.is_some()
-                    && self.fight_end_ms.is_none()
+                    && self.fight_start_ms().is_some()
+                    && self.fight_end_ms().is_none()
                 {
                     self.latch_fight_end(
                         FightEndCause::DungeonEnded,
@@ -1367,7 +1443,7 @@ impl Meter {
             // stopped, the same rule the `Scene` arm's `SceneChanged` latch
             // above already follows.
             EDungeonState::End | EDungeonState::Settlement => {
-                if self.fight_start_ms.is_some() && self.fight_end_ms.is_none() {
+                if self.fight_start_ms().is_some() && self.fight_end_ms().is_none() {
                     self.latch_fight_end(
                         FightEndCause::DungeonEnded,
                         self.last_event_ms,
@@ -1553,7 +1629,7 @@ impl Meter {
         // re-open or extend the held fight either, so this sits in the same
         // guard as the withholds, not as a fallback after it.
         let mut reason = None;
-        if self.fight_end_ms.is_some()
+        if self.fight_end_ms().is_some()
             && d.attacker_kind == EntityKind::Player
             && !d.is_heal
             && !self.withholds_new_fight(d)
@@ -1577,7 +1653,7 @@ impl Meter {
         // hit's `resumes_held_fight`/`withholds_after_wipe` checks see —
         // those must keep reading exactly the inputs they did before this
         // window existed.
-        if self.fight_end_ms.is_some() {
+        if self.fight_end_ms().is_some() {
             if self.damage_in_post_end_grace(d) {
                 return self.apply_damage_grace(d);
             }
@@ -1732,7 +1808,7 @@ impl Meter {
         // to track it in.
         self.last_event_ms = self.last_event_ms.max(d.timestamp_ms);
 
-        if self.fight_start_ms.is_none() {
+        if self.fight_start_ms().is_none() {
             self.fight_start_ms = Some(d.timestamp_ms);
         }
 
@@ -1882,7 +1958,7 @@ impl Meter {
         // only sees enemies the party has actually `took_damage` on, and a
         // raid's next boss standing unengaged nearby is invisible to it
         // until the party's first hit lands.
-        if !recognized || self.fight_start_ms.is_none() || self.fight_end_ms.is_some() {
+        if !recognized || self.fight_start_ms().is_none() || self.fight_end_ms().is_some() {
             return;
         }
         let other_boss = self.other_living_boss(uid, now_ms);
@@ -1995,7 +2071,7 @@ impl Meter {
         observed_ms: u64,
         boss_monster_id: Option<u32>,
     ) {
-        if self.fight_end_ms.is_some() {
+        if self.fight_end_ms().is_some() {
             return;
         }
         self.fight_end_ms = Some(end_ms);
@@ -2196,8 +2272,8 @@ impl Meter {
     /// written this tightly.
     fn apply_enemy_gone(&mut self, uid: i64, reason: Option<DisappearReason>) {
         if !self.fight_cfg.end_on_boss_death
-            || self.fight_start_ms.is_none()
-            || self.fight_end_ms.is_some()
+            || self.fight_start_ms().is_none()
+            || self.fight_end_ms().is_some()
             || self.boss_uid != Some(uid)
         {
             return;
@@ -2318,8 +2394,8 @@ impl Meter {
     /// particular boss's bar refills relative to the 9s idle timeout, which
     /// is why the same wipe used to go either way.
     fn party_is_wiped(&self) -> bool {
-        self.fight_start_ms.is_some()
-            && self.fight_end_ms.is_none()
+        self.fight_start_ms().is_some()
+            && self.fight_end_ms().is_none()
             && !self.players.is_empty()
             && self.players.values().all(|p| !p.alive)
     }
@@ -2338,7 +2414,10 @@ impl Meter {
     /// `party_is_wiped` implies this: everyone down is at least four in
     /// five down, for any non-empty roster.
     fn party_mostly_down(&self) -> bool {
-        if self.fight_start_ms.is_none() || self.fight_end_ms.is_some() || self.players.is_empty() {
+        if self.fight_start_ms().is_none()
+            || self.fight_end_ms().is_some()
+            || self.players.is_empty()
+        {
             return false;
         }
         let down = self.players.values().filter(|p| !p.alive).count();
@@ -2370,7 +2449,7 @@ impl Meter {
     /// deciding and the ordinary issue #78 rule takes it: any real player
     /// damage is the next fight.
     fn withholds_after_wipe(&self, d: &DamageEvent) -> bool {
-        self.wipe_hold
+        self.is_held()
             && !self.wipe_hold_released(d.timestamp_ms)
             && !self
                 .target_monster_id(d)
@@ -2386,7 +2465,7 @@ impl Meter {
     /// missing latch therefore cannot happen, and reading it as "not yet
     /// released" if it somehow did is the conservative answer.
     fn wipe_hold_released(&self, now_ms: u64) -> bool {
-        self.fight_end_ms
+        self.fight_end_ms()
             .is_some_and(|end_ms| now_ms.saturating_sub(end_ms) >= WIPE_HOLD_RELEASE_MS)
     }
 
@@ -2489,7 +2568,7 @@ impl Meter {
         // `fight_end_observed_ms`'s doc comment for why those differ for an
         // idle-timeout end and nowhere else.
         let (Some(observed_ms), Some(ended_by)) =
-            (self.fight_end_observed_ms, self.fight_end_boss_id)
+            (self.fight_end_observed_ms(), self.fight_end_boss_id())
         else {
             return None;
         };
@@ -2542,7 +2621,7 @@ impl Meter {
     /// the tail of the kill is not evidence of anything but that stream of
     /// packets still being in flight.
     fn apply_cast(&mut self, c: &CastEvent) {
-        if self.fight_end_ms.is_some() && !self.in_post_end_grace_window(c.timestamp_ms) {
+        if self.fight_end_ms().is_some() && !self.in_post_end_grace_window(c.timestamp_ms) {
             return;
         }
         if let Some(stats) = self.players.get_mut(&c.caster_uid) {
@@ -2574,7 +2653,7 @@ impl Meter {
         // in the last moments before a kill can decode after `fight_end_ms`
         // latches, same as a trailing damage packet — see
         // `apply_damage_grace`'s doc comment.
-        if self.fight_end_ms.is_some() && !self.in_post_end_grace_window(timestamp_ms) {
+        if self.fight_end_ms().is_some() && !self.in_post_end_grace_window(timestamp_ms) {
             return;
         }
         let Some(stats) = self.players.get_mut(&host_uid) else {
@@ -2626,7 +2705,7 @@ impl Meter {
         // for — without this, a buff still open when the fight ended would
         // never get the chance to credit its last stretch of uptime. See
         // `apply_damage_grace`'s doc comment.
-        if self.fight_end_ms.is_some() && !self.in_post_end_grace_window(timestamp_ms) {
+        if self.fight_end_ms().is_some() && !self.in_post_end_grace_window(timestamp_ms) {
             return;
         }
         let Some(stats) = self.players.get_mut(&host_uid) else {
@@ -3273,13 +3352,13 @@ impl Meter {
         // next fight starts.
         let effective_now_ms = self.fight_ended_at(now_ms).unwrap_or(now_ms);
 
-        let display_duration_ms = match self.fight_start_ms {
+        let display_duration_ms = match self.fight_start_ms() {
             Some(start) => effective_now_ms.saturating_sub(start).max(1),
             None => 0,
         };
         // DPS denominator: last-damage - first-damage, min 1s, so idle time
         // between the caller's `now_ms` and the last hit doesn't dilute DPS.
-        let dps_duration_ms = match self.fight_start_ms {
+        let dps_duration_ms = match self.fight_start_ms() {
             Some(start) => self.last_event_ms.saturating_sub(start).max(1000),
             None => 1000,
         };
@@ -3435,9 +3514,10 @@ impl Meter {
 
     /// Whether a fight's stats are on the board — true both while it is
     /// running and while an ended fight is being held (issue #78). Use
-    /// [`Meter::fight_state`] to tell those two apart.
+    /// [`Meter::fight_state`] to tell those two apart. See
+    /// [`Meter::is_fight_active`] for "running right now" specifically.
     pub fn is_active(&self) -> bool {
-        self.fight_start_ms.is_some()
+        self.fight_start_ms().is_some()
     }
 }
 
@@ -7254,6 +7334,56 @@ mod tests {
                 assert_eq!(m.fight_end_ms(), Some(1_000));
             }
         }
+
+        /// Issue #336 step 1: the `lifecycle`/`is_fight_active`/
+        /// `fight_end_cause` accessor surface has to agree with the
+        /// existing `fight_state`/`fight_end_ms`/`fight_start_ms` answers
+        /// it's derived from, for every state those already cover.
+        mod lifecycle_accessors {
+            use super::*;
+
+            #[test]
+            fn idle_before_any_fight() {
+                let m = Meter::new();
+                assert_eq!(m.lifecycle(600_000), Lifecycle::Idle);
+                assert!(!m.is_fight_active(600_000));
+                assert!(!m.is_held());
+                assert_eq!(m.hold_kind(), None);
+                assert_eq!(m.fight_end_cause(), None);
+            }
+
+            #[test]
+            fn active_while_damage_keeps_arriving() {
+                let mut m = Meter::new();
+                m.apply(&dmg(1, 100, 1_000));
+                assert_eq!(
+                    m.lifecycle(1_000 + idle() - 1),
+                    Lifecycle::Active { since_ms: 1_000 }
+                );
+                assert!(m.is_fight_active(1_000 + idle() - 1));
+            }
+
+            #[test]
+            fn ended_by_idle_timeout_has_no_known_cause_yet() {
+                // The idle timeout is not a wipe, and today's stored state
+                // (issue #336 step 1) has no other way to name a cause —
+                // step 2 is what widens this to `Some(IdleTimeout)`.
+                let mut m = Meter::new();
+                m.apply(&dmg(1, 100, 1_000));
+                let ended_at = 1_000 + idle();
+                assert_eq!(
+                    m.lifecycle(ended_at),
+                    Lifecycle::Ended {
+                        at_ms: 1_000,
+                        cause: None,
+                    }
+                );
+                assert!(!m.is_fight_active(ended_at));
+                assert!(!m.is_held());
+                assert_eq!(m.hold_kind(), None);
+                assert_eq!(m.fight_end_cause(), None);
+            }
+        }
     }
 
     /// Issue #154/#155: a party wipe is the *end of a pull*, not a reset.
@@ -7416,6 +7546,51 @@ mod tests {
             assert_eq!(
                 snap.duration_ms, 5_000,
                 "frozen at the wipe (6_000) minus the first hit (1_000)"
+            );
+        }
+
+        /// Issue #336 step 1: a wipe is the one cause today's stored state
+        /// can still name after the fact, and it reports as `Held`, not a
+        /// plain `Ended` — `Meter::withholds_after_wipe` is still gating
+        /// events, which `lifecycle` surfaces as its own variant.
+        #[test]
+        fn a_wipe_reports_as_held_with_a_known_cause() {
+            let m = wiped();
+            assert!(m.is_held());
+            assert_eq!(m.hold_kind(), Some(HoldKind::Wipe));
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::Wipe));
+            assert_eq!(
+                m.lifecycle(6_500),
+                Lifecycle::Held {
+                    kind: HoldKind::Wipe,
+                    at_ms: 6_000,
+                }
+            );
+            assert!(!m.is_fight_active(6_500));
+        }
+
+        /// Issue #336 step 1: `lifecycle` must consult
+        /// `Meter::wipe_hold_released` the same way `withholds_after_wipe`
+        /// does, or a wipe reports `Held` forever past
+        /// `WIPE_HOLD_RELEASE_MS` instead of falling through to `Ended`.
+        #[test]
+        fn a_released_wipe_hold_reports_as_ended() {
+            let m = wiped();
+            assert_eq!(
+                m.lifecycle(6_000 + 1_000),
+                Lifecycle::Held {
+                    kind: HoldKind::Wipe,
+                    at_ms: 6_000,
+                },
+                "still held well before WIPE_HOLD_RELEASE_MS"
+            );
+            assert_eq!(
+                m.lifecycle(6_000 + WIPE_HOLD_RELEASE_MS),
+                Lifecycle::Ended {
+                    at_ms: 6_000,
+                    cause: Some(FightEndCause::Wipe),
+                },
+                "released once WIPE_HOLD_RELEASE_MS has passed"
             );
         }
 
