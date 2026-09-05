@@ -175,7 +175,7 @@ impl Handle {
 /// through [`dropped_count`] rather than threading a live [`Handle`]
 /// through `OverlayApp`/`ui::draw_header_menu`'s already-deep call chain
 /// lets the "Export session bundle" menu item report how incomplete the
-/// dump might be with no signature changes anywhere in `ui.rs`.
+/// dump might be with no signature changes anywhere in the `ui` module.
 ///
 /// Only ever set from `init`'s `Some` branch, which nothing in this
 /// module's own unit tests calls (they construct `DumpWriter`/

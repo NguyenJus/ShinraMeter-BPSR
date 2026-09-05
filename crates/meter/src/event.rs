@@ -118,7 +118,7 @@ impl Class {
 }
 
 /// Combat role a `Class` fills (issue #44): drives the row share-bar's hue
-/// in the UI (`crates/app/src/ui.rs`). See `Class::role` for the mapping and
+/// in the UI (`crates/app/src/ui/table.rs`). See `Class::role` for the mapping and
 /// its source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {

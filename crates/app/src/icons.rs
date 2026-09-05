@@ -254,7 +254,7 @@ const TOOLBAR_ICON_BYTES: &[(ToolbarIcon, &[u8])] = &[
 /// Textures for the toolbar icons, uploaded once via `ToolbarIcons::load`.
 /// Same lazy-load, load-once-per-process pattern as `ClassIcons` — see its
 /// doc comment — and in fact loaded alongside it, from the same
-/// `OverlayApp::ui`'s single `get_or_insert_with` call (`ui.rs`'s `Icons`
+/// `OverlayApp::ui`'s single `get_or_insert_with` call (`ui/mod.rs`'s `Icons`
 /// wrapper), so there is exactly one lazy-init site for all icon textures,
 /// not two.
 pub struct ToolbarIcons(IconSet<ToolbarIcon>);
@@ -272,7 +272,7 @@ impl ToolbarIcons {
     /// The texture for `icon`, or `None` if its PNG failed to decode (never
     /// expected in practice — `TOOLBAR_ICON_BYTES` are compile-time
     /// constants — but callers fall back to the original glyph rather than
-    /// paint nothing; see `ui.rs`'s `icon_button`).
+    /// paint nothing; see `ui/menu.rs`'s `menu_item_button`).
     pub fn get(&self, icon: ToolbarIcon) -> Option<&egui::TextureHandle> {
         self.0.get(icon)
     }
@@ -281,7 +281,7 @@ impl ToolbarIcons {
 /// One vendored SVG glyph (issue #59), rasterized to PNG by
 /// `scripts/rasterize-icons.sh`. Separate from `ToolbarIcon` because these
 /// are painted through `Painter::image` at caller-derived sizes and tints
-/// (see `ui.rs`'s `paint_stat_pill`), not through `toolbar_icon_image`'s
+/// (see `ui/status.rs`'s `paint_stat_pill`), not through `toolbar_icon_image`'s
 /// fixed size and fixed tint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlyphIcon {

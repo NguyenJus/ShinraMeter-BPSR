@@ -3327,7 +3327,7 @@ impl Meter {
     /// the always-visible Dps bar.
     ///
     /// `focus` is the set of player uids with an open skill-breakdown
-    /// window (`crates/app/src/ui.rs`'s `skill_windows` keys), threaded in
+    /// window (`crates/app/src/ui/skill_window.rs`'s `skill_windows` keys), threaded in
     /// from the UI via `UiCommand::SkillFocus`
     /// (`crates/app/src/pipeline.rs`'s live publish loop). `None` means
     /// "build every breakdown for every player" — [`Meter::snapshot`]'s own
@@ -3468,7 +3468,7 @@ impl Meter {
         // covers. Independent of `boss_monster_id`/`is_boss` above, which
         // stay the raw facts about the currently-selected target: a
         // genuinely recognized live boss (`is_boss`) wins over this field in
-        // `encounter_title` (`crates/app/src/ui.rs`), which is the caption
+        // `encounter_title` (`crates/app/src/ui/header.rs`), which is the caption
         // for "nothing engaged yet" and for a non-boss `boss_uid` target —
         // see that function's doc comment for the full precedence and why.
         //
@@ -10060,7 +10060,7 @@ mod tests {
         /// from 102721 to 130110 — no 103xxx id at all — so a real
         /// current-content boss like 103108 resolved a `boss_monster_id` but
         /// `is_boss` came back false, and `encounter_title`
-        /// (`crates/app/src/ui.rs`) rendered an empty header mid-fight. This
+        /// (`crates/app/src/ui/header.rs`) rendered an empty header mid-fight. This
         /// covers the same end-to-end path with a boss id now sourced from
         /// `MonsterTable.json`'s `MonsterType == 2` instead of the stale
         /// hand-curated list.
