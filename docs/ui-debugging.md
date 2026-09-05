@@ -218,7 +218,7 @@ observed = premultiplied_channel + (1 − a/255) · background_channel
 ```
 
 Worked example — the one that identified the startup-transparency defect.
-`PANEL_FILL` in `crates/app/src/ui.rs` is
+`PANEL_FILL` in `crates/app/src/ui/mod.rs` is
 `Color32::from_rgba_unmultiplied_const(18, 18, 22, 200)`. Premultiplied that is
 `(14, 14, 17)`, and `1 − 200/255 = 0.216`, so:
 
@@ -290,7 +290,7 @@ Each of these cost real time to find; they are commented at the site in
   therefore diagnoses only a genuinely non-zero last error, and downgrades
   non-fatal calls to `NOTE` — error 5 always stays `ERR` with the full
   integrity-level explanation.
-- **The app can veto your resize.** Snap-blocking and auto-fit logic in `ui.rs`
+- **The app can veto your resize.** Snap-blocking and auto-fit logic in `ui/mod.rs`
   may revert an external `MoveWindow`, and `MIN_INNER_SIZE` (220×90) clamps
   shrink tests. `Set-AppRect` re-reads the rect afterwards and prints
   `MISMATCH` when what stuck differs from what was asked for; never assume a

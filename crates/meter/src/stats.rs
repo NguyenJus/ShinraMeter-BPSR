@@ -445,7 +445,7 @@ pub struct EncounterInfo {
     /// (issue #201 — this used to be learned at runtime and cached to disk).
     /// Independent of `boss_monster_id`/`boss_name`/`is_boss` above, which
     /// remain the raw facts about the currently-selected target;
-    /// `encounter_title` in `crates/app/src/ui.rs` falls back to this field
+    /// `encounter_title` in `crates/app/src/ui/header.rs` falls back to this field
     /// so a mid-dungeon mech (or even a genuine mid-dungeon boss) never
     /// displaces the dungeon's final boss name.
     ///
@@ -460,7 +460,7 @@ pub struct EncounterInfo {
     /// (`phase::is_boss_select_scene`), which is the only source — the meter
     /// cannot tell a raid's selections from an ordinary dungeon's boss order
     /// by observation. Drives `encounter_title`'s
-    /// "Select a boss" placeholder in `crates/app/src/ui.rs`: with nothing
+    /// "Select a boss" placeholder in `crates/app/src/ui/header.rs`: with nothing
     /// engaged there is genuinely no target *yet*, as opposed to the
     /// no-target-at-all case "No target" names.
     pub multi_boss_scene: bool,

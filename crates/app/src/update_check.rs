@@ -2,7 +2,7 @@
 //! update that click can now perform (issue #250): decides whether the
 //! running build is behind the latest tagged GitHub release and, if the
 //! user asks for it, downloads that release's executable, swaps it in over
-//! the running one and hands `ui.rs` the path to relaunch. There is still
+//! the running one and hands the `ui` module the path to relaunch. There is still
 //! no automatic or background checking — the header dropdown's "Check for
 //! updates" item (`ui::draw_header_menu`) is the only trigger, and every
 //! request is a deliberate, one-shot click.

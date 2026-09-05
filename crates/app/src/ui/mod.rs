@@ -255,7 +255,7 @@ fn relative_luminance((r, g, b): (u8, u8, u8)) -> f32 {
 ///
 /// Lives here rather than in `skills.rs` (moved in the issue #281 review
 /// pass): `skills.rs`'s module doc says this file owns skill-name/sort
-/// view-model logic and that "`ui.rs` (T4) owns painting this; it must not
+/// view-model logic and that "`ui/skill_window.rs` (T4) owns painting this; it must not
 /// be touched here" — a WCAG contrast decision producing `egui::Color32`
 /// paint values is exactly the painting decision that line rules out, so
 /// it belongs beside `paint_skill_icon_placeholder`, the only caller.
@@ -602,7 +602,7 @@ pub(crate) struct Icons {
 
 impl Icons {
     /// Safe to call more than once per process (each call re-decodes and
-    /// re-uploads every icon), but nothing does: `ui.rs`'s
+    /// re-uploads every icon), but nothing does: this module's
     /// `get_or_insert_with` call site only ever calls this on `OverlayApp`'s
     /// first `ui()` frame.
     pub(crate) fn load(ctx: &egui::Context) -> Self {
@@ -2444,7 +2444,7 @@ fn gesture_pointer(
 /// The `viewport` half is issue #218: `draw_skill_window` now drives this
 /// same gesture code for every open breakdown child viewport, but
 /// `force_frame_recompute` has exactly one window to aim at — the root
-/// `HWND` cached at startup, because the `ui.rs` call sites only ever hold
+/// `HWND` cached at startup, because this module's call sites only ever hold
 /// an `egui::Context` and no per-viewport handle exists (see its doc
 /// comment in `platform`). Firing it from a child would `SetWindowPos` the
 /// *root* window over a resize the root never underwent: nothing for the
