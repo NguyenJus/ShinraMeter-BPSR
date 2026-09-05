@@ -851,8 +851,14 @@ mod tests {
                 title: "Boss".to_string(),
                 subtitle: Some("Scene".to_string()),
                 meter_version: "0.2.2".to_string(),
+                local_uid: None,
                 players: vec![PlayerRecord {
                     uid: 1,
+                    entity: bpsr_meter::EntityId::from_display_uid(
+                        1,
+                        bpsr_meter::EntityKind::Player,
+                    )
+                    .0 as i64,
                     name: "Alice".to_string(),
                     class: Some(Class::FrostMage),
                     ability_score: Some(999),

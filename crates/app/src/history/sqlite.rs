@@ -8,7 +8,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use bpsr_meter::Class;
+use bpsr_meter::{Class, EntityId, EntityKind};
 
 use super::{
     EncounterRecord, EncounterSummary, HistoryError, HistoryStore, PlayerRecord, RetentionPolicy,
@@ -135,13 +135,15 @@ fn init_schema(conn: &Connection) -> Result<(), HistoryError> {
             title           TEXT    NOT NULL,
             subtitle        TEXT,
             player_count    INTEGER NOT NULL,
-            meter_version   TEXT    NOT NULL
+            meter_version   TEXT    NOT NULL,
+            local_uid       INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_encounters_ended_at ON encounters(ended_at_ms DESC);
         CREATE TABLE IF NOT EXISTS encounter_players (
             encounter_id    INTEGER NOT NULL REFERENCES encounters(id) ON DELETE CASCADE,
             slot            INTEGER NOT NULL,
             uid             INTEGER NOT NULL,
+            entity          INTEGER,
             name            TEXT    NOT NULL,
             class           TEXT,
             ability_score   INTEGER,
@@ -204,6 +206,18 @@ fn migrate(conn: &Connection, from: i32) -> Result<(), HistoryError> {
     if from < 2 {
         conn.execute_batch(SKILLS_DDL)?;
     }
+    // v2 → v3 (issues #373, #379): the local player's uid at the moment a
+    // fight ended, and the live `EntityId` behind each saved player row.
+    // Both plain `ALTER TABLE ... ADD COLUMN`s — nullable, so every row
+    // written before this step simply reads back `NULL` (see
+    // `EncounterRecord::to_snapshot`/`PlayerRecord::to_row`'s doc comments)
+    // rather than needing a backfill.
+    if from < 3 {
+        conn.execute_batch(
+            "ALTER TABLE encounters ADD COLUMN local_uid INTEGER;
+             ALTER TABLE encounter_players ADD COLUMN entity INTEGER;",
+        )?;
+    }
     Ok(())
 }
 
@@ -245,8 +259,8 @@ impl HistoryStore for SqliteHistory {
             "INSERT INTO encounters (
                 ended_at_ms, duration_ms, total_damage, total_dps, boss_monster_id,
                 boss_name, is_boss, scene_id, scene_name, title, subtitle,
-                player_count, meter_version
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                player_count, meter_version, local_uid
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 i64::try_from(record.ended_at_ms).unwrap_or(i64::MAX),
                 i64::try_from(record.duration_ms).unwrap_or(i64::MAX),
@@ -261,6 +275,7 @@ impl HistoryStore for SqliteHistory {
                 record.subtitle,
                 i64::try_from(record.players.len()).unwrap_or(i64::MAX),
                 record.meter_version,
+                record.local_uid,
             ],
         )?;
         let encounter_id = tx.last_insert_rowid();
@@ -268,10 +283,10 @@ impl HistoryStore for SqliteHistory {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO encounter_players (
-                    encounter_id, slot, uid, name, class, ability_score, season_strength,
+                    encounter_id, slot, uid, entity, name, class, ability_score, season_strength,
                     imagine_0, imagine_1, imagine_tier_0, imagine_tier_1,
                     damage, dps, share_pct, crit_pct, lucky_pct, hits, deaths
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             )?;
             let mut skill_stmt = tx.prepare(
                 "INSERT INTO encounter_player_skills (
@@ -285,6 +300,7 @@ impl HistoryStore for SqliteHistory {
                     encounter_id,
                     slot_id,
                     player.uid,
+                    player.entity,
                     player.name,
                     player.class.map(|c| c.name()),
                     player.ability_score.map(i64::from),
@@ -376,7 +392,8 @@ impl HistoryStore for SqliteHistory {
             .conn
             .query_row(
                 "SELECT ended_at_ms, duration_ms, total_damage, total_dps, boss_monster_id,
-                        boss_name, is_boss, scene_id, scene_name, title, subtitle, meter_version
+                        boss_name, is_boss, scene_id, scene_name, title, subtitle, meter_version,
+                        local_uid
                  FROM encounters WHERE id = ?1",
                 params![id],
                 |row| {
@@ -397,6 +414,7 @@ impl HistoryStore for SqliteHistory {
                         title: row.get(9)?,
                         subtitle: row.get(10)?,
                         meter_version: row.get(11)?,
+                        local_uid: row.get(12)?,
                         players: Vec::new(),
                     })
                 },
@@ -408,35 +426,45 @@ impl HistoryStore for SqliteHistory {
         };
 
         let mut stmt = self.conn.prepare(
-            "SELECT uid, name, class, ability_score, season_strength, imagine_0, imagine_1,
-                    imagine_tier_0, imagine_tier_1, damage, dps, share_pct, crit_pct, lucky_pct,
-                    hits, deaths
+            "SELECT uid, entity, name, class, ability_score, season_strength, imagine_0,
+                    imagine_1, imagine_tier_0, imagine_tier_1, damage, dps, share_pct, crit_pct,
+                    lucky_pct, hits, deaths
              FROM encounter_players WHERE encounter_id = ?1 ORDER BY slot",
         )?;
         record.players = stmt
             .query_map(params![id], |row| {
+                let uid: i64 = row.get(0)?;
+                // Issue #379: a pre-v3 row has no stored `entity` and reads
+                // back `NULL` here; reconstruct the same `EntityId` a live
+                // encounter would have derived for a bare display uid, so
+                // `PlayerRecord::to_row` always has a real value to hand
+                // back rather than needing its own `Option`.
+                let entity = row.get::<_, Option<i64>>(1)?.unwrap_or_else(|| {
+                    EntityId::from_display_uid(uid, EntityKind::Player).0 as i64
+                });
                 Ok(PlayerRecord {
-                    uid: row.get(0)?,
-                    name: row.get(1)?,
+                    uid,
+                    entity,
+                    name: row.get(2)?,
                     class: row
-                        .get::<_, Option<String>>(2)?
+                        .get::<_, Option<String>>(3)?
                         .as_deref()
                         .and_then(class_from_name),
                     ability_score: row
-                        .get::<_, Option<i64>>(3)?
-                        .map(|v| u32::try_from(v).unwrap_or(0)),
-                    season_strength: row
                         .get::<_, Option<i64>>(4)?
                         .map(|v| u32::try_from(v).unwrap_or(0)),
-                    imagines: [row.get(5)?, row.get(6)?],
-                    imagine_tiers: [row.get(7)?, row.get(8)?],
-                    damage: row.get(9)?,
-                    dps: row.get(10)?,
-                    share_pct: row.get::<_, f64>(11)? as f32,
-                    crit_pct: row.get::<_, f64>(12)? as f32,
-                    lucky_pct: row.get::<_, f64>(13)? as f32,
-                    hits: u64::try_from(row.get::<_, i64>(14)?).unwrap_or(0),
-                    deaths: u32::try_from(row.get::<_, i64>(15)?).unwrap_or(0),
+                    season_strength: row
+                        .get::<_, Option<i64>>(5)?
+                        .map(|v| u32::try_from(v).unwrap_or(0)),
+                    imagines: [row.get(6)?, row.get(7)?],
+                    imagine_tiers: [row.get(8)?, row.get(9)?],
+                    damage: row.get(10)?,
+                    dps: row.get(11)?,
+                    share_pct: row.get::<_, f64>(12)? as f32,
+                    crit_pct: row.get::<_, f64>(13)? as f32,
+                    lucky_pct: row.get::<_, f64>(14)? as f32,
+                    hits: u64::try_from(row.get::<_, i64>(15)?).unwrap_or(0),
+                    deaths: u32::try_from(row.get::<_, i64>(16)?).unwrap_or(0),
                     skills: Vec::new(),
                 })
             })?
@@ -495,11 +523,11 @@ impl HistoryStore for SqliteHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bpsr_meter::Class;
 
     fn sample_player(uid: i64, name: &str) -> PlayerRecord {
         PlayerRecord {
             uid,
+            entity: EntityId::from_display_uid(uid, EntityKind::Player).0 as i64,
             name: name.to_string(),
             class: Some(Class::FrostMage),
             ability_score: Some(999),
@@ -535,6 +563,7 @@ mod tests {
             title: "Boss".to_string(),
             subtitle: Some("Scene".to_string()),
             meter_version: "0.2.2".to_string(),
+            local_uid: None,
             players,
         }
     }
@@ -964,6 +993,110 @@ mod tests {
             "an encounter saved before the skill table simply has no skill rows"
         );
         assert_eq!(fresh.players[0].skills, bob.skills);
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(
+            !bak_exists,
+            "a migratable file is upgraded in place, never renamed aside"
+        );
+    }
+
+    /// Issue #373: `EncounterRecord::local_uid` round-trips through a real
+    /// insert/load cycle, not just through the in-memory `to_snapshot`
+    /// conversion.
+    #[test]
+    fn inserting_and_loading_round_trips_local_uid() {
+        let mut store = SqliteHistory::in_memory(RetentionPolicy::default()).unwrap();
+        let mut record = sample_record(1_000, 10_000, vec![sample_player(1, "Alice")]);
+        record.local_uid = Some(1);
+        let id = store.insert(&record).unwrap().unwrap();
+
+        let loaded = store.load(id).unwrap().unwrap();
+
+        assert_eq!(loaded.local_uid, Some(1));
+    }
+
+    /// Issue #379: two players who share a recycled display `uid` in the
+    /// same live encounter must stay two distinct rows on reload, each
+    /// carrying its own `entity`.
+    #[test]
+    fn two_players_sharing_a_recycled_uid_stay_distinct_by_entity() {
+        let mut store = SqliteHistory::in_memory(RetentionPolicy::default()).unwrap();
+        let mut first = sample_player(1, "Alice");
+        first.entity = 0xAAAA;
+        let mut second = sample_player(1, "Bob");
+        second.entity = 0xBBBB;
+        let id = store
+            .insert(&sample_record(1_000, 10_000, vec![first, second]))
+            .unwrap()
+            .unwrap();
+
+        let loaded = store.load(id).unwrap().unwrap();
+
+        assert_eq!(loaded.players[0].uid, 1);
+        assert_eq!(loaded.players[1].uid, 1);
+        assert_eq!(loaded.players[0].entity, 0xAAAA);
+        assert_eq!(loaded.players[1].entity, 0xBBBB);
+        assert_ne!(loaded.players[0].entity, loaded.players[1].entity);
+
+        let snapshot = loaded.to_snapshot();
+        assert_ne!(snapshot.rows[0].entity, snapshot.rows[1].entity);
+    }
+
+    /// Issue #373/#379: a v2 database has neither `encounters.local_uid` nor
+    /// `encounter_players.entity`. Migrating it forward must add both
+    /// columns and leave every existing row reading back `local_uid: None`
+    /// and an `entity` reconstructed from its bare `uid`, exactly like a
+    /// pre-v3 build would have derived it live.
+    #[test]
+    fn a_v2_database_migrates_in_place_and_backfills_entity() {
+        let path = crate::history::temp_history_path("v2-migration");
+        let bak_path = path.with_extension("v2.bak");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&bak_path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V1_SCHEMA).unwrap();
+            conn.execute_batch(SKILLS_DDL).unwrap();
+            conn.execute(
+                "INSERT INTO encounters (
+                    ended_at_ms, duration_ms, total_damage, total_dps, boss_monster_id,
+                    boss_name, is_boss, scene_id, scene_name, title, subtitle,
+                    player_count, meter_version
+                 ) VALUES (1000, 10000, 10000, 1000.0, 7, 'Boss', 1, 3, 'Scene', 'Boss',
+                           'Scene', 1, '0.2.2')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO encounter_players (
+                    encounter_id, slot, uid, name, class, ability_score, season_strength,
+                    imagine_0, imagine_1, imagine_tier_0, imagine_tier_1,
+                    damage, dps, share_pct, crit_pct, lucky_pct, hits, deaths
+                 ) VALUES (1, 0, 1, 'Alice', 'FrostMage', 999, 42, 1, NULL, 3, NULL,
+                           5000, 500.0, 33.3, 12.5, 6.25, 40, 2)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+
+        let store = SqliteHistory::open(&path, RetentionPolicy::default()).unwrap();
+        let loaded = store.load(1).unwrap().unwrap();
+        let version: i32 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        drop(store);
+        let bak_exists = bak_path.exists();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&bak_path);
+
+        assert_eq!(loaded.local_uid, None);
+        assert_eq!(
+            loaded.players[0].entity,
+            EntityId::from_display_uid(1, EntityKind::Player).0 as i64
+        );
         assert_eq!(version, SCHEMA_VERSION);
         assert!(
             !bak_exists,

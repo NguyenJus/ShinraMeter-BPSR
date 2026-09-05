@@ -24,6 +24,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use bpsr_meter::{EntityId, EntityKind};
 use rusqlite::{Connection, OpenFlags};
 
 use super::HistoryError;
@@ -79,6 +80,15 @@ impl Remap {
     /// `Player<n>`, matching `sanitize-dump`'s `name_for` exactly.
     fn name_for(&mut self, old_uid: i64) -> String {
         format!("Player{}", self.uid(old_uid))
+    }
+
+    /// Whether `old` is a real player uid this remap has already seen —
+    /// used by [`sanitize_into`] to decide whether `encounters.local_uid`
+    /// names one of this encounter's own players (and so gets remapped
+    /// alongside them) or a bystander that never made the roster (and so
+    /// is dropped rather than leaked as an unmapped real uid).
+    fn contains(&self, old: i64) -> bool {
+        self.uids.contains_key(&old)
     }
 }
 
@@ -152,15 +162,17 @@ fn sanitize_into(src: &Path, dst: &Path) -> Result<SanitizeReport, HistoryError>
         conn.query_row("SELECT COUNT(*) FROM encounters", [], |row| row.get(0))?;
     report.encounters = encounters.max(0) as u64;
 
-    let rows: Vec<(i64, i64, i64)> = {
+    let rows: Vec<(i64, i64, i64, Option<i64>)> = {
         let mut stmt = conn.prepare(
-            "SELECT encounter_id, slot, uid FROM encounter_players ORDER BY encounter_id, slot",
+            "SELECT encounter_id, slot, uid, entity FROM encounter_players
+             ORDER BY encounter_id, slot",
         )?;
         stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?
@@ -169,15 +181,48 @@ fn sanitize_into(src: &Path, dst: &Path) -> Result<SanitizeReport, HistoryError>
     let mut remap = Remap::new();
     {
         let tx = conn.transaction()?;
-        for (encounter_id, slot, uid) in rows {
-            let new_uid = remap.uid(uid);
-            let new_name = remap.name_for(uid);
+        for (encounter_id, slot, uid, entity) in &rows {
+            let new_uid = remap.uid(*uid);
+            let new_name = remap.name_for(*uid);
+            // Issue #379: `entity` is `(uid << 16) | flag bits`, so swap the
+            // uid half for the pseudonym and keep the low 16 bits verbatim:
+            // two rows that shared a recycled display uid in the live fight
+            // differ only in those bits, and the sanitized copy must keep
+            // them distinct too. A pre-v3 row (`NULL`) gets the same bare
+            // reconstruction `sqlite::SqliteHistory::load` falls back to.
+            let low_bits = entity
+                .unwrap_or(EntityId::from_display_uid(*uid, EntityKind::Player).0 as i64)
+                & 0xFFFF;
+            let new_entity = (new_uid << 16) | low_bits;
             tx.execute(
-                "UPDATE encounter_players SET uid = ?1, name = ?2 WHERE encounter_id = ?3 AND slot = ?4",
-                rusqlite::params![new_uid, new_name, encounter_id, slot],
+                "UPDATE encounter_players SET uid = ?1, entity = ?2, name = ?3
+                 WHERE encounter_id = ?4 AND slot = ?5",
+                rusqlite::params![new_uid, new_entity, new_name, encounter_id, slot],
             )?;
             report.players_remapped += 1;
         }
+
+        // Issue #373: `encounters.local_uid` names a player, so it is
+        // remapped the same way — but only when it actually is one of this
+        // encounter's own players (the common case); a `local_uid` that
+        // matches no roster row (the local player left before the roster
+        // sync that would have added them) is cleared to `NULL` rather than
+        // leaked into the sanitized copy as an unmapped real uid.
+        let encounters: Vec<(i64, Option<i64>)> = {
+            let mut stmt = tx.prepare("SELECT id, local_uid FROM encounters")?;
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, local_uid) in encounters {
+            let new_local_uid = local_uid
+                .filter(|uid| remap.contains(*uid))
+                .map(|uid| remap.uid(uid));
+            tx.execute(
+                "UPDATE encounters SET local_uid = ?1 WHERE id = ?2",
+                rusqlite::params![new_local_uid, id],
+            )?;
+        }
+
         tx.commit()?;
     }
 
@@ -195,6 +240,7 @@ mod tests {
     use super::*;
     use crate::history::sqlite::SqliteHistory;
     use crate::history::{EncounterRecord, HistoryStore, PlayerRecord, RetentionPolicy};
+    use bpsr_meter::{EntityId, EntityKind};
 
     fn temp_db_path(tag: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -208,6 +254,7 @@ mod tests {
     fn sample_player(uid: i64, name: &str) -> PlayerRecord {
         PlayerRecord {
             uid,
+            entity: EntityId::from_display_uid(uid, EntityKind::Player).0 as i64,
             name: name.to_string(),
             class: Some(Class::FrostMage),
             ability_score: Some(999),
@@ -243,6 +290,7 @@ mod tests {
             title: "Boss".to_string(),
             subtitle: Some("Scene".to_string()),
             meter_version: "0.2.2".to_string(),
+            local_uid: None,
             players,
         }
     }
@@ -369,6 +417,114 @@ mod tests {
         sanitize_copy(&src, &dst).unwrap();
 
         assert_eq!(all_names(&src), vec!["Alice", "Alice", "Bob"]);
+
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&dst);
+    }
+
+    /// Issues #373/#379: `encounters.local_uid` and `encounter_players.entity`
+    /// both name a player, so sanitizing must rewrite them consistently
+    /// with that player's remapped `uid` rather than leaking the real
+    /// value or the pre-sanitize `EntityId`.
+    #[test]
+    fn sanitize_copy_remaps_local_uid_and_entity_with_the_player_uid() {
+        let src = temp_db_path("seed-local-uid");
+        let mut store = SqliteHistory::open(&src, RetentionPolicy::default()).unwrap();
+        let mut record = sample_record(1_000, 10_000, vec![sample_player(1, "Alice")]);
+        record.local_uid = Some(1);
+        store.insert(&record).unwrap();
+        drop(store);
+
+        let dst = temp_db_path("out-local-uid");
+        sanitize_copy(&src, &dst).unwrap();
+
+        let conn = Connection::open(&dst).unwrap();
+        let (new_uid, new_local_uid): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT p.uid, e.local_uid FROM encounter_players p
+                 JOIN encounters e ON e.id = p.encounter_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let new_entity: i64 = conn
+            .query_row("SELECT entity FROM encounter_players", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(
+            new_local_uid,
+            Some(new_uid),
+            "local_uid must follow the same player's remapped uid"
+        );
+        assert_eq!(
+            new_entity,
+            EntityId::from_display_uid(new_uid, EntityKind::Player).0 as i64,
+            "entity must be re-derived from the remapped uid"
+        );
+
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&dst);
+    }
+
+    /// Issue #379: two rows that shared a recycled display uid differ only
+    /// in the entity's low flag bits, and sanitizing must keep them apart.
+    #[test]
+    fn sanitize_copy_keeps_entity_flag_bits_for_recycled_uids() {
+        let src = temp_db_path("seed-entity-bits");
+        let mut store = SqliteHistory::open(&src, RetentionPolicy::default()).unwrap();
+        let mut a = sample_player(1, "Alice");
+        let mut b = sample_player(1, "Bob");
+        a.entity = EntityId::from_display_uid(1, EntityKind::Player).0 as i64;
+        b.entity = a.entity | 0x1;
+        store
+            .insert(&sample_record(1_000, 10_000, vec![a, b]))
+            .unwrap();
+        drop(store);
+
+        let dst = temp_db_path("out-entity-bits");
+        sanitize_copy(&src, &dst).unwrap();
+
+        let conn = Connection::open(&dst).unwrap();
+        let rows: Vec<(i64, i64)> = conn
+            .prepare("SELECT uid, entity FROM encounter_players ORDER BY slot")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, rows[1].0, "same display uid stays shared");
+        assert_ne!(rows[0].1, rows[1].1, "entities must stay distinct");
+        assert_eq!(
+            rows[0].1 >> 16,
+            rows[0].0,
+            "entity uid half follows the pseudonym"
+        );
+        assert_eq!(rows[1].1 & 0xFFFF, (rows[0].1 & 0xFFFF) | 0x1);
+
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&dst);
+    }
+
+    /// A `local_uid` that names no player in this encounter's own roster
+    /// must not leak the real uid into the sanitized copy.
+    #[test]
+    fn sanitize_copy_clears_a_local_uid_with_no_matching_player() {
+        let src = temp_db_path("seed-orphan-local-uid");
+        let mut store = SqliteHistory::open(&src, RetentionPolicy::default()).unwrap();
+        let mut record = sample_record(1_000, 10_000, vec![sample_player(1, "Alice")]);
+        record.local_uid = Some(999);
+        store.insert(&record).unwrap();
+        drop(store);
+
+        let dst = temp_db_path("out-orphan-local-uid");
+        sanitize_copy(&src, &dst).unwrap();
+
+        let conn = Connection::open(&dst).unwrap();
+        let new_local_uid: Option<i64> = conn
+            .query_row("SELECT local_uid FROM encounters", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(new_local_uid, None);
 
         let _ = fs::remove_file(&src);
         let _ = fs::remove_file(&dst);

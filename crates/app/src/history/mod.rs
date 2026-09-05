@@ -21,7 +21,7 @@ pub mod writer;
 
 use std::path::PathBuf;
 
-use bpsr_meter::{Class, EncounterInfo, EntityId, EntityKind, PlayerRow, SkillRow, Snapshot};
+use bpsr_meter::{Class, EncounterInfo, PlayerRow, SkillRow, Snapshot};
 
 /// Where the encounter-history database (issue #39) lives:
 /// `%APPDATA%\ShinraMeter-BPSR\history.sqlite`. `SHINRA_HISTORY_DB` overrides
@@ -48,13 +48,17 @@ pub fn history_db_path() -> PathBuf {
 /// Schema version this build writes and reads (spec §5.4). Bumped whenever
 /// the DDL in `sqlite::init_schema` changes.
 ///
-/// v1 → v2 (issue #222) added `encounter_player_skills`. A file stamped with
-/// an *older* known version is migrated forward in place by
-/// `sqlite::migrate`, so an existing history survives the upgrade with its
-/// pre-v2 encounters simply carrying no skill rows. Only a version this build
-/// has never heard of (a downgrade, or a hand-edited file) is still renamed
-/// aside and replaced, since there is nothing to migrate *from*.
-pub const SCHEMA_VERSION: i32 = 2;
+/// v1 → v2 (issue #222) added `encounter_player_skills`. v2 → v3 (issues
+/// #373, #379) added `encounters.local_uid` and `encounter_players.entity`,
+/// both nullable so a row from an older schema simply reads back `NULL` (see
+/// `EncounterRecord::to_snapshot` and `PlayerRecord::to_row`'s doc comments).
+/// A file stamped with an *older* known version is migrated forward in place
+/// by `sqlite::migrate`, so an existing history survives the upgrade with
+/// its older encounters simply carrying no skill rows / no local uid / no
+/// stored entity. Only a version this build has never heard of (a downgrade,
+/// or a hand-edited file) is still renamed aside and replaced, since there
+/// is nothing to migrate *from*.
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// Retention rules, applied inside every `HistoryStore::insert` (spec §5.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +161,15 @@ impl SkillRecord {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerRecord {
     pub uid: i64,
+    /// The live `EntityId`'s raw value (issue #379). Persisted since schema
+    /// v3 so two players who shared a recycled display `uid` in the live
+    /// encounter (`uid_recycle_separates_entities`) stay distinct rows on
+    /// reload instead of collapsing onto `EntityId::from_display_uid(uid,
+    /// Player)`. A row loaded from a pre-v3 database has no stored entity —
+    /// `sqlite::SqliteHistory::load` fills this in with that same
+    /// reconstruction in that case, so this field is never itself
+    /// `Option`.
+    pub entity: i64,
     pub name: String,
     pub class: Option<Class>,
     pub ability_score: Option<u32>,
@@ -181,6 +194,7 @@ impl From<&PlayerRow> for PlayerRecord {
     fn from(row: &PlayerRow) -> Self {
         Self {
             uid: row.uid,
+            entity: row.entity,
             name: row.name.clone(),
             class: row.class,
             ability_score: row.ability_score,
@@ -206,15 +220,15 @@ impl PlayerRecord {
     fn to_row(&self) -> PlayerRow {
         PlayerRow {
             uid: self.uid,
-            // Issue #335: history predates full `EntityId`s, so the schema
-            // has no stored entity to replay — reconstruct the canonical
-            // one a display uid/kind would have with both flag bits clear
-            // (`EntityId::from_display_uid`), the same id a live player
-            // with no summon/mirror flags gets. Two saved rows can share a
-            // display uid (`uid_recycle_separates_entities`'s golden), but
-            // never this reconstruction plus its kind, since history only
-            // ever persists players.
-            entity: EntityId::from_display_uid(self.uid, EntityKind::Player).0 as i64,
+            // Issue #379: persisted since schema v3, so two saved rows that
+            // shared a recycled display uid in the live encounter
+            // (`uid_recycle_separates_entities`'s golden) stay distinct on
+            // replay instead of collapsing onto the same reconstructed
+            // `EntityId`. A row loaded from a pre-v3 database has already
+            // had this filled in by `sqlite::SqliteHistory::load`'s
+            // `from_display_uid` fallback, so `self.entity` is always a
+            // real value by the time it gets here.
+            entity: self.entity,
             name: self.name.clone(),
             class: self.class,
             ability_score: self.ability_score,
@@ -276,6 +290,11 @@ pub struct EncounterRecord {
     pub title: String,
     pub subtitle: Option<String>,
     pub meter_version: String,
+    /// The local player's uid at the moment this fight ended (issue #373),
+    /// mirroring `Snapshot::local_uid`. Persisted since schema v3; an
+    /// encounter saved before it reads back `None`, the same as a live
+    /// snapshot that never saw a local-player event.
+    pub local_uid: Option<i64>,
     pub players: Vec<PlayerRecord>,
 }
 
@@ -353,6 +372,7 @@ pub fn record_from_snapshot(
         title,
         subtitle,
         meter_version: env!("CARGO_PKG_VERSION").to_string(),
+        local_uid: snapshot.local_uid,
         players: snapshot.rows.iter().map(PlayerRecord::from).collect(),
     })
 }
@@ -389,13 +409,11 @@ impl EncounterRecord {
             // A rebuilt-from-history snapshot has no live capture thread to
             // ask; it renders through the same live table path regardless,
             // and is never checked for this (see `Snapshot::capture_alive`).
-            // Separately, the local player's uid is not persisted in
-            // history.sqlite at all — the current schema (SCHEMA_VERSION =
-            // 2) has no column for it, so a rebuilt snapshot can never
-            // identify "you" even if it wanted to. Persisting it needs a
-            // schema bump plus a sanitizer remap (#353); tracked as a
-            // follow-up in #373.
-            local_uid: None,
+            // Issue #373: persisted since schema v3, so a rebuilt snapshot
+            // can identify "you" the same as a live one — `None` here only
+            // for an encounter saved before the column existed, or one
+            // whose live fight never saw a local-player event.
+            local_uid: self.local_uid,
             capture_alive: true,
         }
     }
@@ -442,6 +460,8 @@ pub(crate) fn temp_history_path(tag: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use bpsr_meter::{EntityId, EntityKind};
+
     use super::*;
 
     fn sample_row(uid: i64, name: &str) -> PlayerRow {
