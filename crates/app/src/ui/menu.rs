@@ -376,6 +376,12 @@ pub(crate) fn draw_header_menu(
     ctx: &egui::Context,
     tx_command: &Sender<UiCommand>,
     settings: SettingsHandle<'_>,
+    // Issue #340: last frame's measured header band — threaded through so
+    // the "Reset to defaults" item's resize target
+    // (`reset_to_defaults_inner_height`) agrees with the resize-border
+    // double-click's and the header's own paint, all sized off the same
+    // measurement via `measured_header_band_height`.
+    previous_header_rect: Option<egui::Rect>,
     icons: &Icons,
     // Issue #171: the manual "Check for updates" item's in-flight/last-
     // result state — see `UpdateCheckState`'s doc comment.
@@ -583,7 +589,7 @@ pub(crate) fn draw_header_menu(
             if ui.button("Reset to defaults").clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     default_inner_width(),
-                    reset_to_defaults_inner_height(),
+                    reset_to_defaults_inner_height(previous_header_rect),
                 )));
                 settings.reset_to_defaults();
                 for slot in ImageSlot::ALL {
@@ -1077,6 +1083,7 @@ mod tests {
                     },
                     &icons,
                     &mut gesture,
+                    None,
                     false,
                     true,
                     &mut update_check,

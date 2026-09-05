@@ -62,7 +62,6 @@ use crate::update_check::{self, CheckOutcome};
 // `FontId`, so a style table would be a second, silently-diverging source of
 // truth rather than a shared one.
 
-/// Boss/encounter title — the source's `FontSize="13" FontWeight="DemiBold"`.
 mod header;
 mod history_view;
 mod menu;
@@ -81,6 +80,7 @@ pub(crate) use skill_window::*;
 pub(crate) use status::*;
 pub(crate) use table::*;
 
+/// Boss/encounter title — the source's `FontSize="13" FontWeight="DemiBold"`.
 const FONT_SIZE_TITLE: f32 = 13.0;
 /// The header's timer readout — the source's `FontSize="16"
 /// FontWeight="DemiBold"`, the largest text in the UI.
@@ -1182,9 +1182,11 @@ fn initial_snapshot(demo_mode: bool) -> Snapshot {
 impl OverlayApp {
     /// The overlay's current window opacity.
     ///
-    /// The one place `Settings::opacity`'s raw `f32` is turned into an
-    /// [`Opacity`]; every paint path takes the typed value from here rather
-    /// than reading (and re-clamping) the setting itself.
+    /// The `OverlayApp`-level accessor for turning `Settings::opacity`'s raw
+    /// `f32` into an [`Opacity`]; most paint paths that already hold `self`
+    /// take the typed value from here. Sites that only have `&Settings`
+    /// (not `&OverlayApp`) call `Opacity::new(settings.opacity)` directly
+    /// instead — this is not the sole call site of `Opacity::new`.
     pub(crate) fn opacity(&self) -> Opacity {
         Opacity::new(self.settings.opacity)
     }
@@ -1860,6 +1862,7 @@ impl eframe::App for OverlayApp {
                     },
                     icons,
                     &mut self.window_gesture,
+                    previous_header_rect,
                     capturing,
                     share_active,
                     &mut self.update_check,
@@ -2954,8 +2957,18 @@ const MIN_COLUMN_SCALE: f32 = 0.6;
 /// same offset the header wash's height derives from (issue #158) — so
 /// this window's "no scrolling needed" promise and the wash's reach can
 /// never drift back out of sync with each other.
-fn default_inner_height() -> f32 {
-    inner_height_for_rows(DEFAULT_VISIBLE_ROWS, header_band_height(BUTTON_ROW_HEIGHT))
+///
+/// `previous_header_rect` is the last frame's measured header band
+/// (`OverlayApp::header_rect`), or `None` before the first frame — threaded
+/// through `measured_header_band_height` so this agrees with the resize-
+/// border double-click and the header's own paint (issue #340), rather than
+/// re-deriving the band from `header_band_height(BUTTON_ROW_HEIGHT)`'s
+/// constant budget alone.
+fn default_inner_height(previous_header_rect: Option<egui::Rect>) -> f32 {
+    inner_height_for_rows(
+        DEFAULT_VISIBLE_ROWS,
+        measured_header_band_height(previous_header_rect),
+    )
 }
 
 /// Number of player rows the header dropdown's "Reset to defaults" item
@@ -2973,10 +2986,14 @@ const RESET_TO_DEFAULTS_VISIBLE_ROWS: usize = 5;
 /// Width is unaffected — `default_inner_width` already sizes for exactly
 /// the `Settings::default()` column set this reset also restores, with no
 /// dependence on row count — so only height needs its own helper here.
-fn reset_to_defaults_inner_height() -> f32 {
+///
+/// `previous_header_rect` is threaded through to `measured_header_band_
+/// height` the same way `default_inner_height` does (issue #340) — see
+/// that function's doc comment.
+fn reset_to_defaults_inner_height(previous_header_rect: Option<egui::Rect>) -> f32 {
     inner_height_for_rows(
         RESET_TO_DEFAULTS_VISIBLE_ROWS,
-        header_band_height(BUTTON_ROW_HEIGHT),
+        measured_header_band_height(previous_header_rect),
     )
 }
 
@@ -3136,7 +3153,7 @@ pub fn viewport(
 ) -> egui::ViewportBuilder {
     let inner_size = window_size
         .and_then(sanitize_window_size)
-        .unwrap_or([default_inner_width(), default_inner_height()]);
+        .unwrap_or([default_inner_width(), default_inner_height(None)]);
     let mut builder = egui::ViewportBuilder::default()
         .with_always_on_top()
         .with_decorations(false)
@@ -4055,6 +4072,7 @@ mod tests {
                 },
                 &icons,
                 &mut WindowGesture::default(),
+                None,
                 false,
                 true,
                 &mut UpdateCheckState::default(),
@@ -4196,7 +4214,7 @@ mod tests {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(default_inner_width(), default_inner_height()),
+                egui::vec2(default_inner_width(), default_inner_height(None)),
             )),
             ..Default::default()
         };
@@ -4219,6 +4237,7 @@ mod tests {
                 },
                 &icons,
                 &mut WindowGesture::default(),
+                None,
                 false,
                 true,
                 &mut UpdateCheckState::default(),
@@ -4788,7 +4807,7 @@ mod tests {
         // `with_min_inner_size` is [220.0, 90.0] (unaffected by issue #26);
         // the default opening size must never start below its own floor.
         assert!(default_inner_width() >= 220.0);
-        assert!(default_inner_height() >= 90.0);
+        assert!(default_inner_height(None) >= 90.0);
     }
 
     #[test]
@@ -4802,7 +4821,7 @@ mod tests {
         // still individually "fit their rows".
         let row_delta = (DEFAULT_VISIBLE_ROWS - RESET_TO_DEFAULTS_VISIBLE_ROWS) as f32;
         assert_eq!(
-            default_inner_height() - reset_to_defaults_inner_height(),
+            default_inner_height(None) - reset_to_defaults_inner_height(None),
             row_delta * ROW_HEIGHT
         );
     }
@@ -4818,8 +4837,8 @@ mod tests {
         let taller = budget + 12.0;
         let five = inner_height_for_rows(RESET_TO_DEFAULTS_VISIBLE_ROWS, taller);
         let twenty = inner_height_for_rows(DEFAULT_VISIBLE_ROWS, taller);
-        assert_eq!(five, reset_to_defaults_inner_height() + 12.0);
-        assert_eq!(twenty, default_inner_height() + 12.0);
+        assert_eq!(five, reset_to_defaults_inner_height(None) + 12.0);
+        assert_eq!(twenty, default_inner_height(None) + 12.0);
         assert_eq!(resize_double_click_preset_height(five, taller), twenty);
         assert_eq!(resize_double_click_preset_height(twenty, taller), five);
     }
@@ -4844,8 +4863,27 @@ mod tests {
     #[test]
     fn resize_double_click_preset_height_alternates_between_the_two_presets() {
         let band = header_band_height(BUTTON_ROW_HEIGHT);
-        let five = reset_to_defaults_inner_height();
-        let twenty = default_inner_height();
+        let five = reset_to_defaults_inner_height(None);
+        let twenty = default_inner_height(None);
+        assert_eq!(resize_double_click_preset_height(five, band), twenty);
+        assert_eq!(resize_double_click_preset_height(twenty, band), five);
+    }
+
+    /// Issue #340: `default_inner_height` and `reset_to_defaults_inner_
+    /// height` both thread the same measured header rect into `measured_
+    /// header_band_height`, and the double-click preset swap sizes its own
+    /// band the identical way — so given one real measured rect (not the
+    /// constant budget), the reset preset must still land exactly on the
+    /// height double-clicking the resize border would produce for that
+    /// same rect, and vice versa. If any of the three ever fell back to
+    /// re-deriving the band from `header_band_height(BUTTON_ROW_HEIGHT)`
+    /// instead of the measured rect, this would catch the resulting drift.
+    #[test]
+    fn reset_to_defaults_and_double_click_agree_on_height_for_a_measured_rect() {
+        let measured = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 81.0));
+        let band = measured_header_band_height(Some(measured));
+        let five = reset_to_defaults_inner_height(Some(measured));
+        let twenty = default_inner_height(Some(measured));
         assert_eq!(resize_double_click_preset_height(five, band), twenty);
         assert_eq!(resize_double_click_preset_height(twenty, band), five);
     }
@@ -4856,8 +4894,8 @@ mod tests {
     /// presets is where that flips.
     #[test]
     fn resize_double_click_preset_height_picks_the_farther_preset_from_an_arbitrary_height() {
-        let five = reset_to_defaults_inner_height();
-        let twenty = default_inner_height();
+        let five = reset_to_defaults_inner_height(None);
+        let twenty = default_inner_height(None);
         let band = header_band_height(BUTTON_ROW_HEIGHT);
         let midpoint = (five + twenty) / 2.0;
         assert_eq!(
@@ -4880,7 +4918,7 @@ mod tests {
         let band = header_band_height(BUTTON_ROW_HEIGHT);
         assert_eq!(resize_double_click_command(false, 100.0, band), None);
         assert_eq!(
-            resize_double_click_command(false, reset_to_defaults_inner_height(), band),
+            resize_double_click_command(false, reset_to_defaults_inner_height(None), band),
             None
         );
     }
@@ -4891,8 +4929,8 @@ mod tests {
     #[test]
     fn resize_double_click_command_uses_the_preset_height_when_double_clicked() {
         let band = header_band_height(BUTTON_ROW_HEIGHT);
-        let five = reset_to_defaults_inner_height();
-        let twenty = default_inner_height();
+        let five = reset_to_defaults_inner_height(None);
+        let twenty = default_inner_height(None);
         assert_eq!(resize_double_click_command(true, five, band), Some(twenty));
         assert_eq!(resize_double_click_command(true, twenty, band), Some(five));
     }
@@ -5078,16 +5116,17 @@ mod tests {
     #[test]
     fn no_scrolling_needed_when_the_default_window_fits_every_row() {
         let snapshot = rows_test_snapshot(DEFAULT_VISIBLE_ROWS);
-        let content = rows_content_size(&snapshot, default_inner_width(), default_inner_height());
+        let content =
+            rows_content_size(&snapshot, default_inner_width(), default_inner_height(None));
         assert!(
             content.x <= default_inner_width() + 0.01,
             "content {content:?} must not exceed the {}pt default width",
             default_inner_width()
         );
         assert!(
-            content.y <= default_inner_height() + 0.01,
+            content.y <= default_inner_height(None) + 0.01,
             "content {content:?} must not exceed the {}pt default height",
-            default_inner_height()
+            default_inner_height(None)
         );
     }
 
@@ -5105,7 +5144,8 @@ mod tests {
     #[test]
     fn each_rows_name_text_is_vertically_centered_in_its_row() {
         let snapshot = rows_test_snapshot(DEFAULT_VISIBLE_ROWS);
-        let frame = rows_painted_boxes(&snapshot, default_inner_width(), default_inner_height());
+        let frame =
+            rows_painted_boxes(&snapshot, default_inner_width(), default_inner_height(None));
         let rows = frame.row_rects();
         assert_eq!(rows.len(), DEFAULT_VISIBLE_ROWS);
         for (i, row_rect) in rows.iter().enumerate() {
@@ -5295,7 +5335,10 @@ mod tests {
 
         assert_eq!(
             built.inner_size,
-            Some(egui::vec2(default_inner_width(), default_inner_height()))
+            Some(egui::vec2(
+                default_inner_width(),
+                default_inner_height(None)
+            ))
         );
     }
 
@@ -5317,7 +5360,10 @@ mod tests {
 
         assert_eq!(
             built.inner_size,
-            Some(egui::vec2(default_inner_width(), default_inner_height())),
+            Some(egui::vec2(
+                default_inner_width(),
+                default_inner_height(None)
+            )),
             "a non-finite persisted size must be rejected outright, not clamped"
         );
     }
@@ -5328,7 +5374,10 @@ mod tests {
 
         assert_eq!(
             built.inner_size,
-            Some(egui::vec2(default_inner_width(), default_inner_height())),
+            Some(egui::vec2(
+                default_inner_width(),
+                default_inner_height(None)
+            )),
             "a corrupted, absurdly large persisted size must be rejected outright"
         );
     }
@@ -5342,7 +5391,10 @@ mod tests {
 
         assert_eq!(
             built.inner_size,
-            Some(egui::vec2(default_inner_width(), default_inner_height())),
+            Some(egui::vec2(
+                default_inner_width(),
+                default_inner_height(None)
+            )),
             "a per-axis-plausible but absurdly large-area persisted size must be rejected outright"
         );
     }
@@ -5358,7 +5410,10 @@ mod tests {
         assert_ne!(reset.inner_size, with_persisted.inner_size);
         assert_eq!(
             reset.inner_size,
-            Some(egui::vec2(default_inner_width(), default_inner_height()))
+            Some(egui::vec2(
+                default_inner_width(),
+                default_inner_height(None)
+            ))
         );
     }
 
@@ -5531,6 +5586,7 @@ mod tests {
                     settings: &mut settings,
                     tx_settings: &tx_settings,
                 },
+                None,
                 &icons,
                 &mut update_check,
                 &unused_log_export_sender(),
