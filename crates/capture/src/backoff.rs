@@ -25,6 +25,37 @@ pub fn next_game_pid_lookup_interval(current: Duration, cap: Duration) -> Durati
     current.saturating_mul(2).min(cap)
 }
 
+/// Whether [`crate::win`]'s capture loop should re-run
+/// `owner::find_game_pids()` on this tick, given how long it has been since
+/// the last lookup (`None` if it has never run) and the two cadences that
+/// apply depending on whether the cached set is currently empty.
+///
+/// Bug: a lookup that was previously gated behind `game_pids.is_empty()`
+/// alone never refreshes a *non-empty* set — so a pid resolved once (say,
+/// at character-select) that then becomes stale (the game relaunches with a
+/// new pid) is never replaced unless a connection is first adopted and torn
+/// down, or a restart is requested. Neither happens if the stale set is
+/// wrongly rejecting the real stream, so capture stays dead until a manual
+/// restart. Refreshing a non-empty set periodically too — on the coarser
+/// `refresh_interval` cadence, since it's the common case and doesn't need
+/// the empty case's back-off — closes that gap.
+pub fn should_refresh_game_pids(
+    game_pids_empty: bool,
+    elapsed_since_last_lookup: Option<Duration>,
+    empty_backoff_interval: Duration,
+    refresh_interval: Duration,
+) -> bool {
+    let Some(elapsed) = elapsed_since_last_lookup else {
+        return true;
+    };
+    let threshold = if game_pids_empty {
+        empty_backoff_interval
+    } else {
+        refresh_interval
+    };
+    elapsed >= threshold
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +113,64 @@ mod tests {
             next_game_pid_lookup_interval(Duration::from_secs(45), LOOKUP_CAP),
             LOOKUP_CAP
         );
+    }
+
+    #[test]
+    fn should_refresh_game_pids_on_the_very_first_tick() {
+        assert!(should_refresh_game_pids(
+            true,
+            None,
+            LOOKUP_INITIAL,
+            LOOKUP_CAP
+        ));
+        // Never having looked up wins regardless of `game_pids_empty`.
+        assert!(should_refresh_game_pids(
+            false,
+            None,
+            LOOKUP_INITIAL,
+            LOOKUP_CAP
+        ));
+    }
+
+    /// B7: a *non-empty* `game_pids` must still refresh periodically (on
+    /// `refresh_interval`), not just once it goes empty again — otherwise a
+    /// pid resolved once and then invalidated by a game relaunch is never
+    /// replaced.
+    #[test]
+    fn should_refresh_game_pids_refreshes_a_non_empty_set_on_the_refresh_interval() {
+        assert!(!should_refresh_game_pids(
+            false,
+            Some(LOOKUP_CAP - Duration::from_secs(1)),
+            LOOKUP_INITIAL,
+            LOOKUP_CAP,
+        ));
+        assert!(should_refresh_game_pids(
+            false,
+            Some(LOOKUP_CAP),
+            LOOKUP_INITIAL,
+            LOOKUP_CAP,
+        ));
+        assert!(should_refresh_game_pids(
+            false,
+            Some(LOOKUP_CAP + Duration::from_secs(1)),
+            LOOKUP_INITIAL,
+            LOOKUP_CAP,
+        ));
+    }
+
+    #[test]
+    fn should_refresh_game_pids_uses_the_backoff_interval_while_empty() {
+        assert!(!should_refresh_game_pids(
+            true,
+            Some(LOOKUP_INITIAL - Duration::from_millis(1)),
+            LOOKUP_INITIAL,
+            LOOKUP_CAP,
+        ));
+        assert!(should_refresh_game_pids(
+            true,
+            Some(LOOKUP_INITIAL),
+            LOOKUP_INITIAL,
+            LOOKUP_CAP,
+        ));
     }
 }

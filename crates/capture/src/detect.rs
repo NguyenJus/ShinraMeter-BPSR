@@ -398,10 +398,38 @@ impl ServerDetector {
     /// source, matching subnet, non-empty payload — and get mis-adopted,
     /// reversing the tracked direction.
     pub fn detects(&mut self, conn: &Conn, payload: &[u8], server_adopted: bool) -> bool {
+        self.detects_with(conn, payload, server_adopted, &|| true)
+    }
+
+    /// As [`Self::detects`], but the ownership check (or any other final
+    /// gate) is threaded through as `allow`, called only once the cheap
+    /// signature/evidence checks below have already passed and this
+    /// connection is about to become a candidate -- never for a connection
+    /// that fails those checks on its own.
+    ///
+    /// This is what lets a caller (`decide_packet`) defer an expensive
+    /// per-packet ownership lookup (issue #337) until it is actually needed:
+    /// running it for every `Unrelated` packet regardless of whether the
+    /// signature scan even matched wastes two `GetExtendedTcpTable` syscalls
+    /// and a full-table allocation on packets that were never going to
+    /// adopt anyway.
+    ///
+    /// `allow` is called immediately before each `true` return (and before
+    /// the subnet-candidate insertion that return implies), so a candidate
+    /// `allow` rejects never consumes a `subnet_candidates` slot -- the same
+    /// property the ownership-first ordering in `decide_packet` existed to
+    /// preserve.
+    pub fn detects_with(
+        &mut self,
+        conn: &Conn,
+        payload: &[u8],
+        server_adopted: bool,
+        allow: &dyn Fn() -> bool,
+    ) -> bool {
         if signature_direction_ok(conn, self.local_endpoint)
             && (looks_like_game_server(payload).is_some() || is_login_return(payload))
         {
-            return true;
+            return allow();
         }
 
         if server_adopted {
@@ -440,6 +468,9 @@ impl ServerDetector {
             return false;
         }
         if self.subnet_candidates.len() >= Self::MAX_SUBNET_CONNECTIONS {
+            return false;
+        }
+        if !allow() {
             return false;
         }
         self.subnet_candidates.insert(*conn);
@@ -620,20 +651,27 @@ pub fn decide_packet(
             frame_offset: 0,
         },
         ConnStreamRole::Unrelated => {
-            // Ownership is checked *before* `detector.detects`: `detects`
-            // has the side effect of inserting a subnet-path candidate into
-            // `subnet_candidates` (see its docs), which permanently spends
-            // one of `MAX_SUBNET_CONNECTIONS` slots on that connection.
-            // Running it first meant a candidate that ownership goes on to
-            // reject was blacklisted forever — it could never be
+            // Ownership is checked *lazily*, via `detects_with`'s `allow`
+            // callback, rather than up front for every packet: the
+            // ownership lookup costs two `GetExtendedTcpTable` syscalls
+            // plus a full-table allocation (issue #337), and with
+            // `game_pids` non-empty the WinDivert filter
+            // (`!loopback && ip && tcp`) hands this branch every unrelated
+            // TCP packet on the box, not just plausible candidates. Only
+            // running it once the cheap signature/evidence checks in
+            // `detects_with` have already passed keeps that cost off the
+            // packets that were never going to adopt anyway.
+            //
+            // It still runs *before* the subnet-candidate insertion that a
+            // `true` return implies (see `detects_with`'s docs): a
+            // candidate ownership rejects must not permanently spend one of
+            // `MAX_SUBNET_CONNECTIONS` slots — it could never be
             // reconsidered even after ownership later allowed it (e.g. the
             // game's pid changes, or `find_game_pids` resolves to a
-            // different, correct set). Checking ownership first, which
-            // has no state of its own to spend, avoids burning that slot on
-            // a candidate that never had a chance of being adopted anyway.
-            if !owner_allows_adoption(conn, ownership)
-                || !detector.detects(conn, payload, known_server.is_some())
-            {
+            // different, correct set).
+            if !detector.detects_with(conn, payload, known_server.is_some(), &|| {
+                owner_allows_adoption(conn, ownership)
+            }) {
                 AdoptionDecision {
                     role,
                     torn_down,
@@ -1371,6 +1409,44 @@ mod tests {
         assert!(decision.skip);
         assert!(!decision.newly_adopted);
         assert_eq!(known_server, None);
+    }
+
+    /// issue #337 perf follow-up: the ownership lookup `detects_with`'s
+    /// `allow` callback wraps must never run for a packet that fails the
+    /// cheap signature/evidence checks on its own -- that's the whole point
+    /// of deferring it (two `GetExtendedTcpTable` syscalls plus a
+    /// full-table allocation, once per `Unrelated` packet, is exactly what
+    /// running it unconditionally cost before this fix). It must still run
+    /// for a packet that does pass those checks, so ownership can still
+    /// reject it.
+    #[test]
+    fn detects_with_only_calls_allow_once_the_cheap_checks_pass() {
+        use std::cell::Cell;
+
+        let calls = Cell::new(0u32);
+        let allow = || {
+            calls.set(calls.get() + 1);
+            true
+        };
+
+        let mut detector = ServerDetector::new();
+        let conn = server_to_client([203, 0, 113, 7], 5000);
+
+        // Fails the cheap signature/login-return/subnet checks: `allow`
+        // must not be called at all.
+        let missed = detector.detects_with(&conn, b"not a signature", false, &allow);
+        assert!(!missed);
+        assert_eq!(calls.get(), 0, "allow() must not run for a rejected packet");
+
+        // Passes the signature scan: `allow` must be consulted exactly
+        // once, immediately before the `true` return.
+        let matched = detector.detects_with(&conn, &login_return_payload(), false, &allow);
+        assert!(matched);
+        assert_eq!(
+            calls.get(),
+            1,
+            "allow() must run once a candidate is otherwise about to be accepted"
+        );
     }
 
     /// issue #293: an adoption whose evidence is the signature scan must

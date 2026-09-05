@@ -28,7 +28,7 @@ use crossbeam_channel::Sender;
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use windows::Win32::Foundation::HANDLE;
 
-use crate::backoff::{next_game_pid_lookup_interval, recv_error_backoff};
+use crate::backoff::{next_game_pid_lookup_interval, recv_error_backoff, should_refresh_game_pids};
 use crate::detect::{Conn, ServerDetector, decide_packet};
 use crate::driver::{Api, WinDivertAddress};
 use crate::error::CaptureError;
@@ -448,14 +448,26 @@ fn recv_loop(
         monitor.record_observed();
         let now = Instant::now();
 
-        // Issue #337: resolve the game's own pid(s), at most once every
-        // `game_pid_lookup_interval`, until found — see the constant docs
-        // above. Every miss doubles that interval so a session in which
-        // nothing ever matches stops re-walking the whole process table.
-        if game_pids.is_empty()
-            && last_game_pid_lookup
-                .is_none_or(|at| now.duration_since(at) >= game_pid_lookup_interval)
-        {
+        // Issue #337 (and its B7 follow-up): resolve the game's own pid(s),
+        // at most once every `game_pid_lookup_interval` while none are
+        // known, until found — see the constant docs above. Every miss
+        // doubles that interval so a session in which nothing ever matches
+        // stops re-walking the whole process table.
+        //
+        // Once pids *are* known, this must keep re-resolving on the coarser
+        // `MAX_GAME_PID_LOOKUP_INTERVAL` cadence instead of going silent
+        // forever: a pid found once (e.g. at character-select) can be
+        // invalidated by the game process relaunching with a new one, and
+        // if nothing gets adopted in the meantime (the only other place
+        // that clears `game_pids`), the stale set would otherwise reject
+        // the real stream until a manual restart.
+        let elapsed_since_last_lookup = last_game_pid_lookup.map(|at| now.duration_since(at));
+        if should_refresh_game_pids(
+            game_pids.is_empty(),
+            elapsed_since_last_lookup,
+            game_pid_lookup_interval,
+            MAX_GAME_PID_LOOKUP_INTERVAL,
+        ) {
             last_game_pid_lookup = Some(now);
             game_pids = owner::find_game_pids();
             if game_pids.is_empty() {
