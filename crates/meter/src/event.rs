@@ -9,9 +9,16 @@
 //! `PlayerInfo` / `EnemyHp` / `Class`); the `ShinraMeter-BPSR` app crate is
 //! responsible for mapping `bpsr_protocol::*` events onto these before
 //! calling `Meter::apply`.
+//!
+//! Exception (issue #371): `EntityId`/`EntityKind`/`uid_of`/`kind_of` are
+//! defined here, in this direction-independent crate, and `bpsr-protocol`
+//! re-exports them (`bpsr-protocol` already depends on `bpsr-meter` for
+//! `crate::map`, so that direction adds nothing new) rather than each crate
+//! keeping its own hand-written copy of the wire's uuid bit layout.
 
-/// Entity kind derived from the low 16 bits of a wire `uuid` (plan §0.6):
-/// `640` = player, `64` = monster, anything else = unknown.
+/// Entity kind unpacked from bits 6-10 of a wire `uuid`; see [`kind_of`] for
+/// the full layout (`EntChar` = 10 -> `Player`, `EntMonster` = 1 ->
+/// `Monster`, anything else -> `Unknown`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum EntityKind {
     Player,
@@ -25,16 +32,56 @@ pub fn uid_of(uuid: i64) -> i64 {
     uuid >> 16
 }
 
-/// Bit offset of the entity-type field inside a uuid, and the two type
-/// values this meter models. Mirrors `bpsr_protocol::entity`'s copy — see
-/// `bpsr_protocol::event::kind_of` for the layout and its sourcing.
+/// Bit offset of the entity-type field inside a uuid, and its width (5
+/// bits). See [`kind_of`] for the full layout.
 const ENT_TYPE_SHIFT: u32 = 6;
+const ENT_TYPE_MASK: i64 = 0x1F;
+/// `EEntityType::EntChar`, the entity-type value for a player.
+/// (BPSR-ZDPS `BPSR-ZDPSLib/protos/EnumEEntityType.cs:53`; identically
+/// bpsr-logs `src-tauri/src/protocol/pb.proto:14`.)
 const ENT_CHAR: i64 = 10;
+/// `EEntityType::EntMonster`, the entity-type value for a monster.
+/// (BPSR-ZDPS `BPSR-ZDPSLib/protos/EnumEEntityType.cs:46`; identically
+/// bpsr-logs `src-tauri/src/protocol/pb.proto:13`.)
 const ENT_MONSTER: i64 = 1;
 
+/// Entity type unpacked from the uuid's bit layout, which BPSR-ZDPS spells
+/// out in `Utils.cs:261` (`EntityIdToUuid`):
+///
+/// ```text
+/// uuid = uid << 16 | is_summon << 15 | is_client << 14 | entity_type << 6
+/// ```
+///
+/// so the type is `(uuid >> 6) & 31` (BPSR-ZDPS `Utils.cs:264`,
+/// `UuidToEntityType`) and carries the proto enum's own numbering —
+/// `EntChar = 10`, `EntMonster = 1`.
+///
+/// issue #76: this used to match the *whole* low-16 against `640`/`64`,
+/// which is only correct while both flag bits are clear. `EntMonster << 6`
+/// is 64 and `EntChar << 6` is 640, so the two forms agree on a plain
+/// entity — but a summoned monster (bit 15) arrives as `0x8040`, and a
+/// client-side entity (bit 14) shifts likewise, and the old form scored
+/// both as `Unknown`. `decode.rs` drops `Unknown` entities outright, so
+/// those monsters produced no `EnemyHp` at all and could never be named or
+/// ranked as the boss. StarResonanceDamageCounter papers over exactly this
+/// case by whitelisting the single extra literal `32832` (`0x8040`)
+/// alongside `64` (`algo/packet.js:234-237`); masking the flags off, as
+/// ZDPS does, handles every combination rather than one.
+///
+/// Types this meter has no use for (`EntNpc = 2`, `EntPet = 8`,
+/// `EntDummy = 11`) stay `Unknown`.
+pub fn kind_of(uuid: i64) -> EntityKind {
+    match (uuid >> ENT_TYPE_SHIFT) & ENT_TYPE_MASK {
+        ENT_CHAR => EntityKind::Player,
+        ENT_MONSTER => EntityKind::Monster,
+        _ => EntityKind::Unknown,
+    }
+}
+
 /// One entity's stable identity: the whole wire `uuid`, not the truncated
-/// `uuid >> 16` this meter used to key on (issue #335). Mirrors
-/// `bpsr_protocol::entity::EntityId` exactly.
+/// `uuid >> 16` this meter used to key on (issue #335). The single
+/// definition of this type (issue #371) — `bpsr-protocol` re-exports it
+/// rather than keeping its own copy.
 ///
 /// The truncation is lossy in two ways that corrupt damage attribution: a
 /// server session recycles a `uuid >> 16` onto an unrelated entity, and a
@@ -66,11 +113,15 @@ impl EntityId {
         uid_of(self.uuid())
     }
 
+    /// The entity type packed into the uuid.
+    pub fn kind(self) -> EntityKind {
+        kind_of(self.uuid())
+    }
+
     /// The canonical identity for a source that knows only a display uid and
     /// a kind, reconstructing the uuid such a uid would have with both flag
-    /// bits clear. Mirrors `bpsr_protocol::entity::EntityId::from_display_uid`,
-    /// so a uid-only source and the AOI channel agree on the same id for any
-    /// entity that is neither a summon nor client-side.
+    /// bits clear, so a uid-only source and the AOI channel agree on the
+    /// same id for any entity that is neither a summon nor client-side.
     pub fn from_display_uid(uid: i64, kind: EntityKind) -> Self {
         let type_bits = match kind {
             EntityKind::Player => ENT_CHAR,
@@ -580,5 +631,91 @@ mod tests {
                 "profession id {id} round-tripped to the wrong role"
             );
         }
+    }
+
+    // -- EntityId / kind_of bit layout (issue #371) -----------------------
+    //
+    // Nothing previously enforced this invariant directly: it lived only as
+    // duplicated logic in both this crate and bpsr-protocol, each trusting
+    // the other's tests. Pinned here now that this is the one place the
+    // layout is defined.
+
+    #[test]
+    fn from_display_uid_and_kind_of_agree_on_the_bit_layout() {
+        let player = EntityId::from_display_uid(42, EntityKind::Player);
+        assert_eq!(player.uuid(), (42i64 << 16) | (10 << 6));
+        assert_eq!(kind_of(player.uuid()), EntityKind::Player);
+
+        let monster = EntityId::from_display_uid(7, EntityKind::Monster);
+        assert_eq!(monster.uuid(), (7i64 << 16) | (1 << 6));
+        assert_eq!(kind_of(monster.uuid()), EntityKind::Monster);
+
+        let unknown = EntityId::from_display_uid(5, EntityKind::Unknown);
+        assert_eq!(unknown.uuid(), 5i64 << 16);
+        assert_eq!(kind_of(unknown.uuid()), EntityKind::Unknown);
+    }
+
+    // -- kind_of / uid_of (issue #371, migrated from bpsr-protocol's
+    // now-deleted copy so this coverage survives the dedupe) -------------
+
+    #[test]
+    fn uid_and_kind_for_player_uuid() {
+        let uuid = (12345i64 << 16) | 640;
+        assert_eq!(uid_of(uuid), 12345);
+        assert_eq!(kind_of(uuid), EntityKind::Player);
+    }
+
+    #[test]
+    fn uid_and_kind_for_monster_uuid() {
+        let uuid = (999i64 << 16) | 64;
+        assert_eq!(uid_of(uuid), 999);
+        assert_eq!(kind_of(uuid), EntityKind::Monster);
+    }
+
+    #[test]
+    fn unknown_kind_for_other_low_bits() {
+        let uuid = (1i64 << 16) | 7;
+        assert_eq!(kind_of(uuid), EntityKind::Unknown);
+    }
+
+    /// issue #76: the uuid packs two flags *above* the type field, so
+    /// matching the whole low-16 against `64` dropped every summoned
+    /// monster on the floor — its `EnemyHp` was never emitted at all, so
+    /// the header could never name it.
+    #[test]
+    fn summoned_monster_uuid_is_still_a_monster() {
+        let uuid = (999i64 << 16) | (1 << 15) | (1 << 6);
+        // The exact low-16 StarResonanceDamageCounter special-cases as
+        // "monster" alongside 64 (`algo/packet.js:234-237`).
+        assert_eq!(uuid & 0xFFFF, 0x8040);
+        assert_eq!(uid_of(uuid), 999);
+        assert_eq!(kind_of(uuid), EntityKind::Monster);
+    }
+
+    /// The client flag (bit 14) is the other flag that must not change an
+    /// entity's decoded type.
+    #[test]
+    fn client_flagged_player_uuid_is_still_a_player() {
+        let uuid = (12345i64 << 16) | (1 << 14) | (10 << 6);
+        assert_eq!(uid_of(uuid), 12345);
+        assert_eq!(kind_of(uuid), EntityKind::Player);
+    }
+
+    /// Bits 0-5 are unused by the packing, so they must not affect the
+    /// decoded type either.
+    #[test]
+    fn unused_low_bits_do_not_change_the_decoded_kind() {
+        let uuid = (7i64 << 16) | (1 << 6) | 0x3F;
+        assert_eq!(kind_of(uuid), EntityKind::Monster);
+    }
+
+    /// An entity type this meter has no use for (NPC = 2, pet = 8, dummy =
+    /// 11) must still decode as `Unknown` rather than being mistaken for a
+    /// monster now that the flag bits are masked off.
+    #[test]
+    fn npc_and_pet_entity_types_stay_unknown() {
+        assert_eq!(kind_of((1i64 << 16) | (2 << 6)), EntityKind::Unknown);
+        assert_eq!(kind_of((1i64 << 16) | (8 << 6)), EntityKind::Unknown);
+        assert_eq!(kind_of((1i64 << 16) | (11 << 6)), EntityKind::Unknown);
     }
 }
