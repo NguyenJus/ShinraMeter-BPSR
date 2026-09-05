@@ -15,11 +15,11 @@ use eframe::egui;
 /// A window opacity: a finite fraction in `0.0..=1.0`, where `0.0` paints
 /// nothing and `1.0` paints the color untouched.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Opacity(f32);
+pub(super) struct Opacity(f32);
 
 impl Opacity {
     /// Fully opaque — the identity for [`Opacity::apply`].
-    pub(crate) const OPAQUE: Self = Self(1.0);
+    pub(super) const OPAQUE: Self = Self(1.0);
 
     /// Clamps `value` into `0.0..=1.0`.
     ///
@@ -27,7 +27,7 @@ impl Opacity {
     /// wrong) becomes [`Opacity::OPAQUE`], not transparent: a fully visible
     /// overlay is recoverable by the user, an invisible one looks like the
     /// meter failed to start.
-    pub(crate) fn new(value: f32) -> Self {
+    pub(super) fn new(value: f32) -> Self {
         if value.is_nan() {
             return Self::OPAQUE;
         }
@@ -35,13 +35,13 @@ impl Opacity {
     }
 
     /// The raw fraction, for the egui APIs that still take an `f32`.
-    pub(crate) fn as_f32(self) -> f32 {
+    pub(super) fn as_f32(self) -> f32 {
         self.0
     }
 
     /// Fades `color` by this opacity — the one place the paint paths turn an
     /// `Opacity` back into a color.
-    pub(crate) fn apply(self, color: egui::Color32) -> egui::Color32 {
+    pub(super) fn apply(self, color: egui::Color32) -> egui::Color32 {
         color.gamma_multiply(self.0)
     }
 }

@@ -26,7 +26,7 @@ use super::*;
 /// width stays pinned at the floor — wider than the viewport — and the
 /// caller's `ScrollArea` picks up the remaining overflow as horizontal
 /// scroll instead of compressing columns any further.
-pub(crate) fn row_content_width(viewport_width: f32, stat_columns_total: f32) -> f32 {
+pub(super) fn row_content_width(viewport_width: f32, stat_columns_total: f32) -> f32 {
     let floor_width = stat_columns_total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
     viewport_width.max(floor_width)
 }
@@ -35,7 +35,7 @@ pub(crate) fn row_content_width(viewport_width: f32, stat_columns_total: f32) ->
 /// viewport on whichever axis actually needed to scroll this frame — purely
 /// so tests can observe that without reaching into egui's persisted scroll
 /// state; `OverlayApp::ui` (the only production caller) ignores it.
-pub(crate) fn draw_rows(
+pub(super) fn draw_rows(
     ui: &mut egui::Ui,
     snapshot: &Snapshot,
     settings: &Settings,
@@ -131,7 +131,7 @@ pub(crate) fn draw_rows(
 /// (`ColumnKind::spec`) and typography belongs with the painting, not with
 /// the column's width and formatter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ColumnEmphasis {
+pub(super) enum ColumnEmphasis {
     /// The headline number, e.g. DPS.
     Value,
     /// A plain stat, e.g. damage.
@@ -160,7 +160,7 @@ impl ColumnEmphasis {
     /// `draw_row` ever passes to `paint_text` — that is what lets the column
     /// width-budget tests measure the pill column the same way they measure
     /// every other one.
-    pub(crate) fn font(self) -> egui::FontId {
+    pub(super) fn font(self) -> egui::FontId {
         match self {
             Self::Value | Self::Stat | Self::Percent => regular(FONT_SIZE_ROW),
             Self::Counter => bold(FONT_SIZE_COUNTER),
@@ -168,13 +168,13 @@ impl ColumnEmphasis {
     }
 
     /// Whether `draw_row` paints this column as a pill rather than as text.
-    pub(crate) fn is_pill(self) -> bool {
+    pub(super) fn is_pill(self) -> bool {
         matches!(self, Self::Counter)
     }
 }
 
 /// Maps a column to its emphasis level (issue #56).
-pub(crate) fn column_emphasis(kind: ColumnKind) -> ColumnEmphasis {
+pub(super) fn column_emphasis(kind: ColumnKind) -> ColumnEmphasis {
     match kind {
         ColumnKind::Dps => ColumnEmphasis::Value,
         ColumnKind::SharePct | ColumnKind::CritPct | ColumnKind::LuckyPct => {
@@ -199,15 +199,15 @@ pub(crate) fn column_emphasis(kind: ColumnKind) -> ColumnEmphasis {
 /// column's anchor point. `text` renders this column's value for a given
 /// row, so a column's width and its formatter travel together.
 #[derive(Debug, Clone, Copy)]
-pub struct StatColumn {
-    pub width: f32,
-    pub text: fn(&PlayerRow) -> String,
+pub(crate) struct StatColumn {
+    pub(crate) width: f32,
+    pub(crate) text: fn(&PlayerRow) -> String,
     /// Text color this column is painted with. Only the DPS column (and
     /// the two unbudgeted stats with no source counterpart) stay pure
     /// white; plain stats use `STAT_TEXT_RGB` and `CritPct`/`LuckyPct` use
     /// `CRIT_PCT_RGB`/`LUCKY_PCT_RGB` to stand out the way the reference
     /// meter colors them.
-    pub color: egui::Color32,
+    pub(crate) color: egui::Color32,
 }
 
 /// Builds the column specs for `column_anchors` out of the currently
@@ -219,7 +219,7 @@ pub struct StatColumn {
 /// one anchor per entry here, so `draw_row` can zip anchors against this
 /// same slice: a column can never end up with an anchor but no text, and
 /// adding a `ColumnKind` cannot skip wiring up its rendering.
-pub(crate) fn stat_columns_for(columns: &[ColumnKind]) -> Vec<StatColumn> {
+pub(super) fn stat_columns_for(columns: &[ColumnKind]) -> Vec<StatColumn> {
     columns.iter().map(|c| c.spec()).collect()
 }
 
@@ -238,7 +238,7 @@ pub(crate) fn stat_columns_for(columns: &[ColumnKind]) -> Vec<StatColumn> {
 /// than the columns' combined width, every column width is scaled down
 /// proportionally so the columns still fit rather than spilling past the
 /// rect's left edge — graceful degradation for a narrow window.
-pub fn column_anchors(
+pub(super) fn column_anchors(
     rect_left: f32,
     rect_right: f32,
     columns: &[StatColumn],
@@ -252,7 +252,7 @@ pub fn column_anchors(
 /// than full `StatColumn`s — for a caller (`draw_skill_window`) that has a
 /// fixed width per column but no per-row `text`/`color` to paint through a
 /// `StatColumn`.
-pub fn column_anchors_from_widths(
+pub(super) fn column_anchors_from_widths(
     rect_left: f32,
     rect_right: f32,
     widths: &[f32],
@@ -313,7 +313,7 @@ pub fn column_anchors_from_widths(
 ///
 /// `Painter::with_clip_rect` intersects with the parent's clip rect, so a
 /// slot reaching past the row's own left edge is still bounded by the ui.
-pub(crate) fn column_clip_rect(rect: egui::Rect, anchor: f32, width: f32) -> egui::Rect {
+pub(super) fn column_clip_rect(rect: egui::Rect, anchor: f32, width: f32) -> egui::Rect {
     egui::Rect::from_min_max(
         egui::pos2(anchor - width, rect.top()),
         egui::pos2(anchor, rect.bottom()),
@@ -328,10 +328,10 @@ pub(crate) fn column_clip_rect(rect: egui::Rect, anchor: f32, width: f32) -> egu
 /// that are always needed together and always travel together push
 /// `draw_row` over clippy's argument limit on their own, especially once
 /// issue #84 adds `row_width`.
-pub(crate) struct RowLayout<'a> {
-    pub(crate) kinds: &'a [ColumnKind],
-    pub(crate) columns: &'a [StatColumn],
-    pub(crate) anchors: &'a [f32],
+pub(super) struct RowLayout<'a> {
+    pub(super) kinds: &'a [ColumnKind],
+    pub(super) columns: &'a [StatColumn],
+    pub(super) anchors: &'a [f32],
     /// Issue #168: `draw_row` needs the live `Settings` (not just `kinds`,
     /// which now excludes `AbilityScore`/`SeasonStrength` — see
     /// `Settings::stat_columns`) to compose the name-suffix text via
@@ -339,10 +339,10 @@ pub(crate) struct RowLayout<'a> {
     /// above for the same reason they are: keeps `draw_row`'s own argument
     /// count under clippy's limit rather than adding a fourth loose
     /// parameter.
-    pub(crate) settings: &'a Settings,
+    pub(super) settings: &'a Settings,
 }
 
-pub(crate) fn draw_row(
+pub(super) fn draw_row(
     ui: &mut egui::Ui,
     row: &PlayerRow,
     layout: &RowLayout<'_>,
@@ -575,7 +575,7 @@ pub(crate) fn draw_row(
 /// anchor is a pure function of the row rect and the column widths, so the
 /// pill neither shifts when the count gains a digit nor needs a width its
 /// `StatColumn::width` budget doesn't already cover.
-pub(crate) fn paint_counter_pill(
+pub(super) fn paint_counter_pill(
     painter: &egui::Painter,
     row: egui::Rect,
     anchor: f32,
@@ -598,7 +598,7 @@ pub(crate) fn paint_counter_pill(
 /// `anchor`. Pure geometry, so the right-alignment and centering are
 /// unit-testable without a live painter — same reasoning as
 /// `pill_content_layout`.
-pub(crate) fn counter_pill_rect(row: egui::Rect, anchor: f32, size: egui::Vec2) -> egui::Rect {
+pub(super) fn counter_pill_rect(row: egui::Rect, anchor: f32, size: egui::Vec2) -> egui::Rect {
     egui::Rect::from_min_size(
         egui::pos2(anchor - size.x, row.center().y - size.y / 2.0),
         size,
@@ -614,16 +614,16 @@ pub(crate) fn counter_pill_rect(row: egui::Rect, anchor: f32, size: egui::Vec2) 
 /// (`docs/reference/role-colors.webp`, issue #77) rather than hand-picked
 /// for legibility — these are the exact hues the game itself uses for each
 /// role's icon.
-pub(crate) const SHARE_BAR_RGB_HEALER: (u8, u8, u8) = (131, 196, 154);
-pub(crate) const SHARE_BAR_RGB_TANK: (u8, u8, u8) = (104, 166, 205);
-pub(crate) const SHARE_BAR_RGB_DAMAGE: (u8, u8, u8) = (219, 135, 135);
+pub(super) const SHARE_BAR_RGB_HEALER: (u8, u8, u8) = (131, 196, 154);
+pub(super) const SHARE_BAR_RGB_TANK: (u8, u8, u8) = (104, 166, 205);
+pub(super) const SHARE_BAR_RGB_DAMAGE: (u8, u8, u8) = (219, 135, 135);
 /// Fallback for `Class::Unknown` (or a row with no `Class` at all). A
 /// desaturated grey rather than any role's hue: reusing a role color here
 /// (as this once did with `SHARE_BAR_RGB_TANK`'s blue) would make an
 /// unclassified row indistinguishable from a confirmed row of that role, so
 /// this must stay visually distinct from all three colors above (issue #44's
 /// second open question).
-pub(crate) const SHARE_BAR_RGB_UNKNOWN: (u8, u8, u8) = (140, 140, 140);
+pub(super) const SHARE_BAR_RGB_UNKNOWN: (u8, u8, u8) = (140, 140, 140);
 
 /// RGB for the `CritPct` stat column's text. Sampled directly from the
 /// reference meter screenshots — `docs/reference/new-shinra-ex.webp` and
@@ -645,23 +645,23 @@ pub(crate) const STAT_TEXT_RGB: (u8, u8, u8) = (0xAA, 0xAA, 0xAA);
 
 /// Alpha at the *bottom* of the bar fill's vertical gradient — the source's
 /// `Opacity=".18"` bottom stop. The top stop is 0 (fully transparent).
-pub(crate) const SHARE_BAR_FILL_BOTTOM_ALPHA: u8 = 46;
+pub(super) const SHARE_BAR_FILL_BOTTOM_ALPHA: u8 = 46;
 
 /// Alpha at the *left* end of the accent line's horizontal gradient — the
 /// source's `Opacity=".1"` left stop. The right stop is fully opaque (255).
-pub(crate) const SHARE_BAR_ACCENT_LEFT_ALPHA: u8 = 26;
+pub(super) const SHARE_BAR_ACCENT_LEFT_ALPHA: u8 = 26;
 
 /// Thickness of the accent line along the row's bottom edge (issue #43;
 /// source `Height="2"`). `share_bar_paints` clamps this against the row
 /// height so it stays sane — never taller than the row itself — at small
 /// row heights.
-pub(crate) const SHARE_BAR_ACCENT_THICKNESS: f32 = 2.0;
+pub(super) const SHARE_BAR_ACCENT_THICKNESS: f32 = 2.0;
 
 /// A two-triangle gradient quad. egui has no gradient brush, so the
 /// source's `LinearGradientBrush`es are reproduced as meshes with
 /// per-vertex colors — exact, one draw call, and cheaper than the strip-
 /// stacking `title_separator_segments` uses.
-pub(crate) fn gradient_mesh(
+pub(super) fn gradient_mesh(
     rect: egui::Rect,
     tl: egui::Color32,
     tr: egui::Color32,
@@ -678,7 +678,7 @@ pub(crate) fn gradient_mesh(
     mesh
 }
 
-pub(crate) fn vertical_gradient_mesh(
+pub(super) fn vertical_gradient_mesh(
     rect: egui::Rect,
     top: egui::Color32,
     bottom: egui::Color32,
@@ -686,7 +686,7 @@ pub(crate) fn vertical_gradient_mesh(
     gradient_mesh(rect, top, top, bottom, bottom)
 }
 
-pub(crate) fn horizontal_gradient_mesh(
+pub(super) fn horizontal_gradient_mesh(
     rect: egui::Rect,
     left: egui::Color32,
     right: egui::Color32,
@@ -697,14 +697,14 @@ pub(crate) fn horizontal_gradient_mesh(
 /// The source's per-row hover band: a horizontal gradient from transparent,
 /// up to `#1fff` at 15% across, and back to transparent at the right edge —
 /// a highlight that peaks near the row's left edge rather than a flat fill.
-pub(crate) const ROW_HOVER_PEAK_ALPHA: u8 = 17;
-pub(crate) const ROW_HOVER_PEAK_OFFSET: f32 = 0.15;
+pub(super) const ROW_HOVER_PEAK_ALPHA: u8 = 17;
+pub(super) const ROW_HOVER_PEAK_OFFSET: f32 = 0.15;
 
 /// The two gradient quads a hovered row's highlight is made of: transparent
 /// -> peak over the first `ROW_HOVER_PEAK_OFFSET` of the width, then peak ->
 /// transparent over the rest. Pure, so the split point is unit-testable
 /// without a live `Ui` — same reasoning as `share_bar_paints`.
-pub(crate) fn row_hover_quads(rect: egui::Rect) -> [(egui::Rect, egui::Color32, egui::Color32); 2] {
+pub(super) fn row_hover_quads(rect: egui::Rect) -> [(egui::Rect, egui::Color32, egui::Color32); 2] {
     let peak = egui::Color32::from_rgba_unmultiplied(255, 255, 255, ROW_HOVER_PEAK_ALPHA);
     let split_x = rect.left() + rect.width() * ROW_HOVER_PEAK_OFFSET;
     let left_quad = egui::Rect::from_min_max(rect.left_top(), egui::pos2(split_x, rect.bottom()));
@@ -721,22 +721,22 @@ pub(crate) fn row_hover_quads(rect: egui::Rect) -> [(egui::Rect, egui::Color32, 
 /// Named fields rather than a positional tuple so a fill/accent (or
 /// rect/color) mix-up at the `draw_row` call site fails to compile instead
 /// of silently swapping which paint lands where.
-pub(crate) struct ShareBarPaints {
+pub(super) struct ShareBarPaints {
     /// The share-scaled fill, vertically graded transparent -> `fill_bottom`.
-    pub(crate) fill_rect: egui::Rect,
-    pub(crate) fill_bottom: egui::Color32,
+    pub(super) fill_rect: egui::Rect,
+    pub(super) fill_bottom: egui::Color32,
     /// The accent line. Issue #73: its width now matches `fill_rect`'s
     /// width exactly, so the accent underline stops exactly where the
     /// gradient fill stops rather than always spanning the full row.
-    pub(crate) accent_rect: egui::Rect,
-    pub(crate) accent_left: egui::Color32,
-    pub(crate) accent_right: egui::Color32,
+    pub(super) accent_rect: egui::Rect,
+    pub(super) accent_left: egui::Color32,
+    pub(super) accent_right: egui::Color32,
 }
 
 /// Maps a row's `Class` to its share-bar hue (issue #44). `None` — either no
 /// `Class` at all or `Class::Unknown` (which has no `Role`,
 /// `Class::role`) — falls back to `SHARE_BAR_RGB_UNKNOWN`, the neutral grey.
-pub(crate) fn share_bar_rgb(class: Option<Class>) -> (u8, u8, u8) {
+pub(super) fn share_bar_rgb(class: Option<Class>) -> (u8, u8, u8) {
     match class.and_then(|c| c.role()) {
         Some(Role::Healer) => SHARE_BAR_RGB_HEALER,
         Some(Role::Tank) => SHARE_BAR_RGB_TANK,
@@ -753,7 +753,7 @@ pub(crate) fn share_bar_rgb(class: Option<Class>) -> (u8, u8, u8) {
 /// that is a solid ~9px sliver — clearly present — while staying far below
 /// any real double-digit share, so it never overstates a near-zero
 /// contributor as roughly comparable to a genuine one.
-pub(crate) const ROW_BAR_MIN_FRAC: f32 = 0.03;
+pub(super) const ROW_BAR_MIN_FRAC: f32 = 0.03;
 
 /// Computes a row's damage-share bar fraction (issue #73): `damage` scaled
 /// against `top_damage` — the highest-damage row in the current snapshot —
@@ -766,7 +766,7 @@ pub(crate) const ROW_BAR_MIN_FRAC: f32 = 0.03;
 /// `ROW_BAR_MIN_FRAC`, so a real but tiny contributor still paints a
 /// visible bar. A row with `damage == 0` (or negative, defensively) stays
 /// at exactly `0.0` — no floor for a row that did nothing.
-pub(crate) fn row_bar_frac(damage: i64, top_damage: i64) -> f32 {
+pub(super) fn row_bar_frac(damage: i64, top_damage: i64) -> f32 {
     if top_damage <= 0 || damage <= 0 {
         0.0
     } else {
@@ -787,7 +787,7 @@ pub(crate) fn row_bar_frac(damage: i64, top_damage: i64) -> f32 {
 /// (`share_bar_rgb`, issue #44) and differ only in alpha. Pure geometry/
 /// color math with no `egui::Ui` dependency, so it's unit-testable on its
 /// own — `draw_row` just paints whatever it returns.
-pub(crate) fn share_bar_paints(
+pub(super) fn share_bar_paints(
     rect: egui::Rect,
     bar_frac: f32,
     class: Option<Class>,
@@ -822,7 +822,7 @@ pub(crate) fn share_bar_paints(
 /// points past that on purpose, since the icon read too small in practice
 /// — `ICON_MARGIN` is left unchanged, so the gutter math below no longer
 /// centers this exactly in a 25px column, it just adds up.
-pub(crate) const ICON_SIZE: f32 = 20.0;
+pub(super) const ICON_SIZE: f32 = 20.0;
 
 /// Gap on both sides of the icon: between the row's left edge and the icon,
 /// and between the icon and the Imagine gutter that follows it. `3.5` was
@@ -832,10 +832,10 @@ pub(crate) const ICON_SIZE: f32 = 20.0;
 /// without touching this margin, so that exact 25px alignment no longer
 /// holds — `25.0` was what `ICON_GUTTER_WIDTH` would have reverted to had
 /// `IMAGINE_GUTTER_WIDTH` been deleted (D4's takedown) before issue #187.
-pub(crate) const ICON_MARGIN: f32 = 3.5;
+pub(super) const ICON_MARGIN: f32 = 3.5;
 
 /// Class icon tint (source `Fill="#ddd"`).
-pub(crate) const CLASS_ICON_TINT: egui::Color32 = egui::Color32::from_rgb(0xDD, 0xDD, 0xDD);
+pub(super) const CLASS_ICON_TINT: egui::Color32 = egui::Color32::from_rgb(0xDD, 0xDD, 0xDD);
 
 // IMAGINE-TAKEDOWN: one of five sites — see
 // `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
@@ -844,7 +844,7 @@ pub(crate) const CLASS_ICON_TINT: egui::Color32 = egui::Color32::from_rgb(0xDD, 
 /// 20x20 class icon. Issue #187 bumped both up together (14 -> 16 here,
 /// 18 -> 20 for `ICON_SIZE`) so the slot's ~0.8x-of-the-icon proportion —
 /// smaller, secondary — is preserved rather than just growing one.
-pub(crate) const IMAGINE_SIZE: f32 = 16.0;
+pub(super) const IMAGINE_SIZE: f32 = 16.0;
 
 // IMAGINE-TAKEDOWN: one of five sites — see
 // `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
@@ -852,7 +852,7 @@ pub(crate) const IMAGINE_SIZE: f32 = 16.0;
 /// Gap between the class icon and Imagine slot 0, and between slot 0 and
 /// slot 1. Not sourced from the reference meter — chosen so the gutter
 /// arithmetic (`IMAGINE_GUTTER_WIDTH`) lands cleanly.
-pub(crate) const IMAGINE_GAP: f32 = 2.0;
+pub(super) const IMAGINE_GAP: f32 = 2.0;
 
 // IMAGINE-TAKEDOWN: one of five sites — see
 // `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
@@ -862,7 +862,7 @@ pub(crate) const IMAGINE_GAP: f32 = 2.0;
 /// mechanical — deleting this line (and its use below) restores
 /// `ICON_GUTTER_WIDTH` to its pre-issue-#33 `25.0` with no other
 /// arithmetic to touch.
-pub(crate) const IMAGINE_GUTTER_WIDTH: f32 = 2.0 * (IMAGINE_GAP + IMAGINE_SIZE);
+pub(super) const IMAGINE_GUTTER_WIDTH: f32 = 2.0 * (IMAGINE_GAP + IMAGINE_SIZE);
 
 // IMAGINE-TAKEDOWN: one of five sites — see
 // `docs/plans/2026-08-17-issue-33-imagines-plan.md` D4.
@@ -870,7 +870,7 @@ pub(crate) const IMAGINE_GUTTER_WIDTH: f32 = 2.0 * (IMAGINE_GAP + IMAGINE_SIZE);
 /// Dim fill for the blank-circle placeholder an empty, unknown-id, or
 /// undecoded-texture Imagine slot paints instead of an icon — in the same
 /// register as `CLASS_ICON_TINT`.
-pub(crate) const IMAGINE_SLOT_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x55, 0x55, 0x55);
+pub(super) const IMAGINE_SLOT_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x55, 0x55, 0x55);
 
 /// Highest Imagine tier (issues #169/#170), the gate for the gold ring
 /// `draw_row` paints around a filled, maxed-out slot.
@@ -891,7 +891,7 @@ pub(crate) const IMAGINE_SLOT_EMPTY: egui::Color32 = egui::Color32::from_rgb(0x5
 /// `>=` still fires once the real max is reached instead of never firing;
 /// the failure mode of `>=` under a wrong-high guess is merely "no ring
 /// yet" until data proves otherwise, never a stuck-wrong ring.
-pub(crate) const IMAGINE_MAX_TIER: i32 = 5;
+pub(super) const IMAGINE_MAX_TIER: i32 = 5;
 
 /// Stroke color of the gold/amber ring `draw_row` paints around a
 /// filled Imagine slot at `IMAGINE_MAX_TIER` (issue #170). Issue #180:
@@ -900,20 +900,20 @@ pub(crate) const IMAGINE_MAX_TIER: i32 = 5;
 /// `#D4AF37`-`#C9A227` range and still reads distinct from
 /// `CLASS_ICON_TINT`'s neutral light gray as a deliberate highlight, not a
 /// tint variation.
-pub(crate) const IMAGINE_MAX_TIER_RING_COLOR: egui::Color32 =
+pub(super) const IMAGINE_MAX_TIER_RING_COLOR: egui::Color32 =
     egui::Color32::from_rgb(0xD4, 0xAF, 0x37);
 
 /// Width of the gold max-tier ring's stroke (issue #170). Issue #180:
 /// thinned from `1.5` to `1.0` so the ring reads as a thin accent rather
 /// than dominating the 16pt `IMAGINE_SIZE` slot it circles.
-pub(crate) const IMAGINE_MAX_TIER_RING_WIDTH: f32 = 1.0;
+pub(super) const IMAGINE_MAX_TIER_RING_WIDTH: f32 = 1.0;
 
 /// Hover-tooltip text for an equipped Imagine slot (issue #169): the plain
 /// `name` when `tier` is absent or the wire-default `0` (proto3's
 /// omit-when-default means "no tier observed yet" and "tier is genuinely
 /// zero" are indistinguishable on the wire, so both read as "nothing to
 /// add"), otherwise `"{name} · Tier {tier}"`.
-pub(crate) fn imagine_hover_text(name: &str, tier: Option<i32>) -> String {
+pub(super) fn imagine_hover_text(name: &str, tier: Option<i32>) -> String {
     match tier {
         Some(t) if t > 0 => format!("{name} · Tier {t}"),
         _ => name.to_string(),
@@ -924,7 +924,7 @@ pub(crate) fn imagine_hover_text(name: &str, tier: Option<i32>) -> String {
 /// #170): `tier >= IMAGINE_MAX_TIER`. `None` (unresolved/no tier data) and
 /// any tier below the max both yield `false` — see `IMAGINE_MAX_TIER`'s doc
 /// comment for why this is `>=` rather than `==`.
-pub(crate) fn imagine_ring_visible(tier: Option<i32>) -> bool {
+pub(super) fn imagine_ring_visible(tier: Option<i32>) -> bool {
     tier.is_some_and(|t| t >= IMAGINE_MAX_TIER)
 }
 
@@ -933,17 +933,17 @@ pub(crate) fn imagine_ring_visible(tier: Option<i32>) -> bool {
 /// gutter, then a matching margin — reserved whether or not this
 /// particular row has any of these to paint, so every row's name still
 /// starts at the same x (see `icon_slots`).
-pub(crate) const ICON_GUTTER_WIDTH: f32 =
+pub(super) const ICON_GUTTER_WIDTH: f32 =
     ICON_MARGIN + ICON_SIZE + IMAGINE_GUTTER_WIDTH + ICON_MARGIN;
 
 /// A row's class-icon slot, its two Imagine slots (issue #33), and the
 /// x-offset from the row rect's left edge at which the player name should
 /// then start.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) struct RowIconSlots {
-    pub(crate) class: egui::Rect,
-    pub(crate) imagines: [egui::Rect; 2],
-    pub(crate) name_offset: f32,
+pub(super) struct RowIconSlots {
+    pub(super) class: egui::Rect,
+    pub(super) imagines: [egui::Rect; 2],
+    pub(super) name_offset: f32,
 }
 
 /// Computes a row's class icon slot (a square, vertically centered in
@@ -954,7 +954,7 @@ pub(crate) struct RowIconSlots {
 /// to paint or any equipped Imagines — so the slots, and therefore the
 /// name's start position, are identical across every row regardless of
 /// which classes have icons or which Imagines are equipped.
-pub(crate) fn icon_slots(rect: egui::Rect) -> RowIconSlots {
+pub(super) fn icon_slots(rect: egui::Rect) -> RowIconSlots {
     let class = egui::Rect::from_min_size(
         egui::pos2(rect.left() + ICON_MARGIN, rect.center().y - ICON_SIZE / 2.0),
         egui::vec2(ICON_SIZE, ICON_SIZE),
@@ -982,7 +982,7 @@ pub(crate) fn icon_slots(rect: egui::Rect) -> RowIconSlots {
 
 /// `bpsr_meter` already fills unknown names with `Player {uid}`; this is a
 /// defensive fallback in case a row ever arrives with an empty name.
-pub(crate) fn row_name(row: &PlayerRow) -> String {
+pub(super) fn row_name(row: &PlayerRow) -> String {
     if row.name.is_empty() {
         format!("Player {}", row.uid)
     } else {
@@ -1021,7 +1021,7 @@ pub(crate) fn row_name(row: &PlayerRow) -> String {
 /// rather than lose characters. `draw_row`'s own comment at the paint
 /// site has the z-order reasoning; this function's job stays just the
 /// string, in full, every time.
-pub(crate) fn name_suffix(row: &PlayerRow, settings: &Settings) -> Option<String> {
+pub(super) fn name_suffix(row: &PlayerRow, settings: &Settings) -> Option<String> {
     let mut parts = Vec::new();
     if settings.is_visible(ColumnKind::AbilityScore) {
         let text = (ColumnKind::AbilityScore.spec().text)(row);

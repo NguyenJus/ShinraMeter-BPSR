@@ -14,7 +14,7 @@ use super::*;
 // otherwise be separate parameters for the same reason. One more scalar
 // flag doesn't earn a second bundling struct of its own.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn draw_header(
+pub(super) fn draw_header(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     snapshot: &Snapshot,
@@ -381,14 +381,14 @@ pub(crate) fn draw_header(
 /// 3.30-3.53:1, clearing the minimum with margin to spare while staying
 /// visibly dimmer than the "on" tint's `0x80`, so the two states stay
 /// distinguishable at a glance.
-pub(crate) const TOGGLE_OFF_COLOR: egui::Color32 =
+pub(super) const TOGGLE_OFF_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x60);
 /// Tint the toggle cluster's buttons are painted with while active — the
 /// same half-white `TOOLBAR_ICON_TINT` every other clickable icon in this
 /// module uses. Share and Reset (one-shot actions, not on/off state) always
 /// paint at this tint; click-through and always-on-top use it only in their
 /// "on" state (`toggle_state_tint`).
-pub(crate) const TOGGLE_ACTIVE_COLOR: egui::Color32 = TOOLBAR_ICON_TINT;
+pub(super) const TOGGLE_ACTIVE_COLOR: egui::Color32 = TOOLBAR_ICON_TINT;
 /// Filled circle painted behind the click-through icon while click-through
 /// is enabled (issue #292): `toggle_state_tint`'s on/off distinction is
 /// only a ~25% alpha delta on the same white glyph (`TOGGLE_OFF_COLOR` vs
@@ -399,39 +399,39 @@ pub(crate) const TOGGLE_ACTIVE_COLOR: egui::Color32 = TOOLBAR_ICON_TINT;
 /// the existing tint, painted only in the "on" state; "off" is unchanged
 /// (relies on the pill's own `PILL_FILL` plus the dim icon tint, same as
 /// before this issue).
-pub(crate) const CLICK_THROUGH_ON_FILL: egui::Color32 =
+pub(super) const CLICK_THROUGH_ON_FILL: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(233, 196, 106, 130);
 /// Circular hover wash painted behind a toggle-cluster button, matching the
 /// oval pill's own shape rather than a foreign square badge.
-pub(crate) const TOGGLE_HOVER_FILL: egui::Color32 =
+pub(super) const TOGGLE_HOVER_FILL: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 30);
-pub(crate) const TOGGLE_MOUSE_SIDE: f32 = 12.0;
-pub(crate) const TOGGLE_CLOUD_SIDE: f32 = 14.0;
+pub(super) const TOGGLE_MOUSE_SIDE: f32 = 12.0;
+pub(super) const TOGGLE_CLOUD_SIDE: f32 = 14.0;
 /// Click-through button glyph side (issue #167) — same 14pt as `TOGGLE_
 /// CLOUD_SIDE`/the old queue slot, keeping every non-Share button in the
 /// cluster the same visual size.
-pub(crate) const TOGGLE_CLICK_THROUGH_SIDE: f32 = 14.0;
+pub(super) const TOGGLE_CLICK_THROUGH_SIDE: f32 = 14.0;
 /// Always-on-top button glyph side (issue #167) — see `TOGGLE_CLICK_
 /// THROUGH_SIDE`'s doc comment.
-pub(crate) const TOGGLE_ALWAYS_ON_TOP_SIDE: f32 = 14.0;
+pub(super) const TOGGLE_ALWAYS_ON_TOP_SIDE: f32 = 14.0;
 /// History button glyph side (issue #186) — the same 14pt as every other
 /// non-Share button in the cluster, see `TOGGLE_CLICK_THROUGH_SIDE`.
-pub(crate) const TOGGLE_HISTORY_SIDE: f32 = 14.0;
-pub(crate) const TOGGLE_GAP: f32 = 5.0;
-pub(crate) const TOGGLE_PAD_X: f32 = 4.0;
+pub(super) const TOGGLE_HISTORY_SIDE: f32 = 14.0;
+pub(super) const TOGGLE_GAP: f32 = 5.0;
+pub(super) const TOGGLE_PAD_X: f32 = 4.0;
 
 /// Gap, in points, between the title row's toggle pill (issue #185) and the
 /// dropdown chevron's reserved strip to its right. `TOGGLE_PAD_X`'s value,
 /// deliberately: the pill's own internal padding is what sets the rhythm the
 /// chevron then continues, so the two read as one run of controls rather
 /// than two clusters that happen to be adjacent.
-pub(crate) const TITLE_TOGGLE_GAP_X: f32 = TOGGLE_PAD_X;
+pub(super) const TITLE_TOGGLE_GAP_X: f32 = TOGGLE_PAD_X;
 
 /// Width of the title row's toggle pill (issue #185): the click-through and
 /// always-on-top buttons, laid out with exactly the padding, glyph sides and
 /// inter-button gap they had inside `toggle_cluster`, so the two ovals still
 /// read as one family after the move.
-pub(crate) const TITLE_TOGGLE_PILL_WIDTH: f32 =
+pub(super) const TITLE_TOGGLE_PILL_WIDTH: f32 =
     2.0 * TOGGLE_PAD_X + TOGGLE_CLICK_THROUGH_SIDE + TOGGLE_GAP + TOGGLE_ALWAYS_ON_TOP_SIDE;
 
 /// Width the *title* row keeps clear at its right end (issue #185): the
@@ -441,13 +441,13 @@ pub(crate) const TITLE_TOGGLE_PILL_WIDTH: f32 =
 /// pill lives on the title row alone — the subtitle row still reserves only
 /// the chevron strip, and widening the shared constant would have punched a
 /// 45pt hole in the area name for no reason.
-pub(crate) const TITLE_RIGHT_CONTROLS_WIDTH: f32 =
+pub(super) const TITLE_RIGHT_CONTROLS_WIDTH: f32 =
     HEADER_RIGHT_CONTROL_WIDTH + TITLE_TOGGLE_GAP_X + TITLE_TOGGLE_PILL_WIDTH;
 /// Points the click-through button's published hit box (`platform::
 /// set_click_through_button_rect`) is padded out by on every side, so the
 /// `WM_NCHITTEST` carve-out that keeps it reachable under click-through
 /// (issue #167 rehash) isn't razor-thin right at the glyph's edges.
-pub(crate) const CLICK_THROUGH_HIT_PAD: f32 = 2.0;
+pub(super) const CLICK_THROUGH_HIT_PAD: f32 = 2.0;
 
 /// Horizontal offset, in points, from the title row's toggle pill's left
 /// edge to the left edge of the click-through button's glyph box. Issue #185
@@ -456,7 +456,7 @@ pub(crate) const CLICK_THROUGH_HIT_PAD: f32 = 2.0;
 /// pill's own left padding and nothing else — still spelled as its own
 /// constant so the hit box can be computed before the pill is painted (see
 /// `click_through_button_slot`).
-pub(crate) const CLICK_THROUGH_SLOT_OFFSET_X: f32 = TOGGLE_PAD_X;
+pub(super) const CLICK_THROUGH_SLOT_OFFSET_X: f32 = TOGGLE_PAD_X;
 
 /// The click-through button's glyph box, in points, derived from the title
 /// row's toggle pill rect (`title_toggle_pill_rect`). Pure so
@@ -464,7 +464,7 @@ pub(crate) const CLICK_THROUGH_SLOT_OFFSET_X: f32 = TOGGLE_PAD_X;
 /// (issue #167 rehash) before it starts painting — and so the geometry is
 /// unit-testable on every platform, unlike the `cfg(windows)` publish
 /// itself.
-pub(crate) fn click_through_button_slot(pill: egui::Rect) -> egui::Rect {
+pub(super) fn click_through_button_slot(pill: egui::Rect) -> egui::Rect {
     egui::Rect::from_center_size(
         egui::pos2(
             pill.left() + CLICK_THROUGH_SLOT_OFFSET_X + TOGGLE_CLICK_THROUGH_SIDE / 2.0,
@@ -491,7 +491,7 @@ pub(crate) fn click_through_button_slot(pill: egui::Rect) -> egui::Rect {
 ///
 /// Pure so the points-to-pixels transform is unit-testable off-Windows; the
 /// `cfg`-gated publish call is the only Windows-only part.
-pub(crate) fn click_through_hit_box_px(
+pub(super) fn click_through_hit_box_px(
     button_rect: egui::Rect,
     pixels_per_point: f32,
 ) -> (i32, i32, i32, i32) {
@@ -534,7 +534,7 @@ pub(crate) fn click_through_hit_box_px(
 /// the History item had back in `draw_header_menu`; gating only the click's
 /// *effect* at the call site left the button sounding perfectly usable
 /// while doing nothing.
-pub(crate) fn toggle_button(
+pub(super) fn toggle_button(
     ui: &egui::Ui,
     rect: egui::Rect,
     label: &str,
@@ -574,7 +574,7 @@ pub(crate) fn toggle_button(
 /// dimmer but still clearly legible white (issue #251) — while off.
 /// Pure so the state -> color mapping is unit-testable without a live
 /// `egui::Context`; `toggle_cluster` is the only caller.
-pub(crate) fn toggle_state_tint(active: bool) -> egui::Color32 {
+pub(super) fn toggle_state_tint(active: bool) -> egui::Color32 {
     if active {
         TOGGLE_ACTIVE_COLOR
     } else {
@@ -596,7 +596,7 @@ pub(crate) fn toggle_state_tint(active: bool) -> egui::Color32 {
 /// leaves `click_through` exactly as it found it. Pure so this is
 /// unit-testable without a live `egui::Context` or the platform layer's
 /// real atomics.
-pub(crate) fn click_through_after_tray_request(click_through: bool, requested: bool) -> bool {
+pub(super) fn click_through_after_tray_request(click_through: bool, requested: bool) -> bool {
     if requested { false } else { click_through }
 }
 
@@ -632,7 +632,7 @@ pub(crate) fn click_through_after_tray_request(click_through: bool, requested: b
 /// `share_active`, History's `has_history`, PR #225 review of issue #219)
 /// — pulled out so the wording can't drift apart between the two call
 /// sites by a hand-edit to just one of them.
-pub(crate) fn availability_label(
+pub(super) fn availability_label(
     active: bool,
     label: &'static str,
     unavailable: &'static str,
@@ -640,7 +640,7 @@ pub(crate) fn availability_label(
     if active { label } else { unavailable }
 }
 
-pub(crate) fn toggle_cluster(
+pub(super) fn toggle_cluster(
     ui: &mut egui::Ui,
     tx_command: &Sender<UiCommand>,
     icons: &Icons,
@@ -766,7 +766,7 @@ pub(crate) fn toggle_cluster(
 /// It is also the one publisher of the click-through button's
 /// `WM_NCHITTEST` hit box, which followed the button here — see the
 /// invariant below.
-pub(crate) fn title_row_toggles(
+pub(super) fn title_row_toggles(
     ui: &mut egui::Ui,
     settings: SettingsHandle<'_>,
     icons: &Icons,
@@ -906,7 +906,7 @@ pub(crate) fn title_row_toggles(
 /// nothing stops another viewport's reply from showing up in a multi-
 /// viewport app; this app only ever has the root viewport, so every event
 /// this frame is implicitly ours.
-pub(crate) fn handle_screenshot_events(
+pub(super) fn handle_screenshot_events(
     ctx: &egui::Context,
     mut write: impl FnMut(std::sync::Arc<egui::ColorImage>),
 ) {
@@ -938,7 +938,7 @@ pub(crate) fn handle_screenshot_events(
 ///   clamps at the scroll area's height rather than the taller row-count
 ///   total, since content past that was clipped out of the render itself
 ///   and cannot be recovered from a screenshot of it.
-pub(crate) fn rows_content_bottom_y(
+pub(super) fn rows_content_bottom_y(
     rows_top: f32,
     row_count: usize,
     row_height: f32,
@@ -958,7 +958,7 @@ pub(crate) fn rows_content_bottom_y(
 /// principle still scale the bound past the image; this clamp makes sure
 /// that only ever crops *less* than the full image, never indexes past its
 /// end.
-pub(crate) fn screenshot_crop_height_px(
+pub(super) fn screenshot_crop_height_px(
     bottom_y_points: f32,
     pixels_per_point: f32,
     image_height_px: usize,
@@ -1001,7 +1001,7 @@ pub(crate) fn screenshot_crop_height_px(
 /// the issue-#82 case above, not a rare edge — returns via a cheap Arc
 /// refcount bump instead of a second full pixel-buffer deep copy on top of
 /// the one `handle_screenshot_events`'s caller already avoids.
-pub(crate) fn crop_screenshot_to_rows(
+pub(super) fn crop_screenshot_to_rows(
     image: &std::sync::Arc<egui::ColorImage>,
     bottom_y_points: f32,
     pixels_per_point: f32,
@@ -1039,7 +1039,7 @@ pub(crate) fn crop_screenshot_to_rows(
 /// Returns the input `Arc` untouched when the capture is already fully
 /// opaque — a refcount bump rather than a second full pixel-buffer copy,
 /// same reasoning as `crop_screenshot_to_rows`'s no-op path.
-pub(crate) fn flatten_screenshot_alpha(
+pub(super) fn flatten_screenshot_alpha(
     image: &std::sync::Arc<egui::ColorImage>,
 ) -> std::sync::Arc<egui::ColorImage> {
     if image.pixels.iter().all(|pixel| pixel.a() == u8::MAX) {
@@ -1075,7 +1075,7 @@ pub(crate) fn flatten_screenshot_alpha(
 /// that actually handles a screenshot event (`event_landed`); every other
 /// frame must leave whatever is pending untouched so it survives however
 /// many frames the round trip takes.
-pub(crate) fn take_pending_screenshot_bound(
+pub(super) fn take_pending_screenshot_bound(
     pending: Option<f32>,
     event_landed: bool,
 ) -> (f32, Option<f32>) {
@@ -1105,7 +1105,7 @@ pub(crate) fn take_pending_screenshot_bound(
 /// request that happens to land in the same frame as an old capture's
 /// reply keeps the guard set (a fresh capture is now in flight) rather
 /// than clearing it.
-pub(crate) fn screenshot_capture_guard(
+pub(super) fn screenshot_capture_guard(
     current: bool,
     requested_this_frame: bool,
     event_landed: bool,
@@ -1143,7 +1143,7 @@ pub(crate) fn screenshot_capture_guard(
 /// cadence this bound is about 2 seconds — comfortably longer than any
 /// real `ViewportCommand::Screenshot` round trip, short enough that a
 /// dropped reply doesn't leave the suppression visible for long.
-pub(crate) const SCREENSHOT_CAPTURE_TIMEOUT_FRAMES: u32 = 20;
+pub(super) const SCREENSHOT_CAPTURE_TIMEOUT_FRAMES: u32 = 20;
 
 /// Issue #156: true once `screenshot_capture_frames_waited` has reached
 /// `SCREENSHOT_CAPTURE_TIMEOUT_FRAMES` — see that constant's doc comment
@@ -1152,7 +1152,7 @@ pub(crate) const SCREENSHOT_CAPTURE_TIMEOUT_FRAMES: u32 = 20;
 /// capture_guard` as `event_landed`, so a timed-out wait clears the guard
 /// through the exact same pure transition a real reply does, rather than a
 /// second, separately-maintained clearing path.
-pub(crate) fn screenshot_capture_timed_out(frames_waited: u32) -> bool {
+pub(super) fn screenshot_capture_timed_out(frames_waited: u32) -> bool {
     frames_waited >= SCREENSHOT_CAPTURE_TIMEOUT_FRAMES
 }
 
@@ -1165,7 +1165,7 @@ pub(crate) fn screenshot_capture_timed_out(frames_waited: u32) -> bool {
 /// timed-out) lands — both already reset `screenshot_capturing` itself —
 /// and increments on every other frame, i.e. every frame the wait for the
 /// reply continues.
-pub(crate) fn advance_screenshot_capture_wait(
+pub(super) fn advance_screenshot_capture_wait(
     frames_waited: u32,
     requested_this_frame: bool,
     event_landed: bool,
@@ -1199,7 +1199,7 @@ pub(crate) fn advance_screenshot_capture_wait(
 /// events`'s `ctx.input` borrow, so the pending-bound take (which needs
 /// `&mut pending_screenshot_bound`) and the crop/write loop can happen
 /// afterward without a borrow conflict.
-pub(crate) fn handle_share_screenshot(
+pub(super) fn handle_share_screenshot(
     ctx: &egui::Context,
     pending_screenshot_bound: &mut Option<f32>,
     mut write: impl FnMut(std::sync::Arc<egui::ColorImage>),
@@ -1336,7 +1336,7 @@ pub(crate) fn encounter_subtitle(e: &EncounterInfo) -> Option<String> {
 /// `docs/reference/new-shinra-ex.webp`, our boss name sat with barely a
 /// point of air under its descenders, while the reference leaves the name a
 /// visibly taller line box.
-pub(crate) const TITLE_LINE_HEIGHT: f32 = 22.0;
+pub(super) const TITLE_LINE_HEIGHT: f32 = 22.0;
 
 /// White the title line is painted in — the source's inherited `White`
 /// title foreground, deliberately not `ui.visuals().text_color()` (the
@@ -1344,7 +1344,7 @@ pub(crate) const TITLE_LINE_HEIGHT: f32 = 22.0;
 /// as the visually heaviest element in the header. `draw_title_line` is its
 /// only user: the header stat pills, which once shared it, are painted a
 /// step dimmer in `PILL_VALUE_COLOR` so the title still outweighs them.
-pub(crate) const TITLE_TEXT_COLOR: egui::Color32 = egui::Color32::WHITE;
+pub(super) const TITLE_TEXT_COLOR: egui::Color32 = egui::Color32::WHITE;
 
 /// Height of the header's subtitle line, always reserved by the header band
 /// whether or not there is an area name to paint into it (issue #91, see
@@ -1357,10 +1357,10 @@ pub(crate) const TITLE_TEXT_COLOR: egui::Color32 = egui::Color32::WHITE;
 /// `docs/reference/new-shinra-ex.webp`, the reference's area name clears its
 /// own descenders and the separator above it with more room than a 14pt line
 /// box leaves.
-pub(crate) const SUBTITLE_LINE_HEIGHT: f32 = 16.0;
+pub(super) const SUBTITLE_LINE_HEIGHT: f32 = 16.0;
 
 /// Subtitle text color — the source's `#5fff`, white at ~1/3 alpha.
-pub(crate) const SUBTITLE_TEXT_COLOR: egui::Color32 =
+pub(super) const SUBTITLE_TEXT_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0x55);
 
 // -- header text gutter (issue #59, #62) --------------------------------
@@ -1375,17 +1375,17 @@ pub(crate) const SUBTITLE_TEXT_COLOR: egui::Color32 =
 /// before the title column starts. A fixed width, not a fraction of the
 /// window: in the source the emblem is a fixed-size `Path` in an `Auto`
 /// column, so the gutter does not breathe with the window.
-pub(crate) const HEADER_GUTTER_WIDTH: f32 = 34.0;
+pub(super) const HEADER_GUTTER_WIDTH: f32 = 34.0;
 /// The source title/subtitle `Margin="2 … 0 0"` — a hair of air between the
 /// gutter and the text.
-pub(crate) const HEADER_TEXT_PAD_X: f32 = 2.0;
+pub(super) const HEADER_TEXT_PAD_X: f32 = 2.0;
 
 /// Width reserved at the *right* end of the title/subtitle rows — the
 /// source's `ComboBoxToggleButton` chevron column, `Width="32"`.
 ///
 /// Issue #54's collapse chevron is what occupies that strip — `chevron_rect`
 /// centers its box in exactly this width, on the title row.
-pub(crate) const HEADER_RIGHT_CONTROL_WIDTH: f32 = 32.0;
+pub(super) const HEADER_RIGHT_CONTROL_WIDTH: f32 = 32.0;
 
 /// The sub-rect of a header row that title/subtitle text may actually paint
 /// into: indented on the left by the fixed `HEADER_GUTTER_WIDTH` +
@@ -1394,7 +1394,7 @@ pub(crate) const HEADER_RIGHT_CONTROL_WIDTH: f32 = 32.0;
 /// width the right edge collapses onto the left one, giving an empty (not
 /// negative) rect, which clips the text away entirely rather than painting
 /// it backwards.
-pub(crate) fn header_text_rect(row: egui::Rect) -> egui::Rect {
+pub(super) fn header_text_rect(row: egui::Rect) -> egui::Rect {
     header_text_rect_reserving(row, HEADER_RIGHT_CONTROL_WIDTH)
 }
 
@@ -1403,7 +1403,7 @@ pub(crate) fn header_text_rect(row: egui::Rect) -> egui::Rect {
 /// WIDTH` — the chevron strip *plus* the toggle pill that now sits left of
 /// it — instead of the chevron strip alone. The subtitle row keeps
 /// `header_text_rect`, since the pill is on the title row only.
-pub(crate) fn title_text_rect(row: egui::Rect) -> egui::Rect {
+pub(super) fn title_text_rect(row: egui::Rect) -> egui::Rect {
     header_text_rect_reserving(row, TITLE_RIGHT_CONTROLS_WIDTH)
 }
 
@@ -1411,7 +1411,7 @@ pub(crate) fn title_text_rect(row: egui::Rect) -> egui::Rect {
 /// differ only in how much of the row's right end is reserved for controls,
 /// and every degradation rule (never inverted, clamped against the left
 /// edge) is identical, so it is spelled once here rather than twice.
-pub(crate) fn header_text_rect_reserving(row: egui::Rect, right_reserve: f32) -> egui::Rect {
+pub(super) fn header_text_rect_reserving(row: egui::Rect, right_reserve: f32) -> egui::Rect {
     let left = row.left() + HEADER_GUTTER_WIDTH + HEADER_TEXT_PAD_X;
     let right = (row.right() - right_reserve).max(left);
     egui::Rect::from_min_max(egui::pos2(left, row.top()), egui::pos2(right, row.bottom()))
@@ -1429,7 +1429,7 @@ pub(crate) fn header_text_rect_reserving(row: egui::Rect, right_reserve: f32) ->
 /// `draw_header` applies it explicitly (`ui.add_space`) *and* budgets it in
 /// `header_band_height`, so the drag band, the wash and the painted rows all
 /// stay derived from this one number.
-pub(crate) const HEADER_STAT_ROW_GAP: f32 = 6.0;
+pub(super) const HEADER_STAT_ROW_GAP: f32 = 6.0;
 
 /// How far the stat row (timer, DPS, damage, toggle cluster) is inset from
 /// the panel's left content edge. The timer used to sit flush against it, so
@@ -1448,7 +1448,7 @@ pub(crate) const HEADER_STAT_ROW_GAP: f32 = 6.0;
 /// edge and the row's leftmost ink — which is why the mark no longer has to
 /// be clipped to the text band (and have its bottom corner sliced off) to
 /// stay clear of the readout. See `header_emblem_rect`.
-pub(crate) const HEADER_STAT_ROW_INSET_X: f32 = HEADER_GUTTER_WIDTH + HEADER_TEXT_PAD_X;
+pub(super) const HEADER_STAT_ROW_INSET_X: f32 = HEADER_GUTTER_WIDTH + HEADER_TEXT_PAD_X;
 
 /// Height of `draw_header`'s drag band: the title line, the subtitle line,
 /// and the button row (`button_row_height`, egui's `interact_size.y`), plus
@@ -1472,14 +1472,14 @@ pub(crate) const HEADER_STAT_ROW_INSET_X: f32 = HEADER_GUTTER_WIDTH + HEADER_TEX
 /// (`OverlayApp::header_rect`), and this is the single place that turns
 /// that measurement — or its absence, on the very first frame — into the
 /// number those consumers size against.
-pub(crate) fn measured_header_band_height(header_rect: Option<egui::Rect>) -> f32 {
+pub(super) fn measured_header_band_height(header_rect: Option<egui::Rect>) -> f32 {
     header_rect.map_or_else(
         || header_band_height(BUTTON_ROW_HEIGHT),
         |rect| rect.height(),
     )
 }
 
-pub(crate) fn header_band_height(button_row_height: f32) -> f32 {
+pub(super) fn header_band_height(button_row_height: f32) -> f32 {
     header_text_band_height() + HEADER_STAT_ROW_GAP + button_row_height
 }
 
@@ -1504,7 +1504,7 @@ pub(crate) fn header_band_height(button_row_height: f32) -> f32 {
 /// back out of sync the way `band_height` alone did. Verified against a
 /// real `egui::Ui` — not just self-consistency — by
 /// `the_row_area_begins_exactly_where_first_player_row_top_offset_predicts`.
-pub(crate) fn first_player_row_top_offset(band_height: f32) -> f32 {
+pub(super) fn first_player_row_top_offset(band_height: f32) -> f32 {
     band_height + 2.0 * ITEM_SPACING_Y + SEPARATOR_HEIGHT
 }
 
@@ -1533,7 +1533,7 @@ pub(crate) fn first_player_row_top_offset(band_height: f32) -> f32 {
 ///
 /// The background wash is deliberately *not* bounded by this either (issue
 /// #91): it spans the whole `header_band_height`, stat row included.
-pub(crate) fn header_text_band_height() -> f32 {
+pub(super) fn header_text_band_height() -> f32 {
     TITLE_LINE_HEIGHT + ITEM_SPACING_Y + SUBTITLE_LINE_HEIGHT
 }
 
@@ -1553,7 +1553,7 @@ pub(crate) fn header_text_band_height() -> f32 {
 ///
 /// The title's paint is clipped to the text rect, so an overlong boss name
 /// loses its tail instead of running into that strip.
-pub(crate) fn draw_title_line(ui: &mut egui::Ui, text: &str) -> egui::Rect {
+pub(super) fn draw_title_line(ui: &mut egui::Ui, text: &str) -> egui::Rect {
     let desired_size = egui::vec2(ui.available_width(), TITLE_LINE_HEIGHT);
     let (row, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
     // `title_text_rect`, not `header_text_rect`: the title row reserves the
@@ -1576,11 +1576,11 @@ pub(crate) fn draw_title_line(ui: &mut egui::Ui, text: &str) -> egui::Rect {
 /// left edge by `Margin="-26 0 0 -8"`, so only its right two-thirds are ever
 /// on screen. Vertically it is centered on the header's *text* band but
 /// clipped to the whole header band — see `header_emblem_rect`.
-pub(crate) const HEADER_EMBLEM_SIZE: f32 = 60.0;
+pub(super) const HEADER_EMBLEM_SIZE: f32 = 60.0;
 /// The `Margin`'s left component: the emblem hangs 26pt off the left edge of
 /// the header rows, so only its right `60 - 26 = 34`pt — one
 /// `HEADER_GUTTER_WIDTH` — is ever on screen.
-pub(crate) const HEADER_EMBLEM_LEFT_BLEED: f32 = -26.0;
+pub(super) const HEADER_EMBLEM_LEFT_BLEED: f32 = -26.0;
 /// The `Margin`'s bottom component (`-8`): a *negative* bottom margin, which
 /// in WPF adds to the height the emblem is centered in rather than moving
 /// it. With the source's 36pt header grid that gives `(36 + 8 - 60)/2 = -8`,
@@ -1588,7 +1588,7 @@ pub(crate) const HEADER_EMBLEM_LEFT_BLEED: f32 = -26.0;
 /// (issue #91 grew the two line heights), so `header_emblem_rect` recomputes
 /// the centering from the text band it is actually given instead of baking
 /// the source's one case in.
-pub(crate) const HEADER_EMBLEM_BOTTOM_BLEED: f32 = 8.0;
+pub(super) const HEADER_EMBLEM_BOTTOM_BLEED: f32 = 8.0;
 /// `Fill="SlateGray"`. The source's gutter placement
 /// (`DamageMeter.UI/HUD/Controls/MainView.xaml`, the `Width="60" Height="60"
 /// Margin="-26 0 0 -8"` `Path` that `header_emblem_rect`'s constants are
@@ -1599,7 +1599,7 @@ pub(crate) const HEADER_EMBLEM_BOTTOM_BLEED: f32 = 8.0;
 /// measured one — it matches this module's own established "dimmed but
 /// legible" idiom (`TOOLBAR_ICON_TINT`'s half-white) rather than painting
 /// the mark fully opaque as a bare `Color32::from_rgb` implied.
-pub(crate) const HEADER_EMBLEM_COLOR: egui::Color32 =
+pub(super) const HEADER_EMBLEM_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(0x70, 0x80, 0x90, 0x80);
 
 /// Where the header emblem's 60x60 box sits: bled off the left of the title
@@ -1636,7 +1636,7 @@ pub(crate) const HEADER_EMBLEM_COLOR: egui::Color32 =
 /// This bounds the *gutter* mark only. The background wash
 /// (`header_wash_rect` / `draw_header_wash`) is a different rect and also
 /// spans the whole header band, stat-pill row included.
-pub(crate) fn header_emblem_rect(row: egui::Rect, text_band_height: f32) -> egui::Rect {
+pub(super) fn header_emblem_rect(row: egui::Rect, text_band_height: f32) -> egui::Rect {
     let available = text_band_height + HEADER_EMBLEM_BOTTOM_BLEED;
     egui::Rect::from_min_size(
         egui::pos2(
@@ -1671,12 +1671,12 @@ pub(crate) fn header_emblem_rect(row: egui::Rect, text_band_height: f32) -> egui
 /// Inset from the panel's edges the wash is painted at, so its square
 /// corners never poke past the panel's own `PANEL_CORNER_RADIUS`-rounded,
 /// `PANEL_BORDER_WIDTH`-thick border.
-pub(crate) const HEADER_WASH_INSET: f32 = 1.0;
+pub(super) const HEADER_WASH_INSET: f32 = 1.0;
 /// Alpha at the wash gradient's brightest (top-left) stop — `Opacity=".5"`.
-pub(crate) const HEADER_WASH_TOP_ALPHA: u8 = 0x50;
+pub(super) const HEADER_WASH_TOP_ALPHA: u8 = 0x50;
 /// Side of the wash's oversized `Svg.HPBar` box, in points — the same emblem
 /// the gutter draws at `HEADER_EMBLEM_SIZE`, blown up as wallpaper.
-pub(crate) const HEADER_WASH_EMBLEM_SIZE: f32 = 200.0;
+pub(super) const HEADER_WASH_EMBLEM_SIZE: f32 = 200.0;
 /// How far the wash emblem's right edge overhangs the wash's own right edge,
 /// in points: the source right-aligns the wash `Svg.HPBar` with a `-25` right
 /// margin, so its last 25pt hang off the panel and the wash's clip rect cuts
@@ -1690,9 +1690,9 @@ pub(crate) const HEADER_WASH_EMBLEM_SIZE: f32 = 200.0;
 /// and the visible arc inside it — further from the panel's right edge,
 /// clearing the toggle glyph boxes without touching the wash's size, alpha
 /// or the toggle cluster's own layout.
-pub(crate) const HEADER_WASH_EMBLEM_BLEED: f32 = 17.0;
+pub(super) const HEADER_WASH_EMBLEM_BLEED: f32 = 17.0;
 /// `Opacity=".05"` on a SlateGray fill.
-pub(crate) const HEADER_WASH_EMBLEM_COLOR: egui::Color32 =
+pub(super) const HEADER_WASH_EMBLEM_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(0x70, 0x80, 0x90, 13);
 
 /// Where the wash panel sits for a central panel of `panel`: inset from the
@@ -1702,7 +1702,7 @@ pub(crate) const HEADER_WASH_EMBLEM_COLOR: egui::Color32 =
 /// `header_emblem_rect`. `height` is the caller's to pick (`draw_header`
 /// passes `header_band_height - HEADER_WASH_INSET`, issue #91) rather than a
 /// fixed constant here, so the wash can never outgrow the band it decorates.
-pub(crate) fn header_wash_rect(panel: egui::Rect, height: f32) -> egui::Rect {
+pub(super) fn header_wash_rect(panel: egui::Rect, height: f32) -> egui::Rect {
     egui::Rect::from_min_size(
         panel.min + egui::Vec2::splat(HEADER_WASH_INSET),
         egui::vec2(panel.width() - 2.0 * HEADER_WASH_INSET, height),
@@ -1714,7 +1714,7 @@ pub(crate) fn header_wash_rect(panel: egui::Rect, height: f32) -> egui::Rect {
 /// points overhang its right edge. Taller than the wash as well as wider, so
 /// both the overhang and the top/bottom overflow rely on the caller's clip
 /// rect.
-pub(crate) fn header_wash_emblem_rect(wash: egui::Rect) -> egui::Rect {
+pub(super) fn header_wash_emblem_rect(wash: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(
         egui::pos2(
             wash.right() + HEADER_WASH_EMBLEM_BLEED - HEADER_WASH_EMBLEM_SIZE,
@@ -1755,7 +1755,7 @@ pub(crate) fn header_wash_emblem_rect(wash: egui::Rect) -> egui::Rect {
 /// the skill window uses throughout (issue #184), so the wash tracks the
 /// rest of the window's chrome instead of staying at its fixed baked-in
 /// alpha — and so the two paths agree on what the slider means.
-pub(crate) fn draw_header_wash(
+pub(super) fn draw_header_wash(
     ui: &egui::Ui,
     panel: egui::Rect,
     icons: &Icons,
@@ -1814,7 +1814,7 @@ pub(crate) fn draw_header_wash(
 /// job, and the same `HEADER_WASH_INSET`, that `header_wash_rect` does at
 /// the top. Pure geometry, so both properties are unit-testable without a
 /// painter, the same factoring as `header_wash_rect`/`header_emblem_rect`.
-pub(crate) fn row_backdrop_rect(available: egui::Rect, panel: egui::Rect) -> egui::Rect {
+pub(super) fn row_backdrop_rect(available: egui::Rect, panel: egui::Rect) -> egui::Rect {
     available.intersect(panel.shrink(HEADER_WASH_INSET))
 }
 
@@ -1833,7 +1833,7 @@ pub(crate) fn row_backdrop_rect(available: egui::Rect, panel: egui::Rect) -> egu
 ///
 /// The scrim `paint_background_image` lays over the image is what keeps the
 /// rows legible over arbitrary artwork — see `BACKGROUND_IMAGE_SCRIM_ALPHA`.
-pub(crate) fn draw_row_backdrop(
+pub(super) fn draw_row_backdrop(
     ui: &egui::Ui,
     panel: egui::Rect,
     available: egui::Rect,
@@ -1850,14 +1850,14 @@ pub(crate) fn draw_row_backdrop(
 
 /// Color of the fading separator line painted under the header title
 /// (`title_separator_segments`) — the source's `#708090`.
-pub(crate) const TITLE_SEPARATOR_RGB: (u8, u8, u8) = (0x70, 0x80, 0x90);
+pub(super) const TITLE_SEPARATOR_RGB: (u8, u8, u8) = (0x70, 0x80, 0x90);
 
 /// Alpha the separator starts at, at its left (indented) end — the source's
 /// left stop is a fully opaque `#708090`.
-pub(crate) const TITLE_SEPARATOR_MAX_ALPHA: u8 = 255;
+pub(super) const TITLE_SEPARATOR_MAX_ALPHA: u8 = 255;
 
 /// Thickness, in points, of the title separator line — `StrokeThickness="2"`.
-pub(crate) const TITLE_SEPARATOR_THICKNESS: f32 = 2.0;
+pub(super) const TITLE_SEPARATOR_THICKNESS: f32 = 2.0;
 
 /// The source's `Margin="-5 7.5 32 0"`: only the `-5` left bleed and the `32`
 /// right reserve survive from that margin (as `TITLE_SEPARATOR_LEFT_BLEED`
@@ -1871,12 +1871,12 @@ pub(crate) const TITLE_SEPARATOR_THICKNESS: f32 = 2.0;
 /// our geometry is exactly the title row's bottom edge (see
 /// `title_separator_rect`), inside the `ITEM_SPACING_Y` gap egui's vertical
 /// layout already leaves there.
-pub(crate) const TITLE_SEPARATOR_LEFT_BLEED: f32 = 5.0;
+pub(super) const TITLE_SEPARATOR_LEFT_BLEED: f32 = 5.0;
 
 /// Number of thin strips `title_separator_segments` divides the fade into.
 /// High enough to read as a smooth gradient, modest enough to stay cheap to
 /// paint every frame.
-pub(crate) const TITLE_SEPARATOR_SEGMENTS: usize = 24;
+pub(super) const TITLE_SEPARATOR_SEGMENTS: usize = 24;
 
 /// The rect the fading title separator is painted over, for a title row
 /// `title_row`: it bleeds `TITLE_SEPARATOR_LEFT_BLEED` back into the gutter
@@ -1885,7 +1885,7 @@ pub(crate) const TITLE_SEPARATOR_SEGMENTS: usize = 24;
 /// between the title and subtitle rows in the reference render (see the
 /// `TITLE_SEPARATOR_LEFT_BLEED` doc comment for why this isn't the source
 /// margin's literal `7.5`).
-pub(crate) fn title_separator_rect(title_row: egui::Rect) -> egui::Rect {
+pub(super) fn title_separator_rect(title_row: egui::Rect) -> egui::Rect {
     let left = title_row.left() + HEADER_GUTTER_WIDTH - TITLE_SEPARATOR_LEFT_BLEED;
     let right = (title_row.right() - HEADER_RIGHT_CONTROL_WIDTH).max(left);
     let top = title_row.bottom();
@@ -1905,7 +1905,7 @@ pub(crate) fn title_separator_rect(title_row: egui::Rect) -> egui::Rect {
 /// of the title rather than stopping at its midpoint. Extracted as a pure
 /// function, same reasoning as `share_bar_paints`: unit-testable without a
 /// live `egui::Ui`.
-pub(crate) fn title_separator_segments(rect: egui::Rect) -> Vec<(egui::Rect, egui::Color32)> {
+pub(super) fn title_separator_segments(rect: egui::Rect) -> Vec<(egui::Rect, egui::Color32)> {
     let (r, g, b) = TITLE_SEPARATOR_RGB;
     let segment_width = rect.width() / TITLE_SEPARATOR_SEGMENTS as f32;
     let y = rect.top();
@@ -1932,7 +1932,7 @@ pub(crate) fn title_separator_segments(rect: egui::Rect) -> Vec<(egui::Rect, egu
 /// (issue #91): the row's height is part of the header's fixed band, so it
 /// is reserved — and rendered blank, with no placeholder — rather than
 /// skipped, which would let the stat row below it ride up.
-pub(crate) fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
+pub(super) fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
     let desired_size = egui::vec2(ui.available_width(), SUBTITLE_LINE_HEIGHT);
     let (row, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
     // Same indent and same right-hand reserve as the title (issue #56): the

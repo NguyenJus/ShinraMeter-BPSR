@@ -15,7 +15,7 @@ use super::*;
 /// #89), the `WM_NCHITTEST` click-through carve-out (issue #167), the
 /// Aero-Snap blocker (issue #11) and the tray subclass (issue #53) — a second
 /// egui viewport would have none of them.
-pub(crate) enum OverlayView {
+pub(super) enum OverlayView {
     Live,
     // Boxed (issue #39, clippy::large_enum_variant): `HistoryUi` carries a
     // `Vec<EncounterSummary>` and an `Option<OpenEncounter>` — enough that
@@ -27,9 +27,9 @@ pub(crate) enum OverlayView {
 /// The history view's own state: what the last reply from the history thread
 /// contained, and which encounter (if any) is open.
 #[derive(Default)]
-pub(crate) struct HistoryUi {
+pub(super) struct HistoryUi {
     /// Newest-first summaries from the last `Listed` reply.
-    pub(crate) encounters: Vec<history::EncounterSummary>,
+    pub(super) encounters: Vec<history::EncounterSummary>,
     /// The encounter currently being read, already rebuilt into a `Snapshot`
     /// so `draw_rows` can render it unchanged — a past fight looks pixel
     /// identical to a live one.
@@ -42,29 +42,29 @@ pub(crate) struct HistoryUi {
     /// `draw_rows`; cloning the `Arc` instead is a refcount bump regardless
     /// of how large the held `Snapshot` is, and consecutive frames between
     /// replies share the exact same allocation (`Arc::ptr_eq`).
-    pub(crate) open: Option<Arc<OpenEncounter>>,
+    pub(super) open: Option<Arc<OpenEncounter>>,
     /// A `HistoryEvent::Failed` message worth showing, cleared on the next
     /// successful reply.
-    pub(crate) error: Option<String>,
+    pub(super) error: Option<String>,
     /// True between firing a request and its reply landing — the view shows
     /// "Loading…" rather than a stale empty list.
-    pub(crate) pending: bool,
+    pub(super) pending: bool,
     /// Latches "Clear all" into a confirming state after one click; a second
     /// click while this is true actually fires `HistoryHandle::clear`. Reset
     /// on every other history-bar/list interaction, so leaving and
     /// returning to the list never leaves it primed.
-    pub(crate) confirm_clear: bool,
+    pub(super) confirm_clear: bool,
     /// The id of the newest in-flight `Load` request, if any. Rows stay
     /// clickable while one is in flight, so a `Loaded`/`Missing` reply
     /// carrying any other id belongs to a click the user has already
     /// superseded, and is dropped.
-    pub(crate) pending_load_id: Option<i64>,
+    pub(super) pending_load_id: Option<i64>,
 }
 
 /// One saved encounter, rebuilt for display: the id (needed for the delete
 /// button while it's open) plus everything `draw_header`/`draw_rows` need.
 #[derive(Clone)]
-pub(crate) struct OpenEncounter {
+pub(super) struct OpenEncounter {
     // `id` is what a breakdown window opened from this fight stores as its
     // `SkillWindowSource::History` (issue #216), so a later frame can tell
     // "still the same fight" from "a different one is open now".
@@ -72,12 +72,12 @@ pub(crate) struct OpenEncounter {
     // (and is what a future "delete the fight I'm looking at" button would
     // need), but WP3's bar only offers delete from the list — so it is not
     // read yet.
-    pub(crate) id: i64,
-    pub(crate) title: String,
-    pub(crate) subtitle: Option<String>,
+    pub(super) id: i64,
+    pub(super) title: String,
+    pub(super) subtitle: Option<String>,
     #[allow(dead_code)]
-    pub(crate) ended_at_ms: u64,
-    pub(crate) snapshot: Snapshot,
+    pub(super) ended_at_ms: u64,
+    pub(super) snapshot: Snapshot,
 }
 
 /// Whether the Share button may fire a screenshot capture this frame
@@ -89,7 +89,7 @@ pub(crate) struct OpenEncounter {
 /// capturing it would just screenshot the list of past encounters. Pure so
 /// the view -> active mapping is unit-testable without an `egui::Context`;
 /// `OverlayApp::ui` is the only caller.
-pub(crate) fn share_active_for_view(view: &OverlayView) -> bool {
+pub(super) fn share_active_for_view(view: &OverlayView) -> bool {
     match view {
         OverlayView::Live => true,
         OverlayView::History(state) => state.open.is_some(),
@@ -105,7 +105,7 @@ pub(crate) fn share_active_for_view(view: &OverlayView) -> bool {
 /// fallback for `Live` and the (never actually captured, since Share is
 /// inactive there — see `share_active_for_view`) bare history list. Pure so
 /// this is unit-testable without an `egui::Context`.
-pub(crate) fn screenshot_row_count(view: &OverlayView, live_row_count: usize) -> usize {
+pub(super) fn screenshot_row_count(view: &OverlayView, live_row_count: usize) -> usize {
     match view {
         OverlayView::Live => live_row_count,
         OverlayView::History(state) => state
@@ -130,7 +130,7 @@ pub(crate) fn screenshot_row_count(view: &OverlayView, live_row_count: usize) ->
 /// drifting apart under a future edit. Pure aside from the `&mut
 /// OverlayView` reset, so the ordering itself is unit-testable without an
 /// `egui::Context`.
-pub(crate) fn resolve_screenshot_row_count(
+pub(super) fn resolve_screenshot_row_count(
     view: &mut OverlayView,
     back_to_live: bool,
     live_row_count: usize,
@@ -145,29 +145,29 @@ pub(crate) fn resolve_screenshot_row_count(
 /// The header's title/subtitle override for a historical fight (spec
 /// DECISION D7) — bundled rather than passed as two loose parameters so
 /// `draw_header`'s argument list stays readable.
-pub(crate) struct HistoryHeader<'a> {
-    pub(crate) title: &'a str,
-    pub(crate) subtitle: Option<&'a str>,
+pub(super) struct HistoryHeader<'a> {
+    pub(super) title: &'a str,
+    pub(super) subtitle: Option<&'a str>,
 }
 
 /// The ceiling on how many encounters the list requests, used when
 /// `Settings::history_max_encounters` is `0` — "prune nothing by count",
 /// which has no matching `LIMIT`. Equal to the settings cap, so the list can
 /// never hide a row retention has kept.
-pub(crate) const HISTORY_LIST_CEILING: u32 = Settings::HISTORY_MAX_ENCOUNTERS_CAP;
+pub(super) const HISTORY_LIST_CEILING: u32 = Settings::HISTORY_MAX_ENCOUNTERS_CAP;
 
 /// Width of the trailing delete button painted into each history row.
-pub(crate) const HISTORY_DELETE_WIDTH: f32 = 18.0;
+pub(super) const HISTORY_DELETE_WIDTH: f32 = 18.0;
 
 /// Left/right text inset inside a history row, matching the row list's own
 /// breathing room rather than introducing a new metric scale.
-pub(crate) const HISTORY_ROW_PADDING: f32 = 8.0;
+pub(super) const HISTORY_ROW_PADDING: f32 = 8.0;
 
 /// The header's title/subtitle selection: a historical fight's saved name
 /// (spec DECISION D7) when `history` is `Some`, the live encounter's derived
 /// name otherwise. Pulled out of `draw_header` as the one pure extraction
 /// WP3 permits, so it is testable without an `egui::Ui`.
-pub(crate) fn header_text(
+pub(super) fn header_text(
     snapshot: &Snapshot,
     history: Option<&HistoryHeader<'_>>,
 ) -> (String, Option<String>) {
@@ -188,7 +188,7 @@ impl OverlayApp {
     /// while that view actually exists to hold it; `open_history` always
     /// issues a fresh `list` request on the way in, so a reply that arrives
     /// after the view has already closed is safe to simply discard.
-    pub(crate) fn poll_history(&mut self) {
+    pub(super) fn poll_history(&mut self) {
         let list_limit = self.history_list_limit();
         for event in self.rx_history.try_iter() {
             let OverlayView::History(state) = &mut self.view else {
@@ -250,7 +250,7 @@ impl OverlayApp {
     /// How many encounters the list asks for: exactly what retention keeps,
     /// so an encounter that is on disk is always one the user can see and
     /// delete (issue #39).
-    pub(crate) fn history_list_limit(&self) -> u32 {
+    pub(super) fn history_list_limit(&self) -> u32 {
         match self.settings.history_max_encounters {
             0 => HISTORY_LIST_CEILING,
             limit => limit.min(HISTORY_LIST_CEILING),
@@ -258,7 +258,7 @@ impl OverlayApp {
     }
 
     /// Switches to the history view and asks for the list (issue #39).
-    pub(crate) fn open_history(&mut self) {
+    pub(super) fn open_history(&mut self) {
         let pending = self.history.is_some();
         let list_limit = self.history_list_limit();
         self.view = OverlayView::History(Box::new(HistoryUi {
@@ -287,7 +287,7 @@ impl OverlayApp {
 /// its content, is what keeps the crop bound from drifting out of sync
 /// with what actually gets painted underneath it.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn draw_history(
+pub(super) fn draw_history(
     ui: &mut egui::Ui,
     state: &mut HistoryUi,
     settings: &Settings,
@@ -357,7 +357,7 @@ pub(crate) fn draw_history(
 
 /// The bar under the header: "← Live", a "← Back" when an encounter is
 /// open, and (in list mode) "Clear all".
-pub(crate) fn draw_history_bar(ui: &mut egui::Ui, state: &HistoryUi) -> HistoryBarAction {
+pub(super) fn draw_history_bar(ui: &mut egui::Ui, state: &HistoryUi) -> HistoryBarAction {
     let mut action = HistoryBarAction::None;
     ui.horizontal(|ui| {
         if ui.button("← Live").clicked() {
@@ -383,7 +383,7 @@ pub(crate) fn draw_history_bar(ui: &mut egui::Ui, state: &HistoryUi) -> HistoryB
 
 /// The newest-first list of saved encounters, one fixed-height row each.
 /// Returns the row the user clicked, if any.
-pub(crate) fn draw_history_list(ui: &mut egui::Ui, state: &HistoryUi) -> Option<HistoryRowAction> {
+pub(super) fn draw_history_list(ui: &mut egui::Ui, state: &HistoryUi) -> Option<HistoryRowAction> {
     if let Some(message) = &state.error {
         ui.colored_label(egui::Color32::from_rgb(220, 80, 80), message.as_str());
         return None;
@@ -412,7 +412,7 @@ pub(crate) fn draw_history_list(ui: &mut egui::Ui, state: &HistoryUi) -> Option<
 
 /// One list row: title, subtitle, local date+time, duration, total DPS,
 /// player count, and a trailing delete button.
-pub(crate) fn draw_history_row(
+pub(super) fn draw_history_row(
     ui: &mut egui::Ui,
     summary: &history::EncounterSummary,
 ) -> Option<HistoryRowAction> {
@@ -501,13 +501,13 @@ pub(crate) fn draw_history_row(
 }
 
 /// What a click on the list produced.
-pub(crate) enum HistoryRowAction {
+pub(super) enum HistoryRowAction {
     Open(i64),
     Delete(i64),
 }
 
 /// What a click on the bar produced.
-pub(crate) enum HistoryBarAction {
+pub(super) enum HistoryBarAction {
     None,
     Live,
     Back,

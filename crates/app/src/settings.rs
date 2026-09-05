@@ -130,7 +130,7 @@ impl ColumnKind {
     /// #8's anchor scheme), budgeted for the widest text `text` can
     /// produce; `ui`'s `widest_formatted_text_fits_its_column_width_budget`
     /// holds every column here to that budget.
-    pub fn spec(self) -> StatColumn {
+    pub(crate) fn spec(self) -> StatColumn {
         match self {
             // `None` (no FIGHT_POINT packet seen yet for this player) is a
             // blank cell, not "0" — a missing reading is not the same as a

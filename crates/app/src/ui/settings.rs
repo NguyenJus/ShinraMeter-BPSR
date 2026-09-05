@@ -13,7 +13,7 @@ use super::*;
 /// open that frame, so a result that lands while it's closed is still
 /// there — not dropped — the moment it's reopened.
 #[derive(Debug, Default)]
-pub(crate) enum UpdateCheckState {
+pub(super) enum UpdateCheckState {
     /// No request has been made yet this session, or this is a fresh
     /// `OverlayApp`.
     #[default]
@@ -54,7 +54,7 @@ pub(crate) enum UpdateCheckState {
 /// so the two channels (`Checking`'s and `Installing`'s) can be drained in
 /// one match and acted on in another — assigning `self.update_check` inside
 /// the first match would still be borrowing it.
-pub(crate) enum LandedUpdate {
+pub(super) enum LandedUpdate {
     Check(Result<CheckOutcome, String>),
     Install {
         available: CheckOutcome,
@@ -66,7 +66,7 @@ pub(crate) enum LandedUpdate {
 /// carry one purely to name it. `UpToDate` has no tag and never reaches any
 /// of those states, so it degrades to a neutral word rather than widening
 /// every call site into a match.
-pub(crate) fn update_tag(available: &CheckOutcome) -> &str {
+pub(super) fn update_tag(available: &CheckOutcome) -> &str {
     match available {
         CheckOutcome::UpdateAvailable { tag, .. } => tag,
         CheckOutcome::UpToDate => "the update",
@@ -95,7 +95,7 @@ pub(crate) fn update_tag(available: &CheckOutcome) -> &str {
 /// A click is reported through `clicked_install` rather than acted on here:
 /// the caller holds the `&mut UpdateCheckState` this row was rendered from,
 /// so the state change has to happen after this borrow ends.
-pub(crate) fn draw_update_available(
+pub(super) fn draw_update_available(
     ui: &mut egui::Ui,
     available: &CheckOutcome,
     clicked_install: &mut Option<CheckOutcome>,
@@ -138,7 +138,7 @@ pub(crate) fn draw_update_available(
 /// thread (a persistent one, unlike this one-shot version, since a
 /// settings write can happen many times a session and an update check is
 /// only ever one click at a time).
-pub(crate) fn start_update_check() -> UpdateCheckState {
+pub(super) fn start_update_check() -> UpdateCheckState {
     let (tx, rx) = crossbeam_channel::unbounded();
     std::thread::Builder::new()
         .name("update-check".to_string())
@@ -167,7 +167,7 @@ pub(crate) fn start_update_check() -> UpdateCheckState {
 /// (`OverlayApp::finish_update_install`), since only it may send a viewport
 /// command, and a background thread calling `std::process::exit` would tear
 /// the app down mid-frame.
-pub(crate) fn start_update_install(available: CheckOutcome) -> UpdateCheckState {
+pub(super) fn start_update_install(available: CheckOutcome) -> UpdateCheckState {
     let CheckOutcome::UpdateAvailable {
         asset_url: Some(asset_url),
         ..
@@ -204,7 +204,7 @@ pub(crate) fn start_update_install(available: CheckOutcome) -> UpdateCheckState 
 /// The destination rides along on the failure too so
 /// `OverlayApp::poll_log_export` can name it in the log line — by the time
 /// a reply lands, the click that chose it is long gone.
-pub(crate) type LogExportOutcome = Result<(PathBuf, Vec<String>), (PathBuf, String)>;
+pub(super) type LogExportOutcome = Result<(PathBuf, Vec<String>), (PathBuf, String)>;
 
 /// Starts a log export (issue #220, PR #227 review): spawns a one-shot
 /// `std::thread` that bundles the log files into `dest` and sends the
@@ -221,7 +221,7 @@ pub(crate) type LogExportOutcome = Result<(PathBuf, Vec<String>), (PathBuf, Stri
 /// `std::env::var` plus path joining, cheap either way, and keeping it
 /// beside the copy leaves the click handler with nothing to do but hand
 /// over the destination.
-pub(crate) fn start_log_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
+pub(super) fn start_log_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
     std::thread::Builder::new()
         .name("export-logs".to_string())
         .spawn(move || {
@@ -250,7 +250,7 @@ pub(crate) fn start_log_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
 /// same as `start_log_export`: cheap either way, but keeping it off the
 /// frame thread means a slow `APPDATA` lookup or a stalled disk (the copy
 /// itself, `bundle::export_bundle_to`) can never stall a frame.
-pub(crate) fn start_bundle_export(
+pub(super) fn start_bundle_export(
     dest: PathBuf,
     include_history: bool,
     tx: Sender<LogExportOutcome>,
@@ -315,7 +315,7 @@ pub(crate) fn start_bundle_export(
 /// nothing is ever sent over it — it exists only to satisfy the parameter,
 /// and its dropped `Receiver` matters to nobody for the same reason.
 #[cfg(test)]
-pub(crate) fn unused_log_export_sender() -> Sender<LogExportOutcome> {
+pub(super) fn unused_log_export_sender() -> Sender<LogExportOutcome> {
     crossbeam_channel::unbounded().0
 }
 

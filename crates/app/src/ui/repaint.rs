@@ -54,25 +54,25 @@ const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
 /// the cadence, so a new "poll until a reply lands" feature has to be added
 /// to one of these fields rather than requesting a repaint of its own.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct RepaintInputs {
+pub(super) struct RepaintInputs {
     /// A new `Snapshot` was drained from `rx_snapshot` this frame, or the
     /// channel still holds one queued up for next frame — either way the
     /// pipeline thread is actively producing, so the overlay should keep
     /// pace with it rather than wait out the idle heartbeat.
-    pub(crate) snapshot_activity: bool,
+    pub(super) snapshot_activity: bool,
     /// The soonest an animated header/backdrop GIF wants its next frame
     /// painted (`custom_image::animation_position_at`'s `remaining`),
     /// or `None` if neither slot holds a live multi-frame entry. Also
     /// requested directly by `CustomImages::texture` the moment it advances
     /// a frame — folded in here too so the *decision* stays correct even if
     /// that call site ever stops requesting its own wakeup.
-    pub(crate) gif_next_wakeup: Option<Duration>,
+    pub(super) gif_next_wakeup: Option<Duration>,
     /// Pointer or keyboard input landed this frame — a drag, a hover move,
     /// a click, a keystroke. Egui's own input state is the source of truth
     /// (see `OverlayApp::ui`'s call site), so a static hover with no
     /// pointer movement does not count: nothing about the pointer sitting
     /// still needs a fresh repaint to keep rendering correctly.
-    pub(crate) input_active: bool,
+    pub(super) input_active: bool,
     /// A transient UI timer is waiting to fire: the transient status
     /// banner's expiry (`status_expires_at`), a "Check for updates" or
     /// "Update now" request in flight (`UpdateCheckState::Checking`/
@@ -84,7 +84,7 @@ pub(crate) struct RepaintInputs {
     /// S2). None of these animate — they are all "poll until a background
     /// thread's reply lands, or a frame-counted guard times out" — so they
     /// share the same cadence rather than each inventing its own.
-    pub(crate) transient_timer_active: bool,
+    pub(super) transient_timer_active: bool,
     /// OS-level mouse click-through is on for this frame (`Settings::
     /// click_through`, not the platform-side atomic — see below). While
     /// true, `platform::click_through_passthrough_wanted`'s per-frame
@@ -106,7 +106,7 @@ pub(crate) struct RepaintInputs {
     /// now-off state. `Settings::click_through` instead only flips one
     /// frame later, once `OverlayApp::ui` has reconciled it, so this stays
     /// true for that whole frame too.
-    pub(crate) click_through_active: bool,
+    pub(super) click_through_active: bool,
 }
 
 /// How soon `OverlayApp::ui` should ask egui to repaint, given this frame's
@@ -119,7 +119,7 @@ pub(crate) struct RepaintInputs {
 /// clamped to the heartbeat, which is also what keeps
 /// `animation_position_at`'s [`Duration::MAX`] static-image sentinel out of
 /// eframe's unchecked `Instant::now() + delay`.
-pub(crate) fn repaint_policy(inputs: RepaintInputs) -> Duration {
+pub(super) fn repaint_policy(inputs: RepaintInputs) -> Duration {
     let mut soonest: Option<Duration> = None;
     let mut consider = |candidate: Duration| {
         soonest = Some(soonest.map_or(candidate, |current: Duration| current.min(candidate)));
