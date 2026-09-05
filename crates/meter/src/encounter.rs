@@ -1922,7 +1922,8 @@ impl Meter {
             // `latch_fight_end` works out for itself — `boss_uid` may
             // already have moved onto a living boss this very death
             // promoted.
-            self.lifecycle.arm_phase_resume(monster_id);
+            self.lifecycle
+                .arm_phase_resume(monster_id.expect("recognized implies monster_id is Some"));
             return;
         }
         // issue #256: the two guards above are the *only* way a recognized
@@ -2009,12 +2010,11 @@ impl Meter {
     /// Every path that ends a fight goes through here — boss death, idle
     /// timeout, party wipe, server change — so the line fires exactly once
     /// per fight end: a fight already latched is left untouched by
-    /// [`FightLifecycle::end`], which is also what makes the repeated "pin
-    /// the end" calls in `apply_damage` and `tick` idempotent. That same
-    /// refusal is why an `IdleTimeout` end arming phase resumption below
-    /// is safe to do unconditionally here rather than at each of its two
-    /// call sites: it only ever runs on the call that performs the actual
-    /// latch.
+    /// [`FightLifecycle::end`]. The early return below is what actually
+    /// keeps the repeated "pin the end" calls in `apply_damage` and `tick`
+    /// cheap during a hold, since it skips the `engaged_boss_monster_id`
+    /// scan before it runs; `FightLifecycle::end` remains the authoritative
+    /// refusal for a fight that never started at all.
     fn latch_fight_end(
         &mut self,
         cause: FightEndCause,
@@ -2022,6 +2022,9 @@ impl Meter {
         observed_ms: u64,
         boss_monster_id: Option<u32>,
     ) {
+        if self.fight_end_ms().is_some() {
+            return;
+        }
         // issue #316: arm phase resumption on an idle-timeout end too, not
         // only a boss death. `end_fight_on_boss_death` names the dying
         // boss's own uid because `boss_uid` may already have moved on by the
@@ -2031,14 +2034,6 @@ impl Meter {
             FightEndCause::IdleTimeout => self.engaged_boss_monster_id(),
             _ => None,
         };
-        // Issue #336 step 3: the `FightLifecycle::Active` -> `Ended`
-        // transition is what makes this idempotent now — it refuses an
-        // end on an already-ended fight, which is what the removed
-        // `fight_end_ms().is_some()` early return used to do, and
-        // additionally refuses one on a fight that never started (every
-        // caller already guards for that; none of them has to be trusted
-        // to). The log line is below the transition so it still fires
-        // exactly once per fight end.
         if !self.lifecycle.end(end_ms, observed_ms, cause, armed) {
             return;
         }

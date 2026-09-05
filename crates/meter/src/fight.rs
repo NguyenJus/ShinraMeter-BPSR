@@ -289,9 +289,8 @@ impl FightLifecycle {
 
     /// Clears everything: back to [`Self::Idle`]. Legal from every state —
     /// this is `Meter::reset`, which every reset reason reaches.
-    pub fn reset(&mut self) -> bool {
+    pub fn reset(&mut self) {
         *self = Self::Idle;
-        true
     }
 
     /// [`Self::Idle`] → [`Self::Active`]: the first player damage of a new
@@ -402,14 +401,14 @@ impl FightLifecycle {
     /// `Meter::end_fight_on_boss_death`'s follow-up to its own latch, which
     /// records the *dying* boss's id rather than whichever one
     /// `recompute_boss` may since have moved onto (issue #210/#211).
-    pub fn arm_phase_resume(&mut self, boss_id: Option<u32>) -> bool {
+    pub fn arm_phase_resume(&mut self, boss_id: u32) -> bool {
         match self {
             Self::Ended { boss_id: armed, .. } => {
-                *armed = boss_id;
+                *armed = Some(boss_id);
                 true
             }
             other => {
-                log::debug!("fight lifecycle: arm_phase_resume({boss_id:?}) refused in {other:?}");
+                log::debug!("fight lifecycle: arm_phase_resume({boss_id}) refused in {other:?}");
                 false
             }
         }
@@ -757,7 +756,7 @@ mod tests {
         #[test]
         fn arm_phase_resume_overwrites_the_armed_id_on_an_ended_fight() {
             let mut lc = ended();
-            assert!(lc.arm_phase_resume(Some(207)));
+            assert!(lc.arm_phase_resume(207));
             assert_eq!(lc.phase_resume_boss_id(), Some(207));
             assert_eq!(lc.end_ms(), Some(900));
         }
@@ -765,10 +764,10 @@ mod tests {
         #[test]
         fn arm_phase_resume_is_refused_off_an_ended_fight() {
             let mut lc = FightLifecycle::Idle;
-            assert!(!lc.arm_phase_resume(Some(103)));
+            assert!(!lc.arm_phase_resume(103));
             assert_eq!(lc.phase_resume_boss_id(), None);
             assert!(lc.start(100));
-            assert!(!lc.arm_phase_resume(Some(103)));
+            assert!(!lc.arm_phase_resume(103));
             assert_eq!(lc.phase_resume_boss_id(), None);
         }
 
@@ -807,7 +806,7 @@ mod tests {
                     h
                 },
             ] {
-                assert!(lc.reset());
+                lc.reset();
                 assert_eq!(lc, FightLifecycle::Idle);
             }
         }
