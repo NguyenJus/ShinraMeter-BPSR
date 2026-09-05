@@ -238,6 +238,7 @@ mod tests {
                 buffs: Vec::new(),
             }],
             encounter: EncounterInfo::default(),
+            local_uid: None,
             capture_alive: true,
             total_absorbed: 0,
             total_immune: 0,

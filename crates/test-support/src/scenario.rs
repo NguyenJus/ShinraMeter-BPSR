@@ -255,6 +255,63 @@ impl Scenario {
         self.hits(target_uid, vec![Hit::new(attacker_uid, skill_id, value)])
     }
 
+    /// One `NotifyJoinTeam` roster push (issues #146/#343), on
+    /// `frame::TEAM_NTF_SERVICE_UUID` rather than the main service. Emits
+    /// one `Player` event per named `members` entry, plus a trailing
+    /// full-roster sync (`ProtocolEvent::TeamRoster`) listing every
+    /// resolved uid — see `bpsr_protocol::decode::on_notify_join_team`.
+    pub fn team_join(mut self, members: Vec<pb::TeamMemData>) -> Self {
+        let payload = wire::notify_join_team_payload(members);
+        let bytes = self.wrap_team_frame(
+            bpsr_protocol::decode::team_opcode::NOTIFY_JOIN_TEAM,
+            &payload,
+        );
+        self.push_bytes(bytes);
+        self
+    }
+
+    /// One `NotifyLeaveTeam` (issue #343): `uid` left the party voluntarily
+    /// (`leave_type = 0`).
+    pub fn team_leave(mut self, uid: i64) -> Self {
+        let payload = wire::notify_leave_team_payload(uid, 0);
+        let bytes = self.wrap_team_frame(
+            bpsr_protocol::decode::team_opcode::NOTIFY_LEAVE_TEAM,
+            &payload,
+        );
+        self.push_bytes(bytes);
+        self
+    }
+
+    /// One `NotifyLeaveTeam` (issue #343): `uid` was kicked from the party
+    /// (`leave_type = 1`) — this crate's decoder doesn't distinguish a kick
+    /// from a voluntary leave, so this must yield the same
+    /// `TeamMemberLeft` event as [`Self::team_leave`].
+    pub fn team_kick(mut self, uid: i64) -> Self {
+        let payload = wire::notify_leave_team_payload(uid, 1);
+        let bytes = self.wrap_team_frame(
+            bpsr_protocol::decode::team_opcode::NOTIFY_LEAVE_TEAM,
+            &payload,
+        );
+        self.push_bytes(bytes);
+        self
+    }
+
+    /// A monster's hit on a player — the reverse attacker/target direction
+    /// from `hit`/`hits` (which always model a player attacking a monster).
+    /// `hit.attacker_uid` is the monster's uid (packed via
+    /// `wire::monster_uuid`, not `wire::player_uuid`); `hit.kill()` sets
+    /// `is_dead` on the wire `SyncDamageInfo`, which is how
+    /// `Meter::record_death` learns a player went down — the way to script a
+    /// party wipe.
+    pub fn monster_hits_player(mut self, target_player_uid: i64, hit: Hit) -> Self {
+        let target_uuid = wire::player_uuid(target_player_uid);
+        let info = wire::monster_damage_info(&hit);
+        let payload = wire::damage_delta(target_uuid, info);
+        let bytes = self.wrap_frame(opcode::SYNC_NEAR_DELTA_INFO, &payload);
+        self.push_bytes(bytes);
+        self
+    }
+
     // --- non-wire verbs ---
 
     pub fn inject(mut self, event: ProtocolEvent) -> Self {
@@ -283,6 +340,25 @@ impl Scenario {
     /// this verb. Consumes the one-shot `nested` flag.
     fn wrap_frame(&mut self, opcode: u32, payload: &[u8]) -> Vec<u8> {
         let frame = wire::notify(opcode, payload, self.compressed);
+        if std::mem::take(&mut self.nested) {
+            wire::framedown(&frame, self.compressed)
+        } else {
+            frame
+        }
+    }
+
+    /// Like [`Self::wrap_frame`], but on
+    /// `bpsr_protocol::frame::TEAM_NTF_SERVICE_UUID` (issue #146/#343)
+    /// instead of the main service — the `GrpcTeamNtf` verbs need this,
+    /// since `method_id` alone collides with the main service's opcode
+    /// space (see `bpsr_protocol::decode::decode_notify`'s doc comment).
+    fn wrap_team_frame(&mut self, method_id: u32, payload: &[u8]) -> Vec<u8> {
+        let frame = wire::notify_with_service(
+            bpsr_protocol::frame::TEAM_NTF_SERVICE_UUID,
+            method_id,
+            payload,
+            self.compressed,
+        );
         if std::mem::take(&mut self.nested) {
             wire::framedown(&frame, self.compressed)
         } else {

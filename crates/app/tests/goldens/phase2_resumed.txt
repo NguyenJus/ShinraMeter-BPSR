@@ -1,0 +1,15 @@
+scenario=phase2_resumed
+at_ms=3500
+fight_state=Active
+duration_ms=1500
+total_damage=90000
+total_dps=60000.00
+encounter.boss_monster_id=103111
+encounter.boss_name=Dragonbane Golem - Left Cannon
+encounter.is_boss=true
+encounter.scene_id=1101
+encounter.scene_name=Towering Ruin
+encounter.scene_boss_name=-
+resets=
+rows=1
+row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=90000 dps=60000.00 share=100.00 crit=0.00 lucky=0.00 hits=3 deaths=0

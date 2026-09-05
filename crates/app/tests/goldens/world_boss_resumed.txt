@@ -1,0 +1,15 @@
+scenario=world_boss_resumed
+at_ms=10600
+fight_state=Active
+duration_ms=9600
+total_damage=85000
+total_dps=8854.17
+encounter.boss_monster_id=3000063
+encounter.boss_name=Denvel
+encounter.is_boss=true
+encounter.scene_id=7152
+encounter.scene_name=World Dominator
+encounter.scene_boss_name=-
+resets=
+rows=1
+row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=85000 dps=8854.17 share=100.00 crit=0.00 lucky=0.00 hits=2 deaths=0

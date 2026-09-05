@@ -494,7 +494,7 @@ pub struct EncounterInfo {
     /// (issue #201 — this used to be learned at runtime and cached to disk).
     /// Independent of `boss_monster_id`/`boss_name`/`is_boss` above, which
     /// remain the raw facts about the currently-selected target;
-    /// `encounter_title` in `crates/app/src/ui.rs` falls back to this field
+    /// `encounter_title` in `crates/app/src/ui/header.rs` falls back to this field
     /// so a mid-dungeon mech (or even a genuine mid-dungeon boss) never
     /// displaces the dungeon's final boss name.
     ///
@@ -509,7 +509,7 @@ pub struct EncounterInfo {
     /// (`phase::is_boss_select_scene`), which is the only source — the meter
     /// cannot tell a raid's selections from an ordinary dungeon's boss order
     /// by observation. Drives `encounter_title`'s
-    /// "Select a boss" placeholder in `crates/app/src/ui.rs`: with nothing
+    /// "Select a boss" placeholder in `crates/app/src/ui/header.rs`: with nothing
     /// engaged there is genuinely no target *yet*, as opposed to the
     /// no-target-at-all case "No target" names.
     pub multi_boss_scene: bool,
@@ -535,6 +535,15 @@ pub struct Snapshot {
     /// What is being fought, if the packet stream has revealed it (issue #9
     /// slice 2).
     pub encounter: EncounterInfo,
+    /// The local player's own uid (issue #344), if a
+    /// `ProtocolEvent::LocalPlayer` has been seen this server session.
+    /// Session-scoped like `dungeon_state`/`objectives`: survives both a
+    /// fight `reset` and `ServerChanged` — the value is `char_id`, the
+    /// persistent character id, not a per-session entity uuid, and a later
+    /// `LocalPlayer` event simply overwrites it. Never cleared. Exposed for
+    /// a future UI "you" highlight / self-only view (neither exists yet;
+    /// follow-up to issue #344).
+    pub local_uid: Option<i64>,
     /// Whether the packet-capture thread is still alive, as far as the
     /// caller publishing this snapshot knows (pipeline-robustness audit,
     /// finding 1). The meter itself has no way to know this — it only ever

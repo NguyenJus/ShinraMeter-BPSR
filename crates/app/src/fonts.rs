@@ -23,7 +23,7 @@
 //! epaint *panics* on a `FontFamily::Name` that is not bound to any font, so
 //! it must never be possible for the family to be missing once
 //! `install_cjk_fallback` has run. Whether a *real* bold was found is
-//! published separately via `has_real_bold`, which is what lets `ui.rs` keep
+//! published separately via `has_real_bold`, which is what lets the `ui` module keep
 //! its faux-bold double-paint hack as the degraded path.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,7 +79,7 @@ const UI_FONT_PAIRS: &[UiFontPair] = &[
 /// What the UI-font probe found on disk (issue #56). Three distinct
 /// outcomes rather than an `Option<(regular, bold)>`, because "a regular but
 /// no bold" is a real, supported state — the app then uses that regular for
-/// everything and `ui.rs` fakes the bold weight.
+/// everything and the `ui` module fakes the bold weight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiFontChoice {
     /// Both weights found: real bold, no faux-bold hack needed.
@@ -111,7 +111,7 @@ impl UiFontChoice {
 }
 
 /// Name the bold family is registered under in egui's font table. Also the
-/// string `ui.rs`'s `bold()` builds its `FontId` from, via `bold_family()`,
+/// string the `ui` module's `bold()` builds its `FontId` from, via `bold_family()`,
 /// so the two can never drift apart.
 const BOLD_FAMILY_NAME: &str = "bold";
 
@@ -122,7 +122,7 @@ pub fn bold_family() -> egui::FontFamily {
     egui::FontFamily::Name(BOLD_FAMILY_NAME.into())
 }
 
-/// Set by `install_cjk_fallback` once per process, read by `ui.rs` on every
+/// Set by `install_cjk_fallback` once per process, read by the `ui` module on every
 /// text paint. An `AtomicBool` rather than a `OnceLock<bool>` so the
 /// never-installed case (unit tests build a bare `egui::Context` and never
 /// call `install_cjk_fallback`) reads `false` without blocking or
@@ -132,7 +132,7 @@ static HAS_REAL_BOLD: AtomicBool = AtomicBool::new(false);
 /// Whether a genuine bold font file was found and registered, i.e. whether
 /// `bold_family()` resolves to something actually heavier than the regular
 /// weight. `false` until `install_cjk_fallback` says otherwise — so on Linux
-/// and in unit tests (which never install anything) `ui.rs` keeps painting
+/// and in unit tests (which never install anything) the `ui` module keeps painting
 /// its faux-bold double pass instead.
 pub fn has_real_bold() -> bool {
     HAS_REAL_BOLD.load(Ordering::Relaxed)
@@ -332,7 +332,7 @@ mod tests {
         );
     }
 
-    /// No bold anywhere: the regular still gets installed and `ui.rs` fakes
+    /// No bold anywhere: the regular still gets installed and the `ui` module fakes
     /// the weight.
     #[test]
     fn regular_only_when_no_bold_file_exists() {
@@ -350,7 +350,7 @@ mod tests {
     }
 
     /// `Neither`/`RegularOnly` must never hand out a bold key — that is the
-    /// flag `has_real_bold` (and therefore `ui.rs`'s faux-bold path) is
+    /// flag `has_real_bold` (and therefore the `ui` module's faux-bold path) is
     /// derived from.
     #[test]
     fn only_a_complete_pair_yields_a_bold_file() {
@@ -368,7 +368,7 @@ mod tests {
 
     /// On any machine that never ran `install_cjk_fallback` — every unit
     /// test, and every Linux run — the app must report no real bold, which
-    /// is what keeps `ui.rs` off the (unbound) named family.
+    /// is what keeps the `ui` module off the (unbound) named family.
     #[test]
     fn no_real_bold_is_reported_before_install_runs() {
         assert!(!has_real_bold());
