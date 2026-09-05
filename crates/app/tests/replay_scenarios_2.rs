@@ -28,6 +28,17 @@ use bpsr_protocol::ProtocolEvent;
 use bpsr_test_support::scenario::{Hit, Scenario};
 use bpsr_test_support::wire::prof;
 use common::{Rig, assert_golden};
+use std::path::PathBuf;
+
+/// Deletes the backing sqlite file on drop, so a temp db is cleaned up even
+/// if the test panics partway through.
+struct TempDb(PathBuf);
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 const P_ARIA: i64 = 1001;
 const M_BOSS: i64 = 2001;
@@ -307,38 +318,27 @@ fn back_to_back_dungeons() {
     assert_golden(fresh);
 }
 
-/// Issue #342, scenario 9: the app closing — the whole `Pipeline` (and its
-/// `HistoryHandle`) dropped, exactly as `main.rs`'s process exit does, with
-/// no history-flushing shutdown call anywhere on that path (unlike
-/// `Pipeline::shutdown_names_cache`, which the name cache does get). Two
-/// things this pins down, using `Rig::with_history` and a real temp-file
-/// SQLite store the same way `replay_history.rs` does:
+/// Issue #342, scenario 9(a): the app closing — the whole `Pipeline` (and
+/// its `HistoryHandle`) dropped, exactly as `main.rs`'s process exit does,
+/// with no history-flushing shutdown call anywhere on that path (unlike
+/// `Pipeline::shutdown_names_cache`, which the name cache does get), using
+/// `Rig::with_history` and a real temp-file SQLite store the same way
+/// `replay_history.rs` does.
 ///
-/// (a) A fight that already finished and cleared its post-end grace window
-///     — already sent to the history channel — survives an abrupt drop
-///     happening mid the *next*, still-unfinished pull without panicking:
-///     the channel is unbounded (`crates/app/src/history/writer.rs`), so
-///     the writer thread drains everything already queued before `rx.recv`
-///     finally errs and the thread exits; the still-active second pull is
-///     correctly never recorded at all, because it never finished.
-/// (b) A real gap this test pins deliberately, not by accident:
-///     `Pipeline::record_fight_end` only ever sends a fight's
-///     `pending_fight_end` to history from a *later* tick/step call — once
-///     the post-end grace window has closed, or the state leaves `Ended`
-///     early (`crates/app/src/pipeline.rs`'s `record_fight_end`/
-///     `settle_pending_fight_end`). There is no `Drop for Pipeline` and
-///     nothing on this shutdown path flushes a still-pending record. A
-///     fight that ends and the app closes again before either of those
-///     fires — well inside `post_end_grace_ms` — never reaches the history
-///     channel at all: its whole record is silently lost. See this PR's
-///     "Deviations / follow-ups".
+/// A fight that already finished and cleared its post-end grace window —
+/// already sent to the history channel — survives an abrupt drop happening
+/// mid the *next*, still-unfinished pull without panicking: the channel is
+/// unbounded (`crates/app/src/history/writer.rs`), so the writer thread
+/// drains everything already queued before `rx.recv` finally errs and the
+/// thread exits; the still-active second pull is correctly never recorded
+/// at all, because it never finished.
 #[test]
-fn app_shutdown_mid_fight() {
-    // (a) An already-flushed fight survives a shutdown mid the next pull.
+fn app_shutdown_mid_next_pull_keeps_flushed_fight() {
     let path_a = std::env::temp_dir().join(format!(
         "shinra-shutdown-mid-fight-safe-{}.sqlite",
         std::process::id()
     ));
+    let _guard_a = TempDb(path_a.clone());
     let _ = std::fs::remove_file(&path_a);
 
     let scenario_a = Scenario::new("app_shutdown_mid_fight_prior_survives")
@@ -383,7 +383,9 @@ fn app_shutdown_mid_fight() {
     // The shutdown: no explicit flush call anywhere, just drop -- the same
     // as the process exiting mid-pull. Must not panic.
     drop(rig);
-    let _ = thread.join();
+    thread
+        .join()
+        .expect("history writer thread must not panic on abrupt pipeline drop");
 
     let store =
         SqliteHistory::open(&path_a, RetentionPolicy::default()).expect("reopen the history store");
@@ -396,14 +398,28 @@ fn app_shutdown_mid_fight() {
          never finished"
     );
     assert_eq!(rows[0].total_damage, 90_000);
-    let _ = std::fs::remove_file(&path_a);
+}
 
-    // (b) The gap: a fight that ends and the app closes again before a
-    // later tick has closed the grace window over it.
+/// Issue #342, scenario 9(b): a real gap this test pins deliberately, not
+/// by accident. `Pipeline::record_fight_end` only ever sends a fight's
+/// `pending_fight_end` to history from a *later* tick/step call — once the
+/// post-end grace window has closed, or the state leaves `Ended` early
+/// (`crates/app/src/pipeline.rs`'s `record_fight_end`/
+/// `settle_pending_fight_end`). There is no `Drop for Pipeline` and nothing
+/// on this shutdown path flushes a still-pending record. A fight that ends
+/// and the app closes again before either of those fires — well inside
+/// `post_end_grace_ms` — never reaches the history channel at all: its
+/// whole record is silently lost. See this PR's "Deviations / follow-ups".
+#[test]
+#[ignore = "known gap: pending_fight_end is not flushed when Pipeline is dropped inside post_end_grace_ms; see #342 follow-ups"]
+fn app_shutdown_inside_grace_window_loses_the_record() {
+    // The gap: a fight that ends and the app closes again before a later
+    // tick has closed the grace window over it.
     let path_b = std::env::temp_dir().join(format!(
         "shinra-shutdown-mid-fight-grace-gap-{}.sqlite",
         std::process::id()
     ));
+    let _guard_b = TempDb(path_b.clone());
     let _ = std::fs::remove_file(&path_b);
 
     let scenario_b = Scenario::new("app_shutdown_inside_grace_window_loses_the_record")
@@ -433,17 +449,19 @@ fn app_shutdown_mid_fight() {
     assert_eq!(rig.fight_state(), FightState::Ended);
 
     drop(rig);
-    let _ = thread.join();
+    thread
+        .join()
+        .expect("history writer thread must not panic on abrupt pipeline drop");
 
     let store =
         SqliteHistory::open(&path_b, RetentionPolicy::default()).expect("reopen the history store");
     let rows = store.list(50).expect("list encounters");
     assert_eq!(
         rows.len(),
-        0,
-        "known gap (see PR follow-ups): a fight that ends inside its own \
-         post-end grace window is lost if the app closes before a later \
-         tick would have flushed it"
+        1,
+        "desired behaviour: a fight that ends inside its own post-end grace \
+         window must still be flushed to history when the app closes, \
+         instead of being silently lost"
     );
-    let _ = std::fs::remove_file(&path_b);
+    assert_eq!(rows[0].total_damage, 90_000);
 }

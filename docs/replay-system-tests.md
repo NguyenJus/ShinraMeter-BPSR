@@ -30,7 +30,10 @@ way `main.rs` wires it.
   dungeon's own enter/leave flow signals (`SyncDungeonData`) alongside an
   ordinary scene change out to the open world, two dungeons pulled back to
   back with no open-world stop in between, and an app shutdown (the whole
-  `Pipeline`/`HistoryHandle` dropped, no explicit flush) mid-pull.
+  `Pipeline`/`HistoryHandle` dropped, no explicit flush) — covering both a
+  shutdown mid the *next* pull (an already-flushed fight survives it) and a
+  shutdown inside the post-end grace window (a known history-flush gap,
+  pinned as an `#[ignore]`d test).
 
 Each synthetic scenario is built from the `Scenario`/`Step` DSL in
 `crates/test-support/src/scenario.rs` (byte payloads via
