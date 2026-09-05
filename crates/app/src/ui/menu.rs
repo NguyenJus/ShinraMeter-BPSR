@@ -220,6 +220,17 @@ pub(crate) const MENU_ROW_HEIGHT: f32 = 24.0;
 /// the one before it (`menu_section`).
 const MENU_SECTION_GAP: f32 = 6.0;
 
+/// Issue #372: leading gap above the root page's *first* section header
+/// only. Every drill-down page's back row starts flush with the page top
+/// and is `MENU_ROW_HEIGHT` tall (`menu_back_row`); with the ordinary
+/// `MENU_SECTION_GAP`, the root page's first row (the header's
+/// `MENU_SECTION_GAP` plus a `menu_small_line` at `MENU_SMALL_LINE_HEIGHT`,
+/// ~22pt down) started inside that same band. A fast double-click there
+/// could open a page and immediately read as backing out of it again.
+/// Padded a few points past the exact `MENU_ROW_HEIGHT` boundary so the
+/// two bands don't just touch edge-to-edge.
+const MENU_FIRST_SECTION_GAP: f32 = MENU_ROW_HEIGHT - MENU_SMALL_LINE_HEIGHT + 4.0;
+
 /// Left/right padding inside a row, between the popup's content edge and
 /// the row's own ink.
 pub(crate) const MENU_ROW_INSET: f32 = 8.0;
@@ -544,7 +555,17 @@ fn menu_back_row(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
             color,
         );
     }
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    // Issue #372: the painted text stays "◂ {label}" — the page title the
+    // user is walking out of — but the accessible name must not repeat
+    // that title verbatim. The root page's own drill-down row into this
+    // same page carries that exact label, and on the Columns page the two
+    // rows' geometry gets close enough (see `MENU_FIRST_SECTION_GAP`)
+    // that a screen-reader user hearing "Columns" twice, meaning opposite
+    // navigation directions, would have no way to tell them apart.
+    let accessible_label = format!("Back from {label}");
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &accessible_label)
+    });
     response
 }
 
@@ -576,6 +597,15 @@ fn menu_small_line(ui: &mut egui::Ui, text: &str) {
 /// above it.
 fn menu_section(ui: &mut egui::Ui, text: &str) {
     ui.add_space(MENU_SECTION_GAP);
+    menu_small_line(ui, text);
+}
+
+/// The root page's *first* section header only (issue #372) — otherwise
+/// identical to `menu_section`, but with `MENU_FIRST_SECTION_GAP` of air
+/// above it instead of `MENU_SECTION_GAP`, so the first row underneath it
+/// clears the band a drill-down page's back row occupies.
+fn menu_first_section(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(MENU_FIRST_SECTION_GAP);
     menu_small_line(ui, text);
 }
 
@@ -962,7 +992,7 @@ fn draw_menu_root(
 ) -> Option<MenuNav> {
     let mut nav = None;
 
-    menu_section(ui, "DISPLAY");
+    menu_first_section(ui, "DISPLAY");
 
     // Issue #13's stat-column toggles, unchanged in behavior — the list
     // itself is a page now (issue #120) instead of a `CollapsingState`
@@ -1527,6 +1557,78 @@ mod tests {
                 col
             );
         }
+    }
+
+    /// Issue #372: the Columns page's back row starts flush with the page
+    /// top and is `MENU_ROW_HEIGHT` tall — the same band the root page's
+    /// own "Columns" row occupied before the first section header got
+    /// enough leading gap to clear it. A fast double click in that overlap
+    /// opened the page and immediately backed out of it again, and an
+    /// accessibility tree with two "Columns" buttons meant opposite
+    /// things. This pins both halves of the fix: the two rows' painted
+    /// rects must not overlap, and their accessible labels must differ.
+    #[test]
+    fn columns_back_row_does_not_overlap_or_share_a_label_with_the_root_drill_down_row() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+
+        let mut frame = |input: egui::RawInput| -> egui::accesskit::TreeUpdate {
+            let output = ctx.run_ui(input, |ui| {
+                draw_header_menu(
+                    ui,
+                    &ctx,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    None,
+                    &icons,
+                    &mut UpdateCheckState::default(),
+                    &unused_log_export_sender(),
+                    &mut 0,
+                    &mut false,
+                );
+            });
+            let update = output
+                .platform_output
+                .accesskit_update
+                .clone()
+                .expect("accesskit was enabled for this frame");
+            output.drop_without_applying_deltas();
+            update
+        };
+
+        // Frame 1: root page, record the drill-down row's rect.
+        let update = frame(egui::RawInput::default());
+        let root_row_label = "Columns";
+        let root_row_rect = accessible_rect_for_label(&update, root_row_label);
+
+        // Frame 2: click it to open the Columns page.
+        let _ = frame(click_at(root_row_rect.center()));
+
+        // Frame 3: the page has settled; record the back row's rect and
+        // label.
+        let update = frame(egui::RawInput::default());
+        let back_row_rect = accessible_rect_for_label(&update, "Back from Columns");
+
+        assert!(
+            !root_row_rect.intersects(back_row_rect),
+            "the root page's {root_row_label:?} row {root_row_rect:?} must not overlap \
+             the Columns page's back row {back_row_rect:?}"
+        );
+        assert!(
+            !update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label().is_some_and(|s| s == root_row_label)),
+            "the back row must not reuse the root row's {root_row_label:?} label"
+        );
     }
 
     /// `Back` is unconditional: whichever page the user is on, it lands

@@ -1686,12 +1686,15 @@ mod tests {
                 .iter()
                 .any(|(_, node)| node.label().is_some_and(|s| s == label))
         };
-        // "Columns" is present on both the Root and Columns pages — the
-        // root's own drill-down row and the Columns page's back row both
-        // carry it — and on none of the closed header, so it answers "is
-        // the popup open" without assuming which page shows. Those are the
-        // only two pages this test visits.
-        let is_open = |update: &egui::accesskit::TreeUpdate| has_label(update, "Columns");
+        // "Columns" (the root page's drill-down row) or "Back from
+        // Columns" (issue #372's distinct back-row label, so it no longer
+        // repeats "Columns") is present on the Root and Columns pages
+        // respectively, and neither on the closed header, so together
+        // they answer "is the popup open" without assuming which page
+        // shows. Those are the only two pages this test visits.
+        let is_open = |update: &egui::accesskit::TreeUpdate| {
+            has_label(update, "Columns") || has_label(update, "Back from Columns")
+        };
 
         // Frame 1: closed header, find the chevron.
         let update = frame(egui::RawInput::default());
@@ -1768,14 +1771,15 @@ mod tests {
         );
 
         // Frame 7: still open on the frame after, too — not just within
-        // the click frame itself. The back row (same "Columns" label, a
-        // "◂" in the icon slot) is what walks out of the page.
+        // the click frame itself. The back row (a "◂" in the icon slot,
+        // labeled "Back from Columns" per issue #372) is what walks out
+        // of the page.
         let update = frame(egui::RawInput::default());
         assert!(
             is_open(&update),
             "the popup must stay open on the frame after the checkbox click"
         );
-        let back_pos = accessible_rect_for_label(&update, "Columns").center();
+        let back_pos = accessible_rect_for_label(&update, "Back from Columns").center();
 
         // Frame 8: click Back. Also a state row, also no `ui.close()`.
         let _ = frame(click_at(back_pos));
