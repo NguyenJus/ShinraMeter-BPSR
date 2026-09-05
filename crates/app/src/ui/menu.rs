@@ -220,6 +220,33 @@ pub(crate) const MENU_ROW_HEIGHT: f32 = 24.0;
 /// the one before it (`menu_section`).
 const MENU_SECTION_GAP: f32 = 6.0;
 
+/// Extra padding `MENU_FIRST_SECTION_GAP` adds past the exact
+/// `MENU_ROW_HEIGHT` boundary, so the root page's first row and a
+/// drill-down page's back row don't just touch edge-to-edge.
+const MENU_FIRST_SECTION_PAD: f32 = 4.0;
+
+/// Issue #372: leading gap above the root page's *first* section header
+/// only. Every drill-down page's back row starts flush with the page top
+/// and is `MENU_ROW_HEIGHT` tall (`menu_back_row`); with the ordinary
+/// `MENU_SECTION_GAP`, the root page's first row would land in that same
+/// band. `menu_small_line`'s own height is only a floor — it allocates
+/// `galley.size().y.max(MENU_SMALL_LINE_HEIGHT)`, so it is *at least*
+/// `MENU_SMALL_LINE_HEIGHT` tall but can wrap taller — and egui's default
+/// vertical `item_spacing.y` (2pt) adds on top of that between the gap
+/// and the line, and again between the line and the row under it, so the
+/// real on-screen gap before the fix was never exactly the arithmetic
+/// sum here. Before this constant existed the two bands were merely
+/// edge-touching (the back row spanned y `[0, 24]`, the root's first row
+/// spanned y `[24, 48]`) rather than overlapping, but a fast double-click
+/// on that shared edge could still open a page and immediately read as
+/// backing out of it again. `MENU_FIRST_SECTION_PAD` pushes the root's
+/// first row a few points past that boundary so the two bands are
+/// clearly separate.
+const MENU_FIRST_SECTION_GAP: f32 =
+    MENU_ROW_HEIGHT - MENU_SMALL_LINE_HEIGHT + MENU_FIRST_SECTION_PAD;
+
+const _: () = assert!(MENU_FIRST_SECTION_GAP >= 0.0);
+
 /// Left/right padding inside a row, between the popup's content edge and
 /// the row's own ink.
 pub(crate) const MENU_ROW_INSET: f32 = 8.0;
@@ -263,7 +290,7 @@ const MENU_COLUMNS_RESET_WIDTH: f32 = 48.0;
 /// view state with no meaning once the popup is shut, and `draw_header`
 /// resets it to `Root` on every frame the popup is closed
 /// (`reset_menu_page`), so reopening the menu always lands on the root.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum MenuPage {
     #[default]
     Root,
@@ -544,7 +571,17 @@ fn menu_back_row(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
             color,
         );
     }
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    // Issue #372: the painted text stays "◂ {label}" — the page title the
+    // user is walking out of — but the accessible name must not repeat
+    // that title verbatim. The root page's own drill-down row into this
+    // same page carries that exact label, and on the Columns page the two
+    // rows' geometry gets close enough (see `MENU_FIRST_SECTION_GAP`)
+    // that a screen-reader user hearing "Columns" twice, meaning opposite
+    // navigation directions, would have no way to tell them apart.
+    let accessible_label = format!("Back from {label}");
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &accessible_label)
+    });
     response
 }
 
@@ -573,9 +610,24 @@ fn menu_small_line(ui: &mut egui::Ui, text: &str) {
 }
 
 /// A section header inside the dropdown, with `MENU_SECTION_GAP` of air
-/// above it.
+/// above it. Callers that are the first thing painted on a page should
+/// use `menu_first_section` instead, so the header clears the band a
+/// drill-down page's back row occupies.
 fn menu_section(ui: &mut egui::Ui, text: &str) {
     ui.add_space(MENU_SECTION_GAP);
+    menu_small_line(ui, text);
+}
+
+/// The root page's *first* section header only (issue #372) — otherwise
+/// identical to `menu_section`, but with `MENU_FIRST_SECTION_GAP` of air
+/// above it instead of `MENU_SECTION_GAP`, so the first row underneath it
+/// clears the band a drill-down page's back row occupies.
+fn menu_first_section(ui: &mut egui::Ui, text: &str) {
+    debug_assert!(
+        ui.next_widget_position().y == ui.max_rect().top(),
+        "menu_first_section must be the first thing on a page"
+    );
+    ui.add_space(MENU_FIRST_SECTION_GAP);
     menu_small_line(ui, text);
 }
 
@@ -912,6 +964,13 @@ pub(crate) fn draw_header_menu(
         // cap, so a short page keeps painting with no reserved scrollbar
         // gutter and no extra bottom padding.
         .auto_shrink([false, true])
+        // Salted on the current page rather than shared: without this,
+        // every page reused the same scroll offset, so drilling into
+        // Columns or Backgrounds after scrolling the root down could open
+        // the drill-down page already scrolled, with its back row pushed
+        // out of view. Salting on `page` gives each page its own
+        // remembered offset, so a freshly opened page always starts at 0.
+        .id_salt(page)
         .show(ui, |ui| {
             nav = match page {
                 MenuPage::Root => draw_menu_root(
@@ -962,7 +1021,7 @@ fn draw_menu_root(
 ) -> Option<MenuNav> {
     let mut nav = None;
 
-    menu_section(ui, "DISPLAY");
+    menu_first_section(ui, "DISPLAY");
 
     // Issue #13's stat-column toggles, unchanged in behavior — the list
     // itself is a page now (issue #120) instead of a `CollapsingState`
@@ -1527,6 +1586,134 @@ mod tests {
                 col
             );
         }
+    }
+
+    /// Issue #372: the Columns page's back row starts flush with the page
+    /// top and is `MENU_ROW_HEIGHT` tall — the same band the root page's
+    /// own "Columns" row occupied before the first section header got
+    /// enough leading gap to clear it. A fast double click in that overlap
+    /// opened the page and immediately backed out of it again, and an
+    /// accessibility tree with two "Columns" buttons meant opposite
+    /// things. This pins both halves of the fix: the two rows' painted
+    /// rects must not overlap, and their accessible labels must differ.
+    #[test]
+    fn columns_back_row_does_not_overlap_or_share_a_label_with_the_root_drill_down_row() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+
+        let mut frame = |input: egui::RawInput| -> egui::accesskit::TreeUpdate {
+            let output = ctx.run_ui(input, |ui| {
+                draw_header_menu(
+                    ui,
+                    &ctx,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    None,
+                    &icons,
+                    &mut UpdateCheckState::default(),
+                    &unused_log_export_sender(),
+                    &mut 0,
+                    &mut false,
+                );
+            });
+            let update = output
+                .platform_output
+                .accesskit_update
+                .clone()
+                .expect("accesskit was enabled for this frame");
+            output.drop_without_applying_deltas();
+            update
+        };
+
+        // Frame 1: root page, record the drill-down row's rect.
+        let update = frame(egui::RawInput::default());
+        let root_row_label = "Columns";
+        let root_row_rect = accessible_rect_for_label(&update, root_row_label);
+
+        // Frame 2: click it to open the Columns page.
+        let _ = frame(click_at(root_row_rect.center()));
+
+        // Frame 3: the page has settled; record the back row's rect and
+        // label.
+        let update = frame(egui::RawInput::default());
+        let back_row_rect = accessible_rect_for_label(&update, "Back from Columns");
+
+        assert!(
+            !root_row_rect.intersects(back_row_rect),
+            "the root page's {root_row_label:?} row {root_row_rect:?} must not overlap \
+             the Columns page's back row {back_row_rect:?}"
+        );
+        assert!(
+            !update
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label().is_some_and(|s| s == root_row_label)),
+            "the back row must not reuse the root row's {root_row_label:?} label"
+        );
+    }
+
+    /// Sibling of `columns_back_row_does_not_overlap_or_share_a_label_with_
+    /// the_root_drill_down_row` for the Backgrounds page: opening it via
+    /// the root's "Background images" row must land on a page whose back
+    /// row is actually reachable in the accessibility tree — i.e. the
+    /// per-page `ScrollArea` id salt (this PR) doesn't leave the page
+    /// scrolled somewhere the back row can't be resolved from.
+    #[test]
+    fn backgrounds_back_row_is_reachable_after_navigating_from_the_root_row() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+
+        let mut frame = |input: egui::RawInput| -> egui::accesskit::TreeUpdate {
+            let output = ctx.run_ui(input, |ui| {
+                draw_header_menu(
+                    ui,
+                    &ctx,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    None,
+                    &icons,
+                    &mut UpdateCheckState::default(),
+                    &unused_log_export_sender(),
+                    &mut 0,
+                    &mut false,
+                );
+            });
+            let update = output
+                .platform_output
+                .accesskit_update
+                .clone()
+                .expect("accesskit was enabled for this frame");
+            output.drop_without_applying_deltas();
+            update
+        };
+
+        // Frame 1: root page, record the "Background images" row's rect
+        // (settings.rs's `row_pos` navigation drives the same row).
+        let update = frame(egui::RawInput::default());
+        let root_row_rect = accessible_rect_for_label(&update, "Background images");
+
+        // Frame 2: click it to open the Backgrounds page.
+        let _ = frame(click_at(root_row_rect.center()));
+
+        // Frame 3: the page has settled; the back row must resolve.
+        let update = frame(egui::RawInput::default());
+        let _ = accessible_rect_for_label(&update, "Back from Background images");
     }
 
     /// `Back` is unconditional: whichever page the user is on, it lands
