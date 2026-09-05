@@ -55,10 +55,12 @@ const MAX_RECV_ERROR_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Issue #337: how often the capture loop retries `owner::find_game_pid`
 /// while it has not yet found the game's pid (e.g. capture started before
-/// the game process did). Once found, the pid is cached for the rest of the
-/// loop's life — the game is not expected to restart mid-session — so this
-/// only bounds the cost of the "not running yet" window, not the steady
-/// state.
+/// the game process did). Once found, the pid is cached until the tracked
+/// connection tears down or a restart is requested — both of which clear it
+/// so a game relaunch (new pid) re-resolves instead of filtering every
+/// candidate against a pid that no longer owns anything — so this bounds
+/// the cost of each such "not resolved yet" window, not necessarily the
+/// whole session.
 const GAME_PID_LOOKUP_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Consecutive `WinDivertRecv` failures tolerated before the capture thread
@@ -384,6 +386,15 @@ fn recv_loop(
             // so they must not fund a second restart a tick later (#271).
             monitor.note_detached();
             monitor.record_gap_cache(0, 0);
+            // Issue #337: a restart can follow the game process itself being
+            // relaunched (new pid), so a cached `game_pid` must not survive
+            // it — otherwise `owner_allows_adoption` keeps filtering every
+            // candidate against a pid that no longer owns anything, and the
+            // fail-closed half of that check (a known, non-matching owner)
+            // leaves capture dead until a second manual restart. Clearing
+            // both lets it re-resolve on the very next packet.
+            game_pid = None;
+            last_game_pid_lookup = None;
         }
 
         let packet_len = match recv_packet(api, handle, &mut buffer) {
@@ -483,6 +494,13 @@ fn recv_loop(
                 tcp.rst(),
             );
             monitor.note_detached();
+            // Issue #337: the same staleness risk as the restart path above
+            // — a teardown can be the game process itself exiting/relaunching
+            // with a new pid, so the cached `game_pid` must not outlive the
+            // connection it was resolved for, or a stale pid fails the
+            // ownership filter closed forever on the reconnect.
+            game_pid = None;
+            last_game_pid_lookup = None;
         }
         if decision.skip {
             // Either the client→server half of the adopted connection
@@ -512,19 +530,8 @@ fn recv_loop(
             reassembler.resync(resync_seq);
             decoder.reset();
             monitor.note_adopted(conn);
-            // Issue #337: only a genuine server-endpoint change gets a
-            // `ServerChanged` — a reconnect (or a secondary stream) to the
-            // same server still resyncs/resets above, but must not wipe the
-            // in-progress meter.
-            if decision.emit_server_changed {
-                if tx.send(ProtocolEvent::ServerChanged).is_err() {
-                    break;
-                }
-            } else {
-                log::info!(
-                    "capture: reconnected to the same server endpoint on {conn}; suppressing \
-                     ServerChanged (issue #337)"
-                );
+            if tx.send(ProtocolEvent::ServerChanged).is_err() {
+                break;
             }
         }
 
