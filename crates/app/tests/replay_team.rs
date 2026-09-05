@@ -41,6 +41,7 @@ fn a_member_who_leaves_drops_out_of_the_roster() {
         .at(3_000)
         .team_leave(P_CASS)
         .at(4_000)
+        .tick()
         .capture("team_leave_drops_roster_member");
 
     let mut rig = Rig::new();
@@ -51,6 +52,47 @@ fn a_member_who_leaves_drops_out_of_the_roster() {
     let mut uids: Vec<i64> = capture.snapshot.rows.iter().map(|r| r.uid).collect();
     uids.sort();
     assert_eq!(uids, vec![P_ARIA, P_BRIN], "Cass left and must not linger");
+
+    assert_golden(capture);
+}
+
+/// A kicked member (`leave_type = 1`) must drop out of the roster the same
+/// way a voluntary leave does (issue #343) — the decoder doesn't
+/// distinguish the two, so this drives the real reassembler/decoder/
+/// pipeline with `Scenario::team_kick` and asserts the same row-drop as
+/// `a_member_who_leaves_drops_out_of_the_roster`.
+#[test]
+fn a_kicked_member_drops_out_of_the_roster() {
+    let scenario = Scenario::new("team_kick_drops_roster_member")
+        .at(1_000)
+        .enter_scene(TOWERING_RUIN)
+        .team_join(vec![
+            wire::team_member(P_ARIA, "Aria", prof::STORMBLADE, 12_000),
+            wire::team_member(P_BRIN, "Brin", prof::FROST_MAGE, 11_000),
+            wire::team_member(P_CASS, "Cass", prof::TWIN_STRIKER, 10_000),
+        ])
+        .monster_appear(M_BOSS, IGNISOR, 1_000_000, 1_000_000)
+        .at(2_000)
+        .hit(P_ARIA, M_BOSS, 101, 50_000)
+        .hit(P_BRIN, M_BOSS, 102, 30_000)
+        .at(3_000)
+        .team_kick(P_CASS)
+        .at(4_000)
+        .tick()
+        .capture("team_kick_drops_roster_member");
+
+    let mut rig = Rig::new();
+    let captures = rig.run(&scenario);
+    assert_eq!(captures.len(), 1);
+    let capture = &captures[0];
+
+    let mut uids: Vec<i64> = capture.snapshot.rows.iter().map(|r| r.uid).collect();
+    uids.sort();
+    assert_eq!(
+        uids,
+        vec![P_ARIA, P_BRIN],
+        "Cass was kicked and must not linger"
+    );
 
     assert_golden(capture);
 }
@@ -83,6 +125,7 @@ fn a_full_roster_resync_prunes_a_member_missing_from_it() {
             12_000,
         )])
         .at(4_000)
+        .tick()
         .capture("team_roster_resync_prunes_missing_member");
 
     let mut rig = Rig::new();

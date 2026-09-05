@@ -1,4 +1,4 @@
-scenario=team_leave_drops_roster_member
+scenario=team_kick_drops_roster_member
 at_ms=4000
 fight_state=Active
 duration_ms=2000

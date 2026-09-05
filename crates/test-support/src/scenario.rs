@@ -246,11 +246,24 @@ impl Scenario {
         self
     }
 
-    /// One `NotifyLeaveTeam` (issue #343): `uid` left the party or was
-    /// kicked — this crate's decoder doesn't distinguish the two, so
-    /// `leave_type` isn't a parameter here.
+    /// One `NotifyLeaveTeam` (issue #343): `uid` left the party voluntarily
+    /// (`leave_type = 0`).
     pub fn team_leave(mut self, uid: i64) -> Self {
         let payload = wire::notify_leave_team_payload(uid, 0);
+        let bytes = self.wrap_team_frame(
+            bpsr_protocol::decode::team_opcode::NOTIFY_LEAVE_TEAM,
+            &payload,
+        );
+        self.push_bytes(bytes);
+        self
+    }
+
+    /// One `NotifyLeaveTeam` (issue #343): `uid` was kicked from the party
+    /// (`leave_type = 1`) — this crate's decoder doesn't distinguish a kick
+    /// from a voluntary leave, so this must yield the same
+    /// `TeamMemberLeft` event as [`Self::team_leave`].
+    pub fn team_kick(mut self, uid: i64) -> Self {
+        let payload = wire::notify_leave_team_payload(uid, 1);
         let bytes = self.wrap_team_frame(
             bpsr_protocol::decode::team_opcode::NOTIFY_LEAVE_TEAM,
             &payload,

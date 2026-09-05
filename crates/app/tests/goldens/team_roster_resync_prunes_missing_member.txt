@@ -1,6 +1,6 @@
 scenario=team_roster_resync_prunes_missing_member
 at_ms=4000
-fight_state=Idle
+fight_state=Active
 duration_ms=2000
 total_damage=50000
 total_dps=50000.00

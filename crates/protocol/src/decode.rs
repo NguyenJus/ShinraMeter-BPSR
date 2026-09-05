@@ -2016,7 +2016,11 @@ mod tests {
         let n = team_notify_for(request);
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
-        assert_eq!(out.len(), 2, "the uid-less member must yield no event");
+        assert_eq!(
+            out.len(),
+            2,
+            "expected one Player event plus the trailing TeamRoster"
+        );
         match &out[0] {
             ProtocolEvent::Player(p) => {
                 assert_eq!(p.uid, 101);
@@ -2078,6 +2082,24 @@ mod tests {
             char_id: 0,
             leave_type: 0,
         });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.is_empty());
+    }
+
+    /// A malformed `NotifyLeaveTeam` with no `v_request` at all must not
+    /// produce a `TeamMemberLeft { uid: 0 }` — `on_notify_leave_team`'s
+    /// `let ... else { return; }` guard.
+    #[test]
+    fn notify_leave_team_missing_v_request_yields_no_event() {
+        let msg = pb::NotifyLeaveTeam { v_request: None };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let n = Notify {
+            service_uuid: crate::frame::TEAM_NTF_SERVICE_UUID,
+            method_id: team_opcode::NOTIFY_LEAVE_TEAM,
+            payload,
+        };
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
         assert!(out.is_empty());
