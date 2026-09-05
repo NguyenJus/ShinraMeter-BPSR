@@ -294,16 +294,14 @@ fn apply_cached_attrs(stats: &mut PlayerStats, merged: CachedAttrs) {
 }
 
 /// The key a damage event's attacker is filed under (issue #335): its own
-/// whole-uuid identity, or — for an event built from a display uid alone —
-/// the canonical reconstruction for that uid. See
-/// [`EntityId::or_display`].
+/// whole-uuid identity.
 fn attacker_key(d: &DamageEvent) -> EntityId {
-    d.attacker.or_display(d.attacker_uid, d.attacker_kind)
+    d.attacker
 }
 
 /// The key a damage event's target is filed under (issue #335).
 fn target_key(d: &DamageEvent) -> EntityId {
-    d.target.or_display(d.target_uid, d.target_kind)
+    d.target
 }
 
 pub struct Meter {
@@ -940,34 +938,23 @@ impl Meter {
             ProtocolEvent::EnemyHp(e) => self.apply_enemy_hp(e),
             ProtocolEvent::BuffApply {
                 host,
-                host_uid,
+                host_uid: _,
                 buff_uuid,
                 base_id,
                 adds_layer,
                 timestamp_ms,
             } => {
-                self.apply_buff_apply(
-                    host.or_display(*host_uid, EntityKind::Player),
-                    *buff_uuid,
-                    *base_id,
-                    *adds_layer,
-                    *timestamp_ms,
-                );
+                self.apply_buff_apply(*host, *buff_uuid, *base_id, *adds_layer, *timestamp_ms);
                 None
             }
             ProtocolEvent::BuffRemove {
                 host,
-                host_uid,
+                host_uid: _,
                 buff_uuid,
                 removes_layer,
                 timestamp_ms,
             } => {
-                self.apply_buff_remove(
-                    host.or_display(*host_uid, EntityKind::Player),
-                    *buff_uuid,
-                    *removes_layer,
-                    *timestamp_ms,
-                );
+                self.apply_buff_remove(*host, *buff_uuid, *removes_layer, *timestamp_ms);
                 None
             }
             ProtocolEvent::Scene { level_map_id } => {
@@ -1309,7 +1296,7 @@ impl Meter {
                 uid,
                 reason,
             } => {
-                self.apply_enemy_gone(entity.or_display(*uid, EntityKind::Monster), *uid, *reason);
+                self.apply_enemy_gone(*entity, *uid, *reason);
                 None
             }
             ProtocolEvent::DungeonVar { name, value } => {
@@ -2573,10 +2560,7 @@ impl Meter {
         if self.fight_end_ms.is_some() && !self.in_post_end_grace_window(c.timestamp_ms) {
             return;
         }
-        if let Some(stats) = self
-            .players
-            .get_mut(&c.caster.or_display(c.caster_uid, EntityKind::Player))
-        {
+        if let Some(stats) = self.players.get_mut(&c.caster) {
             *stats.casts.entry(c.skill_id).or_insert(0) += 1;
         }
     }
@@ -2738,7 +2722,7 @@ impl Meter {
     }
 
     fn apply_player(&mut self, p: &PlayerInfo) {
-        let key = p.entity.or_display(p.uid, EntityKind::Player);
+        let key = p.entity;
         let merged = self.name_upsert(
             p.uid,
             CachedAttrs {
@@ -2821,7 +2805,7 @@ impl Meter {
     }
 
     fn apply_enemy_hp(&mut self, e: &EnemyHp) -> Option<ResetReason> {
-        let key = e.entity.or_display(e.uid, EntityKind::Monster);
+        let key = e.entity;
         // `last_event_ms` is the DPS-window end and must reflect damage
         // only; enemy-HP sync/regen packets arriving after combat stops
         // would otherwise keep extending the denominator and decay DPS
@@ -3805,8 +3789,8 @@ impl Default for Meter {
 mod tests {
     /// An enemy's key in `Meter::enemies` for display uid `u` (issue #335).
     /// These tests build events from display uids alone, so the key is the
-    /// canonical reconstruction `EntityId::or_display` derives — the same
-    /// one the meter files them under.
+    /// canonical reconstruction `EntityId::from_display_uid` derives — the
+    /// same one the meter files them under.
     fn ek(u: i64) -> EntityId {
         EntityId::from_display_uid(u, EntityKind::Monster)
     }
@@ -3819,13 +3803,16 @@ mod tests {
     use super::*;
 
     fn dmg(attacker_uid: i64, value: i64, ts: u64) -> ProtocolEvent {
-        ProtocolEvent::Damage(DamageEvent {
-            attacker_uid,
-            attacker_kind: EntityKind::Player,
-            value,
-            timestamp_ms: ts,
-            ..Default::default()
-        })
+        ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid,
+                attacker_kind: EntityKind::Player,
+                value,
+                timestamp_ms: ts,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        )
     }
 
     // -- issue #335: stable entity ids ------------------------------------
@@ -3843,14 +3830,17 @@ mod tests {
         assert_eq!(first.display_uid(), second.display_uid());
 
         let hit = |attacker: EntityId, value: i64, ts: u64| {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker,
-                attacker_uid: attacker.display_uid(),
-                attacker_kind: EntityKind::Player,
-                value,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker,
+                    attacker_uid: attacker.display_uid(),
+                    attacker_kind: EntityKind::Player,
+                    value,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         };
 
         let mut m = Meter::new();
@@ -3899,17 +3889,20 @@ mod tests {
         value: i64,
         ts: u64,
     ) -> ProtocolEvent {
-        ProtocolEvent::Damage(DamageEvent {
-            attacker_uid,
-            attacker_kind: EntityKind::Player,
-            target_uid,
-            target_kind: EntityKind::Player,
-            skill_id,
-            value,
-            is_heal: true,
-            timestamp_ms: ts,
-            ..Default::default()
-        })
+        ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid,
+                attacker_kind: EntityKind::Player,
+                target_uid,
+                target_kind: EntityKind::Player,
+                skill_id,
+                value,
+                is_heal: true,
+                timestamp_ms: ts,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        )
     }
 
     fn hit_on_player(
@@ -3920,16 +3913,19 @@ mod tests {
         value: i64,
         ts: u64,
     ) -> ProtocolEvent {
-        ProtocolEvent::Damage(DamageEvent {
-            attacker_uid,
-            attacker_kind,
-            target_uid,
-            target_kind: EntityKind::Player,
-            skill_id,
-            value,
-            timestamp_ms: ts,
-            ..Default::default()
-        })
+        ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid,
+                attacker_kind,
+                target_uid,
+                target_kind: EntityKind::Player,
+                skill_id,
+                value,
+                timestamp_ms: ts,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        )
     }
 
     fn cast(caster_uid: i64, skill_id: i32, ts: u64) -> ProtocolEvent {
@@ -4275,26 +4271,32 @@ mod tests {
     fn the_dealt_tab_merges_outgoing_damage_and_healing() {
         let mut m = Meter::new();
         // Skill 10 damages, skill 55 heals, skill 20 does both.
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            target_uid: 9,
-            target_kind: EntityKind::Monster,
-            skill_id: 10,
-            value: 700,
-            timestamp_ms: 1000,
-            ..Default::default()
-        }));
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            target_uid: 9,
-            target_kind: EntityKind::Monster,
-            skill_id: 20,
-            value: 100,
-            timestamp_ms: 1100,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: 9,
+                target_kind: EntityKind::Monster,
+                skill_id: 10,
+                value: 700,
+                timestamp_ms: 1000,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: 9,
+                target_kind: EntityKind::Monster,
+                skill_id: 20,
+                value: 100,
+                timestamp_ms: 1100,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         m.apply(&heal(1, 2, 20, 200, 1200));
         m.apply(&heal(1, 2, 55, 50, 1300));
         let snap = m.snapshot(2000);
@@ -4321,18 +4323,21 @@ mod tests {
     fn a_missed_heal_counts_as_a_use_but_adds_no_amount() {
         let mut m = Meter::new();
         m.apply(&dmg(1, 100, 1000));
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            target_uid: 2,
-            target_kind: EntityKind::Player,
-            skill_id: 55,
-            value: 400,
-            is_heal: true,
-            is_miss: true,
-            timestamp_ms: 1100,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: 2,
+                target_kind: EntityKind::Player,
+                skill_id: 55,
+                value: 400,
+                is_heal: true,
+                is_miss: true,
+                timestamp_ms: 1100,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         let snap = m.snapshot(2000);
         let row = &snap.rows[0];
         assert_eq!(row.heals.len(), 1);
@@ -4344,18 +4349,21 @@ mod tests {
     fn a_crit_heal_feeds_the_heal_tabs_crit_columns() {
         let mut m = Meter::new();
         m.apply(&dmg(1, 100, 1000));
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            target_uid: 2,
-            target_kind: EntityKind::Player,
-            skill_id: 55,
-            value: 900,
-            is_heal: true,
-            crit: true,
-            timestamp_ms: 1100,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: 2,
+                target_kind: EntityKind::Player,
+                skill_id: 55,
+                value: 900,
+                is_heal: true,
+                crit: true,
+                timestamp_ms: 1100,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         m.apply(&heal(1, 2, 55, 100, 1200));
         let snap = m.snapshot(2000);
         let heal_row = &snap.rows[0].heals[0];
@@ -4410,14 +4418,17 @@ mod tests {
     #[test]
     fn heal_excluded_from_damage() {
         let mut m = Meter::new();
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            value: 500,
-            is_heal: true,
-            timestamp_ms: 1000,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                value: 500,
+                is_heal: true,
+                timestamp_ms: 1000,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         let snap = m.snapshot(2000);
         assert_eq!(snap.total_damage, 0);
         assert!(snap.rows.is_empty());
@@ -4427,14 +4438,17 @@ mod tests {
     #[test]
     fn miss_counts_as_hit_with_zero_damage() {
         let mut m = Meter::new();
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            value: 999,
-            is_miss: true,
-            timestamp_ms: 1000,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                value: 999,
+                is_miss: true,
+                timestamp_ms: 1000,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         let snap = m.snapshot(2000);
         assert_eq!(snap.total_damage, 0);
         assert_eq!(snap.rows.len(), 1);
@@ -4451,15 +4465,18 @@ mod tests {
         crit: bool,
         ts: u64,
     ) -> ProtocolEvent {
-        ProtocolEvent::Damage(DamageEvent {
-            attacker_uid,
-            attacker_kind: EntityKind::Player,
-            skill_id,
-            value,
-            crit,
-            timestamp_ms: ts,
-            ..Default::default()
-        })
+        ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid,
+                attacker_kind: EntityKind::Player,
+                skill_id,
+                value,
+                crit,
+                timestamp_ms: ts,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        )
     }
 
     #[test]
@@ -4477,16 +4494,19 @@ mod tests {
     #[test]
     fn a_lucky_non_crit_hit_counts_as_a_white_hit() {
         let mut m = Meter::new();
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            skill_id: 7,
-            value: 150,
-            crit: false,
-            lucky: true,
-            timestamp_ms: 1000,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                skill_id: 7,
+                value: 150,
+                crit: false,
+                lucky: true,
+                timestamp_ms: 1000,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         let snap = m.snapshot(2000);
         let skill = &snap.rows[0].skills[0];
         assert_eq!(skill.hits, 1);
@@ -4512,15 +4532,18 @@ mod tests {
     #[test]
     fn a_missed_swing_bumps_per_skill_hits_but_not_damage() {
         let mut m = Meter::new();
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            skill_id: 3,
-            value: 999,
-            is_miss: true,
-            timestamp_ms: 1000,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                skill_id: 3,
+                value: 999,
+                is_miss: true,
+                timestamp_ms: 1000,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         let snap = m.snapshot(2000);
         let skill = &snap.rows[0].skills[0];
         assert_eq!(skill.hits, 1);
@@ -4533,15 +4556,18 @@ mod tests {
         m.apply(&skill_dmg(1, 1, 100, false, 1000));
         m.apply(&skill_dmg(1, 1, 100, false, 1500));
         m.apply(&skill_dmg(1, 2, 200, true, 2000));
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            skill_id: 2,
-            value: 999,
-            is_miss: true,
-            timestamp_ms: 2500,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                skill_id: 2,
+                value: 999,
+                is_miss: true,
+                timestamp_ms: 2500,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         let snap = m.snapshot(3000);
         let row = &snap.rows[0];
         let skill_hit_sum: u64 = row.skills.iter().map(|s| s.hits).sum();
@@ -5140,15 +5166,18 @@ mod tests {
     fn fight_clock_does_not_start_on_monster_damage() {
         let mut m = Meter::new();
         // Boss hits a player at t=0; the clock must not start yet.
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 99,
-            attacker_kind: EntityKind::Monster,
-            target_uid: 1,
-            target_kind: EntityKind::Player,
-            value: 500,
-            timestamp_ms: 0,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 99,
+                attacker_kind: EntityKind::Monster,
+                target_uid: 1,
+                target_kind: EntityKind::Player,
+                value: 500,
+                timestamp_ms: 0,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         assert!(!m.is_active());
 
         // Players only open 60s later.
@@ -5184,15 +5213,18 @@ mod tests {
     #[test]
     fn monster_attacker_produces_no_row() {
         let mut m = Meter::new();
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 99,
-            attacker_kind: EntityKind::Monster,
-            target_uid: 1,
-            target_kind: EntityKind::Player,
-            value: 200,
-            timestamp_ms: 1000,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 99,
+                attacker_kind: EntityKind::Monster,
+                target_uid: 1,
+                target_kind: EntityKind::Player,
+                value: 200,
+                timestamp_ms: 1000,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         let snap = m.snapshot(2000);
         assert!(snap.rows.is_empty());
     }
@@ -5201,16 +5233,19 @@ mod tests {
         use super::*;
 
         fn death_hit(attacker_uid: i64, target_uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid,
-                attacker_kind: EntityKind::Player,
-                target_uid,
-                target_kind: EntityKind::Player,
-                value: 100,
-                is_dead: true,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid,
+                    attacker_kind: EntityKind::Player,
+                    target_uid,
+                    target_kind: EntityKind::Player,
+                    value: 100,
+                    is_dead: true,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         #[test]
@@ -5226,16 +5261,19 @@ mod tests {
         #[test]
         fn is_dead_on_a_monster_target_increments_nobody() {
             let mut m = Meter::new();
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: 10,
-                target_kind: EntityKind::Monster,
-                value: 100,
-                is_dead: true,
-                timestamp_ms: 1000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 10,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    is_dead: true,
+                    timestamp_ms: 1000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             let snap = m.snapshot(2000);
             assert_eq!(snap.rows.len(), 1);
             assert_eq!(snap.rows[0].deaths, 0);
@@ -5262,17 +5300,20 @@ mod tests {
         #[test]
         fn heal_typed_dead_player_event_still_records_death() {
             let mut m = Meter::new();
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: 2,
-                target_kind: EntityKind::Player,
-                value: 100,
-                is_heal: true,
-                is_dead: true,
-                timestamp_ms: 1000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 2,
+                    target_kind: EntityKind::Player,
+                    value: 100,
+                    is_heal: true,
+                    is_dead: true,
+                    timestamp_ms: 1000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             let snap = m.snapshot(2000);
             let row = snap.rows.iter().find(|r| r.uid == 2).unwrap();
             assert_eq!(row.deaths, 1);
@@ -5657,15 +5698,18 @@ mod tests {
         const UNCURATED_SCENE: u32 = 1001;
 
         fn boss_hit(uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 1,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 1,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         fn hp(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {
@@ -5833,15 +5877,18 @@ mod tests {
         }
 
         fn boss_hit(uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 1,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 1,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         /// An enemy seen only through HP deltas: `AttrHp` but no `AttrMaxHp`,
@@ -6263,16 +6310,19 @@ mod tests {
 
         /// A player hit on monster `uid`, optionally the killing blow.
         fn boss_hit(uid: i64, ts: u64, is_dead: bool) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 100,
-                is_dead,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    is_dead,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         fn hp(uid: i64, curr: u64, monster_id: Option<u32>, ts: u64) -> ProtocolEvent {
@@ -6402,15 +6452,18 @@ mod tests {
             m.apply(&dmg(1, 5_000, 0));
 
             // A mob aggroes the player in town long after the pull ended.
-            let reason = m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 99,
-                attacker_kind: EntityKind::Monster,
-                target_uid: 1,
-                target_kind: EntityKind::Player,
-                value: 200,
-                timestamp_ms: 100_000,
-                ..Default::default()
-            }));
+            let reason = m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 99,
+                    attacker_kind: EntityKind::Monster,
+                    target_uid: 1,
+                    target_kind: EntityKind::Player,
+                    value: 200,
+                    timestamp_ms: 100_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             assert_eq!(reason, None);
             assert_eq!(m.snapshot(101_000).total_damage, 5_000);
             assert_eq!(m.fight_state(101_000), FightState::Ended);
@@ -6420,14 +6473,17 @@ mod tests {
         fn a_heal_does_not_end_the_hold() {
             let mut m = Meter::new();
             m.apply(&dmg(1, 5_000, 0));
-            let reason = m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                value: 400,
-                is_heal: true,
-                timestamp_ms: 100_000,
-                ..Default::default()
-            }));
+            let reason = m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    value: 400,
+                    is_heal: true,
+                    timestamp_ms: 100_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             assert_eq!(reason, None);
             assert_eq!(m.snapshot(101_000).total_damage, 5_000);
         }
@@ -6762,15 +6818,18 @@ mod tests {
             m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 500 });
             assert_eq!(m.fight_state(500), FightState::Ended);
 
-            let reason = m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 99,
-                attacker_kind: EntityKind::Monster,
-                target_uid: 1,
-                target_kind: EntityKind::Player,
-                value: 200,
-                timestamp_ms: 10_000,
-                ..Default::default()
-            }));
+            let reason = m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 99,
+                    attacker_kind: EntityKind::Monster,
+                    target_uid: 1,
+                    target_kind: EntityKind::Player,
+                    value: 200,
+                    timestamp_ms: 10_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             assert_eq!(reason, None);
             assert_eq!(m.snapshot(11_000).total_damage, 5_000);
             assert_eq!(m.fight_state(11_000), FightState::Ended);
@@ -6784,14 +6843,17 @@ mod tests {
             m.apply(&dmg(1, 5_000, 0));
             m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 500 });
 
-            let reason = m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                value: 400,
-                is_heal: true,
-                timestamp_ms: 10_000,
-                ..Default::default()
-            }));
+            let reason = m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    value: 400,
+                    is_heal: true,
+                    timestamp_ms: 10_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             assert_eq!(reason, None);
             assert_eq!(m.snapshot(11_000).total_damage, 5_000);
         }
@@ -7118,15 +7180,18 @@ mod tests {
         /// A monster swinging at a player: the shape that keeps arriving
         /// after a wipe, when the boss carries on hitting corpses.
         fn monster_hit(target_uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 99,
-                attacker_kind: EntityKind::Monster,
-                target_uid,
-                target_kind: EntityKind::Player,
-                value: 200,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 99,
+                    attacker_kind: EntityKind::Monster,
+                    target_uid,
+                    target_kind: EntityKind::Player,
+                    value: 200,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         #[test]
@@ -7184,15 +7249,18 @@ mod tests {
                 value: i64,
                 ts: u64,
             ) -> ProtocolEvent {
-                ProtocolEvent::Damage(DamageEvent {
-                    attacker_uid,
-                    attacker_kind: EntityKind::Player,
-                    target_uid,
-                    target_kind: EntityKind::Monster,
-                    value,
-                    timestamp_ms: ts,
-                    ..Default::default()
-                })
+                ProtocolEvent::Damage(
+                    DamageEvent {
+                        attacker_uid,
+                        attacker_kind: EntityKind::Player,
+                        target_uid,
+                        target_kind: EntityKind::Monster,
+                        value,
+                        timestamp_ms: ts,
+                        ..Default::default()
+                    }
+                    .test_reconstructed(),
+                )
             }
 
             #[test]
@@ -7274,16 +7342,19 @@ mod tests {
                 m.apply(&dmg(1, 100, 1_000));
                 m.tick(1_000 + idle());
 
-                m.apply(&ProtocolEvent::Damage(DamageEvent {
-                    attacker_uid: 2,
-                    attacker_kind: EntityKind::Monster,
-                    target_uid: 1,
-                    target_kind: EntityKind::Player,
-                    value: 9_999,
-                    is_dead: true,
-                    timestamp_ms: 1_000 + 500,
-                    ..Default::default()
-                }));
+                m.apply(&ProtocolEvent::Damage(
+                    DamageEvent {
+                        attacker_uid: 2,
+                        attacker_kind: EntityKind::Monster,
+                        target_uid: 1,
+                        target_kind: EntityKind::Player,
+                        value: 9_999,
+                        is_dead: true,
+                        timestamp_ms: 1_000 + 500,
+                        ..Default::default()
+                    }
+                    .test_reconstructed(),
+                ));
 
                 // A hit well past the grace window resumes as an ordinary
                 // `NewFight`, exactly as it would have with no wipe hold at
@@ -7371,15 +7442,18 @@ mod tests {
         const MOB_UID: i64 = 12;
 
         fn hit(attacker_uid: i64, target_uid: i64, value: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid,
-                attacker_kind: EntityKind::Player,
-                target_uid,
-                target_kind: EntityKind::Monster,
-                value,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid,
+                    attacker_kind: EntityKind::Player,
+                    target_uid,
+                    target_kind: EntityKind::Monster,
+                    value,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         fn enemy_hp(uid: i64, curr: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
@@ -7400,16 +7474,19 @@ mod tests {
 
         /// Any monster landing a killing blow on a player.
         fn killing_blow_from(attacker_uid: i64, target_uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid,
-                attacker_kind: EntityKind::Monster,
-                target_uid,
-                target_kind: EntityKind::Player,
-                value: 9_999,
-                is_dead: true,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid,
+                    attacker_kind: EntityKind::Monster,
+                    target_uid,
+                    target_kind: EntityKind::Player,
+                    value: 9_999,
+                    is_dead: true,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         /// A player landing a killing blow on *themselves* — a reflected
@@ -7417,44 +7494,53 @@ mod tests {
         /// which is the case `killing_blow_from` (always a monster
         /// attacker) cannot express.
         fn self_killing_blow(uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: uid,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Player,
-                value: 9_999,
-                is_dead: true,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: uid,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Player,
+                    value: 9_999,
+                    is_dead: true,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         /// A player healing a party member — the only kind of outgoing
         /// event a pure support ever produces.
         fn heal(attacker_uid: i64, target_uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid,
-                attacker_kind: EntityKind::Player,
-                target_uid,
-                target_kind: EntityKind::Player,
-                value: 4_000,
-                is_heal: true,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid,
+                    attacker_kind: EntityKind::Player,
+                    target_uid,
+                    target_kind: EntityKind::Player,
+                    value: 4_000,
+                    is_heal: true,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         /// The boss carrying on swinging after the party is down.
         fn monster_swing(target_uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: BOSS_UID,
-                attacker_kind: EntityKind::Monster,
-                target_uid,
-                target_kind: EntityKind::Player,
-                value: 200,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: BOSS_UID,
+                    attacker_kind: EntityKind::Monster,
+                    target_uid,
+                    target_kind: EntityKind::Player,
+                    value: 200,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         /// A two-player party in an instance, both rows known from the
@@ -8148,16 +8234,19 @@ mod tests {
 
         /// A player hit on monster `uid`, optionally the killing blow.
         fn hit(uid: i64, ts: u64, is_dead: bool) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 500,
-                is_dead,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 500,
+                    is_dead,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         #[test]
@@ -8405,15 +8494,18 @@ mod tests {
         }
 
         fn hit(uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 500,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 500,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         /// A despawn carrying no tag 2 at all — the fallback path, and what
@@ -8613,16 +8705,19 @@ mod tests {
             let mut m = in_raid();
             m.apply(&hp(BOSS_UID, 1_000_000, 1_000_000, ORIGIN, 0));
             m.apply(&hit(BOSS_UID, 1_000));
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: BOSS_UID,
-                target_kind: EntityKind::Monster,
-                value: 500,
-                is_dead: true,
-                timestamp_ms: 2_000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: BOSS_UID,
+                    target_kind: EntityKind::Monster,
+                    value: 500,
+                    is_dead: true,
+                    timestamp_ms: 2_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             assert_eq!(m.fight_end_ms, Some(2_000));
             let rank = m.enemies[&ek(BOSS_UID)].death_order;
             let seen = m.deaths_seen;
@@ -9175,16 +9270,19 @@ mod tests {
 
         /// A player hit on monster `uid`, optionally the killing blow.
         fn hit(uid: i64, value: i64, ts: u64, is_dead: bool) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value,
-                is_dead,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value,
+                    is_dead,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         fn hp(uid: i64, curr: u64, max: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
@@ -9603,16 +9701,19 @@ mod tests {
             m.apply(&hit(10, 500, 1_000, true));
 
             m.apply(&hp(11, 500, 500, CONTINUATION, 20_000));
-            let reason = m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: 11,
-                target_kind: EntityKind::Monster,
-                value: 0,
-                is_miss: true,
-                timestamp_ms: 21_000,
-                ..Default::default()
-            }));
+            let reason = m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 11,
+                    target_kind: EntityKind::Monster,
+                    value: 0,
+                    is_miss: true,
+                    timestamp_ms: 21_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
 
             assert_eq!(reason, None, "a miss is still the party engaging");
             assert_eq!(m.fight_start_ms, Some(100));
@@ -9969,15 +10070,18 @@ mod tests {
         use super::*;
 
         fn boss_hit(uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 1,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 1,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         fn hp(uid: i64, curr: u64, max: u64, monster_id: Option<u32>, ts: u64) -> ProtocolEvent {
@@ -10317,15 +10421,18 @@ mod tests {
                 monster_id: Some(DIAG_BOSS),
                 timestamp_ms: 0,
             }));
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: 10,
-                target_kind: EntityKind::Monster,
-                value: 1_000,
-                timestamp_ms: 1_000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 10,
+                    target_kind: EntityKind::Monster,
+                    value: 1_000,
+                    timestamp_ms: 1_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             assert_eq!(m.boss_entity, Some(ek(10)));
 
             m.apply(&ProtocolEvent::ServerChanged {
@@ -10354,37 +10461,46 @@ mod tests {
 
             let mut m = Meter::new();
             // uid 1 dies to a monster...
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 90,
-                attacker_kind: EntityKind::Monster,
-                target_uid: 1,
-                target_kind: EntityKind::Player,
-                value: 500,
-                is_dead: true,
-                timestamp_ms: 1_000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 90,
+                    attacker_kind: EntityKind::Monster,
+                    target_uid: 1,
+                    target_kind: EntityKind::Player,
+                    value: 500,
+                    is_dead: true,
+                    timestamp_ms: 1_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             // ...uid 2 is just a second known party member, never down...
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 2,
-                attacker_kind: EntityKind::Player,
-                target_uid: 90,
-                target_kind: EntityKind::Monster,
-                value: 1_000,
-                timestamp_ms: 1_000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 2,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 90,
+                    target_kind: EntityKind::Monster,
+                    value: 1_000,
+                    timestamp_ms: 1_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             // ...and uid 1 is battle-rezzed: their next action (a hit)
             // clears `alive` back to true, but `deaths` stays 1 forever.
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: 90,
-                target_kind: EntityKind::Monster,
-                value: 1_000,
-                timestamp_ms: 2_000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 90,
+                    target_kind: EntityKind::Monster,
+                    value: 1_000,
+                    timestamp_ms: 2_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             assert_eq!(
                 m.players.get(&pk(1)).map(|p| (p.deaths, p.alive)),
                 Some((1, true)),
@@ -10446,27 +10562,33 @@ mod tests {
                 monster_id: Some(DIAG_BOSS),
                 timestamp_ms: 0,
             }));
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: DIAG_UID,
-                target_kind: EntityKind::Monster,
-                value: 100,
-                timestamp_ms: 1_000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: DIAG_UID,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    timestamp_ms: 1_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             assert_eq!(m.boss_entity, Some(ek(DIAG_UID)));
 
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: DIAG_UID,
-                target_kind: EntityKind::Monster,
-                value: 100,
-                is_dead: true,
-                timestamp_ms: 2_000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: DIAG_UID,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    is_dead: true,
+                    timestamp_ms: 2_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
 
             assert_eq!(
                 m.fight_end_ms, None,
@@ -10666,15 +10788,18 @@ mod tests {
         }
 
         fn boss_hit(uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 99,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 1,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 99,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 1,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         /// (a) A boss burned to 40%, then the same uid reports a new
@@ -10716,16 +10841,19 @@ mod tests {
             let mut m = Meter::new();
             m.apply(&hp(OLD_BOSS, 1_000_000, 1_000_000, 0));
             m.apply(&boss_hit(UID, 100));
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 99,
-                attacker_kind: EntityKind::Player,
-                target_uid: UID,
-                target_kind: EntityKind::Monster,
-                value: 1,
-                is_dead: true,
-                timestamp_ms: 200,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 99,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: UID,
+                    target_kind: EntityKind::Monster,
+                    value: 1,
+                    is_dead: true,
+                    timestamp_ms: 200,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             assert!(!m.enemies[&ek(UID)].is_alive());
 
             m.apply(&hp(NEW_BOSS, 500_000, 1_000_000, 300));
@@ -10805,15 +10933,18 @@ mod tests {
         use super::*;
 
         fn boss_hit(uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 1,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 1,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         fn hp(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {
@@ -10957,16 +11088,19 @@ mod tests {
 
         /// A player hit on monster `uid`, optionally the killing blow.
         fn boss_hit(uid: i64, ts: u64, is_dead: bool) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 100,
-                is_dead,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    is_dead,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         fn hp(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {

@@ -79,32 +79,6 @@ impl EntityId {
         };
         EntityId::from_uuid((uid << 16) | (type_bits << ENT_TYPE_SHIFT))
     }
-
-    /// This identity if it is a real one, else the canonical reconstruction
-    /// for `uid`/`kind`.
-    ///
-    /// Every event the decoder produces carries a real `EntityId`, so in
-    /// production this always returns `self`. It exists for events built by
-    /// hand from a display uid alone — this crate's own unit tests, and any
-    /// future source with no uuid to offer: the reconstruction is then the
-    /// most specific stable key that source can honestly supply, and it is
-    /// the same one `bpsr_protocol` would synthesise for it.
-    pub fn or_display(self, uid: i64, kind: EntityKind) -> EntityId {
-        if self == EntityId::UNKNOWN {
-            EntityId::from_display_uid(uid, kind)
-        } else {
-            self
-        }
-    }
-}
-
-/// `entity_kind = uuid & 0xFFFF`; `640` = player, `64` = monster.
-pub fn kind_of(uuid: i64) -> EntityKind {
-    match uuid & 0xFFFF {
-        640 => EntityKind::Player,
-        64 => EntityKind::Monster,
-        _ => EntityKind::Unknown,
-    }
 }
 
 /// Player class, derived from `ATTR_PROFESSION_ID` / `cur_profession_id`
@@ -233,6 +207,29 @@ pub struct DamageEvent {
     /// `pb::SyncDamageInfo` tag 17 — a victim-side signal, not an
     /// attacker-side kill count (issue #49).
     pub is_dead: bool,
+}
+
+#[cfg(test)]
+impl DamageEvent {
+    /// Test-only reconstruction of `attacker`/`target` from the uid/kind
+    /// pair a hand-built event already carries (issue #335).
+    ///
+    /// Every event the decoder produces already carries a real `attacker`/
+    /// `target`, so production code never needs this — it reads those
+    /// fields directly. This crate's own unit tests build events from a
+    /// display uid alone, so this fills in the same canonical
+    /// reconstruction `EntityId::from_display_uid` gives any other uid-only
+    /// source, and it is the same one `bpsr_protocol` would synthesise for
+    /// it.
+    pub(crate) fn test_reconstructed(mut self) -> Self {
+        if self.attacker == EntityId::UNKNOWN {
+            self.attacker = EntityId::from_display_uid(self.attacker_uid, self.attacker_kind);
+        }
+        if self.target == EntityId::UNKNOWN {
+            self.target = EntityId::from_display_uid(self.target_uid, self.target_kind);
+        }
+        self
+    }
 }
 
 /// Mirrors `bpsr_protocol::event::CastEvent` (issue #245): one skill
