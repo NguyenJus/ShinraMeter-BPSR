@@ -50,9 +50,10 @@ impl StreamOwnerLookup for NoOwnerFilter {
     }
 }
 
-/// Executable names (without the `.exe` suffix match is case-insensitive on
-/// Windows, so this list is compared case-insensitively) the game ships
-/// under, per BPSR-ZDPS's `NetCapConfig`/`Utils.GetGameCapturePreference`
+/// Executable names (with the `.exe` suffix; the match against a running
+/// process's image name is case-insensitive on Windows, so this list is
+/// compared case-insensitively too) the game ships under, per BPSR-ZDPS's
+/// `NetCapConfig`/`Utils.GetGameCapturePreference`
 /// (`/tmp/refs/BPSR-ZDPS/BPSR-ZDPS/Utils.cs`, `EGameCapturePreference.Auto`).
 /// Kept in one place so a future store/launcher variant is a one-line
 /// addition here rather than a hunt through the capture pipeline.
@@ -67,15 +68,93 @@ pub const GAME_PROCESS_NAMES: &[&str] = &[
     "Star.exe",
 ];
 
+/// `szExeFile` is a fixed-size, NUL-terminated UTF-16 buffer (as
+/// `PROCESSENTRY32W` on Windows carries it); this slices at the first NUL
+/// (or the whole buffer, if somehow unterminated) before decoding and
+/// comparing case-insensitively against [`GAME_PROCESS_NAMES`]. Pure, so it
+/// is kept out of `#[cfg(windows)]` and exercised directly on any host.
+// Only `windows_impl` (and this module's tests) call it; off Windows the
+// non-test build has no caller, exactly like `error.rs`'s Windows-only
+// helpers.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn exe_name_matches_game(exe_file: &[u16; 260]) -> bool {
+    let len = exe_file
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(exe_file.len());
+    let name = String::from_utf16_lossy(&exe_file[..len]);
+    GAME_PROCESS_NAMES
+        .iter()
+        .any(|game_name| name.eq_ignore_ascii_case(game_name))
+}
+
+/// Size in bytes of one `MIB_TCPROW_OWNER_PID` row: six back-to-back
+/// native-endian `u32` fields — state, localAddr, localPort, remoteAddr,
+/// remotePort, owningPid — with no padding between them, per
+/// `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)`'s documented
+/// `MIB_TCPTABLE_OWNER_PID` output layout.
+#[cfg_attr(not(windows), allow(dead_code))]
+const TCP_ROW_SIZE: usize = 6 * 4;
+
+/// Walks a `MIB_TCPTABLE_OWNER_PID`-shaped `buffer` — a `u32` entry count at
+/// offset 0, immediately followed by that many [`TCP_ROW_SIZE`]-byte rows —
+/// for the row matching `(local_ip, local_port, remote_ip, remote_port)` and
+/// returns its owning pid.
+///
+/// Pure, ordinary byte parsing with no unsafe code of its own — the only
+/// unsafe part of the real lookup is getting `buffer` populated by
+/// `GetExtendedTcpTable` in the first place (see
+/// `windows_impl::owner_pid_from_table`) — so this half is kept out of
+/// `#[cfg(windows)]` and unit-tested against a hand-built buffer on any
+/// host.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn find_owner_pid(
+    buffer: &[u8],
+    local_ip: [u8; 4],
+    local_port: u16,
+    remote_ip: [u8; 4],
+    remote_port: u16,
+) -> Option<u32> {
+    if buffer.len() < 4 {
+        return None;
+    }
+    let num_entries = u32::from_ne_bytes(buffer[0..4].try_into().unwrap()) as usize;
+    let rows = buffer[4..].chunks_exact(TCP_ROW_SIZE);
+    let num_entries = num_entries.min(rows.len());
+
+    for row in rows.take(num_entries) {
+        // Row layout: state, localAddr, localPort, remoteAddr, remotePort,
+        // owningPid, each a native-endian u32. `localAddr`/`remoteAddr` are
+        // stored in network byte order inside that u32, so `to_ne_bytes`
+        // reads back exactly the bytes the API wrote (already in address
+        // order); `*Port` packs the 16-bit network-order port in the low
+        // bits, which `from_be` undoes.
+        let row_local_addr = u32::from_ne_bytes(row[4..8].try_into().unwrap());
+        let row_local_port = u32::from_ne_bytes(row[8..12].try_into().unwrap());
+        let row_remote_addr = u32::from_ne_bytes(row[12..16].try_into().unwrap());
+        let row_remote_port = u32::from_ne_bytes(row[16..20].try_into().unwrap());
+        let row_owning_pid = u32::from_ne_bytes(row[20..24].try_into().unwrap());
+
+        if row_local_addr.to_ne_bytes() == local_ip
+            && u16::from_be(row_local_port as u16) == local_port
+            && row_remote_addr.to_ne_bytes() == remote_ip
+            && u16::from_be(row_remote_port as u16) == remote_port
+        {
+            return Some(row_owning_pid);
+        }
+    }
+    None
+}
+
 #[cfg(windows)]
 pub use windows_impl::SystemOwnerLookup;
 #[cfg(windows)]
-pub use windows_impl::find_game_pid;
+pub use windows_impl::find_game_pids;
 
 #[cfg(not(windows))]
 pub use stub_impl::SystemOwnerLookup;
 #[cfg(not(windows))]
-pub use stub_impl::find_game_pid;
+pub use stub_impl::find_game_pids;
 
 /// Off-Windows stand-in: capture never runs here (see `crate::stub`), so
 /// there is no TCP table or process list to query. Exists purely so
@@ -102,8 +181,8 @@ mod stub_impl {
     }
 
     /// Always "not found" off Windows — see the module doc.
-    pub fn find_game_pid() -> Option<u32> {
-        None
+    pub fn find_game_pids() -> Vec<u32> {
+        Vec::new()
     }
 }
 
@@ -115,12 +194,11 @@ mod stub_impl {
 /// Windows.
 #[cfg(windows)]
 mod windows_impl {
-    use super::{GAME_PROCESS_NAMES, StreamOwnerLookup};
-    use std::mem::size_of;
+    use super::{StreamOwnerLookup, exe_name_matches_game, find_owner_pid};
     use std::net::{IpAddr, SocketAddr};
     use windows::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE};
     use windows::Win32::NetworkManagement::IpHelper::{
-        GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+        GetExtendedTcpTable, TCP_TABLE_OWNER_PID_ALL,
     };
     use windows::Win32::Networking::WinSock::AF_INET;
     use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -154,18 +232,31 @@ mod windows_impl {
         }
     }
 
-    /// Finds the pid of the first running process whose image name matches
+    /// Finds the pids of every running process whose image name matches
     /// [`GAME_PROCESS_NAMES`] (case-insensitive), by walking a
     /// `TH32CS_SNAPPROCESS` snapshot — the same "enumerate every process,
     /// filter by name" approach BPSR-ZDPS's `Utils.GetProcessesFromList`
     /// uses, chosen over `OpenProcess` + name query so this never needs a
     /// per-process access right that a protected game process might deny.
-    pub fn find_game_pid() -> Option<u32> {
+    ///
+    /// Returns every match, not just the first (issue #337, O5):
+    /// [`GAME_PROCESS_NAMES`] includes generic names (e.g. `Star.exe`) that
+    /// more than one running process can share, and latching onto whichever
+    /// one happens to be listed first in the snapshot can pick the wrong
+    /// pid — which then fails every real candidate's ownership check
+    /// closed. Returning the whole matching set and checking membership in
+    /// it (see `crate::detect::OwnershipFilter`) is a strict superset of
+    /// filtering against a single guess, so it can only allow adoptions a
+    /// wrong single pick would have rejected, keeping the fail-open
+    /// contract intact.
+    pub fn find_game_pids() -> Vec<u32> {
         // SAFETY: `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)` snapshots
         // every process in the system; the returned handle is closed below
         // on every return path.
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.ok()?;
-        let found = find_game_pid_in_snapshot(snapshot);
+        let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+            return Vec::new();
+        };
+        let found = find_game_pids_in_snapshot(snapshot);
         // SAFETY: `snapshot` is a live handle opened just above and not used
         // again after this call.
         unsafe {
@@ -174,53 +265,37 @@ mod windows_impl {
         found
     }
 
-    fn find_game_pid_in_snapshot(snapshot: HANDLE) -> Option<u32> {
+    fn find_game_pids_in_snapshot(snapshot: HANDLE) -> Vec<u32> {
         let mut entry = PROCESSENTRY32W {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
         };
+        let mut found = Vec::new();
         // SAFETY: `snapshot` is a live TH32CS_SNAPPROCESS handle and `entry`
         // is a valid, correctly-sized out-parameter (`dwSize` set above, as
         // the API requires).
         let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
         while ok {
             if exe_name_matches_game(&entry.szExeFile) {
-                return Some(entry.th32ProcessID);
+                found.push(entry.th32ProcessID);
             }
             // SAFETY: same `snapshot`/`entry` as above; `Process32NextW`
             // reuses the same out-parameter contract as `Process32FirstW`.
             ok = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
         }
-        None
-    }
-
-    /// `szExeFile` is a fixed-size, NUL-terminated UTF-16 buffer; this slices
-    /// at the first NUL (or the whole buffer, if somehow unterminated)
-    /// before decoding and comparing case-insensitively against
-    /// [`GAME_PROCESS_NAMES`].
-    fn exe_name_matches_game(exe_file: &[u16; 260]) -> bool {
-        let len = exe_file
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(exe_file.len());
-        let name = String::from_utf16_lossy(&exe_file[..len]);
-        GAME_PROCESS_NAMES
-            .iter()
-            .any(|game_name| name.eq_ignore_ascii_case(game_name))
+        found
     }
 
     /// Walks `GetExtendedTcpTable(AF_INET, TCP_TABLE_OWNER_PID_ALL)` for the
     /// row matching `(local_ip, local_port, remote_ip, remote_port)` and
     /// returns its owning pid.
     ///
-    /// `MIB_TCPTABLE_OWNER_PID` is a C flexible-array-member struct — the
-    /// `table` field windows-rs models as `[MIB_TCPROW_OWNER_PID; 1]` is
-    /// only the *first* row; the real row count is `dwNumEntries`, and rows
-    /// beyond the first live past the end of the fixed-size struct in the
-    /// buffer this function allocates. Every row is read through a raw
-    /// pointer offset from that buffer rather than through the `table`
-    /// field, precisely so `dwNumEntries > 1` doesn't read out of bounds of
-    /// the (size-1) array type.
+    /// `MIB_TCPTABLE_OWNER_PID` is a C flexible-array-member struct, so this
+    /// deliberately does not model it as a windows-rs type at all: the raw
+    /// bytes `GetExtendedTcpTable` writes into `buffer` are handed straight
+    /// to [`find_owner_pid`], which parses the row count and every row
+    /// (`dwNumEntries` can be, and often is, greater than one) directly out
+    /// of the byte slice.
     fn owner_pid_from_table(
         local_ip: [u8; 4],
         local_port: u16,
@@ -270,67 +345,138 @@ mod windows_impl {
             if status != 0 {
                 return None;
             }
-            // SAFETY: `buffer` was just filled by a successful
-            // `GetExtendedTcpTable` call using `TCP_TABLE_OWNER_PID_ALL`,
-            // which documents its output as a `MIB_TCPTABLE_OWNER_PID`:
-            // a `u32` row count followed by that many `MIB_TCPROW_OWNER_PID`
-            // rows, back to back, with no padding between the count and the
-            // first row on this (LLP64, 4-byte-aligned `u32` fields)
-            // target. `buffer` is large enough for that whole layout because
-            // the call just reported success writing into it.
-            return unsafe {
-                find_owner_pid(&buffer, local_ip, local_port, remote_ip, remote_port)
-            };
+            // `buffer` was just filled by a successful `GetExtendedTcpTable`
+            // call using `TCP_TABLE_OWNER_PID_ALL`, which documents its
+            // output as a `MIB_TCPTABLE_OWNER_PID`: a `u32` row count
+            // followed by that many `MIB_TCPROW_OWNER_PID` rows, back to
+            // back — exactly the layout `find_owner_pid` parses.
+            return find_owner_pid(&buffer, local_ip, local_port, remote_ip, remote_port);
         }
         None
     }
+}
 
-    /// # Safety
-    /// `buffer` must hold a successfully-populated `MIB_TCPTABLE_OWNER_PID`:
-    /// a `u32` entry count at offset 0, immediately followed by that many
-    /// `MIB_TCPROW_OWNER_PID` rows.
-    unsafe fn find_owner_pid(
-        buffer: &[u8],
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds one `MIB_TCPROW_OWNER_PID`-shaped row (24 bytes): a 4-byte
+    /// `state` (unused by `find_owner_pid`, left zeroed), `local_ip`/
+    /// `remote_ip` written as plain octets (addresses are already in
+    /// network byte order, so no `htons`-style byte swap applies to them),
+    /// and each port written the way `htons` actually lays a 16-bit value
+    /// out in memory: the big-endian two-byte encoding in the field's low
+    /// two bytes, zero-padded to fill the 4-byte `u32` slot.
+    fn build_row(
         local_ip: [u8; 4],
         local_port: u16,
         remote_ip: [u8; 4],
         remote_port: u16,
-    ) -> Option<u32> {
-        if buffer.len() < size_of::<u32>() {
-            return None;
-        }
-        let num_entries = u32::from_ne_bytes(buffer[0..4].try_into().unwrap()) as usize;
-        let rows_ptr =
-            buffer.as_ptr().wrapping_add(size_of::<u32>()) as *const MIB_TCPROW_OWNER_PID;
-        let row_size = size_of::<MIB_TCPROW_OWNER_PID>();
-        let available = (buffer.len().saturating_sub(size_of::<u32>())) / row_size;
-        let num_entries = num_entries.min(available);
+        pid: u32,
+    ) -> Vec<u8> {
+        let mut row = Vec::with_capacity(TCP_ROW_SIZE);
+        row.extend_from_slice(&[0u8; 4]); // state, unused
+        row.extend_from_slice(&local_ip);
+        row.extend_from_slice(&local_port.to_be_bytes());
+        row.extend_from_slice(&[0u8; 2]);
+        row.extend_from_slice(&remote_ip);
+        row.extend_from_slice(&remote_port.to_be_bytes());
+        row.extend_from_slice(&[0u8; 2]);
+        row.extend_from_slice(&pid.to_ne_bytes());
+        assert_eq!(row.len(), TCP_ROW_SIZE);
+        row
+    }
 
-        for i in 0..num_entries {
-            // SAFETY: `i < num_entries <= available`, so `rows_ptr.add(i)`
-            // stays within `buffer` per the row layout documented on
-            // `find_owner_pid`'s safety contract, and reading a `Copy`,
-            // `repr(C)` POD struct through a suitably-aligned pointer built
-            // from a byte buffer is well-defined (no padding bytes are ever
-            // treated as anything but plain integers here).
-            let row = unsafe { rows_ptr.add(i).read_unaligned() };
-            // `dwLocalAddr`/`dwRemoteAddr`/`*Port` are stored in network byte
-            // order inside a native-endian `u32` field; `to_ne_bytes` reads
-            // back exactly the bytes the API wrote, which is already the
-            // address's byte order, and `from_be` undoes the port's 16-bit
-            // network-order packing in the low bits.
-            let row_local_ip = row.dwLocalAddr.to_ne_bytes();
-            let row_local_port = u16::from_be(row.dwLocalPort as u16);
-            let row_remote_ip = row.dwRemoteAddr.to_ne_bytes();
-            let row_remote_port = u16::from_be(row.dwRemotePort as u16);
-            if row_local_ip == local_ip
-                && row_local_port == local_port
-                && row_remote_ip == remote_ip
-                && row_remote_port == remote_port
-            {
-                return Some(row.dwOwningPid);
-            }
+    fn build_table(rows: &[Vec<u8>]) -> Vec<u8> {
+        let mut buffer = (rows.len() as u32).to_ne_bytes().to_vec();
+        for row in rows {
+            buffer.extend_from_slice(row);
         }
-        None
+        buffer
+    }
+
+    #[test]
+    fn find_owner_pid_matches_the_row_with_the_requested_four_tuple() {
+        // Port 0x1F90 (8080) is stored in network byte order: htons(8080)
+        // is the byte pair 0x1F, 0x90 — the low two bytes of the row's
+        // `dwLocalPort`/`dwRemotePort` field — which is exactly what
+        // `build_row` writes and `find_owner_pid` must undo with
+        // `u16::from_be` to recover 8080.
+        let row = build_row([127, 0, 0, 1], 8080, [93, 184, 216, 34], 443, 4321);
+        let buffer = build_table(&[row]);
+
+        let found = find_owner_pid(&buffer, [127, 0, 0, 1], 8080, [93, 184, 216, 34], 443);
+        assert_eq!(found, Some(4321));
+    }
+
+    #[test]
+    fn find_owner_pid_does_not_confuse_local_and_remote() {
+        // Swapping local/remote in the query must not still match — this
+        // would catch an accidental local/remote argument-order swap in
+        // `find_owner_pid` or its caller.
+        let row = build_row([127, 0, 0, 1], 8080, [93, 184, 216, 34], 443, 4321);
+        let buffer = build_table(&[row]);
+
+        let found = find_owner_pid(&buffer, [93, 184, 216, 34], 443, [127, 0, 0, 1], 8080);
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn find_owner_pid_scans_past_the_first_row() {
+        let first = build_row([10, 0, 0, 1], 1000, [10, 0, 0, 2], 2000, 111);
+        let second = build_row([127, 0, 0, 1], 8080, [93, 184, 216, 34], 443, 4321);
+        let buffer = build_table(&[first, second]);
+
+        let found = find_owner_pid(&buffer, [127, 0, 0, 1], 8080, [93, 184, 216, 34], 443);
+        assert_eq!(found, Some(4321));
+    }
+
+    #[test]
+    fn find_owner_pid_returns_none_when_nothing_matches() {
+        let row = build_row([10, 0, 0, 1], 1000, [10, 0, 0, 2], 2000, 111);
+        let buffer = build_table(&[row]);
+
+        let found = find_owner_pid(&buffer, [127, 0, 0, 1], 8080, [93, 184, 216, 34], 443);
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn find_owner_pid_ignores_an_entry_count_beyond_the_buffer() {
+        // A malformed/truncated `dwNumEntries` must not be trusted past what
+        // the buffer actually holds.
+        let row = build_row([127, 0, 0, 1], 8080, [93, 184, 216, 34], 443, 4321);
+        let mut buffer = build_table(&[row]);
+        buffer[0..4].copy_from_slice(&99u32.to_ne_bytes());
+
+        let found = find_owner_pid(&buffer, [127, 0, 0, 1], 8080, [93, 184, 216, 34], 443);
+        assert_eq!(found, Some(4321));
+    }
+
+    fn utf16_exe_name(name: &str) -> [u16; 260] {
+        let mut buf = [0u16; 260];
+        for (dst, src) in buf.iter_mut().zip(name.encode_utf16()) {
+            *dst = src;
+        }
+        buf
+    }
+
+    #[test]
+    fn exe_name_matches_game_is_case_insensitive() {
+        assert!(exe_name_matches_game(&utf16_exe_name("bpsr.exe")));
+        assert!(exe_name_matches_game(&utf16_exe_name("BPSR.EXE")));
+    }
+
+    #[test]
+    fn exe_name_matches_game_rejects_unrelated_names() {
+        assert!(!exe_name_matches_game(&utf16_exe_name("explorer.exe")));
+    }
+
+    #[test]
+    fn exe_name_matches_game_stops_at_the_nul_terminator() {
+        // The buffer is fixed-size and NUL-padded; trailing garbage past the
+        // terminator must not affect the match.
+        let mut buf = utf16_exe_name("BPSR.exe");
+        buf[20] = 'X' as u16;
+        assert!(exe_name_matches_game(&buf));
     }
 }

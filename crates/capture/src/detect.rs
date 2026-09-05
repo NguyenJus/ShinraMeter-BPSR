@@ -514,14 +514,22 @@ pub struct AdoptionDecision {
 /// [`decide_packet`] doesn't need two separate parameters for it (and stays
 /// under clippy's `too_many_arguments`).
 ///
-/// `game_pid` is `None` when the game's own pid has not (yet) been
-/// identified — e.g. `owner::find_game_pid` hasn't found it, or ownership
+/// `game_pids` is empty when the game's own pid(s) have not (yet) been
+/// identified — e.g. `owner::find_game_pids` hasn't found any, or ownership
 /// lookups are unsupported on this platform — in which case
 /// [`owner_allows_adoption`] always allows adoption; there is nothing to
 /// filter against.
+///
+/// This is a set, not a single pid: [`GAME_PROCESS_NAMES`](crate::owner::GAME_PROCESS_NAMES)
+/// includes generic names (e.g. `Star.exe`) that more than one running
+/// process can share, so `owner::find_game_pids` can legitimately resolve
+/// to several candidates at once. Filtering against the whole set is a
+/// strict superset of filtering against any one of them — it can only
+/// *allow* an adoption a single wrong pick would have rejected — so it
+/// keeps the same fail-open contract.
 pub struct OwnershipFilter<'a> {
     pub lookup: &'a dyn StreamOwnerLookup,
-    pub game_pid: Option<u32>,
+    pub game_pids: &'a [u32],
 }
 
 impl OwnershipFilter<'static> {
@@ -533,22 +541,23 @@ impl OwnershipFilter<'static> {
     pub fn none() -> Self {
         Self {
             lookup: &NoOwnerFilter,
-            game_pid: None,
+            game_pids: &[],
         }
     }
 }
 
 /// Whether ownership evidence permits adopting `conn` — see
 /// [`OwnershipFilter`] for the fail-open contract this implements: an
-/// unknown owner (`owner.owner_pid` returning `None`) or an unknown
-/// `game_pid` never blocks adoption, and only a *known*, non-matching owner
-/// is rejected. This asymmetry is deliberate (issue #337): a false negative
-/// here silently leaves capture dead until a manual restart, which is worse
-/// than the false positive it would take to adopt a stray secondary stream.
+/// unknown owner (`owner.owner_pid` returning `None`) or an empty
+/// `game_pids` set never blocks adoption, and only a *known* owner absent
+/// from that set is rejected. This asymmetry is deliberate (issue #337): a
+/// false negative here silently leaves capture dead until a manual restart,
+/// which is worse than the false positive it would take to adopt a stray
+/// secondary stream.
 fn owner_allows_adoption(conn: &Conn, ownership: &OwnershipFilter<'_>) -> bool {
-    let Some(game_pid) = ownership.game_pid else {
+    if ownership.game_pids.is_empty() {
         return true;
-    };
+    }
     // The adoption candidate is server→client (`signature_direction_ok`
     // already gates on this): `dst` is this machine's side, `src` the
     // server's.
@@ -556,7 +565,7 @@ fn owner_allows_adoption(conn: &Conn, ownership: &OwnershipFilter<'_>) -> bool {
     let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(conn.src)), conn.src_port);
     match ownership.lookup.owner_pid(local, remote) {
         None => true,
-        Some(pid) => pid == game_pid,
+        Some(pid) => ownership.game_pids.contains(&pid),
     }
 }
 
@@ -618,8 +627,8 @@ pub fn decide_packet(
             // Running it first meant a candidate that ownership goes on to
             // reject was blacklisted forever — it could never be
             // reconsidered even after ownership later allowed it (e.g. the
-            // game's pid changes, or `find_game_pid` resolves to a
-            // different, correct value). Checking ownership first, which
+            // game's pid changes, or `find_game_pids` resolves to a
+            // different, correct set). Checking ownership first, which
             // has no state of its own to spend, avoids burning that slot on
             // a candidate that never had a chance of being adopted anyway.
             if !owner_allows_adoption(conn, ownership)
@@ -1553,7 +1562,7 @@ mod tests {
         let mut known_server = None;
         let conn = server_to_client([203, 0, 113, 7], 5000);
         let owner = FakeOwnerLookup(Some(9999));
-        let game_pid = Some(1234u32);
+        let game_pids = [1234u32];
 
         let decision = decide_packet(
             &mut detector,
@@ -1564,7 +1573,7 @@ mod tests {
             false,
             &OwnershipFilter {
                 lookup: &owner,
-                game_pid,
+                game_pids: &game_pids,
             },
         );
         assert!(!decision.newly_adopted);
@@ -1581,7 +1590,7 @@ mod tests {
         let mut known_server = None;
         let conn = server_to_client([203, 0, 113, 7], 5000);
         let owner = FakeOwnerLookup(None);
-        let game_pid = Some(1234u32);
+        let game_pids = [1234u32];
 
         let decision = decide_packet(
             &mut detector,
@@ -1592,7 +1601,7 @@ mod tests {
             false,
             &OwnershipFilter {
                 lookup: &owner,
-                game_pid,
+                game_pids: &game_pids,
             },
         );
         assert!(decision.newly_adopted);
@@ -1605,7 +1614,7 @@ mod tests {
         let mut known_server = None;
         let conn = server_to_client([203, 0, 113, 7], 5000);
         let owner = FakeOwnerLookup(Some(1234));
-        let game_pid = Some(1234u32);
+        let game_pids = [1234u32];
 
         let decision = decide_packet(
             &mut detector,
@@ -1616,7 +1625,35 @@ mod tests {
             false,
             &OwnershipFilter {
                 lookup: &owner,
-                game_pid,
+                game_pids: &game_pids,
+            },
+        );
+        assert!(decision.newly_adopted);
+        assert_eq!(known_server, Some(conn));
+    }
+
+    #[test]
+    fn a_candidate_stream_owned_by_any_pid_in_the_game_pid_set_is_adopted() {
+        // Issue #337 (O5): `GAME_PROCESS_NAMES` includes generic names that
+        // more than one running process can match, so `game_pids` can carry
+        // several candidates at once. Ownership must allow a connection
+        // owned by *any* of them, not just the first one resolved.
+        let mut detector = ServerDetector::new();
+        let mut known_server = None;
+        let conn = server_to_client([203, 0, 113, 7], 5000);
+        let owner = FakeOwnerLookup(Some(5678));
+        let game_pids = [1234u32, 5678u32];
+
+        let decision = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &conn,
+            &login_return_payload(),
+            false,
+            false,
+            &OwnershipFilter {
+                lookup: &owner,
+                game_pids: &game_pids,
             },
         );
         assert!(decision.newly_adopted);
@@ -1631,7 +1668,7 @@ mod tests {
         // candidate the ownership filter is about to reject anyway, or the
         // connection is permanently blacklisted (and burns one of
         // `MAX_SUBNET_CONNECTIONS` slots) even though ownership would allow
-        // it moments later, e.g. once `find_game_pid` resolves correctly.
+        // it moments later, e.g. once `find_game_pids` resolves correctly.
         let known_conn = server_to_client([203, 0, 113, 7], 5000);
         let mut detector = detector_knowing(&known_conn);
         let mut known_server = None; // torn down; the subnet-reconnect path is armed
@@ -1639,6 +1676,7 @@ mod tests {
         let payload = b"payload";
 
         let owner = FakeOwnerLookup(Some(9999));
+        let game_pids = [1234u32];
         let rejected = decide_packet(
             &mut detector,
             &mut known_server,
@@ -1648,7 +1686,7 @@ mod tests {
             false,
             &OwnershipFilter {
                 lookup: &owner,
-                game_pid: Some(1234),
+                game_pids: &game_pids,
             },
         );
         assert!(!rejected.newly_adopted);
@@ -1667,7 +1705,7 @@ mod tests {
             false,
             &OwnershipFilter {
                 lookup: &owner,
-                game_pid: Some(1234),
+                game_pids: &game_pids,
             },
         );
         assert!(
