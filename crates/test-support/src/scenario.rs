@@ -255,7 +255,10 @@ impl Scenario {
     /// `WorldNtf.SyncDungeonData` (issue #139, `opcode::SYNC_DUNGEON_DATA`,
     /// `0x17`): a dungeon flow-state update. `state` is the raw
     /// `EDungeonState` wire value — see `wire::dungeon_sync_data_payload`'s
-    /// doc comment for the mapping.
+    /// doc comment for the mapping. `scene_uuid` is encoded for wire
+    /// fidelity only — the meter currently ignores it entirely (`encounter.rs`'s
+    /// handler destructures only `state`, not `scene_uuid`); there is no
+    /// scene check against it.
     pub fn dungeon_state(mut self, scene_uuid: u32, state: i32) -> Self {
         let payload = wire::dungeon_sync_data_payload(scene_uuid, state);
         let bytes = self.wrap_frame(opcode::SYNC_DUNGEON_DATA, &payload);

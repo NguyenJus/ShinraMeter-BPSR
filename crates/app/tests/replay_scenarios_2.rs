@@ -18,6 +18,15 @@
 //! here — `on_sync_dungeon_data`/`on_sync_dungeon_dirty_data` both funnel
 //! into the same `ProtocolEvent::DungeonState`, so `0x17` alone is enough to
 //! exercise the meter's reaction to it end to end.
+//!
+//! ## `was_tracked_boss`/`recompute_boss` ordering
+//!
+//! A recognized boss's first-ever hit only *becomes* `boss_uid` once
+//! `recompute_boss` runs on it — a hit that is simultaneously both the
+//! target's first-ever damage and its killing blow reads `was_tracked_boss`
+//! (computed just ahead of that recompute) as `false` and never ends the
+//! fight. A real pull always lands an ordinary hit before the kill; several
+//! scenarios below establish that ordering before landing a kill.
 
 mod common;
 
@@ -81,22 +90,21 @@ fn uid_recycle_across_pulls() {
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
         .monster_appear(M_BOSS, IGNISOR, 1_000_000, 1_000_000)
         .at(2_000)
-        // A recognized boss's first-ever hit only *becomes* `boss_uid`
-        // once `recompute_boss` runs on it — a hit that is simultaneously
-        // both the target's first-ever damage and its killing blow reads
-        // `was_tracked_boss` (computed just ahead of that recompute) as
-        // `false` and never ends the fight. A real pull always lands an
-        // ordinary hit before the kill; this establishes that ordering.
+        // See the module doc on was_tracked_boss/recompute_boss ordering.
         .hit(P_ARIA, M_BOSS, 101, 50_000)
         .at(2_100)
         .hits(M_BOSS, vec![Hit::new(P_ARIA, 101, 40_000).kill()])
         .tick()
         .capture("uid_recycle_pull1_ignisor_defeated")
-        // Much later, the same uid (2001) is handed to a completely
+        // Well within `phase_resume_window_ms` (60_000ms) of the first
+        // pull's end, the same uid (2001) is handed to a completely
         // different recognized boss for the next pull — the server
         // recycling a despawned monster's slot, not the same entity
-        // resyncing.
-        .at(120_000)
+        // resyncing. Landing inside the resume window is deliberate: it is
+        // what actually exercises uid-recycle handling instead of an
+        // ordinary NewFight reset that would happen to look the same from
+        // outside the window.
+        .at(30_000)
         .monster_appear(M_BOSS, DENVEL, 50_000_000, 50_000_000)
         .hit(P_ARIA, M_BOSS, 101, 35_000)
         .tick()
@@ -115,7 +123,7 @@ fn uid_recycle_across_pulls() {
     assert_eq!(pull1.snapshot.encounter.boss_name, Some("Ignisor"));
 
     assert_eq!(pull2.fight_state, FightState::Active);
-    assert_eq!(pull2.resets, vec![(120_000, ResetReason::NewFight)]);
+    assert_eq!(pull2.resets, vec![(30_000, ResetReason::NewFight)]);
     assert_eq!(
         pull2.snapshot.total_damage, 35_000,
         "the recycled uid's new pull must not blend onto the old occupant's 90_000"
@@ -163,6 +171,12 @@ fn dungeon_enter_leave_events() {
         // covers for `Scene`, here for `DungeonState`.
         .at(1_500)
         .hit(P_ARIA, M_BOSS, 101, 40_000)
+        // Observed before the dungeon's own "you're playing" signal
+        // arrives: the pull is already running, entirely on the ordinary
+        // `Scene`/damage path, with no reset yet at all.
+        .at(1_600)
+        .tick()
+        .capture("dungeon_pre_entry_pull_in_progress")
         .at(2_000)
         .dungeon_state(TOWERING_RUIN, DUNGEON_PLAYING)
         .tick()
@@ -182,10 +196,19 @@ fn dungeon_enter_leave_events() {
 
     let mut rig = Rig::new();
     let captures = rig.run(&scenario);
-    assert_eq!(captures.len(), 3);
-    let entered = &captures[0];
-    let ended = &captures[1];
-    let left = &captures[2];
+    assert_eq!(captures.len(), 4);
+    let pre_entry = &captures[0];
+    let entered = &captures[1];
+    let ended = &captures[2];
+    let left = &captures[3];
+
+    assert_eq!(
+        pre_entry.fight_state,
+        FightState::Active,
+        "the pull is already running before the dungeon's own Playing signal arrives"
+    );
+    assert!(pre_entry.resets.is_empty());
+    assert_eq!(pre_entry.snapshot.total_damage, 40_000);
 
     assert_eq!(entered.resets, vec![(2_000, ResetReason::DungeonStarted)]);
     assert_eq!(
@@ -230,6 +253,7 @@ fn dungeon_enter_leave_events() {
     // rather than silently accepted.
     assert_eq!(left.snapshot.encounter.scene_id, Some(TOWERING_RUIN));
 
+    assert_golden(pre_entry);
     assert_golden(entered);
     assert_golden(ended);
     assert_golden(left);
@@ -258,12 +282,7 @@ fn back_to_back_dungeons() {
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
         .monster_appear(M_BOSS, IGNISOR, 1_000_000, 1_000_000)
         .at(2_000)
-        // A recognized boss's first-ever hit only *becomes* `boss_uid`
-        // once `recompute_boss` runs on it — a hit that is simultaneously
-        // both the target's first-ever damage and its killing blow reads
-        // `was_tracked_boss` (computed just ahead of that recompute) as
-        // `false` and never ends the fight. A real pull always lands an
-        // ordinary hit before the kill; this establishes that ordering.
+        // See the module doc on was_tracked_boss/recompute_boss ordering.
         .hit(P_ARIA, M_BOSS, 101, 50_000)
         .at(2_100)
         .hits(M_BOSS, vec![Hit::new(P_ARIA, 101, 40_000).kill()])
@@ -347,12 +366,7 @@ fn app_shutdown_mid_next_pull_keeps_flushed_fight() {
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
         .monster_appear(M_BOSS, IGNISOR, 1_000_000, 1_000_000)
         .at(2_000)
-        // A recognized boss's first-ever hit only *becomes* `boss_uid`
-        // once `recompute_boss` runs on it — a hit that is simultaneously
-        // both the target's first-ever damage and its killing blow reads
-        // `was_tracked_boss` (computed just ahead of that recompute) as
-        // `false` and never ends the fight. A real pull always lands an
-        // ordinary hit before the kill; this establishes that ordering.
+        // See the module doc on was_tracked_boss/recompute_boss ordering.
         .hit(P_ARIA, M_BOSS, 101, 50_000)
         // `RetentionPolicy::default().min_duration_ms` is 5_000ms — clear
         // of the floor, like `replay_history.rs`'s `boss_kill_scenario`.
@@ -428,12 +442,7 @@ fn app_shutdown_inside_grace_window_loses_the_record() {
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
         .monster_appear(M_BOSS, IGNISOR, 1_000_000, 1_000_000)
         .at(2_000)
-        // A recognized boss's first-ever hit only *becomes* `boss_uid`
-        // once `recompute_boss` runs on it — a hit that is simultaneously
-        // both the target's first-ever damage and its killing blow reads
-        // `was_tracked_boss` (computed just ahead of that recompute) as
-        // `false` and never ends the fight. A real pull always lands an
-        // ordinary hit before the kill; this establishes that ordering.
+        // See the module doc on was_tracked_boss/recompute_boss ordering.
         .hit(P_ARIA, M_BOSS, 101, 50_000)
         // Clear of `min_duration_ms`'s 5_000ms floor, same as scenario (a).
         .at(8_000)

@@ -1,0 +1,15 @@
+scenario=dungeon_pre_entry_pull_in_progress
+at_ms=1600
+fight_state=Active
+duration_ms=100
+total_damage=40000
+total_dps=40000.00
+encounter.boss_monster_id=103
+encounter.boss_name=Ignisor
+encounter.is_boss=true
+encounter.scene_id=1101
+encounter.scene_name=Towering Ruin
+encounter.scene_boss_name=-
+resets=
+rows=1
+row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=40000 dps=40000.00 share=100.00 crit=0.00 lucky=0.00 hits=1 deaths=0
