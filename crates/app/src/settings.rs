@@ -1885,6 +1885,7 @@ mod tests {
     fn deaths_column_formats_the_plain_count() {
         let row = PlayerRow {
             uid: 7,
+            entity: 7,
             name: String::new(),
             class: None,
             damage: 0,

@@ -3281,7 +3281,8 @@ impl Meter {
     /// named in `focus` — building only `skills`, which every row needs for
     /// the always-visible Dps bar.
     ///
-    /// `focus` is the set of player uids with an open skill-breakdown
+    /// `focus` is the set of player entity ids (`EntityId.0`, issue #335 —
+    /// not the display uid) with an open skill-breakdown
     /// window (`crates/app/src/ui.rs`'s `skill_windows` keys), threaded in
     /// from the UI via `UiCommand::SkillFocus`
     /// (`crates/app/src/pipeline.rs`'s live publish loop). `None` means
@@ -3320,8 +3321,8 @@ impl Meter {
 
         let mut rows: Vec<PlayerRow> = self
             .players
-            .values()
-            .map(|p| {
+            .iter()
+            .map(|(entity, p)| {
                 let dps = p.total_damage as f64 / (dps_duration_ms as f64 / 1000.0);
                 let share_pct = if total_damage > 0 {
                     (p.total_damage as f64 / total_damage as f64 * 100.0) as f32
@@ -3338,7 +3339,8 @@ impl Meter {
                 // else gets the same empty vectors `SkillTab::rows` already
                 // returns for `Buff`, which is indistinguishable from "no
                 // events yet" to every consumer since none is looking.
-                let wants_breakdowns = focus.is_none_or(|uids| uids.contains(&p.uid));
+                let wants_breakdowns =
+                    focus.is_none_or(|entities| entities.contains(&(entity.0 as i64)));
                 let (heals, dealt, received, casts, buffs) = if wants_breakdowns {
                     (
                         breakdown_rows(&p.heals, p.total_heal, dps_duration_ms),
@@ -3352,6 +3354,7 @@ impl Meter {
                 };
                 PlayerRow {
                     uid: p.uid,
+                    entity: entity.0 as i64,
                     name: p
                         .name
                         .clone()

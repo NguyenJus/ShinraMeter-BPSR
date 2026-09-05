@@ -20,7 +20,7 @@ pub mod writer;
 
 use std::path::PathBuf;
 
-use bpsr_meter::{Class, EncounterInfo, PlayerRow, SkillRow, Snapshot};
+use bpsr_meter::{Class, EncounterInfo, EntityId, EntityKind, PlayerRow, SkillRow, Snapshot};
 
 /// Schema version this build writes and reads (spec §5.4). Bumped whenever
 /// the DDL in `sqlite::init_schema` changes.
@@ -176,6 +176,15 @@ impl PlayerRecord {
     fn to_row(&self) -> PlayerRow {
         PlayerRow {
             uid: self.uid,
+            // Issue #335: history predates full `EntityId`s, so the schema
+            // has no stored entity to replay — reconstruct the canonical
+            // one a display uid/kind would have with both flag bits clear
+            // (`EntityId::from_display_uid`), the same id a live player
+            // with no summon/mirror flags gets. Two saved rows can share a
+            // display uid (`uid_recycle_separates_entities`'s golden), but
+            // never this reconstruction plus its kind, since history only
+            // ever persists players.
+            entity: EntityId::from_display_uid(self.uid, EntityKind::Player).0 as i64,
             name: self.name.clone(),
             class: self.class,
             ability_score: self.ability_score,
@@ -383,6 +392,7 @@ mod tests {
     fn sample_row(uid: i64, name: &str) -> PlayerRow {
         PlayerRow {
             uid,
+            entity: EntityId::from_display_uid(uid, EntityKind::Player).0 as i64,
             name: name.to_string(),
             class: Some(Class::Stormblade),
             ability_score: Some(1234),

@@ -323,8 +323,9 @@ pub enum UiCommand {
     /// `pipeline::run` holds the `Send`-able half (`CaptureRestart`) and
     /// makes the request on this command's behalf.
     RestartCapture,
-    /// The uids of every player with an open skill-breakdown window, sent
-    /// whenever `OverlayApp::skill_windows`' key set changes (PR #268
+    /// The entity ids (issue #335 — not the display uid; two rows can
+    /// share one) of every player with an open skill-breakdown window,
+    /// sent whenever `OverlayApp::skill_windows`' key set changes (PR #268
     /// review, finding 2). `pipeline::run` keeps the latest one and uses it
     /// to skip building the heals/dealt/received/casts breakdowns
     /// (`bpsr_meter::Meter::snapshot_focused`) for every other player on
@@ -1069,6 +1070,7 @@ fn demo_snapshot() -> Snapshot {
             )| {
                 PlayerRow {
                     uid: i as i64 + 1,
+                    entity: i as i64 + 1,
                     name: name.to_string(),
                     class: Some(class),
                     ability_score: None,
@@ -6294,8 +6296,10 @@ fn draw_row(
     // can report an unbounded width, which is not what a row should paint
     // itself at.
     row_width: f32,
-    // Issue #16: `Some(row.uid)` when this row was right-clicked this
+    // Issue #16: `Some(row.entity)` when this row was right-clicked this
     // frame, so `draw_rows` can open (or re-show) its breakdown window.
+    // The entity id, not the display uid (issue #335) — two rows can share
+    // a uid, and the window must resolve back to this specific row.
     // `Sense::click()` (widened from `Sense::hover()`) still reports
     // `hovered()` exactly as before, so the hover gradient below is
     // unaffected; left-click stays free for the window drag, which lives
@@ -6501,7 +6505,7 @@ fn draw_row(
     // breakdown; left-click is deliberately not sensed here at all — it
     // stays free for the window drag (`WindowGesture`'s header band and
     // resize strips are the only primary-button drag surfaces).
-    response.secondary_clicked().then_some(row.uid)
+    response.secondary_clicked().then_some(row.entity)
 }
 
 /// Paints one counter pill (issue #49) so that its **right edge lands on
@@ -7870,9 +7874,11 @@ fn skill_windows_to_draw<'a>(
 ) -> Vec<(&'a PlayerRow, i64)> {
     windows
         .iter()
-        .filter_map(|(&uid, state)| {
+        .filter_map(|(&entity, state)| {
             let rows = skill_window_rows(state.source, live, history_open)?;
-            rows.iter().find(|r| r.uid == uid).map(|row| (row, uid))
+            rows.iter()
+                .find(|r| r.entity == entity)
+                .map(|row| (row, entity))
         })
         .collect()
 }
@@ -13357,6 +13363,7 @@ mod tests {
     fn sample_row(ability_score: Option<u32>) -> PlayerRow {
         PlayerRow {
             uid: 1,
+            entity: 1,
             name: String::new(),
             class: None,
             damage: 0,
@@ -14484,6 +14491,7 @@ mod tests {
         assert_eq!(fmt_pct0(100.0), "100%");
         let widest_row = PlayerRow {
             uid: 1,
+            entity: 1,
             name: String::new(),
             class: None,
             damage: 99_999_000,

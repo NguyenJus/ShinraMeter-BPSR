@@ -213,6 +213,7 @@ mod tests {
             total_dps: 500.0,
             rows: vec![PlayerRow {
                 uid: 1,
+                entity: 1,
                 name: "Alice".to_string(),
                 class: None,
                 ability_score: None,
