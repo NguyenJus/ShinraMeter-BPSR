@@ -285,14 +285,44 @@ pub fn decode_varint_i32_truncating(raw: &[u8]) -> Option<i32> {
 }
 
 /// `EActorState::ActorStateDead` (9) — the only [`attr_id::STATE`] value
-/// this crate treats as "dead"; every other actor state (skill, stiff,
-/// born, resurrection animation, etc.) reads as alive (issue #339/#272).
-/// BPSR-ZDPS `EnumEActorState.cs` (`ActorStateDead = 9`).
+/// this crate treats as "dead"; the full alive/ambiguous classification of
+/// every other state lives in [`actor_state_signal`] (issue #378,
+/// superseding #339/#272's "everything else is alive" rule). BPSR-ZDPS
+/// `EnumEActorState.cs` / `Zproto.EActorState` (`ActorStateDead = 9`).
 const ACTOR_STATE_DEAD: i32 = 9;
 
-/// Decodes [`attr_id::STATE`] off an entity's `Attr` list (issue #339/#272)
-/// into `is_dead`: `Some(true)` when the decoded state equals
-/// [`ACTOR_STATE_DEAD`], `Some(false)` for any other decoded state, `None`
+/// Classifies a raw [`attr_id::STATE`] value against the reference
+/// `Zproto.EActorState` enum (issue #378): `Some(true)` only for `Dead`
+/// (9); `Some(false)` for a state that unambiguously means the actor is up
+/// and acting/moving/idle; `None` for anything that doesn't clearly say
+/// "alive" — a down/recovering state (`Born`, `Reset`, `Breaking`,
+/// `Weakness`, `Fracture`, `Abnormal`, `Resurrection`), the `All` sentinel,
+/// the unassigned value 15, or any value outside the enum entirely.
+///
+/// Before #378, every non-dead value (known or not) decoded to
+/// `Some(false)`, which the meter read as an explicit revive and released
+/// an active wipe hold on states like `Resurrection` that are really still
+/// "down". Only genuinely alive states report `Some(false)` now; the rest
+/// report `None` ("no signal") so a wipe hold isn't released on ambiguous
+/// data.
+fn actor_state_signal(state: i32) -> Option<bool> {
+    match state {
+        ACTOR_STATE_DEAD => Some(true),
+        // Default, Singing, Skill, Jump, Rush, Climb, Swim, Fishing,
+        // Action, Stiff, SwimStiff, TelePort, Fall, Flow, Glide,
+        // PedalWall, FallTelePort, SelfPhoto, Collection, Interaction,
+        // SceneInteraction, TunnelFly, Levitation, HomelandEdit, Ride,
+        // RideControl, Instrument, Fixed.
+        0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 13 | 14 | 16 | 17 | 18 | 19 | 20 | 21
+        | 28 | 29 | 30 | 31 | 32 | 33 | 34 | 35 | 36 => Some(false),
+        // Born, unassigned 15, Reset, Breaking, Weakness, Fracture,
+        // Abnormal, Resurrection, All, and anything outside the enum.
+        _ => None,
+    }
+}
+
+/// Decodes [`attr_id::STATE`] off an entity's `Attr` list (issue #339/#272,
+/// refined by #378) into `is_dead` via [`actor_state_signal`], or `None`
 /// when the attr is absent or malformed. `decode::on_aoi_sync_delta` treats
 /// `None` as "no signal" rather than "alive" — matching this module's
 /// absent-is-not-a-value convention elsewhere (e.g. `cast_skill_id_from_attrs`).
@@ -301,7 +331,7 @@ pub fn entity_state_from_attrs(attrs: &[pb::Attr]) -> Option<bool> {
         .iter()
         .find(|attr| attr.id == attr_id::STATE && !attr.raw_data.is_empty())
         .and_then(|attr| decode_varint_i32(&attr.raw_data))
-        .map(|state| state == ACTOR_STATE_DEAD)
+        .and_then(actor_state_signal)
 }
 
 /// `raw_data` for [`attr_id::POSITION`] / [`attr_id::TARGET_POSITION`]
@@ -1597,8 +1627,8 @@ mod tests {
         assert_eq!(entity_state_from_attrs(&attrs), Some(true));
     }
 
-    /// Any other decoded actor state (e.g. `ActorStateAction = 8`) reads as
-    /// alive, not just the default state.
+    /// Any other known-alive decoded actor state (e.g. `ActorStateAction =
+    /// 8`) reads as alive, not just the default state.
     #[test]
     fn entity_state_non_dead_value_decodes_false() {
         let attrs = vec![pb::Attr {
@@ -1606,6 +1636,59 @@ mod tests {
             raw_data: vec![0x08],
         }];
         assert_eq!(entity_state_from_attrs(&attrs), Some(false));
+    }
+
+    /// `ActorStateDefault (0)` is explicitly alive.
+    #[test]
+    fn entity_state_default_decodes_false() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::STATE,
+            raw_data: vec![0x00],
+        }];
+        assert_eq!(entity_state_from_attrs(&attrs), Some(false));
+    }
+
+    /// `ActorStateSkill (2)` is explicitly alive.
+    #[test]
+    fn entity_state_skill_decodes_false() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::STATE,
+            raw_data: vec![0x02],
+        }];
+        assert_eq!(entity_state_from_attrs(&attrs), Some(false));
+    }
+
+    /// Issue #378: `ActorStateResurrection (27)` is ambiguous for a
+    /// down/recovering actor and must not be read as an explicit revive.
+    #[test]
+    fn entity_state_resurrection_is_none() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::STATE,
+            raw_data: vec![27],
+        }];
+        assert_eq!(entity_state_from_attrs(&attrs), None);
+    }
+
+    /// Issue #378: `ActorStateWeakness (24)` is ambiguous, not a revive
+    /// signal.
+    #[test]
+    fn entity_state_weakness_is_none() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::STATE,
+            raw_data: vec![24],
+        }];
+        assert_eq!(entity_state_from_attrs(&attrs), None);
+    }
+
+    /// Issue #378: a value outside the known `Zproto.EActorState` enum is
+    /// unknown, not an explicit alive signal.
+    #[test]
+    fn entity_state_unknown_value_is_none() {
+        let attrs = vec![pb::Attr {
+            id: attr_id::STATE,
+            raw_data: vec![200, 1], // varint-encoded 200
+        }];
+        assert_eq!(entity_state_from_attrs(&attrs), None);
     }
 
     #[test]
