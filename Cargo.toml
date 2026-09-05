@@ -7,6 +7,17 @@ strip = true
 lto = "thin"
 codegen-units = 1
 
+# The debug/test target dir was growing ~16 GB/day: full DWARF for every
+# workspace binary *and* every dependency, re-linked per worktree. Line tables
+# alone keep panic backtraces' `file:line`, which is all these builds are ever
+# debugged with, and dependencies need no debuginfo at all. `[profile.test]`
+# inherits from `dev`, so `cargo test` is covered too.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [workspace.dependencies]
 prost = "0.14"
 bytes = "1"

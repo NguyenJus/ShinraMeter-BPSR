@@ -8,28 +8,37 @@ the unit tests in `crates/protocol` and `crates/meter`, these exercise the
 same `bpsr_app::pipeline::Pipeline` the real binary drives, wired the same
 way `main.rs` wires it.
 
+All of it is one integration-test target, `crates/app/tests/replay/main.rs`,
+whose scenario modules live in `crates/app/tests/replay/` and whose shared
+harness is `crates/app/tests/common/mod.rs`. One binary rather than one per
+file keeps the debug target dir from growing by a per-scenario-file
+executable (roughly 340 MB each under the previous full-debuginfo profile,
+still tens of MB each with line tables only); the cost is that test names
+are module-qualified, so a single test is run as
+`cargo test -p ShinraMeter-BPSR replay_pull::multi_player_pull`.
+
 ## What's covered
 
-- `crates/app/tests/replay_pull.rs` — a fight pull with multiple players,
+- `crates/app/tests/replay/replay_pull.rs` — a fight pull with multiple players,
   a boss-kill title change, and a pull whose bytes arrive split across
   multiple TCP segments (`tcp_segmented_pull`), exercising reassembly
   ordering.
-- `crates/app/tests/replay_lifecycle.rs` — fight-state transitions: a boss
+- `crates/app/tests/replay/replay_lifecycle.rs` — fight-state transitions: a boss
   HP rollback that should auto-reset the fight, a server-change reset, an
   idle-timeout freeze, and pet damage credited to its owner.
-- `crates/app/tests/replay_entities.rs` — entity identity (issue #335): two
+- `crates/app/tests/replay/replay_entities.rs` — entity identity (issue #335): two
   distinct entities wearing the same display uid (`uuid >> 16`) — a recycled
   uid, or a shadow/mirror copy — must keep separate rows and totals rather
   than blending into one.
-- `crates/app/tests/replay_dump.rs` — replays a real, sanitized packet
+- `crates/app/tests/replay/replay_dump.rs` — replays a real, sanitized packet
   capture (not a hand-built scenario) through the same pipeline. See
   "Replaying a real capture" below.
-- `crates/app/tests/replay_scenarios.rs` — issue #342's first batch of
+- `crates/app/tests/replay/replay_scenarios.rs` — issue #342's first batch of
   scenarios not covered above: starting mid-instance (no `EnterScene` before
   damage), a server change landing in a *new* dungeon mid-pull, a party wipe
   followed by a re-pull, a world boss holding a pull open through a long
   lull, and a curated multi-phase boss transition.
-- `crates/app/tests/replay_scenarios_2.rs` — issue #342's second batch: a
+- `crates/app/tests/replay/replay_scenarios_2.rs` — issue #342's second batch: a
   monster uid recycled onto an unrelated boss for the next pull, a
   dungeon's own enter/leave flow signals (`SyncDungeonData`) alongside an
   ordinary scene change out to the open world, two dungeons pulled back to
@@ -78,7 +87,7 @@ confirm it now passes. Never hand-edit a golden file.
 
 ## Replaying a real capture
 
-`crates/app/tests/replay_dump.rs` replays
+`crates/app/tests/replay/replay_dump.rs` replays
 `crates/app/tests/fixtures/dump-2976-boss-fight.jsonl.zst` — a ~209s window
 of one real boss fight (monster id 1152, "Kartgriff", in scene id 8,
 "Asterleeds") from a real, sanitized packet capture — through

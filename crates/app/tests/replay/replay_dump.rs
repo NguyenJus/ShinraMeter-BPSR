@@ -46,12 +46,10 @@
 //! one Notify body), so this test enters at `common::Rig::feed_notify`
 //! (`decode_notify -> Pipeline::step`), not `Rig::run`'s TCP-byte seam.
 
-mod common;
-
 use std::path::Path;
 
+use crate::common::{Capture, Rig, assert_golden};
 use bpsr_protocol::dump_format;
-use common::{Capture, Rig, assert_golden};
 
 /// The real boss this fixture's window is built around. The single most
 /// valuable thing this test proves: the encounter title resolves to the

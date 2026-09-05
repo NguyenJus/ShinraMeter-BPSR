@@ -8,11 +8,9 @@
 //! end (`common::Rig`: bytes -> `TcpReassembler` -> `Decoder` -> `Pipeline`)
 //! and pin the result against a golden.
 
-mod common;
-
+use crate::common::{Rig, assert_golden};
 use bpsr_test_support::scenario::{Hit, Scenario};
 use bpsr_test_support::wire::{player_uuid, prof};
-use common::{Rig, assert_golden};
 
 const P_ARIA: i64 = 1001;
 const P_BRIN: i64 = 1002;

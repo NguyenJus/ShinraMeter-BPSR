@@ -11,12 +11,10 @@
 //! enter/leave events, back-to-back dungeons, and app shutdown mid-fight —
 //! the second batch of issue #342.
 
-mod common;
-
+use crate::common::{Rig, assert_golden};
 use bpsr_meter::{FightState, ResetReason};
 use bpsr_test_support::scenario::{Hit, Scenario};
 use bpsr_test_support::wire::prof;
-use common::{Rig, assert_golden};
 
 const P_ARIA: i64 = 1001;
 const P_BRIN: i64 = 1002;
