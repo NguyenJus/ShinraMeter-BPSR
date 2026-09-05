@@ -1646,18 +1646,7 @@ impl Meter {
             // scene check was vestigial, this one's is not. Scene 7152 picks
             // the wipe hold up regardless, via issue #313's
             // `DUNGEON_SCENE_IDS` addition.
-            if self.party_is_wiped()
-                && self.in_dungeon_scene()
-                && self.engaged_boss_still_up(d.timestamp_ms)
-            {
-                self.latch_fight_end(
-                    FightEndCause::Wipe,
-                    d.timestamp_ms,
-                    d.timestamp_ms,
-                    self.boss_monster_id(),
-                );
-                self.wipe_hold = true;
-            }
+            self.latch_wipe_if_party_down(d.timestamp_ms);
         }
 
         // issue #245: the per-tab breakdowns the skill window's Heal,
@@ -2712,6 +2701,32 @@ impl Meter {
         stats.last_death_ms = Some(timestamp_ms);
     }
 
+    /// Latches the wipe hold (issue #154) if the death just recorded left
+    /// the whole party down inside an engaged dungeon fight. Shared by
+    /// `apply_damage`'s `DamageEvent::is_dead` path and
+    /// `apply_entity_state`'s `AttrState`-dead path (issue #366 review,
+    /// finding O6) — a wipe whose final death arrives only as an
+    /// `AttrState` delta (no `DamageEvent` at all) must latch exactly the
+    /// same way a damage-event death does, or the meter is left running
+    /// past the end of the pull until the idle timeout eventually takes it.
+    ///
+    /// See the call site in `apply_damage` for the gating rationale
+    /// (`party_is_wiped` + `in_dungeon_scene` + `engaged_boss_still_up`).
+    fn latch_wipe_if_party_down(&mut self, timestamp_ms: u64) {
+        if self.party_is_wiped()
+            && self.in_dungeon_scene()
+            && self.engaged_boss_still_up(timestamp_ms)
+        {
+            self.latch_fight_end(
+                FightEndCause::Wipe,
+                timestamp_ms,
+                timestamp_ms,
+                self.boss_monster_id(),
+            );
+            self.wipe_hold = true;
+        }
+    }
+
     /// Routes a decoded `AttrState` (issue #339/#272) into the same
     /// explicit death/revive machinery `DamageEvent::is_dead` and `Revive`
     /// use. Players and monsters take different paths — a player's death
@@ -2726,7 +2741,21 @@ impl Meter {
         match kind {
             EntityKind::Player => {
                 if is_dead {
-                    self.record_death(uid, timestamp_ms);
+                    // issue #366 review, finding O5: `record_death` opens a
+                    // roster row via `entry`/`or_insert_with` for whatever
+                    // uid it's given — fine for `DamageEvent::is_dead`,
+                    // whose target is necessarily someone this meter has
+                    // already seen act, but an `AttrState` delta can name
+                    // any uid in AOI range, including a bystander this
+                    // meter has never otherwise recorded. Guard with the
+                    // same `contains_key` check the `Monster` arm below
+                    // already uses, so a stranger's death never opens a row
+                    // — matching `apply_revive`'s doc'd rule that these
+                    // views must never create one.
+                    if self.players.contains_key(&uid) {
+                        self.record_death(uid, timestamp_ms);
+                        self.latch_wipe_if_party_down(timestamp_ms);
+                    }
                 } else if let Some(stats) = self.players.get_mut(&uid) {
                     // Explicit signal, not the inferred "next action" path —
                     // see `PlayerStats::set_alive`'s `explicit` parameter.
@@ -6854,6 +6883,27 @@ mod tests {
             assert_eq!(m.fight_state(1_100), FightState::Idle);
         }
 
+        /// Issue #366 review, finding O5: an `AttrState` delta can name any
+        /// uid in AOI range, including a bystander this meter has never
+        /// otherwise recorded — the `Monster` arm above already guards on
+        /// `self.enemies.contains_key`, and the `Player` arm must guard the
+        /// same way on `self.players.contains_key` rather than opening a
+        /// roster row via `record_death`'s `entry` API.
+        #[test]
+        fn attr_state_dead_for_an_unknown_player_does_not_open_a_roster_row() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::EntityState {
+                uid: 999,
+                kind: EntityKind::Player,
+                is_dead: true,
+                timestamp_ms: 1_000,
+            });
+            assert!(
+                m.snapshot(1_100).rows.iter().all(|r| r.uid != 999),
+                "a stranger's death must never open a roster row"
+            );
+        }
+
         #[test]
         fn a_trash_mob_dying_does_not_end_the_fight() {
             let mut m = Meter::new();
@@ -7545,6 +7595,34 @@ mod tests {
                 snap.duration_ms, 5_000,
                 "frozen at the wipe (6_000) minus the first hit (1_000)"
             );
+        }
+
+        /// Issue #366 review, finding O6: a wipe's final death can arrive
+        /// with no `DamageEvent` at all — only a decoded `AttrState` delta
+        /// (the PR's motivating case). The wipe latch must fire exactly
+        /// the same way it does when both deaths come from damage events.
+        #[test]
+        fn a_wipe_whose_final_death_is_attr_state_only_still_latches() {
+            let mut m = pull();
+            m.apply(&killing_blow(1, 5_000));
+            assert_eq!(
+                m.fight_state(5_500),
+                FightState::Active,
+                "one player down is not a wipe"
+            );
+
+            m.apply(&ProtocolEvent::EntityState {
+                uid: 2,
+                kind: EntityKind::Player,
+                is_dead: true,
+                timestamp_ms: 6_000,
+            });
+            assert_eq!(
+                m.fight_state(6_500),
+                FightState::Ended,
+                "the AttrState-only death must latch the wipe just like a DamageEvent death"
+            );
+            assert_eq!(m.snapshot(66_000).duration_ms, 5_000);
         }
 
         #[test]
