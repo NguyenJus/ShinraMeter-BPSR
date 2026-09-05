@@ -201,7 +201,7 @@ needed to cover that path for everyone.
 
 ## Limitation: the synthetic scenarios are not a substitute for live verification
 
-Every byte in `replay_pull.rs`/`replay_lifecycle.rs`'s scenarios is built
+Every byte in `replay_pull.rs`/`replay_lifecycle.rs`/`replay_scenarios.rs`'s scenarios is built
 from our own understanding of the protocol (the same builders used in
 `crates/protocol`'s unit tests), not captured from a real client. That means
 this suite proves the pipeline behaves *consistently* with what we believe

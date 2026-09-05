@@ -188,10 +188,10 @@ fn wipe_then_re_pull() {
         .at(2_000)
         .hit(P_ARIA, M_BOSS, 101, 50_000)
         // The boss's next swing kills the (only) player: `party_is_wiped`
-        // (down/roster >= 80%) is unanimous with a single player, so this
-        // latches the wipe hold.
+        // requires all party members down, which a single player trivially
+        // satisfies, so this latches the wipe hold.
         .at(3_000)
-        .monster_hits_player(M_BOSS, P_ARIA, 999, 80_000, true)
+        .monster_hits_player(P_ARIA, Hit::new(M_BOSS, 999, 80_000).kill())
         .tick()
         .capture("wipe_hold_engaged")
         // Past `FightConfig::post_end_grace_ms` (2s), so this is not just
