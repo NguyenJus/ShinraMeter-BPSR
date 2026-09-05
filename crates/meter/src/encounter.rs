@@ -2877,9 +2877,17 @@ impl Meter {
     /// decision reads `EnemyState`/`recompute_boss` — but `is_dead` means
     /// the same thing on both.
     ///
-    /// `record_death`'s own debounce (`DEATH_DEBOUNCE_MS`) already protects
-    /// against double-counting when this and a `DamageEvent::is_dead` on the
-    /// same kill both land close together, so no extra guard is needed here.
+    /// The `Player` arm below gates a dead signal on two conditions before
+    /// calling `record_death`: the row must already exist (`players.get`,
+    /// not `entry`/`or_insert_with`) so a bystander this meter never
+    /// otherwise recorded can't have a row opened just because an
+    /// `AttrState` named them dead, and the player must be currently
+    /// recorded alive (`p.alive`). That second guard is load-bearing on its
+    /// own: `record_death`'s debounce is only the 2s `DEATH_DEBOUNCE_MS`
+    /// window, not an already-dead check, so a repeated `AttrState` dead
+    /// broadcast arriving more than 2s after the first (e.g. a resend on
+    /// reconnect) is otherwise indistinguishable from a second, real death
+    /// and would double-count it.
     fn apply_entity_state(
         &mut self,
         entity: EntityId,
@@ -2901,7 +2909,15 @@ impl Meter {
                     // already uses, so a stranger's death never opens a row
                     // — matching `apply_revive`'s doc'd rule that these
                     // views must never create one.
-                    if self.players.contains_key(&entity) {
+                    //
+                    // `record_death`'s own guard is only the 2s
+                    // `DEATH_DEBOUNCE_MS` window, not an already-dead check
+                    // — a repeated `AttrState` dead broadcast arriving more
+                    // than 2s after the first (e.g. a resend on reconnect)
+                    // would otherwise double-count the same death. Only
+                    // route a dead signal through when this player is
+                    // currently recorded alive.
+                    if self.players.get(&entity).is_some_and(|p| p.alive) {
                         self.record_death(entity, entity.display_uid(), timestamp_ms);
                         self.latch_wipe_if_party_down(timestamp_ms);
                     }
@@ -2915,14 +2931,16 @@ impl Meter {
             EntityKind::Monster => {
                 if is_dead && self.enemies.contains_key(&entity) {
                     self.mark_enemy_dead(entity);
-                    self.recompute_boss();
+                    // issue #210/#211: captured *before* `recompute_boss`,
+                    // which ranks a living recognized boss above a dead one
+                    // — so the instant `mark_enemy_dead` above stamps this
+                    // uid's death order, any other recognized boss already
+                    // damaged and still alive outranks the corpse and
+                    // `recompute_boss` moves `boss_entity` off it. Mirrors
+                    // the capture in `apply_damage`/`apply_enemy_hp`.
                     let was_tracked_boss = self.boss_entity == Some(entity);
-                    let is_engaged = was_tracked_boss
-                        || self
-                            .enemies
-                            .get(&entity)
-                            .is_some_and(|e| is_engaged_recognized_boss(e, timestamp_ms));
-                    if self.fight_cfg.end_on_boss_death && is_engaged {
+                    self.recompute_boss();
+                    if self.fight_cfg.end_on_boss_death && was_tracked_boss {
                         self.end_fight_on_boss_death(entity, timestamp_ms);
                     }
                 }
@@ -3085,8 +3103,20 @@ impl Meter {
     /// the encounter is frozen for review/history (`record_fight_end`), and
     /// a departure in that post-end grace window must not rewrite it — the
     /// next pull clears `players` via `reset(NewFight)` on its own.
+    ///
+    /// Exempts `Meter::local_uid`: this is the local player's own meter, so
+    /// a `TeamMemberLeft` naming them (a kick or a disband mid-fight) must
+    /// never prune their own row.
     fn apply_team_member_left(&mut self, uid: i64) {
         if !self.in_dungeon_scene() || self.fight_end_ms().is_some() {
+            return;
+        }
+        // A `NotifyLeaveTeam` naming the local player (a kick or a
+        // disband mid-fight) must not delete this meter's own row — the
+        // local player's damage stays visible, and `local_uid` is never
+        // cleared (see its doc comment) so there is no "they actually
+        // left" reading of this signal for that one uid.
+        if Some(uid) == self.local_uid {
             return;
         }
         // `players` is keyed on `EntityId` (issue #335) while the team
@@ -3131,13 +3161,20 @@ impl Meter {
     /// unrelated bystanders' damage rows. Also gated on
     /// `fight_end_ms.is_some()`, for the same post-end-freeze reason as
     /// `apply_team_member_left`.
+    ///
+    /// Exempts `Meter::local_uid` the same way `apply_team_member_left`
+    /// does: a roster push that omits the local player (e.g. a kick or
+    /// disband mid-fight) must not prune their own row — this is the local
+    /// player's own meter.
     fn apply_team_roster(&mut self, members: &[i64]) {
         if members.is_empty() || !self.in_dungeon_scene() || self.fight_end_ms().is_some() {
             return;
         }
         let mut pruned = 0u32;
+        let local_uid = self.local_uid;
         self.players.retain(|entity, p| {
-            let keep = members.contains(&entity.display_uid());
+            let keep =
+                members.contains(&entity.display_uid()) || Some(entity.display_uid()) == local_uid;
             if !keep && p.total_damage == 0 && p.hits == 0 && p.deaths == 0 {
                 pruned += 1;
             }
@@ -5769,6 +5806,37 @@ mod tests {
             m.apply(&death_hit(1, 2, 1000 + DEATH_DEBOUNCE_MS));
             let snap = m.snapshot(2000 + DEATH_DEBOUNCE_MS);
             assert_eq!(snap.rows.iter().find(|r| r.uid == 2).unwrap().deaths, 2);
+        }
+
+        /// Regression: the `Player` arm of `apply_entity_state` must only
+        /// route a dead `AttrState` signal through `record_death` while
+        /// this player is currently recorded alive. Two dead signals for
+        /// the same player 3s apart (outside `DEATH_DEBOUNCE_MS`, so the
+        /// debounce alone cannot save this) with no revive in between must
+        /// still count one death, not two — the second is a resend of the
+        /// same death, not a new one.
+        #[test]
+        fn a_second_attr_state_dead_signal_without_a_revive_does_not_double_count() {
+            let mut m = Meter::new();
+            // Open the row so uid 2's death is not the "unknown player"
+            // no-op case above.
+            m.apply(&dmg(2, 100, 0));
+            m.apply(&ProtocolEvent::EntityState {
+                entity: pk(2),
+                uid: 2,
+                kind: EntityKind::Player,
+                is_dead: true,
+                timestamp_ms: 1_000,
+            });
+            m.apply(&ProtocolEvent::EntityState {
+                entity: pk(2),
+                uid: 2,
+                kind: EntityKind::Player,
+                is_dead: true,
+                timestamp_ms: 1_000 + 3_000,
+            });
+            let snap = m.snapshot(1_000 + 3_000 + 1_000);
+            assert_eq!(snap.rows.iter().find(|r| r.uid == 2).unwrap().deaths, 1);
         }
 
         #[test]
@@ -9282,6 +9350,43 @@ mod tests {
 
             assert_eq!(m.preload_count, 0);
         }
+
+        /// Regression: `local_uid` (issue #344) is never cleared and is
+        /// never in a real `TeamMemberLeft`/`TeamRoster` reading of "this
+        /// player left" — see the doc comments on both handlers. A
+        /// `TeamMemberLeft` naming the local player, or a `TeamRoster` that
+        /// simply omits them, must not prune this meter's own row, even
+        /// though every other absent member is pruned as usual.
+        #[test]
+        fn local_player_row_survives_team_member_left_and_team_roster() {
+            let mut m = Meter::new();
+            in_dungeon(&mut m);
+            m.apply(&ProtocolEvent::LocalPlayer { uid: 1 });
+            m.apply(&damage_from(1, 0));
+            m.apply(&player_info(2, "Bravo"));
+
+            m.apply(&ProtocolEvent::TeamMemberLeft { uid: 1 });
+            let snap = m.snapshot(1_000);
+            assert!(
+                snap.rows.iter().any(|r| r.uid == 1),
+                "TeamMemberLeft naming the local player must not drop their row"
+            );
+
+            // A full-roster sync that omits the local uid: every other
+            // absent member (uid 2) is pruned as usual, but the local row
+            // stays. Non-empty and naming neither uid 1 nor uid 2, since an
+            // empty roster is its own no-op special case (see
+            // `an_empty_team_roster_is_a_no_op` above).
+            m.apply(&ProtocolEvent::TeamRoster { members: vec![99] });
+            let mut uids: Vec<i64> = m.snapshot(2_000).rows.iter().map(|r| r.uid).collect();
+            uids.sort();
+            assert_eq!(
+                uids,
+                vec![1],
+                "TeamRoster omitting the local uid must still keep their row \
+                 while pruning everyone else"
+            );
+        }
     }
 
     /// Issue #210/#211: a boss-select raid scene lets the party pick which
@@ -9455,6 +9560,54 @@ mod tests {
                 m.fight_end_ms(),
                 Some(kill_ts),
                 "Origin's death must still end the fight"
+            );
+            assert_eq!(m.fight_end_boss_id(), Some(ORIGIN));
+        }
+
+        /// Same shape as the test above, but the tracked boss's death
+        /// arrives only as an `AttrState`-decoded dead signal
+        /// (`Meter::apply_entity_state`'s `Monster` arm), never a
+        /// `DamageEvent::is_dead`. Regression for the same defect 2 that
+        /// test guards, isolated to this entry point: `was_tracked_boss`
+        /// must be captured *before* `recompute_boss` runs, or
+        /// `recompute_boss` has already moved `boss_entity` onto
+        /// Continuation (still alive, still damaged) by the time the
+        /// tracked-boss guard is checked, and the fight-end is silently
+        /// dropped.
+        #[test]
+        fn attr_state_death_of_the_tracked_selection_still_ends_the_fight_even_though_the_other_selection_was_engaged_long_ago_and_left_alone()
+         {
+            let mut m = in_raid();
+            // Origin carries the bigger pool, so it is the tracked boss.
+            m.apply(&hp(10, 2_000_000, 2_000_000, ORIGIN, 0));
+            m.apply(&hp(11, 1_000_000, 1_000_000, CONTINUATION, 0));
+            m.apply(&hit(10, 1_000, false));
+            m.apply(&hit(11, 1_100, false));
+            assert_eq!(
+                m.boss_entity,
+                Some(ek(10)),
+                "Origin, the larger pool, is tracked"
+            );
+
+            let step = idle() - 1_000; // comfortably inside the idle timeout
+            let mut ts = 1_100;
+            while ts <= 1_100 + BOSS_ENGAGEMENT_WINDOW_MS {
+                ts += step;
+                m.apply(&hit(10, ts, false));
+            }
+            let kill_ts = ts + step;
+            m.apply(&ProtocolEvent::EntityState {
+                entity: ek(10),
+                uid: 10,
+                kind: EntityKind::Monster,
+                is_dead: true,
+                timestamp_ms: kill_ts,
+            });
+
+            assert_eq!(
+                m.fight_end_ms(),
+                Some(kill_ts),
+                "Origin's AttrState-only death must still end the fight"
             );
             assert_eq!(m.fight_end_boss_id(), Some(ORIGIN));
         }
