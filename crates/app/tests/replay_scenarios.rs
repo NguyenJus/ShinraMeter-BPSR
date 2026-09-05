@@ -85,6 +85,7 @@ fn starting_mid_instance() {
         "the pull's earlier damage must survive the scene finally being learned"
     );
     assert_eq!(learned.snapshot.rows.len(), 1);
+    assert_eq!(learned.fight_state, FightState::Active);
 
     assert_golden(no_scene);
     assert_golden(learned);
@@ -113,6 +114,12 @@ fn server_change_mid_pull_new_dungeon() {
         .hit(P_ARIA, M_BOSS, 101, 40_000)
         .at(10_000)
         .inject(bpsr_protocol::ProtocolEvent::ServerChanged)
+        // A tick between the reconnect and the new instance's `Scene`
+        // packet, matching the real TICK_INTERVAL (100ms) — without it the
+        // cut-short fight is destroyed before `record_fight_end` observes
+        // it, an ordering that can't happen live.
+        .at(10_500)
+        .tick()
         // The reconnect lands in a different instance, not the one just
         // left: `ResetReason::SceneChanged` fires right here, before any
         // new damage.
@@ -167,6 +174,12 @@ fn server_change_mid_pull_new_dungeon() {
 /// resumes instead of resetting.
 #[test]
 fn wipe_then_re_pull() {
+    // A trash monster (not in `tables::is_boss_monster`) encountered during
+    // the wipe hold — `withholds_after_wipe` must drop a hit on it rather
+    // than treat it as a re-pull.
+    const TRASH: u32 = 10_900;
+    const M_TRASH: i64 = 2_003;
+
     let scenario = Scenario::new("wipe_then_re_pull")
         .at(1_000)
         .enter_scene(TOWERING_RUIN)
@@ -181,6 +194,15 @@ fn wipe_then_re_pull() {
         .monster_hits_player(M_BOSS, P_ARIA, 999, 80_000, true)
         .tick()
         .capture("wipe_hold_engaged")
+        // Past `FightConfig::post_end_grace_ms` (2s), so this is not just
+        // the tail of the wipe's own packet stream, but still well inside
+        // the wipe hold's release window: a hit on an unrecognized trash
+        // monster must be withheld, not read as a re-pull.
+        .at(5_500)
+        .monster_appear(M_TRASH, TRASH, 10_000, 10_000)
+        .hit(P_ARIA, M_TRASH, 101, 5_000)
+        .tick()
+        .capture("wipe_hold_withholds_trash_hit")
         // Well inside `WIPE_HOLD_RELEASE_MS` (60s), and well past
         // `FightConfig::post_end_grace_ms` (2s) so this reads as a genuine
         // re-pull rather than the tail of the wipe's own packet stream: the
@@ -192,9 +214,10 @@ fn wipe_then_re_pull() {
 
     let mut rig = Rig::new();
     let captures = rig.run(&scenario);
-    assert_eq!(captures.len(), 2);
+    assert_eq!(captures.len(), 3);
     let wiped = &captures[0];
-    let repulled = &captures[1];
+    let trash_hit = &captures[1];
+    let repulled = &captures[2];
 
     assert_eq!(wiped.fight_state, FightState::Ended);
     assert!(
@@ -208,6 +231,22 @@ fn wipe_then_re_pull() {
     );
     assert_eq!(wiped.snapshot.rows.len(), 1);
 
+    assert_eq!(
+        trash_hit.fight_state,
+        FightState::Ended,
+        "a hit on an unrecognized trash monster does not resume or reset the held wipe"
+    );
+    assert!(
+        trash_hit.resets.is_empty(),
+        "the trash hit is withheld, not treated as a new fight: {:?}",
+        trash_hit.resets
+    );
+    assert_eq!(
+        trash_hit.snapshot.total_damage, 50_000,
+        "the withheld trash hit must not be added onto the wiped attempt's numbers"
+    );
+    assert_eq!(trash_hit.snapshot.rows.len(), 1);
+
     assert_eq!(repulled.fight_state, FightState::Active);
     assert_eq!(repulled.resets, vec![(6_000, ResetReason::NewFight)]);
     assert_eq!(
@@ -217,6 +256,7 @@ fn wipe_then_re_pull() {
     assert_eq!(repulled.snapshot.rows.len(), 1);
 
     assert_golden(wiped);
+    assert_golden(trash_hit);
     assert_golden(repulled);
 }
 
