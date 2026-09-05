@@ -22,6 +22,13 @@ pub(crate) fn draw_header(
     settings: SettingsHandle<'_>,
     icons: &Icons,
     gesture: &mut WindowGesture,
+    // Issue #340: last frame's measured header band (`OverlayApp::header_
+    // rect`), or `None` before the first frame — the same value the
+    // resize-border double-click and the "Reset to defaults"/default-size
+    // helpers size against via `measured_header_band_height`, so the band
+    // this frame paints (and the wash it derives from) can never disagree
+    // with what those other paths think the header occupies.
+    previous_header_rect: Option<egui::Rect>,
     // Issue #156: whether a Share screenshot capture is currently in
     // flight (the request was fired and its `Event::Screenshot` reply has
     // not landed yet) — threaded down to `toggle_cluster` so the toggle
@@ -70,7 +77,7 @@ pub(crate) fn draw_header(
     // The header band's height budget — also what `draw_header_wash` and the
     // paint clips below size themselves against, so the whole band is one
     // number derived once rather than several that could drift apart.
-    let band_height = header_band_height(ui.spacing().interact_size.y);
+    let band_height = measured_header_band_height(previous_header_rect);
 
     // The panel's own full-width rect, captured before the band below
     // narrows it to the drag band's height — the background wash (issue #59,
@@ -245,6 +252,7 @@ pub(crate) fn draw_header(
                     settings: &mut *settings.settings,
                     tx_settings: settings.tx_settings,
                 },
+                previous_header_rect,
                 icons,
                 update_check,
                 tx_log_export,
@@ -4112,7 +4120,7 @@ mod tests {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(default_inner_width(), default_inner_height()),
+                egui::vec2(default_inner_width(), default_inner_height(None)),
             )),
             ..Default::default()
         };
@@ -4132,6 +4140,7 @@ mod tests {
                 },
                 &icons,
                 &mut WindowGesture::default(),
+                None,
                 false,
                 true,
                 &mut UpdateCheckState::default(),
@@ -4413,7 +4422,7 @@ mod tests {
         // `first_player_row_top_offset`'s doc comment — so this independent
         // sum needs both, not one.
         let expected = band + SEPARATOR_HEIGHT + rows + 2.0 * ITEM_SPACING_Y;
-        assert_eq!(default_inner_height(), expected);
+        assert_eq!(default_inner_height(None), expected);
         // Issue #91 grew this from `652.0` -> `658.0` (a 2pt taller title
         // line, and `HEADER_STAT_ROW_GAP` above the stat row in place of
         // `ITEM_SPACING_Y`) -> `676.0` here: the band now reserves the
@@ -4422,7 +4431,7 @@ mod tests {
         // of the 20 rows it promises. Issue #297 then grew it to `678.0`:
         // the missing second `ITEM_SPACING_Y` around the separator was a
         // real 2pt gap at the banner/body seam, not just a test bug.
-        assert_eq!(default_inner_height(), 678.0);
+        assert_eq!(default_inner_height(None), 678.0);
     }
 
     #[test]
@@ -4432,7 +4441,7 @@ mod tests {
         // `first_player_row_top_offset`'s doc comment.
         let expected =
             header_band_height(BUTTON_ROW_HEIGHT) + SEPARATOR_HEIGHT + rows + 2.0 * ITEM_SPACING_Y;
-        assert_eq!(reset_to_defaults_inner_height(), expected);
+        assert_eq!(reset_to_defaults_inner_height(None), expected);
     }
 
     /// The chevron lives entirely in the strip `header_text_rect` reserves

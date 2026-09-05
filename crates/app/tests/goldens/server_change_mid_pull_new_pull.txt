@@ -1,0 +1,15 @@
+scenario=server_change_mid_pull_new_pull
+at_ms=12000
+fight_state=Active
+duration_ms=1
+total_damage=30000
+total_dps=30000.00
+encounter.boss_monster_id=103
+encounter.boss_name=Ignisor
+encounter.is_boss=true
+encounter.scene_id=1001
+encounter.scene_name=Tina's Mindrealm
+encounter.scene_boss_name=-
+resets=SceneChanged@11000
+rows=1
+row uid=1002 name=Brin class=FrostMage ability_score=11500 season_strength=- imagines=[-,-] damage=30000 dps=30000.00 share=100.00 crit=0.00 lucky=0.00 hits=1 deaths=0

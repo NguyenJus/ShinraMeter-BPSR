@@ -2047,7 +2047,8 @@ mod tests {
     #[test]
     fn rows_painted_boxes_are_exactly_row_height_apart() {
         let snapshot = rows_test_snapshot(DEFAULT_VISIBLE_ROWS);
-        let frame = rows_painted_boxes(&snapshot, default_inner_width(), default_inner_height());
+        let frame =
+            rows_painted_boxes(&snapshot, default_inner_width(), default_inner_height(None));
         let rows = frame.row_rects();
         assert_eq!(
             rows.len(),
@@ -2089,6 +2090,7 @@ mod tests {
             total_dps: row.dps,
             rows: vec![row.clone()],
             encounter: EncounterInfo::default(),
+            local_uid: None,
             capture_alive: true,
         };
 
@@ -2096,7 +2098,7 @@ mod tests {
             &snapshot,
             &settings,
             default_inner_width(),
-            default_inner_height(),
+            default_inner_height(None),
         );
 
         // Painted whole, exactly as `name_suffix` composed it, with the

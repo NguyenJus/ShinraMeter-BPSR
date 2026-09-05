@@ -931,11 +931,11 @@ mod tests {
         // window issue #91 inherited would also have passed.
         let chrome = header_band_height(BUTTON_ROW_HEIGHT) + SEPARATOR_HEIGHT + ITEM_SPACING_Y;
         assert!(
-            default_inner_height() - chrome >= rows_only,
+            default_inner_height(None) - chrome >= rows_only,
             "default height {} leaves only {}pt under the {chrome}pt of header \
              chrome — short of the {rows_only}pt the {DEFAULT_VISIBLE_ROWS} rows need",
-            default_inner_height(),
-            default_inner_height() - chrome
+            default_inner_height(None),
+            default_inner_height(None) - chrome
         );
     }
 
@@ -949,11 +949,11 @@ mod tests {
         let rows_only = RESET_TO_DEFAULTS_VISIBLE_ROWS as f32 * ROW_HEIGHT;
         let chrome = header_band_height(BUTTON_ROW_HEIGHT) + SEPARATOR_HEIGHT + ITEM_SPACING_Y;
         assert!(
-            reset_to_defaults_inner_height() - chrome >= rows_only,
+            reset_to_defaults_inner_height(None) - chrome >= rows_only,
             "reset height {} leaves only {}pt under the {chrome}pt of header \
              chrome — short of the {rows_only}pt the {RESET_TO_DEFAULTS_VISIBLE_ROWS} rows need",
-            reset_to_defaults_inner_height(),
-            reset_to_defaults_inner_height() - chrome
+            reset_to_defaults_inner_height(None),
+            reset_to_defaults_inner_height(None) - chrome
         );
     }
 

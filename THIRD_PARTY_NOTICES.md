@@ -98,10 +98,12 @@ WinDivert's LGPL-3.0 option is compatible.
 
 ## BPSR-ZDPS skill icons
 
-- Files: `crates/app/assets/skills/*.png` — 387 of the 446 icon basenames
-  referenced by `crates/meter/data/SkillOverridesIcons.json` and
-  `crates/meter/data/SkillTableIcons.json` together. The 59 remaining
-  references have no image upstream at all: some are not asset names (upstream
+- Files: `crates/app/assets/skills/*.png` — 386 PNG files covering 387 of the
+  446 icon basenames referenced by `crates/meter/data/SkillOverridesIcons.json`
+  and `crates/meter/data/SkillTableIcons.json` together (`weapon_sf-01_skill_03`
+  is a byte-identical alias of `weapon_sf-01_kx05` and shares its file rather
+  than being redistributed a second time — see `scripts/_skill_aliases.py`).
+  The 59 remaining references have no image upstream at all: some are not asset names (upstream
   stores the prose "From Shield Combo talent" in one row's `Icon` field), the
   rest name art the client ships in an atlas BPSR-ZDPS does not extract
   (`talent_skill_*`, `weapon_iruna_*`). Only the icons the meter can actually

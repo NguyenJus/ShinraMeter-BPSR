@@ -863,6 +863,10 @@ pub(crate) fn draw_header_menu(
     ctx: &egui::Context,
     tx_command: &Sender<UiCommand>,
     settings: SettingsHandle<'_>,
+    // Issue #340: last frame's measured header band, threaded down to the
+    // "Reset to defaults" row so the height it resizes to is derived from
+    // the band the header actually painted rather than a constant budget.
+    previous_header_rect: Option<egui::Rect>,
     icons: &Icons,
     // Issue #171: the manual "Check for updates" item's in-flight/last-
     // result state — see `UpdateCheckState`'s doc comment.
@@ -909,6 +913,7 @@ pub(crate) fn draw_header_menu(
                     tx_command,
                     settings,
                     tx_settings,
+                    previous_header_rect,
                     icons,
                     update_check,
                     tx_log_export,
@@ -940,6 +945,7 @@ fn draw_menu_root(
     tx_command: &Sender<UiCommand>,
     settings: &mut Settings,
     tx_settings: &Sender<Settings>,
+    previous_header_rect: Option<egui::Rect>,
     icons: &Icons,
     update_check: &mut UpdateCheckState,
     tx_log_export: &Sender<LogExportOutcome>,
@@ -1085,8 +1091,10 @@ fn draw_menu_root(
 
     // The whole-session handover: logs plus the packet-inspection dump
     // ring, `settings.json`, and a `manifest.json` describing all of it.
-    // `history.sqlite` is deliberately never included (plaintext party
-    // member names) and `manifest.json` says so. Same dialog-inline /
+    // The raw `history.sqlite` is deliberately never included (plaintext
+    // party member names) — a sanitized copy with stable pseudonyms in
+    // place of names is included instead (issue #347), and
+    // `manifest.json` says so either way. Same dialog-inline /
     // copy-on-a-spawned-thread split as "Export logs", and the same reply
     // channel.
     if menu_row(
@@ -1103,7 +1111,7 @@ fn draw_menu_root(
         if let Some(dest) =
             crate::platform::choose_bundle_export_path(bundle::EXPORT_BUNDLE_DEFAULT_DIRNAME)
         {
-            start_bundle_export(dest, tx_log_export.clone());
+            start_bundle_export(dest, settings.history_enabled, tx_log_export.clone());
         }
         ui.close();
     }
@@ -1216,7 +1224,7 @@ fn draw_menu_root(
     {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
             default_inner_width(),
-            reset_to_defaults_inner_height(),
+            reset_to_defaults_inner_height(previous_header_rect),
         )));
         settings.reset_to_defaults();
         for slot in ImageSlot::ALL {
@@ -1449,6 +1457,7 @@ mod tests {
                     settings: &mut settings,
                     tx_settings: &tx_settings,
                 },
+                None,
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
@@ -2162,6 +2171,7 @@ mod tests {
                     },
                     &icons,
                     &mut gesture,
+                    None,
                     false,
                     true,
                     &mut update_check,
