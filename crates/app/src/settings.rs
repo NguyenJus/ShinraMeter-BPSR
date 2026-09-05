@@ -94,13 +94,13 @@ impl ColumnKind {
     pub fn sample_text(self) -> &'static str {
         match self {
             ColumnKind::AbilityScore => "1234",
-            ColumnKind::SeasonStrength => "+12",
+            ColumnKind::SeasonStrength => "12",
             ColumnKind::Damage => "1.23M",
-            ColumnKind::Dps => "12.3k",
+            ColumnKind::Dps => "12.3K/s",
             ColumnKind::SharePct => "34.5%",
-            ColumnKind::CritPct => "48.2%",
-            ColumnKind::LuckyPct => "9.1%",
-            ColumnKind::Hits => "1,204",
+            ColumnKind::CritPct => "48%",
+            ColumnKind::LuckyPct => "9%",
+            ColumnKind::Hits => "1.20K",
             ColumnKind::Deaths => "2",
         }
     }
@@ -2142,5 +2142,69 @@ mod tests {
             ),
             (42, 7, 1_234)
         );
+    }
+
+    /// A shape-only fingerprint of a formatted stat: whether it carries a
+    /// decimal point, a thousands separator, a trailing percent sign, a
+    /// trailing "/s", and (if any) its abbreviation suffix letter. Two
+    /// strings with the same fingerprint could plausibly come out of the
+    /// same formatter even though the digits themselves differ — which is
+    /// exactly the level `ColumnKind::sample_text`'s doc comment promises:
+    /// "shaped like" the real formatter's output, not a frozen snapshot of
+    /// one specific value.
+    fn format_shape(s: &str) -> (bool, bool, bool, bool, Option<char>) {
+        let has_dot = s.contains('.');
+        let has_comma = s.contains(',');
+        let has_percent = s.contains('%');
+        let has_slash_s = s.ends_with("/s");
+        let stripped = s.strip_suffix("/s").unwrap_or(s);
+        let suffix = stripped
+            .trim_end_matches('%')
+            .chars()
+            .last()
+            .filter(|c| c.is_ascii_alphabetic());
+        (has_dot, has_comma, has_percent, has_slash_s, suffix)
+    }
+
+    /// Issue #120's samples claim to be shaped like what `ColumnKind::spec`'s
+    /// real formatter would produce. This runs a representative value
+    /// through each column's actual formatter and checks the sample matches
+    /// its shape: same decimal-point/comma/percent/"/s" presence, and (for
+    /// the abbreviated columns) the same K/M/B-style suffix letter.
+    #[test]
+    fn sample_text_matches_the_real_formatters_shape() {
+        let row = PlayerRow {
+            uid: 1,
+            name: "Tester".to_owned(),
+            class: None,
+            ability_score: Some(1234),
+            season_strength: Some(12),
+            imagines: [None, None],
+            imagine_tiers: [None, None],
+            damage: 1_234_567,
+            dps: 12_345.0,
+            share_pct: 34.5,
+            crit_pct: 48.4,
+            lucky_pct: 9.4,
+            hits: 1_204,
+            deaths: 2,
+            dead_ms: None,
+            skills: Vec::new(),
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
+            buffs: Vec::new(),
+        };
+
+        for col in ColumnKind::ALL {
+            let sample = col.sample_text();
+            let real = (col.spec().text)(&row);
+            assert_eq!(
+                format_shape(sample),
+                format_shape(&real),
+                "{col:?}: sample {sample:?} does not match real formatter output {real:?} in shape"
+            );
+        }
     }
 }

@@ -286,10 +286,10 @@ pub(crate) enum MenuNav {
 /// pointer: the hierarchy is exactly one level deep by design (§1 of the
 /// redesign — no nested popups, no nested pages), so a back row needs no
 /// wiring of its own and a third page can be added without touching this.
-pub(crate) fn next_page(current: MenuPage, nav: MenuNav) -> MenuPage {
-    match (current, nav) {
-        (_, MenuNav::Back) => MenuPage::Root,
-        (_, MenuNav::Open(page)) => page,
+pub(crate) fn next_page(nav: MenuNav) -> MenuPage {
+    match nav {
+        MenuNav::Back => MenuPage::Root,
+        MenuNav::Open(page) => page,
     }
 }
 
@@ -903,7 +903,7 @@ pub(crate) fn draw_header_menu(
         });
 
     if let Some(nav) = nav {
-        ctx.data_mut(|data| data.insert_temp(page_id, next_page(page, nav)));
+        ctx.data_mut(|data| data.insert_temp(page_id, next_page(nav)));
     }
 }
 
@@ -1253,6 +1253,21 @@ fn draw_menu_root(
 /// The back row shares its line with a column-scoped "Reset" (see
 /// `reset_columns_to_default`), enabled only when the set actually
 /// differs from the default.
+/// Whether the Columns page's Reset button should be enabled: `true` iff
+/// some column's visibility actually differs from `Settings::default`.
+///
+/// Order-insensitive by construction: `Settings::toggle` re-enabling a
+/// column pushes it to the end of `visible_columns` rather than restoring
+/// its original slot, so a plain `Vec` comparison against the default
+/// would leave Reset lit up after an off-then-on toggle that changed
+/// nothing about which columns are actually visible.
+fn columns_differ_from_default(settings: &Settings) -> bool {
+    let default_settings = Settings::default();
+    ColumnKind::ALL
+        .iter()
+        .any(|col| settings.is_visible(*col) != default_settings.is_visible(*col))
+}
+
 fn draw_columns_page(
     ui: &mut egui::Ui,
     settings: &mut Settings,
@@ -1261,7 +1276,7 @@ fn draw_columns_page(
     let mut nav = None;
     let mut changed = false;
 
-    let reset_enabled = settings.visible_columns != Settings::default().visible_columns;
+    let reset_enabled = columns_differ_from_default(settings);
     ui.horizontal(|ui| {
         ui.set_min_height(MENU_ROW_HEIGHT);
         let back_width = (ui.available_width() - MENU_COLUMNS_RESET_WIDTH).max(1.0);
@@ -1454,16 +1469,14 @@ mod tests {
     #[test]
     fn next_page_opens_a_page_and_back_always_returns_to_root() {
         assert_eq!(
-            next_page(MenuPage::Root, MenuNav::Open(MenuPage::Columns)),
+            next_page(MenuNav::Open(MenuPage::Columns)),
             MenuPage::Columns
         );
         assert_eq!(
-            next_page(MenuPage::Root, MenuNav::Open(MenuPage::Backgrounds)),
+            next_page(MenuNav::Open(MenuPage::Backgrounds)),
             MenuPage::Backgrounds
         );
-        for page in [MenuPage::Root, MenuPage::Columns, MenuPage::Backgrounds] {
-            assert_eq!(next_page(page, MenuNav::Back), MenuPage::Root, "{page:?}");
-        }
+        assert_eq!(next_page(MenuNav::Back), MenuPage::Root);
         assert_eq!(MenuPage::default(), MenuPage::Root);
     }
 
