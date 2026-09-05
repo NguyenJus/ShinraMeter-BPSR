@@ -10,14 +10,12 @@
 //! `Rig`/`Scenario` — never wall-clock — so a recorded `ended_at_ms` and the
 //! retention math built on it stay exactly reproducible.
 
-mod common;
-
+use crate::common::{Rig, assert_history_golden};
 use bpsr_app::history::sqlite::SqliteHistory;
 use bpsr_app::history::writer::{HistoryEvent, HistoryHandle};
 use bpsr_app::history::{EncounterRecord, EncounterSummary, HistoryStore, RetentionPolicy};
 use bpsr_test_support::scenario::{Hit, Scenario};
 use bpsr_test_support::wire::prof;
-use common::{Rig, assert_history_golden};
 
 const P_ARIA: i64 = 1001;
 const P_BRIN: i64 = 1002;

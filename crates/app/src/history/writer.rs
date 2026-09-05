@@ -75,7 +75,7 @@ impl HistoryHandle {
     /// a broken or unwritable history file costs the user history and
     /// nothing else (issue #39; never panic, never stall the overlay).
     ///
-    /// This is also the integration-test seam: `tests/replay_history.rs`
+    /// This is also the integration-test seam: `tests/replay/replay_history.rs`
     /// cannot see `#[cfg(test)]` items of this library (`SqliteHistory::
     /// in_memory` stays test-only for WP1's unit tests), so rather than
     /// growing a Cargo feature for one test binary, that test simply calls

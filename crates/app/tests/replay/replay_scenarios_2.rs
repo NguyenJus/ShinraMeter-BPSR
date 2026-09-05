@@ -28,15 +28,13 @@
 //! fight. A real pull always lands an ordinary hit before the kill; several
 //! scenarios below establish that ordering before landing a kill.
 
-mod common;
-
+use crate::common::{Rig, assert_golden};
 use bpsr_app::history::sqlite::SqliteHistory;
 use bpsr_app::history::{HistoryStore, RetentionPolicy};
 use bpsr_meter::{FightState, ResetReason};
 use bpsr_protocol::ProtocolEvent;
 use bpsr_test_support::scenario::{Hit, Scenario};
 use bpsr_test_support::wire::prof;
-use common::{Rig, assert_golden};
 use std::path::PathBuf;
 
 /// Deletes the backing sqlite file on drop, so a temp db is cleaned up even

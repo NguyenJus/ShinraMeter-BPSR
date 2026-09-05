@@ -53,7 +53,7 @@ const TICK_INTERVAL_MS: u64 = 100;
 /// How far past the last replayed record's `ts_ms` synthetic ticks
 /// continue, so a trailing idle timeout gets the chance to fire before
 /// `--snapshot-at-end` takes its snapshot — mirrors
-/// `crates/app/tests/replay_dump.rs`'s `POST_FIXTURE_TICK_MARGIN_MS`
+/// `crates/app/tests/replay/replay_dump.rs`'s `POST_FIXTURE_TICK_MARGIN_MS`
 /// (comfortably past the meter's 9s default idle timeout).
 const TAIL_MARGIN_MS: u64 = 20_000;
 

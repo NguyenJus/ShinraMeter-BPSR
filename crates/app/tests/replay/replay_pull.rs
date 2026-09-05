@@ -11,12 +11,10 @@
 //! out-of-order segment — asserted against the *same* golden file to prove
 //! reassembly is transparent to the meter (`tcp_segmented_pull`).
 
-mod common;
-
+use crate::common::{Rig, assert_golden};
 use bpsr_meter::FightState;
 use bpsr_test_support::scenario::{Delivery, Hit, Scenario, Step};
 use bpsr_test_support::wire::prof;
-use common::{Rig, assert_golden};
 
 // Shared uids for this file's scenarios. `common/mod.rs` (Slice B) doesn't
 // define these — the plan's fallback rule (§5 Slice C) is to put a missing

@@ -14,7 +14,7 @@ contain only the modeled opcodes with player names and ids pseudonymised,
 and are safe to attach to an issue or a session bundle. A dump written with
 `dump_sanitize: false` holds raw player names and identifying traffic (see
 `.gitignore`) and must never be attached; extract only the minimal bytes
-needed as a synthetic fixture under `crates/protocol/tests/common/` instead.
+needed as a synthetic fixture under `crates/test-support/src/wire.rs` instead.
 For protocol discovery (unmodeled opcodes, undecodable payloads) set
 `dump_sanitize: false` and `SHINRA_INSPECT=1`. On startup the app sweeps
 prior sessions' dumps from the inspect directory: anything older than 7 days
@@ -337,7 +337,7 @@ decode is inert in practice until someone runs the Setup procedure above
 during an in-party session and confirms `GrpcTeamNtf` Notify fragments show
 up (or don't) alongside the main service's. If they do, the fixture-based
 unit/integration tests already in `crates/protocol/src/decode.rs` and
-`crates/protocol/tests/framing.rs` (synthetic payloads only — see below) are
+`crates/protocol/tests/protocol/framing.rs` (synthetic payloads only — see below) are
 the regression coverage; if the traffic never appears in a real capture, or
 its shape doesn't match the field-tag table, that's the next thing to fix
 here.
@@ -348,7 +348,7 @@ Once a constant is confirmed:
 
 1. Extract the minimal bytes that demonstrate it from the dump — a single
    `Attr`/Notify's worth, not the whole session — and add a fixture builder
-   to `crates/protocol/tests/common/mod.rs` alongside the existing ones
+   to `crates/test-support/src/wire.rs` alongside the existing ones
    (`varint_attr`, `notify`, etc.), plus a regression test that decodes it.
 2. Add the constant to `attr_id` / `opcode` in `crates/protocol/src/attrs.rs`
    / `crates/protocol/src/decode.rs`, with a comment noting it was confirmed

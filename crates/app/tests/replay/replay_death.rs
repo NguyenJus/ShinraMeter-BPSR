@@ -7,12 +7,10 @@
 //!
 //! Scripted `now_ms` values only — never wall-clock.
 
-mod common;
-
+use crate::common::{Rig, assert_golden};
 use bpsr_meter::FightState;
 use bpsr_test_support::scenario::Scenario;
 use bpsr_test_support::wire::prof;
-use common::{Rig, assert_golden};
 
 const P_ARIA: i64 = 1001;
 const P_BRIN: i64 = 1002;
