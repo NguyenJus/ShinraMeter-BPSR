@@ -107,11 +107,13 @@ pub enum Lifecycle {
     Idle,
     /// A fight is in progress, started at `since_ms`.
     Active { since_ms: u64 },
-    /// The fight is over and its stats are frozen as of `at_ms`. `cause` is
-    /// `Some` for every fight end (issue #336 step 2 stores the
-    /// `FightEndCause` `latch_fight_end` is given, alongside the timestamp
-    /// fields it always latched) — `None` only when no fight has ended
-    /// since the last reset, which this arm is never reached for anyway.
+    /// The fight is over and its stats are frozen as of `at_ms`. `cause`
+    /// is usually `Some` (issue #336 step 2 stores the `FightEndCause`
+    /// `latch_fight_end` is given, alongside the timestamp fields it always
+    /// latched), but can be `None`: `Meter::lifecycle` derives an
+    /// idle-timeout end from `fight_ended_at` before `tick` has run
+    /// `latch_fight_end` for it, so this arm is reachable with no cause
+    /// latched yet in that window.
     Ended {
         at_ms: u64,
         cause: Option<FightEndCause>,

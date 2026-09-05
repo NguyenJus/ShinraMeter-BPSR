@@ -2,13 +2,13 @@
 //! produces the UI-facing `Snapshot` (plan §T2.1/T2.2).
 //!
 //! Where the *fight* is in its lifecycle — running, ended, held after a
-//! wipe — is stored in one place, [`Meter::lifecycle`]'s
+//! wipe — is stored in one place, `fight_lifecycle`'s
 //! [`crate::fight::FightLifecycle`], and moved only by that type's named
 //! transitions (issue #336 step 3). Read it through the accessors
 //! (`fight_start_ms`, `fight_end_ms`, `is_held`, `fight_end_cause`, …) or
-//! through the `now_ms`-relative [`Meter::lifecycle`]/[`Meter::fight_state`]
+//! through the `now_ms`-relative [`Meter::lifecycle()`]/[`Meter::fight_state`]
 //! views, which additionally fold in the idle-timeout end that
-//! [`Meter::fight_ended_at`] derives before anything latches it.
+//! `fight_ended_at` derives before anything latches it.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -363,12 +363,12 @@ pub struct Meter {
     /// [`Self::fight_end_boss_id`], [`Self::fight_end_cause`],
     /// [`Self::is_held`], [`Self::hold_kind`]) are unchanged in name,
     /// signature and meaning; they pattern-match this instead of reading a
-    /// field. [`Self::fight_state`] and [`Self::lifecycle`] stay
+    /// field. [`Self::fight_state`] and [`Self::lifecycle()`] stay
     /// `now_ms`-relative on top of it, because the idle-timeout end is
-    /// still *derived* ([`Self::fight_ended_at`]) rather than latched at
+    /// still *derived* (`fight_ended_at`) rather than latched at
     /// the instant it becomes true — a caller that only ever calls
     /// `snapshot` must still see the hold.
-    lifecycle: FightLifecycle,
+    fight_lifecycle: FightLifecycle,
     /// Identity of the fight currently on the board (issue #152): the
     /// recognized boss it is against and the scene it is being fought in,
     /// captured while the fight is *live* by `recompute_boss`.
@@ -469,7 +469,7 @@ impl Meter {
             boss_uid: None,
             scene_id: None,
             last_known_scene_id: None,
-            lifecycle: FightLifecycle::Idle,
+            fight_lifecycle: FightLifecycle::Idle,
             fight_identity: None,
             deaths_seen: 0,
             reset_cfg: ResetConfig::default(),
@@ -816,7 +816,7 @@ impl Meter {
     /// deterministic. Callers persisting this as a timestamp are relying on that
     /// and on nothing else.
     pub fn fight_end_ms(&self) -> Option<u64> {
-        self.lifecycle.end_ms()
+        self.fight_lifecycle.end_ms()
     }
 
     /// When the currently-running (or currently-held) fight started, in the
@@ -831,23 +831,24 @@ impl Meter {
     /// `bpsr_app::pipeline::Pipeline::record_fight_end` is exactly that
     /// caller.
     pub fn fight_start_ms(&self) -> Option<u64> {
-        self.lifecycle.start_ms()
+        self.fight_lifecycle.start_ms()
     }
 
     /// The monster id whose death latched the currently-held fight's end,
     /// if that is what ended it (or, since issue #316, the recognized boss
-    /// an idle-timeout end left engaged) — see the `fight_end_boss_id`
-    /// field doc for the full arming story. `None` while a fight is
-    /// running, or once it ended some other way.
+    /// an idle-timeout end left engaged) — see [`FightLifecycle::Ended`]'s
+    /// `boss_id` field doc for the full arming story. `None` while a fight
+    /// is running, or once it ended some other way.
     fn fight_end_boss_id(&self) -> Option<u32> {
-        self.lifecycle.phase_resume_boss_id()
+        self.fight_lifecycle.phase_resume_boss_id()
     }
 
     /// When the currently-held fight's end was actually latched, as
-    /// opposed to when it happened (`fight_end_ms`) — see the
-    /// `fight_end_observed_ms` field doc for why those two can diverge.
+    /// opposed to when it happened (`fight_end_ms`) — see
+    /// [`FightLifecycle::Ended`]'s `observed_ms` field doc for why those
+    /// two can diverge.
     fn fight_end_observed_ms(&self) -> Option<u64> {
-        self.lifecycle.end_observed_ms()
+        self.fight_lifecycle.end_observed_ms()
     }
 
     /// Whether the current (or most recently held) fight ended in a party
@@ -857,20 +858,20 @@ impl Meter {
     /// Cleared by `reset` and by leaving the instance, same as the hold
     /// itself.
     pub fn is_held(&self) -> bool {
-        self.lifecycle.hold_kind().is_some()
+        self.fight_lifecycle.hold_kind().is_some()
     }
 
     /// Which hold, if any, [`Self::is_held`] names. Only one exists today
     /// (issue #336): [`HoldKind::Wipe`].
     pub fn hold_kind(&self) -> Option<HoldKind> {
-        self.lifecycle.hold_kind()
+        self.fight_lifecycle.hold_kind()
     }
 
     /// Why the currently-held (or most recently ended) fight ended — the
     /// stored counterpart of [`Self::fight_end_ms`], set by the same
-    /// [`Self::latch_fight_end`] call and cleared everywhere that field is.
-    /// `None` while a fight is running, or once no fight has ended since
-    /// the last reset.
+    /// [`Self::latch_fight_end`] call and cleared by the same
+    /// `FightLifecycle::reset`. `None` while a fight is running, or once no
+    /// fight has ended since the last reset.
     ///
     /// Issue #336 step 2: this used to re-derive a lossy subset of the
     /// answer from `is_held()` — every cause but `Wipe` was logged once and
@@ -878,7 +879,7 @@ impl Meter {
     /// every [`FightEndCause`] variant survives to this point, not only the
     /// one the wipe hold happens to also track.
     pub fn fight_end_cause(&self) -> Option<FightEndCause> {
-        self.lifecycle.end_cause()
+        self.fight_lifecycle.end_cause()
     }
 
     /// Whether a fight is currently running, as of `now_ms` — the `Active`
@@ -1168,15 +1169,15 @@ impl Meter {
                     if entering_dungeon {
                         self.enemies.clear();
                         self.boss_uid = None;
-                        // issue #316: `fight_end_boss_id` arms phase resume
-                        // by looking a hit's target up in `enemies`, which
-                        // this just emptied — leaving it set would have the
+                        // issue #316: `FightLifecycle`'s `boss_id` arms phase
+                        // resume by looking a hit's target up in `enemies`,
+                        // which this just emptied — leaving it set would have the
                         // new instance's first hit on anything read as
                         // "undecided" (`target_monster_id` unknown) and get
                         // withheld by `withholds_new_fight` until the window
                         // lapsed on its own, dropping every event in
                         // between. Mirrors the `ServerChanged` arm below.
-                        self.lifecycle.disarm_phase_resume();
+                        self.fight_lifecycle.disarm_phase_resume();
                         self.clear_dungeon_instance_state();
                     }
 
@@ -1201,7 +1202,7 @@ impl Meter {
                     // destination whose reset *did* run has already had it
                     // cleared by `reset` itself.
                     if !tables::is_dungeon_scene(*level_map_id) {
-                        self.lifecycle.release_hold();
+                        self.fight_lifecycle.release_hold();
                     }
                 }
                 self.scene_id = Some(*level_map_id);
@@ -1259,12 +1260,12 @@ impl Meter {
                 self.boss_uid = None;
                 // issue #316: same reason as the `Scene` arm's
                 // `entering_dungeon` clear above — a reconnect empties
-                // `enemies`, and a stale `fight_end_boss_id` armed against
-                // it would withhold the reconnecting player's first hit
+                // `enemies`, and a stale `FightLifecycle` `boss_id` armed
+                // against it would withhold the reconnecting player's first hit
                 // (and every one after it) as "undecided" until the resume
                 // window expired on its own, instead of starting the next
                 // fight immediately.
-                self.lifecycle.disarm_phase_resume();
+                self.fight_lifecycle.disarm_phase_resume();
                 // issue #139: as invalid across a reconnect as
                 // `enemies`/`boss_uid` — the new server session may not
                 // even land back in the same dungeon, let alone the same
@@ -1281,7 +1282,7 @@ impl Meter {
                 // recognize anything. Leaving the instance hands the hold
                 // back to issue #78's ordinary rule, where the next real
                 // hit clears it.
-                self.lifecycle.release_hold();
+                self.fight_lifecycle.release_hold();
 
                 None
             }
@@ -1547,7 +1548,7 @@ impl Meter {
         // `ProtocolEvent::EnemyHp`, so looking it up here sees exactly what
         // looking it up after the bookkeeping would.
         if self.resumes_held_fight(d) {
-            self.lifecycle.resume();
+            self.fight_lifecycle.resume();
         }
 
         // Real combat activity — a player landing a hit — is the *only*
@@ -1673,7 +1674,7 @@ impl Meter {
                     d.timestamp_ms,
                     self.boss_monster_id(),
                 );
-                self.lifecycle.hold(HoldKind::Wipe);
+                self.fight_lifecycle.hold(HoldKind::Wipe);
             }
         }
 
@@ -1753,7 +1754,7 @@ impl Meter {
         self.last_event_ms = self.last_event_ms.max(d.timestamp_ms);
 
         if self.fight_start_ms().is_none() {
-            self.lifecycle.start(d.timestamp_ms);
+            self.fight_lifecycle.start(d.timestamp_ms);
         }
 
         self.accumulate_damage_stats(d);
@@ -1922,7 +1923,7 @@ impl Meter {
             // `latch_fight_end` works out for itself — `boss_uid` may
             // already have moved onto a living boss this very death
             // promoted.
-            self.lifecycle
+            self.fight_lifecycle
                 .arm_phase_resume(monster_id.expect("recognized implies monster_id is Some"));
             return;
         }
@@ -2034,7 +2035,7 @@ impl Meter {
             FightEndCause::IdleTimeout => self.engaged_boss_monster_id(),
             _ => None,
         };
-        if !self.lifecycle.end(end_ms, observed_ms, cause, armed) {
+        if !self.fight_lifecycle.end(end_ms, observed_ms, cause, armed) {
             return;
         }
         log::info!("{}", fight_end_log(cause, boss_monster_id));
@@ -2414,9 +2415,9 @@ impl Meter {
     ///
     /// `fight_end_ms` is the wipe: `withholds_after_wipe` is only ever
     /// consulted from the `NewFight` gate, which already requires a held
-    /// fight, and `wipe_hold` is only ever set alongside that latch. A
-    /// missing latch therefore cannot happen, and reading it as "not yet
-    /// released" if it somehow did is the conservative answer.
+    /// fight, and `FightLifecycle`'s hold is only ever set alongside that
+    /// latch. A missing latch therefore cannot happen, and reading it as
+    /// "not yet released" if it somehow did is the conservative answer.
     fn wipe_hold_released(&self, now_ms: u64) -> bool {
         self.fight_end_ms()
             .is_some_and(|end_ms| now_ms.saturating_sub(end_ms) >= WIPE_HOLD_RELEASE_MS)
@@ -2428,8 +2429,8 @@ impl Meter {
     /// Every condition is load-bearing:
     ///
     /// * a fight is being held, and it was ended by a *boss death* — an
-    ///   idle-timeout end leaves `fight_end_boss_id` `None` and never
-    ///   resumes;
+    ///   idle-timeout end leaves `FightLifecycle`'s `boss_id` `None` and
+    ///   never resumes;
     /// * a player is landing a real (non-heal) hit on a monster — the same
     ///   gate the `NewFight` reset uses, so a monster swinging at the party
     ///   in town cannot resume anything;
@@ -2472,8 +2473,8 @@ impl Meter {
     /// * the target's `monster_id` is **not known yet**. Packet order is not
     ///   guaranteed, so the first swing at the next phase can decode before
     ///   the `EnemyHp` that names it. Undecidable is not "new fight": clearing
-    ///   here would also drop `fight_end_boss_id`, so the resume could never
-    ///   be retried once the id arrived.
+    ///   here would also drop `FightLifecycle`'s `boss_id`, so the resume
+    ///   could never be retried once the id arrived.
     ///
     /// Withholding only defers — it never extends the hold. The window's own
     /// expiry ends it, after which every player hit clears the fight exactly
@@ -2998,7 +2999,7 @@ impl Meter {
                         e.timestamp_ms,
                         self.boss_monster_id(),
                     );
-                    self.lifecycle.hold(HoldKind::Wipe);
+                    self.fight_lifecycle.hold(HoldKind::Wipe);
                 }
                 // issue #78: while the last fight's stats are held, a boss HP
                 // bar refilling (the corpse resyncing, or the next party
@@ -3259,7 +3260,7 @@ impl Meter {
         // transition rather than six stores, which is exactly the
         // cleared-only-some-of-them defect class issue #336 step 3
         // removes.
-        self.lifecycle.reset();
+        self.fight_lifecycle.reset();
         self.last_reset_ms = Some(now_ms);
         // No enemy has `took_damage` anymore, so this clears `boss_uid`.
         // Otherwise a stale `boss_uid` from the previous pull would still
