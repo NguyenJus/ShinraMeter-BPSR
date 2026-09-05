@@ -1,6 +1,8 @@
 scenario=starting_mid_instance_scene_learned
 at_ms=2500
 fight_state=Active
+fight_end_cause=-
+hold_kind=-
 duration_ms=1500
 total_damage=60000
 total_dps=40000.00

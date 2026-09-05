@@ -1,6 +1,8 @@
 scenario=server_change_mid_pull_new_pull
 at_ms=12000
 fight_state=Active
+fight_end_cause=-
+hold_kind=-
 duration_ms=1
 total_damage=30000
 total_dps=30000.00

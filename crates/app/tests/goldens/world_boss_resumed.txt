@@ -1,6 +1,8 @@
 scenario=world_boss_resumed
 at_ms=10600
 fight_state=Active
+fight_end_cause=-
+hold_kind=-
 duration_ms=9600
 total_damage=85000
 total_dps=8854.17

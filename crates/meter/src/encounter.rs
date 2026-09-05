@@ -412,6 +412,17 @@ pub struct Meter {
     /// hit is a phase change, and a stale armed id there withheld every hit
     /// until the window lapsed on its own.
     fight_end_boss_id: Option<u32>,
+    /// Why the fight recorded in `fight_end_ms` ended (issue #336 step 2).
+    /// Set once by [`Meter::latch_fight_end`], which every end path already
+    /// funnels through carrying the cause it is about to log — before this
+    /// field the cause reached that log line and nowhere else, so
+    /// [`Meter::fight_end_cause`] could only re-derive the one cause a
+    /// separate flag happened to preserve (`wipe_hold`) and answered `None`
+    /// for every other.
+    ///
+    /// Cleared everywhere `fight_end_ms` is, so it can never name the cause
+    /// of a fight that has already been reset away.
+    fight_end_cause: Option<FightEndCause>,
     /// Whether the fight was ended by a **party wipe** and the attempt is
     /// being held for review (issue #154). A wipe is the end of a pull, not
     /// a reset: the rows freeze exactly as they do on a boss kill, and this
@@ -541,6 +552,7 @@ impl Meter {
             fight_end_ms: None,
             fight_end_observed_ms: None,
             fight_end_boss_id: None,
+            fight_end_cause: None,
             wipe_hold: false,
             fight_identity: None,
             deaths_seen: 0,
@@ -938,16 +950,18 @@ impl Meter {
         self.is_held().then_some(HoldKind::Wipe)
     }
 
-    /// Why the currently-held fight ended, when today's stored fields can
-    /// still tell it apart after the fact — right now, only whether it was
-    /// a wipe. `None` while a fight is running, and also `None` for an
-    /// ended fight whose cause was something other than a wipe: every
-    /// [`FightEndCause`] is logged at [`Self::latch_fight_end`] but only the
-    /// wipe flag survives past that log line today (issue #336 step 2 widens
-    /// this to every cause).
+    /// Why the currently-held (or most recently ended) fight ended — the
+    /// cause [`Self::latch_fight_end`] stored, for every cause (issue #336
+    /// step 2), not just the wipe a separate flag happened to preserve.
+    ///
+    /// `None` while a fight is running, and `None` once a reset clears the
+    /// held fight. The `fight_end_ms()?` gate is what enforces the first
+    /// half: an idle-timeout end is over on the clock before anything
+    /// latches it, and this must not name a cause the meter has not
+    /// committed to yet.
     pub fn fight_end_cause(&self) -> Option<FightEndCause> {
         self.fight_end_ms()?;
-        self.is_held().then_some(FightEndCause::Wipe)
+        self.fight_end_cause
     }
 
     /// Whether a fight is currently running, as of `now_ms` — the `Active`
@@ -1656,6 +1670,7 @@ impl Meter {
             self.fight_end_ms = None;
             self.fight_end_observed_ms = None;
             self.fight_end_boss_id = None;
+            self.fight_end_cause = None;
         }
 
         // Real combat activity — a player landing a hit — is the *only*
@@ -2145,6 +2160,8 @@ impl Meter {
         }
         self.fight_end_ms = Some(end_ms);
         self.fight_end_observed_ms = Some(observed_ms);
+        // issue #336 step 2: retain the cause, not just log it.
+        self.fight_end_cause = Some(cause);
         // issue #316: arm phase resumption on an idle-timeout end too, not
         // only a boss death. `end_fight_on_boss_death` names the dying
         // boss's own uid because `boss_entity` may already have moved on by the
@@ -3617,6 +3634,9 @@ impl Meter {
         // being held belong to the encounter that is being cleared.
         self.fight_end_ms = None;
         self.fight_end_observed_ms = None;
+        // ...and the cause that end was latched with (issue #336 step 2):
+        // it names an encounter that no longer exists.
+        self.fight_end_cause = None;
         // ...and with it the phase-resume arming (issue #124): the fight
         // whose boss died is gone, so nothing can be a continuation of it.
         self.fight_end_boss_id = None;
@@ -8165,24 +8185,28 @@ mod tests {
             }
 
             #[test]
-            fn ended_by_idle_timeout_has_no_known_cause_yet() {
-                // The idle timeout is not a wipe, and today's stored state
-                // (issue #336 step 1) has no other way to name a cause —
-                // step 2 is what widens this to `Some(IdleTimeout)`.
+            fn ended_by_idle_timeout_reports_idle_timeout() {
+                // Issue #336 step 2: the cause `latch_fight_end` logged is
+                // now retained, so an idle-timeout end names itself rather
+                // than reading back as an unknown `None`.
                 let mut m = Meter::new();
                 m.apply(&dmg(1, 100, 1_000));
                 let ended_at = 1_000 + idle();
+                // `lifecycle` derives its cause from stored state, but the
+                // idle-timeout end is only *latched* by `tick`; before that
+                // the fight is over on the clock with nothing latched yet.
+                assert_eq!(m.tick(ended_at), FightState::Ended);
                 assert_eq!(
                     m.lifecycle(ended_at),
                     Lifecycle::Ended {
                         at_ms: 1_000,
-                        cause: None,
+                        cause: Some(FightEndCause::IdleTimeout),
                     }
                 );
                 assert!(!m.is_fight_active(ended_at));
                 assert!(!m.is_held());
                 assert_eq!(m.hold_kind(), None);
-                assert_eq!(m.fight_end_cause(), None);
+                assert_eq!(m.fight_end_cause(), Some(FightEndCause::IdleTimeout));
             }
         }
     }
@@ -8395,10 +8419,10 @@ mod tests {
             assert_eq!(m.snapshot(66_000).duration_ms, 5_000);
         }
 
-        /// Issue #336 step 1: a wipe is the one cause today's stored state
-        /// can still name after the fact, and it reports as `Held`, not a
-        /// plain `Ended` — `Meter::withholds_after_wipe` is still gating
-        /// events, which `lifecycle` surfaces as its own variant.
+        /// Issue #336: a wipe reports as `Held`, not a plain `Ended` —
+        /// `Meter::withholds_after_wipe` is still gating events, which
+        /// `lifecycle` surfaces as its own variant. Its cause survives the
+        /// latch like every other one does since step 2.
         #[test]
         fn a_wipe_reports_as_held_with_a_known_cause() {
             let m = wiped();

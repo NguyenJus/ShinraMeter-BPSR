@@ -1,6 +1,8 @@
 scenario=dungeon_b_fresh_pull
 at_ms=601500
 fight_state=Active
+fight_end_cause=-
+hold_kind=-
 duration_ms=1
 total_damage=25000
 total_dps=25000.00

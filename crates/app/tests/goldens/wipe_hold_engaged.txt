@@ -1,6 +1,8 @@
 scenario=wipe_hold_engaged
 at_ms=3000
 fight_state=Ended
+fight_end_cause=wipe
+hold_kind=Wipe
 duration_ms=1000
 total_damage=50000
 total_dps=50000.00

@@ -203,6 +203,8 @@ fn replay_dump_boss_fight() {
         at_ms: final_ts,
         snapshot,
         fight_state,
+        fight_end_cause: rig.fight_end_cause(),
+        hold_kind: rig.hold_kind(),
         resets: rig.resets(),
     };
     assert_golden(&capture);

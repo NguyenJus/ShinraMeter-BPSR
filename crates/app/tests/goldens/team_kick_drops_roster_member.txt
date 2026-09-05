@@ -1,6 +1,8 @@
 scenario=team_kick_drops_roster_member
 at_ms=4000
 fight_state=Active
+fight_end_cause=-
+hold_kind=-
 duration_ms=2000
 total_damage=80000
 total_dps=80000.00

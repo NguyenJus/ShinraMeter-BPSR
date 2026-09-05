@@ -8,8 +8,8 @@
 
 mod common;
 
-use bpsr_meter::{FightState, ResetReason};
-use bpsr_protocol::ProtocolEvent;
+use bpsr_meter::{FightEndCause, FightState, HoldKind, ResetReason};
+use bpsr_protocol::{DamageEvent, DamageKind, EntityId, EntityKind, ProtocolEvent};
 use bpsr_test_support::scenario::{Hit, Scenario};
 use bpsr_test_support::wire::prof;
 use common::{Rig, assert_golden};
@@ -331,6 +331,114 @@ fn pet_damage_credited_to_owner() {
         .expect("owner row must exist");
     assert_eq!(owner_row.damage, 45_000);
     assert_eq!(owner_row.hits, 1);
+
+    assert_golden(capture);
+}
+
+/// Issue #336 step 2: a party wipe on a recognized, still-live dungeon boss
+/// latches `FightEndCause::Wipe` / `HoldKind::Wipe` — the one hold none of
+/// the other lifecycle goldens above pin. Both players land a hit first (so
+/// each has a roster row and counts as "alive" per the wipe check), then the
+/// boss kills them both; the decoder never emits a monster-attacks-player
+/// damage packet in production capture (only the client's own
+/// `SyncDamageInfo` entries are decoded), so this is driven with
+/// `Scenario::inject` the same way `server_change_holds_the_numbers` drives
+/// `ServerChanged`.
+#[test]
+fn party_wipe_holds_as_wipe() {
+    let scenario = Scenario::new("party_wipe")
+        .at(1_000)
+        .enter_scene(TOWERING_RUIN)
+        .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
+        .player_appear(P_BRIN, "Brin", prof::FROST_MAGE, 11_500)
+        .monster_appear(M_BOSS, IGNISOR, 1_000_000, 1_000_000)
+        .at(2_000)
+        .hit(P_ARIA, M_BOSS, 101, 40_000)
+        .at(2_500)
+        .hit(P_BRIN, M_BOSS, 202, 25_000)
+        .at(3_000)
+        .inject(ProtocolEvent::Damage(DamageEvent {
+            attacker: EntityId::from_display_uid(M_BOSS, EntityKind::Monster),
+            attacker_uid: M_BOSS,
+            attacker_kind: EntityKind::Monster,
+            skill_id: 901,
+            value: 12_000,
+            crit: false,
+            lucky: false,
+            hp_lessen: 12_000,
+            is_miss: false,
+            is_heal: false,
+            kind: DamageKind::Normal,
+            target: EntityId::from_display_uid(P_ARIA, EntityKind::Player),
+            target_uid: P_ARIA,
+            target_kind: EntityKind::Player,
+            timestamp_ms: 3_000,
+            is_dead: true,
+        }))
+        .at(3_500)
+        .inject(ProtocolEvent::Damage(DamageEvent {
+            attacker: EntityId::from_display_uid(M_BOSS, EntityKind::Monster),
+            attacker_uid: M_BOSS,
+            attacker_kind: EntityKind::Monster,
+            skill_id: 901,
+            value: 11_500,
+            crit: false,
+            lucky: false,
+            hp_lessen: 11_500,
+            is_miss: false,
+            is_heal: false,
+            kind: DamageKind::Normal,
+            target: EntityId::from_display_uid(P_BRIN, EntityKind::Player),
+            target_uid: P_BRIN,
+            target_kind: EntityKind::Player,
+            timestamp_ms: 3_500,
+            is_dead: true,
+        }))
+        .at(4_000)
+        .capture("party_wipe");
+
+    let mut rig = Rig::new();
+    let captures = rig.run(&scenario);
+
+    assert_eq!(captures.len(), 1);
+    let capture = &captures[0];
+    assert_eq!(capture.fight_end_cause, Some(FightEndCause::Wipe));
+    assert_eq!(capture.hold_kind, Some(HoldKind::Wipe));
+
+    assert_golden(capture);
+}
+
+/// Issue #336 step 2: a scene change mid-fight (a same-shard dungeon
+/// transition, not a reconnect) latches `FightEndCause::SceneChanged` —
+/// distinct from `server_change_holds_the_numbers`'s `ServerChanged`, and,
+/// unlike the `party_wipe` golden above, one that never sets `HoldKind` at
+/// all: `is_held`/`hold_kind` only ever name the wipe hold, so a fight cut
+/// short by leaving the scene reports its cause without being "held" in
+/// that sense.
+#[test]
+fn scene_change_mid_fight_reports_scene_changed() {
+    let scenario = Scenario::new("scene_change_mid_fight")
+        .at(1_000)
+        .enter_scene(TOWERING_RUIN)
+        .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
+        .player_appear(P_BRIN, "Brin", prof::FROST_MAGE, 11_500)
+        .monster_appear(M_BOSS, IGNISOR, 1_000_000, 1_000_000)
+        .at(2_000)
+        .hit(P_ARIA, M_BOSS, 101, 40_000)
+        .at(2_500)
+        .hit(P_BRIN, M_BOSS, 202, 25_000)
+        .at(12_000)
+        .enter_scene(ASTERIA_PLAINS)
+        .at(13_000)
+        .capture("scene_change_mid_fight");
+
+    let mut rig = Rig::new();
+    let captures = rig.run(&scenario);
+
+    assert_eq!(captures.len(), 1);
+    let capture = &captures[0];
+    assert_eq!(capture.fight_end_cause, Some(FightEndCause::SceneChanged));
+    assert_eq!(capture.hold_kind, None);
 
     assert_golden(capture);
 }

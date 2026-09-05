@@ -1,6 +1,8 @@
 scenario=dungeon_ended_by_flow_signal
 at_ms=3000
 fight_state=Ended
+fight_end_cause=dungeon_ended
+hold_kind=-
 duration_ms=1
 total_damage=60000
 total_dps=60000.00

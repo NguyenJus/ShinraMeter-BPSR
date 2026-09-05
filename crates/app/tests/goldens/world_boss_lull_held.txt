@@ -1,6 +1,8 @@
 scenario=world_boss_lull_held
 at_ms=10500
 fight_state=Active
+fight_end_cause=-
+hold_kind=-
 duration_ms=9500
 total_damage=60000
 total_dps=60000.00

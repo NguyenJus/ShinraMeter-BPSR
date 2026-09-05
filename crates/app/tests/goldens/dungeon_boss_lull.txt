@@ -1,6 +1,8 @@
 scenario=dungeon_boss_lull
 at_ms=33000
 fight_state=Active
+fight_end_cause=-
+hold_kind=-
 duration_ms=31500
 total_damage=65000
 total_dps=43333.33

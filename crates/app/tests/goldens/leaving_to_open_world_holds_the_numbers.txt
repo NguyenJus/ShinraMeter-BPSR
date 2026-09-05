@@ -1,6 +1,8 @@
 scenario=leaving_to_open_world_holds_the_numbers
 at_ms=4000
 fight_state=Ended
+fight_end_cause=dungeon_ended
+hold_kind=-
 duration_ms=1
 total_damage=60000
 total_dps=60000.00

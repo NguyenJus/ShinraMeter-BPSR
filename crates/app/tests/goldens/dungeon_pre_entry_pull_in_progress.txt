@@ -1,6 +1,8 @@
 scenario=dungeon_pre_entry_pull_in_progress
 at_ms=1600
 fight_state=Active
+fight_end_cause=-
+hold_kind=-
 duration_ms=100
 total_damage=40000
 total_dps=40000.00
