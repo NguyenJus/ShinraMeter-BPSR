@@ -203,9 +203,14 @@ fn on_sync_near_entities(
         // The AOI appear list is the authoritative population source for the
         // entity table (issue #335): it is where a uuid is first seen, and so
         // where a recycled display uid gets its second, separate record.
-        let id = entities.observe(entity.uuid, now_ms);
+        // Only a tracked kind consumes a table slot — NPCs, pets, and
+        // dummies (`EntityKind::Unknown`) are never referenced by identity
+        // elsewhere, so observing them here would just spend `MAX_ENTITIES`
+        // on entities nothing ever looks up.
+        let id = EntityId::from_uuid(entity.uuid);
         match id.kind() {
             EntityKind::Player => {
+                let id = entities.observe(entity.uuid, now_ms);
                 out.push(ProtocolEvent::Player(player_info_from_attrs(
                     id,
                     &attrs.attrs,
@@ -213,10 +218,8 @@ fn on_sync_near_entities(
                 )));
             }
             EntityKind::Monster => {
+                let id = entities.observe(entity.uuid, now_ms);
                 let hp = enemy_hp_from_attrs(id, &attrs.attrs, now_ms, sink);
-                if let Some(monster_id) = hp.monster_id {
-                    entities.set_monster_id(id, monster_id);
-                }
                 out.push(ProtocolEvent::EnemyHp(hp));
             }
             EntityKind::Unknown => {}
@@ -296,9 +299,6 @@ fn on_aoi_sync_delta(
             }
             EntityKind::Monster => {
                 let hp = enemy_hp_from_attrs(target, &attrs.attrs, now_ms, sink);
-                if let Some(monster_id) = hp.monster_id {
-                    entities.set_monster_id(target, monster_id);
-                }
                 out.push(ProtocolEvent::EnemyHp(hp));
             }
             EntityKind::Unknown => {}
@@ -609,15 +609,17 @@ fn on_enter_scene(
     sink: Option<&dyn InspectSink>,
     entities: &mut EntityTable,
 ) {
-    // Zoning invalidates every entity the previous scene put in the table:
-    // none of them is in AOI range any more, and a stale shadow mapping would
-    // resolve the next scene's bare `char_id` onto a uuid that is gone.
-    // Mirrors the meter's own `enemies` clear on dungeon entry.
-    entities.clear();
     let Some(attrs) = msg.info.as_ref().and_then(|i| i.attrs.as_ref()) else {
         return;
     };
     if let Some(level_map_id) = scene_id_from_attrs(&attrs.attrs, sink) {
+        // Zoning invalidates every entity the previous scene put in the
+        // table: none of them is in AOI range any more, and a stale shadow
+        // mapping would resolve the next scene's bare `char_id` onto a uuid
+        // that is gone. Mirrors the meter's own `enemies` clear on dungeon
+        // entry. Only done once a scene change is confirmed, so a packet
+        // that carries no usable scene id leaves the table untouched.
+        entities.clear();
         out.push(ProtocolEvent::Scene { level_map_id });
     }
 }
@@ -747,11 +749,6 @@ impl Decoder {
             sink: Some(sink),
             entities: EntityTable::new(),
         }
-    }
-
-    /// The entity table this decoder has built so far (issue #335).
-    pub fn entities(&self) -> &EntityTable {
-        &self.entities
     }
 
     /// Bytes currently buffered waiting for a frame to complete. Never
@@ -2793,7 +2790,7 @@ mod tests {
     /// `SyncNearEntities.appear` is what populates the table, and the
     /// `EnemyHp` it emits carries the same identity the table filed.
     #[test]
-    fn appearing_entities_are_filed_in_the_table_with_their_monster_id() {
+    fn appearing_entities_are_filed_in_the_table() {
         let mut entities = EntityTable::new();
         let n = near_entities_notify(
             vec![pb::Entity {
@@ -2814,7 +2811,6 @@ mod tests {
         let id = EntityId::from_uuid(TARGET_UUID);
         let rec = entities.get(id).expect("appear list populates the table");
         assert_eq!(rec.first_seen_ms, 4_000);
-        assert_eq!(rec.monster_id, Some(100_665));
         match &out[0] {
             ProtocolEvent::EnemyHp(e) => {
                 assert_eq!(e.entity, id);
@@ -2917,27 +2913,42 @@ mod tests {
         );
         assert!(!entities.is_empty());
 
-        let msg = pb::EnterScene {
-            info: Some(pb::EnterSceneInfo {
-                attrs: Some(AttrCollection {
-                    uuid: 0,
-                    attrs: vec![],
-                }),
-            }),
-        };
-        let mut payload = Vec::new();
-        msg.encode(&mut payload).unwrap();
         super::decode_notify(
-            &Notify {
-                service_uuid: crate::frame::SERVICE_UUID,
-                method_id: opcode::ENTER_SCENE,
-                payload,
-            },
+            &enter_scene_notify(vec![pb::Attr {
+                id: 341, // AttrSceneBasicId
+                raw_data: vec![0x08],
+            }]),
             0,
             &mut out,
             None,
             &mut entities,
         );
         assert!(entities.is_empty());
+    }
+
+    /// An `EnterScene` payload with no usable scene id (attrs present but
+    /// empty, or no `AttrSceneBasicId`) emits no `Scene` event — and so must
+    /// leave the table untouched rather than clearing on every such packet.
+    #[test]
+    fn enter_scene_without_a_scene_id_does_not_clear_the_entity_table() {
+        let mut entities = EntityTable::new();
+        let mut out = Vec::new();
+        super::decode_notify(
+            &notify_for_damage(base_damage()),
+            0,
+            &mut out,
+            None,
+            &mut entities,
+        );
+        assert!(!entities.is_empty());
+
+        super::decode_notify(
+            &enter_scene_notify(vec![]),
+            0,
+            &mut out,
+            None,
+            &mut entities,
+        );
+        assert!(!entities.is_empty());
     }
 }

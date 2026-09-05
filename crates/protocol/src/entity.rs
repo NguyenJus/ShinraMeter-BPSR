@@ -122,9 +122,6 @@ pub struct EntityRecord {
     /// The `now_ms` of the packet this entity was first observed in. Not
     /// wall-clock: the same caller-supplied clock every event carries.
     pub first_seen_ms: u64,
-    /// The monster/template id, once an `EnemyHp`-bearing packet has
-    /// supplied one. Always `None` for a player.
-    pub monster_id: Option<u32>,
 }
 
 /// Every entity this server session has named, keyed on the full uuid, plus
@@ -167,22 +164,12 @@ impl EntityTable {
                 kind: id.kind(),
                 display_uid,
                 first_seen_ms: now_ms,
-                monster_id: None,
             });
             self.order.push_back(id);
             self.evict_if_full();
         }
         self.shadow.insert(display_uid, id);
         id
-    }
-
-    /// Attaches a monster/template id to an entity the table already knows.
-    /// A no-op for an unknown entity: the table is populated by `observe`,
-    /// and an id for something never observed has nothing to describe.
-    pub fn set_monster_id(&mut self, id: EntityId, monster_id: u32) {
-        if let Some(rec) = self.entries.get_mut(&id) {
-            rec.monster_id = Some(monster_id);
-        }
     }
 
     pub fn get(&self, id: EntityId) -> Option<&EntityRecord> {
@@ -225,7 +212,12 @@ impl EntityTable {
         self.entries.is_empty()
     }
 
-    /// Drops the oldest entities once the table is over `MAX_ENTITIES`.
+    /// Drops the oldest entities once the table is over `MAX_ENTITIES`,
+    /// FIFO by first sighting — `order` is insertion order and is never
+    /// reshuffled, so a re-observed entity does not get a fresher spot in
+    /// the queue and is exactly as eviction-prone as the moment it first
+    /// appeared. This is not LRU: repeatedly re-observing an entity does
+    /// not keep it alive.
     /// Only the evicted entity's *own* shadow entry goes with it — if the
     /// uid has since been recycled onto a newer entity, that mapping is the
     /// live one and must survive its predecessor.
@@ -297,7 +289,6 @@ mod tests {
         assert_eq!(rec.kind, EntityKind::Monster);
         assert_eq!(rec.display_uid, 42);
         assert_eq!(rec.first_seen_ms, 1_000);
-        assert_eq!(rec.monster_id, None);
     }
 
     #[test]
@@ -359,18 +350,6 @@ mod tests {
             table.resolve_uid(7, EntityKind::Player),
             EntityId::from_uuid(player_uuid(7))
         );
-    }
-
-    #[test]
-    fn set_monster_id_attaches_to_an_observed_entity_only() {
-        let mut table = EntityTable::new();
-        let id = table.observe(monster_uuid(42), 0);
-        table.set_monster_id(id, 103_001);
-        assert_eq!(table.get(id).unwrap().monster_id, Some(103_001));
-
-        let unobserved = EntityId::from_uuid(monster_uuid(43));
-        table.set_monster_id(unobserved, 1);
-        assert_eq!(table.get(unobserved), None);
     }
 
     #[test]
