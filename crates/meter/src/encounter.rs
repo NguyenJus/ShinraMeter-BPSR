@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::event::{
-    CastEvent, Class, DamageEvent, DamageKind, DisappearReason, EDungeonState, EnemyHp, EntityKind,
-    PlayerInfo, ProtocolEvent,
+    CastEvent, Class, DamageEvent, DamageKind, DisappearReason, EDungeonState, EnemyHp, EntityId,
+    EntityKind, PlayerInfo, ProtocolEvent,
 };
 use crate::fight::{FightConfig, FightEndCause, FightState, HoldKind, Lifecycle};
 use crate::phase;
@@ -42,7 +42,7 @@ const MAX_PRELOADED_PLAYERS: u32 = 64;
 /// The fallback exists because `Meter::reset` clears `took_damage` on every
 /// enemy, so for the instant after a mid-pull reset — a wipe-and-re-pull's
 /// `BossHpRollback`, a `Manual` reset, the `NewFight` reset that starts the
-/// next attempt — the first thing hit wins `boss_uid` outright, and party
+/// next attempt — the first thing hit wins `boss_entity` outright, and party
 /// AoE lands on adds first. It therefore has to reach back past the reset,
 /// to an enemy with no damage *in this fight at all*. That reach is what
 /// needs bounding: "alive and damaged at some point" also describes a boss
@@ -293,8 +293,26 @@ fn apply_cached_attrs(stats: &mut PlayerStats, merged: CachedAttrs) {
     }
 }
 
+/// The key a damage event's attacker is filed under (issue #335): its own
+/// whole-uuid identity.
+fn attacker_key(d: &DamageEvent) -> EntityId {
+    d.attacker
+}
+
+/// The key a damage event's target is filed under (issue #335).
+fn target_key(d: &DamageEvent) -> EntityId {
+    d.target
+}
+
 pub struct Meter {
-    players: HashMap<i64, PlayerStats>,
+    /// Per-player state, keyed on the whole-uuid [`EntityId`] rather than the
+    /// truncated display uid (issue #335). The display uid is not unique —
+    /// a server session recycles it, and a shadow/mirror entity shares one
+    /// with its original — so keying on it silently blended two players'
+    /// stats into one row. Rows still *print* `PlayerStats::uid`, and the
+    /// name cache below is still keyed on it, because that is the number
+    /// the game itself shows.
+    players: HashMap<EntityId, PlayerStats>,
     /// Player identity cache, keyed by uid. Never cleared by `reset` — names
     /// often arrive in packets separate from (and out of order relative to)
     /// damage, so late-named rows must still resolve after a reset. Seeded
@@ -305,7 +323,9 @@ pub struct Meter {
     /// Monotonic counter bumped on every name-cache touch (read or write);
     /// backs the recency order returned by [`Meter::names_for_save`].
     names_seq: u64,
-    enemies: HashMap<i64, EnemyState>,
+    /// Per-enemy state, keyed on the whole-uuid [`EntityId`] for the same
+    /// reason `players` is (issue #335).
+    enemies: HashMap<EntityId, EnemyState>,
     fight_start_ms: Option<u64>,
     /// Timestamp of the most recent event seen (damage or enemy-hp). Used as
     /// the DPS-window end and as the reference point for the boss-HP-rollback
@@ -314,7 +334,7 @@ pub struct Meter {
     /// Timestamp of the last reset, if any. `None` means no reset has
     /// happened yet, so the cooldown gate never blocks the first rollback.
     last_reset_ms: Option<u64>,
-    boss_uid: Option<i64>,
+    boss_entity: Option<EntityId>,
     /// Current dungeon/instance id (issue #9 slice 2), from the most recent
     /// `ProtocolEvent::Scene`. Survives `Meter::reset` (a manual reset or a
     /// boss-HP rollback both stay in the same dungeon); cleared only on
@@ -415,7 +435,7 @@ pub struct Meter {
     /// `snapshot` renders this instead of live state for as long as the
     /// fight is held ([`FightState::Ended`]). Zoning out of a dungeon
     /// discards the live answer — `ServerChanged` clears `enemies`,
-    /// `boss_uid` and `scene_id`, then the town's `Scene` event lands —
+    /// `boss_entity` and `scene_id`, then the town's `Scene` event lands —
     /// while the fight's rows, totals and clock stay frozen on screen, so
     /// without this capture the header would caption a raid's damage
     /// breakdown with "No target" and the name of the town the player just
@@ -446,7 +466,7 @@ pub struct Meter {
     /// same instance), and is cleared only when the instance itself goes
     /// away — an explicit `DungeonState::Null` (§4), a `ServerChanged`, or
     /// entering a different dungeon/raid scene (mirroring the `enemies`/
-    /// `boss_uid` clears at both of those points).
+    /// `boss_entity` clears at both of those points).
     dungeon_state: Option<EDungeonState>,
     /// Every dungeon objective seen this instance, keyed by target id
     /// (issue #139 §1). Survives `Meter::reset` for the same reason
@@ -515,7 +535,7 @@ impl Meter {
             fight_start_ms: None,
             last_event_ms: 0,
             last_reset_ms: None,
-            boss_uid: None,
+            boss_entity: None,
             scene_id: None,
             last_known_scene_id: None,
             fight_end_ms: None,
@@ -763,7 +783,7 @@ impl Meter {
             return true;
         }
         self.enemies
-            .get(&d.target_uid)
+            .get(&target_key(d))
             .is_some_and(|e| e.took_damage)
     }
 
@@ -772,9 +792,9 @@ impl Meter {
     /// (`tables::is_boss_monster`) that has taken damage this fight and is
     /// not known to be dead.
     ///
-    /// Deliberately "any", not "`boss_uid`": a pull can have two bosses up
+    /// Deliberately "any", not "`boss_entity`": a pull can have two bosses up
     /// at once (Dreambloom Ruins' Caprahorn spawns a matched pair fought
-    /// together), and `boss_uid` can only name one of them. If the named
+    /// together), and `boss_entity` can only name one of them. If the named
     /// one dies first, the pull is still very much in progress.
     ///
     /// This is what stops the idle timeout from standing in for an
@@ -1006,35 +1026,42 @@ impl Meter {
             }
             ProtocolEvent::EnemyHp(e) => self.apply_enemy_hp(e),
             ProtocolEvent::BuffApply {
-                host_uid,
+                host,
+                host_uid: _,
                 buff_uuid,
                 base_id,
                 adds_layer,
                 timestamp_ms,
             } => {
-                self.apply_buff_apply(*host_uid, *buff_uuid, *base_id, *adds_layer, *timestamp_ms);
+                self.apply_buff_apply(*host, *buff_uuid, *base_id, *adds_layer, *timestamp_ms);
                 None
             }
             ProtocolEvent::BuffRemove {
-                host_uid,
+                host,
+                host_uid: _,
                 buff_uuid,
                 removes_layer,
                 timestamp_ms,
             } => {
-                self.apply_buff_remove(*host_uid, *buff_uuid, *removes_layer, *timestamp_ms);
+                self.apply_buff_remove(*host, *buff_uuid, *removes_layer, *timestamp_ms);
                 None
             }
             ProtocolEvent::EntityState {
-                uid,
+                entity,
+                uid: _,
                 kind,
                 is_dead,
                 timestamp_ms,
             } => {
-                self.apply_entity_state(*uid, *kind, *is_dead, *timestamp_ms);
+                self.apply_entity_state(*entity, *kind, *is_dead, *timestamp_ms);
                 None
             }
-            ProtocolEvent::Revive { uid, timestamp_ms } => {
-                self.apply_revive(*uid, *timestamp_ms);
+            ProtocolEvent::Revive {
+                entity,
+                uid: _,
+                timestamp_ms,
+            } => {
+                self.apply_revive(*entity, *timestamp_ms);
                 None
             }
             ProtocolEvent::TeamMemberLeft { uid } => {
@@ -1212,7 +1239,7 @@ impl Meter {
                     // flagged `took_damage` and alive, and that flag is the
                     // whole candidate set `recompute_boss` ranks over: the
                     // new dungeon's very first `EnemyHp` packet would hand
-                    // `boss_uid` to the boss of the dungeon just left, and
+                    // `boss_entity` to the boss of the dungeon just left, and
                     // issue #125's latch would then record it as *this*
                     // scene's final boss for the rest of the session.
                     //
@@ -1223,7 +1250,7 @@ impl Meter {
                     // new instance's entities anyway, since the old
                     // instance's uids will never be seen again.
                     //
-                    // `boss_uid` spelled out here, where the pre-#205 code
+                    // `boss_entity` spelled out here, where the pre-#205 code
                     // could leave it to `reset`: the withheld paths run no
                     // `reset`, and so no `recompute_boss` to clear it.
                     // Mirrors the `ServerChanged` arm below.
@@ -1242,7 +1269,7 @@ impl Meter {
                     // sees.
                     if entering_dungeon {
                         self.enemies.clear();
-                        self.boss_uid = None;
+                        self.boss_entity = None;
                         // issue #316: `fight_end_boss_id` arms phase resume
                         // by looking a hit's target up in `enemies`, which
                         // this just emptied — leaving it set would have the
@@ -1316,7 +1343,7 @@ impl Meter {
                 //
                 // Latched *before* the entity state is dropped below (PR
                 // #163 review, finding 3): `latch_fight_end` logs the boss
-                // identity, and it reads it out of `boss_uid`/`enemies`, so
+                // identity, and it reads it out of `boss_entity`/`enemies`, so
                 // clearing those first made this diagnostic always say
                 // `boss_monster_id=<unknown>` — losing the one fact it
                 // exists to record about a fight cut short by a reconnect.
@@ -1331,7 +1358,7 @@ impl Meter {
 
                 self.prune_stale_preloads();
                 self.enemies.clear();
-                self.boss_uid = None;
+                self.boss_entity = None;
                 // issue #316: same reason as the `Scene` arm's
                 // `entering_dungeon` clear above — a reconnect empties
                 // `enemies`, and a stale `fight_end_boss_id` armed against
@@ -1341,7 +1368,7 @@ impl Meter {
                 // fight immediately.
                 self.fight_end_boss_id = None;
                 // issue #139: as invalid across a reconnect as
-                // `enemies`/`boss_uid` — the new server session may not
+                // `enemies`/`boss_entity` — the new server session may not
                 // even land back in the same dungeon, let alone the same
                 // objective sequence, so nothing about the old instance's
                 // dungeon-state tracking can be trusted to describe it.
@@ -1380,8 +1407,12 @@ impl Meter {
             // see `apply_enemy_gone` for the cases where it is allowed to
             // stand in for a death signal that never arrived, including the
             // server's own `DisappearReason::Dead` (issue #276).
-            ProtocolEvent::EnemyGone { uid, reason } => {
-                self.apply_enemy_gone(*uid, *reason);
+            ProtocolEvent::EnemyGone {
+                entity,
+                uid,
+                reason,
+            } => {
+                self.apply_enemy_gone(*entity, *uid, *reason);
                 None
             }
             ProtocolEvent::DungeonVar { name, value } => {
@@ -1703,7 +1734,7 @@ impl Meter {
         // way past the player in town would open a row in a damage meter
         // they are no part of.
         if d.attacker_kind == EntityKind::Player
-            && let Some(stats) = self.players.get_mut(&d.attacker_uid)
+            && let Some(stats) = self.players.get_mut(&attacker_key(d))
         {
             // issue #339/#272: `explicit = false` — this is the inferred
             // fallback (see `PlayerStats::set_alive`'s doc comment), kept
@@ -1719,7 +1750,7 @@ impl Meter {
         // negative/lethal heal). This must run before the `is_heal` early
         // return below so heal-typed death packets still record deaths.
         if d.is_dead && d.target_kind == EntityKind::Player {
-            self.record_death(d.target_uid, d.timestamp_ms);
+            self.record_death(target_key(d), d.target_uid, d.timestamp_ms);
             // issue #154: that death may have been the last one standing.
             // A wipe is a fight *end* — the moment a damage meter is most
             // useful — so latch the hold here instead of leaving the
@@ -1762,7 +1793,7 @@ impl Meter {
         }
 
         if d.target_kind == EntityKind::Monster {
-            let enemy = self.enemies.entry(d.target_uid).or_default();
+            let enemy = self.enemies.entry(target_key(d)).or_default();
             enemy.took_damage = true;
             // The same fact minus the reset, and with a clock on it (PR
             // #163 review, finding 2): `recompute_boss`'s issue #157
@@ -1781,23 +1812,23 @@ impl Meter {
             // the phase that just fell. Must run before `recompute_boss`,
             // which reads both.
             if d.is_dead {
-                self.mark_enemy_dead(d.target_uid);
+                self.mark_enemy_dead(target_key(d));
             }
             // issue #210/#211: captured *before* `recompute_boss`, which
             // ranks a living recognized boss above a dead one — so the
             // instant `mark_enemy_dead` above stamps this uid's death
             // order, any other recognized boss already damaged and still
             // alive (the raid's next selection, say) outranks the corpse
-            // and `recompute_boss` moves `boss_uid` off it. Reading
-            // `boss_uid` after that point can no longer tell whether the
+            // and `recompute_boss` moves `boss_entity` off it. Reading
+            // `boss_entity` after that point can no longer tell whether the
             // enemy that just died was the one being tracked.
-            let was_tracked_boss = self.boss_uid == Some(d.target_uid);
+            let was_tracked_boss = self.boss_entity == Some(target_key(d));
             self.recompute_boss();
             // issue #78: a recognized boss dying ends the fight now, rather
             // than after the idle timeout, so the meter freezes on the kill
             // instead of on a straggler's last tick of DoT damage.
             if self.fight_cfg.end_on_boss_death && d.is_dead && was_tracked_boss {
-                self.end_fight_on_boss_death(d.target_uid, d.timestamp_ms);
+                self.end_fight_on_boss_death(target_key(d), d.timestamp_ms);
             }
         }
 
@@ -1879,7 +1910,7 @@ impl Meter {
         let cached = self.name_lookup(d.attacker_uid);
         let stats = self
             .players
-            .entry(d.attacker_uid)
+            .entry(attacker_key(d))
             .or_insert_with(|| PlayerStats::new(d.attacker_uid));
         if let Some(cached) = cached {
             if stats.name.is_none() {
@@ -1969,17 +2000,20 @@ impl Meter {
     /// Ruins' Caprahorn pair, which spawns inside a boss-select scene same
     /// as the sequential raids do — still counts, exactly as it does
     /// outside a boss-select scene.
-    fn end_fight_on_boss_death(&mut self, uid: i64, now_ms: u64) {
+    fn end_fight_on_boss_death(&mut self, entity: EntityId, now_ms: u64) {
+        // The display number, for the diagnostics below only — `entity` is
+        // what indexes `enemies` (issue #335).
+        let uid = entity.display_uid();
         // issue #210/#211: `uid`'s own monster id, not `self.boss_monster_id()`
-        // (== whatever `self.boss_uid` currently is). Both call sites used to
-        // guard on `self.boss_uid == Some(uid)`, so the two were always the
+        // (== whatever `self.boss_entity` currently is). Both call sites used to
+        // guard on `self.boss_entity == Some(uid)`, so the two were always the
         // same id — but that guard is now the pre-`recompute_boss` capture
         // `was_tracked_boss` (defect 2), and by the time this runs
-        // `recompute_boss` may already have moved `boss_uid` onto another
+        // `recompute_boss` may already have moved `boss_entity` onto another
         // living boss `uid`'s death just promoted (e.g. a raid's next
         // selection). This function must still record *this* dying boss's
         // identity, not whichever one the header now follows.
-        let monster_id = self.enemies.get(&uid).and_then(|e| e.monster_id);
+        let monster_id = self.enemies.get(&entity).and_then(|e| e.monster_id);
         let recognized = monster_id.is_some_and(tables::is_boss_monster);
         // Guarded on an in-progress fight so a kill packet arriving while no
         // fight is running (the tail of a pull the user just reset away)
@@ -1996,7 +2030,7 @@ impl Meter {
         if !recognized || self.fight_start_ms().is_none() || self.fight_end_ms().is_some() {
             return;
         }
-        let other_boss = self.other_living_boss(uid, now_ms);
+        let other_boss = self.other_living_boss(entity, now_ms);
         // issue #256: computed unconditionally rather than short-circuited
         // behind `other_boss.is_none()` — the diagnostic log line below
         // reports `dungeon_objective_still_running={objective_holds}` on
@@ -2026,7 +2060,7 @@ impl Meter {
              scene={} boss_select={} dungeon_state={:?} current_objective={:?} \
              objective_complete={:?} (issue #256)",
             monster_id.map_or(-1i64, i64::from),
-            other_boss.unwrap_or(-1),
+            other_boss.map_or(-1, EntityId::display_uid),
             self.scene_id.map_or(-1i64, i64::from),
             self.scene_id.is_some_and(phase::is_boss_select_scene),
             self.dungeon_state,
@@ -2078,7 +2112,7 @@ impl Meter {
     /// `boss_monster_id` is the id the log line should name — ordinarily
     /// `self.boss_monster_id()`, except from `end_fight_on_boss_death`
     /// (issue #210/#211), which passes the dying boss's own id since
-    /// `self.boss_uid` may already have moved on by the time this runs.
+    /// `self.boss_entity` may already have moved on by the time this runs.
     ///
     /// `observed_ms` is when this call is actually happening — `now_ms` for
     /// `tick`/`end_fight_on_boss_death`, the current event's `timestamp_ms`
@@ -2113,7 +2147,7 @@ impl Meter {
         self.fight_end_observed_ms = Some(observed_ms);
         // issue #316: arm phase resumption on an idle-timeout end too, not
         // only a boss death. `end_fight_on_boss_death` names the dying
-        // boss's own uid because `boss_uid` may already have moved on by the
+        // boss's own uid because `boss_entity` may already have moved on by the
         // time it runs; nothing has moved on here, so the currently engaged
         // recognized boss is the right (and only sensible) answer.
         if cause == FightEndCause::IdleTimeout {
@@ -2124,7 +2158,7 @@ impl Meter {
 
     /// The monster id of the currently selected boss target, if it has one.
     fn boss_monster_id(&self) -> Option<u32> {
-        self.boss_uid
+        self.boss_entity
             .and_then(|uid| self.enemies.get(&uid))
             .and_then(|e| e.monster_id)
     }
@@ -2143,7 +2177,7 @@ impl Meter {
     /// recency-free half of the question instead: is there a recognized
     /// boss the party actually fought this encounter and never saw die.
     ///
-    /// "Any", not "`boss_uid`'s own", for the same reason
+    /// "Any", not "`boss_entity`'s own", for the same reason
     /// `engaged_boss_still_up` is: a pull can have two bosses up at once,
     /// and the header's current selection is not necessarily the one whose
     /// idling out just ended the fight.
@@ -2175,9 +2209,9 @@ impl Meter {
     /// wins, so a death packet followed by the corpse's HP sync to 0 (or a
     /// retransmit of either) does not re-stamp the rank and reshuffle
     /// `recompute_boss`'s view of who fell last.
-    fn mark_enemy_dead(&mut self, uid: i64) {
+    fn mark_enemy_dead(&mut self, entity: EntityId) {
         let next = self.deaths_seen + 1;
-        let assigned = match self.enemies.get_mut(&uid) {
+        let assigned = match self.enemies.get_mut(&entity) {
             Some(enemy) if enemy.death_order.is_none() => {
                 enemy.death_order = Some(next);
                 true
@@ -2224,7 +2258,7 @@ impl Meter {
     ///    boss-death-driven end already respects.
     /// 2. A fight is running and not already ended. A despawn can never
     ///    *start* anything, and must never re-stamp a held fight's end time.
-    /// 3. The enemy is the currently tracked boss (`boss_uid`). This is the
+    /// 3. The enemy is the currently tracked boss (`boss_entity`). This is the
     ///    strongest clause: the header is following it, so `recompute_boss`
     ///    has already ranked it above everything else the party has engaged.
     ///    A sibling boss, an add, or a mob nobody is looking at cannot end a
@@ -2305,16 +2339,16 @@ impl Meter {
     /// issues #35 and #111 set). Until it has, this rule's field behaviour on
     /// scene 13023 is argued, not observed — which is the other reason it is
     /// written this tightly.
-    fn apply_enemy_gone(&mut self, uid: i64, reason: Option<DisappearReason>) {
+    fn apply_enemy_gone(&mut self, entity: EntityId, uid: i64, reason: Option<DisappearReason>) {
         if !self.fight_cfg.end_on_boss_death
             || self.fight_start_ms().is_none()
             || self.fight_end_ms().is_some()
-            || self.boss_uid != Some(uid)
+            || self.boss_entity != Some(entity)
         {
             return;
         }
         let now_ms = self.last_event_ms;
-        let Some(enemy) = self.enemies.get(&uid) else {
+        let Some(enemy) = self.enemies.get(&entity) else {
             return;
         };
         if !is_engaged_recognized_boss(enemy, now_ms) {
@@ -2338,9 +2372,9 @@ impl Meter {
             "encounter: treating despawn of uid={uid} monster_id={} reason={reason:?} as a death (issues #215/#276)",
             enemy.monster_id.map_or(-1i64, i64::from)
         );
-        self.mark_enemy_dead(uid);
+        self.mark_enemy_dead(entity);
         self.recompute_boss();
-        self.end_fight_on_boss_death(uid, now_ms);
+        self.end_fight_on_boss_death(entity, now_ms);
     }
 
     /// Whether some enemy other than `dying_uid` is a recognized boss that
@@ -2392,16 +2426,16 @@ impl Meter {
     /// previously supply. Which uid is reported when several qualify is
     /// unspecified (`enemies` is a `HashMap`) — the guard's answer is the
     /// yes/no, and the uid is a diagnostic hint, not a contract.
-    fn other_living_boss(&self, dying_uid: i64, now_ms: u64) -> Option<i64> {
+    fn other_living_boss(&self, dying: EntityId, now_ms: u64) -> Option<EntityId> {
         let boss_select = self.scene_id.is_some_and(phase::is_boss_select_scene);
         self.enemies
             .iter()
-            .find(|(uid, e)| {
-                **uid != dying_uid
+            .find(|(id, e)| {
+                **id != dying
                     && is_damaged_living_boss(e)
                     && (!boss_select || engaged_within_window(e.last_damaged_ms, Some(now_ms)))
             })
-            .map(|(uid, _)| *uid)
+            .map(|(id, _)| *id)
     }
 
     /// Whether every party member the meter knows about is down *right
@@ -2644,7 +2678,7 @@ impl Meter {
         if d.target_kind != EntityKind::Monster {
             return None;
         }
-        self.enemies.get(&d.target_uid).and_then(|e| e.monster_id)
+        self.enemies.get(&target_key(d)).and_then(|e| e.monster_id)
     }
 
     /// Counts one death for `target_uid`, debounced by `DEATH_DEBOUNCE_MS`
@@ -2676,7 +2710,7 @@ impl Meter {
         if self.fight_end_ms().is_some() && !self.in_post_end_grace_window(c.timestamp_ms) {
             return;
         }
-        if let Some(stats) = self.players.get_mut(&c.caster_uid) {
+        if let Some(stats) = self.players.get_mut(&c.caster) {
             *stats.casts.entry(c.skill_id).or_insert(0) += 1;
         }
     }
@@ -2695,7 +2729,7 @@ impl Meter {
     /// interval — see `ActiveBuff::layers`.
     fn apply_buff_apply(
         &mut self,
-        host_uid: i64,
+        host: EntityId,
         buff_uuid: i32,
         base_id: Option<i32>,
         adds_layer: bool,
@@ -2708,7 +2742,7 @@ impl Meter {
         if self.fight_end_ms().is_some() && !self.in_post_end_grace_window(timestamp_ms) {
             return;
         }
-        let Some(stats) = self.players.get_mut(&host_uid) else {
+        let Some(stats) = self.players.get_mut(&host) else {
             return;
         };
         match stats.active_buffs.get_mut(&buff_uuid) {
@@ -2747,7 +2781,7 @@ impl Meter {
     /// closes the interval outright, however many layers it held.
     fn apply_buff_remove(
         &mut self,
-        host_uid: i64,
+        host: EntityId,
         buff_uuid: i32,
         removes_layer: bool,
         timestamp_ms: u64,
@@ -2760,7 +2794,7 @@ impl Meter {
         if self.fight_end_ms().is_some() && !self.in_post_end_grace_window(timestamp_ms) {
             return;
         }
-        let Some(stats) = self.players.get_mut(&host_uid) else {
+        let Some(stats) = self.players.get_mut(&host) else {
             return;
         };
         if removes_layer && let Some(active) = stats.active_buffs.get_mut(&buff_uuid) {
@@ -2793,7 +2827,7 @@ impl Meter {
     fn record_breakdowns(&mut self, d: &DamageEvent) {
         if d.is_heal
             && d.attacker_kind == EntityKind::Player
-            && let Some(stats) = self.players.get_mut(&d.attacker_uid)
+            && let Some(stats) = self.players.get_mut(&attacker_key(d))
         {
             accumulate_skill(stats.heals.entry(d.skill_id).or_default(), d);
             if !d.is_miss {
@@ -2801,7 +2835,7 @@ impl Meter {
             }
         }
         if d.target_kind == EntityKind::Player
-            && let Some(stats) = self.players.get_mut(&d.target_uid)
+            && let Some(stats) = self.players.get_mut(&target_key(d))
         {
             accumulate_skill(stats.incoming.entry(d.skill_id).or_default(), d);
             // Issue #338: absorbed/immune hits get their own channels on
@@ -2814,10 +2848,10 @@ impl Meter {
         }
     }
 
-    fn record_death(&mut self, target_uid: i64, timestamp_ms: u64) {
+    fn record_death(&mut self, target: EntityId, target_uid: i64, timestamp_ms: u64) {
         let stats = self
             .players
-            .entry(target_uid)
+            .entry(target)
             .or_insert_with(|| PlayerStats::new(target_uid));
         // issue #212: `deaths` is a cumulative counter — it never resets
         // once nonzero — so `party_is_wiped` cannot read it directly
@@ -2880,7 +2914,13 @@ impl Meter {
     /// `record_death`'s own debounce (`DEATH_DEBOUNCE_MS`) already protects
     /// against double-counting when this and a `DamageEvent::is_dead` on the
     /// same kill both land close together, so no extra guard is needed here.
-    fn apply_entity_state(&mut self, uid: i64, kind: EntityKind, is_dead: bool, timestamp_ms: u64) {
+    fn apply_entity_state(
+        &mut self,
+        entity: EntityId,
+        kind: EntityKind,
+        is_dead: bool,
+        timestamp_ms: u64,
+    ) {
         match kind {
             EntityKind::Player => {
                 if is_dead {
@@ -2895,11 +2935,11 @@ impl Meter {
                     // already uses, so a stranger's death never opens a row
                     // — matching `apply_revive`'s doc'd rule that these
                     // views must never create one.
-                    if self.players.contains_key(&uid) {
-                        self.record_death(uid, timestamp_ms);
+                    if self.players.contains_key(&entity) {
+                        self.record_death(entity, entity.display_uid(), timestamp_ms);
                         self.latch_wipe_if_party_down(timestamp_ms);
                     }
-                } else if let Some(stats) = self.players.get_mut(&uid) {
+                } else if let Some(stats) = self.players.get_mut(&entity) {
                     // Explicit signal, not the inferred "next action" path —
                     // see `PlayerStats::set_alive`'s `explicit` parameter.
                     stats.set_alive(true, timestamp_ms, true);
@@ -2907,17 +2947,17 @@ impl Meter {
                 }
             }
             EntityKind::Monster => {
-                if is_dead && self.enemies.contains_key(&uid) {
-                    self.mark_enemy_dead(uid);
+                if is_dead && self.enemies.contains_key(&entity) {
+                    self.mark_enemy_dead(entity);
                     self.recompute_boss();
-                    let was_tracked_boss = self.boss_uid == Some(uid);
+                    let was_tracked_boss = self.boss_entity == Some(entity);
                     let is_engaged = was_tracked_boss
                         || self
                             .enemies
-                            .get(&uid)
+                            .get(&entity)
                             .is_some_and(|e| is_engaged_recognized_boss(e, timestamp_ms));
                     if self.fight_cfg.end_on_boss_death && is_engaged {
-                        self.end_fight_on_boss_death(uid, timestamp_ms);
+                        self.end_fight_on_boss_death(entity, timestamp_ms);
                     }
                 }
                 // A monster's `AttrState` going alive again (a respawn, or a
@@ -2938,8 +2978,8 @@ impl Meter {
     /// inference follows — it must never *open* a row for a uid this meter
     /// has not otherwise seen. A revive for an unknown uid (or one that was
     /// never recorded dead) is therefore a no-op.
-    fn apply_revive(&mut self, uid: i64, timestamp_ms: u64) {
-        if let Some(stats) = self.players.get_mut(&uid) {
+    fn apply_revive(&mut self, entity: EntityId, timestamp_ms: u64) {
+        if let Some(stats) = self.players.get_mut(&entity) {
             stats.set_alive(true, timestamp_ms, true);
             self.release_wipe_hold_if_recovered();
         }
@@ -2963,6 +3003,7 @@ impl Meter {
     }
 
     fn apply_player(&mut self, p: &PlayerInfo) {
+        let key = p.entity;
         let merged = self.name_upsert(
             p.uid,
             CachedAttrs {
@@ -2974,7 +3015,7 @@ impl Meter {
                 imagine_tiers: p.imagine_tiers,
             },
         );
-        if let Some(stats) = self.players.get_mut(&p.uid) {
+        if let Some(stats) = self.players.get_mut(&key) {
             apply_cached_attrs(stats, merged);
             // Issue #338: unlike the identity fields above, `shield` is not
             // routed through `name_upsert`'s cross-session cache — it is a
@@ -3006,7 +3047,7 @@ impl Meter {
             if let Some(shield) = p.shield {
                 stats.shield = Some(shield);
             }
-            self.players.insert(p.uid, stats);
+            self.players.insert(key, stats);
             // issue #69/#12: no per-player log here by design (would flood
             // a raid); just tally, and let `prune_stale_preloads` emit one
             // sparse summary line when this scene ends.
@@ -3082,13 +3123,20 @@ impl Meter {
         if !self.in_dungeon_scene() || self.fight_end_ms.is_some() {
             return;
         }
-        if let Some(removed) = self.players.remove(&uid)
-            && removed.total_damage == 0
-            && removed.hits == 0
-            && removed.deaths == 0
-        {
-            self.preload_count = self.preload_count.saturating_sub(1);
-        }
+        // `players` is keyed on `EntityId` (issue #335) while the team
+        // roster speaks display uids, so match on `display_uid()` rather
+        // than on the map key. Two live entities sharing one display uid is
+        // vanishingly rare among party members, but dropping both is the
+        // right reading of "this uid left the party" either way.
+        let mut pruned = 0u32;
+        self.players.retain(|entity, p| {
+            let keep = entity.display_uid() != uid;
+            if !keep && p.total_damage == 0 && p.hits == 0 && p.deaths == 0 {
+                pruned += 1;
+            }
+            keep
+        });
+        self.preload_count = self.preload_count.saturating_sub(pruned);
     }
 
     /// `ProtocolEvent::TeamRoster` (issue #343): the authoritative
@@ -3122,8 +3170,8 @@ impl Meter {
             return;
         }
         let mut pruned = 0u32;
-        self.players.retain(|uid, p| {
-            let keep = members.contains(uid);
+        self.players.retain(|entity, p| {
+            let keep = members.contains(&entity.display_uid());
             if !keep && p.total_damage == 0 && p.hits == 0 && p.deaths == 0 {
                 pruned += 1;
             }
@@ -3133,12 +3181,13 @@ impl Meter {
     }
 
     fn apply_enemy_hp(&mut self, e: &EnemyHp) -> Option<ResetReason> {
+        let key = e.entity;
         // `last_event_ms` is the DPS-window end and must reflect damage
         // only; enemy-HP sync/regen packets arriving after combat stops
         // would otherwise keep extending the denominator and decay DPS
         // toward zero with no combat happening.
         {
-            let enemy = self.enemies.entry(e.uid).or_default();
+            let enemy = self.enemies.entry(key).or_default();
             if let Some(new_id) = e.monster_id {
                 // issue #313/#317: this in-place rewrite is how a `uid=1`
                 // boss silently went from monster_id 20004 ("Ignisor", a
@@ -3216,19 +3265,19 @@ impl Meter {
         // dead for the rest of this fight. Before `recompute_boss`, which
         // ranks on it.
         if e.curr_hp == Some(0) {
-            self.mark_enemy_dead(e.uid);
+            self.mark_enemy_dead(key);
         }
 
         // issue #210/#211: captured *before* `recompute_boss`, which ranks a
         // living recognized boss above a dead one — so the instant this
         // sync's `curr_hp == 0` stamps `e.uid`'s death order above, any
         // other recognized boss already damaged and still alive outranks
-        // the corpse and `recompute_boss` moves `boss_uid` off it. Mirrors
+        // the corpse and `recompute_boss` moves `boss_entity` off it. Mirrors
         // `apply_damage`'s capture: it answers whether `e.uid` was the
         // tracked boss when this update landed, which is the only form of
         // the question a *death* can still be asked after the ranking has
         // reacted to it.
-        let was_tracked_boss = self.boss_uid == Some(e.uid);
+        let was_tracked_boss = self.boss_entity == Some(key);
 
         self.recompute_boss();
 
@@ -3237,9 +3286,9 @@ impl Meter {
             // signal (the death packet can be missed; an HP sync to 0 is
             // hard to miss). Same recognized-boss gate as the death path.
             if self.fight_cfg.end_on_boss_death
-                && self.enemies.get(&e.uid).and_then(|x| x.curr_hp) == Some(0)
+                && self.enemies.get(&key).and_then(|x| x.curr_hp) == Some(0)
             {
-                self.end_fight_on_boss_death(e.uid, e.timestamp_ms);
+                self.end_fight_on_boss_death(key, e.timestamp_ms);
             }
         }
 
@@ -3247,21 +3296,21 @@ impl Meter {
         // identity, not `was_tracked_boss`. The two checks ask opposite
         // questions of the same sync. A death asks "was this the boss we were
         // following?", and only the pre-capture can answer it, because dying
-        // is itself what demotes the enemy out of `boss_uid`. A rollback asks
+        // is itself what demotes the enemy out of `boss_entity`. A rollback asks
         // "is the boss we are following the one whose bar just refilled?" —
-        // and refilling is what *promotes* an enemy into `boss_uid`, since in
+        // and refilling is what *promotes* an enemy into `boss_entity`, since in
         // the tier-0 (`curr_hp`-only, issue #76) ranking the bar's height is
         // the rank. The canonical wipe is exactly that: the boss the party
         // burned to 20% snaps back to full in one sync, overtaking whatever
         // trash or sibling boss led the ranking while it was low. Gating that
         // on the pre-capture drops the reset on the floor, which is how the
         // wipe's damage keeps piling into the next pull.
-        if self.boss_uid == Some(e.uid) {
+        if self.boss_entity == Some(key) {
             let cooldown_ok = match self.last_reset_ms {
                 Some(last) => e.timestamp_ms.saturating_sub(last) >= self.reset_cfg.cooldown_ms,
                 None => true,
             };
-            // issue #157: `boss_uid` is not only a display choice — it
+            // issue #157: `boss_entity` is not only a display choice — it
             // selects whose HP bar the auto-reset heuristic watches, and
             // `recompute_boss` can park it on a trash mob (its candidate
             // set is "damaged in this fight", which after a reset the first
@@ -3271,7 +3320,7 @@ impl Meter {
             // therefore never reset the meter, whatever the header is
             // pointing at.
             let should_reset = {
-                let enemy = &self.enemies[&e.uid];
+                let enemy = &self.enemies[&key];
                 enemy.monster_id.is_some_and(tables::is_boss_monster)
                     && check_hp_rollback(enemy, &self.reset_cfg)
             };
@@ -3328,7 +3377,7 @@ impl Meter {
                 // same rollback can't re-fire the instant the cooldown
                 // expires (it's level-triggered on `lowest_pct`, which only
                 // clears inside `reset`).
-                if let Some(enemy) = self.enemies.get_mut(&e.uid) {
+                if let Some(enemy) = self.enemies.get_mut(&key) {
                     enemy.lowest_pct = None;
                 }
             }
@@ -3345,7 +3394,7 @@ impl Meter {
     /// arrives on the entity's `SyncNearEntities` appear packet; the HP
     /// deltas that follow carry `AttrHp` and `AttrId` but not `AttrMaxHp`.
     /// A meter started mid-pull therefore never learns the boss's `max_hp`
-    /// at all, and demanding it left `boss_uid` — and so the header — empty
+    /// at all, and demanding it left `boss_entity` — and so the header — empty
     /// for the whole fight. The reference trackers hit the same problem and
     /// each work around it rather than accepting the empty result: bpsr-logs
     /// keeps a `uid_to_monster_info` shadow map of `(monster_id, max_hp)`
@@ -3368,7 +3417,7 @@ impl Meter {
     ///    fallen and the party is hitting Continuation, the header follows
     ///    the phase actually being fought — and Continuation's own death
     ///    then latches the fight end through the ordinary
-    ///    `boss_uid == target_uid` path instead of falling through to the
+    ///    `boss_entity == target_uid` path instead of falling through to the
     ///    idle timeout. Deliberately *below* `recognized`: a dead recognized
     ///    boss must still outrank a living unrecognized add, or the header
     ///    would flip to a straggling trash mob the instant the boss died,
@@ -3391,12 +3440,12 @@ impl Meter {
     ///    `EnemyState::pct`, which already guards on `max > 0`.
     /// 5. **HP magnitude** within a tier, then **uid** to tie-break
     ///    deterministically: `HashMap` iteration order is unspecified, so
-    ///    breaking ties on `hp` alone let `boss_uid` flip between calls for
+    ///    breaking ties on `hp` alone let `boss_entity` flip between calls for
     ///    two enemies sharing the same `max_hp`.
     ///
     /// An enemy with no HP of either kind is unrankable and stays out.
     fn recompute_boss(&mut self) {
-        let previous_boss_uid = self.boss_uid;
+        let previous_boss_entity = self.boss_entity;
         let damaged = self.rank_boss(|e| e.took_damage);
         // issue #157: an enemy the boss table does not recognize must not
         // hold the target while a recognized boss is still up in this
@@ -3429,7 +3478,7 @@ impl Meter {
         // the two cases (see `BOSS_ENGAGEMENT_WINDOW_MS`). It also keeps
         // `recompute_boss` callable from the `EnemyHp` path, which carries
         // no timestamp of its own.
-        self.boss_uid = match damaged {
+        self.boss_entity = match damaged {
             Some(uid) if !self.is_recognized_boss(uid) => {
                 let engaged_at = self.enemies.get(&uid).and_then(|e| e.last_damaged_ms);
                 self.rank_boss(|e| {
@@ -3448,7 +3497,7 @@ impl Meter {
         // so the header can keep naming it once the fight ends and zoning
         // out throws the live answer away. Only a recognized boss is worth
         // pinning — see `fight_identity` — and only a `Some` answer
-        // overwrites, so an add that briefly wins `boss_uid` after the boss
+        // overwrites, so an add that briefly wins `boss_entity` after the boss
         // dies cannot rename the fight that is being held.
         if let Some(id) = monster_id
             && tables::is_boss_monster(id)
@@ -3464,8 +3513,9 @@ impl Meter {
         // the winner actually changes — logging every call would reproduce
         // the #87 flood at boss-target granularity instead of attr-id
         // granularity.
-        if self.boss_uid != previous_boss_uid
-            && let Some(msg) = boss_transition_log(previous_boss_uid, self.boss_uid, monster_id)
+        if self.boss_entity != previous_boss_entity
+            && let Some(msg) =
+                boss_transition_log(previous_boss_entity, self.boss_entity, monster_id)
         {
             log::info!("{msg}");
         }
@@ -3480,7 +3530,7 @@ impl Meter {
     /// candidate sets — the enemies damaged in this fight, and the
     /// recognized bosses still up (issue #157) — without duplicating the
     /// ranking.
-    fn rank_boss(&self, candidate: impl Fn(&EnemyState) -> bool) -> Option<i64> {
+    fn rank_boss(&self, candidate: impl Fn(&EnemyState) -> bool) -> Option<EntityId> {
         self.enemies
             .iter()
             .filter(|(_, e)| candidate(e))
@@ -3502,10 +3552,10 @@ impl Meter {
             .map(|(uid, ..)| uid)
     }
 
-    /// Whether `uid` names an enemy whose monster id is in the boss table.
-    fn is_recognized_boss(&self, uid: i64) -> bool {
+    /// Whether `entity` names an enemy whose monster id is in the boss table.
+    fn is_recognized_boss(&self, entity: EntityId) -> bool {
         self.enemies
-            .get(&uid)
+            .get(&entity)
             .and_then(|e| e.monster_id)
             .is_some_and(tables::is_boss_monster)
     }
@@ -3520,7 +3570,7 @@ impl Meter {
         // this is naturally sparse (issue #69) — no transition-only guard
         // needed the way scene/boss logging above requires one.
         let boss_hp_pct = self
-            .boss_uid
+            .boss_entity
             .and_then(|uid| self.enemies.get(&uid))
             .and_then(|e| e.pct());
         // issue #284: live down-state, not cumulative deaths — see
@@ -3574,8 +3624,8 @@ impl Meter {
         // is what just got cleared.
         self.wipe_hold = false;
         self.last_reset_ms = Some(now_ms);
-        // No enemy has `took_damage` anymore, so this clears `boss_uid`.
-        // Otherwise a stale `boss_uid` from the previous pull would still
+        // No enemy has `took_damage` anymore, so this clears `boss_entity`.
+        // Otherwise a stale `boss_entity` from the previous pull would still
         // match an `EnemyHp` packet for the old boss arriving before the
         // next damage event, letting its HP-refill curve fire a second,
         // spurious reset.
@@ -3591,8 +3641,9 @@ impl Meter {
     /// named in `focus` — building only `skills`, which every row needs for
     /// the always-visible Dps bar.
     ///
-    /// `focus` is the set of player uids with an open skill-breakdown
-    /// window (`crates/app/src/ui/skill_window.rs`'s `skill_windows` keys), threaded in
+    /// `focus` is the set of player entity ids (`EntityId.0`, issue #335 —
+    /// not the display uid) with an open skill-breakdown window
+    /// (`crates/app/src/ui/skill_window.rs`'s `skill_windows` keys), threaded in
     /// from the UI via `UiCommand::SkillFocus`
     /// (`crates/app/src/pipeline.rs`'s live publish loop). `None` means
     /// "build every breakdown for every player" — [`Meter::snapshot`]'s own
@@ -3630,8 +3681,8 @@ impl Meter {
 
         let mut rows: Vec<PlayerRow> = self
             .players
-            .values()
-            .map(|p| {
+            .iter()
+            .map(|(entity, p)| {
                 let dps = p.total_damage as f64 / (dps_duration_ms as f64 / 1000.0);
                 let share_pct = if total_damage > 0 {
                     (p.total_damage as f64 / total_damage as f64 * 100.0) as f32
@@ -3648,7 +3699,8 @@ impl Meter {
                 // else gets the same empty vectors `SkillTab::rows` already
                 // returns for `Buff`, which is indistinguishable from "no
                 // events yet" to every consumer since none is looking.
-                let wants_breakdowns = focus.is_none_or(|uids| uids.contains(&p.uid));
+                let wants_breakdowns =
+                    focus.is_none_or(|entities| entities.contains(&(entity.0 as i64)));
                 let (heals, dealt, received, casts, buffs) = if wants_breakdowns {
                     (
                         breakdown_rows(&p.heals, p.total_heal, dps_duration_ms),
@@ -3662,6 +3714,7 @@ impl Meter {
                 };
                 PlayerRow {
                     uid: p.uid,
+                    entity: entity.0 as i64,
                     name: p
                         .name
                         .clone()
@@ -3736,8 +3789,9 @@ impl Meter {
         // covers. Independent of `boss_monster_id`/`is_boss` above, which
         // stay the raw facts about the currently-selected target: a
         // genuinely recognized live boss (`is_boss`) wins over this field in
-        // `encounter_title` (`crates/app/src/ui/header.rs`), which is the caption
-        // for "nothing engaged yet" and for a non-boss `boss_uid` target —
+        // `encounter_title` (`crates/app/src/ui/header.rs`), which is the
+        // caption for "nothing engaged yet" and for a non-boss `boss_entity`
+        // target —
         // see that function's doc comment for the full precedence and why.
         //
         // issue #150: a scene that lets the party pick which boss to pull has
@@ -4040,14 +4094,14 @@ fn preload_summary_log(scene_id: Option<u32>, preloaded: u32, pruned: u32) -> Op
 /// the #87 flood at boss-target granularity. Pure, like
 /// [`scene_transition_log`], for the same testability reason.
 fn boss_transition_log(
-    previous_uid: Option<i64>,
-    new_uid: Option<i64>,
+    previous: Option<EntityId>,
+    new: Option<EntityId>,
     monster_id: Option<u32>,
 ) -> Option<String> {
-    if previous_uid == new_uid {
+    if previous == new {
         return None;
     }
-    Some(match new_uid {
+    Some(match new.map(EntityId::display_uid) {
         None => "encounter: boss target cleared".to_string(),
         Some(uid) => match monster_id {
             Some(id) => {
@@ -4137,16 +4191,97 @@ impl Default for Meter {
 
 #[cfg(test)]
 mod tests {
+    /// An enemy's key in `Meter::enemies` for display uid `u` (issue #335).
+    /// These tests build events from display uids alone, so the key is the
+    /// canonical reconstruction `EntityId::from_display_uid` derives — the
+    /// same one the meter files them under.
+    fn ek(u: i64) -> EntityId {
+        EntityId::from_display_uid(u, EntityKind::Monster)
+    }
+
+    /// A player's key in `Meter::players` for display uid `u`.
+    fn pk(u: i64) -> EntityId {
+        EntityId::from_display_uid(u, EntityKind::Player)
+    }
+
     use super::*;
 
     fn dmg(attacker_uid: i64, value: i64, ts: u64) -> ProtocolEvent {
-        ProtocolEvent::Damage(DamageEvent {
-            attacker_uid,
-            attacker_kind: EntityKind::Player,
-            value,
-            timestamp_ms: ts,
-            ..Default::default()
-        })
+        ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid,
+                attacker_kind: EntityKind::Player,
+                value,
+                timestamp_ms: ts,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        )
+    }
+
+    // -- issue #335: stable entity ids ------------------------------------
+
+    /// Two entities that share a display uid but not a uuid — a recycled
+    /// uid, or a shadow/mirror copy of a live entity — must keep separate
+    /// stats. Before #335 the meter keyed on `uuid >> 16`, so both of these
+    /// landed in one row and their damage blended.
+    #[test]
+    fn two_entities_sharing_a_display_uid_keep_separate_damage_totals() {
+        let first = EntityId::from_display_uid(7, EntityKind::Player);
+        // Same `uuid >> 16`, one extra flag bit: a distinct entity the old
+        // truncation could not see.
+        let second = EntityId::from_uuid(first.uuid() | (1 << 14));
+        assert_eq!(first.display_uid(), second.display_uid());
+
+        let hit = |attacker: EntityId, value: i64, ts: u64| {
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker,
+                    attacker_uid: attacker.display_uid(),
+                    attacker_kind: EntityKind::Player,
+                    value,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
+        };
+
+        let mut m = Meter::new();
+        m.apply(&hit(first, 100, 1_000));
+        m.apply(&hit(second, 250, 1_100));
+
+        let snap = m.snapshot(1_100);
+        assert_eq!(snap.rows.len(), 2, "one row per entity, not per uid");
+        let mut totals: Vec<i64> = snap.rows.iter().map(|r| r.damage).collect();
+        totals.sort_unstable();
+        assert_eq!(totals, vec![100, 250]);
+        // Both still *print* the same display uid — that is the number the
+        // game shows, and #335 does not change it.
+        assert!(snap.rows.iter().all(|r| r.uid == 7));
+    }
+
+    /// The same separation on the enemy side: a recycled monster uid must
+    /// not inherit the previous holder's engagement or HP state.
+    #[test]
+    fn two_enemies_sharing_a_display_uid_keep_separate_state() {
+        let first = EntityId::from_display_uid(9, EntityKind::Monster);
+        let second = EntityId::from_uuid(first.uuid() | (1 << 15));
+
+        let mut m = Meter::new();
+        for (entity, curr, max) in [(first, 100u64, 100u64), (second, 500, 900)] {
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity,
+                uid: entity.display_uid(),
+                curr_hp: Some(curr),
+                max_hp: Some(max),
+                monster_id: None,
+                timestamp_ms: 1_000,
+            }));
+        }
+        assert_eq!(m.enemies.len(), 2);
+        assert_eq!(m.enemies[&first].max_hp, Some(100));
+        assert_eq!(m.enemies[&second].max_hp, Some(900));
     }
 
     // -- issue #245: Heal / Skill dealt / Skill received breakdowns -------
@@ -4158,17 +4293,20 @@ mod tests {
         value: i64,
         ts: u64,
     ) -> ProtocolEvent {
-        ProtocolEvent::Damage(DamageEvent {
-            attacker_uid,
-            attacker_kind: EntityKind::Player,
-            target_uid,
-            target_kind: EntityKind::Player,
-            skill_id,
-            value,
-            is_heal: true,
-            timestamp_ms: ts,
-            ..Default::default()
-        })
+        ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid,
+                attacker_kind: EntityKind::Player,
+                target_uid,
+                target_kind: EntityKind::Player,
+                skill_id,
+                value,
+                is_heal: true,
+                timestamp_ms: ts,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        )
     }
 
     fn hit_on_player(
@@ -4179,20 +4317,24 @@ mod tests {
         value: i64,
         ts: u64,
     ) -> ProtocolEvent {
-        ProtocolEvent::Damage(DamageEvent {
-            attacker_uid,
-            attacker_kind,
-            target_uid,
-            target_kind: EntityKind::Player,
-            skill_id,
-            value,
-            timestamp_ms: ts,
-            ..Default::default()
-        })
+        ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid,
+                attacker_kind,
+                target_uid,
+                target_kind: EntityKind::Player,
+                skill_id,
+                value,
+                timestamp_ms: ts,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        )
     }
 
     fn cast(caster_uid: i64, skill_id: i32, ts: u64) -> ProtocolEvent {
         ProtocolEvent::Cast(CastEvent {
+            caster: EntityId::from_display_uid(caster_uid, EntityKind::Player),
             caster_uid,
             skill_id,
             timestamp_ms: ts,
@@ -4258,6 +4400,7 @@ mod tests {
 
     fn buff_apply(host_uid: i64, buff_uuid: i32, base_id: Option<i32>, ts: u64) -> ProtocolEvent {
         ProtocolEvent::BuffApply {
+            host: EntityId::from_display_uid(host_uid, EntityKind::Player),
             host_uid,
             buff_uuid,
             base_id,
@@ -4270,6 +4413,7 @@ mod tests {
     /// is already up.
     fn buff_stack(host_uid: i64, buff_uuid: i32, ts: u64) -> ProtocolEvent {
         ProtocolEvent::BuffApply {
+            host: EntityId::from_display_uid(host_uid, EntityKind::Player),
             host_uid,
             buff_uuid,
             base_id: None,
@@ -4281,6 +4425,7 @@ mod tests {
     /// The full `Remove`: the whole instance, however many layers.
     fn buff_remove(host_uid: i64, buff_uuid: i32, ts: u64) -> ProtocolEvent {
         ProtocolEvent::BuffRemove {
+            host: EntityId::from_display_uid(host_uid, EntityKind::Player),
             host_uid,
             buff_uuid,
             removes_layer: false,
@@ -4292,6 +4437,7 @@ mod tests {
     /// instance is the whole thing.
     fn buff_remove_layer(host_uid: i64, buff_uuid: i32, ts: u64) -> ProtocolEvent {
         ProtocolEvent::BuffRemove {
+            host: EntityId::from_display_uid(host_uid, EntityKind::Player),
             host_uid,
             buff_uuid,
             removes_layer: true,
@@ -4517,20 +4663,23 @@ mod tests {
     fn an_absorbed_hit_on_a_player_leaves_incoming_damage_at_zero() {
         let mut m = Meter::new();
         m.apply(&dmg(1, 100, 1000));
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 9,
-            attacker_kind: EntityKind::Monster,
-            target_uid: 1,
-            target_kind: EntityKind::Player,
-            skill_id: 77,
-            value: 500,
-            kind: DamageKind::Absorbed,
-            timestamp_ms: 1100,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 9,
+                attacker_kind: EntityKind::Monster,
+                target_uid: 1,
+                target_kind: EntityKind::Player,
+                skill_id: 77,
+                value: 500,
+                kind: DamageKind::Absorbed,
+                timestamp_ms: 1100,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         let snap = m.snapshot(2000);
         let row = &snap.rows[0];
-        assert_eq!(m.players.get(&1).map(|p| p.total_incoming), Some(0));
+        assert_eq!(m.players.get(&pk(1)).map(|p| p.total_incoming), Some(0));
         assert_eq!(row.received[0].skill_id, 77);
         assert_eq!(row.received[0].damage, 0);
         assert_eq!(row.received[0].absorbed_total, 500);
@@ -4556,26 +4705,32 @@ mod tests {
     fn the_dealt_tab_merges_outgoing_damage_and_healing() {
         let mut m = Meter::new();
         // Skill 10 damages, skill 55 heals, skill 20 does both.
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            target_uid: 9,
-            target_kind: EntityKind::Monster,
-            skill_id: 10,
-            value: 700,
-            timestamp_ms: 1000,
-            ..Default::default()
-        }));
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            target_uid: 9,
-            target_kind: EntityKind::Monster,
-            skill_id: 20,
-            value: 100,
-            timestamp_ms: 1100,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: 9,
+                target_kind: EntityKind::Monster,
+                skill_id: 10,
+                value: 700,
+                timestamp_ms: 1000,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: 9,
+                target_kind: EntityKind::Monster,
+                skill_id: 20,
+                value: 100,
+                timestamp_ms: 1100,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         m.apply(&heal(1, 2, 20, 200, 1200));
         m.apply(&heal(1, 2, 55, 50, 1300));
         let snap = m.snapshot(2000);
@@ -4602,18 +4757,21 @@ mod tests {
     fn a_missed_heal_counts_as_a_use_but_adds_no_amount() {
         let mut m = Meter::new();
         m.apply(&dmg(1, 100, 1000));
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            target_uid: 2,
-            target_kind: EntityKind::Player,
-            skill_id: 55,
-            value: 400,
-            is_heal: true,
-            is_miss: true,
-            timestamp_ms: 1100,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: 2,
+                target_kind: EntityKind::Player,
+                skill_id: 55,
+                value: 400,
+                is_heal: true,
+                is_miss: true,
+                timestamp_ms: 1100,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         let snap = m.snapshot(2000);
         let row = &snap.rows[0];
         assert_eq!(row.heals.len(), 1);
@@ -4625,18 +4783,21 @@ mod tests {
     fn a_crit_heal_feeds_the_heal_tabs_crit_columns() {
         let mut m = Meter::new();
         m.apply(&dmg(1, 100, 1000));
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            target_uid: 2,
-            target_kind: EntityKind::Player,
-            skill_id: 55,
-            value: 900,
-            is_heal: true,
-            crit: true,
-            timestamp_ms: 1100,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                target_uid: 2,
+                target_kind: EntityKind::Player,
+                skill_id: 55,
+                value: 900,
+                is_heal: true,
+                crit: true,
+                timestamp_ms: 1100,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         m.apply(&heal(1, 2, 55, 100, 1200));
         let snap = m.snapshot(2000);
         let heal_row = &snap.rows[0].heals[0];
@@ -4691,14 +4852,17 @@ mod tests {
     #[test]
     fn heal_excluded_from_damage() {
         let mut m = Meter::new();
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            value: 500,
-            is_heal: true,
-            timestamp_ms: 1000,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                value: 500,
+                is_heal: true,
+                timestamp_ms: 1000,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         let snap = m.snapshot(2000);
         assert_eq!(snap.total_damage, 0);
         assert!(snap.rows.is_empty());
@@ -4708,14 +4872,17 @@ mod tests {
     #[test]
     fn miss_counts_as_hit_with_zero_damage() {
         let mut m = Meter::new();
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            value: 999,
-            is_miss: true,
-            timestamp_ms: 1000,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                value: 999,
+                is_miss: true,
+                timestamp_ms: 1000,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         let snap = m.snapshot(2000);
         assert_eq!(snap.total_damage, 0);
         assert_eq!(snap.rows.len(), 1);
@@ -4732,15 +4899,18 @@ mod tests {
         crit: bool,
         ts: u64,
     ) -> ProtocolEvent {
-        ProtocolEvent::Damage(DamageEvent {
-            attacker_uid,
-            attacker_kind: EntityKind::Player,
-            skill_id,
-            value,
-            crit,
-            timestamp_ms: ts,
-            ..Default::default()
-        })
+        ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid,
+                attacker_kind: EntityKind::Player,
+                skill_id,
+                value,
+                crit,
+                timestamp_ms: ts,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        )
     }
 
     #[test]
@@ -4758,16 +4928,19 @@ mod tests {
     #[test]
     fn a_lucky_non_crit_hit_counts_as_a_white_hit() {
         let mut m = Meter::new();
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            skill_id: 7,
-            value: 150,
-            crit: false,
-            lucky: true,
-            timestamp_ms: 1000,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                skill_id: 7,
+                value: 150,
+                crit: false,
+                lucky: true,
+                timestamp_ms: 1000,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         let snap = m.snapshot(2000);
         let skill = &snap.rows[0].skills[0];
         assert_eq!(skill.hits, 1);
@@ -4793,15 +4966,18 @@ mod tests {
     #[test]
     fn a_missed_swing_bumps_per_skill_hits_but_not_damage() {
         let mut m = Meter::new();
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            skill_id: 3,
-            value: 999,
-            is_miss: true,
-            timestamp_ms: 1000,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                skill_id: 3,
+                value: 999,
+                is_miss: true,
+                timestamp_ms: 1000,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         let snap = m.snapshot(2000);
         let skill = &snap.rows[0].skills[0];
         assert_eq!(skill.hits, 1);
@@ -4814,15 +4990,18 @@ mod tests {
         m.apply(&skill_dmg(1, 1, 100, false, 1000));
         m.apply(&skill_dmg(1, 1, 100, false, 1500));
         m.apply(&skill_dmg(1, 2, 200, true, 2000));
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 1,
-            attacker_kind: EntityKind::Player,
-            skill_id: 2,
-            value: 999,
-            is_miss: true,
-            timestamp_ms: 2500,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 1,
+                attacker_kind: EntityKind::Player,
+                skill_id: 2,
+                value: 999,
+                is_miss: true,
+                timestamp_ms: 2500,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         let snap = m.snapshot(3000);
         let row = &snap.rows[0];
         let skill_hit_sum: u64 = row.skills.iter().map(|s| s.hits).sum();
@@ -4849,6 +5028,7 @@ mod tests {
         let mut m = Meter::new();
         m.apply(&dmg(5, 100, 1000));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(5, EntityKind::Player),
             uid: 5,
             name: Some("Foo".to_string()),
             class: Some(Class::Stormblade),
@@ -4865,6 +5045,7 @@ mod tests {
 
     fn player_info(uid: i64, name: &str) -> ProtocolEvent {
         ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(uid, EntityKind::Player),
             uid,
             name: Some(name.to_string()),
             class: Some(Class::Stormblade),
@@ -5282,6 +5463,7 @@ mod tests {
         let mut m = Meter::new();
         m.apply(&dmg(7, 100, 1000));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(7, EntityKind::Player),
             uid: 7,
             name: None,
             class: None,
@@ -5299,6 +5481,7 @@ mod tests {
     fn ability_score_survives_reset_like_name_and_class() {
         let mut m = Meter::new();
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(3, EntityKind::Player),
             uid: 3,
             name: Some("Foo".to_string()),
             class: None,
@@ -5323,6 +5506,7 @@ mod tests {
         let mut m = Meter::new();
         m.apply(&dmg(9, 100, 1000));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(9, EntityKind::Player),
             uid: 9,
             name: None,
             class: None,
@@ -5344,6 +5528,7 @@ mod tests {
         let mut m = Meter::new();
         m.apply(&dmg(9, 100, 1000));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(9, EntityKind::Player),
             uid: 9,
             name: None,
             class: None,
@@ -5354,6 +5539,7 @@ mod tests {
             shield: None,
         }));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(9, EntityKind::Player),
             uid: 9,
             name: None,
             class: None,
@@ -5375,6 +5561,7 @@ mod tests {
         let mut m = Meter::new();
         m.apply(&dmg(9, 100, 1000));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(9, EntityKind::Player),
             uid: 9,
             name: None,
             class: None,
@@ -5385,6 +5572,7 @@ mod tests {
             shield: None,
         }));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(9, EntityKind::Player),
             uid: 9,
             name: None,
             class: None,
@@ -5413,6 +5601,7 @@ mod tests {
         let mut m = Meter::new();
         m.apply(&dmg(8, 100, 1000));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(8, EntityKind::Player),
             uid: 8,
             name: None,
             class: None,
@@ -5430,6 +5619,7 @@ mod tests {
     fn season_strength_survives_reset_like_name_and_class() {
         let mut m = Meter::new();
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(4, EntityKind::Player),
             uid: 4,
             name: Some("Foo".to_string()),
             class: None,
@@ -5485,15 +5675,18 @@ mod tests {
     fn fight_clock_does_not_start_on_monster_damage() {
         let mut m = Meter::new();
         // Boss hits a player at t=0; the clock must not start yet.
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 99,
-            attacker_kind: EntityKind::Monster,
-            target_uid: 1,
-            target_kind: EntityKind::Player,
-            value: 500,
-            timestamp_ms: 0,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 99,
+                attacker_kind: EntityKind::Monster,
+                target_uid: 1,
+                target_kind: EntityKind::Player,
+                value: 500,
+                timestamp_ms: 0,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         assert!(!m.is_active());
 
         // Players only open 60s later.
@@ -5513,6 +5706,7 @@ mod tests {
 
         // A boss-HP sync/regen tick arrives long after combat stopped.
         m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+            entity: EntityId::from_display_uid(10, EntityKind::Monster),
             uid: 10,
             curr_hp: Some(100),
             max_hp: Some(100),
@@ -5528,15 +5722,18 @@ mod tests {
     #[test]
     fn monster_attacker_produces_no_row() {
         let mut m = Meter::new();
-        m.apply(&ProtocolEvent::Damage(DamageEvent {
-            attacker_uid: 99,
-            attacker_kind: EntityKind::Monster,
-            target_uid: 1,
-            target_kind: EntityKind::Player,
-            value: 200,
-            timestamp_ms: 1000,
-            ..Default::default()
-        }));
+        m.apply(&ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid: 99,
+                attacker_kind: EntityKind::Monster,
+                target_uid: 1,
+                target_kind: EntityKind::Player,
+                value: 200,
+                timestamp_ms: 1000,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        ));
         let snap = m.snapshot(2000);
         assert!(snap.rows.is_empty());
     }
@@ -5545,16 +5742,19 @@ mod tests {
         use super::*;
 
         fn death_hit(attacker_uid: i64, target_uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid,
-                attacker_kind: EntityKind::Player,
-                target_uid,
-                target_kind: EntityKind::Player,
-                value: 100,
-                is_dead: true,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid,
+                    attacker_kind: EntityKind::Player,
+                    target_uid,
+                    target_kind: EntityKind::Player,
+                    value: 100,
+                    is_dead: true,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         #[test]
@@ -5570,16 +5770,19 @@ mod tests {
         #[test]
         fn is_dead_on_a_monster_target_increments_nobody() {
             let mut m = Meter::new();
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: 10,
-                target_kind: EntityKind::Monster,
-                value: 100,
-                is_dead: true,
-                timestamp_ms: 1000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 10,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    is_dead: true,
+                    timestamp_ms: 1000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             let snap = m.snapshot(2000);
             assert_eq!(snap.rows.len(), 1);
             assert_eq!(snap.rows[0].deaths, 0);
@@ -5606,17 +5809,20 @@ mod tests {
         #[test]
         fn heal_typed_dead_player_event_still_records_death() {
             let mut m = Meter::new();
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: 2,
-                target_kind: EntityKind::Player,
-                value: 100,
-                is_heal: true,
-                is_dead: true,
-                timestamp_ms: 1000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 2,
+                    target_kind: EntityKind::Player,
+                    value: 100,
+                    is_heal: true,
+                    is_dead: true,
+                    timestamp_ms: 1000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             let snap = m.snapshot(2000);
             let row = snap.rows.iter().find(|r| r.uid == 2).unwrap();
             assert_eq!(row.deaths, 1);
@@ -5649,6 +5855,7 @@ mod tests {
             m.apply(&dmg(2, 100, 1_000));
             m.apply(&death_hit(1, 2, 2_000));
             m.apply(&ProtocolEvent::Revive {
+                entity: pk(2),
                 uid: 2,
                 timestamp_ms: 4_500,
             });
@@ -5668,6 +5875,7 @@ mod tests {
         fn a_revive_without_a_prior_death_is_a_no_op() {
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Revive {
+                entity: pk(99),
                 uid: 99,
                 timestamp_ms: 1_000,
             });
@@ -5679,6 +5887,7 @@ mod tests {
             let mut m2 = Meter::new();
             m2.apply(&dmg(2, 100, 1_000));
             m2.apply(&ProtocolEvent::Revive {
+                entity: pk(2),
                 uid: 2,
                 timestamp_ms: 1_500,
             });
@@ -5697,6 +5906,7 @@ mod tests {
             let mut m = Meter::new();
             m.apply(&dmg(2, 100, 1_000));
             m.apply(&ProtocolEvent::EntityState {
+                entity: pk(2),
                 uid: 2,
                 kind: EntityKind::Player,
                 is_dead: true,
@@ -5709,6 +5919,7 @@ mod tests {
                 "AttrState dead counts as a death"
             );
             m.apply(&ProtocolEvent::EntityState {
+                entity: pk(2),
                 uid: 2,
                 kind: EntityKind::Player,
                 is_dead: false,
@@ -5838,6 +6049,7 @@ mod tests {
             let mut m = Meter::with_names_cache(cache);
 
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(5, EntityKind::Player),
                 uid: 5,
                 name: Some("Fresh".to_string()),
                 class: Some(Class::FrostMage),
@@ -5861,6 +6073,7 @@ mod tests {
 
             // Live packet only carries a name this time, no class.
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(5, EntityKind::Player),
                 uid: 5,
                 name: Some("Renamed".to_string()),
                 class: None,
@@ -5889,6 +6102,7 @@ mod tests {
         fn class_none_packet_preserves_a_previously_known_class() {
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(5, EntityKind::Player),
                 uid: 5,
                 name: Some("Ren".to_string()),
                 class: Some(Class::Stormblade),
@@ -5903,6 +6117,7 @@ mod tests {
             // A simulated Imagine-transform packet: profession id decoded to
             // no class at all (see `bpsr_protocol::pb::class_of_profession_id`).
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(5, EntityKind::Player),
                 uid: 5,
                 name: None,
                 class: None,
@@ -5956,6 +6171,7 @@ mod tests {
 
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(1, EntityKind::Player),
                 uid: 1,
                 name: Some("A".to_string()),
                 class: None,
@@ -5966,6 +6182,7 @@ mod tests {
                 shield: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(2, EntityKind::Player),
                 uid: 2,
                 name: Some("B".to_string()),
                 class: None,
@@ -5976,6 +6193,7 @@ mod tests {
                 shield: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(3, EntityKind::Player),
                 uid: 3,
                 name: Some("C".to_string()),
                 class: None,
@@ -5988,6 +6206,7 @@ mod tests {
             // Re-touch uid 1 so it becomes the most recently used, ahead of
             // 3 and 2 (in that order).
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(1, EntityKind::Player),
                 uid: 1,
                 name: Some("A".to_string()),
                 class: None,
@@ -6017,6 +6236,7 @@ mod tests {
         fn names_for_save_orders_most_recently_touched_first() {
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(1, EntityKind::Player),
                 uid: 1,
                 name: Some("First".to_string()),
                 class: None,
@@ -6027,6 +6247,7 @@ mod tests {
                 shield: None,
             }));
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(2, EntityKind::Player),
                 uid: 2,
                 name: Some("Second".to_string()),
                 class: None,
@@ -6046,6 +6267,7 @@ mod tests {
         fn server_change_reset_preserves_names_for_save() {
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(1, EntityKind::Player),
                 uid: 1,
                 name: Some("Foo".to_string()),
                 class: None,
@@ -6082,19 +6304,23 @@ mod tests {
         const UNCURATED_SCENE: u32 = 1001;
 
         fn boss_hit(uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 1,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 1,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         fn hp(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(100),
                 max_hp: Some(100),
@@ -6247,6 +6473,7 @@ mod tests {
 
         fn identified(uid: i64, curr: u64, max: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(max),
@@ -6256,21 +6483,25 @@ mod tests {
         }
 
         fn boss_hit(uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 1,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 1,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         /// An enemy seen only through HP deltas: `AttrHp` but no `AttrMaxHp`,
         /// the shape a meter started mid-pull gets (issue #76).
         fn curr_hp_only(uid: i64, curr: u64, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: None,
@@ -6312,14 +6543,14 @@ mod tests {
         }
 
         /// PR #223 review, finding 2: the rollback reset must survive the
-        /// sync that *hands* `boss_uid` to the boss doing the rolling back.
+        /// sync that *hands* `boss_entity` to the boss doing the rolling back.
         ///
         /// Two recognized bosses pulled together, both known only by
         /// `curr_hp` (issue #76's mid-pull join), so the ranking is a raw HP
         /// comparison and the leader changes whenever their bars cross. The
         /// wipe arrives as one `EnemyHp` that does two things at once: it
         /// completes B's 20% -> 100% rollback shape *and* lifts B's bar over
-        /// A's, promoting B to `boss_uid` inside the very call that has to
+        /// A's, promoting B to `boss_entity` inside the very call that has to
         /// notice the rollback. Gating the rollback on the pre-`recompute_boss`
         /// capture the boss-death latch needs (issue #210/#211) made this
         /// return `None`: B was not the tracked boss when the sync landed,
@@ -6332,6 +6563,7 @@ mod tests {
 
             fn curr_only(uid: i64, curr: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
                 ProtocolEvent::EnemyHp(EnemyHp {
+                    entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                     uid,
                     curr_hp: Some(curr),
                     max_hp: None,
@@ -6341,7 +6573,7 @@ mod tests {
             }
 
             let mut m = Meter::new();
-            // A is the bigger bar, so it holds `boss_uid` throughout the
+            // A is the bigger bar, so it holds `boss_entity` throughout the
             // pull...
             m.apply(&boss_hit(10, 0));
             assert_eq!(m.apply(&curr_only(10, 1_000, BOSS, 0)), None);
@@ -6350,14 +6582,14 @@ mod tests {
             m.apply(&boss_hit(11, 10));
             assert_eq!(m.apply(&curr_only(11, 500, OTHER_BOSS, 10)), None);
             assert_eq!(m.apply(&curr_only(11, 100, OTHER_BOSS, 100)), None);
-            assert_eq!(m.boss_uid, Some(10));
+            assert_eq!(m.boss_entity, Some(ek(10)));
 
             // The wipe: B's bar snaps back past its peak in a single sync,
             // which is both the rollback signature and the moment B outranks
             // A.
             let r = m.apply(&curr_only(11, 2_000, OTHER_BOSS, 200));
             assert_eq!(r, Some(ResetReason::BossHpRollback));
-            // The reset clears the board, `boss_uid` included, so B's
+            // The reset clears the board, `boss_entity` included, so B's
             // promotion is only observable through the reset having fired
             // at all.
             assert_eq!(m.snapshot(1_000).total_damage, 0);
@@ -6442,8 +6674,8 @@ mod tests {
             m2.apply(&boss_hit(5, 0));
             m2.apply(&hp(5, 100, 100, 0));
 
-            assert_eq!(m1.boss_uid, Some(10));
-            assert_eq!(m2.boss_uid, Some(10));
+            assert_eq!(m1.boss_entity, Some(ek(10)));
+            assert_eq!(m2.boss_entity, Some(ek(10)));
         }
 
         #[test]
@@ -6478,18 +6710,18 @@ mod tests {
         }
 
         #[test]
-        fn reset_clears_boss_uid_so_stale_hp_packet_cannot_refire() {
+        fn reset_clears_boss_entity_so_stale_hp_packet_cannot_refire() {
             let mut m = Meter::new();
             m.apply(&boss_hit(10, 0));
             m.apply(&hp(10, 100, 100, 0));
-            assert_eq!(m.boss_uid, Some(10));
+            assert_eq!(m.boss_entity, Some(ek(10)));
 
             m.reset(ResetReason::Manual, 1000);
-            assert_eq!(m.boss_uid, None);
+            assert_eq!(m.boss_entity, None);
 
             // An HP packet for the old boss uid, arriving before any new
             // damage picks a new boss, must not be able to drive a reset off
-            // the stale boss_uid.
+            // the stale boss_entity.
             let r = m.apply(&hp(10, 55, 100, 1100));
             assert_eq!(r, None);
         }
@@ -6499,9 +6731,9 @@ mod tests {
             let mut m = Meter::new();
             m.apply(&boss_hit(10, 0));
             m.apply(&hp(10, 100, 100, 0));
-            assert!(m.enemies[&10].took_damage);
+            assert!(m.enemies[&ek(10)].took_damage);
             m.reset(ResetReason::Manual, 1000);
-            assert!(!m.enemies[&10].took_damage);
+            assert!(!m.enemies[&ek(10)].took_damage);
         }
 
         /// issue #138: a server change invalidates uid-keyed entity state
@@ -6522,7 +6754,7 @@ mod tests {
                 "player rows must survive a reconnect"
             );
             assert!(m.enemies.is_empty());
-            assert!(m.boss_uid.is_none());
+            assert!(m.boss_entity.is_none());
         }
 
         // -- issue #157: trash must not hold the reset heuristic ---------
@@ -6530,20 +6762,20 @@ mod tests {
         #[test]
         fn an_add_does_not_hold_the_boss_target_while_a_recognized_boss_is_present() {
             // The shape from issue #157's log: a reset clears `took_damage`
-            // on every enemy, so the next enemy hit wins `boss_uid`
+            // on every enemy, so the next enemy hit wins `boss_entity`
             // outright — and party AoE lands on adds first.
             let mut m = Meter::new();
             m.apply(&identified(10, 1_000_000, 1_000_000, BOSS, 0));
             m.apply(&boss_hit(10, 0));
-            assert_eq!(m.boss_uid, Some(10));
+            assert_eq!(m.boss_entity, Some(ek(10)));
 
             m.reset(ResetReason::NewFight, 1_000);
             m.apply(&identified(20, 50_000, 50_000, TRASH, 1_100));
             m.apply(&boss_hit(20, 1_200));
 
             assert_eq!(
-                m.boss_uid,
-                Some(10),
+                m.boss_entity,
+                Some(ek(10)),
                 "the recognized boss keeps the target, not the add"
             );
         }
@@ -6554,7 +6786,7 @@ mod tests {
             // "actually still being fought", and a boss the party has never
             // touched — merely synced into the enemy map by an AOI
             // `EnemyHp` packet on the way past — is not one. Letting it win
-            // `boss_uid` puts its name in the header and its bar on screen
+            // `boss_entity` puts its name in the header and its bar on screen
             // while the party is fighting something else entirely.
             let mut m = Meter::new();
             m.apply(&identified(10, 1_000_000, 1_000_000, BOSS, 0));
@@ -6562,8 +6794,8 @@ mod tests {
             m.apply(&boss_hit(20, 200));
 
             assert_eq!(
-                m.boss_uid,
-                Some(20),
+                m.boss_entity,
+                Some(ek(20)),
                 "the add actually being hit holds the target"
             );
             let snap = m.snapshot(300);
@@ -6585,7 +6817,7 @@ mod tests {
 
             m.apply(&identified(20, 50_000, 50_000, TRASH, 1_100));
             m.apply(&boss_hit(20, 1_200));
-            assert_eq!(m.boss_uid, Some(20));
+            assert_eq!(m.boss_entity, Some(ek(20)));
         }
 
         #[test]
@@ -6600,15 +6832,15 @@ mod tests {
             let mut m = Meter::new();
             m.apply(&identified(10, 1_000_000, 1_000_000, BOSS, 0));
             m.apply(&boss_hit(10, 0));
-            assert_eq!(m.boss_uid, Some(10));
+            assert_eq!(m.boss_entity, Some(ek(10)));
             m.reset(ResetReason::Manual, 1_000);
 
             let much_later = 5 * 60_000;
             m.apply(&identified(20, 50_000, 50_000, TRASH, much_later));
             m.apply(&boss_hit(20, much_later + 100));
             assert_eq!(
-                m.boss_uid,
-                Some(20),
+                m.boss_entity,
+                Some(ek(20)),
                 "the pack being fought now holds the target, not the boss \
                  the party walked away from"
             );
@@ -6629,8 +6861,8 @@ mod tests {
             m.apply(&identified(20, 50_000, 50_000, TRASH, 1_100));
             m.apply(&boss_hit(20, 30_000));
             assert_eq!(
-                m.boss_uid,
-                Some(10),
+                m.boss_entity,
+                Some(ek(10)),
                 "the boss the party is still on keeps the target"
             );
         }
@@ -6638,12 +6870,12 @@ mod tests {
         #[test]
         fn an_unrecognized_enemys_hp_rollback_never_resets_the_encounter() {
             // No recognized boss anywhere in the encounter, so the add
-            // legitimately holds `boss_uid` — and its bar snapping back
+            // legitimately holds `boss_entity` — and its bar snapping back
             // must still not wipe everyone's numbers.
             let mut m = Meter::new();
             m.apply(&boss_hit(20, 0));
             m.apply(&identified(20, 100, 100, TRASH, 0));
-            assert_eq!(m.boss_uid, Some(20));
+            assert_eq!(m.boss_entity, Some(ek(20)));
             m.apply(&identified(20, 55, 100, TRASH, 100));
             assert_eq!(m.apply(&identified(20, 95, 100, TRASH, 200)), None);
             assert_eq!(m.snapshot(300).total_damage, 1);
@@ -6653,6 +6885,7 @@ mod tests {
         fn manual_reset_keeps_name_cache_for_late_damage() {
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(1, EntityKind::Player),
                 uid: 1,
                 name: Some("Foo".to_string()),
                 class: None,
@@ -6684,20 +6917,24 @@ mod tests {
 
         /// A player hit on monster `uid`, optionally the killing blow.
         fn boss_hit(uid: i64, ts: u64, is_dead: bool) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 100,
-                is_dead,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    is_dead,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         fn hp(uid: i64, curr: u64, monster_id: Option<u32>, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(100),
@@ -6822,15 +7059,18 @@ mod tests {
             m.apply(&dmg(1, 5_000, 0));
 
             // A mob aggroes the player in town long after the pull ended.
-            let reason = m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 99,
-                attacker_kind: EntityKind::Monster,
-                target_uid: 1,
-                target_kind: EntityKind::Player,
-                value: 200,
-                timestamp_ms: 100_000,
-                ..Default::default()
-            }));
+            let reason = m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 99,
+                    attacker_kind: EntityKind::Monster,
+                    target_uid: 1,
+                    target_kind: EntityKind::Player,
+                    value: 200,
+                    timestamp_ms: 100_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             assert_eq!(reason, None);
             assert_eq!(m.snapshot(101_000).total_damage, 5_000);
             assert_eq!(m.fight_state(101_000), FightState::Ended);
@@ -6840,14 +7080,17 @@ mod tests {
         fn a_heal_does_not_end_the_hold() {
             let mut m = Meter::new();
             m.apply(&dmg(1, 5_000, 0));
-            let reason = m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                value: 400,
-                is_heal: true,
-                timestamp_ms: 100_000,
-                ..Default::default()
-            }));
+            let reason = m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    value: 400,
+                    is_heal: true,
+                    timestamp_ms: 100_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             assert_eq!(reason, None);
             assert_eq!(m.snapshot(101_000).total_damage, 5_000);
         }
@@ -7058,7 +7301,7 @@ mod tests {
             m.apply(&hp(20, 50, None, 20_000));
 
             assert!(
-                !m.enemies.contains_key(&10),
+                !m.enemies.contains_key(&ek(10)),
                 "the old instance's entities must not survive into the new one"
             );
             assert_eq!(
@@ -7099,7 +7342,7 @@ mod tests {
                 "the clock latches to the ServerChanged timestamp, not fight_start_ms drifting"
             );
             assert!(m.enemies.is_empty(), "uids are re-issued by the new server");
-            assert!(m.boss_uid.is_none());
+            assert!(m.boss_entity.is_none());
             assert!(
                 m.scene_id.is_none(),
                 "the scene is unknown until the next EnterScene"
@@ -7182,15 +7425,18 @@ mod tests {
             m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 500 });
             assert_eq!(m.fight_state(500), FightState::Ended);
 
-            let reason = m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 99,
-                attacker_kind: EntityKind::Monster,
-                target_uid: 1,
-                target_kind: EntityKind::Player,
-                value: 200,
-                timestamp_ms: 10_000,
-                ..Default::default()
-            }));
+            let reason = m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 99,
+                    attacker_kind: EntityKind::Monster,
+                    target_uid: 1,
+                    target_kind: EntityKind::Player,
+                    value: 200,
+                    timestamp_ms: 10_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             assert_eq!(reason, None);
             assert_eq!(m.snapshot(11_000).total_damage, 5_000);
             assert_eq!(m.fight_state(11_000), FightState::Ended);
@@ -7204,14 +7450,17 @@ mod tests {
             m.apply(&dmg(1, 5_000, 0));
             m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 500 });
 
-            let reason = m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                value: 400,
-                is_heal: true,
-                timestamp_ms: 10_000,
-                ..Default::default()
-            }));
+            let reason = m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    value: 400,
+                    is_heal: true,
+                    timestamp_ms: 10_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             assert_eq!(reason, None);
             assert_eq!(m.snapshot(11_000).total_damage, 5_000);
         }
@@ -7237,6 +7486,7 @@ mod tests {
             m.apply(&boss_hit(10, 0, false));
             m.apply(&hp(10, 50, Some(103), 0)); // 103 = a catalogued boss
             m.apply(&ProtocolEvent::EntityState {
+                entity: ek(10),
                 uid: 10,
                 kind: EntityKind::Monster,
                 is_dead: true,
@@ -7262,6 +7512,7 @@ mod tests {
             m.apply(&boss_hit(10, 0, false));
             m.apply(&hp(10, 50, Some(103), 0)); // 103 = a catalogued boss
             m.apply(&ProtocolEvent::EntityState {
+                entity: ek(10),
                 uid: 10,
                 kind: EntityKind::Monster,
                 is_dead: true,
@@ -7289,6 +7540,7 @@ mod tests {
             // landed on it.
             m.apply(&hp(10, 50, Some(103), 0)); // 103 = a catalogued boss
             m.apply(&ProtocolEvent::EntityState {
+                entity: ek(10),
                 uid: 10,
                 kind: EntityKind::Monster,
                 is_dead: true,
@@ -7310,6 +7562,7 @@ mod tests {
         fn attr_state_dead_for_an_unseen_enemy_does_nothing() {
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::EntityState {
+                entity: ek(999),
                 uid: 999,
                 kind: EntityKind::Monster,
                 is_dead: true,
@@ -7328,6 +7581,7 @@ mod tests {
         fn attr_state_dead_for_an_unknown_player_does_not_open_a_roster_row() {
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::EntityState {
+                entity: pk(999),
                 uid: 999,
                 kind: EntityKind::Player,
                 is_dead: true,
@@ -7456,6 +7710,7 @@ mod tests {
         fn names_survive_the_new_fight_reset() {
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Player(PlayerInfo {
+                entity: EntityId::from_display_uid(1, EntityKind::Player),
                 uid: 1,
                 name: Some("Foo".to_string()),
                 class: None,
@@ -7589,7 +7844,7 @@ mod tests {
         #[test]
         fn the_second_of_a_boss_pair_holds_the_pull_open_after_the_first_dies() {
             // Dreambloom Ruins' Caprahorn spawns two recognized bosses of
-            // equal HP and the party fights both at once, so `boss_uid` can
+            // equal HP and the party fights both at once, so `boss_entity` can
             // only ever name one of them. Neither the liveness gate nor the
             // boss-death latch may read "the boss" as "the selected one".
             let mut m = in_dungeon();
@@ -7650,15 +7905,18 @@ mod tests {
         /// A monster swinging at a player: the shape that keeps arriving
         /// after a wipe, when the boss carries on hitting corpses.
         fn monster_hit(target_uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 99,
-                attacker_kind: EntityKind::Monster,
-                target_uid,
-                target_kind: EntityKind::Player,
-                value: 200,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 99,
+                    attacker_kind: EntityKind::Monster,
+                    target_uid,
+                    target_kind: EntityKind::Player,
+                    value: 200,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         #[test]
@@ -7716,15 +7974,18 @@ mod tests {
                 value: i64,
                 ts: u64,
             ) -> ProtocolEvent {
-                ProtocolEvent::Damage(DamageEvent {
-                    attacker_uid,
-                    attacker_kind: EntityKind::Player,
-                    target_uid,
-                    target_kind: EntityKind::Monster,
-                    value,
-                    timestamp_ms: ts,
-                    ..Default::default()
-                })
+                ProtocolEvent::Damage(
+                    DamageEvent {
+                        attacker_uid,
+                        attacker_kind: EntityKind::Player,
+                        target_uid,
+                        target_kind: EntityKind::Monster,
+                        value,
+                        timestamp_ms: ts,
+                        ..Default::default()
+                    }
+                    .test_reconstructed(),
+                )
             }
 
             #[test]
@@ -7806,16 +8067,19 @@ mod tests {
                 m.apply(&dmg(1, 100, 1_000));
                 m.tick(1_000 + idle());
 
-                m.apply(&ProtocolEvent::Damage(DamageEvent {
-                    attacker_uid: 2,
-                    attacker_kind: EntityKind::Monster,
-                    target_uid: 1,
-                    target_kind: EntityKind::Player,
-                    value: 9_999,
-                    is_dead: true,
-                    timestamp_ms: 1_000 + 500,
-                    ..Default::default()
-                }));
+                m.apply(&ProtocolEvent::Damage(
+                    DamageEvent {
+                        attacker_uid: 2,
+                        attacker_kind: EntityKind::Monster,
+                        target_uid: 1,
+                        target_kind: EntityKind::Player,
+                        value: 9_999,
+                        is_dead: true,
+                        timestamp_ms: 1_000 + 500,
+                        ..Default::default()
+                    }
+                    .test_reconstructed(),
+                ));
 
                 // A hit well past the grace window resumes as an ordinary
                 // `NewFight`, exactly as it would have with no wipe hold at
@@ -7832,6 +8096,7 @@ mod tests {
                 m.tick(1_000 + idle());
 
                 m.apply(&ProtocolEvent::Cast(CastEvent {
+                    caster: EntityId::from_display_uid(1, EntityKind::Player),
                     caster_uid: 1,
                     skill_id: 1550,
                     timestamp_ms: 1_000 + 500,
@@ -7847,6 +8112,7 @@ mod tests {
                 let mut m = Meter::new();
                 m.apply(&dmg(1, 100, 1_000));
                 m.apply(&ProtocolEvent::BuffApply {
+                    host: EntityId::from_display_uid(1, EntityKind::Player),
                     host_uid: 1,
                     buff_uuid: 417,
                     base_id: Some(3_210_031),
@@ -7857,6 +8123,7 @@ mod tests {
 
                 // The buff closes 500ms into the grace window.
                 m.apply(&ProtocolEvent::BuffRemove {
+                    host: EntityId::from_display_uid(1, EntityKind::Player),
                     host_uid: 1,
                     buff_uuid: 417,
                     removes_layer: false,
@@ -7950,19 +8217,23 @@ mod tests {
         const MOB_UID: i64 = 12;
 
         fn hit(attacker_uid: i64, target_uid: i64, value: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid,
-                attacker_kind: EntityKind::Player,
-                target_uid,
-                target_kind: EntityKind::Monster,
-                value,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid,
+                    attacker_kind: EntityKind::Player,
+                    target_uid,
+                    target_kind: EntityKind::Monster,
+                    value,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         fn enemy_hp(uid: i64, curr: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(1_000_000),
@@ -7978,16 +8249,19 @@ mod tests {
 
         /// Any monster landing a killing blow on a player.
         fn killing_blow_from(attacker_uid: i64, target_uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid,
-                attacker_kind: EntityKind::Monster,
-                target_uid,
-                target_kind: EntityKind::Player,
-                value: 9_999,
-                is_dead: true,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid,
+                    attacker_kind: EntityKind::Monster,
+                    target_uid,
+                    target_kind: EntityKind::Player,
+                    value: 9_999,
+                    is_dead: true,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         /// A player landing a killing blow on *themselves* — a reflected
@@ -7995,44 +8269,53 @@ mod tests {
         /// which is the case `killing_blow_from` (always a monster
         /// attacker) cannot express.
         fn self_killing_blow(uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: uid,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Player,
-                value: 9_999,
-                is_dead: true,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: uid,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Player,
+                    value: 9_999,
+                    is_dead: true,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         /// A player healing a party member — the only kind of outgoing
         /// event a pure support ever produces.
         fn heal(attacker_uid: i64, target_uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid,
-                attacker_kind: EntityKind::Player,
-                target_uid,
-                target_kind: EntityKind::Player,
-                value: 4_000,
-                is_heal: true,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid,
+                    attacker_kind: EntityKind::Player,
+                    target_uid,
+                    target_kind: EntityKind::Player,
+                    value: 4_000,
+                    is_heal: true,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         /// The boss carrying on swinging after the party is down.
         fn monster_swing(target_uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: BOSS_UID,
-                attacker_kind: EntityKind::Monster,
-                target_uid,
-                target_kind: EntityKind::Player,
-                value: 200,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: BOSS_UID,
+                    attacker_kind: EntityKind::Monster,
+                    target_uid,
+                    target_kind: EntityKind::Player,
+                    value: 200,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         /// A two-player party in an instance, both rows known from the
@@ -8098,6 +8381,7 @@ mod tests {
             );
 
             m.apply(&ProtocolEvent::EntityState {
+                entity: pk(2),
                 uid: 2,
                 kind: EntityKind::Player,
                 is_dead: true,
@@ -8278,6 +8562,7 @@ mod tests {
             // One battle-rez: 7 of 8 are still down (87.5%), still at or
             // above the 80% wipe threshold — the hold must persist.
             m.apply(&ProtocolEvent::Revive {
+                entity: pk(1),
                 uid: 1,
                 timestamp_ms: 6_500,
             });
@@ -8289,10 +8574,12 @@ mod tests {
             // Two more revive: 5 of 8 down (62.5%), under the 80% wipe
             // threshold — enough of the roster is back up.
             m.apply(&ProtocolEvent::Revive {
+                entity: pk(2),
                 uid: 2,
                 timestamp_ms: 6_600,
             });
             m.apply(&ProtocolEvent::Revive {
+                entity: pk(3),
                 uid: 3,
                 timestamp_ms: 6_700,
             });
@@ -8483,11 +8770,11 @@ mod tests {
             );
 
             assert_eq!(
-                m.players.get(&1).map(|p| p.deaths),
+                m.players.get(&pk(1)).map(|p| p.deaths),
                 Some(1),
                 "death counts must survive the post-wipe scene bounce"
             );
-            assert_eq!(m.players.get(&2).map(|p| p.deaths), Some(1));
+            assert_eq!(m.players.get(&pk(2)).map(|p| p.deaths), Some(1));
 
             assert_eq!(m.fight_state(60_000), FightState::Ended);
             let snap = m.snapshot(60_000);
@@ -8516,23 +8803,23 @@ mod tests {
             m.apply(&enemy_hp(NEXT_BOSS_UID, 800_000, NEXT_BOSS, 30_000));
 
             assert_ne!(
-                m.boss_uid,
-                Some(BOSS_UID),
+                m.boss_entity,
+                Some(ek(BOSS_UID)),
                 "the last dungeon's boss must not own the target in this one"
             );
             assert_eq!(
-                m.boss_uid, None,
+                m.boss_entity, None,
                 "and nothing here has been engaged yet either"
             );
 
             // PR #209 removed the runtime scene->boss *learning* system
             // (`Meter::scene_bosses` and friends) this test used to guard
-            // here: a stale `boss_uid` had no way to poison a *learned*
+            // here: a stale `boss_entity` had no way to poison a *learned*
             // per-scene answer, because that answer no longer exists.
             // `EncounterInfo::scene_boss_name` (`Meter::snapshot`) is now a
             // pure lookup into the static, curated
             // `tables::SCENE_FINAL_BOSSES` keyed only on `scene_id` — it
-            // cannot observe `boss_uid` or the live enemy map at all, so
+            // cannot observe `boss_entity` or the live enemy map at all, so
             // there is nothing left for a cross-dungeon hijack to corrupt.
 
             // The frozen wipe display is untouched by all of that: it is
@@ -8908,15 +9195,18 @@ mod tests {
             in_dungeon(&mut m);
             m.apply(&player_info(1, "Alpha"));
             m.apply(&player_info(2, "Bravo"));
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: 100,
-                target_kind: EntityKind::Monster,
-                value: 5_000,
-                timestamp_ms: 1_000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 100,
+                    target_kind: EntityKind::Monster,
+                    value: 5_000,
+                    timestamp_ms: 1_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             m.apply(&ProtocolEvent::TeamRoster {
                 members: vec![1, 2],
             });
@@ -8939,15 +9229,18 @@ mod tests {
         }
 
         fn damage_from(attacker_uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid,
-                attacker_kind: EntityKind::Player,
-                target_uid: 100,
-                target_kind: EntityKind::Monster,
-                value: 1_000,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 100,
+                    target_kind: EntityKind::Monster,
+                    value: 1_000,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         /// Issue #343 finding O1: outside a dungeon, `players` is an AOI
@@ -9051,6 +9344,7 @@ mod tests {
 
         fn hp(uid: i64, curr: u64, max: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(max),
@@ -9061,16 +9355,19 @@ mod tests {
 
         /// A player hit on monster `uid`, optionally the killing blow.
         fn hit(uid: i64, ts: u64, is_dead: bool) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 500,
-                is_dead,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 500,
+                    is_dead,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         #[test]
@@ -9142,8 +9439,8 @@ mod tests {
          {
             // Defect 2: `recompute_boss` ranks a living enemy above a dead
             // one, so once Origin is marked dead, `recompute_boss` moves
-            // `boss_uid` onto the already-damaged, still-alive Continuation
-            // *before* the `boss_uid == target_uid` guard below is checked
+            // `boss_entity` onto the already-damaged, still-alive Continuation
+            // *before* the `boss_entity == target_uid` guard below is checked
             // — unless that fact is captured first.
             //
             // Defect 3: even with the ordering fixed, `other_living_boss`
@@ -9167,7 +9464,11 @@ mod tests {
             m.apply(&hp(11, 1_000_000, 1_000_000, CONTINUATION, 0));
             m.apply(&hit(10, 1_000, false));
             m.apply(&hit(11, 1_100, false));
-            assert_eq!(m.boss_uid, Some(10), "Origin, the larger pool, is tracked");
+            assert_eq!(
+                m.boss_entity,
+                Some(ek(10)),
+                "Origin, the larger pool, is tracked"
+            );
 
             let step = idle() - 1_000; // comfortably inside the idle timeout
             let mut ts = 1_100;
@@ -9291,6 +9592,7 @@ mod tests {
 
         fn hp(uid: i64, curr: u64, max: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(max),
@@ -9303,6 +9605,7 @@ mod tests {
         /// was never observed at all.
         fn hp_unknown(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: None,
                 max_hp: None,
@@ -9312,26 +9615,34 @@ mod tests {
         }
 
         fn hit(uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 500,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 500,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         /// A despawn carrying no tag 2 at all — the fallback path, and what
         /// every pre-#276 test in this module means by "gone".
         fn gone(uid: i64) -> ProtocolEvent {
-            ProtocolEvent::EnemyGone { uid, reason: None }
+            ProtocolEvent::EnemyGone {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
+                uid,
+                reason: None,
+            }
         }
 
         /// A despawn carrying the server's own reason (issue #276).
         fn gone_because(uid: i64, reason: DisappearReason) -> ProtocolEvent {
             ProtocolEvent::EnemyGone {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 reason: Some(reason),
             }
@@ -9353,7 +9664,7 @@ mod tests {
             // the corpse is simply removed from AOI. That despawn is the
             // only evidence the meter will ever get.
             let mut m = pull();
-            assert_eq!(m.boss_uid, Some(BOSS_UID));
+            assert_eq!(m.boss_entity, Some(ek(BOSS_UID)));
 
             let reason = m.apply(&gone(BOSS_UID));
 
@@ -9366,7 +9677,7 @@ mod tests {
             assert_eq!(m.fight_end_boss_id, Some(ORIGIN));
             assert_eq!(m.fight_state(2_000), FightState::Ended);
             assert!(
-                !m.enemies[&BOSS_UID].is_alive(),
+                !m.enemies[&ek(BOSS_UID)].is_alive(),
                 "the boss must read as dead so nothing holds the pull open"
             );
         }
@@ -9385,7 +9696,7 @@ mod tests {
 
             assert_eq!(m.fight_end_ms, None);
             assert_eq!(m.fight_state(1_100), FightState::Active);
-            assert!(m.enemies[&BOSS_UID].is_alive());
+            assert!(m.enemies[&ek(BOSS_UID)].is_alive());
         }
 
         #[test]
@@ -9399,7 +9710,7 @@ mod tests {
             m.apply(&gone(BOSS_UID));
 
             assert_eq!(m.fight_end_ms, None);
-            assert!(m.enemies[&BOSS_UID].is_alive());
+            assert!(m.enemies[&ek(BOSS_UID)].is_alive());
         }
 
         #[test]
@@ -9428,7 +9739,7 @@ mod tests {
             m.apply(&gone(BOSS_UID));
 
             assert_eq!(m.fight_end_ms, None);
-            assert!(m.enemies[&BOSS_UID].is_alive());
+            assert!(m.enemies[&ek(BOSS_UID)].is_alive());
         }
 
         #[test]
@@ -9442,7 +9753,7 @@ mod tests {
             m.apply(&gone(BOSS_UID));
 
             assert_eq!(m.fight_end_ms, None);
-            assert!(m.enemies[&BOSS_UID].is_alive());
+            assert!(m.enemies[&ek(BOSS_UID)].is_alive());
         }
 
         #[test]
@@ -9457,7 +9768,7 @@ mod tests {
             m.apply(&gone(OTHER_UID));
 
             assert_eq!(m.fight_end_ms, None);
-            assert!(m.enemies[&OTHER_UID].is_alive());
+            assert!(m.enemies[&ek(OTHER_UID)].is_alive());
         }
 
         #[test]
@@ -9471,12 +9782,12 @@ mod tests {
             m.apply(&hit(BOSS_UID, 1_000));
             m.apply(&hit(OTHER_UID, 1_100));
             m.apply(&hp(OTHER_UID, 10_000, 1_000_000, CONTINUATION, 1_200));
-            assert_eq!(m.boss_uid, Some(BOSS_UID), "Origin, the larger pool");
+            assert_eq!(m.boss_entity, Some(ek(BOSS_UID)), "Origin, the larger pool");
 
             m.apply(&gone(OTHER_UID));
 
             assert_eq!(m.fight_end_ms, None);
-            assert!(m.enemies[&OTHER_UID].is_alive());
+            assert!(m.enemies[&ek(OTHER_UID)].is_alive());
             assert_eq!(m.fight_state(1_300), FightState::Active);
         }
 
@@ -9495,12 +9806,16 @@ mod tests {
                 ts += step;
                 m.apply(&hit(OTHER_UID, ts));
             }
-            assert_eq!(m.boss_uid, Some(BOSS_UID), "the recognized boss is tracked");
+            assert_eq!(
+                m.boss_entity,
+                Some(ek(BOSS_UID)),
+                "the recognized boss is tracked"
+            );
 
             m.apply(&gone(BOSS_UID));
 
             assert_eq!(m.fight_end_ms, None);
-            assert!(m.enemies[&BOSS_UID].is_alive());
+            assert!(m.enemies[&ek(BOSS_UID)].is_alive());
         }
 
         #[test]
@@ -9511,24 +9826,27 @@ mod tests {
             let mut m = in_raid();
             m.apply(&hp(BOSS_UID, 1_000_000, 1_000_000, ORIGIN, 0));
             m.apply(&hit(BOSS_UID, 1_000));
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: BOSS_UID,
-                target_kind: EntityKind::Monster,
-                value: 500,
-                is_dead: true,
-                timestamp_ms: 2_000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: BOSS_UID,
+                    target_kind: EntityKind::Monster,
+                    value: 500,
+                    is_dead: true,
+                    timestamp_ms: 2_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             assert_eq!(m.fight_end_ms, Some(2_000));
-            let rank = m.enemies[&BOSS_UID].death_order;
+            let rank = m.enemies[&ek(BOSS_UID)].death_order;
             let seen = m.deaths_seen;
 
             m.apply(&gone(BOSS_UID));
 
             assert_eq!(m.fight_end_ms, Some(2_000));
-            assert_eq!(m.enemies[&BOSS_UID].death_order, rank);
+            assert_eq!(m.enemies[&ek(BOSS_UID)].death_order, rank);
             assert_eq!(m.deaths_seen, seen, "the corpse must not die twice");
         }
 
@@ -9554,7 +9872,7 @@ mod tests {
             m.apply(&gone(BOSS_UID));
 
             assert_eq!(m.fight_end_ms, None);
-            assert!(m.enemies[&BOSS_UID].is_alive());
+            assert!(m.enemies[&ek(BOSS_UID)].is_alive());
         }
 
         /// PR #239 review, finding 2: the despawn death is routed through
@@ -9572,16 +9890,16 @@ mod tests {
             m.apply(&hit(BOSS_UID, 1_000));
             m.apply(&hit(OTHER_UID, 1_100));
             m.apply(&hp(BOSS_UID, 30_000, 2_000_000, ORIGIN, 1_200));
-            assert_eq!(m.boss_uid, Some(BOSS_UID), "Origin, the larger pool");
+            assert_eq!(m.boss_entity, Some(ek(BOSS_UID)), "Origin, the larger pool");
 
             m.apply(&gone(BOSS_UID));
 
             assert!(
-                !m.enemies[&BOSS_UID].is_alive(),
+                !m.enemies[&ek(BOSS_UID)].is_alive(),
                 "the despawn itself was read as a death -- this test is about \
                  the guard downstream of that, not about refusing the despawn"
             );
-            assert!(m.enemies[&OTHER_UID].is_alive());
+            assert!(m.enemies[&ek(OTHER_UID)].is_alive());
             assert_eq!(m.fight_end_ms, None, "the twin is still being fought");
             assert_eq!(m.fight_state(1_200), FightState::Active);
         }
@@ -9609,7 +9927,7 @@ mod tests {
             m.apply(&gone(BOSS_UID));
 
             assert!(
-                !m.enemies[&BOSS_UID].is_alive(),
+                !m.enemies[&ek(BOSS_UID)].is_alive(),
                 "the despawn itself was read as a death -- this test is about \
                  the guard downstream of that, not about refusing the despawn"
             );
@@ -9658,7 +9976,7 @@ mod tests {
             let mut m = in_raid();
             m.apply(&hp(BOSS_UID, 1_000_000, 1_000_000, ORIGIN, 0));
             m.apply(&hit(BOSS_UID, 1_000));
-            assert_eq!(m.boss_uid, Some(BOSS_UID));
+            assert_eq!(m.boss_entity, Some(ek(BOSS_UID)));
 
             let reason = m.apply(&gone_because(BOSS_UID, DisappearReason::Dead));
 
@@ -9670,12 +9988,12 @@ mod tests {
             );
             assert_eq!(m.fight_end_boss_id, Some(ORIGIN));
             assert_eq!(m.fight_state(2_000), FightState::Ended);
-            assert!(!m.enemies[&BOSS_UID].is_alive());
+            assert!(!m.enemies[&ek(BOSS_UID)].is_alive());
         }
 
         /// `Dead` replaces clause 8, not clause 3. An enemy whose health was
         /// never observed at all is unrankable (`rank_boss` drops a
-        /// `(None, None)` HP pair outright), so it is never `boss_uid` and
+        /// `(None, None)` HP pair outright), so it is never `boss_entity` and
         /// the despawn never reaches the reason check — the server saying it
         /// died does not change that. Pinned so a later widening of the rule
         /// has to be done deliberately.
@@ -9684,12 +10002,16 @@ mod tests {
             let mut m = in_raid();
             m.apply(&hp_unknown(BOSS_UID, ORIGIN, 0));
             m.apply(&hit(BOSS_UID, 1_000));
-            assert_ne!(m.boss_uid, Some(BOSS_UID), "no HP ever synced: unrankable");
+            assert_ne!(
+                m.boss_entity,
+                Some(ek(BOSS_UID)),
+                "no HP ever synced: unrankable"
+            );
 
             m.apply(&gone_because(BOSS_UID, DisappearReason::Dead));
 
             assert_eq!(m.fight_end_ms, None);
-            assert!(m.enemies[&BOSS_UID].is_alive());
+            assert!(m.enemies[&ek(BOSS_UID)].is_alive());
         }
 
         /// **The regression that matters most** (issue #243's false-positive
@@ -9700,7 +10022,7 @@ mod tests {
         #[test]
         fn a_destroy_reason_does_not_end_the_fight_even_at_low_health() {
             let mut m = pull();
-            assert_eq!(m.boss_uid, Some(BOSS_UID));
+            assert_eq!(m.boss_entity, Some(ek(BOSS_UID)));
 
             m.apply(&gone_because(BOSS_UID, DisappearReason::Destroy));
 
@@ -9708,7 +10030,7 @@ mod tests {
                 m.fight_end_ms, None,
                 "the server said eviction, which outranks our HP inference"
             );
-            assert!(m.enemies[&BOSS_UID].is_alive());
+            assert!(m.enemies[&ek(BOSS_UID)].is_alive());
             assert_eq!(m.fight_state(2_000), FightState::Active);
         }
 
@@ -9722,7 +10044,7 @@ mod tests {
             m.apply(&gone_because(BOSS_UID, DisappearReason::TransferLeave));
 
             assert_eq!(m.fight_end_ms, None);
-            assert!(m.enemies[&BOSS_UID].is_alive());
+            assert!(m.enemies[&ek(BOSS_UID)].is_alive());
         }
 
         #[test]
@@ -9735,7 +10057,7 @@ mod tests {
             ));
 
             assert_eq!(m.fight_end_ms, None);
-            assert!(m.enemies[&BOSS_UID].is_alive());
+            assert!(m.enemies[&ek(BOSS_UID)].is_alive());
         }
 
         /// An explicit `Normal` is ordinary streaming churn, and is *not*
@@ -9748,7 +10070,7 @@ mod tests {
             m.apply(&gone_because(BOSS_UID, DisappearReason::Normal));
 
             assert_eq!(m.fight_end_ms, None);
-            assert!(m.enemies[&BOSS_UID].is_alive());
+            assert!(m.enemies[&ek(BOSS_UID)].is_alive());
         }
 
         /// A future value nobody has decoded yet is refused rather than
@@ -9761,7 +10083,7 @@ mod tests {
             m.apply(&gone_because(BOSS_UID, DisappearReason::Unknown(99)));
 
             assert_eq!(m.fight_end_ms, None);
-            assert!(m.enemies[&BOSS_UID].is_alive());
+            assert!(m.enemies[&ek(BOSS_UID)].is_alive());
         }
 
         /// `Dead` replaces clause 8 only. The identity clauses still stand:
@@ -9775,7 +10097,7 @@ mod tests {
             m.apply(&gone_because(OTHER_UID, DisappearReason::Dead));
 
             assert_eq!(m.fight_end_ms, None);
-            assert!(m.enemies[&OTHER_UID].is_alive());
+            assert!(m.enemies[&ek(OTHER_UID)].is_alive());
         }
 
         /// Likewise for a boss nobody engaged: the party walked past it and
@@ -9789,7 +10111,7 @@ mod tests {
             m.apply(&gone_because(BOSS_UID, DisappearReason::Dead));
 
             assert_eq!(m.fight_end_ms, None);
-            assert!(m.enemies[&BOSS_UID].is_alive());
+            assert!(m.enemies[&ek(BOSS_UID)].is_alive());
         }
 
         /// The retained fallback, stated once explicitly rather than only
@@ -9846,7 +10168,7 @@ mod tests {
             m.apply(&hp(BOSS_UID, 2_000_000, 2_000_000, ORIGIN, 0));
             m.apply(&hit(BOSS_UID, 1_000));
             m.apply(&hp(BOSS_UID, 60_000, 2_000_000, ORIGIN, 1_500));
-            assert_eq!(m.boss_uid, Some(BOSS_UID), "the engaged selection");
+            assert_eq!(m.boss_entity, Some(ek(BOSS_UID)), "the engaged selection");
 
             m.apply(&gone(BOSS_UID));
 
@@ -9863,7 +10185,7 @@ mod tests {
             );
             assert_eq!(m.fight_state(1_600), FightState::Ended);
             assert!(
-                m.enemies[&OTHER_UID].is_alive(),
+                m.enemies[&ek(OTHER_UID)].is_alive(),
                 "the untouched next selection is still standing -- it simply \
                  has no say in whether this pull ended"
             );
@@ -10031,7 +10353,7 @@ mod tests {
             m.apply(&gone(BOSS_UID));
 
             assert!(
-                !m.enemies[&BOSS_UID].is_alive(),
+                !m.enemies[&ek(BOSS_UID)].is_alive(),
                 "the despawn itself was still read as a death"
             );
             assert_eq!(m.fight_end_ms, None, "the twin is still being fought");
@@ -10069,20 +10391,24 @@ mod tests {
 
         /// A player hit on monster `uid`, optionally the killing blow.
         fn hit(uid: i64, value: i64, ts: u64, is_dead: bool) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value,
-                is_dead,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value,
+                    is_dead,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         fn hp(uid: i64, curr: u64, max: u64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(max),
@@ -10103,7 +10429,11 @@ mod tests {
             m.apply(&hp(11, 400, 500, CONTINUATION, 0));
             m.apply(&hit(10, 100, 100, false));
             m.apply(&hit(11, 100, 200, false));
-            assert_eq!(m.boss_uid, Some(10), "the larger-max-hp phase is boss");
+            assert_eq!(
+                m.boss_entity,
+                Some(ek(10)),
+                "the larger-max-hp phase is boss"
+            );
 
             m.apply(&hit(10, 100, 300, true));
 
@@ -10146,7 +10476,7 @@ mod tests {
         fn a_damaged_boss_with_no_hp_at_all_counts_as_living() {
             // Pins `other_living_boss` on its own, without help from the
             // ranking key: an enemy with neither `max_hp` nor `curr_hp` is
-            // unrankable, so `recompute_boss` cannot move `boss_uid` off the
+            // unrankable, so `recompute_boss` cannot move `boss_entity` off the
             // dying phase and the guard is the only thing standing between
             // this fight and an early end. It also pins the asymmetry
             // documented on `EnemyState::is_alive` — never-observed HP counts
@@ -10155,6 +10485,7 @@ mod tests {
             let mut m = Meter::new();
             m.apply(&hp(10, 900, 1_000, ORIGIN, 0));
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(11, EntityKind::Monster),
                 uid: 11,
                 curr_hp: None,
                 max_hp: None,
@@ -10165,7 +10496,7 @@ mod tests {
             m.apply(&hit(11, 100, 200, false));
             m.apply(&hit(10, 100, 300, true));
 
-            assert_eq!(m.boss_uid, Some(10), "the other boss is unrankable");
+            assert_eq!(m.boss_entity, Some(ek(10)), "the other boss is unrankable");
             assert_eq!(m.fight_end_ms, None);
         }
 
@@ -10351,7 +10682,7 @@ mod tests {
             assert_eq!(m.fight_state(10_100), FightState::Active);
 
             // The final phase's death latches through the ordinary
-            // `boss_uid == target_uid` path — no fall-through to the idle
+            // `boss_entity == target_uid` path — no fall-through to the idle
             // timeout — and the header holds on the phase just killed rather
             // than snapping back to the larger-max-hp corpse.
             m.apply(&hit(12, 100, 11_000, true));
@@ -10491,16 +10822,19 @@ mod tests {
             m.apply(&hit(10, 500, 1_000, true));
 
             m.apply(&hp(11, 500, 500, CONTINUATION, 20_000));
-            let reason = m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: 11,
-                target_kind: EntityKind::Monster,
-                value: 0,
-                is_miss: true,
-                timestamp_ms: 21_000,
-                ..Default::default()
-            }));
+            let reason = m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 11,
+                    target_kind: EntityKind::Monster,
+                    value: 0,
+                    is_miss: true,
+                    timestamp_ms: 21_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
 
             assert_eq!(reason, None, "a miss is still the party engaging");
             assert_eq!(m.fight_start_ms, Some(100));
@@ -10716,7 +11050,7 @@ mod tests {
             m.apply(&hit(10, 100, 100, false));
             m.apply(&hit(10, 100, 200, true));
             assert_eq!(m.fight_end_ms, Some(200));
-            assert_eq!(m.enemies[&10].curr_hp, Some(900), "no sync ever hit 0");
+            assert_eq!(m.enemies[&ek(10)].curr_hp, Some(900), "no sync ever hit 0");
 
             m.reset(ResetReason::Manual, 300);
 
@@ -10727,8 +11061,12 @@ mod tests {
             m.apply(&hp(11, 500, 500, OTHER_BOSS, 400));
             m.apply(&hit(11, 100, 500, false));
 
-            assert!(!m.enemies[&10].is_alive(), "the corpse is still dead");
-            assert_eq!(m.boss_uid, Some(11), "the living boss keeps the header");
+            assert!(!m.enemies[&ek(10)].is_alive(), "the corpse is still dead");
+            assert_eq!(
+                m.boss_entity,
+                Some(ek(11)),
+                "the living boss keeps the header"
+            );
 
             m.apply(&hit(11, 100, 600, true));
             assert_eq!(m.fight_end_ms, Some(600), "and its death still latches");
@@ -10747,8 +11085,8 @@ mod tests {
             m.reset(ResetReason::Manual, 300);
             m.apply(&hp(10, 1_000, 1_000, ORIGIN, 400));
 
-            assert_eq!(m.enemies[&10].death_order, None, "the rank is cleared");
-            assert!(m.enemies[&10].is_alive());
+            assert_eq!(m.enemies[&ek(10)].death_order, None, "the rank is cleared");
+            assert!(m.enemies[&ek(10)].is_alive());
 
             m.apply(&hit(10, 100, 500, false));
             m.apply(&hit(10, 100, 600, true));
@@ -10770,7 +11108,7 @@ mod tests {
             assert_eq!(m.fight_end_ms, None, "the other phase is still up");
 
             m.apply(&hp(10, 1_500, 2_000, ORIGIN, 250));
-            assert!(!m.enemies[&10].is_alive(), "a resync is not a respawn");
+            assert!(!m.enemies[&ek(10)].is_alive(), "a resync is not a respawn");
 
             m.apply(&hit(11, 100, 300, true));
             assert_eq!(m.fight_end_ms, Some(300));
@@ -10792,7 +11130,7 @@ mod tests {
             m.apply(&hit(11, 100, 150, false));
             m.apply(&hit(10, 100, 200, true));
 
-            assert_eq!(m.boss_uid, Some(10));
+            assert_eq!(m.boss_entity, Some(ek(10)));
             assert_eq!(m.snapshot(300).encounter.boss_monster_id, Some(ORIGIN));
             assert_eq!(m.fight_end_ms, Some(200), "the add cannot block the latch");
         }
@@ -10812,7 +11150,7 @@ mod tests {
             m.apply(&hit(10, 100, 200, true));
             m.apply(&hit(11, 100, 300, true));
 
-            assert_eq!(m.boss_uid, Some(11));
+            assert_eq!(m.boss_entity, Some(ek(11)));
             assert_eq!(
                 m.snapshot(400).encounter.boss_monster_id,
                 Some(CONTINUATION)
@@ -10827,7 +11165,7 @@ mod tests {
             m.apply(&hit(10, 100, 100, false));
             m.apply(&hit(10, 100, 200, true));
 
-            assert_eq!(m.boss_uid, Some(10));
+            assert_eq!(m.boss_entity, Some(ek(10)));
             assert_eq!(m.snapshot(300).encounter.boss_monster_id, Some(ORIGIN));
         }
 
@@ -10838,10 +11176,14 @@ mod tests {
             m.apply(&hp(11, 500, 500, CONTINUATION, 0));
             m.apply(&hit(10, 100, 100, false));
             m.apply(&hit(11, 100, 150, false));
-            assert_eq!(m.boss_uid, Some(10), "both alive: the larger pool wins");
+            assert_eq!(
+                m.boss_entity,
+                Some(ek(10)),
+                "both alive: the larger pool wins"
+            );
 
             m.apply(&hit(10, 100, 200, true));
-            assert_eq!(m.boss_uid, Some(11), "the living phase takes over");
+            assert_eq!(m.boss_entity, Some(ek(11)), "the living phase takes over");
         }
     }
 
@@ -10849,19 +11191,23 @@ mod tests {
         use super::*;
 
         fn boss_hit(uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 1,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 1,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         fn hp(uid: i64, curr: u64, max: u64, monster_id: Option<u32>, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(max),
@@ -10914,6 +11260,7 @@ mod tests {
             let mut m = Meter::new();
             m.apply(&boss_hit(10, 0));
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(10, EntityKind::Monster),
                 uid: 10,
                 curr_hp: Some(5_000_000),
                 max_hp: None,
@@ -10940,6 +11287,7 @@ mod tests {
             m.apply(&hp(10, 100, 100, Some(103), 0));
             // Trash caught mid-delta with a huge current HP and no max.
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(11, EntityKind::Monster),
                 uid: 11,
                 curr_hp: Some(9_000_000),
                 max_hp: None,
@@ -10961,6 +11309,7 @@ mod tests {
             m.apply(&boss_hit(11, 0));
             // Real boss, damaged down to 2M of a pool we never saw.
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(10, EntityKind::Monster),
                 uid: 10,
                 curr_hp: Some(2_000_000),
                 max_hp: None,
@@ -10969,6 +11318,7 @@ mod tests {
             }));
             // Untouched trash add with a bigger raw number, same tier.
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(11, EntityKind::Monster),
                 uid: 11,
                 curr_hp: Some(3_000_000),
                 max_hp: None,
@@ -10989,6 +11339,7 @@ mod tests {
             m.apply(&boss_hit(10, 0));
             m.apply(&boss_hit(11, 0));
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(10, EntityKind::Monster),
                 uid: 10,
                 curr_hp: Some(2_000_000),
                 max_hp: None,
@@ -11010,6 +11361,7 @@ mod tests {
             m.apply(&boss_hit(11, 0));
             // Mid-pull boss, no `max_hp` but a real current HP.
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(10, EntityKind::Monster),
                 uid: 10,
                 curr_hp: Some(5_000_000),
                 max_hp: None,
@@ -11174,7 +11526,7 @@ mod tests {
         #[test]
         fn a_server_change_logs_the_boss_the_fight_was_on() {
             // PR #163 review, finding 3: the `ServerChanged` arm cleared
-            // `enemies` and `boss_uid` before latching the fight end, and
+            // `enemies` and `boss_entity` before latching the fight end, and
             // `latch_fight_end` reads the boss identity out of exactly
             // those — so this diagnostic always read
             // `boss_monster_id=<unknown>`, losing the one fact it exists to
@@ -11183,22 +11535,26 @@ mod tests {
 
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(10, EntityKind::Monster),
                 uid: 10,
                 curr_hp: Some(500_000),
                 max_hp: Some(1_000_000),
                 monster_id: Some(DIAG_BOSS),
                 timestamp_ms: 0,
             }));
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: 10,
-                target_kind: EntityKind::Monster,
-                value: 1_000,
-                timestamp_ms: 1_000,
-                ..Default::default()
-            }));
-            assert_eq!(m.boss_uid, Some(10));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 10,
+                    target_kind: EntityKind::Monster,
+                    value: 1_000,
+                    timestamp_ms: 1_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
+            assert_eq!(m.boss_entity, Some(ek(10)));
 
             m.apply(&ProtocolEvent::ServerChanged {
                 timestamp_ms: 2_000,
@@ -11226,39 +11582,48 @@ mod tests {
 
             let mut m = Meter::new();
             // uid 1 dies to a monster...
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 90,
-                attacker_kind: EntityKind::Monster,
-                target_uid: 1,
-                target_kind: EntityKind::Player,
-                value: 500,
-                is_dead: true,
-                timestamp_ms: 1_000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 90,
+                    attacker_kind: EntityKind::Monster,
+                    target_uid: 1,
+                    target_kind: EntityKind::Player,
+                    value: 500,
+                    is_dead: true,
+                    timestamp_ms: 1_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             // ...uid 2 is just a second known party member, never down...
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 2,
-                attacker_kind: EntityKind::Player,
-                target_uid: 90,
-                target_kind: EntityKind::Monster,
-                value: 1_000,
-                timestamp_ms: 1_000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 2,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 90,
+                    target_kind: EntityKind::Monster,
+                    value: 1_000,
+                    timestamp_ms: 1_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             // ...and uid 1 is battle-rezzed: their next action (a hit)
             // clears `alive` back to true, but `deaths` stays 1 forever.
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: 90,
-                target_kind: EntityKind::Monster,
-                value: 1_000,
-                timestamp_ms: 2_000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 90,
+                    target_kind: EntityKind::Monster,
+                    value: 1_000,
+                    timestamp_ms: 2_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
             assert_eq!(
-                m.players.get(&1).map(|p| (p.deaths, p.alive)),
+                m.players.get(&pk(1)).map(|p| (p.deaths, p.alive)),
                 Some((1, true)),
                 "the rez must leave a cumulative death on the board but the player standing"
             );
@@ -11311,33 +11676,40 @@ mod tests {
             });
 
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(DIAG_UID, EntityKind::Monster),
                 uid: DIAG_UID,
                 curr_hp: Some(100),
                 max_hp: Some(100),
                 monster_id: Some(DIAG_BOSS),
                 timestamp_ms: 0,
             }));
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: DIAG_UID,
-                target_kind: EntityKind::Monster,
-                value: 100,
-                timestamp_ms: 1_000,
-                ..Default::default()
-            }));
-            assert_eq!(m.boss_uid, Some(DIAG_UID));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: DIAG_UID,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    timestamp_ms: 1_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
+            assert_eq!(m.boss_entity, Some(ek(DIAG_UID)));
 
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: DIAG_UID,
-                target_kind: EntityKind::Monster,
-                value: 100,
-                is_dead: true,
-                timestamp_ms: 2_000,
-                ..Default::default()
-            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: DIAG_UID,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    is_dead: true,
+                    timestamp_ms: 2_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
 
             assert_eq!(
                 m.fight_end_ms, None,
@@ -11384,11 +11756,11 @@ mod tests {
 
         #[test]
         fn boss_transition_log_fires_only_when_the_uid_changes() {
-            assert!(boss_transition_log(None, Some(10), Some(103)).is_some());
-            assert!(boss_transition_log(Some(10), Some(10), Some(103)).is_none());
-            assert!(boss_transition_log(Some(10), Some(11), Some(103)).is_some());
+            assert!(boss_transition_log(None, Some(ek(10)), Some(103)).is_some());
+            assert!(boss_transition_log(Some(ek(10)), Some(ek(10)), Some(103)).is_none());
+            assert!(boss_transition_log(Some(ek(10)), Some(ek(11)), Some(103)).is_some());
             // Boss target clearing (a real transition) still logs.
-            assert!(boss_transition_log(Some(10), None, None).is_some());
+            assert!(boss_transition_log(Some(ek(10)), None, None).is_some());
             // No-op stays silent even when both sides are already empty.
             assert!(boss_transition_log(None, None, None).is_none());
         }
@@ -11416,7 +11788,7 @@ mod tests {
         #[test]
         fn boss_transition_log_reports_recognition_and_the_resolved_name() {
             // Recognized boss id with a catalogued name.
-            let msg = boss_transition_log(None, Some(10), Some(103)).unwrap();
+            let msg = boss_transition_log(None, Some(ek(10)), Some(103)).unwrap();
             assert!(msg.contains("monster_id=103"));
             assert!(msg.contains("recognized_boss=true"));
             assert!(msg.contains("name=Ignisor"));
@@ -11425,16 +11797,16 @@ mod tests {
             // name still resolved if catalogued (boss_monster_id itself is
             // real data regardless of recognition — see `EncounterInfo`'s
             // doc comment).
-            let msg = boss_transition_log(None, Some(10), Some(10_900)).unwrap();
+            let msg = boss_transition_log(None, Some(ek(10)), Some(10_900)).unwrap();
             assert!(msg.contains("recognized_boss=false"));
 
             // Unknown monster id entirely.
-            let msg = boss_transition_log(None, Some(10), None).unwrap();
+            let msg = boss_transition_log(None, Some(ek(10)), None).unwrap();
             assert!(msg.contains("uid=10"));
             assert!(msg.contains("monster_id=<unknown>"));
 
             // Boss target cleared.
-            let msg = boss_transition_log(Some(10), None, None).unwrap();
+            let msg = boss_transition_log(Some(ek(10)), None, None).unwrap();
             assert!(msg.contains("cleared"));
         }
 
@@ -11527,6 +11899,7 @@ mod tests {
 
         fn hp(monster_id: u32, curr: u64, max: u64, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(UID, EntityKind::Monster),
                 uid: UID,
                 curr_hp: Some(curr),
                 max_hp: Some(max),
@@ -11536,15 +11909,18 @@ mod tests {
         }
 
         fn boss_hit(uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 99,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 1,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 99,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 1,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         /// (a) A boss burned to 40%, then the same uid reports a new
@@ -11558,14 +11934,14 @@ mod tests {
             m.apply(&boss_hit(UID, 100));
             m.apply(&hp(OLD_BOSS, 400_000, 1_000_000, 200));
 
-            let old = &m.enemies[&UID];
+            let old = &m.enemies[&ek(UID)];
             assert_eq!(old.pct(), Some(40.0));
             assert_eq!(old.lowest_pct, Some(40.0));
             assert!(old.took_damage);
 
             m.apply(&hp(NEW_BOSS, 1_000_000, 1_000_000, 300));
 
-            let new = &m.enemies[&UID];
+            let new = &m.enemies[&ek(UID)];
             assert_eq!(new.monster_id, Some(NEW_BOSS));
             assert_eq!(new.pct(), Some(100.0));
             assert_eq!(
@@ -11586,22 +11962,25 @@ mod tests {
             let mut m = Meter::new();
             m.apply(&hp(OLD_BOSS, 1_000_000, 1_000_000, 0));
             m.apply(&boss_hit(UID, 100));
-            m.apply(&ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 99,
-                attacker_kind: EntityKind::Player,
-                target_uid: UID,
-                target_kind: EntityKind::Monster,
-                value: 1,
-                is_dead: true,
-                timestamp_ms: 200,
-                ..Default::default()
-            }));
-            assert!(!m.enemies[&UID].is_alive());
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 99,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: UID,
+                    target_kind: EntityKind::Monster,
+                    value: 1,
+                    is_dead: true,
+                    timestamp_ms: 200,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
+            assert!(!m.enemies[&ek(UID)].is_alive());
 
             m.apply(&hp(NEW_BOSS, 500_000, 1_000_000, 300));
 
-            assert!(m.enemies[&UID].is_alive());
-            assert_eq!(m.enemies[&UID].death_order, None);
+            assert!(m.enemies[&ek(UID)].is_alive());
+            assert_eq!(m.enemies[&ek(UID)].death_order, None);
         }
 
         /// (c) A resync repeating the *same* `monster_id` is not a change
@@ -11613,9 +11992,9 @@ mod tests {
             m.apply(&boss_hit(UID, 100));
             m.apply(&hp(OLD_BOSS, 400_000, 1_000_000, 200));
 
-            let before = m.enemies[&UID];
+            let before = m.enemies[&ek(UID)];
             m.apply(&hp(OLD_BOSS, 400_000, 1_000_000, 300));
-            let after = m.enemies[&UID];
+            let after = m.enemies[&ek(UID)];
 
             assert_eq!(before.lowest_pct, after.lowest_pct);
             assert_eq!(before.took_damage, after.took_damage);
@@ -11636,9 +12015,10 @@ mod tests {
             m.apply(&hp(OLD_BOSS, 1_000_000, 1_000_000, 0));
             m.apply(&boss_hit(UID, 100));
             m.apply(&hp(OLD_BOSS, 400_000, 1_000_000, 200));
-            assert_eq!(m.enemies[&UID].pct(), Some(40.0));
+            assert_eq!(m.enemies[&ek(UID)].pct(), Some(40.0));
 
             m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(UID, EntityKind::Monster),
                 uid: UID,
                 curr_hp: None,
                 max_hp: None,
@@ -11646,7 +12026,7 @@ mod tests {
                 timestamp_ms: 300,
             }));
 
-            let reset = &m.enemies[&UID];
+            let reset = &m.enemies[&ek(UID)];
             assert_eq!(reset.monster_id, Some(NEW_BOSS));
             assert_eq!(reset.curr_hp, None);
             assert_eq!(reset.max_hp, None);
@@ -11662,7 +12042,7 @@ mod tests {
 
             // The next HP-bearing packet restores a reading.
             m.apply(&hp(NEW_BOSS, 500_000, 1_000_000, 400));
-            assert_eq!(m.enemies[&UID].pct(), Some(50.0));
+            assert_eq!(m.enemies[&ek(UID)].pct(), Some(50.0));
         }
     }
 
@@ -11674,19 +12054,23 @@ mod tests {
         use super::*;
 
         fn boss_hit(uid: i64, ts: u64) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 1,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 1,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         fn hp(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(100),
                 max_hp: Some(100),
@@ -11700,6 +12084,7 @@ mod tests {
         /// idle timeout off for as long as an engaged boss is still up).
         fn killed(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(0),
                 max_hp: Some(100),
@@ -11824,20 +12209,24 @@ mod tests {
 
         /// A player hit on monster `uid`, optionally the killing blow.
         fn boss_hit(uid: i64, ts: u64, is_dead: bool) -> ProtocolEvent {
-            ProtocolEvent::Damage(DamageEvent {
-                attacker_uid: 1,
-                attacker_kind: EntityKind::Player,
-                target_uid: uid,
-                target_kind: EntityKind::Monster,
-                value: 100,
-                is_dead,
-                timestamp_ms: ts,
-                ..Default::default()
-            })
+            ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: uid,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    is_dead,
+                    timestamp_ms: ts,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            )
         }
 
         fn hp(uid: i64, monster_id: u32, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
                 uid,
                 curr_hp: Some(100),
                 max_hp: Some(100),
@@ -12177,25 +12566,31 @@ mod tests {
     // -- issue #338: absorbed/immune damage channels ------------------------
 
     fn absorbed_dmg(attacker_uid: i64, value: i64, ts: u64) -> ProtocolEvent {
-        ProtocolEvent::Damage(DamageEvent {
-            attacker_uid,
-            attacker_kind: EntityKind::Player,
-            value,
-            timestamp_ms: ts,
-            kind: DamageKind::Absorbed,
-            ..Default::default()
-        })
+        ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid,
+                attacker_kind: EntityKind::Player,
+                value,
+                timestamp_ms: ts,
+                kind: DamageKind::Absorbed,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        )
     }
 
     fn immune_dmg(attacker_uid: i64, value: i64, ts: u64) -> ProtocolEvent {
-        ProtocolEvent::Damage(DamageEvent {
-            attacker_uid,
-            attacker_kind: EntityKind::Player,
-            value,
-            timestamp_ms: ts,
-            kind: DamageKind::Immune,
-            ..Default::default()
-        })
+        ProtocolEvent::Damage(
+            DamageEvent {
+                attacker_uid,
+                attacker_kind: EntityKind::Player,
+                value,
+                timestamp_ms: ts,
+                kind: DamageKind::Immune,
+                ..Default::default()
+            }
+            .test_reconstructed(),
+        )
     }
 
     #[test]
@@ -12262,6 +12657,7 @@ mod tests {
         let mut m = Meter::new();
         m.apply(&dmg(1, 100, 1_000));
         m.apply(&ProtocolEvent::Player(PlayerInfo {
+            entity: EntityId::from_display_uid(1, EntityKind::Player),
             uid: 1,
             shield: Some(750),
             ..Default::default()

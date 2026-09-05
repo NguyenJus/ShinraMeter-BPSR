@@ -58,6 +58,12 @@ pub struct Hit {
     pub heal: bool,
     /// `is_dead`.
     pub kills_target: bool,
+    /// The attacker's whole wire uuid, when the scenario needs to say more
+    /// than `attacker_uid` can (issue #335). `None` — the default — packs
+    /// `attacker_uid` the ordinary way (`wire::player_uuid`); `Some` lets a
+    /// scenario express a shadow/mirror entity or a recycled uid, i.e. two
+    /// attackers that share `uuid >> 16` and differ only above it.
+    pub attacker_uuid: Option<i64>,
     /// Issue #338: sets `r#type = EDamageType::Absorbed`. Mutually
     /// exclusive with `immune`/`miss`/`heal` — `wire::damage_info` reads
     /// them in `miss > heal > absorbed > immune > normal` priority order,
@@ -80,9 +86,18 @@ impl Hit {
             miss: false,
             heal: false,
             kills_target: false,
+            attacker_uuid: None,
             absorbed: false,
             immune: false,
         }
+    }
+
+    /// Gives this hit's attacker an explicit whole uuid (issue #335), rather
+    /// than the one `attacker_uid` would pack into. `attacker_uid` still
+    /// says what the row prints — the two must agree on `uuid >> 16`.
+    pub fn from_uuid(mut self, uuid: i64) -> Self {
+        self.attacker_uuid = Some(uuid);
+        self
     }
 
     pub fn crit(mut self) -> Self {
@@ -177,14 +192,22 @@ impl Scenario {
         self
     }
 
-    pub fn player_appear(
+    pub fn player_appear(self, uid: i64, name: &str, profession_id: i32, fight_point: i32) -> Self {
+        let uuid = wire::player_uuid(uid);
+        self.player_appear_uuid(uuid, name, profession_id, fight_point)
+    }
+
+    /// `player_appear`, but with the entity's whole uuid spelled out (issue
+    /// #335) so a scenario can appear two entities that share a display uid
+    /// — a recycled uid, or a shadow/mirror copy — and differ only in the
+    /// bits `uuid >> 16` discards.
+    pub fn player_appear_uuid(
         mut self,
-        uid: i64,
+        uuid: i64,
         name: &str,
         profession_id: i32,
         fight_point: i32,
     ) -> Self {
-        let uuid = wire::player_uuid(uid);
         let entity = wire::appear_entity(
             uuid,
             pb::EEntityType::EntChar as i32,

@@ -371,6 +371,14 @@ impl PlayerStats {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerRow {
     pub uid: i64,
+    /// This row's full `EntityId` (`EntityId.0`, issue #335) — the raw
+    /// per-entity map key, not the display `uid` above. Two rows can share
+    /// the same `uid` (uid recycling collapses their display number, but
+    /// not their identity), so anything that needs to resolve *this specific
+    /// row* again — the skill window, `UiCommand::SkillFocus`,
+    /// `Meter::snapshot_focused`'s `focus` slice — must key on this field,
+    /// never on `uid`.
+    pub entity: i64,
     pub name: String,
     pub class: Option<Class>,
     /// Ability score (a.k.a. combat power); `None` when no packet carrying

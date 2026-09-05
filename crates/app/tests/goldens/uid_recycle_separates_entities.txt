@@ -1,0 +1,17 @@
+scenario=uid_recycle_separates_entities
+at_ms=30000
+fight_state=Idle
+duration_ms=28000
+total_damage=177000
+total_dps=177000.00
+encounter.boss_monster_id=103
+encounter.boss_name=Ignisor
+encounter.is_boss=true
+encounter.scene_id=1101
+encounter.scene_name=Towering Ruin
+encounter.scene_boss_name=-
+resets=
+rows=3
+row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=95000 dps=95000.00 share=53.67 crit=0.00 lucky=0.00 hits=2 deaths=0
+row uid=1002 name=Brin class=FrostMage ability_score=11500 season_strength=- imagines=[-,-] damage=51000 dps=51000.00 share=28.81 crit=0.00 lucky=0.00 hits=1 deaths=0
+row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=31000 dps=31000.00 share=17.51 crit=0.00 lucky=0.00 hits=2 deaths=0

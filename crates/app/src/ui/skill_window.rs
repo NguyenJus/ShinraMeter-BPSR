@@ -459,9 +459,11 @@ pub(crate) fn skill_windows_to_draw<'a>(
 ) -> Vec<(&'a PlayerRow, i64)> {
     windows
         .iter()
-        .filter_map(|(&uid, state)| {
+        .filter_map(|(&entity, state)| {
             let rows = skill_window_rows(state.source, live, history_open)?;
-            rows.iter().find(|r| r.uid == uid).map(|row| (row, uid))
+            rows.iter()
+                .find(|r| r.entity == entity)
+                .map(|row| (row, entity))
         })
         .collect()
 }

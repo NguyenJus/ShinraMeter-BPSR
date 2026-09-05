@@ -63,6 +63,11 @@ fn drive(records: &[DumpRecord]) -> (Vec<meter::Snapshot>, meter::Snapshot) {
         return (Vec::new(), m.snapshot(0));
     };
     let mut clock = first.ts_ms;
+    // One table for the whole replay, exactly as a live `Decoder` keeps one
+    // for the whole session (issue #335) — entity identity is cross-packet
+    // state, and a per-record table would resolve every bare `char_id`
+    // through the fallback instead of the shadow map.
+    let mut entities = proto::EntityTable::new();
     let mut state = meter::FightState::Idle;
     let mut ends = Vec::new();
     for r in records {
@@ -83,7 +88,7 @@ fn drive(records: &[DumpRecord]) -> (Vec<meter::Snapshot>, meter::Snapshot) {
             payload: r.payload.clone(),
         };
         let mut evs = Vec::new();
-        decode_notify(&n, r.ts_ms, &mut evs, None);
+        decode_notify(&n, r.ts_ms, &mut evs, None, &mut entities);
         for ev in evs {
             m.apply(&proto::map::map_event(ev, r.ts_ms, None, None));
         }

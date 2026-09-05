@@ -354,8 +354,10 @@ pub(crate) fn draw_row(
     // can report an unbounded width, which is not what a row should paint
     // itself at.
     row_width: f32,
-    // Issue #16: `Some(row.uid)` when this row was right-clicked this
+    // Issue #16: `Some(row.entity)` when this row was right-clicked this
     // frame, so `draw_rows` can open (or re-show) its breakdown window.
+    // The entity id, not the display uid (issue #335) — two rows can share
+    // a uid, and the window must resolve back to this specific row.
     // `Sense::click()` (widened from `Sense::hover()`) still reports
     // `hovered()` exactly as before, so the hover gradient below is
     // unaffected; left-click stays free for the window drag, which lives
@@ -561,7 +563,7 @@ pub(crate) fn draw_row(
     // breakdown; left-click is deliberately not sensed here at all — it
     // stays free for the window drag (`WindowGesture`'s header band and
     // resize strips are the only primary-button drag surfaces).
-    response.secondary_clicked().then_some(row.uid)
+    response.secondary_clicked().then_some(row.entity)
 }
 
 /// Paints one counter pill (issue #49) so that its **right edge lands on
@@ -1414,6 +1416,7 @@ mod tests {
         assert_eq!(fmt_pct0(100.0), "100%");
         let widest_row = PlayerRow {
             uid: 1,
+            entity: 1,
             name: String::new(),
             class: None,
             damage: 99_999_000,

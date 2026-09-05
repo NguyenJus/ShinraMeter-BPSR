@@ -340,8 +340,9 @@ pub enum UiCommand {
     /// `pipeline::run` holds the `Send`-able half (`CaptureRestart`) and
     /// makes the request on this command's behalf.
     RestartCapture,
-    /// The uids of every player with an open skill-breakdown window, sent
-    /// whenever `OverlayApp::skill_windows`' key set changes (PR #268
+    /// The entity ids (issue #335 — not the display uid; two rows can
+    /// share one) of every player with an open skill-breakdown window,
+    /// sent whenever `OverlayApp::skill_windows`' key set changes (PR #268
     /// review, finding 2). `pipeline::run` keeps the latest one and uses it
     /// to skip building the heals/dealt/received/casts breakdowns
     /// (`bpsr_meter::Meter::snapshot_focused`) for every other player on
@@ -1102,6 +1103,7 @@ fn demo_snapshot() -> Snapshot {
             )| {
                 PlayerRow {
                     uid: i as i64 + 1,
+                    entity: i as i64 + 1,
                     name: name.to_string(),
                     class: Some(class),
                     ability_score: None,
@@ -4479,6 +4481,7 @@ mod tests {
     pub(crate) fn sample_row(ability_score: Option<u32>) -> PlayerRow {
         PlayerRow {
             uid: 1,
+            entity: 1,
             name: String::new(),
             class: None,
             damage: 0,

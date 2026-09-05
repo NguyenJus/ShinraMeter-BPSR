@@ -184,6 +184,9 @@ fn main() {
     let mut next_tick: Option<u64> = None;
     let mut last_ts = 0u64;
     let mut fed_any = false;
+    // Cross-packet entity identity (issue #335), kept for the whole replay
+    // the same way a live `Decoder` keeps it for the whole session.
+    let mut entities = bpsr_protocol::EntityTable::new();
 
     for record in &records {
         if !in_window(record.ts_ms, args.since, args.until) {
@@ -220,7 +223,13 @@ fn main() {
             payload: record.payload.clone(),
         };
         let mut events = Vec::new();
-        bpsr_protocol::decode::decode_notify(&notify, record.ts_ms, &mut events, None);
+        bpsr_protocol::decode::decode_notify(
+            &notify,
+            record.ts_ms,
+            &mut events,
+            None,
+            &mut entities,
+        );
 
         CURRENT_TS_MS.with(|cell| cell.set(record.ts_ms));
         for ev in events {

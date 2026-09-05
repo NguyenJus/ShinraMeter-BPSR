@@ -142,7 +142,9 @@ pub fn damage_info(hit: &Hit) -> pb::SyncDamageInfo {
         value: if hit.lucky { 0 } else { hit.value },
         lucky_value: if hit.lucky { hit.value } else { 0 },
         hp_lessen_value: hit.value,
-        attacker_uuid: player_uuid(hit.attacker_uid),
+        attacker_uuid: hit
+            .attacker_uuid
+            .unwrap_or_else(|| player_uuid(hit.attacker_uid)),
         owner_id: hit.skill_id,
         is_dead: hit.kills_target,
         top_summoner_id: if hit.summoner_uid != 0 {

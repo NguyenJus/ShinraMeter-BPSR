@@ -1933,6 +1933,7 @@ mod tests {
     fn deaths_column_formats_the_plain_count() {
         let row = PlayerRow {
             uid: 7,
+            entity: 7,
             name: String::new(),
             class: None,
             damage: 0,
@@ -2202,6 +2203,7 @@ mod tests {
     fn sample_text_matches_the_real_formatters_shape() {
         let row = PlayerRow {
             uid: 1,
+            entity: 1,
             name: "Tester".to_owned(),
             class: None,
             ability_score: Some(1234),

@@ -705,6 +705,7 @@ mod tests {
     fn player_row() -> PlayerRow {
         PlayerRow {
             uid: 1,
+            entity: 1,
             name: "Tester".to_owned(),
             class: None,
             ability_score: None,
