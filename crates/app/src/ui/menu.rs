@@ -465,13 +465,29 @@ pub(crate) fn menu_row(ui: &mut egui::Ui, row: MenuRow<'_>) -> egui::Response {
                 ),
             );
         }
-        ui.painter().text(
-            rects.label.left_center(),
-            egui::Align2::LEFT_CENTER,
-            &label,
-            regular(MENU_LABEL_FONT_SIZE),
-            label_color,
+        // Laid out as a single-row, elided `LayoutJob` rather than
+        // `ui.painter().text` (which never wraps, clips, or truncates)
+        // so a label too long for the slot truncates with an ellipsis
+        // instead of overrunning the trailing value.
+        let mut label_job = egui::text::LayoutJob::single_section(
+            label.clone(),
+            egui::TextFormat {
+                font_id: regular(MENU_LABEL_FONT_SIZE),
+                color: label_color,
+                ..Default::default()
+            },
         );
+        label_job.wrap = egui::text::TextWrapping {
+            max_width: rects.label.width(),
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        };
+        let label_galley = ui.painter().layout_job(label_job);
+        let label_pos = egui::Align2::LEFT_CENTER
+            .anchor_size(rects.label.left_center(), label_galley.size())
+            .min;
+        ui.painter().galley(label_pos, label_galley, label_color);
         if let Some(text) = trailing {
             ui.painter().text(
                 rects.trailing.right_center(),
@@ -547,12 +563,13 @@ fn menu_small_line(ui: &mut egui::Ui, text: &str) {
         wrap_width,
     );
     let height = galley.size().y.max(MENU_SMALL_LINE_HEIGHT);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     ui.painter().galley(
         egui::pos2(rect.left() + MENU_ROW_INSET, rect.top()),
         galley,
         color,
     );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
 }
 
 /// A section header inside the dropdown, with `MENU_SECTION_GAP` of air
@@ -1335,6 +1352,24 @@ fn draw_columns_page(
             }
         }
     }
+    // Re-derive the reason after any in-frame toggle above: a checkbox
+    // that unlocked or locked a sibling this frame must have its footer
+    // reflect the post-toggle state, not the reason latched while
+    // iterating groups.
+    if changed {
+        locked = None;
+        for group in column_groups() {
+            for &col in group.columns {
+                if let Some(lock) = column_toggle_lock(settings, col) {
+                    locked = Some(lock);
+                    break;
+                }
+            }
+            if locked.is_some() {
+                break;
+            }
+        }
+    }
     if let Some(lock) = locked {
         menu_hint(ui, column_lock_hint(lock));
     }
@@ -1692,6 +1727,25 @@ mod tests {
         assert!(!settings.always_on_top);
         assert!(settings.click_through);
         assert_eq!(settings.history_max_encounters, 7);
+    }
+
+    /// `columns_differ_from_default` drives the Reset button's enabled
+    /// state, so it must come back down once a toggle is undone — not
+    /// just go up when one is made.
+    #[test]
+    fn columns_differ_from_default_ignores_an_off_then_on_toggle() {
+        let mut settings = Settings::default();
+        let col = *ColumnKind::ALL
+            .iter()
+            .find(|col| settings.is_visible(**col))
+            .expect("default settings show at least one column");
+
+        settings.toggle(col);
+        settings.toggle(col);
+        assert!(!columns_differ_from_default(&settings));
+
+        settings.toggle(col);
+        assert!(columns_differ_from_default(&settings));
     }
 
     /// Every column's trailing sample has to say something — an empty one
