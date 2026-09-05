@@ -1,6 +1,8 @@
 scenario=death_and_revive
 at_ms=7500
 fight_state=Ended
+fight_end_cause=boss_death
+hold_kind=-
 duration_ms=5000
 total_damage=50000
 total_dps=12500.00

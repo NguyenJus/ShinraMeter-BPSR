@@ -1,6 +1,8 @@
 scenario=phase2_resumed
 at_ms=3500
 fight_state=Active
+fight_end_cause=-
+hold_kind=-
 duration_ms=1500
 total_damage=90000
 total_dps=60000.00

@@ -99,12 +99,10 @@ pub enum Lifecycle {
     Idle,
     /// A fight is in progress, started at `since_ms`.
     Active { since_ms: u64 },
-    /// The fight is over and its stats are frozen as of `at_ms`. `cause` is
-    /// `Some` only when today's stored fields can still tell it apart after
-    /// the fact — right now, just a wipe (`HoldKind::Wipe`/`wipe_hold`);
-    /// every other cause is logged (`FightEndCause`) the moment it happens
-    /// but not retained, so it reads back `None` here. Issue #336 step 2
-    /// widens the stored state so every cause survives to this point.
+    /// The fight is over and its stats are frozen as of `at_ms`. `cause`
+    /// is whatever `Meter::latch_fight_end` recorded (issue #336 step 2) —
+    /// `None` only in the window where the fight is over on the clock but
+    /// the idle-timeout end has not been latched by a `Meter::tick` yet.
     Ended {
         at_ms: u64,
         cause: Option<FightEndCause>,

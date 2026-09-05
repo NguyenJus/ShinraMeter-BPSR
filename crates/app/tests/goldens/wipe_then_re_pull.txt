@@ -1,6 +1,8 @@
 scenario=wipe_then_re_pull
 at_ms=6000
 fight_state=Active
+fight_end_cause=-
+hold_kind=-
 duration_ms=1
 total_damage=30000
 total_dps=30000.00

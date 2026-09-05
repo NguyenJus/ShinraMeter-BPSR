@@ -1,0 +1,18 @@
+scenario=party_wipe
+at_ms=4000
+fight_state=Idle
+fight_end_cause=wipe
+hold_kind=Wipe
+duration_ms=1500
+total_damage=65000
+total_dps=65000.00
+encounter.boss_monster_id=103
+encounter.boss_name=Ignisor
+encounter.is_boss=true
+encounter.scene_id=1101
+encounter.scene_name=Towering Ruin
+encounter.scene_boss_name=-
+resets=
+rows=2
+row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=40000 dps=40000.00 share=61.54 crit=0.00 lucky=0.00 hits=1 deaths=1
+row uid=1002 name=Brin class=FrostMage ability_score=11500 season_strength=- imagines=[-,-] damage=25000 dps=25000.00 share=38.46 crit=0.00 lucky=0.00 hits=1 deaths=1
