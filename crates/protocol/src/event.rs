@@ -398,6 +398,35 @@ pub enum ProtocolEvent {
         removes_layer: bool,
         timestamp_ms: u64,
     },
+    /// One party member left or was kicked from the team (issue #343),
+    /// decoded from `GrpcTeamNtf.NotifyLeaveTeam` — see
+    /// `crate::decode::on_notify_leave_team`. The wire's `leaveType` field
+    /// tells voluntary leaves and kicks apart, but nothing downstream
+    /// treats them differently (both mean "this uid is no longer in the
+    /// roster"), so it is not carried onto this event.
+    TeamMemberLeft {
+        uid: i64,
+    },
+    /// The authoritative party/raid roster as of this `NotifyJoinTeam`
+    /// push (issue #343), decoded alongside that message's per-member
+    /// `Player` events — see `crate::decode::on_notify_join_team`.
+    /// `NotifyJoinTeam` is not purely additive: BPSR-ZDPS's own client
+    /// resends the *whole* roster (up to a 20-player raid) on every team
+    /// change, not just the delta, so this variant lets a consumer prune
+    /// any roster row it holds that is no longer named here — the
+    /// counterpart to `TeamMemberLeft` for changes this crate never saw an
+    /// explicit leave/kick notify for (e.g. a member who left while this
+    /// meter was attached to a different scene).
+    ///
+    /// `members` holds every roster uid this push resolved (the same
+    /// `TeamMemData.char_id` / `TeamBasicData.char_id` fallback
+    /// `on_notify_join_team` uses), including members whose `Player` event
+    /// was suppressed for carrying no name/class/ability_score — a
+    /// bot-like entry with nothing to display is still a roster member and
+    /// must not be pruned as if it had left.
+    TeamRoster {
+        members: Vec<i64>,
+    },
     /// The local player's own uid (issue #344), decoded from
     /// `SyncContainerData.v_data.char_id` — see
     /// `decode::on_sync_container_data`. `char_id` is a **bare** uid, not a

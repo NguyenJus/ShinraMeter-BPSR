@@ -482,6 +482,22 @@ pub fn notify_join_team_payload(members: Vec<pb::TeamMemData>) -> Vec<u8> {
     buf
 }
 
+/// Prost-encodes a `NotifyLeaveTeam` payload (not wrapped in a frame,
+/// issue #343) for one member leaving or being kicked. `leave_type` is
+/// opaque to this crate's decoder (see `pb::NotifyLeaveTeamRequest`'s doc
+/// comment) — pass any value; `0` for a plain test.
+pub fn notify_leave_team_payload(char_id: i64, leave_type: i32) -> Vec<u8> {
+    let msg = pb::NotifyLeaveTeam {
+        v_request: Some(pb::NotifyLeaveTeamRequest {
+            char_id,
+            leave_type,
+        }),
+    };
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
