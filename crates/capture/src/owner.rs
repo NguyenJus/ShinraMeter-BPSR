@@ -119,10 +119,10 @@ fn find_owner_pid(
         return None;
     }
     let num_entries = u32::from_ne_bytes(buffer[0..4].try_into().unwrap()) as usize;
-    let rows = buffer[4..].chunks_exact(TCP_ROW_SIZE);
+    let (rows, _remainder) = buffer[4..].as_chunks::<TCP_ROW_SIZE>();
     let num_entries = num_entries.min(rows.len());
 
-    for row in rows.take(num_entries) {
+    for row in rows.iter().take(num_entries) {
         // Row layout: state, localAddr, localPort, remoteAddr, remotePort,
         // owningPid, each a native-endian u32. `localAddr`/`remoteAddr` are
         // stored in network byte order inside that u32, so `to_ne_bytes`
