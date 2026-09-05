@@ -769,7 +769,7 @@ fn run(
                 // more ticks left to catch it. One last `publish` below
                 // flushes that final state — and its `record_fight_end`
                 // call — before the thread actually exits. Logged at INFO,
-                // not the ERROR `ui.rs::raise_pipeline_dead_status` used to
+                // not the ERROR `ui/mod.rs::raise_pipeline_dead_status` used to
                 // log for every orderly quit (issue #321's false positive):
                 // this is the pipeline thread's own confirmation that the
                 // shutdown it is about to cause was requested, not a crash.
@@ -849,6 +849,7 @@ mod tests {
             hp_lessen: value - 1,
             is_miss: false,
             is_heal: false,
+            kind: proto::DamageKind::Normal,
             target: proto::EntityId::from_display_uid(500, proto::EntityKind::Monster),
             target_uid: 500,
             target_kind: proto::EntityKind::Monster,
@@ -941,6 +942,7 @@ mod tests {
                 skill_ids: Vec::new(),
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             0,
         );
@@ -955,6 +957,7 @@ mod tests {
                 season_strength: Some(3_333),
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             })
         );
     }
@@ -978,6 +981,7 @@ mod tests {
                 skill_ids: vec![(3905, 1), (102640, 4), (3926, 3), (999_999_999, 9)],
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             0,
         );
@@ -1002,6 +1006,7 @@ mod tests {
                 skill_ids: Vec::new(),
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             0,
         );
@@ -1261,6 +1266,7 @@ mod tests {
                     skill_ids: Vec::new(),
                     position: None,
                     target_position: None,
+                    shield: None,
                 }),
                 1_000,
             );
@@ -1301,6 +1307,7 @@ mod tests {
                     skill_ids: Vec::new(),
                     position: None,
                     target_position: None,
+                    shield: None,
                 }),
                 1_000,
             );
@@ -1340,6 +1347,7 @@ mod tests {
                 skill_ids: Vec::new(),
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             1_000,
         );
@@ -1364,6 +1372,7 @@ mod tests {
                 skill_ids: Vec::new(),
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             1_000,
         );
@@ -1387,6 +1396,7 @@ mod tests {
                 skill_ids: Vec::new(),
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             1_000,
         );

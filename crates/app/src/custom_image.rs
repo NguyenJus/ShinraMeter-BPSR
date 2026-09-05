@@ -772,7 +772,7 @@ struct Entry {
 /// The whole runtime-image cache: at most one live texture per slot.
 ///
 /// Lives inside `ui::Icons` (behind a `RefCell`, since every painter in
-/// `ui.rs` holds `&Icons`), which is what lets the header wash and the row
+/// `ui/mod.rs` holds `&Icons`), which is what lets the header wash and the row
 /// backdrop reach it without threading a new `&mut` parameter through the
 /// twenty-odd call sites `draw_header`/`draw_header_menu` already have.
 #[derive(Default)]

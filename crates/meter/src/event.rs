@@ -165,13 +165,28 @@ impl Class {
 }
 
 /// Combat role a `Class` fills (issue #44): drives the row share-bar's hue
-/// in the UI (`crates/app/src/ui.rs`). See `Class::role` for the mapping and
+/// in the UI (`crates/app/src/ui/table.rs`). See `Class::role` for the mapping and
 /// its source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
     Tank,
     Healer,
     Damage,
+}
+
+/// Mirrors `bpsr_protocol::event::DamageKind` (issue #338): which of the
+/// (evidenced) absorbed/immune channels a hit's `value` belongs to, beyond
+/// the existing `is_miss`/`is_heal` booleans.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DamageKind {
+    #[default]
+    Normal,
+    /// The target's shield (`AttrShieldList`) fully absorbed this hit —
+    /// `value` is shield damage, not a change to the target's HP, so it
+    /// must not be folded into `damage`/DPS.
+    Absorbed,
+    /// The target was immune to this hit.
+    Immune,
 }
 
 /// A single damage (or miss/heal) event, already fully resolved by the
@@ -195,6 +210,8 @@ pub struct DamageEvent {
     pub hp_lessen: i64,
     pub is_miss: bool,
     pub is_heal: bool,
+    /// Mirrors `bpsr_protocol::DamageEvent::kind` (issue #338).
+    pub kind: DamageKind,
     /// Who was hit (issue #335) — the counterpart of `attacker` above, and
     /// what the meter keys enemy state on.
     pub target: EntityId,
@@ -278,6 +295,11 @@ pub struct PlayerInfo {
     /// element type to leave that already-established `[Option<i32>; 2]`
     /// id shape (and its many existing callers/tests) undisturbed.
     pub imagine_tiers: Option<[Option<i32>; 2]>,
+    /// Current total shield value. Mirrors
+    /// `bpsr_protocol::PlayerInfo::shield` (issue #338) — see there for the
+    /// `None` (attr absent from this delta) vs `Some(0)` (known to be no
+    /// shield right now) distinction.
+    pub shield: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -413,6 +435,54 @@ pub enum ProtocolEvent {
         buff_uuid: i32,
         removes_layer: bool,
         timestamp_ms: u64,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::EntityState` (issue
+    /// #339/#272): an entity's decoded `AttrState`, `is_dead` boiled down
+    /// from the wire's full `EActorState` enum. Emitted for both players and
+    /// monsters. See `Meter::apply` for how each side folds it in.
+    EntityState {
+        /// The entity's stable identity (issue #335) — what the meter keys
+        /// player/enemy state on.
+        entity: EntityId,
+        /// `entity.display_uid()`. Display only.
+        uid: i64,
+        kind: EntityKind,
+        is_dead: bool,
+        timestamp_ms: u64,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::Revive` (issue #272): the
+    /// dedicated `WorldNtf.NotifyReviveUser` (opcode `0x27`) signal — the
+    /// exact revive moment, replacing the inferred "next action implies
+    /// alive" fallback for any player whose revive this actually observes.
+    Revive {
+        /// The revived player's stable identity (issue #335).
+        entity: EntityId,
+        /// `entity.display_uid()`. Display only.
+        uid: i64,
+        timestamp_ms: u64,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::TeamMemberLeft` (issue #343):
+    /// one party member left or was kicked. See
+    /// `Meter::apply_team_member_left`.
+    TeamMemberLeft {
+        uid: i64,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::TeamRoster` (issue #343): the
+    /// authoritative party/raid roster as of the `NotifyJoinTeam` push this
+    /// was decoded alongside. See `Meter::apply_team_roster`.
+    TeamRoster {
+        members: Vec<i64>,
+    },
+    /// Mirrors `bpsr_protocol::ProtocolEvent::LocalPlayer` (issue #344):
+    /// the local player's own uid, decoded from
+    /// `SyncContainerData.v_data.char_id`. Session-scoped like
+    /// `dungeon_state`/`objectives`: survives both `Meter::reset` and
+    /// `ServerChanged`, since `char_id` is the persistent character id
+    /// (not a per-session entity uuid) and stays valid across a server
+    /// change. A later `LocalPlayer` event simply overwrites the stored
+    /// value. Never cleared. See `Snapshot::local_uid`.
+    LocalPlayer {
+        uid: i64,
     },
 }
 

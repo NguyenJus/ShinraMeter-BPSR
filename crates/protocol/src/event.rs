@@ -64,6 +64,45 @@ pub fn kind_of(uuid: i64) -> EntityKind {
     }
 }
 
+/// Which of the (evidenced) `pb::EDamageType` buckets a hit's `value`
+/// belongs in (issue #338). Deliberately narrower than the wire enum: `Miss`
+/// and `Heal` already have their own booleans on `DamageEvent`
+/// (`is_miss`/`is_heal`), decoded independently for backward compatibility,
+/// so this only distinguishes the two the meter previously had no channel
+/// for — a shield-absorbed hit and an immunity-blocked one — from
+/// everything else. `Fall` (`pb::EDamageType::Fall`) has no dedicated
+/// variant here for the same reason it has none on the wire enum's doc
+/// comment: no live-capture evidence separates it from `Normal`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum DamageKind {
+    #[default]
+    Normal,
+    /// `pb::EDamageType::Absorbed` — a target's shield (`AttrShieldList`)
+    /// soaked this hit. `value` is the amount the shield absorbed, not
+    /// damage the target's HP took, so the meter must not fold it into
+    /// `damage`/DPS (issue #338).
+    Absorbed,
+    /// `pb::EDamageType::Immune` — the target was immune to this hit.
+    /// `value` is usually `0`, but MessageManager.cs notes rare packets
+    /// where it isn't even though HP didn't change, so this still gets its
+    /// own channel rather than being assumed to always be a no-op.
+    Immune,
+}
+
+/// Reads a raw `pb::SyncDamageInfo.r#type` value into [`DamageKind`].
+/// Anything other than `Absorbed`/`Immune` — including `Normal`, `Miss`,
+/// `Heal`, `Fall`, and any unrecognized future value — maps to `Normal`,
+/// matching `DamageKind`'s `Default`: those cases already have their own
+/// signal (`is_miss`/`is_heal`) or no signal at all, so there's nothing this
+/// function should do differently for them.
+pub fn damage_kind_of(raw_type: i32) -> DamageKind {
+    match raw_type {
+        v if v == crate::pb::EDamageType::Absorbed as i32 => DamageKind::Absorbed,
+        v if v == crate::pb::EDamageType::Immune as i32 => DamageKind::Immune,
+        _ => DamageKind::Normal,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DamageEvent {
     /// Who dealt this hit, as a whole-uuid identity (issue #335). This is
@@ -85,6 +124,10 @@ pub struct DamageEvent {
     pub hp_lessen: i64,
     pub is_miss: bool,
     pub is_heal: bool,
+    /// Which absorbed/immune channel (if any) this hit's `value` belongs to
+    /// (issue #338), sourced from `pb::SyncDamageInfo.r#type` via
+    /// [`damage_kind_of`].
+    pub kind: DamageKind,
     /// Who was hit, as a whole-uuid identity (issue #335) — the counterpart
     /// of `attacker` above.
     pub target: EntityId,
@@ -181,6 +224,13 @@ pub struct PlayerInfo {
     /// doc comment for why these are believed to be current-vs-target
     /// rather than duplicates, and the confidence caveat on that belief.
     pub target_position: Option<[f32; 3]>,
+    /// Current total shield value, sourced from `attr_id::SHIELD_LIST`
+    /// (`AttrShieldList`, issue #338) — summed across every active shield
+    /// instance this delta's attrs carried. `None` when this packet's
+    /// attrs carried no shield-list update at all (not the same as "no
+    /// shield right now", which decodes as `Some(0)` — see
+    /// `attrs::decode_shield_total`'s doc comment).
+    pub shield: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -434,6 +484,85 @@ pub enum ProtocolEvent {
         buff_uuid: i32,
         removes_layer: bool,
         timestamp_ms: u64,
+    },
+    /// An entity's decoded `AttrState` (issue #339/#272), sourced from
+    /// `attrs::attr_id::STATE` on an `AoiSyncDelta`'s attr channel — see
+    /// `attrs::entity_state_from_attrs` for the wire evidence and
+    /// `decode::on_aoi_sync_delta` for the emit site. Emitted for both
+    /// players and monsters (unlike `Cast`, which is player-only): a boss's
+    /// own `AttrState` transitioning to dead is one of this issue's two
+    /// explicit death signals.
+    ///
+    /// `is_dead` is the only bit this crate extracts from the wire's full
+    /// `EActorState` enum — every non-dead state (skill, stiff, born, the
+    /// resurrection animation, ...) collapses to `false`. Consumers must
+    /// not read `false` as "just revived": it means only "not currently in
+    /// the dead state", which is true on every ordinary delta a live
+    /// entity ever sends.
+    EntityState {
+        /// The entity's whole-uuid identity (issue #335).
+        entity: EntityId,
+        /// `entity.display_uid()`. Display only; never key state on it.
+        uid: i64,
+        kind: EntityKind,
+        is_dead: bool,
+        timestamp_ms: u64,
+    },
+    /// `WorldNtf.NotifyReviveUser` (opcode `0x27`, issue #272), the
+    /// dedicated revive notify — see `decode::opcode::NOTIFY_REVIVE_USER`
+    /// for the wire evidence. Carries only the revived actor's uid and the
+    /// packet-arrival timestamp; unlike the inferred "next action implies
+    /// alive" fallback it replaces, this is the actual revive moment.
+    Revive {
+        /// The revived actor's whole-uuid identity (issue #335).
+        entity: EntityId,
+        /// `entity.display_uid()`. Display only.
+        uid: i64,
+        timestamp_ms: u64,
+    },
+    /// One party member left or was kicked from the team (issue #343),
+    /// decoded from `GrpcTeamNtf.NotifyLeaveTeam` — see
+    /// `crate::decode::on_notify_leave_team`. The wire's `leaveType` field
+    /// tells voluntary leaves and kicks apart, but nothing downstream
+    /// treats them differently (both mean "this uid is no longer in the
+    /// roster"), so it is not carried onto this event.
+    TeamMemberLeft {
+        uid: i64,
+    },
+    /// The authoritative party/raid roster as of this `NotifyJoinTeam`
+    /// push (issue #343), decoded alongside that message's per-member
+    /// `Player` events — see `crate::decode::on_notify_join_team`.
+    /// `NotifyJoinTeam` is not purely additive: BPSR-ZDPS's own client
+    /// resends the *whole* roster (up to a 20-player raid) on every team
+    /// change, not just the delta, so this variant lets a consumer prune
+    /// any roster row it holds that is no longer named here — the
+    /// counterpart to `TeamMemberLeft` for changes this crate never saw an
+    /// explicit leave/kick notify for (e.g. a member who left while this
+    /// meter was attached to a different scene).
+    ///
+    /// `members` holds every roster uid this push resolved (the same
+    /// `TeamMemData.char_id` / `TeamBasicData.char_id` fallback
+    /// `on_notify_join_team` uses), including members whose `Player` event
+    /// was suppressed for carrying no name/class/ability_score — a
+    /// bot-like entry with nothing to display is still a roster member and
+    /// must not be pruned as if it had left.
+    TeamRoster {
+        members: Vec<i64>,
+    },
+    /// The local player's own uid (issue #344), decoded from
+    /// `SyncContainerData.v_data.char_id` — see
+    /// `decode::on_sync_container_data`. `char_id` is a **bare** uid, not a
+    /// packed `uuid`; unlike `Entity`/`AoiSyncDelta`/`SyncDamageInfo` ids it
+    /// must never be shifted through `uid_of` (that trap is what sank the
+    /// field's first pass in `crate::sanitize`, whose module doc (see
+    /// crates/protocol/src/sanitize.rs:22-23) documents the same
+    /// distinction for `CharSerialize.char_id`/`CharBaseInfo.char_id`).
+    /// Emitted independently of `Player`: a
+    /// `CharSerialize` with only `char_id` (no `char_base`) still says who
+    /// the local player is, even though `on_sync_container_data` has
+    /// nothing to build a `Player` event from in that case.
+    LocalPlayer {
+        uid: i64,
     },
 }
 

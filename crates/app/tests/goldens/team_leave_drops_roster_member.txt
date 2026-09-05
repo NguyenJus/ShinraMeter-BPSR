@@ -1,0 +1,16 @@
+scenario=team_leave_drops_roster_member
+at_ms=4000
+fight_state=Active
+duration_ms=2000
+total_damage=80000
+total_dps=80000.00
+encounter.boss_monster_id=103
+encounter.boss_name=Ignisor
+encounter.is_boss=true
+encounter.scene_id=1101
+encounter.scene_name=Towering Ruin
+encounter.scene_boss_name=-
+resets=
+rows=2
+row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=50000 dps=50000.00 share=62.50 crit=0.00 lucky=0.00 hits=1 deaths=0
+row uid=1002 name=Brin class=FrostMage ability_score=11000 season_strength=- imagines=[-,-] damage=30000 dps=30000.00 share=37.50 crit=0.00 lucky=0.00 hits=1 deaths=0

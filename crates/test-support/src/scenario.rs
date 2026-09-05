@@ -64,6 +64,14 @@ pub struct Hit {
     /// scenario express a shadow/mirror entity or a recycled uid, i.e. two
     /// attackers that share `uuid >> 16` and differ only above it.
     pub attacker_uuid: Option<i64>,
+    /// Issue #338: sets `r#type = EDamageType::Absorbed`. Mutually
+    /// exclusive with `immune`/`miss`/`heal` — `wire::damage_info` reads
+    /// them in `miss > heal > absorbed > immune > normal` priority order,
+    /// so a `Hit` should only ever set one.
+    pub absorbed: bool,
+    /// Issue #338: sets `r#type = EDamageType::Immune`. See `absorbed`'s
+    /// doc comment for the priority order.
+    pub immune: bool,
 }
 
 impl Hit {
@@ -79,6 +87,8 @@ impl Hit {
             heal: false,
             kills_target: false,
             attacker_uuid: None,
+            absorbed: false,
+            immune: false,
         }
     }
 
@@ -102,6 +112,20 @@ impl Hit {
 
     pub fn kill(mut self) -> Self {
         self.kills_target = true;
+        self
+    }
+
+    /// Marks this hit as fully absorbed by the target's shield (issue
+    /// #338): `r#type = EDamageType::Absorbed`.
+    pub fn absorbed(mut self) -> Self {
+        self.absorbed = true;
+        self
+    }
+
+    /// Marks this hit as blocked by the target's immunity (issue #338):
+    /// `r#type = EDamageType::Immune`.
+    pub fn immune(mut self) -> Self {
+        self.immune = true;
         self
     }
 
@@ -254,6 +278,121 @@ impl Scenario {
         self.hits(target_uid, vec![Hit::new(attacker_uid, skill_id, value)])
     }
 
+    /// A monster's killing blow on a player uid (issue #339/#272): unlike
+    /// [`Self::hits`], which always targets a monster, this targets a
+    /// player — the shape a real death packet has.
+    pub fn player_killed_by(
+        mut self,
+        attacker_monster_uid: i64,
+        target_uid: i64,
+        skill_id: i32,
+        value: i64,
+    ) -> Self {
+        let dmg = pb::SyncDamageInfo {
+            is_dead: true,
+            ..wire::base_damage(wire::monster_uuid(attacker_monster_uid), skill_id, value)
+        };
+        let payload = wire::damage_delta(wire::player_uuid(target_uid), dmg);
+        let bytes = self.wrap_frame(opcode::SYNC_NEAR_DELTA_INFO, &payload);
+        self.push_bytes(bytes);
+        self
+    }
+
+    /// `WorldNtf.NotifyReviveUser` (opcode `0x27`, issue #272/#339) for a
+    /// player uid.
+    pub fn revive(mut self, uid: i64) -> Self {
+        let payload = wire::revive_payload(wire::player_uuid(uid));
+        let bytes = self.wrap_frame(opcode::NOTIFY_REVIVE_USER, &payload);
+        self.push_bytes(bytes);
+        self
+    }
+
+    /// One `SyncNearDeltaInfo` carrying a decoded `AttrState` (issue
+    /// #339/#272) for a player uid: `dead = true` encodes
+    /// `EActorState::ActorStateDead` (9), `dead = false` encodes
+    /// `ActorStateDefault` (0).
+    pub fn player_state(mut self, uid: i64, dead: bool) -> Self {
+        let uuid = wire::player_uuid(uid);
+        let payload = wire::attr_delta_payload(
+            uuid,
+            vec![wire::varint_attr(attr_id::STATE, if dead { 9 } else { 0 })],
+        );
+        let bytes = self.wrap_frame(opcode::SYNC_NEAR_DELTA_INFO, &payload);
+        self.push_bytes(bytes);
+        self
+    }
+
+    /// One `NotifyJoinTeam` roster push (issues #146/#343), on
+    /// `frame::TEAM_NTF_SERVICE_UUID` rather than the main service. Emits
+    /// one `Player` event per named `members` entry, plus a trailing
+    /// full-roster sync (`ProtocolEvent::TeamRoster`) listing every
+    /// resolved uid — see `bpsr_protocol::decode::on_notify_join_team`.
+    pub fn team_join(mut self, members: Vec<pb::TeamMemData>) -> Self {
+        let payload = wire::notify_join_team_payload(members);
+        let bytes = self.wrap_team_frame(
+            bpsr_protocol::decode::team_opcode::NOTIFY_JOIN_TEAM,
+            &payload,
+        );
+        self.push_bytes(bytes);
+        self
+    }
+
+    /// One `SyncNearDeltaInfo` carrying a decoded `AttrState` (issue
+    /// #339/#272) for a monster uid — see [`Self::player_state`] for the
+    /// wire values.
+    pub fn monster_state(mut self, uid: i64, dead: bool) -> Self {
+        let uuid = wire::monster_uuid(uid);
+        let payload = wire::attr_delta_payload(
+            uuid,
+            vec![wire::varint_attr(attr_id::STATE, if dead { 9 } else { 0 })],
+        );
+        let bytes = self.wrap_frame(opcode::SYNC_NEAR_DELTA_INFO, &payload);
+        self.push_bytes(bytes);
+        self
+    }
+
+    /// One `NotifyLeaveTeam` (issue #343): `uid` left the party voluntarily
+    /// (`leave_type = 0`).
+    pub fn team_leave(mut self, uid: i64) -> Self {
+        let payload = wire::notify_leave_team_payload(uid, 0);
+        let bytes = self.wrap_team_frame(
+            bpsr_protocol::decode::team_opcode::NOTIFY_LEAVE_TEAM,
+            &payload,
+        );
+        self.push_bytes(bytes);
+        self
+    }
+
+    /// One `NotifyLeaveTeam` (issue #343): `uid` was kicked from the party
+    /// (`leave_type = 1`) — this crate's decoder doesn't distinguish a kick
+    /// from a voluntary leave, so this must yield the same
+    /// `TeamMemberLeft` event as [`Self::team_leave`].
+    pub fn team_kick(mut self, uid: i64) -> Self {
+        let payload = wire::notify_leave_team_payload(uid, 1);
+        let bytes = self.wrap_team_frame(
+            bpsr_protocol::decode::team_opcode::NOTIFY_LEAVE_TEAM,
+            &payload,
+        );
+        self.push_bytes(bytes);
+        self
+    }
+
+    /// A monster's hit on a player — the reverse attacker/target direction
+    /// from `hit`/`hits` (which always model a player attacking a monster).
+    /// `hit.attacker_uid` is the monster's uid (packed via
+    /// `wire::monster_uuid`, not `wire::player_uuid`); `hit.kill()` sets
+    /// `is_dead` on the wire `SyncDamageInfo`, which is how
+    /// `Meter::record_death` learns a player went down — the way to script a
+    /// party wipe.
+    pub fn monster_hits_player(mut self, target_player_uid: i64, hit: Hit) -> Self {
+        let target_uuid = wire::player_uuid(target_player_uid);
+        let info = wire::monster_damage_info(&hit);
+        let payload = wire::damage_delta(target_uuid, info);
+        let bytes = self.wrap_frame(opcode::SYNC_NEAR_DELTA_INFO, &payload);
+        self.push_bytes(bytes);
+        self
+    }
+
     // --- non-wire verbs ---
 
     pub fn inject(mut self, event: ProtocolEvent) -> Self {
@@ -282,6 +421,25 @@ impl Scenario {
     /// this verb. Consumes the one-shot `nested` flag.
     fn wrap_frame(&mut self, opcode: u32, payload: &[u8]) -> Vec<u8> {
         let frame = wire::notify(opcode, payload, self.compressed);
+        if std::mem::take(&mut self.nested) {
+            wire::framedown(&frame, self.compressed)
+        } else {
+            frame
+        }
+    }
+
+    /// Like [`Self::wrap_frame`], but on
+    /// `bpsr_protocol::frame::TEAM_NTF_SERVICE_UUID` (issue #146/#343)
+    /// instead of the main service — the `GrpcTeamNtf` verbs need this,
+    /// since `method_id` alone collides with the main service's opcode
+    /// space (see `bpsr_protocol::decode::decode_notify`'s doc comment).
+    fn wrap_team_frame(&mut self, method_id: u32, payload: &[u8]) -> Vec<u8> {
+        let frame = wire::notify_with_service(
+            bpsr_protocol::frame::TEAM_NTF_SERVICE_UUID,
+            method_id,
+            payload,
+            self.compressed,
+        );
         if std::mem::take(&mut self.nested) {
             wire::framedown(&frame, self.compressed)
         } else {

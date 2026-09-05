@@ -72,6 +72,53 @@ impl FightEndCause {
     }
 }
 
+/// Which hold, if any, is keeping an ended fight's events withheld beyond
+/// the ordinary [`FightState::Ended`] freeze (issue #336). Only one hold
+/// exists today — a party wipe
+/// (`crate::encounter::Meter::withholds_after_wipe`, issue #154) — split
+/// into its own type rather than a bare bool so a caller that already
+/// matches on this does not have to change shape if a second kind is ever
+/// added.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HoldKind {
+    /// The whole party went down and the attempt is being held open for a
+    /// possible re-pull, per
+    /// `crate::encounter::Meter::withholds_after_wipe`.
+    Wipe,
+}
+
+/// Read-only, point-in-time view of the fight lifecycle (issue #336 step
+/// 1). Every value here is derived on the fly from state `Meter` already
+/// stores — nothing new is retained to produce it, so this changes no
+/// behaviour. It's the accessor surface a later, explicit state machine
+/// (issue #336 step 3) replaces the derivation behind, without callers
+/// having to change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Lifecycle {
+    /// No fight has started since the last reset.
+    Idle,
+    /// A fight is in progress, started at `since_ms`.
+    Active { since_ms: u64 },
+    /// The fight is over and its stats are frozen as of `at_ms`. `cause` is
+    /// `Some` only when today's stored fields can still tell it apart after
+    /// the fact — right now, just a wipe (`HoldKind::Wipe`/`wipe_hold`);
+    /// every other cause is logged (`FightEndCause`) the moment it happens
+    /// but not retained, so it reads back `None` here. Issue #336 step 2
+    /// widens the stored state so every cause survives to this point.
+    Ended {
+        at_ms: u64,
+        cause: Option<FightEndCause>,
+    },
+    /// The fight ended in a party wipe and the attempt is still being held
+    /// open for a possible re-pull, per
+    /// `crate::encounter::Meter::withholds_after_wipe`. A sibling of
+    /// `Ended`, split out for hold-aware callers — `fight_end_cause`
+    /// reports `Wipe` here too. Callers that just mean "the fight is over"
+    /// must match `Ended { .. } | Held { .. }`. `at_ms` is the fight-end
+    /// timestamp, mirroring `Ended`'s `at_ms`.
+    Held { kind: HoldKind, at_ms: u64 },
+}
+
 /// Tunables for fight-end detection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FightConfig {

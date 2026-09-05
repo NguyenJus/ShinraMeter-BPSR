@@ -18,6 +18,17 @@ pub struct SkillStats {
     /// (resonance-logs, bpsr-logs and BPSR-ZDPS all sum but never max a
     /// crit), so it is ours to maintain — one comparison per crit event.
     pub max_crit: i64,
+    /// Sum of every `DamageEvent` on this skill whose `kind` was
+    /// `DamageKind::Absorbed` (issue #338) — a target's shield fully soaked
+    /// the hit. Kept out of `total_damage`/DPS entirely; this is its own
+    /// channel, not a damage sub-total.
+    pub absorbed_total: i64,
+    /// Sum of every `DamageEvent` on this skill whose `kind` was
+    /// `DamageKind::Immune` (issue #338). Usually stays `0` — an immune hit
+    /// is typically reported with `value == 0` — but this still gets its
+    /// own channel rather than assuming that always holds (see
+    /// `DamageKind::Immune`'s doc comment).
+    pub immune_total: i64,
 }
 
 impl SkillStats {
@@ -37,6 +48,8 @@ impl SkillStats {
         self.lucky_hits += other.lucky_hits;
         self.lucky_damage += other.lucky_damage;
         self.max_crit = self.max_crit.max(other.max_crit);
+        self.absorbed_total += other.absorbed_total;
+        self.immune_total += other.immune_total;
     }
 }
 
@@ -106,6 +119,23 @@ pub struct PlayerStats {
     pub crit_damage: i64,
     pub lucky_hits: u64,
     pub lucky_damage: i64,
+    /// Sum of every hit this player dealt whose `kind` was
+    /// `DamageKind::Absorbed` (issue #338) — the target's shield fully
+    /// soaked it. Excluded from `total_damage`/DPS on purpose; see
+    /// `SkillStats::absorbed_total`, the per-skill breakdown this mirrors
+    /// at the player level.
+    pub absorbed_total: i64,
+    /// Sum of every hit this player dealt whose `kind` was
+    /// `DamageKind::Immune` (issue #338). See `SkillStats::immune_total`.
+    pub immune_total: i64,
+    /// This player's current total shield value, sourced from
+    /// `PlayerInfo::shield` (`AttrShieldList`, issue #338). `None` until a
+    /// packet carrying the attr has been seen for this player this
+    /// encounter — see that field's doc comment for the `None`-vs-`Some(0)`
+    /// distinction, which carries through unchanged here. Not accumulated
+    /// like the totals above: this is a live gauge, overwritten by every
+    /// packet that carries it, not summed across the encounter.
+    pub shield: Option<i64>,
     /// Times this player died this encounter, per `DamageEvent::is_dead`
     /// (issue #49). This counts the *victim*, not the attacker — see
     /// `Meter::apply_damage`.
@@ -222,6 +252,9 @@ impl PlayerStats {
             crit_damage: 0,
             lucky_hits: 0,
             lucky_damage: 0,
+            absorbed_total: 0,
+            immune_total: 0,
+            shield: None,
             deaths: 0,
             alive: true,
             skills: HashMap::new(),
@@ -254,9 +287,28 @@ impl PlayerStats {
     /// apply in arrival order — which is what makes a killing blow a
     /// player deals to themselves land *after* the swing that carried it
     /// and leave them down.
-    pub(crate) fn set_alive(&mut self, alive: bool, timestamp_ms: u64) {
+    ///
+    /// `explicit` (issue #339/#272) distinguishes a real signal
+    /// (`DamageEvent::is_dead`, decoded `AttrState`, or `Revive`) from the
+    /// old inferred fallback: a player's next *acted* event (damage or
+    /// heal) still counts as proof of life for a player whose actual
+    /// revive this meter never observed on the wire (`Meter::apply_damage`
+    /// passes `false` there), but only that call site does — every other
+    /// caller has a real signal and passes `true`. Purely a diagnostic
+    /// distinction: both still move the dead clock identically on a
+    /// `(false, true)`/`(true, false)` edge; the only difference is the
+    /// debug log below, which fires exactly when the estimate this pill
+    /// used to be entirely built on is still the only evidence available.
+    pub(crate) fn set_alive(&mut self, alive: bool, timestamp_ms: u64, explicit: bool) {
         if self.alive_as_of_ms.is_some_and(|last| timestamp_ms < last) {
             return;
+        }
+        if !explicit && !self.alive && alive {
+            log::debug!(
+                "stats: uid={} revive inferred from next action at {timestamp_ms}ms — no \
+                 explicit Revive/AttrState signal was observed for this death (issue #339/#272)",
+                self.uid
+            );
         }
         // Issue #254: the two *edges* — and only the edges — move the dead
         // clock. A repeated `set_alive(false)` while already down (the
@@ -351,6 +403,17 @@ pub struct PlayerRow {
     pub crit_pct: f32,
     pub lucky_pct: f32,
     pub hits: u64,
+    /// Sum of this player's `SkillStats::absorbed_total` across every skill
+    /// (issue #338) — a shield fully soaking one of their hits. Excluded
+    /// from `damage`/`dps` above; see `PlayerStats::absorbed_total`.
+    pub absorbed_total: i64,
+    /// Sum of this player's `SkillStats::immune_total` across every skill
+    /// (issue #338). See `PlayerStats::immune_total`.
+    pub immune_total: i64,
+    /// This player's current total shield value (issue #338). Mirrors
+    /// `PlayerStats::shield` — `None` means unseen this encounter, not
+    /// "no shield right now" (that's `Some(0)`).
+    pub shield: Option<i64>,
     /// Times this player died this encounter (issue #49). See
     /// `PlayerStats::deaths`.
     pub deaths: u32,
@@ -430,6 +493,11 @@ pub struct SkillRow {
     /// `dps_duration_ms`, so a skill's rate can never disagree with the
     /// row's own DPS window.
     pub hits_per_min: f64,
+    /// This skill's `SkillStats::absorbed_total` (issue #338) — not part of
+    /// `damage` above.
+    pub absorbed_total: i64,
+    /// This skill's `SkillStats::immune_total` (issue #338).
+    pub immune_total: i64,
 }
 
 /// What the meter believes is being fought, as far as the packet stream reveals
@@ -453,7 +521,7 @@ pub struct EncounterInfo {
     /// (issue #201 — this used to be learned at runtime and cached to disk).
     /// Independent of `boss_monster_id`/`boss_name`/`is_boss` above, which
     /// remain the raw facts about the currently-selected target;
-    /// `encounter_title` in `crates/app/src/ui.rs` falls back to this field
+    /// `encounter_title` in `crates/app/src/ui/header.rs` falls back to this field
     /// so a mid-dungeon mech (or even a genuine mid-dungeon boss) never
     /// displaces the dungeon's final boss name.
     ///
@@ -468,7 +536,7 @@ pub struct EncounterInfo {
     /// (`phase::is_boss_select_scene`), which is the only source — the meter
     /// cannot tell a raid's selections from an ordinary dungeon's boss order
     /// by observation. Drives `encounter_title`'s
-    /// "Select a boss" placeholder in `crates/app/src/ui.rs`: with nothing
+    /// "Select a boss" placeholder in `crates/app/src/ui/header.rs`: with nothing
     /// engaged there is genuinely no target *yet*, as opposed to the
     /// no-target-at-all case "No target" names.
     pub multi_boss_scene: bool,
@@ -485,10 +553,24 @@ pub struct Snapshot {
     /// separate denominators lets them diverge (e.g. a huge spike on the
     /// first tick, or the header decaying while idle).
     pub total_dps: f64,
+    /// Sum of every row's `absorbed_total` (issue #338) — total shield
+    /// damage this encounter, kept out of `total_damage`/`total_dps`.
+    pub total_absorbed: i64,
+    /// Sum of every row's `immune_total` (issue #338).
+    pub total_immune: i64,
     pub rows: Vec<PlayerRow>,
     /// What is being fought, if the packet stream has revealed it (issue #9
     /// slice 2).
     pub encounter: EncounterInfo,
+    /// The local player's own uid (issue #344), if a
+    /// `ProtocolEvent::LocalPlayer` has been seen this server session.
+    /// Session-scoped like `dungeon_state`/`objectives`: survives both a
+    /// fight `reset` and `ServerChanged` — the value is `char_id`, the
+    /// persistent character id, not a per-session entity uuid, and a later
+    /// `LocalPlayer` event simply overwrites it. Never cleared. Exposed for
+    /// a future UI "you" highlight / self-only view (neither exists yet;
+    /// follow-up to issue #344).
+    pub local_uid: Option<i64>,
     /// Whether the packet-capture thread is still alive, as far as the
     /// caller publishing this snapshot knows (pipeline-robustness audit,
     /// finding 1). The meter itself has no way to know this — it only ever
@@ -509,10 +591,10 @@ mod tests {
     #[test]
     fn set_alive_edges_accumulate_dead_time() {
         let mut s = PlayerStats::new(1);
-        s.set_alive(false, 1_000);
-        s.set_alive(true, 4_000);
-        s.set_alive(false, 10_000);
-        s.set_alive(true, 10_500);
+        s.set_alive(false, 1_000, true);
+        s.set_alive(true, 4_000, true);
+        s.set_alive(false, 10_000, true);
+        s.set_alive(true, 10_500, true);
         assert_eq!(s.dead_ms, 3_500);
         assert_eq!(s.dead_since_ms, None);
         assert_eq!(s.dead_ms_as_of(60_000), 3_500);
@@ -524,9 +606,9 @@ mod tests {
     #[test]
     fn a_repeated_death_keeps_the_first_start() {
         let mut s = PlayerStats::new(1);
-        s.set_alive(false, 1_000);
-        s.set_alive(false, 1_400);
-        s.set_alive(true, 5_000);
+        s.set_alive(false, 1_000, true);
+        s.set_alive(false, 1_400, true);
+        s.set_alive(true, 5_000, true);
         assert_eq!(s.dead_ms, 4_000);
     }
 
@@ -535,19 +617,19 @@ mod tests {
     #[test]
     fn a_repeated_revive_adds_nothing() {
         let mut s = PlayerStats::new(1);
-        s.set_alive(false, 1_000);
-        s.set_alive(true, 5_000);
-        s.set_alive(true, 6_000);
-        s.set_alive(true, 7_000);
+        s.set_alive(false, 1_000, true);
+        s.set_alive(true, 5_000, true);
+        s.set_alive(true, 6_000, true);
+        s.set_alive(true, 7_000, true);
         assert_eq!(s.dead_ms, 4_000);
     }
 
     #[test]
     fn dead_ms_as_of_adds_the_interval_still_open() {
         let mut s = PlayerStats::new(1);
-        s.set_alive(false, 1_000);
-        s.set_alive(true, 3_000);
-        s.set_alive(false, 8_000);
+        s.set_alive(false, 1_000, true);
+        s.set_alive(true, 3_000, true);
+        s.set_alive(false, 8_000, true);
         assert_eq!(s.dead_ms, 2_000, "only the closed interval is stored");
         assert_eq!(s.dead_ms_as_of(9_500), 3_500);
         assert_eq!(
@@ -562,8 +644,8 @@ mod tests {
     #[test]
     fn a_stale_transition_moves_neither_the_bit_nor_the_dead_clock() {
         let mut s = PlayerStats::new(1);
-        s.set_alive(false, 5_000);
-        s.set_alive(true, 4_000);
+        s.set_alive(false, 5_000, true);
+        s.set_alive(true, 4_000, true);
         assert!(!s.alive);
         assert_eq!(s.dead_ms, 0);
         assert_eq!(s.dead_ms_as_of(9_000), 4_000);

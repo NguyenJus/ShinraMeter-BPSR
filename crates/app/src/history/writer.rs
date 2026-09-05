@@ -226,6 +226,9 @@ mod tests {
                 crit_pct: 0.0,
                 lucky_pct: 0.0,
                 hits: 10,
+                absorbed_total: 0,
+                immune_total: 0,
+                shield: None,
                 deaths: 0,
                 dead_ms: Some(0),
                 skills: Vec::new(),
@@ -236,7 +239,10 @@ mod tests {
                 buffs: Vec::new(),
             }],
             encounter: EncounterInfo::default(),
+            local_uid: None,
             capture_alive: true,
+            total_absorbed: 0,
+            total_immune: 0,
         };
         record_from_snapshot(&snapshot, 1_000, title.to_string(), None).unwrap()
     }

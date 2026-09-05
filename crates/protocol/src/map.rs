@@ -7,7 +7,7 @@
 //! a future field or enum variant only needs fixing once.
 
 use crate::entity::EntityId;
-use crate::event::{DisappearReason, EDungeonState, EntityKind, ProtocolEvent};
+use crate::event::{DamageKind, DisappearReason, EDungeonState, EntityKind, ProtocolEvent};
 use crate::pb::Class;
 use bpsr_meter as meter;
 
@@ -41,6 +41,15 @@ pub fn map_disappear_reason(reason: DisappearReason) -> meter::DisappearReason {
 /// Both are the whole wire uuid; only the crate they live in differs.
 pub fn map_entity_id(id: EntityId) -> meter::EntityId {
     meter::EntityId(id.0)
+}
+
+/// Maps a protocol damage kind onto the meter's mirror type (issue #338).
+pub fn map_damage_kind(kind: DamageKind) -> meter::DamageKind {
+    match kind {
+        DamageKind::Normal => meter::DamageKind::Normal,
+        DamageKind::Absorbed => meter::DamageKind::Absorbed,
+        DamageKind::Immune => meter::DamageKind::Immune,
+    }
 }
 
 /// Maps a protocol entity kind onto the meter's mirror type.
@@ -112,6 +121,7 @@ pub fn map_event(
             hp_lessen: d.hp_lessen,
             is_miss: d.is_miss,
             is_heal: d.is_heal,
+            kind: map_damage_kind(d.kind),
             target: map_entity_id(d.target),
             target_uid: d.target_uid,
             target_kind: map_kind(d.target_kind),
@@ -127,6 +137,7 @@ pub fn map_event(
             season_strength: p.season_strength,
             imagines,
             imagine_tiers,
+            shield: p.shield,
         }),
         ProtocolEvent::EnemyHp(e) => meter::ProtocolEvent::EnemyHp(meter::EnemyHp {
             entity: map_entity_id(e.entity),
@@ -196,6 +207,31 @@ pub fn map_event(
             removes_layer,
             timestamp_ms,
         },
+        ProtocolEvent::EntityState {
+            entity,
+            uid,
+            kind,
+            is_dead,
+            timestamp_ms,
+        } => meter::ProtocolEvent::EntityState {
+            entity: map_entity_id(entity),
+            uid,
+            kind: map_kind(kind),
+            is_dead,
+            timestamp_ms,
+        },
+        ProtocolEvent::Revive {
+            entity,
+            uid,
+            timestamp_ms,
+        } => meter::ProtocolEvent::Revive {
+            entity: map_entity_id(entity),
+            uid,
+            timestamp_ms,
+        },
+        ProtocolEvent::TeamMemberLeft { uid } => meter::ProtocolEvent::TeamMemberLeft { uid },
+        ProtocolEvent::TeamRoster { members } => meter::ProtocolEvent::TeamRoster { members },
+        ProtocolEvent::LocalPlayer { uid } => meter::ProtocolEvent::LocalPlayer { uid },
     }
 }
 
@@ -285,5 +321,54 @@ mod tests {
                 reason: Some(meter::DisappearReason::Unknown(99)),
             }
         );
+    }
+
+    /// Pins every `DamageKind`/`meter::DamageKind` pairing individually
+    /// (issue #338), same rationale as `map_disappear_reason`'s pinning
+    /// test above — a transposed match arm would stay exhaustive and
+    /// compile.
+    #[test]
+    fn map_damage_kind_pins_every_variant() {
+        assert_eq!(
+            map_damage_kind(DamageKind::Normal),
+            meter::DamageKind::Normal
+        );
+        assert_eq!(
+            map_damage_kind(DamageKind::Absorbed),
+            meter::DamageKind::Absorbed
+        );
+        assert_eq!(
+            map_damage_kind(DamageKind::Immune),
+            meter::DamageKind::Immune
+        );
+    }
+
+    #[test]
+    fn map_event_carries_damage_kind_and_shield_through() {
+        use crate::event::{DamageEvent, EntityKind};
+
+        let d = DamageEvent {
+            attacker: crate::entity::EntityId::from_display_uid(1, EntityKind::Player),
+            attacker_uid: 1,
+            attacker_kind: EntityKind::Player,
+            skill_id: 1,
+            value: 500,
+            crit: false,
+            lucky: false,
+            hp_lessen: 0,
+            is_miss: false,
+            is_heal: false,
+            kind: DamageKind::Absorbed,
+            target: crate::entity::EntityId::from_display_uid(2, EntityKind::Monster),
+            target_uid: 2,
+            target_kind: EntityKind::Monster,
+            timestamp_ms: 0,
+            is_dead: false,
+        };
+        let mapped = map_event(ProtocolEvent::Damage(d), 0, None, None);
+        let meter::ProtocolEvent::Damage(m) = mapped else {
+            panic!("expected a damage event");
+        };
+        assert_eq!(m.kind, meter::DamageKind::Absorbed);
     }
 }

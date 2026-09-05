@@ -15,12 +15,35 @@
 //! JSONL fallback — replaces one file and nothing else in this module or its
 //! callers.
 
+pub mod sanitize;
 pub mod sqlite;
 pub mod writer;
 
 use std::path::PathBuf;
 
 use bpsr_meter::{Class, EncounterInfo, EntityId, EntityKind, PlayerRow, SkillRow, Snapshot};
+
+/// Where the encounter-history database (issue #39) lives:
+/// `%APPDATA%\ShinraMeter-BPSR\history.sqlite`. `SHINRA_HISTORY_DB` overrides
+/// it outright. Lives here — rather than staying a `main.rs`-local helper —
+/// so both `main`'s `HistoryHandle::spawn` and the lib-side session-bundle
+/// export (`crate::bundle`, driven from `crate::ui`) name the exact same
+/// file without the lib crate depending back on the bin crate for it.
+/// Mirrors `settings::settings_path`/`inspect::dump_path`/
+/// `logging::log_file_path`'s own `paths::resolve` calls.
+pub fn history_db_path() -> PathBuf {
+    let (path, warning) = crate::paths::resolve(
+        std::env::var("SHINRA_HISTORY_DB").ok().as_deref(),
+        std::env::var("APPDATA").ok().as_deref(),
+        &["ShinraMeter-BPSR", "history.sqlite"],
+        "ShinraMeter-BPSR-history.sqlite",
+        "APPDATA is not set; falling back to a working-directory file for the encounter history",
+    );
+    if let Some(warning) = warning {
+        log::warn!("{warning}");
+    }
+    path
+}
 
 /// Schema version this build writes and reads (spec §5.4). Bumped whenever
 /// the DDL in `sqlite::init_schema` changes.
@@ -115,6 +138,13 @@ impl SkillRecord {
             hits: self.hits,
             crit_hits: self.crit_hits,
             hits_per_min: self.hits_per_min,
+            // Issue #338's absorbed/immune channels predate this on-disk
+            // record shape; a historical row has no way to have recorded
+            // them, so a replayed `SkillRow` always reads `0` here rather
+            // than growing the sqlite schema for a field no saved encounter
+            // can supply.
+            absorbed_total: 0,
+            immune_total: 0,
         }
     }
 }
@@ -221,6 +251,12 @@ impl PlayerRecord {
             // above — the Buff tab is live-only, and the schema has no
             // per-buff column to replay.
             buffs: Vec::new(),
+            // Issue #338: same story as `dead_ms` above — no schema column,
+            // so a replayed row reads unmeasured/absent rather than a real
+            // (and misleadingly precise) zero-or-unknown value.
+            absorbed_total: 0,
+            immune_total: 0,
+            shield: None,
         }
     }
 }
@@ -268,6 +304,8 @@ pub enum HistoryError {
     },
     #[error("failed to move the unreadable history file aside: {0}")]
     RenameAside(std::io::Error),
+    #[error("failed to copy the history database for sanitizing: {0}")]
+    Copy(std::io::Error),
 }
 
 /// The narrow seam the storage backend lives behind (spec §10): swapping
@@ -327,11 +365,21 @@ impl EncounterRecord {
     /// the header gets its text from `title`/`subtitle` instead (DECISION
     /// D7, wired up in WP3).
     pub fn to_snapshot(&self) -> Snapshot {
+        let rows: Vec<PlayerRow> = self.players.iter().map(PlayerRecord::to_row).collect();
+        // Issue #338: `PlayerRecord::to_row` always zeroes a replayed row's
+        // absorbed/immune totals (no schema column to replay them from —
+        // see that function's doc comment), so these sum to `0` too; kept
+        // as a real sum rather than a hardcoded `0` so this stays correct
+        // the day a schema revision does persist them.
+        let total_absorbed: i64 = rows.iter().map(|r| r.absorbed_total).sum();
+        let total_immune: i64 = rows.iter().map(|r| r.immune_total).sum();
         Snapshot {
             duration_ms: self.duration_ms,
             total_damage: self.total_damage,
             total_dps: self.total_dps,
-            rows: self.players.iter().map(PlayerRecord::to_row).collect(),
+            total_absorbed,
+            total_immune,
+            rows,
             encounter: EncounterInfo {
                 boss_monster_id: self.boss_monster_id,
                 is_boss: self.is_boss,
@@ -341,6 +389,13 @@ impl EncounterRecord {
             // A rebuilt-from-history snapshot has no live capture thread to
             // ask; it renders through the same live table path regardless,
             // and is never checked for this (see `Snapshot::capture_alive`).
+            // Separately, the local player's uid is not persisted in
+            // history.sqlite at all — the current schema (SCHEMA_VERSION =
+            // 2) has no column for it, so a rebuilt snapshot can never
+            // identify "you" even if it wanted to. Persisting it needs a
+            // schema bump plus a sanitizer remap (#353); tracked as a
+            // follow-up in #373.
+            local_uid: None,
             capture_alive: true,
         }
     }
@@ -413,6 +468,9 @@ mod tests {
             received: Vec::new(),
             casts: Vec::new(),
             buffs: Vec::new(),
+            absorbed_total: 0,
+            immune_total: 0,
+            shield: None,
         }
     }
 
@@ -421,6 +479,8 @@ mod tests {
             duration_ms: 12_345,
             total_damage,
             total_dps: 999.0,
+            total_absorbed: 0,
+            total_immune: 0,
             rows,
             encounter: EncounterInfo {
                 boss_monster_id: Some(42),
@@ -431,6 +491,7 @@ mod tests {
                 scene_boss_name: Some("Test Boss"),
                 multi_boss_scene: false,
             },
+            local_uid: None,
             capture_alive: true,
         }
     }
@@ -540,6 +601,8 @@ mod tests {
             hits: 8,
             crit_hits: 2,
             hits_per_min: 40.5,
+            absorbed_total: 0,
+            immune_total: 0,
         }
     }
 
