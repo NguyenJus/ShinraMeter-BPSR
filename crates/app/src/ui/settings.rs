@@ -1266,9 +1266,9 @@ mod tests {
     /// Issue #235: the opacity slider used to size itself off
     /// `Spacing::slider_width` (a fixed ~100pt rail) instead of stretching
     /// to fill its row the way the menu's other full-width controls do.
-    /// Compares its painted rect against the "Minimize to tray" button's —
-    /// a plain, always-visible control in the same popup, not nested inside
-    /// the Columns disclosure.
+    /// Compares its painted rect against the "Minimize to tray" row's — a
+    /// plain, always-visible control on the same root page (issue #120),
+    /// so both are measured under the same width.
     ///
     /// Every other `draw_header_menu` test calls it directly on the bare
     /// `Ui` `ctx.run_ui` hands back, bypassing the real
@@ -1318,15 +1318,18 @@ mod tests {
         let button_rect = accessible_rect_for_label(&update, "Minimize to tray");
         layout.drop_without_applying_deltas();
 
+        // Issue #120 inset every control by `MENU_ROW_INSET` from the
+        // popup's content edge, so "full width" now means the row's width
+        // less that inset on each side rather than the row's width exactly.
         assert!(
-            (slider_rect.left() - button_rect.left()).abs() < 1.0,
-            "the slider must start at the same left edge as the row below it: \
-             slider {slider_rect:?}, button {button_rect:?}"
+            (slider_rect.left() - (button_rect.left() + MENU_ROW_INSET)).abs() < 1.0,
+            "the slider must start on the same inset as the rows around it: \
+             slider {slider_rect:?}, row {button_rect:?}"
         );
         assert!(
-            (slider_rect.width() - button_rect.width()).abs() < 1.0,
-            "the slider must fill the same row width as the row below it, not a fixed rail: \
-             slider {slider_rect:?}, button {button_rect:?}"
+            (slider_rect.width() - (button_rect.width() - 2.0 * MENU_ROW_INSET)).abs() < 1.0,
+            "the slider must fill the inset row width, not a fixed rail: \
+             slider {slider_rect:?}, row {button_rect:?}"
         );
     }
 
@@ -1521,33 +1524,44 @@ mod tests {
         let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
         let mut settings = Settings::default();
 
-        let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
-            draw_header_menu(
-                ui,
-                &ctx,
-                &tx_command,
-                SettingsHandle {
-                    settings: &mut settings,
-                    tx_settings: &tx_settings,
-                },
-                None,
-                &icons,
-                &mut UpdateCheckState::default(),
-                &unused_log_export_sender(),
-                &mut false,
-            );
-        });
-        let update = layout
-            .platform_output
-            .accesskit_update
-            .clone()
-            .expect("accesskit was enabled for this frame");
+        // Issue #120 moved both rows onto the Background images *page*, so
+        // this drives the real navigation rather than asserting on the
+        // root: frame 1 locates the root row, frame 2 lets the click's
+        // page change take effect, frame 3 reads the page back.
+        let mut frame = |input: egui::RawInput| -> egui::accesskit::TreeUpdate {
+            let output = ctx.run_ui(input, |ui| {
+                draw_header_menu(
+                    ui,
+                    &ctx,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    None,
+                    &icons,
+                    &mut UpdateCheckState::default(),
+                    &unused_log_export_sender(),
+                    &mut false,
+                );
+            });
+            let update = output
+                .platform_output
+                .accesskit_update
+                .clone()
+                .expect("accesskit was enabled for this frame");
+            output.drop_without_applying_deltas();
+            update
+        };
+        let update = frame(egui::RawInput::default());
+        let row_pos = accessible_rect_for_label(&update, "Background images").center();
+        let _ = frame(click_at(row_pos));
+        let update = frame(egui::RawInput::default());
         let labels: Vec<String> = update
             .nodes
             .iter()
             .filter_map(|(_, node)| node.label().map(str::to_owned))
             .collect();
-        layout.drop_without_applying_deltas();
 
         let expected = ImageSlot::ALL.len();
         for button in ["Choose…", "Clear"] {
@@ -1565,60 +1579,54 @@ mod tests {
         );
     }
 
-    /// Regression coverage for issue #93's actual fix, which the test above
-    /// cannot see: it calls `draw_header_menu` directly, never through the
+    /// Regression coverage for issue #93's fix and for issue #120's page
+    /// structure, neither of which the direct-call tests above can see:
+    /// they call `draw_header_menu` on a bare `Ui`, never through the
     /// `egui::Popup::menu(&chevron_response).close_behavior(CloseOnClickOutside)`
-    /// wiring `draw_header` builds around it (~lines 473-477), so the
-    /// `ui.close()` calls on Minimize/Close are no-ops in that harness — a
-    /// popup that was never opened has nothing to close.
+    /// wiring `draw_header` builds around it, so the `ui.close()` calls on
+    /// the action rows are no-ops in that harness — a popup that was never
+    /// opened has nothing to close.
     ///
-    /// This drives the real thing through `draw_header` across several
-    /// frames of the same `egui::Context` (memory persists across `run_ui`
-    /// calls the way it would across real app frames): open the chevron
-    /// menu with a genuine click, expand the Columns disclosure, click a
-    /// column checkbox, and confirm the popup is still open afterward — the
-    /// whole point of `CloseOnClickOutside` plus no `ui.close()` on that
-    /// path. Then click Close and confirm the popup closes (on the frame
-    /// after, since `Ui::close` only takes effect for the next frame's
-    /// `is_open` check) and the right command still goes out, even with the
-    /// popup now in the mix.
+    /// This drives the real thing through `draw_header` across many frames
+    /// of the same `egui::Context` (memory persists across `run_ui` calls
+    /// the way it would across real app frames): open the menu with a
+    /// genuine click, drill into the Columns page, toggle a column, walk
+    /// back out with the back row, and only then click Close. Every one of
+    /// those is a *state* click that must leave the popup standing; Close
+    /// is the one that must dismiss it, and must still dispatch Quit even
+    /// with the real popup in the mix.
+    ///
+    /// It also pins issue #120's page-state rule at the other end:
+    /// `draw_header` clears the remembered page on every frame the popup
+    /// is shut, so reopening lands on the root rather than on whatever
+    /// page the user was last looking at when they dismissed it.
     #[test]
     fn header_menu_popup_stays_open_for_a_column_checkbox_but_closes_for_close() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         apply_theme(&ctx);
-        // The Columns disclosure section's own arrow (`show_toggle_button`)
-        // reads `openness()` once before this test's click toggles it and
-        // once more right after, both in the same frame — with the default
-        // nonzero `animation_time`, the second read still animates from
-        // the first read's now-stale timestamp with zero elapsed time, so
-        // it stays at 0.0 and the checkboxes never render that frame. A
-        // zero animation time makes `AnimationManager::animate_bool` snap
-        // straight to the target instead (its `elapsed / animation_time`
-        // divide-by-zero produces a non-finite value, which its own
-        // fallback resolves to the target), matching how instantly a real
-        // click should feel anyway.
+        // A zero animation time makes each click's effect fully painted on
+        // the frame after it (egui's `animate_bool` snaps straight to the
+        // target) instead of fading in over several — matching how
+        // instantly a real click should feel anyway.
         ctx.global_style_mut(|style| style.animation_time = 0.0);
         let icons = Icons::load(&ctx);
         let (tx_command, rx_command) = crossbeam_channel::unbounded();
-        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let (tx_settings, rx_settings) = crossbeam_channel::unbounded();
         let mut settings = Settings::default();
         let snapshot = header_test_snapshot(0);
         let mut gesture = WindowGesture::default();
         let mut update_check = UpdateCheckState::default();
 
         // Runs one frame of the real `draw_header` (chevron, popup wiring,
-        // and all) and hands back this frame's accessibility tree, the same
-        // ground truth `draw_header_menu_dispatches_close_to_the_right_command`
-        // reads Close's position from.
+        // and all) and hands back this frame's accessibility tree.
         let mut frame = |mut input: egui::RawInput| -> egui::accesskit::TreeUpdate {
             // A fixed, bounded screen every frame — the same reasoning as
             // `header_painted_boxes`'s doc comment: without one, the
-            // popup's own best-alignment logic (there is nothing to align
-            // *inside*) has no stable anchor to measure against, and the
-            // chevron/menu paint at a different, arbitrary offset each
-            // frame, silently invalidating a position captured on an
-            // earlier frame.
+            // popup's own best-alignment logic has no stable anchor to
+            // measure against, and the chevron/menu paint at a different,
+            // arbitrary offset each frame, silently invalidating a
+            // position captured on an earlier frame.
             input.screen_rect = Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(default_inner_width(), default_inner_height(None)),
@@ -1654,12 +1662,18 @@ mod tests {
             output.drop_without_applying_deltas();
             update
         };
-        let is_open = |update: &egui::accesskit::TreeUpdate| {
+        let has_label = |update: &egui::accesskit::TreeUpdate, label: &str| {
             update
                 .nodes
                 .iter()
-                .any(|(_, node)| node.label() == Some("Close"))
+                .any(|(_, node)| node.label().is_some_and(|s| s == label))
         };
+        // "Columns" is present on both the Root and Columns pages — the
+        // root's own drill-down row and the Columns page's back row both
+        // carry it — and on none of the closed header, so it answers "is
+        // the popup open" without assuming which page shows. Those are the
+        // only two pages this test visits.
+        let is_open = |update: &egui::accesskit::TreeUpdate| has_label(update, "Columns");
 
         // Frame 1: closed header, find the chevron.
         let update = frame(egui::RawInput::default());
@@ -1668,69 +1682,125 @@ mod tests {
 
         // Frame 2: click the chevron. `Popup::menu`'s `open_memory` toggles
         // and the popup paints in the very same frame (egui's `Popup::show`
-        // opens before deciding whether to render), so Columns is already
-        // visible here — collapsed, per its own `default_open(false)`. Its
-        // *position* is not trustworthy yet though: `Popup::show` runs the
-        // just-opened Area through a `sizing_pass` (no prior measured size
-        // to align against), which lays the content out differently from
-        // every later frame — so this frame only proves the menu opened.
+        // opens before deciding whether to render), but its *position* is
+        // not trustworthy yet: `Popup::show` runs the just-opened `Area`
+        // through a `sizing_pass` with no prior measured size to align
+        // against. So this frame only proves the menu opened.
         let update = frame(click_at(chevron_pos));
         assert!(is_open(&update), "clicking the chevron must open the menu");
 
         // Frame 3: no new input, just letting the popup settle into its
         // real, stable position now that a prior frame's size is on record.
+        // This is the root page, so it carries the action rows and none of
+        // the column checkboxes.
         let update = frame(egui::RawInput::default());
         assert!(is_open(&update), "the menu must still be open once settled");
+        assert!(
+            has_label(&update, "Restart packet capture"),
+            "the root page must carry its own action rows"
+        );
+        let first_column_label = ColumnKind::ALL[0].label();
+        assert!(
+            !has_label(&update, first_column_label),
+            "no column checkbox may sit on the root page"
+        );
         let columns_pos = accessible_rect_for_label(&update, "Columns").center();
 
-        // Frame 4: click Columns to expand its disclosure section.
+        // Frame 4: click the Columns row. It is a state row — no
+        // `ui.close()`, per issue #120's rule — so the popup must survive
+        // it; the page change it records lands on the next frame.
         let update = frame(click_at(columns_pos));
         assert!(
             is_open(&update),
-            "expanding Columns must not close the menu"
+            "opening the Columns page must not close the menu"
         );
-        let first_column_label = ColumnKind::ALL[0].label();
+
+        // Frame 5: the Columns page itself has replaced the root's body —
+        // one popup, one page at a time, no second layer.
+        let update = frame(egui::RawInput::default());
+        assert!(is_open(&update), "the Columns page must still be the menu");
+        assert!(
+            has_label(&update, first_column_label),
+            "the Columns page must list the columns"
+        );
+        assert!(
+            !has_label(&update, "Restart packet capture"),
+            "the root page's rows must be gone while a page is showing"
+        );
         let checkbox_pos = accessible_rect_for_label(&update, first_column_label).center();
 
-        // Frame 5: click a column checkbox. Issue #93's fix — no `ui.close()`
-        // on this path, plus the root popup's `CloseOnClickOutside` — means
-        // this must NOT dismiss the popup, unlike the old submenu flyout.
+        // Frame 6: click a column checkbox. Issue #93's fix — no
+        // `ui.close()` on this path, plus the root popup's
+        // `CloseOnClickOutside` — means this must NOT dismiss the popup.
         let update = frame(click_at(checkbox_pos));
         assert!(
             is_open(&update),
-            "a Columns checkbox click must leave the popup open"
+            "a column checkbox click must leave the popup open"
         );
         assert!(
             rx_command.try_recv().is_err(),
             "a checkbox click must not dispatch a command"
         );
+        let sent = rx_settings
+            .try_recv()
+            .expect("a column toggle must be handed to the settings writer");
+        assert!(
+            sent.is_visible(ColumnKind::ALL[0]),
+            "the toggle must have enabled the column it was clicked on"
+        );
 
-        // Frame 6: confirm it is still open on the frame after too — not
-        // just within the click frame itself.
+        // Frame 7: still open on the frame after, too — not just within
+        // the click frame itself. The back row (same "Columns" label, a
+        // "◂" in the icon slot) is what walks out of the page.
         let update = frame(egui::RawInput::default());
         assert!(
             is_open(&update),
             "the popup must stay open on the frame after the checkbox click"
         );
+        let back_pos = accessible_rect_for_label(&update, "Columns").center();
+
+        // Frame 8: click Back. Also a state row, also no `ui.close()`.
+        let _ = frame(click_at(back_pos));
+
+        // Frame 9: back on the root, with the action rows returned.
+        let update = frame(egui::RawInput::default());
+        assert!(
+            has_label(&update, "Restart packet capture"),
+            "the back row must return to the root page"
+        );
         let close_pos = accessible_rect_for_label(&update, "Close").center();
 
-        // Frame 7: click Close. It calls `ui.close()` itself, so — unlike
-        // the checkbox — this must close the popup, and still dispatch the
-        // Quit command even though the click went through the real popup
-        // wiring this time, not a direct `draw_header_menu` call.
+        // Frame 10: click Close. It calls `ui.close()` itself, so — unlike
+        // every click above — this must dismiss the popup, and still
+        // dispatch Quit through the real popup wiring.
         let _ = frame(click_at(close_pos));
         assert_eq!(
             rx_command.try_recv().expect("Close must send a command"),
             UiCommand::Quit
         );
 
-        // Frame 8: `Ui::close` only closes for the *next* frame's `is_open`
-        // check (the frame it's called on already painted before the close
-        // decision runs) — so the popup must be gone by now.
+        // Frame 11: `Ui::close` only closes for the *next* frame's
+        // `is_open` check (the frame it's called on already painted before
+        // the close decision runs) — so the popup must be gone by now.
         let update = frame(egui::RawInput::default());
         assert!(
             !is_open(&update),
             "Close must actually dismiss the popup by the following frame"
+        );
+
+        // Frames 12-13: reopen. Issue #120's page state is cleared by
+        // `draw_header` on every frame the popup is shut, so this must
+        // land on the root — not back on the Columns page the user was
+        // drilled into two clicks ago.
+        let _ = frame(click_at(chevron_pos));
+        let update = frame(egui::RawInput::default());
+        assert!(
+            has_label(&update, "Restart packet capture"),
+            "reopening the menu must land on the root page"
+        );
+        assert!(
+            !has_label(&update, first_column_label),
+            "reopening the menu must not restore the Columns page"
         );
     }
 
