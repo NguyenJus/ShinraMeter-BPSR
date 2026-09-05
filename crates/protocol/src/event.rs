@@ -443,11 +443,11 @@ pub enum ProtocolEvent {
     /// explicit death signals.
     ///
     /// `is_dead` is the only bit this crate extracts from the wire's full
-    /// `EActorState` enum — every non-dead state (skill, stiff, born, the
-    /// resurrection animation, ...) collapses to `false`. Consumers must
-    /// not read `false` as "just revived": it means only "not currently in
-    /// the dead state", which is true on every ordinary delta a live
-    /// entity ever sends.
+    /// `EActorState` enum, but only known-alive states (skill, stiff,
+    /// jump, ...) yield `false`: ambiguous/down states (`Born`,
+    /// `Resurrection`, `Weakness`, etc.) and unknown values emit no
+    /// `EntityState` at all rather than a misleading `false` — see
+    /// `attrs::actor_state_is_dead` for the full classification.
     EntityState {
         /// The entity's whole-uuid identity (issue #335).
         entity: EntityId,

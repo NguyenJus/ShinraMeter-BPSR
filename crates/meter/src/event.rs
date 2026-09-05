@@ -489,8 +489,13 @@ pub enum ProtocolEvent {
     },
     /// Mirrors `bpsr_protocol::ProtocolEvent::EntityState` (issue
     /// #339/#272): an entity's decoded `AttrState`, `is_dead` boiled down
-    /// from the wire's full `EActorState` enum. Emitted for both players and
-    /// monsters. See `Meter::apply` for how each side folds it in.
+    /// from the wire's full `EActorState` enum — but only known-alive
+    /// states yield `false`; ambiguous/down states (`Born`, `Resurrection`,
+    /// `Weakness`, etc.) and unknown values emit no `EntityState` at all,
+    /// so this event never even arrives for those (see
+    /// `bpsr_protocol::attrs::actor_state_is_dead`). Emitted for both
+    /// players and monsters. See `Meter::apply` for how each side folds it
+    /// in.
     EntityState {
         /// The entity's stable identity (issue #335) — what the meter keys
         /// player/enemy state on.
