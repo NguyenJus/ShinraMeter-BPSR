@@ -778,7 +778,7 @@ struct Entry {
 
 /// The whole runtime-image cache: at most one live texture per slot.
 ///
-/// Lives inside `ui::Icons` (behind a `RefCell`, since every painter in
+/// Lives inside the ui module's private `Icons` (behind a `RefCell`, since every painter in
 /// `ui/mod.rs` holds `&Icons`), which is what lets the header wash and the row
 /// backdrop reach it without threading a new `&mut` parameter through the
 /// twenty-odd call sites `draw_header`/`draw_header_menu` already have.
@@ -931,7 +931,7 @@ impl CustomImages {
     /// This duplicates `texture`'s own `ctx.request_repaint_after(position.
     /// remaining)` call rather than replacing it — that call is what keeps
     /// playback correct (and tested) on its own; this accessor only feeds
-    /// the same number into `repaint::repaint_policy`'s decision table so
+    /// the same number into ui's private `repaint_policy`'s decision table so
     /// an animated background is visible in the *reasons* `ui()` chose to
     /// repaint, not just as a side effect buried inside the image cache.
     pub fn next_wakeup(&self, ctx: &egui::Context) -> Option<Duration> {
@@ -1804,7 +1804,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Issue #349/#350's repaint gate (`ui::repaint::repaint_policy`) reads
+    /// Issue #349/#350's repaint gate (ui's private `repaint_policy`) reads
     /// `CustomImages::next_wakeup` to fold an animated background's own
     /// timing into its decision. `None` with nothing loaded is the "no
     /// GIF is active" case that decision table falls back on.

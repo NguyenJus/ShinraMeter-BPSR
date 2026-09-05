@@ -84,9 +84,13 @@ use status::*;
 use table::*;
 
 // Explicit re-exports of the handful of `ui`-internal items genuinely used
-// outside `crate::ui` (issue #374) — everything else in the child modules
-// above is `pub(super)`, reachable only within `crate::ui` via `use
+// outside `crate::ui` (issue #374) — everything else the child modules
+// expose is at most `pub(super)`, reachable only within `crate::ui` via `use
 // super::*`.
+//
+// These names are also pulled in by the globs above; the explicit
+// `pub(crate) use` shadows the glob binding, so removing a name here changes
+// what external callers see, not what `ui` sees.
 pub(crate) use header::{encounter_subtitle, encounter_title};
 pub(crate) use status::DEATH_COUNT_RGB;
 pub(crate) use table::{CRIT_PCT_RGB, LUCKY_PCT_RGB, STAT_TEXT_RGB, StatColumn};
@@ -4206,6 +4210,10 @@ mod tests {
     /// geometry away, and the pure-geometry pill tests only prove
     /// `pill_size` and `pill_content_layout` agree with *each other*, not
     /// that the paint agrees with them or that nothing else lands on top.
+    ///
+    /// Fields are intentionally private; tests go through this struct's
+    /// accessor methods (unlike `RowFrame::texts`, which tests index
+    /// directly for z-order).
     pub(super) struct HeaderFrame {
         texts: Vec<(String, egui::Rect)>,
         images: Vec<(egui::TextureId, egui::Rect)>,

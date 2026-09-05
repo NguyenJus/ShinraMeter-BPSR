@@ -1808,7 +1808,7 @@ fn click_through_button_rect() -> Option<Rect> {
 /// receiving mouse input entirely while click-through is on, so nothing
 /// about the cursor moving can schedule a frame; what keeps this
 /// reconciliation running is that `OverlayApp::ui` feeds
-/// `Settings::click_through` into `ui::repaint::RepaintInputs`'
+/// `Settings::click_through` into the ui module's private `repaint::RepaintInputs`'
 /// `click_through_active`, which holds the 100 ms transient cadence for as
 /// long as click-through is on (issues #349, #350).
 ///
