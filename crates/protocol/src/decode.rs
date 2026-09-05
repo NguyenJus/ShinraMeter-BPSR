@@ -16,7 +16,7 @@ use crate::attrs::{
 use crate::blob;
 use crate::event::{
     CastEvent, DamageEvent, DisappearReason, EDungeonState, EntityKind, PlayerInfo, ProtocolEvent,
-    kind_of, uid_of,
+    damage_kind_of, kind_of, uid_of,
 };
 use crate::frame::{
     Desync, MAX_TAIL_LEN, Notify, SERVICE_UUID, TEAM_NTF_SERVICE_UUID, parse_frame, split_frames,
@@ -74,18 +74,20 @@ pub mod opcode {
 /// `(Notify.service_uuid, Notify.method_id)` together so these never
 /// collide with `opcode`'s constants despite sharing raw values.
 pub mod team_opcode {
-    /// `NotifyJoinTeam` — the bulk party-roster push, and the only
-    /// `GrpcTeamNtf` method this crate decodes (issue #146).
+    /// `NotifyJoinTeam` — the bulk party-roster push (issue #146), and
+    /// also this crate's full-roster-sync signal (issue #343): see
+    /// `decode::on_notify_join_team` and `ProtocolEvent::TeamRoster`.
     pub const NOTIFY_JOIN_TEAM: u32 = 0x3;
-    /// `NoticeUpdateTeamInfo`. No documented field tags (issue #146's
-    /// table covers only `NotifyJoinTeam`) — left unhandled on purpose so
-    /// traffic on this method falls through to the inspect sink instead of
-    /// being guessed at.
+    /// `NoticeUpdateTeamInfo`. No documented field tags for membership
+    /// (issue #146's table covers only `NotifyJoinTeam`; BPSR-ZDPS's own
+    /// handler for this method only ever reads `TeamId`, never a member
+    /// list) — left unhandled on purpose so traffic on this method falls
+    /// through to the inspect sink instead of being guessed at.
     #[allow(dead_code)]
     pub const NOTICE_UPDATE_TEAM_INFO: u32 = 0x1;
-    /// `NotifyLeaveTeam`. Same as `NOTICE_UPDATE_TEAM_INFO` above: no
-    /// documented field tags, deliberately unhandled.
-    #[allow(dead_code)]
+    /// `NotifyLeaveTeam` — one member leaving or being kicked (issue
+    /// #343), decoded by `decode::on_notify_leave_team` into
+    /// `ProtocolEvent::TeamMemberLeft`.
     pub const NOTIFY_LEAVE_TEAM: u32 = 0x4;
 }
 
@@ -178,6 +180,12 @@ pub fn decode_notify(
                 Err(_) => log::debug!("bpsr-protocol: NotifyJoinTeam decode failed"),
             }
         }
+        (TEAM_NTF_SERVICE_UUID, team_opcode::NOTIFY_LEAVE_TEAM) => {
+            match pb::NotifyLeaveTeam::decode(n.payload.as_slice()) {
+                Ok(msg) => on_notify_leave_team(&msg, out),
+                Err(_) => log::debug!("bpsr-protocol: NotifyLeaveTeam decode failed"),
+            }
+        }
         // Every other (service, method) pair is skipped on purpose. The
         // largest single main-service opcode left unhandled,
         // `SyncContainerDirtyData` (0x16, a few hundred messages a session), was
@@ -190,9 +198,9 @@ pub fn decode_notify(
         // PROFESSION_ID, 10030 FIGHT_POINT, 11310 HP, 11320 MAX_HP) appears
         // anywhere in it. It is a container/inventory diff channel, so every
         // entity attribute we care about still arrives on the four opcodes
-        // above. `team_opcode::NOTICE_UPDATE_TEAM_INFO` /
-        // `team_opcode::NOTIFY_LEAVE_TEAM` also fall through here (issue
-        // #146): no documented field tags for either.
+        // above. `team_opcode::NOTICE_UPDATE_TEAM_INFO` also falls through
+        // here (issue #146): no documented field tags carry a member list,
+        // only `TeamId`.
         _ => {}
     }
 }
@@ -369,6 +377,7 @@ fn on_aoi_sync_delta(
                 hp_lessen: dmg.hp_lessen_value,
                 is_miss: dmg.is_miss || dmg.r#type == EDamageType::Miss as i32,
                 is_heal,
+                kind: damage_kind_of(dmg.r#type),
                 target_uid,
                 target_kind,
                 timestamp_ms: now_ms,
@@ -444,7 +453,7 @@ fn buff_base_id_from_logic_effects(logic_effect: &[pb::BuffEffectLogicInfo]) -> 
         .map(|info| info.base_id)
 }
 
-/// Emits `Scene` (issue #293) and `Player`.
+/// Emits `LocalPlayer` (issue #344), `Scene` (issue #293) and `Player`.
 ///
 /// `Scene` comes from `v_data.scene_data.level_map_id` — see
 /// `pb::CharSerialize::scene_data`'s doc comment for why this field, once
@@ -463,6 +472,20 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
     let Some(v_data) = &msg.v_data else {
         return;
     };
+    // issue #344: `SyncContainerData` is the full-state push the server
+    // sends about *this client's own session* (see this function's doc
+    // comment for why it — unlike `Player`/`EnemyHp` — always describes the
+    // local player), so `v_data.char_id` alone identifies who "you" is.
+    // Emitted ahead of (and independently of) `Scene`/`Player` below: it
+    // needs neither `scene_data` nor `char_base` to be meaningful. Zero is
+    // treated as absent — the same zero-is-absent rule `scene_id_from_attrs`
+    // (crates/protocol/src/attrs.rs) uses, borrowed here and applied to
+    // `scene_data` just below.
+    if v_data.char_id != 0 {
+        out.push(ProtocolEvent::LocalPlayer {
+            uid: v_data.char_id,
+        });
+    }
     if let Some(level_map_id) = v_data
         .scene_data
         .as_ref()
@@ -470,6 +493,10 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
         .filter(|&id| id != 0)
     {
         out.push(ProtocolEvent::Scene { level_map_id });
+    }
+    // A zero char_id cannot key a Player row either.
+    if v_data.char_id == 0 {
+        return;
     }
     let Some(char_base) = &v_data.char_base else {
         return;
@@ -507,6 +534,9 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
         // only (issue #286).
         position: None,
         target_position: None,
+        // Same: no confirmed `CharBaseInfo` shield field (issue #338) —
+        // attr-list path only, via `player_info_from_attrs`.
+        shield: None,
     }));
 }
 
@@ -529,15 +559,19 @@ fn on_notify_revive_user(msg: &pb::NotifyReviveUser, now_ms: u64, out: &mut Vec<
 /// #146): the bulk party-roster push, emitting one `ProtocolEvent::Player`
 /// per roster member so party members' names/classes/ability scores arrive
 /// without depending on AOI proximity (issue #145 rides AOI and misses
-/// distant raid members).
+/// distant raid members), plus one trailing `ProtocolEvent::TeamRoster`
+/// listing every resolved uid this push named (issue #343) — see
+/// `ProtocolEvent::TeamRoster`'s doc comment for why this message doubles
+/// as a full-roster sync, not just a join.
 ///
 /// Every sub-message on the path from `NotifyJoinTeamRequest` down to
 /// `TeamBasicData`/`TeamProfessionData`/`TeamUserAttrData` is independently
 /// optional and decoded defensively: a bot-like roster entry that carries
 /// only `char_id` (no `social_data` at all) must not panic and must not
-/// produce a name-less garbage row — it simply yields no event. An event is
-/// emitted only when at least one of name / class / ability_score is
-/// present.
+/// produce a name-less garbage row — it simply yields no `Player` event
+/// (though it still counts as a roster member for `TeamRoster` below, as
+/// long as it resolves a uid). A `Player` event is emitted only when at
+/// least one of name / class / ability_score is present.
 ///
 /// `TeamBasicData.level` is decoded onto the pb struct (see its doc
 /// comment) but deliberately never read here: `PlayerInfo` has no `level`
@@ -546,8 +580,33 @@ fn on_notify_join_team(msg: &pb::NotifyJoinTeam, out: &mut Vec<ProtocolEvent>) {
     let Some(request) = &msg.v_request else {
         return;
     };
+    // issue #343: collected across every member with a resolved uid,
+    // regardless of whether a `Player` event was emitted for it — a
+    // display-less bot is still a roster member. Pushed as one trailing
+    // `TeamRoster` event after the per-member `Player` events below, and
+    // only when non-empty: an empty roster here is far more likely a
+    // malformed/partial payload than a real "team of zero", and a consumer
+    // that prunes on it would drop the whole roster on that basis alone
+    // (see `ProtocolEvent::TeamRoster`'s doc comment).
+    let mut roster = Vec::with_capacity(request.member_data.len());
     for member in &request.member_data {
         let social = member.social_data.as_ref();
+        // `TeamMemData.char_id` is the uid directly (issue #146: ZDPS's
+        // `EntityIdToUuid(charId, EntChar)` is exactly undone by our
+        // `uid_of = uuid >> 16`). A member missing it falls back to the copy
+        // inside `basicData`; with neither there is no uid to key a player
+        // row on, so the member is dropped rather than filed under uid 0.
+        let uid = match member.char_id {
+            0 => social
+                .and_then(|s| s.basic_data.as_ref())
+                .map(|b| b.char_id)
+                .unwrap_or(0),
+            id => id,
+        };
+        if uid == 0 {
+            continue;
+        }
+        roster.push(uid);
         let name = social
             .and_then(|s| s.basic_data.as_ref())
             .map(|b| b.name.as_str())
@@ -572,21 +631,6 @@ fn on_notify_join_team(msg: &pb::NotifyJoinTeam, out: &mut Vec<ProtocolEvent>) {
         if name.is_none() && class.is_none() && ability_score.is_none() {
             continue;
         }
-        // `TeamMemData.char_id` is the uid directly (issue #146: ZDPS's
-        // `EntityIdToUuid(charId, EntChar)` is exactly undone by our
-        // `uid_of = uuid >> 16`). A member missing it falls back to the copy
-        // inside `basicData`; with neither there is no uid to key a player
-        // row on, so the member is dropped rather than filed under uid 0.
-        let uid = match member.char_id {
-            0 => social
-                .and_then(|s| s.basic_data.as_ref())
-                .map(|b| b.char_id)
-                .unwrap_or(0),
-            id => id,
-        };
-        if uid == 0 {
-            continue;
-        }
         out.push(ProtocolEvent::Player(PlayerInfo {
             uid,
             name,
@@ -599,8 +643,34 @@ fn on_notify_join_team(msg: &pb::NotifyJoinTeam, out: &mut Vec<ProtocolEvent>) {
             // attr-list path only (issue #286).
             position: None,
             target_position: None,
+            // Same: no shield field on this push — attr-list path only
+            // (issue #338).
+            shield: None,
         }));
     }
+    if !roster.is_empty() {
+        out.push(ProtocolEvent::TeamRoster { members: roster });
+    }
+}
+
+/// `GrpcTeamNtf.NotifyLeaveTeam` (`team_opcode::NOTIFY_LEAVE_TEAM`, issue
+/// #343): one member leaving or being kicked, emitting a single
+/// `ProtocolEvent::TeamMemberLeft` for `NotifyLeaveTeamRequest.char_id` —
+/// already the departing member's uid directly, same as
+/// `TeamMemData.char_id` above. A malformed payload with no `v_request`
+/// yields nothing rather than a `TeamMemberLeft { uid: 0 }`, which would
+/// otherwise be a no-op removal at best and a collision with a real uid-0
+/// row at worst.
+fn on_notify_leave_team(msg: &pb::NotifyLeaveTeam, out: &mut Vec<ProtocolEvent>) {
+    let Some(request) = &msg.v_request else {
+        return;
+    };
+    if request.char_id == 0 {
+        return;
+    }
+    out.push(ProtocolEvent::TeamMemberLeft {
+        uid: request.char_id,
+    });
 }
 
 /// `WorldNtf.EnterScene` (issue #35): the current scene id, decoded from
@@ -925,6 +995,60 @@ mod tests {
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
         assert!(!only_damage(out).crit);
+    }
+
+    // -- issue #338: damage type -> DamageKind ------------------------------
+
+    #[test]
+    fn normal_type_decodes_to_normal_kind() {
+        let dmg = pb::SyncDamageInfo {
+            r#type: EDamageType::Normal as i32,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(only_damage(out).kind, crate::event::DamageKind::Normal);
+    }
+
+    #[test]
+    fn absorbed_type_decodes_to_absorbed_kind() {
+        let dmg = pb::SyncDamageInfo {
+            r#type: EDamageType::Absorbed as i32,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(only_damage(out).kind, crate::event::DamageKind::Absorbed);
+    }
+
+    #[test]
+    fn immune_type_decodes_to_immune_kind() {
+        let dmg = pb::SyncDamageInfo {
+            r#type: EDamageType::Immune as i32,
+            value: 0,
+            hp_lessen_value: 0,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(only_damage(out).kind, crate::event::DamageKind::Immune);
+    }
+
+    /// `Fall` (issue #338's evidence gap) has no dedicated channel — it
+    /// decodes to `Normal`, same as every other unrecognized wire value.
+    #[test]
+    fn fall_type_decodes_to_normal_kind() {
+        let dmg = pb::SyncDamageInfo {
+            r#type: EDamageType::Fall as i32,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(only_damage(out).kind, crate::event::DamageKind::Normal);
     }
 
     #[test]
@@ -1736,11 +1860,80 @@ mod tests {
         });
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
-        assert_eq!(out.len(), 1);
-        match &out[0] {
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], ProtocolEvent::LocalPlayer { uid: 8 });
+        match &out[1] {
             ProtocolEvent::Player(p) => assert_eq!(p.class, None),
             other => panic!("expected Player, got {other:?}"),
         }
+    }
+
+    // -- LocalPlayer (issue #344) --------------------------------------
+
+    #[test]
+    fn container_data_char_id_yields_local_player() {
+        let n = container_notify(pb::CharSerialize {
+            char_id: 12345,
+            char_base: None,
+            scene_data: None,
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out, vec![ProtocolEvent::LocalPlayer { uid: 12345 }]);
+    }
+
+    #[test]
+    fn container_data_char_id_is_not_shifted_like_a_packed_uuid() {
+        // Trap guard (issue #344): `char_id` is a bare uid, not a packed
+        // `uuid` — a value that would look like a plausible packed uuid
+        // (i.e. `uid_of` would change it) must still come through verbatim.
+        let packed_looking = 8i64 << 16;
+        let n = container_notify(pb::CharSerialize {
+            char_id: packed_looking,
+            char_base: None,
+            scene_data: None,
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(
+            out,
+            vec![ProtocolEvent::LocalPlayer {
+                uid: packed_looking
+            }]
+        );
+    }
+
+    #[test]
+    fn container_data_zero_char_id_yields_no_local_player() {
+        let n = container_notify(pb::CharSerialize {
+            char_id: 0,
+            char_base: None,
+            scene_data: Some(pb::SceneData { level_map_id: 8 }),
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out, vec![ProtocolEvent::Scene { level_map_id: 8 }]);
+    }
+
+    #[test]
+    fn container_data_zero_char_id_with_char_base_yields_no_player() {
+        // A zero char_id cannot key a Player row either, even when
+        // char_base is present.
+        let n = container_notify(pb::CharSerialize {
+            char_id: 0,
+            char_base: Some(pb::CharBaseInfo {
+                name: "Ari".to_string(),
+                ..Default::default()
+            }),
+            scene_data: Some(pb::SceneData { level_map_id: 8 }),
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out, vec![ProtocolEvent::Scene { level_map_id: 8 }]);
     }
 
     // -- SyncContainerData.scene_data (issue #293: mid-instance attach) -----
@@ -1790,17 +1983,21 @@ mod tests {
         decode_notify(&n, 0, &mut out, None);
         assert_eq!(
             out,
-            vec![ProtocolEvent::Player(PlayerInfo {
-                uid: 8,
-                name: Some("Ari".to_string()),
-                class: None,
-                ability_score: None,
-                season_level: None,
-                season_strength: None,
-                skill_ids: Vec::new(),
-                position: None,
-                target_position: None,
-            })]
+            vec![
+                ProtocolEvent::LocalPlayer { uid: 8 },
+                ProtocolEvent::Player(PlayerInfo {
+                    uid: 8,
+                    name: Some("Ari".to_string()),
+                    class: None,
+                    ability_score: None,
+                    season_level: None,
+                    season_strength: None,
+                    skill_ids: Vec::new(),
+                    position: None,
+                    target_position: None,
+                    shield: None,
+                })
+            ]
         );
     }
 
@@ -1820,14 +2017,15 @@ mod tests {
         });
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
-        assert_eq!(out.len(), 2);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], ProtocolEvent::LocalPlayer { uid: 8 });
         assert_eq!(
-            out[0],
+            out[1],
             ProtocolEvent::Scene {
                 level_map_id: 40001
             }
         );
-        match &out[1] {
+        match &out[2] {
             ProtocolEvent::Player(p) => assert_eq!(p.uid, 8),
             other => panic!("expected Player, got {other:?}"),
         }
@@ -1886,7 +2084,8 @@ mod tests {
         let n = team_notify_for(request);
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
-        assert_eq!(out.len(), 3);
+        // 3 `Player` events, plus one trailing `TeamRoster` (issue #343).
+        assert_eq!(out.len(), 4);
         let expected = [
             (101, "Ari", pb::Class::Stormblade, 12_345u32),
             (102, "Zed", pb::Class::FrostMage, 22_222u32),
@@ -1903,13 +2102,21 @@ mod tests {
                 other => panic!("expected Player, got {other:?}"),
             }
         }
+        match &out[3] {
+            ProtocolEvent::TeamRoster { members } => {
+                assert_eq!(members, &vec![101, 102, 103]);
+            }
+            other => panic!("expected TeamRoster, got {other:?}"),
+        }
     }
 
     /// A bot-like roster entry carrying only `char_id` (no `social_data` at
     /// all — "bots are missing a lot of fields") must not panic and must
-    /// not produce a name-less garbage row.
+    /// not produce a name-less garbage row — but it still counts as a
+    /// roster member for `TeamRoster` (issue #343): a display-less bot has
+    /// not left the party.
     #[test]
-    fn notify_join_team_member_with_only_char_id_yields_no_event_and_no_panic() {
+    fn notify_join_team_member_with_only_char_id_yields_no_player_event_but_counts_in_roster() {
         let request = pb::NotifyJoinTeamRequest {
             base_info: Some(pb::TeamBaseInfo {}),
             member_data: vec![pb::TeamMemData {
@@ -1922,7 +2129,12 @@ mod tests {
         let n = team_notify_for(request);
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
-        assert!(out.is_empty());
+        assert!(out.iter().all(|e| !matches!(e, ProtocolEvent::Player(_))));
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ProtocolEvent::TeamRoster { members } => assert_eq!(members, &vec![999]),
+            other => panic!("expected TeamRoster, got {other:?}"),
+        }
     }
 
     /// A member with a name but no profession/attr data still yields a
@@ -1950,7 +2162,7 @@ mod tests {
         let n = team_notify_for(request);
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2);
         match &out[0] {
             ProtocolEvent::Player(p) => {
                 assert_eq!(p.uid, 55);
@@ -1959,6 +2171,10 @@ mod tests {
                 assert_eq!(p.ability_score, None);
             }
             other => panic!("expected Player, got {other:?}"),
+        }
+        match &out[1] {
+            ProtocolEvent::TeamRoster { members } => assert_eq!(members, &vec![55]),
+            other => panic!("expected TeamRoster, got {other:?}"),
         }
     }
 
@@ -1994,7 +2210,11 @@ mod tests {
         let n = team_notify_for(request);
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
-        assert_eq!(out.len(), 1, "the uid-less member must yield no event");
+        assert_eq!(
+            out.len(),
+            2,
+            "expected one Player event plus the trailing TeamRoster"
+        );
         match &out[0] {
             ProtocolEvent::Player(p) => {
                 assert_eq!(p.uid, 101);
@@ -2002,6 +2222,81 @@ mod tests {
             }
             other => panic!("expected Player, got {other:?}"),
         }
+        match &out[1] {
+            // The uid-less member must not appear in the roster either —
+            // it was never resolved to a uid at all (issue #343).
+            ProtocolEvent::TeamRoster { members } => assert_eq!(members, &vec![101]),
+            other => panic!("expected TeamRoster, got {other:?}"),
+        }
+    }
+
+    // -- NotifyLeaveTeam (issue #343) -----------------------------------
+
+    fn leave_team_notify_for(request: pb::NotifyLeaveTeamRequest) -> Notify {
+        let msg = pb::NotifyLeaveTeam {
+            v_request: Some(request),
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        Notify {
+            service_uuid: crate::frame::TEAM_NTF_SERVICE_UUID,
+            method_id: team_opcode::NOTIFY_LEAVE_TEAM,
+            payload,
+        }
+    }
+
+    #[test]
+    fn notify_leave_team_yields_team_member_left() {
+        let n = leave_team_notify_for(pb::NotifyLeaveTeamRequest {
+            char_id: 101,
+            leave_type: 0,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out, vec![ProtocolEvent::TeamMemberLeft { uid: 101 }]);
+    }
+
+    /// A kick is delivered on the same method as a voluntary leave,
+    /// differing only in `leaveType` (issue #343) — this crate does not
+    /// read that field, so the resulting event is identical either way.
+    #[test]
+    fn notify_leave_team_kick_yields_same_event_shape_as_voluntary_leave() {
+        let n = leave_team_notify_for(pb::NotifyLeaveTeamRequest {
+            char_id: 202,
+            leave_type: 1,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out, vec![ProtocolEvent::TeamMemberLeft { uid: 202 }]);
+    }
+
+    #[test]
+    fn notify_leave_team_zero_char_id_yields_no_event() {
+        let n = leave_team_notify_for(pb::NotifyLeaveTeamRequest {
+            char_id: 0,
+            leave_type: 0,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.is_empty());
+    }
+
+    /// A malformed `NotifyLeaveTeam` with no `v_request` at all must not
+    /// produce a `TeamMemberLeft { uid: 0 }` — `on_notify_leave_team`'s
+    /// `let ... else { return; }` guard.
+    #[test]
+    fn notify_leave_team_missing_v_request_yields_no_event() {
+        let msg = pb::NotifyLeaveTeam { v_request: None };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let n = Notify {
+            service_uuid: crate::frame::TEAM_NTF_SERVICE_UUID,
+            method_id: team_opcode::NOTIFY_LEAVE_TEAM,
+            payload,
+        };
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.is_empty());
     }
 
     /// The regression this slice exists to prevent: `NotifyJoinTeam`'s

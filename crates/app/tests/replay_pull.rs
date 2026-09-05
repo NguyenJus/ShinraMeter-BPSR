@@ -174,6 +174,60 @@ fn multi_player_pull() {
     assert_eq!(cade.hits, 3); // includes the miss, which still counts as a hit
     assert!((aria.crit_pct - 75.0).abs() < 0.01); // 3 of 4 hits crit
     assert!((brin.lucky_pct - 100.0 / 3.0).abs() < 0.01); // 1 of 3 hits lucky
+    // issue #344: this scenario's `.container_data(P_ARIA, ...)` step is the
+    // `SyncContainerData` identity path, which is also what identifies the
+    // local player — asserted independent of the golden file, same as the
+    // rest of this block.
+    assert_eq!(capture.snapshot.local_uid, Some(P_ARIA));
+
+    assert_golden(capture);
+}
+
+/// Issue #338: a shield-absorbed hit and an immune hit must not be
+/// misreported as dealt damage — they land in their own channels instead,
+/// alongside an ordinary hit from the same player so the golden also pins
+/// that `Normal`-kind damage is unaffected.
+#[test]
+fn absorbed_and_immune_hits() {
+    let scenario = Scenario::new("absorbed_and_immune_hits")
+        .at(1_000)
+        .enter_scene(scene::TOWERING_RUIN)
+        .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
+        .monster_appear(M_BOSS, monster::IGNISOR, 5_000_000, 5_000_000)
+        .at(2_000)
+        .hit(P_ARIA, M_BOSS, 101, 10_000)
+        .at(2_500)
+        .hits(
+            M_BOSS,
+            vec![
+                Hit::new(P_ARIA, 101, 8_000).absorbed(),
+                Hit::new(P_ARIA, 101, 0).immune(),
+            ],
+        )
+        .at(30_000)
+        .capture("absorbed_and_immune_hits");
+
+    let mut rig = Rig::new();
+    let captures = rig.run(&scenario);
+    assert_eq!(captures.len(), 1);
+    let capture = &captures[0];
+
+    // Hand-computed sanity checks, independent of the golden file.
+    assert_eq!(capture.snapshot.rows.len(), 1);
+    let aria = &capture.snapshot.rows[0];
+    assert_eq!(
+        aria.damage, 10_000,
+        "only the Normal-kind hit counts as dealt damage"
+    );
+    assert_eq!(aria.absorbed_total, 8_000);
+    assert_eq!(aria.immune_total, 0);
+    assert_eq!(
+        aria.hits, 3,
+        "every hit counts as a swing, absorbed/immune included"
+    );
+    assert_eq!(capture.snapshot.total_damage, 10_000);
+    assert_eq!(capture.snapshot.total_absorbed, 8_000);
+    assert_eq!(capture.snapshot.total_immune, 0);
 
     assert_golden(capture);
 }

@@ -3,6 +3,7 @@ pub mod backpressure;
 pub mod detect;
 pub mod error;
 pub mod install;
+pub mod owner;
 pub mod restart;
 pub mod tcp;
 pub mod throughput;

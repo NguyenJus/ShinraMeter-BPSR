@@ -26,7 +26,7 @@
 //!   a reset edge case) without the design surface of a scenario DSL, which
 //!   nothing in this repo currently needs.
 
-use crate::event::{DamageEvent, EntityKind, PlayerInfo, ProtocolEvent};
+use crate::event::{DamageEvent, DamageKind, EntityKind, PlayerInfo, ProtocolEvent};
 
 /// Deterministic xorshift64* PRNG. Seed must be nonzero (a zero seed is
 /// remapped to a fixed nonzero constant) — xorshift's all-zero state is a
@@ -132,6 +132,7 @@ fn player_info_event(uid: i64, ts: u64) -> SimEvent {
             season_strength: Some(1),
             imagines: None,
             imagine_tiers: None,
+            shield: None,
         }),
     }
 }
@@ -166,6 +167,7 @@ fn hit_event(attacker_uid: i64, boss_uid: i64, ts: u64, rng: &mut Rng) -> SimEve
             hp_lessen: value,
             is_miss: false,
             is_heal: false,
+            kind: DamageKind::Normal,
             target_uid: boss_uid,
             target_kind: EntityKind::Monster,
             timestamp_ms: ts,

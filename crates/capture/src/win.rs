@@ -28,10 +28,11 @@ use crossbeam_channel::Sender;
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use windows::Win32::Foundation::HANDLE;
 
-use crate::backoff::recv_error_backoff;
+use crate::backoff::{next_game_pid_lookup_interval, recv_error_backoff};
 use crate::detect::{Conn, ServerDetector, decide_packet};
 use crate::driver::{Api, WinDivertAddress};
 use crate::error::CaptureError;
+use crate::owner::{self, SystemOwnerLookup};
 use crate::restart::CaptureRestart;
 use crate::tcp::TcpReassembler;
 use crate::throughput::{
@@ -51,6 +52,21 @@ const RECV_BUFFER_SIZE: usize = 10 * 1024 * 1024;
 /// no longer spins the thread at 100% CPU.
 const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 const MAX_RECV_ERROR_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Issue #337: how long the capture loop waits before retrying
+/// `owner::find_game_pids` while it has not yet found any game pid (e.g.
+/// capture started before the game process did). Each miss doubles the wait
+/// up to [`MAX_GAME_PID_LOOKUP_INTERVAL`] (see
+/// [`next_game_pid_lookup_interval`]), so a session where the game never
+/// runs — or has already exited — stops paying for a whole-system Toolhelp
+/// snapshot every couple of seconds forever, while a game that starts
+/// moments after capture is still picked up promptly. Once found, the pids
+/// are cached until the tracked connection tears down or a restart is
+/// requested — both of which clear them *and* reset this interval, so a
+/// game relaunch (new pid) re-resolves quickly instead of filtering every
+/// candidate against pids that no longer own anything.
+const GAME_PID_LOOKUP_INITIAL_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_GAME_PID_LOOKUP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Consecutive `WinDivertRecv` failures tolerated before the capture thread
 /// concludes the handle is dead and exits. Exiting drops `tx`, which closes
@@ -345,6 +361,17 @@ fn recv_loop(
     // block this thread behind a full channel and back the kernel WinDivert
     // queue up with it. See `crate::backpressure`.
     let mut drop_counter = crate::backpressure::DropCounter::new();
+    // Issue #337: process-ownership filter for candidate streams.
+    // `game_pids` starts empty and is (re)resolved on a backing-off schedule
+    // (`GAME_PID_LOOKUP_INITIAL_INTERVAL`, doubling to
+    // `MAX_GAME_PID_LOOKUP_INTERVAL`) until non-empty;
+    // `owner_allows_adoption` (in `crate::detect`) fails open on an empty
+    // set, so capture behaves exactly as it did before #337 until the game's
+    // pid(s) are located.
+    let owner_lookup = SystemOwnerLookup::new();
+    let mut game_pids: Vec<u32> = Vec::new();
+    let mut last_game_pid_lookup: Option<Instant> = None;
+    let mut game_pid_lookup_interval = GAME_PID_LOOKUP_INITIAL_INTERVAL;
 
     log::info!("capture: WinDivert sniff loop started on filter {FILTER:?}");
 
@@ -367,6 +394,19 @@ fn recv_loop(
             // so they must not fund a second restart a tick later (#271).
             monitor.note_detached();
             monitor.record_gap_cache(0, 0);
+            // Issue #337: a restart can follow the game process itself being
+            // relaunched (new pid), so cached `game_pids` must not survive
+            // it — otherwise `owner_allows_adoption` keeps filtering every
+            // candidate against pids that no longer own anything, and the
+            // fail-closed half of that check (a known, non-matching owner)
+            // leaves capture dead until a second manual restart. Clearing
+            // all three — including the backed-off retry interval, which a
+            // long game-less stretch may have pushed all the way to
+            // `MAX_GAME_PID_LOOKUP_INTERVAL` — lets it re-resolve on the
+            // very next packet.
+            game_pids.clear();
+            last_game_pid_lookup = None;
+            game_pid_lookup_interval = GAME_PID_LOOKUP_INITIAL_INTERVAL;
         }
 
         let packet_len = match recv_packet(api, handle, &mut buffer) {
@@ -408,6 +448,24 @@ fn recv_loop(
         monitor.record_observed();
         let now = Instant::now();
 
+        // Issue #337: resolve the game's own pid(s), at most once every
+        // `game_pid_lookup_interval`, until found — see the constant docs
+        // above. Every miss doubles that interval so a session in which
+        // nothing ever matches stops re-walking the whole process table.
+        if game_pids.is_empty()
+            && last_game_pid_lookup
+                .is_none_or(|at| now.duration_since(at) >= game_pid_lookup_interval)
+        {
+            last_game_pid_lookup = Some(now);
+            game_pids = owner::find_game_pids();
+            if game_pids.is_empty() {
+                game_pid_lookup_interval = next_game_pid_lookup_interval(
+                    game_pid_lookup_interval,
+                    MAX_GAME_PID_LOOKUP_INTERVAL,
+                );
+            }
+        }
+
         let Ok(sliced) = SlicedPacket::from_ip(packet) else {
             continue;
         };
@@ -438,6 +496,10 @@ fn recv_loop(
             payload,
             tcp.fin(),
             tcp.rst(),
+            &crate::detect::OwnershipFilter {
+                lookup: &owner_lookup,
+                game_pids: &game_pids,
+            },
         );
         // A FIN or RST on either direction of the tracked flow means it is
         // tearing down naturally. `decide_packet` already cleared
@@ -452,6 +514,16 @@ fn recv_loop(
                 tcp.rst(),
             );
             monitor.note_detached();
+            // Issue #337: the same staleness risk as the restart path above
+            // — a teardown can be the game process itself exiting/relaunching
+            // with a new pid, so the cached `game_pids` must not outlive the
+            // connection they were resolved for, or a stale pid fails the
+            // ownership filter closed forever on the reconnect. The retry
+            // interval is reset with them so the replacement process is
+            // picked up within seconds rather than after a backed-off wait.
+            game_pids.clear();
+            last_game_pid_lookup = None;
+            game_pid_lookup_interval = GAME_PID_LOOKUP_INITIAL_INTERVAL;
         }
         if decision.skip {
             // Either the client→server half of the adopted connection

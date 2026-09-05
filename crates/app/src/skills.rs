@@ -2,8 +2,8 @@
 //! #16): column definitions/formatting, sort state, skill-name resolution,
 //! and window placement. Deliberately free of `egui::Ui`/`Context` — plain
 //! geometry types (`egui::Rect`/`Pos2`/`Vec2`) are fine as inputs/outputs,
-//! same split `ui.rs` already uses for `column_anchors`/`row_bar_frac` —
-//! so all of it is unit-testable with no window. `crates/app/src/ui.rs`
+//! same split `ui/table.rs` already uses for `column_anchors`/`row_bar_frac` —
+//! so all of it is unit-testable with no window. `crates/app/src/ui/skill_window.rs`
 //! (T4) owns painting this; it must not be touched here.
 
 use crate::ui::{fmt_duration, fmt_pct0, fmt_short};
@@ -122,7 +122,7 @@ impl SkillColumn {
     /// Heal sorted by `% Crit` degraded to `Hea% Hea% Crit ↑`.
     ///
     /// So every width below clears its own widest label *including that
-    /// arrow*, and `ui.rs`'s
+    /// arrow*, and `ui/skill_window.rs`'s
     /// `every_tab_header_label_fits_its_column_at_every_sort_state`
     /// measures that through the exact font the header loop paints with,
     /// for every tab and every sort state — a relabelled or re-budgeted
@@ -132,7 +132,7 @@ impl SkillColumn {
     /// other column here) are not bounded by `fmt_short`.
     pub fn width(self) -> f32 {
         match self {
-            // The 38pt icon (`SKILL_ICON_SIZE` in `ui.rs`) plus the 10pt
+            // The 38pt icon (`SKILL_ICON_SIZE` in `ui/skill_window.rs`) plus the 10pt
             // gap that separates it from the skill name — issue #200
             // measured the reference's row icon at 38px across, clearing
             // the name text (which starts at x=78) by ~9px.
@@ -144,7 +144,7 @@ impl SkillColumn {
             // project's `skill_name` table happens to carry, since the
             // reference is a different build/decoder of the same game)
             // measures 156.9pt through this app's own `regular
-            // (FONT_SIZE_ROW)` font (`ui.rs`'s `skill_name_column_clears_
+            // (FONT_SIZE_ROW)` font (`ui/skill_window.rs`'s `skill_name_column_clears_
             // the_widest_real_skill_name_before_the_next_column` test),
             // leaving under 4pt of trailing room before the `Damage`
             // column starts.
@@ -154,7 +154,7 @@ impl SkillColumn {
             // for us to read off, and the capture's own gap after a long
             // name is inflated by a per-skill "loadout set" watermark
             // (e.g. "Balder's Seal") this app doesn't render. Absent a
-            // pinned number, this reuses `ui.rs`'s `SKILL_HEADER_PAD_X`
+            // pinned number, this reuses `ui/skill_window.rs`'s `SKILL_HEADER_PAD_X`
             // (12.0) doubled — 24.0 — as the trailing gap: it is the same
             // "breathing room" unit the header already uses twice over
             // (icon-to-name, and now name-to-pill via `SKILL_DEATHS_PILL_
@@ -195,7 +195,7 @@ impl SkillColumn {
             SkillColumn::HitPerMin => 56.0,
             SkillColumn::CastPerMin => 64.0,
             // Issue #267, measured through `every_tab_header_label_fits_
-            // its_column_at_every_sort_state` (`ui.rs`) the same way every
+            // its_column_at_every_sort_state` (`ui/skill_window.rs`) the same way every
             // other width here is: sorted (arrow included), "% Uptime"
             // measures 72.97pt and "Duration" 67.41pt, both wider than the
             // `DmgPct`/`HealPct`/`Avg`-family budgets their own values
@@ -208,13 +208,13 @@ impl SkillColumn {
     }
 
     /// Renders this column's value for one row. Built only on the existing
-    /// `fmt_short`/`fmt_pct0` formatters (reused from `ui.rs`, not
+    /// `fmt_short`/`fmt_pct0` formatters (reused from `ui/skill_window.rs`, not
     /// reinvented) plus one 2-decimal `format!` for `Hit/m`, the reference's
     /// only 2-decimal column (D5).
     pub fn text(self, row: &SkillRow) -> String {
         match self {
             // Painted as a texture, not text — see `SkillColumn`'s doc
-            // comment and the row-paint loop in `ui.rs`.
+            // comment and the row-paint loop in `ui/skill_window.rs`.
             SkillColumn::Icon => String::new(),
             SkillColumn::Name => skill_display_name(row.skill_id),
             SkillColumn::Damage => fmt_short(row.damage),
@@ -240,7 +240,7 @@ impl SkillColumn {
     /// Whether clicking this column's header sorts by it. Every column but
     /// `Icon` does; ordering rows by which picture they carry is
     /// meaningless, and the reference's icon column is not clickable
-    /// either. `ui.rs`'s header loop skips the toggle for an unsortable
+    /// either. `ui/skill_window.rs`'s header loop skips the toggle for an unsortable
     /// column, and `sort_rows` returns early on one, so no code path can
     /// reach `numeric_key`'s `unreachable!` for it.
     pub fn sortable(self) -> bool {
@@ -494,7 +494,7 @@ impl SkillTab {
 /// the header text; `SKILL_WINDOW_MIN_SIZE` is what keeps it out of reach,
 /// being at least the widest tab's own column sum plus the header row's
 /// padding (`skill_window_min_width_fits_every_column_at_its_stated_width`
-/// in `ui.rs` is what holds that true, and it is only true because the
+/// in `ui/skill_window.rs` is what holds that true, and it is only true because the
 /// widths above are now measured against their labels — before issue
 /// #245's live-window pass they were not, and the labels overlapped at
 /// every reachable width).
@@ -642,7 +642,7 @@ impl SkillSort {
 /// `SkillColumn::numeric_key`. `Icon` is not sortable and is a no-op here.
 pub fn sort_rows(rows: &mut [SkillRow], sort: SkillSort) {
     // An unsortable column (`Icon`) leaves the incoming meter order alone.
-    // `ui.rs` never toggles the sort onto one, so this is belt-and-braces
+    // `ui/skill_window.rs` never toggles the sort onto one, so this is belt-and-braces
     // against a future caller constructing such a `SkillSort` by hand — but
     // it is what keeps `numeric_key`'s `unreachable!` genuinely unreachable.
     if !sort.column.sortable() {
@@ -725,6 +725,9 @@ mod tests {
             received: Vec::new(),
             casts: Vec::new(),
             buffs: Vec::new(),
+            absorbed_total: 0,
+            immune_total: 0,
+            shield: None,
         }
     }
 
@@ -741,6 +744,8 @@ mod tests {
             hits: 0,
             crit_hits: 0,
             hits_per_min: 0.0,
+            absorbed_total: 0,
+            immune_total: 0,
         }
     }
 
@@ -842,14 +847,14 @@ mod tests {
     #[test]
     fn every_tabs_columns_fit_the_windows_minimum_content_width() {
         // `SKILL_WINDOW_MIN_SIZE.x` (880) minus the column header row's
-        // two `SKILL_HEADER_PAD_X` insets (24) — the budget `ui.rs`'s
+        // two `SKILL_HEADER_PAD_X` insets (24) — the budget `ui/skill_window.rs`'s
         // `skill_window_min_width_fits_every_column_at_its_stated_width`
         // pins for the widest tab, applied to all of them. It grew with
         // the widths themselves when issue #245's live-window pass found
         // the header labels overflowing their columns (`SkillColumn::
         // width`), and again at issue #248's `Name` re-measure (184.0, up
         // from 160.0), which took the widest tab's sum 832 -> 856 and the
-        // floor 856 -> 880 with it; `ui.rs` owns that constant, so this is
+        // floor 856 -> 880 with it; `ui/skill_window.rs` owns that constant, so this is
         // the mirror of it that this `egui`-free module can assert.
         for tab in SKILL_TABS {
             let total: f32 = tab.columns().iter().map(|c| c.width()).sum();
@@ -1190,7 +1195,7 @@ mod tests {
     #[test]
     fn a_name_with_no_alphanumeric_content_yields_no_monogram() {
         // Empty, whitespace-only, and pure-punctuation names all have
-        // nothing to derive a glyph from — `ui.rs` keeps painting the flat
+        // nothing to derive a glyph from — `ui/skill_window.rs` keeps painting the flat
         // `SKILL_ICON_EMPTY` disc for exactly this case.
         assert_eq!(skill_monogram(""), None);
         assert_eq!(skill_monogram("   "), None);

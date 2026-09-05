@@ -2,12 +2,23 @@
 //! needs (see plan §0.4). No `build.rs` / `.proto` / `prost-build` — prost
 //! skips unknown tags automatically, so these stay forward-compatible.
 
+/// BPSR-ZDPS `BPSR-ZDPSLib/protos/EnumEDamageType.cs`: `Normal=0, Miss=1,
+/// Heal=2, Immune=3, Fall=4, Absorbed=5`. `Immune` and `Absorbed` are what
+/// issue #338 adds — a hit a target's shield fully soaks (`Absorbed`) or one
+/// their immunity blocks outright (`Immune`) previously decoded as a plain
+/// `Normal` value and got folded straight into dealt damage. `Fall` is
+/// ported for completeness (an out-of-range wire value still gets a name)
+/// but has no dedicated channel — no evidence distinguishes it from
+/// `Normal` damage in this project's captures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum EDamageType {
     Normal = 0,
     Miss = 1,
     Heal = 2,
+    Immune = 3,
+    Fall = 4,
+    Absorbed = 5,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, ::prost::Enumeration)]
@@ -658,6 +669,32 @@ pub struct TeamUserAttrData {
     pub fight_point: i64,
     #[prost(int32, tag = "5")]
     pub season_strength: i32,
+}
+
+/// `GrpcTeamNtf.NotifyLeaveTeam` (`decode::team_opcode::NOTIFY_LEAVE_TEAM`,
+/// issue #343): sent to the remaining roster whenever one member leaves —
+/// voluntarily or by being kicked, see `NotifyLeaveTeamRequest::leave_type`.
+/// Same provenance discipline as `NotifyJoinTeam` above: tags read directly
+/// off BPSR-ZDPS's protoc-generated `FieldNumber` constants
+/// (`StruNotifyLeaveTeamRequest.cs`), not inferred.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NotifyLeaveTeam {
+    #[prost(message, optional, tag = "1")]
+    pub v_request: Option<NotifyLeaveTeamRequest>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NotifyLeaveTeamRequest {
+    /// The departing member's uid directly (same as `TeamMemData.char_id`
+    /// — `Utils.EntityIdToUuid`/`uid_of` round-trip, issue #146).
+    #[prost(int64, tag = "1")]
+    pub char_id: i64,
+    /// Voluntary leave vs. kicked — decoded but unread by
+    /// `decode::on_notify_leave_team`: this crate treats both the same
+    /// way (the uid is simply no longer in the roster), so nothing
+    /// downstream needs to tell them apart.
+    #[prost(int32, tag = "2")]
+    pub leave_type: i32,
 }
 
 // -- Dungeon state / objectives (issue #139) --------------------------------

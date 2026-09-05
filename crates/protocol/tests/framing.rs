@@ -121,12 +121,16 @@ fn interleaved_known_and_unknown_opcodes_only_known_produce_events() {
 
     let mut decoder = Decoder::new();
     let events = decoder.push_stream(&stream, 5);
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 3);
     match &events[0] {
         ProtocolEvent::Damage(d) => assert_eq!(d.value, 321),
         other => panic!("expected Damage, got {other:?}"),
     }
     match &events[1] {
+        ProtocolEvent::LocalPlayer { uid } => assert_eq!(*uid, 10),
+        other => panic!("expected LocalPlayer, got {other:?}"),
+    }
+    match &events[2] {
         ProtocolEvent::Player(p) => {
             assert_eq!(p.uid, 10);
             assert_eq!(p.name.as_deref(), Some("Ari"));
@@ -148,8 +152,12 @@ fn container_data_fight_point_becomes_ability_score() {
 
     let mut decoder = Decoder::new();
     let events = decoder.push_stream(&stream, 5);
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
     match &events[0] {
+        ProtocolEvent::LocalPlayer { uid } => assert_eq!(*uid, 11),
+        other => panic!("expected LocalPlayer, got {other:?}"),
+    }
+    match &events[1] {
         ProtocolEvent::Player(p) => assert_eq!(p.ability_score, Some(98_765)),
         other => panic!("expected Player, got {other:?}"),
     }
@@ -169,8 +177,12 @@ fn container_data_zero_fight_point_is_no_ability_score() {
 
     let mut decoder = Decoder::new();
     let events = decoder.push_stream(&stream, 5);
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
     match &events[0] {
+        ProtocolEvent::LocalPlayer { uid } => assert_eq!(*uid, 12),
+        other => panic!("expected LocalPlayer, got {other:?}"),
+    }
+    match &events[1] {
         ProtocolEvent::Player(p) => assert_eq!(p.ability_score, None),
         other => panic!("expected Player, got {other:?}"),
     }
@@ -201,16 +213,22 @@ fn container_data_imagine_transform_then_revert_round_trips() {
 
     let mut decoder = Decoder::new();
     let events = decoder.push_stream(&stream, 5);
-    assert_eq!(events.len(), 3);
-    match &events[0] {
+    assert_eq!(events.len(), 6);
+    for uid_idx in [0usize, 2, 4] {
+        match &events[uid_idx] {
+            ProtocolEvent::LocalPlayer { uid } => assert_eq!(*uid, 13),
+            other => panic!("expected LocalPlayer, got {other:?}"),
+        }
+    }
+    match &events[1] {
         ProtocolEvent::Player(p) => assert_eq!(p.class, Some(bpsr_protocol::Class::Stormblade)),
         other => panic!("expected Player, got {other:?}"),
     }
-    match &events[1] {
+    match &events[3] {
         ProtocolEvent::Player(p) => assert_eq!(p.class, None),
         other => panic!("expected Player, got {other:?}"),
     }
-    match &events[2] {
+    match &events[5] {
         ProtocolEvent::Player(p) => assert_eq!(p.class, Some(bpsr_protocol::Class::Stormblade)),
         other => panic!("expected Player, got {other:?}"),
     }
@@ -509,7 +527,13 @@ fn team_ntf_notify_join_team_decodes_roster_end_to_end() {
 
     let mut decoder = Decoder::new();
     let events = decoder.push_stream(&stream, 5);
-    assert_eq!(events.len(), 2, "the bot-like member must yield no event");
+    // 2 `Player` events (the bot-like member yields no `Player` event) plus
+    // one trailing `TeamRoster` naming all three resolved uids (issue #343).
+    assert_eq!(
+        events.len(),
+        3,
+        "the bot-like member must yield no Player event"
+    );
     match &events[0] {
         ProtocolEvent::Player(p) => {
             assert_eq!(p.uid, 101);
@@ -527,5 +551,11 @@ fn team_ntf_notify_join_team_decodes_roster_end_to_end() {
             assert_eq!(p.ability_score, None);
         }
         other => panic!("expected Player, got {other:?}"),
+    }
+    match &events[2] {
+        ProtocolEvent::TeamRoster { members } => {
+            assert_eq!(members, &vec![101, 102, 103]);
+        }
+        other => panic!("expected TeamRoster, got {other:?}"),
     }
 }
