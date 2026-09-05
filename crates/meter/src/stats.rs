@@ -368,7 +368,7 @@ impl PlayerStats {
 }
 
 /// The UI's read model for one row of the meter table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlayerRow {
     pub uid: i64,
     pub name: String,
@@ -460,7 +460,7 @@ pub struct PlayerRow {
 /// One row of a player's skill breakdown (issue #16). This is the contract
 /// the skills-window UI consumes — do not change it without updating that
 /// consumer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkillRow {
     /// Raw wire skill id; the display name is resolved at draw time via
     /// `tables::skill_name`, so no `String` is allocated per skill per tick.
@@ -536,7 +536,7 @@ pub struct EncounterInfo {
 
 /// Cheap, immutable snapshot of the current encounter, sorted by damage
 /// descending.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     pub duration_ms: u64,
     pub total_damage: i64,

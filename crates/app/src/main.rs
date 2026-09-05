@@ -365,12 +365,19 @@ fn main() -> eframe::Result {
     // why and there is nothing to restart.
     let capture_restart = capture.as_ref().map(|handle| handle.restart_requester());
 
+    // Issue #349: created before the window exists (the real `egui::Context`
+    // is not available until `run_native`'s creator closure below runs), and
+    // installed with it there — `publish` reads through this handle to wake
+    // the overlay's event loop the moment a changed snapshot is ready.
+    let repaint = pipeline::RepaintHandle::new();
+
     let (rx_snapshot, pipeline_thread) = pipeline::spawn(
         rx_events,
         rx_command,
         names_cache_path(),
         history_handle.clone(),
         capture_restart,
+        repaint.clone(),
     );
     let (tx_settings, settings_thread) = settings::spawn_writer();
 
@@ -425,6 +432,7 @@ fn main() -> eframe::Result {
         "ShinraMeter-BPSR",
         native_options,
         Box::new(move |cc| {
+            repaint.install(cc.egui_ctx.clone());
             fonts::install_cjk_fallback(&cc.egui_ctx);
             ui::apply_theme(&cc.egui_ctx);
             platform::disable_aero_snap(cc);

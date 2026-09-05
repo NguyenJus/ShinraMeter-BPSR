@@ -876,6 +876,13 @@ pub(crate) fn draw_header_menu(
     // `LogExportOutcome` and this module's own doc comment for why the two
     // items share one channel.
     tx_log_export: &Sender<LogExportOutcome>,
+    // Issue #350 (S2): incremented for each "Export logs"/"Export session
+    // bundle" click that actually spawns a copy thread below — decremented
+    // per outcome by `OverlayApp::poll_log_export` once it drains. Fed into
+    // `repaint::RepaintInputs`'s `transient_timer_active` so the overlay
+    // wakes at the transient cadence while any export is in flight, rather
+    // than waiting out the idle heartbeat for its status banner.
+    log_exports_in_flight: &mut usize,
     // Issue #321: set when the Close item below actually sends
     // `UiCommand::Quit`, so `OverlayApp::ui` can flag `self.quit_requested`
     // — the callers of that flag need to know an orderly quit is under way
@@ -917,6 +924,7 @@ pub(crate) fn draw_header_menu(
                     icons,
                     update_check,
                     tx_log_export,
+                    log_exports_in_flight,
                     quit_requested,
                 ),
                 MenuPage::Columns => draw_columns_page(ui, settings, tx_settings),
@@ -949,6 +957,7 @@ fn draw_menu_root(
     icons: &Icons,
     update_check: &mut UpdateCheckState,
     tx_log_export: &Sender<LogExportOutcome>,
+    log_exports_in_flight: &mut usize,
     quit_requested: &mut bool,
 ) -> Option<MenuNav> {
     let mut nav = None;
@@ -1085,6 +1094,7 @@ fn draw_menu_root(
             crate::platform::choose_log_export_path(crate::logging::EXPORT_DEFAULT_FILENAME)
         {
             start_log_export(dest, tx_log_export.clone());
+            *log_exports_in_flight += 1;
         }
         ui.close();
     }
@@ -1112,6 +1122,7 @@ fn draw_menu_root(
             crate::platform::choose_bundle_export_path(bundle::EXPORT_BUNDLE_DEFAULT_DIRNAME)
         {
             start_bundle_export(dest, settings.history_enabled, tx_log_export.clone());
+            *log_exports_in_flight += 1;
         }
         ui.close();
     }
@@ -1461,6 +1472,7 @@ mod tests {
                 &icons,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 &mut false,
             );
         });
@@ -2176,6 +2188,7 @@ mod tests {
                     true,
                     &mut update_check,
                     &unused_log_export_sender(),
+                    &mut 0,
                     false,
                     &mut false,
                     None,

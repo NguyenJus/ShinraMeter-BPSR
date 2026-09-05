@@ -54,6 +54,9 @@ pub(crate) fn draw_header(
     // spawned copy thread reports back to — threaded through to
     // `draw_header_menu`, the only place that clones it.
     tx_log_export: &Sender<LogExportOutcome>,
+    // Issue #350 (S2): forwarded straight through to `draw_header_menu`,
+    // the only place that writes to it — see that parameter's doc comment.
+    log_exports_in_flight: &mut usize,
     // Issue #39: whether the history thread exists at all — threaded
     // through to `toggle_cluster` (issue #186 moved the History control
     // there from `draw_header_menu`) so its History button can be disabled
@@ -256,6 +259,7 @@ pub(crate) fn draw_header(
                 icons,
                 update_check,
                 tx_log_export,
+                log_exports_in_flight,
                 quit_requested,
             );
         });
@@ -1131,8 +1135,12 @@ pub(crate) fn screenshot_capture_guard(
 /// tooltip on both buttons (they share the one flag) with no error and no
 /// recovery short of restarting the app.
 ///
-/// At the app's ~10Hz repaint cadence (`ctx.request_repaint_after` in
-/// `OverlayApp::ui`) this is about 2 seconds — comfortably longer than any
+/// Counted in frames, so it needs frames to happen: since issue #349 the
+/// overlay only repaints when something asks it to, and `OverlayApp::ui`
+/// feeds `screenshot_capturing` into `repaint::RepaintInputs`'
+/// `transient_timer_active` precisely so a pending capture holds the
+/// `TRANSIENT_TIMER_REPAINT` (100 ms) cadence while it waits. At that
+/// cadence this bound is about 2 seconds — comfortably longer than any
 /// real `ViewportCommand::Screenshot` round trip, short enough that a
 /// dropped reply doesn't leave the suppression visible for long.
 pub(crate) const SCREENSHOT_CAPTURE_TIMEOUT_FRAMES: u32 = 20;
@@ -4145,6 +4153,7 @@ mod tests {
                 true,
                 &mut UpdateCheckState::default(),
                 &unused_log_export_sender(),
+                &mut 0,
                 false,
                 &mut false,
                 None,
