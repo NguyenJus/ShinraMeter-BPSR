@@ -209,7 +209,7 @@ pub(crate) fn header_menu_scroll_max_height(screen_height: f32, margin: f32) -> 
 /// popup sideways: the user's pointer stays over the same column of
 /// pixels when the body swaps, which is the whole reason pages are usable
 /// in place of a flyout.
-pub(crate) const HEADER_MENU_WIDTH: f32 = 248.0;
+const HEADER_MENU_WIDTH: f32 = 248.0;
 
 /// Height of every clickable row in the dropdown. Uniform on purpose —
 /// the rows are a list, and a list whose items are sized by their own
@@ -218,7 +218,7 @@ pub(crate) const MENU_ROW_HEIGHT: f32 = 24.0;
 
 /// Vertical space above a section label, separating a group of rows from
 /// the one before it (`menu_section`).
-pub(crate) const MENU_SECTION_GAP: f32 = 6.0;
+const MENU_SECTION_GAP: f32 = 6.0;
 
 /// Left/right padding inside a row, between the popup's content edge and
 /// the row's own ink.
@@ -228,10 +228,10 @@ pub(crate) const MENU_ROW_INSET: f32 = 8.0;
 /// particular row has one — that reservation is exactly what makes an
 /// icon-less row's label line up with an icon-bearing one above it, and
 /// it is why `menu_row_layout` takes no icon argument at all.
-pub(crate) const MENU_ICON_SLOT: f32 = 20.0;
+const MENU_ICON_SLOT: f32 = 20.0;
 
 /// Gap between the icon slot's right edge and where a row's label starts.
-pub(crate) const MENU_ROW_LABEL_GAP: f32 = 4.0;
+const MENU_ROW_LABEL_GAP: f32 = 4.0;
 
 /// Row-label text size — the theme's proportional body font (`regular`),
 /// not the monospace numerals the table uses.
@@ -511,7 +511,7 @@ pub(crate) fn menu_row(ui: &mut egui::Ui, row: MenuRow<'_>) -> egui::Response {
 ///
 /// Takes an explicit `width` rather than claiming `available_width`
 /// because the Columns page shares this line with its own "Reset" button.
-pub(crate) fn menu_back_row(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
+fn menu_back_row(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(width.max(0.0), MENU_ROW_HEIGHT),
         egui::Sense::click(),
@@ -574,14 +574,14 @@ fn menu_small_line(ui: &mut egui::Ui, text: &str) {
 
 /// A section header inside the dropdown, with `MENU_SECTION_GAP` of air
 /// above it.
-pub(crate) fn menu_section(ui: &mut egui::Ui, text: &str) {
+fn menu_section(ui: &mut egui::Ui, text: &str) {
     ui.add_space(MENU_SECTION_GAP);
     menu_small_line(ui, text);
 }
 
 /// A hint or footer line — `menu_section` without the leading gap, so it
 /// reads as attached to whatever it annotates.
-pub(crate) fn menu_hint(ui: &mut egui::Ui, text: &str) {
+fn menu_hint(ui: &mut egui::Ui, text: &str) {
     menu_small_line(ui, text);
 }
 
@@ -672,7 +672,7 @@ pub(crate) fn column_toggle_lock(settings: &Settings, col: ColumnKind) -> Option
 }
 
 /// The user-facing reason a locked checkbox will not move.
-pub(crate) fn column_lock_hint(lock: ColumnLock) -> &'static str {
+fn column_lock_hint(lock: ColumnLock) -> &'static str {
     match lock {
         ColumnLock::LastVisible => "At least one column must stay visible",
         ColumnLock::LastStatColumn => "At least one stat column must stay visible",
@@ -716,7 +716,7 @@ pub(crate) fn backgrounds_summary_text(settings: &Settings) -> String {
 /// mean "reset the columns", not silently discard the user's opacity,
 /// window toggles and history retention as a side effect of looking at
 /// this page.
-pub(crate) fn reset_columns_to_default(settings: &mut Settings) {
+fn reset_columns_to_default(settings: &mut Settings) {
     settings.visible_columns = Settings::default().visible_columns;
 }
 
@@ -1149,16 +1149,25 @@ fn draw_menu_root(
     match &*update_check {
         UpdateCheckState::Idle => {}
         UpdateCheckState::Checking { .. } => {
-            ui.label("Checking…");
+            ui.horizontal(|ui| {
+                ui.add_space(MENU_ROW_INSET);
+                ui.label("Checking…");
+            });
         }
         UpdateCheckState::Done(Ok(CheckOutcome::UpToDate)) => {
-            ui.label(format!("Up to date (v{})", env!("CARGO_PKG_VERSION")));
+            ui.horizontal(|ui| {
+                ui.add_space(MENU_ROW_INSET);
+                ui.label(format!("Up to date (v{})", env!("CARGO_PKG_VERSION")));
+            });
         }
         UpdateCheckState::Done(Ok(available @ CheckOutcome::UpdateAvailable { .. })) => {
             draw_update_available(ui, available, &mut clicked_install);
         }
         UpdateCheckState::Done(Err(err)) => {
-            ui.label(format!("Update check failed: {err}"));
+            ui.horizontal(|ui| {
+                ui.add_space(MENU_ROW_INSET);
+                ui.label(format!("Update check failed: {err}"));
+            });
         }
         UpdateCheckState::Installing { available, .. } => {
             let tag = update_tag(available);

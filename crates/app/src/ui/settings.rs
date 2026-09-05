@@ -1629,10 +1629,11 @@ mod tests {
                 .iter()
                 .any(|(_, node)| node.label().is_some_and(|s| s == label))
         };
-        // "Columns" is the one label present on *every* page of the open
-        // menu — the root's own drill-down row and the Columns page's back
-        // row both carry it — and on none of the closed header, so it
-        // answers "is the popup open" without assuming which page shows.
+        // "Columns" is present on both the Root and Columns pages — the
+        // root's own drill-down row and the Columns page's back row both
+        // carry it — and on none of the closed header, so it answers "is
+        // the popup open" without assuming which page shows. Those are the
+        // only two pages this test visits.
         let is_open = |update: &egui::accesskit::TreeUpdate| has_label(update, "Columns");
 
         // Frame 1: closed header, find the chevron.
