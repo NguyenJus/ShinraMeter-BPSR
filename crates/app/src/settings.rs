@@ -766,13 +766,18 @@ impl Settings {
         Some(updated)
     }
 
-    /// Repairs a nonsense state (currently: no columns enabled) by resetting
-    /// only the offending field, leaving everything else — `window_position`
-    /// included — exactly as it was loaded. `toggle` already prevents
-    /// reaching this via the settings menu, but a hand-edited or otherwise
-    /// malformed settings file could still deserialize into one.
+    /// Repairs a nonsense or malformed state loaded from settings.json,
+    /// leaving everything else — `window_position` included — exactly as it
+    /// was loaded. Repairs applied here: dedupes `visible_columns` (a
+    /// hand-edited file can list the same column twice) and, if that leaves
+    /// it empty, resets it to the default; clamps `opacity` to its valid
+    /// range; and caps `history_max_encounters`, `history_max_age_days`,
+    /// and `history_min_duration_ms` at their respective limits. `toggle`
+    /// already prevents reaching an empty `visible_columns` via the
+    /// settings menu, but a hand-edited or otherwise malformed settings
+    /// file could still deserialize into one.
     fn sanitized(mut self) -> Self {
-        // Issue: a hand-edited settings.json can list the same column twice
+        // A hand-edited settings.json can list the same column twice
         // (e.g. `["Damage","Damage"]`); dedupe before the empty check below
         // so the menu's "N of M" count label never overcounts.
         let mut seen = std::collections::HashSet::new();

@@ -2877,9 +2877,17 @@ impl Meter {
     /// decision reads `EnemyState`/`recompute_boss` — but `is_dead` means
     /// the same thing on both.
     ///
-    /// `record_death`'s own debounce (`DEATH_DEBOUNCE_MS`) already protects
-    /// against double-counting when this and a `DamageEvent::is_dead` on the
-    /// same kill both land close together, so no extra guard is needed here.
+    /// The `Player` arm below gates a dead signal on two conditions before
+    /// calling `record_death`: the row must already exist (`players.get`,
+    /// not `entry`/`or_insert_with`) so a bystander this meter never
+    /// otherwise recorded can't have a row opened just because an
+    /// `AttrState` named them dead, and the player must be currently
+    /// recorded alive (`p.alive`). That second guard is load-bearing on its
+    /// own: `record_death`'s debounce is only the 2s `DEATH_DEBOUNCE_MS`
+    /// window, not an already-dead check, so a repeated `AttrState` dead
+    /// broadcast arriving more than 2s after the first (e.g. a resend on
+    /// reconnect) is otherwise indistinguishable from a second, real death
+    /// and would double-count it.
     fn apply_entity_state(
         &mut self,
         entity: EntityId,
@@ -3095,6 +3103,10 @@ impl Meter {
     /// the encounter is frozen for review/history (`record_fight_end`), and
     /// a departure in that post-end grace window must not rewrite it — the
     /// next pull clears `players` via `reset(NewFight)` on its own.
+    ///
+    /// Exempts `Meter::local_uid`: this is the local player's own meter, so
+    /// a `TeamMemberLeft` naming them (a kick or a disband mid-fight) must
+    /// never prune their own row.
     fn apply_team_member_left(&mut self, uid: i64) {
         if !self.in_dungeon_scene() || self.fight_end_ms().is_some() {
             return;
@@ -3149,6 +3161,11 @@ impl Meter {
     /// unrelated bystanders' damage rows. Also gated on
     /// `fight_end_ms.is_some()`, for the same post-end-freeze reason as
     /// `apply_team_member_left`.
+    ///
+    /// Exempts `Meter::local_uid` the same way `apply_team_member_left`
+    /// does: a roster push that omits the local player (e.g. a kick or
+    /// disband mid-fight) must not prune their own row — this is the local
+    /// player's own meter.
     fn apply_team_roster(&mut self, members: &[i64]) {
         if members.is_empty() || !self.in_dungeon_scene() || self.fight_end_ms().is_some() {
             return;
