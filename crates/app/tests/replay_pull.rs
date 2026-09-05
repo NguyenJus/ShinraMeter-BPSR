@@ -174,6 +174,11 @@ fn multi_player_pull() {
     assert_eq!(cade.hits, 3); // includes the miss, which still counts as a hit
     assert!((aria.crit_pct - 75.0).abs() < 0.01); // 3 of 4 hits crit
     assert!((brin.lucky_pct - 100.0 / 3.0).abs() < 0.01); // 1 of 3 hits lucky
+    // issue #344: this scenario's `.container_data(P_ARIA, ...)` step is the
+    // `SyncContainerData` identity path, which is also what identifies the
+    // local player — asserted independent of the golden file, same as the
+    // rest of this block.
+    assert_eq!(capture.snapshot.local_uid, Some(P_ARIA));
 
     assert_golden(capture);
 }

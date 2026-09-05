@@ -119,3 +119,55 @@ jobs:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+
+  # Issue #341: every other job builds *for* Windows without ever running the
+  # result — cross-compiled from Linux (build-windows) or checked without
+  # linking (clippy). Nothing has ever launched the actual exe on the actual
+  # OS, so a Windows-only regression (a Win32 API call that compiles but
+  # misbehaves, a manifest that fails to load, a startup panic) would only
+  # ever be caught by a user. This builds natively on `windows-latest` — no
+  # mingw cross-toolchain, the host default is `x86_64-pc-windows-msvc` and
+  # the runner ships the Windows SDK's `rc.exe` that `embed-resource` needs
+  # for the manifest — then runs the exe with `--version`, which `main.rs`
+  # now checks for before opening a window or touching the single-instance
+  # lock. The shipped manifest's `requireAdministrator` is honored by the
+  # Windows loader at `CreateProcess`, before `main` ever runs, so
+  # `--version` cannot avoid the elevation prompt itself — this smoke test
+  # only passes because hosted `windows-latest` runners already run with a
+  # full admin token; `--version` merely avoids the window and the
+  # single-instance lock.
+  windows-smoke:
+    runs-on: windows-latest
+    # Cold thin-LTO + codegen-units=1 release build on a 4-core Windows
+    # runner is the slow case here; rust-cache keeps warm runs well under
+    # this, but a cache miss needs the headroom.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p ShinraMeter-BPSR
+      - name: Run the built exe with --version
+        shell: pwsh
+        run: |
+          # Start-Process -Wait blocks regardless of subsystem, -PassThru
+          # exposes the real exit code, and -RedirectStandardOutput gives
+          # the GUI-subsystem child a real stdout to write the banner to.
+          $p = Start-Process -FilePath .\target\release\ShinraMeter-BPSR.exe -ArgumentList '--version' -Wait -PassThru -NoNewWindow -RedirectStandardOutput version.txt
+          Get-Content version.txt
+          if ($p.ExitCode -ne 0) { throw "ShinraMeter-BPSR.exe --version exited with $($p.ExitCode)" }
+          if (-not (Select-String -Path version.txt -Pattern '^ShinraMeter-BPSR \d+\.\d+\.\d+' -Quiet)) { throw "--version did not print the expected banner" }
+
+  # Issue #341: fails the PR on a known-vulnerable/unmaintained advisory or a
+  # license outside `deny.toml`'s allow list, rather than letting either slip
+  # in unnoticed with the rest of a dependency bump.
+  cargo-deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # The action's default `arguments` is `--all-features`, which
+          # would override deny.toml's `all-features = false`.
+          command: check
+          arguments: ""

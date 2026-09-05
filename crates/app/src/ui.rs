@@ -1132,6 +1132,7 @@ fn demo_snapshot() -> Snapshot {
             scene_boss_name: None,
             multi_boss_scene: false,
         },
+        local_uid: None,
         capture_alive: true,
     }
 }
@@ -1153,6 +1154,7 @@ fn initial_snapshot(demo_mode: bool) -> Snapshot {
             total_dps: 0.0,
             rows: Vec::new(),
             encounter: EncounterInfo::default(),
+            local_uid: None,
             capture_alive: true,
         }
     }
@@ -5046,8 +5048,10 @@ fn draw_header_menu(
             // needs to find a bug without the maintainer's help, in one folder
             // rather than the log-only file "Export logs" above hands over.
             // `crate::bundle`'s module doc comment has the full shape;
-            // `history.sqlite` is deliberately never included (it holds
-            // plaintext party member names) and `manifest.json` says so.
+            // the raw `history.sqlite` is deliberately never included (it
+            // holds plaintext party member names) — a sanitized copy with
+            // stable pseudonyms in place of names is included instead
+            // (issue #347), and `manifest.json` says so either way.
             //
             // Same dialog-inline / copy-on-a-spawned-thread split as "Export
             // logs" just above, and the same reply channel (see this module's
@@ -5056,7 +5060,7 @@ fn draw_header_menu(
                 if let Some(dest) = crate::platform::choose_bundle_export_path(
                     bundle::EXPORT_BUNDLE_DEFAULT_DIRNAME,
                 ) {
-                    start_bundle_export(dest, tx_log_export.clone());
+                    start_bundle_export(dest, settings.history_enabled, tx_log_export.clone());
                 }
                 ui.close();
             }
@@ -5421,7 +5425,7 @@ fn start_log_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
 /// same as `start_log_export`: cheap either way, but keeping it off the
 /// frame thread means a slow `APPDATA` lookup or a stalled disk (the copy
 /// itself, `bundle::export_bundle_to`) can never stall a frame.
-fn start_bundle_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
+fn start_bundle_export(dest: PathBuf, include_history: bool, tx: Sender<LogExportOutcome>) {
     std::thread::Builder::new()
         .name("export-bundle".to_string())
         .spawn(move || {
@@ -5429,7 +5433,8 @@ fn start_bundle_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
             let log_parts = crate::logging::files_to_export(&log_path);
 
             let inspect_enabled = crate::inspect::enabled();
-            let dump_parts = if inspect_enabled {
+            let dump_sanitized = crate::inspect::sanitized().unwrap_or(false);
+            let dump_parts = if inspect_enabled && dump_sanitized {
                 bundle::dump_ring_parts(&crate::inspect::dump_path())
             } else {
                 Vec::new()
@@ -5443,12 +5448,28 @@ fn start_bundle_export(dest: PathBuf, tx: Sender<LogExportOutcome>) {
                 session_id,
                 env!("CARGO_PKG_VERSION"),
                 bundle::started_at_from_session_id(session_id),
-                inspect_enabled,
-                crate::dump::max_total_ring_bytes(),
-                crate::inspect::dropped_count(),
+                bundle::DumpStatus {
+                    inspect_enabled,
+                    dump_byte_budget: crate::dump::max_total_ring_bytes(),
+                    dropped_records: crate::inspect::dropped_count(),
+                    dump_sanitized,
+                    sanitized_out_records: crate::inspect::sanitized_out_count(),
+                },
             );
 
-            let outcome = match bundle::export_bundle_to(&dest, &entries, &manifest) {
+            // Issue #347: the bundle follows `Settings::history_enabled` —
+            // a sanitized copy is the only way `history.sqlite` data
+            // reaches a bundle at all (`export_bundle_to`'s doc comment),
+            // and a user who has turned history off should not have it
+            // sanitized into a bundle either.
+            let history_source = crate::history::history_db_path();
+            let outcome = match bundle::export_bundle_to(
+                &dest,
+                &entries,
+                &manifest,
+                Some(&history_source),
+                include_history,
+            ) {
                 Ok(missing) => Ok((dest, missing)),
                 Err(err) => Err((dest, err.to_string())),
             };
@@ -10230,6 +10251,7 @@ mod tests {
                 scene_boss_name: None,
                 multi_boss_scene: false,
             },
+            local_uid: None,
             capture_alive: true,
         }
     }
@@ -16349,6 +16371,7 @@ mod tests {
                 })
                 .collect(),
             encounter: EncounterInfo::default(),
+            local_uid: None,
             capture_alive: true,
         }
     }
@@ -16624,6 +16647,7 @@ mod tests {
             total_dps: row.dps,
             rows: vec![row.clone()],
             encounter: EncounterInfo::default(),
+            local_uid: None,
             capture_alive: true,
         };
 
