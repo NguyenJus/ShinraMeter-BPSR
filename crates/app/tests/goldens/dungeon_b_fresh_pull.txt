@@ -1,0 +1,15 @@
+scenario=dungeon_b_fresh_pull
+at_ms=601500
+fight_state=Active
+duration_ms=1
+total_damage=25000
+total_dps=25000.00
+encounter.boss_monster_id=103
+encounter.boss_name=Ignisor
+encounter.is_boss=true
+encounter.scene_id=1001
+encounter.scene_name=Tina's Mindrealm
+encounter.scene_boss_name=-
+resets=SceneChanged@600500,DungeonStarted@601000
+rows=1
+row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=25000 dps=25000.00 share=100.00 crit=0.00 lucky=0.00 hits=1 deaths=0

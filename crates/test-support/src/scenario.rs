@@ -393,6 +393,20 @@ impl Scenario {
         self
     }
 
+    /// `WorldNtf.SyncDungeonData` (issue #139, `opcode::SYNC_DUNGEON_DATA`,
+    /// `0x17`): a dungeon flow-state update. `state` is the raw
+    /// `EDungeonState` wire value — see `wire::dungeon_sync_data_payload`'s
+    /// doc comment for the mapping. `scene_uuid` is encoded for wire
+    /// fidelity only — the meter currently ignores it entirely (`encounter.rs`'s
+    /// handler destructures only `state`, not `scene_uuid`); there is no
+    /// scene check against it.
+    pub fn dungeon_state(mut self, scene_uuid: u32, state: i32) -> Self {
+        let payload = wire::dungeon_sync_data_payload(scene_uuid, state);
+        let bytes = self.wrap_frame(opcode::SYNC_DUNGEON_DATA, &payload);
+        self.push_bytes(bytes);
+        self
+    }
+
     // --- non-wire verbs ---
 
     pub fn inject(mut self, event: ProtocolEvent) -> Self {
@@ -524,5 +538,15 @@ mod tests {
 
         assert_ne!(nested_bytes.len(), plain_bytes.len());
         assert_eq!(unnested_bytes, plain_bytes);
+    }
+
+    #[test]
+    fn dungeon_state_appends_one_bytes_step_at_the_current_clock() {
+        let scenario = Scenario::new("x").at(5_000).dungeon_state(1_101, 3);
+        assert_eq!(scenario.steps.len(), 1);
+        assert!(matches!(
+            scenario.steps[0],
+            Step::Bytes { at_ms: 5_000, .. }
+        ));
     }
 }

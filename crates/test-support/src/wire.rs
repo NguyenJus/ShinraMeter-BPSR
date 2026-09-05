@@ -448,6 +448,29 @@ pub fn enter_scene_payload(scene_id: u32) -> Vec<u8> {
     buf
 }
 
+/// Prost-encodes a `DungeonSyncData` payload (not wrapped in a frame) —
+/// `decode::opcode::SYNC_DUNGEON_DATA` (`0x17`), issue #139's plain-protobuf
+/// dungeon-flow channel. `state` is the raw `EDungeonState` wire value
+/// (`bpsr_protocol::event::EDungeonState`'s `From<i32>`: `0` Null, `1`
+/// Active, `2` Ready, `3` Playing, `4` End, `5` Settlement, `6` Vote) —
+/// taken raw rather than the typed enum so this module stays app-free of
+/// even `bpsr-meter`'s event mirror, matching every other builder here.
+/// `target`/`dungeon_var` are left `None`: every real `0x17` message this
+/// build ever captured was empty of them (`decode.rs`'s
+/// `on_sync_dungeon_data` doc comment), and the meter never reads them off
+/// this opcode either way.
+pub fn dungeon_sync_data_payload(scene_uuid: u32, state: i32) -> Vec<u8> {
+    let msg = pb::DungeonSyncData {
+        scene_uuid,
+        flow_info: Some(pb::DungeonFlowInfo { state }),
+        target: None,
+        dungeon_var: None,
+    };
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+    buf
+}
+
 /// Builds a fully-populated `TeamMemData` roster entry (issue #146) — a
 /// name, class, and ability score, so a test only has to override what it
 /// cares about via the individual fields.
@@ -547,5 +570,13 @@ mod tests {
         assert_eq!(info.r#type, pb::EDamageType::Normal as i32);
         assert!(info.is_dead);
         assert_eq!(info.top_summoner_id, 0);
+    }
+
+    #[test]
+    fn dungeon_sync_data_payload_round_trips_scene_uuid_and_state() {
+        let payload = dungeon_sync_data_payload(7_152, 3);
+        let msg = pb::DungeonSyncData::decode(payload.as_slice()).unwrap();
+        assert_eq!(msg.scene_uuid, 7_152);
+        assert_eq!(msg.flow_info.unwrap().state, 3);
     }
 }
