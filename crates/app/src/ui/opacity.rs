@@ -14,7 +14,7 @@ use eframe::egui;
 
 /// A window opacity: a finite fraction in `0.0..=1.0`, where `0.0` paints
 /// nothing and `1.0` paints the color untouched.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub(crate) struct Opacity(f32);
 
 impl Opacity {
@@ -46,6 +46,18 @@ impl Opacity {
     }
 }
 
+impl Default for Opacity {
+    fn default() -> Self {
+        Self::OPAQUE
+    }
+}
+
+impl From<f32> for Opacity {
+    fn from(value: f32) -> Self {
+        Self::new(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,6 +83,13 @@ mod tests {
     }
 
     #[test]
+    fn from_f32_is_the_same_clamp_as_new() {
+        assert_eq!(Opacity::from(2.0), Opacity::OPAQUE);
+        assert_eq!(Opacity::from(f32::NAN), Opacity::OPAQUE);
+        assert_eq!(Opacity::from(0.5), Opacity::new(0.5));
+    }
+
+    #[test]
     fn applying_full_opacity_leaves_a_color_untouched() {
         let color = egui::Color32::from_rgba_unmultiplied(0x10, 0x20, 0x30, 0x80);
         assert_eq!(Opacity::OPAQUE.apply(color), color);
@@ -92,5 +111,10 @@ mod tests {
                 "apply must stay a pure rename of gamma_multiply for {raw}"
             );
         }
+    }
+
+    #[test]
+    fn the_default_is_opaque() {
+        assert_eq!(Opacity::default(), Opacity::OPAQUE);
     }
 }

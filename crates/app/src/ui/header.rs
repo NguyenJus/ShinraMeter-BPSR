@@ -220,11 +220,20 @@ pub(crate) fn draw_header(
     // completion after the window was supposedly locked.
     cancel_move_gesture_when_pinned(gesture, settings.settings.always_on_top);
     let chevron_response = menu_chevron(ui, chevron_rect(title_row));
+    // Issue #120: the dropdown's drill-down page lives in egui temp memory
+    // (`menu_page_id`), so it has to be cleared while the popup is shut or
+    // a menu closed on the Columns page would reopen there — the first
+    // click after opening would land somewhere the user never asked for.
+    // Cleared here, outside the popup body, because the body only runs
+    // while the popup is open; `Popup::default_response_id` is exactly the
+    // id `Popup::menu(&chevron_response)` below keys its open state under.
+    if !egui::Popup::is_id_open(ctx, egui::Popup::default_response_id(&chevron_response)) {
+        reset_menu_page(ctx);
+    }
     // `CloseOnClickOutside` rather than the default `CloseOnClick` (issue
-    // #93): with the Columns checkboxes now direct children of this popup
-    // (no submenu layer to defer the close decision to, see
-    // `draw_header_menu`'s doc comment), the default would dismiss the
-    // whole dropdown on every checkbox toggle. Minimize/Close call
+    // #93, now a standing rule — see `menu.rs`'s issue #120 block): this
+    // menu holds toggles, a slider and page-navigation rows, so no click
+    // inside it may dismiss it implicitly. The action rows call
     // `ui.close()` themselves to still dismiss on click.
     // `settings` (a `SettingsHandle<'_>`) is reborrowed rather than moved
     // into this closure — issue #167 added a second use of it below
