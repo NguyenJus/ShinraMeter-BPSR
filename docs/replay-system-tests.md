@@ -11,9 +11,11 @@ way `main.rs` wires it.
 All of it is one integration-test target, `crates/app/tests/replay/main.rs`,
 whose scenario modules live in `crates/app/tests/replay/` and whose shared
 harness is `crates/app/tests/common/mod.rs`. One binary rather than one per
-file keeps the debug target dir from growing by a ~340 MB executable per
-scenario file; the cost is that test names are module-qualified, so a single
-test is run as `cargo test -p ShinraMeter-BPSR replay_pull::multi_player_pull`.
+file keeps the debug target dir from growing by a per-scenario-file
+executable (roughly 340 MB each under the previous full-debuginfo profile,
+still tens of MB each with line tables only); the cost is that test names
+are module-qualified, so a single test is run as
+`cargo test -p ShinraMeter-BPSR replay_pull::multi_player_pull`.
 
 ## What's covered
 

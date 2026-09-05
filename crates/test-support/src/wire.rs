@@ -1,6 +1,6 @@
 //! Wire-level byte builders for scripting `bpsr-protocol` fixtures, shared
-//! across the workspace's crate test suites (promoted from
-//! `crates/protocol/tests/protocol/`, plan `docs/plans/system-test-harness.md`
+//! across the workspace's crate test suites (promoted from the former
+//! `crates/protocol/tests/common/mod.rs`, plan `docs/plans/system-test-harness.md`
 //! §1.3/A2). Every builder emits **big-endian** headers matching the wire
 //! format documented in `crates/protocol/src/frame.rs`.
 //!
