@@ -772,6 +772,11 @@ impl Settings {
     /// reaching this via the settings menu, but a hand-edited or otherwise
     /// malformed settings file could still deserialize into one.
     fn sanitized(mut self) -> Self {
+        // Issue: a hand-edited settings.json can list the same column twice
+        // (e.g. `["Damage","Damage"]`); dedupe before the empty check below
+        // so the menu's "N of M" count label never overcounts.
+        let mut seen = std::collections::HashSet::new();
+        self.visible_columns.retain(|c| seen.insert(*c));
         if self.visible_columns.is_empty() {
             self.visible_columns = Self::default().visible_columns;
         }
@@ -1177,6 +1182,25 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(settings.sanitized(), Settings::default());
+    }
+
+    #[test]
+    fn loading_a_hand_edited_duplicate_column_list_dedupes_it() {
+        let settings = Settings {
+            visible_columns: vec![
+                ColumnKind::Damage,
+                ColumnKind::Damage,
+                ColumnKind::Dps,
+                ColumnKind::Damage,
+            ],
+            window_position: None,
+            window_size: None,
+            ..Settings::default()
+        };
+        assert_eq!(
+            settings.sanitized().visible_columns,
+            vec![ColumnKind::Damage, ColumnKind::Dps]
+        );
     }
 
     #[test]

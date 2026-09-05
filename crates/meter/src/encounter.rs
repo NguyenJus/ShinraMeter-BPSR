@@ -2901,7 +2901,15 @@ impl Meter {
                     // already uses, so a stranger's death never opens a row
                     // — matching `apply_revive`'s doc'd rule that these
                     // views must never create one.
-                    if self.players.contains_key(&entity) {
+                    //
+                    // `record_death`'s own guard is only the 2s
+                    // `DEATH_DEBOUNCE_MS` window, not an already-dead check
+                    // — a repeated `AttrState` dead broadcast arriving more
+                    // than 2s after the first (e.g. a resend on reconnect)
+                    // would otherwise double-count the same death. Only
+                    // route a dead signal through when this player is
+                    // currently recorded alive.
+                    if self.players.get(&entity).is_some_and(|p| p.alive) {
                         self.record_death(entity, entity.display_uid(), timestamp_ms);
                         self.latch_wipe_if_party_down(timestamp_ms);
                     }
@@ -2915,14 +2923,16 @@ impl Meter {
             EntityKind::Monster => {
                 if is_dead && self.enemies.contains_key(&entity) {
                     self.mark_enemy_dead(entity);
-                    self.recompute_boss();
+                    // issue #210/#211: captured *before* `recompute_boss`,
+                    // which ranks a living recognized boss above a dead one
+                    // — so the instant `mark_enemy_dead` above stamps this
+                    // uid's death order, any other recognized boss already
+                    // damaged and still alive outranks the corpse and
+                    // `recompute_boss` moves `boss_entity` off it. Mirrors
+                    // the capture in `apply_damage`/`apply_enemy_hp`.
                     let was_tracked_boss = self.boss_entity == Some(entity);
-                    let is_engaged = was_tracked_boss
-                        || self
-                            .enemies
-                            .get(&entity)
-                            .is_some_and(|e| is_engaged_recognized_boss(e, timestamp_ms));
-                    if self.fight_cfg.end_on_boss_death && is_engaged {
+                    self.recompute_boss();
+                    if self.fight_cfg.end_on_boss_death && was_tracked_boss {
                         self.end_fight_on_boss_death(entity, timestamp_ms);
                     }
                 }
@@ -3089,6 +3099,14 @@ impl Meter {
         if !self.in_dungeon_scene() || self.fight_end_ms().is_some() {
             return;
         }
+        // A `NotifyLeaveTeam` naming the local player (a kick or a
+        // disband mid-fight) must not delete this meter's own row — the
+        // local player's damage stays visible, and `local_uid` is never
+        // cleared (see its doc comment) so there is no "they actually
+        // left" reading of this signal for that one uid.
+        if Some(uid) == self.local_uid {
+            return;
+        }
         // `players` is keyed on `EntityId` (issue #335) while the team
         // roster speaks display uids, so match on `display_uid()` rather
         // than on the map key. Two live entities sharing one display uid is
@@ -3136,8 +3154,10 @@ impl Meter {
             return;
         }
         let mut pruned = 0u32;
+        let local_uid = self.local_uid;
         self.players.retain(|entity, p| {
-            let keep = members.contains(&entity.display_uid());
+            let keep =
+                members.contains(&entity.display_uid()) || Some(entity.display_uid()) == local_uid;
             if !keep && p.total_damage == 0 && p.hits == 0 && p.deaths == 0 {
                 pruned += 1;
             }

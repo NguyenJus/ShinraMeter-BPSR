@@ -145,9 +145,10 @@ def main() -> None:
     # Drop anything left from a previous run whose basename is no longer
     # referenced, so the committed set never accumulates icons the meter cannot
     # draw. Mirrors `prep-imagine-icons.py`'s same-purpose sweep. Alias
-    # basenames are expected-absent (issue #348): their PNG is deliberately
-    # not written above, so their absence here is not staleness.
-    expected = set(found) | set(DUPLICATE_ALIASES)
+    # basenames are expected-absent (issue #348): their PNG was deliberately
+    # not written above (and was `del`eted from `found` above), so an alias
+    # PNG still present on disk must be swept, not protected.
+    expected = set(found)
     stale = [p for p in OUT.glob("*.png") if p.stem not in expected]
     for path in stale:
         path.unlink()
