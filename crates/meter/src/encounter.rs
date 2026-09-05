@@ -2795,8 +2795,26 @@ impl Meter {
     ///
     /// A uid this meter never had a row for (never preloaded, never dealt
     /// damage) is a silent no-op: `HashMap::remove` on a missing key.
+    ///
+    /// Gated on `in_dungeon_scene()`: outside a dungeon, `players` is an
+    /// AOI damage table keyed on whoever hit something (see `apply_player`
+    /// and its own `in_dungeon_scene` preload gate), not a party roster, so
+    /// a leave/kick signal there says nothing about who belongs in it.
+    /// Also gated on `fight_end_ms.is_some()`: once a fight end is latched
+    /// the encounter is frozen for review/history (`record_fight_end`), and
+    /// a departure in that post-end grace window must not rewrite it — the
+    /// next pull clears `players` via `reset(NewFight)` on its own.
     fn apply_team_member_left(&mut self, uid: i64) {
-        self.players.remove(&uid);
+        if !self.in_dungeon_scene() || self.fight_end_ms.is_some() {
+            return;
+        }
+        if let Some(removed) = self.players.remove(&uid)
+            && removed.total_damage == 0
+            && removed.hits == 0
+            && removed.deaths == 0
+        {
+            self.preload_count = self.preload_count.saturating_sub(1);
+        }
     }
 
     /// `ProtocolEvent::TeamRoster` (issue #343): the authoritative
@@ -2818,11 +2836,26 @@ impl Meter {
     /// comment on why the decode layer never emits one, kept as a second,
     /// defensive check here too, so a malformed/adversarial roster can
     /// never wipe every party row in one shot.
+    ///
+    /// Gated on `in_dungeon_scene()`: outside a dungeon, `players` is an
+    /// AOI damage table (see `apply_team_member_left`'s doc for why), not a
+    /// party roster, so pruning rows against `members` there would drop
+    /// unrelated bystanders' damage rows. Also gated on
+    /// `fight_end_ms.is_some()`, for the same post-end-freeze reason as
+    /// `apply_team_member_left`.
     fn apply_team_roster(&mut self, members: &[i64]) {
-        if members.is_empty() {
+        if members.is_empty() || !self.in_dungeon_scene() || self.fight_end_ms.is_some() {
             return;
         }
-        self.players.retain(|uid, _| members.contains(uid));
+        let mut pruned = 0u32;
+        self.players.retain(|uid, p| {
+            let keep = members.contains(uid);
+            if !keep && p.total_damage == 0 && p.hits == 0 && p.deaths == 0 {
+                pruned += 1;
+            }
+            keep
+        });
+        self.preload_count = self.preload_count.saturating_sub(pruned);
     }
 
     fn apply_enemy_hp(&mut self, e: &EnemyHp) -> Option<ResetReason> {
@@ -8106,6 +8139,87 @@ mod tests {
             m.apply(&ProtocolEvent::TeamRoster { members: vec![] });
             let snap = m.snapshot(1_000);
             assert_eq!(snap.rows.iter().map(|r| r.uid).collect::<Vec<_>>(), vec![1]);
+        }
+
+        fn damage_from(attacker_uid: i64, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::Damage(DamageEvent {
+                attacker_uid,
+                attacker_kind: EntityKind::Player,
+                target_uid: 100,
+                target_kind: EntityKind::Monster,
+                value: 1_000,
+                timestamp_ms: ts,
+                ..Default::default()
+            })
+        }
+
+        /// Issue #343 finding O1: outside a dungeon, `players` is an AOI
+        /// damage table keyed on whoever hit something (`apply_player`'s own
+        /// `in_dungeon_scene` preload gate), not a party roster — nothing
+        /// says uid 2 leaving *this player's* party means the row for a
+        /// bystander who happened to damage something nearby should
+        /// disappear. Neither handler may touch `players` without the same
+        /// gate `apply_player` uses.
+        #[test]
+        fn team_events_are_a_no_op_outside_a_dungeon() {
+            let mut m = Meter::new();
+            // No `Scene` event at all — `in_dungeon_scene()` is `false`.
+            m.apply(&damage_from(1, 1_000));
+            m.apply(&damage_from(2, 1_100));
+            m.apply(&damage_from(3, 1_200));
+            m.apply(&ProtocolEvent::TeamRoster { members: vec![1] });
+            m.apply(&ProtocolEvent::TeamMemberLeft { uid: 2 });
+            let mut uids: Vec<i64> = m.snapshot(2_000).rows.iter().map(|r| r.uid).collect();
+            uids.sort();
+            assert_eq!(
+                uids,
+                vec![1, 2, 3],
+                "a roster/leave signal must not prune AOI damage rows outside a dungeon"
+            );
+        }
+
+        /// Issue #343 finding O2: once `fight_end_ms` is latched the
+        /// encounter is frozen for review and history (`record_fight_end`
+        /// already snapshotted it); a departure in the post-end grace
+        /// window must not rewrite a row out of that frozen snapshot.
+        #[test]
+        fn team_member_left_after_fight_end_does_not_touch_the_frozen_encounter() {
+            let mut m = Meter::new();
+            in_dungeon(&mut m);
+            m.apply(&player_info(1, "Alpha"));
+            m.apply(&damage_from(1, 1_000));
+            // Latch the fight end directly, as the various `latch_fight_end`
+            // call sites do on a real boss death.
+            m.fight_start_ms = Some(500);
+            m.fight_end_ms = Some(2_000);
+
+            m.apply(&ProtocolEvent::TeamMemberLeft { uid: 1 });
+
+            let snap = m.snapshot(5_000);
+            let alpha = snap.rows.iter().find(|r| r.uid == 1);
+            assert!(
+                alpha.is_some(),
+                "a departure after fight end must not drop the frozen row"
+            );
+            assert_eq!(alpha.unwrap().damage, 1_000);
+        }
+
+        /// Issue #343 finding O4: a row removed by a leave/kick/full-sync is
+        /// exactly as gone from the roster as one `prune_stale_preloads`
+        /// drops, so it must count against the same `preload_count` budget
+        /// — otherwise a dungeon full of joins and leaves permanently
+        /// inflates the counter against `MAX_PRELOADED_PLAYERS` without ever
+        /// actually holding that many rows at once.
+        #[test]
+        fn team_member_left_decrements_the_preload_budget() {
+            let mut m = Meter::new();
+            in_dungeon(&mut m);
+            m.apply(&player_info(1, "Alpha"));
+            assert_eq!(m.preload_count, 1, "player_info preloads a zero-stat row");
+
+            m.apply(&ProtocolEvent::TeamMemberLeft { uid: 1 });
+
+            assert_eq!(m.preload_count, 0);
         }
     }
 
