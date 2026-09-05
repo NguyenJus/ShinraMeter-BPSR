@@ -312,6 +312,7 @@ fn the_recorded_rows_match_the_live_snapshot() {
     assert_eq!(live_rows.len(), saved_rows.len());
     for (live, saved) in live_rows.iter().zip(saved_rows.iter()) {
         assert_eq!(live.uid, saved.uid);
+        assert_eq!(live.entity, saved.entity);
         assert_eq!(live.name, saved.name);
         assert_eq!(live.class, saved.class);
         assert_eq!(live.ability_score, saved.ability_score);
@@ -326,6 +327,14 @@ fn the_recorded_rows_match_the_live_snapshot() {
         assert_eq!(live.hits, saved.hits);
         assert_eq!(live.deaths, saved.deaths);
     }
+
+    // Issue #373: `record.local_uid` must match the live snapshot's
+    // `local_uid`, subject to `record_from_snapshot`'s roster guard (it is
+    // only saved when it names one of the saved rows).
+    let expected_local_uid = live_snapshot
+        .local_uid
+        .filter(|uid| live_snapshot.rows.iter().any(|r| r.uid == *uid));
+    assert_eq!(record.local_uid, expected_local_uid);
 
     assert_history_golden("history_rows", &encounters, &record);
 }

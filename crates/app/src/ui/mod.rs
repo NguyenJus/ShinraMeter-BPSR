@@ -6247,6 +6247,7 @@ mod tests {
             title: title.to_string(),
             subtitle: None,
             meter_version: "0.0.0".to_string(),
+            local_uid: None,
             players: Vec::new(),
         }
     }
