@@ -93,7 +93,7 @@ pub enum HoldKind {
 /// behaviour. It's the accessor surface a later, explicit state machine
 /// (issue #336 step 3) replaces the derivation behind, without callers
 /// having to change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Lifecycle {
     /// No fight has started since the last reset.
     Idle,
@@ -111,10 +111,12 @@ pub enum Lifecycle {
     },
     /// The fight ended in a party wipe and the attempt is still being held
     /// open for a possible re-pull, per
-    /// `crate::encounter::Meter::withholds_after_wipe`. A refinement of
-    /// `Ended` for callers that care about the hold specifically, not a
-    /// disjoint state — `fight_end_cause` reports `Wipe` here too.
-    Held { kind: HoldKind, since_ms: u64 },
+    /// `crate::encounter::Meter::withholds_after_wipe`. A sibling of
+    /// `Ended`, split out for hold-aware callers — `fight_end_cause`
+    /// reports `Wipe` here too. Callers that just mean "the fight is over"
+    /// must match `Ended { .. } | Held { .. }`. `at_ms` is the fight-end
+    /// timestamp, mirroring `Ended`'s `at_ms`.
+    Held { kind: HoldKind, at_ms: u64 },
 }
 
 /// Tunables for fight-end detection.

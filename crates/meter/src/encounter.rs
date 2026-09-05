@@ -921,7 +921,8 @@ impl Meter {
     }
 
     /// Whether a fight is currently running, as of `now_ms` — the `Active`
-    /// half of [`Self::fight_state`], as its own predicate.
+    /// half of [`Self::fight_state`], as its own predicate. See
+    /// [`Self::is_active`] for "stats on the board, running or held".
     pub fn is_fight_active(&self, now_ms: u64) -> bool {
         matches!(self.lifecycle(now_ms), Lifecycle::Active { .. })
     }
@@ -939,11 +940,11 @@ impl Meter {
         let Some(at_ms) = self.fight_ended_at(now_ms) else {
             return Lifecycle::Active { since_ms };
         };
-        match self.hold_kind() {
-            Some(kind) => Lifecycle::Held {
-                kind,
-                since_ms: at_ms,
-            },
+        match self
+            .hold_kind()
+            .filter(|_| !self.wipe_hold_released(now_ms))
+        {
+            Some(kind) => Lifecycle::Held { kind, at_ms },
             None => Lifecycle::Ended {
                 at_ms,
                 cause: self.fight_end_cause(),
@@ -3498,7 +3499,8 @@ impl Meter {
 
     /// Whether a fight's stats are on the board — true both while it is
     /// running and while an ended fight is being held (issue #78). Use
-    /// [`Meter::fight_state`] to tell those two apart.
+    /// [`Meter::fight_state`] to tell those two apart. See
+    /// [`Meter::is_fight_active`] for "running right now" specifically.
     pub fn is_active(&self) -> bool {
         self.fight_start_ms().is_some()
     }
@@ -7482,10 +7484,35 @@ mod tests {
                 m.lifecycle(6_500),
                 Lifecycle::Held {
                     kind: HoldKind::Wipe,
-                    since_ms: 6_000,
+                    at_ms: 6_000,
                 }
             );
             assert!(!m.is_fight_active(6_500));
+        }
+
+        /// Issue #336 step 1: `lifecycle` must consult
+        /// `Meter::wipe_hold_released` the same way `withholds_after_wipe`
+        /// does, or a wipe reports `Held` forever past
+        /// `WIPE_HOLD_RELEASE_MS` instead of falling through to `Ended`.
+        #[test]
+        fn a_released_wipe_hold_reports_as_ended() {
+            let m = wiped();
+            assert_eq!(
+                m.lifecycle(6_000 + 1_000),
+                Lifecycle::Held {
+                    kind: HoldKind::Wipe,
+                    at_ms: 6_000,
+                },
+                "still held well before WIPE_HOLD_RELEASE_MS"
+            );
+            assert_eq!(
+                m.lifecycle(6_000 + WIPE_HOLD_RELEASE_MS),
+                Lifecycle::Ended {
+                    at_ms: 6_000,
+                    cause: Some(FightEndCause::Wipe),
+                },
+                "released once WIPE_HOLD_RELEASE_MS has passed"
+            );
         }
 
         #[test]
