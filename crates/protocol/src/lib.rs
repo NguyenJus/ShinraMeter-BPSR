@@ -13,7 +13,7 @@ pub mod reader;
 pub mod sanitize;
 
 pub use decode::Decoder;
-pub use event::{DamageEvent, EnemyHp, EntityKind, PlayerInfo, ProtocolEvent};
+pub use event::{DamageEvent, DamageKind, EnemyHp, EntityKind, PlayerInfo, ProtocolEvent};
 pub use inspect::InspectSink;
 pub use pb::Class;
 pub use sanitize::Sanitizer;

@@ -848,6 +848,7 @@ mod tests {
             hp_lessen: value - 1,
             is_miss: false,
             is_heal: false,
+            kind: proto::DamageKind::Normal,
             target_uid: 500,
             target_kind: proto::EntityKind::Monster,
             timestamp_ms: ts,
@@ -938,6 +939,7 @@ mod tests {
                 skill_ids: Vec::new(),
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             0,
         );
@@ -951,6 +953,7 @@ mod tests {
                 season_strength: Some(3_333),
                 imagines: None,
                 imagine_tiers: None,
+                shield: None,
             })
         );
     }
@@ -973,6 +976,7 @@ mod tests {
                 skill_ids: vec![(3905, 1), (102640, 4), (3926, 3), (999_999_999, 9)],
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             0,
         );
@@ -996,6 +1000,7 @@ mod tests {
                 skill_ids: Vec::new(),
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             0,
         );
@@ -1252,6 +1257,7 @@ mod tests {
                     skill_ids: Vec::new(),
                     position: None,
                     target_position: None,
+                    shield: None,
                 }),
                 1_000,
             );
@@ -1291,6 +1297,7 @@ mod tests {
                     skill_ids: Vec::new(),
                     position: None,
                     target_position: None,
+                    shield: None,
                 }),
                 1_000,
             );
@@ -1329,6 +1336,7 @@ mod tests {
                 skill_ids: Vec::new(),
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             1_000,
         );
@@ -1352,6 +1360,7 @@ mod tests {
                 skill_ids: Vec::new(),
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             1_000,
         );
@@ -1374,6 +1383,7 @@ mod tests {
                 skill_ids: Vec::new(),
                 position: None,
                 target_position: None,
+                shield: None,
             }),
             1_000,
         );

@@ -1439,6 +1439,9 @@ mod tests {
             received: Vec::new(),
             casts: Vec::new(),
             buffs: Vec::new(),
+            absorbed_total: 0,
+            immune_total: 0,
+            shield: None,
         };
 
         for (kind, column) in ColumnKind::ALL
@@ -2088,6 +2091,8 @@ mod tests {
             duration_ms: 90_000,
             total_damage: row.damage,
             total_dps: row.dps,
+            total_absorbed: 0,
+            total_immune: 0,
             rows: vec![row.clone()],
             encounter: EncounterInfo::default(),
             local_uid: None,

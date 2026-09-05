@@ -138,6 +138,13 @@ impl SkillRecord {
             hits: self.hits,
             crit_hits: self.crit_hits,
             hits_per_min: self.hits_per_min,
+            // Issue #338's absorbed/immune channels predate this on-disk
+            // record shape; a historical row has no way to have recorded
+            // them, so a replayed `SkillRow` always reads `0` here rather
+            // than growing the sqlite schema for a field no saved encounter
+            // can supply.
+            absorbed_total: 0,
+            immune_total: 0,
         }
     }
 }
@@ -235,6 +242,12 @@ impl PlayerRecord {
             // above — the Buff tab is live-only, and the schema has no
             // per-buff column to replay.
             buffs: Vec::new(),
+            // Issue #338: same story as `dead_ms` above — no schema column,
+            // so a replayed row reads unmeasured/absent rather than a real
+            // (and misleadingly precise) zero-or-unknown value.
+            absorbed_total: 0,
+            immune_total: 0,
+            shield: None,
         }
     }
 }
@@ -343,11 +356,21 @@ impl EncounterRecord {
     /// the header gets its text from `title`/`subtitle` instead (DECISION
     /// D7, wired up in WP3).
     pub fn to_snapshot(&self) -> Snapshot {
+        let rows: Vec<PlayerRow> = self.players.iter().map(PlayerRecord::to_row).collect();
+        // Issue #338: `PlayerRecord::to_row` always zeroes a replayed row's
+        // absorbed/immune totals (no schema column to replay them from —
+        // see that function's doc comment), so these sum to `0` too; kept
+        // as a real sum rather than a hardcoded `0` so this stays correct
+        // the day a schema revision does persist them.
+        let total_absorbed: i64 = rows.iter().map(|r| r.absorbed_total).sum();
+        let total_immune: i64 = rows.iter().map(|r| r.immune_total).sum();
         Snapshot {
             duration_ms: self.duration_ms,
             total_damage: self.total_damage,
             total_dps: self.total_dps,
-            rows: self.players.iter().map(PlayerRecord::to_row).collect(),
+            total_absorbed,
+            total_immune,
+            rows,
             encounter: EncounterInfo {
                 boss_monster_id: self.boss_monster_id,
                 is_boss: self.is_boss,
@@ -435,6 +458,9 @@ mod tests {
             received: Vec::new(),
             casts: Vec::new(),
             buffs: Vec::new(),
+            absorbed_total: 0,
+            immune_total: 0,
+            shield: None,
         }
     }
 
@@ -443,6 +469,8 @@ mod tests {
             duration_ms: 12_345,
             total_damage,
             total_dps: 999.0,
+            total_absorbed: 0,
+            total_immune: 0,
             rows,
             encounter: EncounterInfo {
                 boss_monster_id: Some(42),
@@ -563,6 +591,8 @@ mod tests {
             hits: 8,
             crit_hits: 2,
             hits_per_min: 40.5,
+            absorbed_total: 0,
+            immune_total: 0,
         }
     }
 

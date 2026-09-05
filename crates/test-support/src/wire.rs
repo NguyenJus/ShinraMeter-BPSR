@@ -131,6 +131,10 @@ pub fn damage_info(hit: &Hit) -> pb::SyncDamageInfo {
             pb::EDamageType::Miss as i32
         } else if hit.heal {
             pb::EDamageType::Heal as i32
+        } else if hit.absorbed {
+            pb::EDamageType::Absorbed as i32
+        } else if hit.immune {
+            pb::EDamageType::Immune as i32
         } else {
             pb::EDamageType::Normal as i32
         },

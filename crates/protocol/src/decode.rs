@@ -16,7 +16,7 @@ use crate::attrs::{
 use crate::blob;
 use crate::event::{
     CastEvent, DamageEvent, DisappearReason, EDungeonState, EntityKind, PlayerInfo, ProtocolEvent,
-    kind_of, uid_of,
+    damage_kind_of, kind_of, uid_of,
 };
 use crate::frame::{
     Desync, MAX_TAIL_LEN, Notify, SERVICE_UUID, TEAM_NTF_SERVICE_UUID, parse_frame, split_frames,
@@ -351,6 +351,7 @@ fn on_aoi_sync_delta(
                 hp_lessen: dmg.hp_lessen_value,
                 is_miss: dmg.is_miss || dmg.r#type == EDamageType::Miss as i32,
                 is_heal,
+                kind: damage_kind_of(dmg.r#type),
                 target_uid,
                 target_kind,
                 timestamp_ms: now_ms,
@@ -507,6 +508,9 @@ fn on_sync_container_data(msg: &pb::SyncContainerData, out: &mut Vec<ProtocolEve
         // only (issue #286).
         position: None,
         target_position: None,
+        // Same: no confirmed `CharBaseInfo` shield field (issue #338) —
+        // attr-list path only, via `player_info_from_attrs`.
+        shield: None,
     }));
 }
 
@@ -598,6 +602,9 @@ fn on_notify_join_team(msg: &pb::NotifyJoinTeam, out: &mut Vec<ProtocolEvent>) {
             // attr-list path only (issue #286).
             position: None,
             target_position: None,
+            // Same: no shield field on this push — attr-list path only
+            // (issue #338).
+            shield: None,
         }));
     }
     if !roster.is_empty() {
@@ -947,6 +954,60 @@ mod tests {
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
         assert!(!only_damage(out).crit);
+    }
+
+    // -- issue #338: damage type -> DamageKind ------------------------------
+
+    #[test]
+    fn normal_type_decodes_to_normal_kind() {
+        let dmg = pb::SyncDamageInfo {
+            r#type: EDamageType::Normal as i32,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(only_damage(out).kind, crate::event::DamageKind::Normal);
+    }
+
+    #[test]
+    fn absorbed_type_decodes_to_absorbed_kind() {
+        let dmg = pb::SyncDamageInfo {
+            r#type: EDamageType::Absorbed as i32,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(only_damage(out).kind, crate::event::DamageKind::Absorbed);
+    }
+
+    #[test]
+    fn immune_type_decodes_to_immune_kind() {
+        let dmg = pb::SyncDamageInfo {
+            r#type: EDamageType::Immune as i32,
+            value: 0,
+            hp_lessen_value: 0,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(only_damage(out).kind, crate::event::DamageKind::Immune);
+    }
+
+    /// `Fall` (issue #338's evidence gap) has no dedicated channel — it
+    /// decodes to `Normal`, same as every other unrecognized wire value.
+    #[test]
+    fn fall_type_decodes_to_normal_kind() {
+        let dmg = pb::SyncDamageInfo {
+            r#type: EDamageType::Fall as i32,
+            ..base_damage()
+        };
+        let n = notify_for_damage(dmg);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(only_damage(out).kind, crate::event::DamageKind::Normal);
     }
 
     #[test]
@@ -1893,6 +1954,7 @@ mod tests {
                     skill_ids: Vec::new(),
                     position: None,
                     target_position: None,
+                    shield: None,
                 })
             ]
         );

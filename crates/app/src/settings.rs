@@ -1929,6 +1929,9 @@ mod tests {
             received: Vec::new(),
             casts: Vec::new(),
             buffs: Vec::new(),
+            absorbed_total: 0,
+            immune_total: 0,
+            shield: None,
         };
         assert_eq!((ColumnKind::Deaths.spec().text)(&row), "12");
     }
