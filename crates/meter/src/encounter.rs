@@ -2333,6 +2333,23 @@ impl Meter {
         if self.fight_start_ms.is_none() || self.fight_end_ms.is_some() || self.players.is_empty() {
             return false;
         }
+        self.roster_mostly_down()
+    }
+
+    /// The roster-fraction half of [`Self::party_mostly_down`], without its
+    /// `fight_start_ms`/`fight_end_ms` guards.
+    ///
+    /// [`Self::release_wipe_hold_if_recovered`] needs this reading, not
+    /// `party_mostly_down`'s: `wipe_hold` is only ever set right after
+    /// `latch_fight_end(Wipe)`, so `fight_end_ms` is always `Some` while the
+    /// hold is up, and `party_mostly_down` would therefore read `false`
+    /// unconditionally — releasing the hold on the very first battle-rez
+    /// regardless of how much of the roster actually recovered (issue
+    /// #366 review, finding O1).
+    fn roster_mostly_down(&self) -> bool {
+        if self.players.is_empty() {
+            return false;
+        }
         let down = self.players.values().filter(|p| !p.alive).count();
         // Multiply rather than divide: no division by zero to reason about
         // (the empty roster is already refused above) and no rounding rule
@@ -2767,7 +2784,15 @@ impl Meter {
                 if is_dead && self.enemies.contains_key(&uid) {
                     self.mark_enemy_dead(uid);
                     self.recompute_boss();
-                    self.end_fight_on_boss_death(uid, timestamp_ms);
+                    let was_tracked_boss = self.boss_uid == Some(uid);
+                    let is_engaged = was_tracked_boss
+                        || self
+                            .enemies
+                            .get(&uid)
+                            .is_some_and(|e| is_engaged_recognized_boss(e, timestamp_ms));
+                    if self.fight_cfg.end_on_boss_death && is_engaged {
+                        self.end_fight_on_boss_death(uid, timestamp_ms);
+                    }
                 }
                 // A monster's `AttrState` going alive again (a respawn, or a
                 // false-negative on an earlier dead reading) is not handled
@@ -2806,7 +2831,7 @@ impl Meter {
     /// A no-op when no hold is latched, so every explicit-alive call site
     /// can call it unconditionally.
     fn release_wipe_hold_if_recovered(&mut self) {
-        if self.wipe_hold && !self.party_mostly_down() {
+        if self.wipe_hold && !self.roster_mostly_down() {
             self.wipe_hold = false;
         }
     }
@@ -6867,6 +6892,61 @@ mod tests {
             assert_eq!(m.snapshot(60_000).duration_ms, 1_000);
         }
 
+        /// Issue #366 review, finding O3: the `Monster` arm of
+        /// `apply_entity_state` must honor `end_on_boss_death` the same way
+        /// every other boss-death path already does (`apply_damage`,
+        /// `apply_enemy_gone`, `apply_enemy_hp`) — an `AttrState` dead
+        /// signal on the engaged boss must not end the fight when the
+        /// switch is off.
+        #[test]
+        fn attr_state_boss_death_honors_end_on_boss_death() {
+            let mut m = Meter::with_fight_config(FightConfig {
+                end_on_boss_death: false,
+                ..FightConfig::default()
+            });
+            m.apply(&boss_hit(10, 0, false));
+            m.apply(&hp(10, 50, Some(103), 0)); // 103 = a catalogued boss
+            m.apply(&ProtocolEvent::EntityState {
+                uid: 10,
+                kind: EntityKind::Monster,
+                is_dead: true,
+                timestamp_ms: 1_000,
+            });
+
+            assert_eq!(
+                m.fight_state(1_100),
+                FightState::Active,
+                "end_on_boss_death=false must leave the fight unended"
+            );
+        }
+
+        /// Issue #366 review, finding O4: the `Monster` arm must also carry
+        /// the same engagement precondition every other boss-death path
+        /// does (`boss_uid == Some(uid)`, or `is_engaged_recognized_boss`).
+        /// A uid merely present in `enemies` — populated by any `EnemyHp`
+        /// sync, engaged or not — must not end the fight just because its
+        /// `monster_id` is a recognized boss.
+        #[test]
+        fn attr_state_dead_for_an_unengaged_recognized_boss_does_not_end_the_fight() {
+            let mut m = Meter::new();
+            // A recognized boss synced into `enemies` (e.g. an AoI sync)
+            // that the party never actually engaged: no player hit ever
+            // landed on it.
+            m.apply(&hp(10, 50, Some(103), 0)); // 103 = a catalogued boss
+            m.apply(&ProtocolEvent::EntityState {
+                uid: 10,
+                kind: EntityKind::Monster,
+                is_dead: true,
+                timestamp_ms: 1_000,
+            });
+
+            assert_eq!(
+                m.fight_state(1_100),
+                FightState::Idle,
+                "an unengaged boss's death must not end (or start) a fight"
+            );
+        }
+
         /// The same signal for an enemy this meter has never otherwise seen
         /// (no prior `EnemyHp`) is dropped rather than fabricating an
         /// enemy row from nothing — mirrors `apply_enemy_gone`'s
@@ -7697,16 +7777,54 @@ mod tests {
         /// back up (`party_mostly_down` reading false again) lifts the
         /// hold early, rather than making the next real fight wait for
         /// `WIPE_HOLD_RELEASE_MS` or a hit on the recognized boss.
+        ///
+        /// Issue #366 review, finding O1: `release_wipe_hold_if_recovered`
+        /// used to guard on `party_mostly_down`, which reads `false`
+        /// unconditionally whenever `fight_end_ms` is set — true for the
+        /// entire time a wipe hold is up. That let a *single* battle-rez in
+        /// an 8-player wipe drop the hold outright. An 8-player roster
+        /// exercises that: one revive (7 of 8 still down, 87.5% >= the 80%
+        /// threshold) must not be enough; the hold only clears once fewer
+        /// than the wipe fraction are down.
         #[test]
         fn reviving_enough_of_the_party_releases_the_wipe_hold() {
-            let mut m = wiped();
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: RAID_SCENE,
+            });
+            for uid in 1..=8 {
+                m.apply(&player_info(uid, &format!("Player{uid}")));
+            }
+            m.apply(&enemy_hp(BOSS_UID, 1_000_000, BOSS, 0));
+            for uid in 1..=8 {
+                m.apply(&hit(uid, BOSS_UID, 1_000, 1_000));
+            }
+            for uid in 1..=8 {
+                m.apply(&killing_blow(uid, 5_000 + uid as u64));
+            }
             assert!(m.wipe_hold, "sanity: the wipe latched a hold");
-            // One of the two players revives — `party_mostly_down`'s 80%
-            // threshold no longer holds for a 2-player roster with only one
-            // down.
+            assert_eq!(m.fight_state(5_100), FightState::Ended);
+
+            // One battle-rez: 7 of 8 are still down (87.5%), still at or
+            // above the 80% wipe threshold — the hold must persist.
             m.apply(&ProtocolEvent::Revive {
                 uid: 1,
                 timestamp_ms: 6_500,
+            });
+            assert!(
+                m.wipe_hold,
+                "one revive out of eight must not release the hold"
+            );
+
+            // Two more revive: 5 of 8 down (62.5%), under the 80% wipe
+            // threshold — enough of the roster is back up.
+            m.apply(&ProtocolEvent::Revive {
+                uid: 2,
+                timestamp_ms: 6_600,
+            });
+            m.apply(&ProtocolEvent::Revive {
+                uid: 3,
+                timestamp_ms: 6_700,
             });
             assert!(!m.wipe_hold, "enough of the roster is back up");
 
