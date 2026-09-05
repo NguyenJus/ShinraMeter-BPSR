@@ -2680,7 +2680,11 @@ impl Meter {
             && let Some(stats) = self.players.get_mut(&d.target_uid)
         {
             accumulate_skill(stats.incoming.entry(d.skill_id).or_default(), d);
-            if !d.is_miss {
+            // Issue #338: absorbed/immune hits get their own channels on
+            // `stats` too (see `apply_damage`'s `stats.absorbed_total`/
+            // `stats.immune_total`), so only a `Normal`-kind hit may fold
+            // into `total_incoming`/damage-taken.
+            if !d.is_miss && d.kind == DamageKind::Normal {
                 stats.total_incoming += d.value;
             }
         }
@@ -3521,8 +3525,8 @@ pub fn skill_row_from_stats(
         hits: skill.hits,
         crit_hits: skill.crit_hits,
         hits_per_min,
-        absorbed: skill.absorbed_total,
-        immune: skill.immune_total,
+        absorbed_total: skill.absorbed_total,
+        immune_total: skill.immune_total,
     }
 }
 
@@ -3538,11 +3542,24 @@ fn skill_rows(stats: &PlayerStats, dps_duration_ms: u64) -> Vec<SkillRow> {
 /// (issue #245), mirroring `Meter::apply_damage`'s own outgoing-damage
 /// bookkeeping exactly: `hits` counts the swing whether or not it landed
 /// (a miss is a use of the skill, not a non-event), while every amount is
-/// gated on `!is_miss`.
+/// gated on `!is_miss`. Issue #338: an absorbed/immune hit's value is not a
+/// change to the target's HP either, so — same as the dealt side — it gets
+/// its own channel instead of folding into `total_damage`/crit/lucky.
 fn accumulate_skill(skill: &mut SkillStats, d: &DamageEvent) {
     skill.hits += 1;
     if d.is_miss {
         return;
+    }
+    match d.kind {
+        DamageKind::Absorbed => {
+            skill.absorbed_total += d.value;
+            return;
+        }
+        DamageKind::Immune => {
+            skill.immune_total += d.value;
+            return;
+        }
+        DamageKind::Normal => {}
     }
     skill.total_damage += d.value;
     if d.crit {
@@ -3648,8 +3665,8 @@ fn buff_rows(stats: &PlayerStats, dps_duration_ms: u64) -> Vec<SkillRow> {
             hits: buff.apply_count as u64,
             crit_hits: 0,
             hits_per_min: 0.0,
-            absorbed: 0,
-            immune: 0,
+            absorbed_total: 0,
+            immune_total: 0,
         })
         .collect();
     rows.sort_by_key(|s| std::cmp::Reverse(s.damage));
@@ -4167,6 +4184,33 @@ mod tests {
         assert!((row.received[0].share_pct - 100.0).abs() < 0.01);
         // The attacker was a monster, so no second row was opened for it.
         assert_eq!(snap.rows.len(), 1);
+    }
+
+    /// Issue #338: an absorbed hit on the *target* side must not leak into
+    /// `total_incoming` or the incoming skill's `total_damage` either —
+    /// mirrors `an_absorbed_hit_adds_to_absorbed_total_not_damage`'s
+    /// dealt-side assertion, but for `record_breakdowns`'s incoming path.
+    #[test]
+    fn an_absorbed_hit_on_a_player_leaves_incoming_damage_at_zero() {
+        let mut m = Meter::new();
+        m.apply(&dmg(1, 100, 1000));
+        m.apply(&ProtocolEvent::Damage(DamageEvent {
+            attacker_uid: 9,
+            attacker_kind: EntityKind::Monster,
+            target_uid: 1,
+            target_kind: EntityKind::Player,
+            skill_id: 77,
+            value: 500,
+            kind: DamageKind::Absorbed,
+            timestamp_ms: 1100,
+            ..Default::default()
+        }));
+        let snap = m.snapshot(2000);
+        let row = &snap.rows[0];
+        assert_eq!(m.players.get(&1).map(|p| p.total_incoming), Some(0));
+        assert_eq!(row.received[0].skill_id, 77);
+        assert_eq!(row.received[0].damage, 0);
+        assert_eq!(row.received[0].absorbed_total, 500);
     }
 
     #[test]
@@ -11207,13 +11251,13 @@ mod tests {
     #[test]
     fn an_immune_hit_adds_to_immune_total_not_damage() {
         let mut m = Meter::new();
-        m.apply(&immune_dmg(1, 0, 1_000));
+        m.apply(&immune_dmg(1, 250, 1_000));
         let snap = m.snapshot(2_000);
         let row = &snap.rows[0];
         assert_eq!(row.damage, 0);
-        assert_eq!(row.immune_total, 0);
+        assert_eq!(row.immune_total, 250);
         assert_eq!(row.hits, 1);
-        assert_eq!(snap.total_immune, 0);
+        assert_eq!(snap.total_immune, 250);
     }
 
     #[test]
@@ -11244,7 +11288,7 @@ mod tests {
         let skill = &snap.rows[0].skills[0];
         assert_eq!(skill.skill_id, 42);
         assert_eq!(skill.damage, 0);
-        assert_eq!(skill.absorbed, 500);
+        assert_eq!(skill.absorbed_total, 500);
     }
 
     #[test]

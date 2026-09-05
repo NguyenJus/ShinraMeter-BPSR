@@ -19815,8 +19815,8 @@ mod tests {
             hits: 10,
             crit_hits: 1,
             hits_per_min: 5.0,
-            absorbed: 0,
-            immune: 0,
+            absorbed_total: 0,
+            immune_total: 0,
         }
     }
 

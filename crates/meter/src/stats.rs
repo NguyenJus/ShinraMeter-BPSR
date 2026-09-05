@@ -468,9 +468,9 @@ pub struct SkillRow {
     pub hits_per_min: f64,
     /// This skill's `SkillStats::absorbed_total` (issue #338) — not part of
     /// `damage` above.
-    pub absorbed: i64,
+    pub absorbed_total: i64,
     /// This skill's `SkillStats::immune_total` (issue #338).
-    pub immune: i64,
+    pub immune_total: i64,
 }
 
 /// What the meter believes is being fought, as far as the packet stream reveals

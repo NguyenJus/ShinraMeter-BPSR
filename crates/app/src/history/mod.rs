@@ -120,8 +120,8 @@ impl SkillRecord {
             // them, so a replayed `SkillRow` always reads `0` here rather
             // than growing the sqlite schema for a field no saved encounter
             // can supply.
-            absorbed: 0,
-            immune: 0,
+            absorbed_total: 0,
+            immune_total: 0,
         }
     }
 }
@@ -558,8 +558,8 @@ mod tests {
             hits: 8,
             crit_hits: 2,
             hits_per_min: 40.5,
-            absorbed: 0,
-            immune: 0,
+            absorbed_total: 0,
+            immune_total: 0,
         }
     }
 
