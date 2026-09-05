@@ -1,6 +1,6 @@
 history=history_rows
 count=1
 summary title=Ignisor subtitle=Towering Ruin ended_at_ms=9000 duration_ms=7000 total_damage=1000000 total_dps=142857.14 players=2
-record title=Ignisor subtitle=Towering Ruin boss_monster_id=103 is_boss=true scene_id=1101 ended_at_ms=9000 duration_ms=7000 total_damage=1000000 total_dps=142857.14
-row slot=0 uid=1001 name=Aria class=Stormblade damage=800000 dps=114285.71 share=80.00 crit=0.00 lucky=0.00 hits=2 deaths=0
-row slot=1 uid=1002 name=Brin class=FrostMage damage=200000 dps=28571.43 share=20.00 crit=0.00 lucky=0.00 hits=1 deaths=0
+record title=Ignisor subtitle=Towering Ruin boss_monster_id=103 is_boss=true scene_id=1101 ended_at_ms=9000 duration_ms=7000 total_damage=1000000 total_dps=142857.14 local_uid=-
+row slot=0 uid=1001 entity=65602176 name=Aria class=Stormblade damage=800000 dps=114285.71 share=80.00 crit=0.00 lucky=0.00 hits=2 deaths=0
+row slot=1 uid=1002 entity=65667712 name=Brin class=FrostMage damage=200000 dps=28571.43 share=20.00 crit=0.00 lucky=0.00 hits=1 deaths=0

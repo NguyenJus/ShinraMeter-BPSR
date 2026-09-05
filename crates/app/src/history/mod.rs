@@ -291,9 +291,13 @@ pub struct EncounterRecord {
     pub subtitle: Option<String>,
     pub meter_version: String,
     /// The local player's uid at the moment this fight ended (issue #373),
-    /// mirroring `Snapshot::local_uid`. Persisted since schema v3; an
-    /// encounter saved before it reads back `None`, the same as a live
-    /// snapshot that never saw a local-player event.
+    /// mirroring `Snapshot::local_uid`, but only when that uid is actually
+    /// in this fight's saved roster (`players`) — `Meter::local_uid` is
+    /// never cleared on its own, so without this guard a snapshot taken
+    /// after the local player left the fight would save a `local_uid` that
+    /// names nobody in `players`. Persisted since schema v3; an encounter
+    /// saved before it reads back `None`, the same as a live snapshot that
+    /// never saw a local-player event.
     pub local_uid: Option<i64>,
     pub players: Vec<PlayerRecord>,
 }
@@ -372,7 +376,12 @@ pub fn record_from_snapshot(
         title,
         subtitle,
         meter_version: env!("CARGO_PKG_VERSION").to_string(),
-        local_uid: snapshot.local_uid,
+        // Guard against `Meter::local_uid` outliving the local player's
+        // roster row (it is never cleared on its own): only save it when
+        // it actually names one of this fight's saved rows.
+        local_uid: snapshot
+            .local_uid
+            .filter(|uid| snapshot.rows.iter().any(|r| r.uid == *uid)),
         players: snapshot.rows.iter().map(PlayerRecord::from).collect(),
     })
 }
@@ -411,8 +420,10 @@ impl EncounterRecord {
             // and is never checked for this (see `Snapshot::capture_alive`).
             // Issue #373: persisted since schema v3, so a rebuilt snapshot
             // can identify "you" the same as a live one — `None` here only
-            // for an encounter saved before the column existed, or one
-            // whose live fight never saw a local-player event.
+            // for an encounter saved before the column existed, one whose
+            // live fight never saw a local-player event, or one where the
+            // local player was not in the saved roster (see
+            // `EncounterRecord::local_uid`'s doc comment).
             local_uid: self.local_uid,
             capture_alive: true,
         }
@@ -562,6 +573,29 @@ mod tests {
 
         assert_eq!(record.title, "My Title");
         assert_eq!(record.subtitle, Some("My Subtitle".to_string()));
+    }
+
+    #[test]
+    fn record_from_snapshot_clears_a_local_uid_not_in_the_saved_roster() {
+        let mut snapshot = sample_snapshot(vec![sample_row(1, "Alice")], 1_000);
+        snapshot.local_uid = Some(999);
+
+        let record = record_from_snapshot(&snapshot, 1_000, "Title".to_string(), None).unwrap();
+
+        assert_eq!(
+            record.local_uid, None,
+            "local_uid naming nobody in the saved roster must not be persisted"
+        );
+    }
+
+    #[test]
+    fn record_from_snapshot_keeps_a_local_uid_in_the_saved_roster() {
+        let mut snapshot = sample_snapshot(vec![sample_row(1, "Alice")], 1_000);
+        snapshot.local_uid = Some(1);
+
+        let record = record_from_snapshot(&snapshot, 1_000, "Title".to_string(), None).unwrap();
+
+        assert_eq!(record.local_uid, Some(1));
     }
 
     #[test]

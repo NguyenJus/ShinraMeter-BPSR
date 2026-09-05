@@ -72,8 +72,16 @@ impl SqliteHistory {
                     "history db: migrating {} from schema v{v} to v{SCHEMA_VERSION}",
                     path.display()
                 );
-                migrate(&conn, v)?;
-                conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                // SQLite DDL (including `ALTER TABLE`) is transactional, so
+                // wrapping every migration step and the `user_version` bump
+                // in one transaction makes the whole upgrade atomic: either
+                // every step lands and the version bumps, or (on error, or a
+                // crash mid-migration) nothing commits and the file is left
+                // reading its original `v`, ready to retry on next open.
+                let tx = conn.unchecked_transaction()?;
+                migrate(&tx, v)?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                tx.commit()?;
             }
             v if allow_reset => {
                 log::warn!(
@@ -200,6 +208,9 @@ const SKILLS_DDL: &str = "CREATE TABLE IF NOT EXISTS encounter_player_skills (
 /// a file the previous version could still read, and a user's history is
 /// never wiped to gain a column.
 fn migrate(conn: &Connection, from: i32) -> Result<(), HistoryError> {
+    // Every step below is plain DDL (`CREATE TABLE`/`ALTER TABLE`), which
+    // SQLite runs transactionally like any other statement — safe to issue
+    // inside the caller's transaction alongside the `user_version` bump.
     // v1 → v2 (issue #222): per-skill totals. Nothing but a new table, so
     // encounters saved before it keep every field they had and simply have
     // no skill rows to hand back.
@@ -1022,11 +1033,15 @@ mod tests {
     fn two_players_sharing_a_recycled_uid_stay_distinct_by_entity() {
         let mut store = SqliteHistory::in_memory(RetentionPolicy::default()).unwrap();
         let mut first = sample_player(1, "Alice");
-        first.entity = 0xAAAA;
+        first.entity = EntityId::from_display_uid(1, EntityKind::Player).0 as i64;
         let mut second = sample_player(1, "Bob");
-        second.entity = 0xBBBB;
+        second.entity = first.entity | 0x1;
         let id = store
-            .insert(&sample_record(1_000, 10_000, vec![first, second]))
+            .insert(&sample_record(
+                1_000,
+                10_000,
+                vec![first.clone(), second.clone()],
+            ))
             .unwrap()
             .unwrap();
 
@@ -1034,8 +1049,8 @@ mod tests {
 
         assert_eq!(loaded.players[0].uid, 1);
         assert_eq!(loaded.players[1].uid, 1);
-        assert_eq!(loaded.players[0].entity, 0xAAAA);
-        assert_eq!(loaded.players[1].entity, 0xBBBB);
+        assert_eq!(loaded.players[0].entity, first.entity);
+        assert_eq!(loaded.players[1].entity, second.entity);
         assert_ne!(loaded.players[0].entity, loaded.players[1].entity);
 
         let snapshot = loaded.to_snapshot();

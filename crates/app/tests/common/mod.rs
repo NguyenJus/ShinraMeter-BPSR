@@ -383,7 +383,7 @@ fn render_history(
         ));
     }
     out.push_str(&format!(
-        "record title={} subtitle={} boss_monster_id={} is_boss={} scene_id={} ended_at_ms={} duration_ms={} total_damage={} total_dps={}\n",
+        "record title={} subtitle={} boss_monster_id={} is_boss={} scene_id={} ended_at_ms={} duration_ms={} total_damage={} total_dps={} local_uid={}\n",
         record.title,
         opt(record.subtitle.clone()),
         opt(record.boss_monster_id),
@@ -393,12 +393,14 @@ fn render_history(
         record.duration_ms,
         record.total_damage,
         fmt_f64(record.total_dps),
+        opt(record.local_uid),
     ));
     for (slot, player) in record.players.iter().enumerate() {
         out.push_str(&format!(
-            "row slot={} uid={} name={} class={} damage={} dps={} share={} crit={} lucky={} hits={} deaths={}\n",
+            "row slot={} uid={} entity={} name={} class={} damage={} dps={} share={} crit={} lucky={} hits={} deaths={}\n",
             slot,
             player.uid,
+            player.entity,
             player.name,
             match player.class {
                 Some(class) => class.name(),

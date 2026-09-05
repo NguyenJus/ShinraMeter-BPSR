@@ -34,7 +34,10 @@ use super::HistoryError;
 /// copy itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SanitizeReport {
-    /// Rows in `encounters` (unchanged by sanitizing — copied over as-is).
+    /// Rows in `encounters` — the row itself is neither added nor removed
+    /// by sanitizing, but `local_uid` is remapped to the same pseudonym as
+    /// the matching `encounter_players` row (or cleared to `NULL` when it
+    /// names no roster row in that encounter).
     pub encounters: u64,
     /// `encounter_players` rows whose `uid`/`name` were rewritten.
     pub players_remapped: u64,
@@ -81,22 +84,16 @@ impl Remap {
     fn name_for(&mut self, old_uid: i64) -> String {
         format!("Player{}", self.uid(old_uid))
     }
-
-    /// Whether `old` is a real player uid this remap has already seen —
-    /// used by [`sanitize_into`] to decide whether `encounters.local_uid`
-    /// names one of this encounter's own players (and so gets remapped
-    /// alongside them) or a bystander that never made the roster (and so
-    /// is dropped rather than leaked as an unmapped real uid).
-    fn contains(&self, old: i64) -> bool {
-        self.uids.contains_key(&old)
-    }
 }
 
 /// Snapshots the history database at `src` into `dst`, then rewrites every
 /// `encounter_players` row's `uid` and `name` in the copy to a stable
 /// pseudonym pair (see [`Remap`]) — the same uid always yields the same
 /// pseudonym within the copy, so a reader can still tell two rows are the
-/// same player without learning who that player is.
+/// same player without learning who that player is. `encounters.local_uid`
+/// is rewritten alongside them: remapped to the same pseudonym when it
+/// names one of that encounter's own roster rows, or cleared to `NULL`
+/// when it names no roster row there.
 ///
 /// `src` is opened read-only and snapshotted with SQLite's own `VACUUM
 /// INTO` rather than `fs::copy`: that's a consistent, transactionally-safe
@@ -110,7 +107,8 @@ impl Remap {
 /// real names/uids the `UPDATE`s overwrote don't linger as stale bytes in
 /// `dst`'s free pages. Every other column — `encounters.boss_name`,
 /// `scene_name`, `title`, `subtitle`, all of `encounter_player_skills` — is
-/// left exactly as copied: none of them name a player.
+/// left exactly as copied except `encounters.local_uid`, which is
+/// remapped (or cleared to `NULL`) as described above.
 ///
 /// On any error, `dst` (and a `<dst>-journal` sibling, if SQLite left one
 /// behind) is removed before returning — a half-sanitized copy must never
@@ -178,6 +176,21 @@ fn sanitize_into(src: &Path, dst: &Path) -> Result<SanitizeReport, HistoryError>
         .collect::<Result<Vec<_>, _>>()?
     };
 
+    // Issue #373: `encounters.local_uid` must only be remapped when it
+    // names one of *that encounter's own* roster rows — a db-wide remap
+    // check would wrongly pass through a `local_uid` that happens to match
+    // some other encounter's player uid. Built once, up front, from `rows`
+    // (rather than re-querying per encounter) since `rows` already has
+    // every `(encounter_id, uid)` pair in hand.
+    let mut roster_by_encounter: std::collections::HashMap<i64, std::collections::HashSet<i64>> =
+        std::collections::HashMap::new();
+    for (encounter_id, _slot, uid, _entity) in &rows {
+        roster_by_encounter
+            .entry(*encounter_id)
+            .or_default()
+            .insert(*uid);
+    }
+
     let mut remap = Remap::new();
     {
         let tx = conn.transaction()?;
@@ -203,11 +216,14 @@ fn sanitize_into(src: &Path, dst: &Path) -> Result<SanitizeReport, HistoryError>
         }
 
         // Issue #373: `encounters.local_uid` names a player, so it is
-        // remapped the same way — but only when it actually is one of this
-        // encounter's own players (the common case); a `local_uid` that
-        // matches no roster row (the local player left before the roster
-        // sync that would have added them) is cleared to `NULL` rather than
-        // leaked into the sanitized copy as an unmapped real uid.
+        // remapped the same way — but only when it actually is one of
+        // *that encounter's own* roster rows (the common case, checked
+        // against `roster_by_encounter`, not the db-wide `remap`); a
+        // `local_uid` that matches no roster row in its own encounter (the
+        // local player left before the roster sync that would have added
+        // them, or it happens to collide with some other encounter's uid)
+        // is cleared to `NULL` rather than leaked into the sanitized copy
+        // as an unmapped real uid.
         let encounters: Vec<(i64, Option<i64>)> = {
             let mut stmt = tx.prepare("SELECT id, local_uid FROM encounters")?;
             stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -215,7 +231,11 @@ fn sanitize_into(src: &Path, dst: &Path) -> Result<SanitizeReport, HistoryError>
         };
         for (id, local_uid) in encounters {
             let new_local_uid = local_uid
-                .filter(|uid| remap.contains(*uid))
+                .filter(|uid| {
+                    roster_by_encounter
+                        .get(&id)
+                        .is_some_and(|roster| roster.contains(uid))
+                })
                 .map(|uid| remap.uid(uid));
             tx.execute(
                 "UPDATE encounters SET local_uid = ?1 WHERE id = ?2",
@@ -525,6 +545,61 @@ mod tests {
             .query_row("SELECT local_uid FROM encounters", [], |row| row.get(0))
             .unwrap();
         assert_eq!(new_local_uid, None);
+
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&dst);
+    }
+
+    /// Issue #373: a `local_uid` must be checked against *its own*
+    /// encounter's roster, not the db-wide remap — a value that happens to
+    /// match some other encounter's player uid must still be cleared.
+    #[test]
+    fn sanitize_copy_scopes_local_uid_to_its_own_encounter_roster() {
+        let src = temp_db_path("seed-cross-encounter-local-uid");
+        let mut store = SqliteHistory::open(&src, RetentionPolicy::default()).unwrap();
+
+        // Encounter A: roster is uid 7, but local_uid names uid 9 — which
+        // never appears in A's own roster (it's only ever seen in B).
+        let mut record_a = sample_record(1_000, 10_000, vec![sample_player(7, "Alice")]);
+        record_a.local_uid = Some(9);
+        let id_a = store.insert(&record_a).unwrap().unwrap();
+
+        // Encounter B: roster is uid 9, and local_uid correctly names it.
+        let mut record_b = sample_record(2_000, 10_000, vec![sample_player(9, "Bob")]);
+        record_b.local_uid = Some(9);
+        let id_b = store.insert(&record_b).unwrap().unwrap();
+        drop(store);
+
+        let dst = temp_db_path("out-cross-encounter-local-uid");
+        sanitize_copy(&src, &dst).unwrap();
+
+        let conn = Connection::open(&dst).unwrap();
+        let local_uid_a: Option<i64> = conn
+            .query_row(
+                "SELECT local_uid FROM encounters WHERE id = ?1",
+                [id_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            local_uid_a, None,
+            "local_uid naming uid 9 must be cleared for A, whose own roster is only uid 7"
+        );
+
+        let (b_player_new_uid, local_uid_b): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT p.uid, e.local_uid FROM encounter_players p
+                 JOIN encounters e ON e.id = p.encounter_id
+                 WHERE e.id = ?1",
+                [id_b],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            local_uid_b,
+            Some(b_player_new_uid),
+            "local_uid naming uid 9 must follow B's own remapped roster uid"
+        );
 
         let _ = fs::remove_file(&src);
         let _ = fs::remove_file(&dst);
