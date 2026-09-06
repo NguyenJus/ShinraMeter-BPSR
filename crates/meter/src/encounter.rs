@@ -1534,17 +1534,7 @@ impl Meter {
         // The borrow ends here: the `hp_pct` diagnostic is all the held
         // branch needs from the target, and that branch stores into `self`.
         let live_pct = self.fought_target_alive().map(EnemyState::pct);
-        // "Nothing is standing" only describes a finished fight when
-        // something *was* fought and is now dead (issue #391). An empty
-        // damaged set is not that: `apply_enemy_hp` drops the whole
-        // `EnemyState`, `took_damage` included, when a uid re-templates onto
-        // a new `monster_id` (issue #317 — Abyssal Nappo cycles 4601/4607/
-        // 4612-4615/4621 inside a single pull), and latching on that empty
-        // set reinstates the very ~3s `NewFight` oscillation this issue is a
-        // report of, one re-template later. Hold instead: a later death path
-        // or the ordinary idle timeout closes the fight.
-        let confirmed_kill = live_pct.is_none() && self.enemies.values().any(|e| e.took_damage);
-        if confirmed_kill {
+        if self.dungeon_finish_resolvable() {
             self.latch_dungeon_end(source, self.last_event_ms);
             return;
         }
@@ -1592,9 +1582,16 @@ impl Meter {
     /// test reads them as ordinary mobs, and it is precisely those fights
     /// the early signal truncates.
     ///
-    /// Alive is `death_order.is_none() && curr_hp != Some(0)`, so an enemy
-    /// whose health was never observed counts as alive — the same reading
-    /// [`EnemyState::is_alive`] takes.
+    /// Aliveness is [`EnemyState::is_alive`] — `death_order.is_none() &&
+    /// curr_hp != Some(0)`, so the tracked boss counts as alive until its
+    /// health is actually observed at zero, the conservative reading for the
+    /// one enemy the whole fight is about.
+    ///
+    /// The fallback scan additionally requires `curr_hp.is_some()` (PR #395
+    /// review, finding O6): an *add* the party clipped once and whose HP no
+    /// packet ever carried is indistinguishable from a corpse, and letting
+    /// it read "alive" holds a completion signal open forever. The boss
+    /// branch cannot afford that asymmetry; a nameless add can.
     ///
     /// A *dead* `boss_entity` falls through to the damaged-enemy scan rather
     /// than answering `None` (issue #391): `recompute_boss`/`rank_boss` rank
@@ -1603,11 +1600,45 @@ impl Meter {
     /// hitting stands right next to it. Only "nothing this fight damaged is
     /// up" answers `None`.
     fn fought_target_alive(&self) -> Option<&EnemyState> {
-        let alive = |e: &EnemyState| e.death_order.is_none() && e.curr_hp != Some(0);
         self.boss_entity
             .and_then(|entity| self.enemies.get(&entity))
-            .filter(|boss| alive(boss))
-            .or_else(|| self.enemies.values().find(|e| e.took_damage && alive(e)))
+            .filter(|boss| boss.is_alive())
+            .or_else(|| {
+                self.enemies
+                    .values()
+                    .find(|e| e.took_damage && e.is_alive() && e.curr_hp.is_some())
+            })
+    }
+
+    /// True iff this fight damaged at least one enemy and every enemy it
+    /// damaged is dead (PR #395 review, finding O1).
+    ///
+    /// An *empty* damaged set is not a confirmed kill: `apply_enemy_hp`
+    /// drops the whole `EnemyState`, `took_damage` included, when a uid
+    /// re-templates onto a new `monster_id` (issue #317 — Abyssal Nappo
+    /// cycles 4601/4607/4612-4615/4621 inside a single pull), and treating
+    /// that empty set as "the fight is over" reinstates the ~3s `NewFight`
+    /// oscillation issue #391 is a report of, one re-template later.
+    fn fought_target_killed(&self) -> bool {
+        self.enemies
+            .values()
+            .any(|e| e.took_damage && !e.is_alive())
+    }
+
+    /// The one predicate both halves of the hold consult (PR #395 review,
+    /// finding O1): nothing the party was fighting is standing, something it
+    /// *was* fighting died, and the dungeon's own objective tracking is no
+    /// longer claiming the run is in progress.
+    ///
+    /// Before this was shared, the immediate-latch path in
+    /// `apply_dungeon_completion_signal` and the deferred path in
+    /// `end_fight_on_held_dungeon_finish` disagreed on both the kill test
+    /// and the §8 gate, so whether a dungeon ended depended on which side of
+    /// the killing blow the signal landed.
+    fn dungeon_finish_resolvable(&self) -> bool {
+        self.fought_target_alive().is_none()
+            && self.fought_target_killed()
+            && !self.dungeon_objective_still_running()
     }
 
     /// Turns a held completion signal into a real end once the party has
@@ -1636,16 +1667,12 @@ impl Meter {
         if self.fight_start_ms().is_none() || self.fight_end_ms().is_some() {
             return;
         }
-        if self.fought_target_alive().is_some() {
-            return;
-        }
-        // The same refusal `end_fight_on_boss_death` makes on issue #139 §8's
-        // gate (issues #256/#210/#211): while the instance's own objective
-        // says the run is still going, a death inside it is a phase of the
-        // fight rather than its end. A held completion signal waits that out
-        // instead of routing around a guard the boss-death path honours
-        // (issue #391).
-        if self.dungeon_objective_still_running() {
+        // The same predicate the immediate-latch path uses (PR #395 review,
+        // finding O1), which folds in the refusal `end_fight_on_boss_death`
+        // makes on issue #139 §8's gate (issues #256/#210/#211): while the
+        // instance's own objective says the run is still going, a death
+        // inside it is a phase of the fight rather than its end.
+        if !self.dungeon_finish_resolvable() {
             return;
         }
         self.latch_dungeon_end(source, now_ms);
@@ -1964,8 +1991,11 @@ impl Meter {
                 self.end_fight_on_boss_death(target_key(d), d.timestamp_ms);
             }
             // issue #391: after `end_fight_on_boss_death` has had its
-            // chance, so a recognized boss keeps `cause=boss_death`.
-            if d.is_dead {
+            // chance, so a recognized boss keeps `cause=boss_death`. Gated
+            // on the same config flag (PR #395 review, finding O5): a
+            // deployment that turned instant boss-death ends off must not
+            // get them back through the dungeon-hold path.
+            if self.fight_cfg.end_on_boss_death && d.is_dead {
                 self.end_fight_on_held_dungeon_finish(d.timestamp_ms);
             }
         }
@@ -2237,6 +2267,19 @@ impl Meter {
         // twins) is still held open by `other_living_boss`'s co-engagement
         // rule, which sees them because the party is hitting both.
         if self.scene_id.is_some_and(phase::is_boss_select_scene) {
+            return false;
+        }
+        // PR #395 review, finding O3: the instance's own terminal state
+        // outranks a stale objective (issue #391). `apply_dungeon_state`
+        // stores `End`/`Settlement` *before* dispatching, so a run whose
+        // last objective never reported `complete` would otherwise keep this
+        // gate closed for the rest of the instance and hold the completion
+        // signal forever. `IsFinishTarget` while the state is still `Active`
+        // stays gated on both paths.
+        if matches!(
+            self.dungeon_state,
+            Some(EDungeonState::End | EDungeonState::Settlement)
+        ) {
             return false;
         }
         if !self.dungeon_state.is_some_and(|s| s != EDungeonState::Null) {
@@ -2521,9 +2564,6 @@ impl Meter {
         self.mark_enemy_dead(entity);
         self.recompute_boss();
         self.end_fight_on_boss_death(entity, now_ms);
-        // issue #391: a despawn-as-death can be what clears the last thing
-        // standing in front of a held completion signal.
-        self.end_fight_on_held_dungeon_finish(now_ms);
     }
 
     /// Whether some enemy other than `dying_uid` is a recognized boss that
@@ -3126,8 +3166,11 @@ impl Meter {
                     if self.fight_cfg.end_on_boss_death && was_tracked_boss {
                         self.end_fight_on_boss_death(entity, timestamp_ms);
                     }
-                    // issue #391: same ordering as the other death paths.
-                    self.end_fight_on_held_dungeon_finish(timestamp_ms);
+                    // issue #391: same ordering, and the same
+                    // `end_on_boss_death` gate, as the other death paths.
+                    if self.fight_cfg.end_on_boss_death {
+                        self.end_fight_on_held_dungeon_finish(timestamp_ms);
+                    }
                 }
                 // A monster's `AttrState` going alive again (a respawn, or a
                 // false-negative on an earlier dead reading) is not handled
@@ -3484,7 +3527,7 @@ impl Meter {
         // `end_fight_on_boss_death` above has had its chance — and the one
         // that covers a boss no table recognizes, which never reaches that
         // path at all.
-        if e.curr_hp == Some(0) {
+        if self.fight_cfg.end_on_boss_death && e.curr_hp == Some(0) {
             self.end_fight_on_held_dungeon_finish(e.timestamp_ms);
         }
 
@@ -12951,6 +12994,15 @@ mod tests {
             assert_eq!(m.fight_end_ms(), None, "ended on the wiped damaged set");
             assert_eq!(m.fight_start_ms(), Some(1_000), "restarted the clock");
 
+            // PR #395 review, finding O8a: a bystander dying inside that gap
+            // is not this fight's kill. `any(took_damage)` would have read
+            // the *empty* damaged set plus a corpse as "the fight is over";
+            // `fought_target_killed` asks for a corpse this fight damaged,
+            // and uid 12 was never touched.
+            m.apply(&hp_at(12, HUNT_BOSS, 0, 2_500));
+            assert_eq!(m.fight_end_ms(), None, "ended on an undamaged corpse");
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+
             // The party keeps hitting the new form; still held.
             assert_eq!(m.apply(&boss_hit(BOSS_UID, 3_000, false)), None);
             m.apply(&hp_at(BOSS_UID, NAPPO_NEXT, 40, 3_000));
@@ -12991,7 +13043,10 @@ mod tests {
             m.apply(&objective(100, Some(0), Some(false)));
             m.apply(&boss_hit(BOSS_UID, 1_000, false));
             m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 50, 1_000));
-            m.apply(&dungeon_state(EDungeonState::End));
+            // Held via §7's producer, not `End`: the instance's own terminal
+            // state now outranks the objective (PR #395 review, finding O3),
+            // so only an `Active` instance can still be gated here.
+            m.apply(&var("IsFinishTarget", 1));
             assert_eq!(m.fight_end_ms(), None);
 
             m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 2_000));
@@ -13001,6 +13056,102 @@ mod tests {
             m.apply(&objective(100, None, Some(true)));
             m.apply(&boss_hit(BOSS_UID, 3_000, true));
             assert_eq!(m.fight_end_ms(), Some(3_000));
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+        }
+
+        /// PR #395 review, finding O1: the immediate-latch path must apply
+        /// the *same* §8 gate the deferred path does. A signal that arrives
+        /// after the kill, while the instance's objective is still
+        /// incomplete, used to latch outright while the identical signal
+        /// arriving one packet earlier was held — the outcome depended on
+        /// which side of the killing blow the signal landed.
+        #[test]
+        fn a_completion_signal_after_the_kill_is_held_while_the_objective_is_incomplete() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&objective(100, Some(0), Some(false)));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 100, 1_000));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 2_000));
+            assert_eq!(m.fight_end_ms(), None, "§8's gate did not hold the fight");
+
+            m.apply(&var("IsFinishTarget", 1));
+            assert_eq!(m.fight_end_ms(), None, "latched past the objective gate");
+
+            // Objective complete: the gate is down, and the next ~3s re-send
+            // of the same signal resolves the fight.
+            m.apply(&objective(100, None, Some(true)));
+            m.apply(&var("IsFinishTarget", 1));
+            assert_eq!(m.fight_end_ms(), Some(1_000));
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+        }
+
+        /// PR #395 review, finding O3: `apply_dungeon_state` stores `End`
+        /// *before* dispatching, so a run whose last objective never
+        /// reported `complete` would keep §8's gate shut for the rest of the
+        /// instance and hold the completion signal forever. The instance's
+        /// own terminal state outranks that stale objective.
+        #[test]
+        fn an_end_state_outranks_an_incomplete_objective() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&objective(100, Some(0), Some(false)));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 100, 1_000));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 2_000));
+            assert_eq!(m.fight_end_ms(), None);
+
+            m.apply(&dungeon_state(EDungeonState::End));
+            assert_eq!(m.fight_end_ms(), Some(1_000));
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+        }
+
+        /// PR #395 review, finding O6: an add the party clipped once and
+        /// whose HP no packet ever carried is indistinguishable from a
+        /// corpse. Treating it as alive held every completion signal in the
+        /// instance open; the fallback scan therefore requires an observed
+        /// `curr_hp`. The tracked boss keeps the conservative reading.
+        #[test]
+        fn a_damaged_add_with_unobserved_hp_does_not_hold_a_resolved_signal() {
+            const ADD_UID: i64 = 11;
+
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 50, 1_000));
+            // Damaged, never HP-synced: no `EnemyHp` packet ever names it.
+            m.apply(&boss_hit(ADD_UID, 2_000, false));
+
+            m.apply(&dungeon_state(EDungeonState::End));
+            assert_eq!(m.fight_end_ms(), None, "ended over the living boss");
+
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 2_000));
+            assert_eq!(m.fight_end_ms(), Some(2_000), "the add held the signal");
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+        }
+
+        /// PR #395 review, finding O5: `end_on_boss_death: false` turns off
+        /// instant end-on-kill, and the dungeon hold must not hand it back
+        /// through a death path. The kill no longer resolves the held
+        /// signal; a later re-send of the signal itself still does, because
+        /// by then the kill is a fact the dungeon's own word confirms.
+        #[test]
+        fn a_death_does_not_resolve_a_held_signal_when_end_on_boss_death_is_off() {
+            let mut m = Meter::with_fight_config(FightConfig {
+                end_on_boss_death: false,
+                ..Default::default()
+            });
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 50, 1_000));
+            m.apply(&dungeon_state(EDungeonState::End));
+            assert_eq!(m.fight_end_ms(), None);
+
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 2_000));
+            assert_eq!(m.fight_end_ms(), None, "the death path ended the fight");
+
+            m.apply(&dungeon_state(EDungeonState::End));
+            assert_eq!(m.fight_end_ms(), Some(1_000));
             assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
         }
 
