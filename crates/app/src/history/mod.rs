@@ -478,7 +478,9 @@ mod tests {
     fn sample_row(uid: i64, name: &str) -> PlayerRow {
         PlayerRow {
             uid,
-            entity: EntityId::from_display_uid(uid, EntityKind::Player).0 as i64,
+            entity: EntityId::from_display_uid(uid, EntityKind::Player)
+                .expect("in-range test uid")
+                .0 as i64,
             name: name.to_string(),
             class: Some(Class::Stormblade),
             ability_score: Some(1234),
