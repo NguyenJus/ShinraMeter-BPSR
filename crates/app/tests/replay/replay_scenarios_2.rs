@@ -31,7 +31,7 @@
 use crate::common::{Rig, assert_golden};
 use bpsr_app::history::sqlite::SqliteHistory;
 use bpsr_app::history::{HistoryStore, RetentionPolicy};
-use bpsr_meter::{FightState, ResetReason};
+use bpsr_meter::{FightEndCause, FightState, ResetReason};
 use bpsr_protocol::ProtocolEvent;
 use bpsr_test_support::scenario::{Hit, Scenario};
 use bpsr_test_support::wire::prof;
@@ -147,10 +147,17 @@ fn uid_recycle_across_pulls() {
 ///    in progress — the same "attach mid-fight, then learn where you are"
 ///    shape `replay_scenarios.rs`'s `starting_mid_instance` covers for a
 ///    late `Scene`, but for the dungeon's own start signal arriving late.
-/// 2. **The dungeon's own end signal ends the fight appropriately.**
-///    `EDungeonState::End` latches the fight end (`FightEndCause::
-///    DungeonEnded`) without itself being a `ResetReason` — more
-///    authoritative than the idle-timeout heuristic, and immediate.
+/// 2. **The dungeon's own end signal ends the fight, but not while the
+///    party is still swinging.** Issue #391: `EDungeonState::End` arriving
+///    with the fought boss still standing (`curr_hp` above zero) is *held*,
+///    not latched — Guild Hunt sends it at ~0.9% HP and the trailing damage
+///    belongs to the same fight, so latching it on arrival ended the pull
+///    early and handed the kill to a spurious new one. Nothing resolves the
+///    hold on a clock: the kill itself does. Here the boss is a recognized
+///    one (`IGNISOR`), so `end_fight_on_boss_death` gets to the same kill
+///    first and the cause is `FightEndCause::BossDeath` — the held signal
+///    only has to *not* have ended the fight early. Neither the hold nor
+///    the kill is itself a `ResetReason`.
 /// 3. **Leaving to the open world holds, it does not clear.** A plain
 ///    `Scene` transition to a *non*-dungeon destination after the fight has
 ///    already ended leaves the held numbers exactly as they were (issue
@@ -182,23 +189,36 @@ fn dungeon_enter_leave_events() {
         // The real pull begins now that the instance is confirmed started.
         .at(2_500)
         .hit(P_ARIA, M_BOSS, 101, 60_000)
+        // Issue #391: the End lands 500ms after a hit, with the boss alive
+        // on full-ish HP. The fight keeps running — the signal is held, not
+        // latched (an INFO `... held, target still alive hp_pct=...` line
+        // names it).
         .at(3_000)
         .dungeon_state(TOWERING_RUIN, DUNGEON_END)
         .tick()
-        .capture("dungeon_ended_by_flow_signal")
-        // The party zones out to an ordinary open-world scene.
+        .capture("dungeon_end_signal_held_while_boss_alive")
+        // The kill is what ends it. `IGNISOR` is in `MonsterTableBossIds`,
+        // so the boss-death latch fires on this same HP sync and names the
+        // cause; the held signal is the backstop for the bosses no table
+        // recognizes.
         .at(4_000)
+        .monster_hp(M_BOSS, 0)
+        .tick()
+        .capture("dungeon_end_held_signal_resolves_at_the_kill")
+        // The party zones out to an ordinary open-world scene.
+        .at(14_000)
         .enter_scene(ASTERIA_PLAINS)
         .tick()
         .capture("leaving_to_open_world_holds_the_numbers");
 
     let mut rig = Rig::new();
     let captures = rig.run(&scenario);
-    assert_eq!(captures.len(), 4);
+    assert_eq!(captures.len(), 5);
     let pre_entry = &captures[0];
     let entered = &captures[1];
-    let ended = &captures[2];
-    let left = &captures[3];
+    let held = &captures[2];
+    let ended = &captures[3];
+    let left = &captures[4];
 
     assert_eq!(
         pre_entry.fight_state,
@@ -218,17 +238,38 @@ fn dungeon_enter_leave_events() {
     assert_eq!(entered.snapshot.rows.len(), 0);
 
     assert_eq!(
+        held.fight_state,
+        FightState::Active,
+        "issue #391: an End against a boss still standing is held, not latched"
+    );
+    assert_eq!(held.fight_end_cause, None);
+    assert_eq!(
+        held.resets, entered.resets,
+        "an End signal is neither a fight end here nor itself a ResetReason"
+    );
+    assert_eq!(
+        held.snapshot.total_damage, 60_000,
+        "only the damage since the clean restart, not the pre-entry 40_000"
+    );
+    assert_eq!(held.snapshot.rows.len(), 1);
+
+    assert_eq!(
         ended.fight_state,
         FightState::Ended,
-        "the dungeon's own End signal ends the fight immediately"
+        "issue #391: the kill after the held End is what ends the fight"
+    );
+    assert_eq!(
+        ended.fight_end_cause,
+        Some(FightEndCause::BossDeath),
+        "a recognized boss's own death latch gets to the kill first"
     );
     assert_eq!(
         ended.resets, entered.resets,
-        "an End signal is a fight end, not itself a ResetReason"
+        "the kill fires no reset either"
     );
     assert_eq!(
         ended.snapshot.total_damage, 60_000,
-        "only the damage since the clean restart, not the pre-entry 40_000"
+        "the held numbers are the same ones the held signal was protecting"
     );
     assert_eq!(ended.snapshot.rows.len(), 1);
 
@@ -253,6 +294,7 @@ fn dungeon_enter_leave_events() {
 
     assert_golden(pre_entry);
     assert_golden(entered);
+    assert_golden(held);
     assert_golden(ended);
     assert_golden(left);
 }

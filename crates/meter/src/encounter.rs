@@ -446,6 +446,23 @@ pub struct Meter {
     /// The objective the instance is currently on (issue #139 §5),
     /// updated by each recognized transition. `None` until the first one.
     current_objective_id: Option<i32>,
+    /// The producer names of the dungeon completion signals that arrived
+    /// while the fight still had something to resolve, and so were *held*
+    /// rather than ending the fight (issue #391). Empty until one arrives;
+    /// each distinct `"is_finish_target"` / `"dungeon_state_end"` /
+    /// `"dungeon_state_settlement"` is pushed once by
+    /// [`Self::apply_dungeon_completion_signal`], and the most recent one
+    /// (the last element) is what [`Self::end_fight_on_held_dungeon_finish`]
+    /// latches under once the fight resolves.
+    ///
+    /// Fight-scoped, not instance-scoped: cleared by [`Self::reset`] (every
+    /// reason — a held signal describes the encounter that was just thrown
+    /// away) as well as by [`Self::clear_dungeon_instance_state`]. Holding
+    /// the producers rather than a bare `bool` is what keeps the end it
+    /// eventually latches attributable to the signals that asked for it —
+    /// issue #391's logs could not tell §3's and §7's producers apart, and a
+    /// dungeon that fires both is now reported as having fired both.
+    dungeon_finish_seen: Vec<&'static str>,
     /// The local player's own uid (issue #344), from the most recent
     /// `ProtocolEvent::LocalPlayer`. Session-scoped like `dungeon_state`/
     /// `objectives`: survives both `Meter::reset` (a fight ending says
@@ -508,6 +525,7 @@ impl Meter {
             objectives: BTreeMap::new(),
             first_objective_id: None,
             current_objective_id: None,
+            dungeon_finish_seen: Vec::new(),
             local_uid: None,
         }
     }
@@ -1100,6 +1118,14 @@ impl Meter {
                             self.boss_monster_id(),
                         );
                     }
+                    // issue #391 (PR #395 review, finding O8b): a completion
+                    // signal belongs to the scene being left, not whatever
+                    // comes next — drop any held one on every scene
+                    // transition, `cut_short` or not, so a fight that
+                    // already latched under `SceneChanged` above can never
+                    // be re-ended by a stale producer, and the fresh
+                    // instance's own signals start from a clean hold.
+                    self.dungeon_finish_seen.clear();
 
                     // issue #191: only entering a *dungeon/raid* scene
                     // clears the roster immediately. That is the one
@@ -1383,17 +1409,16 @@ impl Meter {
                 // `End`/`Settlement`. Every other var name is real,
                 // decoded, and deliberately ignored — the meter has no use
                 // for `music_value`, `cur_qinshi`, etc.
-                if name == "IsFinishTarget"
-                    && *value != 0
-                    && self.fight_start_ms().is_some()
-                    && self.fight_end_ms().is_none()
-                {
-                    self.latch_fight_end(
-                        FightEndCause::DungeonEnded,
-                        self.last_event_ms,
-                        self.last_event_ms,
-                        self.boss_monster_id(),
-                    );
+                //
+                // issue #391: no edge tracking on the value. Sea-Ringed
+                // Reef re-asserts this var every ~3s for the whole
+                // encounter, and each re-send used to end the fight; the
+                // repeats are harmless now because
+                // `apply_dungeon_completion_signal` either no-ops on an
+                // already-ended fight or holds the signal while the fought
+                // target is still standing.
+                if name == "IsFinishTarget" && *value != 0 {
+                    self.apply_dungeon_completion_signal("is_finish_target");
                 }
                 None
             }
@@ -1419,6 +1444,10 @@ impl Meter {
         self.objectives.clear();
         self.first_objective_id = None;
         self.current_objective_id = None;
+        // issue #391: leaving the instance is what re-arms both
+        // `DungeonEnded` producers — a completion signal belongs to the run
+        // that produced it, and the next run gets to end itself once.
+        self.dungeon_finish_seen.clear();
     }
 
     /// Applies a `DungeonState` transition (issue #139 §§2-4).
@@ -1454,15 +1483,19 @@ impl Meter {
             // `last_event_ms`, not "now": the fight ended when the hitting
             // stopped, the same rule the `Scene` arm's `SceneChanged` latch
             // above already follows.
+            //
+            // issue #391: deliberately no edge tracking on the state. A
+            // re-send is handed to `apply_dungeon_completion_signal` like
+            // any other signal, which no-ops on an already-ended fight and
+            // holds the signal while the fought target is still standing —
+            // so a level-triggered producer can no longer end the fresh
+            // fight that the intervening `NewFight` reset started.
             EDungeonState::End | EDungeonState::Settlement => {
-                if self.fight_start_ms().is_some() && self.fight_end_ms().is_none() {
-                    self.latch_fight_end(
-                        FightEndCause::DungeonEnded,
-                        self.last_event_ms,
-                        self.last_event_ms,
-                        self.boss_monster_id(),
-                    );
-                }
+                let source = match state {
+                    EDungeonState::Settlement => "dungeon_state_settlement",
+                    _ => "dungeon_state_end",
+                };
+                self.apply_dungeon_completion_signal(source);
                 None
             }
             // §4: back to open world (or a dungeon the meter has not
@@ -1479,6 +1512,193 @@ impl Meter {
             | EDungeonState::Ready
             | EDungeonState::Vote
             | EDungeonState::Unknown(_) => None,
+        }
+    }
+
+    /// The single place both §3's `End`/`Settlement` and §7's
+    /// `IsFinishTarget` hand their completion signal to (issue #391).
+    ///
+    /// Three outcomes:
+    ///
+    /// 1. No fight is running, or one already ended — nothing to do. This is
+    ///    what makes the repeats harmless: after an end has latched, the
+    ///    next damage packet fires `ResetReason::NewFight`, and a level-
+    ///    triggered signal used to end that fresh fight straight away, which
+    ///    is the 3s-period oscillation the issue is a report of.
+    /// 2. The fight still has something to resolve — either something the
+    ///    party was fighting is standing ([`Self::fought_target_alive`]) or
+    ///    the meter knows of no damaged enemy at all — *held*, not dropped.
+    ///    Guild Hunt's signal lands a few hundred ms before the killing blow,
+    ///    so latching it there ended the fight and handed the last seconds of
+    ///    the boss to a spurious new one. The kill itself closes the fight
+    ///    instead, through [`Self::end_fight_on_held_dungeon_finish`].
+    /// 3. A *confirmed kill* — this fight damaged at least one enemy and
+    ///    every enemy it damaged is dead — so the dungeon really is over and
+    ///    its word is more authoritative than any heuristic: latch it (§3).
+    fn apply_dungeon_completion_signal(&mut self, source: &'static str) {
+        if self.fight_start_ms().is_none() || self.fight_end_ms().is_some() {
+            return;
+        }
+        // The borrow ends here: the `hp_pct` diagnostic is all the held
+        // branch needs from the target, and that branch stores into `self`.
+        let live_pct = self.fought_target_alive().map(EnemyState::pct);
+        if self.dungeon_finish_resolvable() {
+            self.latch_dungeon_end(source, self.last_event_ms);
+            return;
+        }
+        // Most-recent-last (PR #395 review, finding S2): a producer already
+        // held that fires again is moved to the back rather than left in
+        // place, so `dungeon_finish_seen.last()` — what
+        // `end_fight_on_held_dungeon_finish` and `latch_dungeon_end` name as
+        // the resolving source — is always whichever producer signalled
+        // most recently, not whichever signalled first.
+        if let Some(pos) = self.dungeon_finish_seen.iter().position(|s| *s == source) {
+            self.dungeon_finish_seen.remove(pos);
+            self.dungeon_finish_seen.push(source);
+        } else {
+            self.dungeon_finish_seen.push(source);
+            // Once per distinct producer per fight (issue #69): the re-sends
+            // are a ~3s cadence, and every repeat of a producer already held
+            // is a silent no-op. A dungeon that fires both §3's and §7's
+            // producer logs both, so the capture names every signal the hold
+            // is standing on.
+            log::info!(
+                "encounter: dungeon completion signal source={source} held, \
+                 target hp_pct={:.1} damaged_enemies={} (issue #391)",
+                live_pct.flatten().unwrap_or(-1.0),
+                self.enemies.values().filter(|e| e.took_damage).count()
+            );
+        }
+    }
+
+    /// Latches [`FightEndCause::DungeonEnded`] at `end_ms` (issue #391). The
+    /// extra `info` line names which of the two producers fired, which the
+    /// shared `encounter: fight ended cause=dungeon_ended ...` line cannot
+    /// say — the whole reason issue #391's logs could not tell them apart.
+    fn latch_dungeon_end(&mut self, source: &str, end_ms: u64) {
+        log::info!(
+            "encounter: dungeon completion signal source={source} ended the fight, \
+             held producers={:?} (issue #391)",
+            self.dungeon_finish_seen
+        );
+        self.latch_fight_end(
+            FightEndCause::DungeonEnded,
+            end_ms,
+            end_ms,
+            self.boss_monster_id(),
+        );
+    }
+
+    /// The target the party is fighting, if it is still standing (issue
+    /// #391): the tracked `boss_entity` when there is one — whatever the
+    /// boss tables think of it — and otherwise any enemy this fight has
+    /// damaged.
+    ///
+    /// Deliberately not gated on `tables::is_boss_monster` and not
+    /// [`Self::engaged_boss_still_up`]: Guild Hunt's bosses (80015-80018)
+    /// are absent from `MonsterTableBossIds.json`, so every boss-identity
+    /// test reads them as ordinary mobs, and it is precisely those fights
+    /// the early signal truncates.
+    ///
+    /// Aliveness is [`EnemyState::is_alive`] — `death_order.is_none() &&
+    /// curr_hp != Some(0)`, so the tracked boss counts as alive until its
+    /// health is actually observed at zero, the conservative reading for the
+    /// one enemy the whole fight is about.
+    ///
+    /// The fallback scan additionally requires `curr_hp.is_some()` (PR #395
+    /// review, finding O6): an *add* the party clipped once and whose HP no
+    /// packet ever carried is indistinguishable from a corpse, and letting
+    /// it read "alive" holds a completion signal open forever. The boss
+    /// branch cannot afford that asymmetry; a nameless add can.
+    ///
+    /// A *dead* `boss_entity` falls through to the damaged-enemy scan rather
+    /// than answering `None` (issue #391): `recompute_boss`/`rank_boss` rank
+    /// `recognized` above `alive`, so the tracked boss can sit on a
+    /// recognized corpse — or on an add — while the thing the party is still
+    /// hitting stands right next to it. Only "nothing this fight damaged is
+    /// up" answers `None`.
+    fn fought_target_alive(&self) -> Option<&EnemyState> {
+        self.boss_entity
+            .and_then(|entity| self.enemies.get(&entity))
+            .filter(|boss| boss.is_alive())
+            .or_else(|| {
+                self.enemies
+                    .values()
+                    .find(|e| e.took_damage && e.is_alive() && e.curr_hp.is_some())
+            })
+    }
+
+    /// True iff this fight damaged at least one enemy and every enemy it
+    /// damaged is dead (PR #395 review, finding O1).
+    ///
+    /// An *empty* damaged set is not a confirmed kill: `apply_enemy_hp`
+    /// drops the whole `EnemyState`, `took_damage` included, when a uid
+    /// re-templates onto a new `monster_id` (issue #317 — Abyssal Nappo
+    /// cycles 4601/4607/4612-4615/4621 inside a single pull), and treating
+    /// that empty set as "the fight is over" reinstates the ~3s `NewFight`
+    /// oscillation issue #391 is a report of, one re-template later.
+    fn fought_target_killed(&self) -> bool {
+        self.enemies
+            .values()
+            .any(|e| e.took_damage && !e.is_alive())
+    }
+
+    /// The one predicate both halves of the hold consult (PR #395 review,
+    /// finding O1): nothing the party was fighting is standing, something it
+    /// *was* fighting died, and the dungeon's own objective tracking is no
+    /// longer claiming the run is in progress.
+    ///
+    /// Before this was shared, the immediate-latch path in
+    /// `apply_dungeon_completion_signal` and the deferred path in
+    /// `end_fight_on_held_dungeon_finish` disagreed on both the kill test
+    /// and the §8 gate, so whether a dungeon ended depended on which side of
+    /// the killing blow the signal landed.
+    fn dungeon_finish_resolvable(&self) -> bool {
+        self.fought_target_alive().is_none()
+            && self.fought_target_killed()
+            && !self.dungeon_objective_still_running()
+    }
+
+    /// Turns a held completion signal into a real end once the party has
+    /// nothing left standing in front of it (issue #391) — the killing blow
+    /// that lands right after Guild Hunt's early signal, or the HP sync to
+    /// zero that stands in for it.
+    ///
+    /// Called from the paths that can kill an enemy, *after*
+    /// `end_fight_on_boss_death` has had its chance, so a recognized boss
+    /// keeps its own `cause=boss_death` end and this only covers the bosses
+    /// no table recognizes. Nothing resolves on a clock: a party that walks
+    /// away from a held signal falls back to the idle timeout, the pre-#139
+    /// backstop.
+    ///
+    /// Both fight-end timestamps are the killing event's `now_ms`, mirroring
+    /// `end_fight_on_boss_death`, so trailing damage inside
+    /// `post_end_grace_ms` folds into the held fight rather than firing
+    /// `ResetReason::NewFight`.
+    fn end_fight_on_held_dungeon_finish(&mut self, now_ms: u64) {
+        // `None` in every session that never sees a dungeon completion
+        // signal, which is what keeps this a single `Option` test on the
+        // hot path.
+        let Some(&source) = self.dungeon_finish_seen.last() else {
+            return;
+        };
+        if self.fight_start_ms().is_none() || self.fight_end_ms().is_some() {
+            return;
+        }
+        // The same predicate the immediate-latch path uses (PR #395 review,
+        // finding O1), which folds in the refusal `end_fight_on_boss_death`
+        // makes on issue #139 §8's gate (issues #256/#210/#211): while the
+        // instance's own objective says the run is still going, a death
+        // inside it is a phase of the fight rather than its end.
+        if !self.dungeon_finish_resolvable() {
+            return;
+        }
+        self.latch_dungeon_end(source, now_ms);
+        // ...and the same post-latch arming `end_fight_on_boss_death` does,
+        // so the next phase of a multi-phase boss is protected by
+        // `withholds_new_fight` rather than reading as a brand-new fight.
+        if let Some(id) = self.boss_monster_id() {
+            self.fight_lifecycle.arm_phase_resume(id);
         }
     }
 
@@ -1532,6 +1752,12 @@ impl Meter {
         let is_new_objective =
             Some(target_id) != prior_current && complete == Some(false) && nums == Some(0);
         if !is_new_objective {
+            // issue #391 (PR #395 review, finding O2): this update did not
+            // move the objective off the one a held completion signal is
+            // gated on, but it may still be what just marked that objective
+            // complete — re-check the hold every time the gate could have
+            // lifted, not only on a transition.
+            self.end_fight_on_held_dungeon_finish(self.last_event_ms);
             return None;
         }
 
@@ -1555,6 +1781,11 @@ impl Meter {
             self.reset(ResetReason::DungeonStarted, self.last_event_ms);
             Some(ResetReason::DungeonStarted)
         } else {
+            // issue #391 (PR #395 review, finding O2): the transition itself
+            // can be what lifts the gate a held completion signal is waiting
+            // on — re-check now rather than only on the next damage/death
+            // event.
+            self.end_fight_on_held_dungeon_finish(self.last_event_ms);
             None
         }
     }
@@ -1578,6 +1809,10 @@ impl Meter {
         if self.current_objective_id == Some(target_id) {
             self.current_objective_id = None;
         }
+        // issue #391 (PR #395 review, finding O2): clearing the gated
+        // objective can itself be what lifts a held completion signal's
+        // gate — re-check right away.
+        self.end_fight_on_held_dungeon_finish(self.last_event_ms);
     }
 
     fn apply_damage(&mut self, d: &DamageEvent) -> Option<ResetReason> {
@@ -1787,6 +2022,14 @@ impl Meter {
             // instead of on a straggler's last tick of DoT damage.
             if self.fight_cfg.end_on_boss_death && d.is_dead && was_tracked_boss {
                 self.end_fight_on_boss_death(target_key(d), d.timestamp_ms);
+            }
+            // issue #391: after `end_fight_on_boss_death` has had its
+            // chance, so a recognized boss keeps `cause=boss_death`. Gated
+            // on the same config flag (PR #395 review, finding O5): a
+            // deployment that turned instant boss-death ends off must not
+            // get them back through the dungeon-hold path.
+            if self.fight_cfg.end_on_boss_death && d.is_dead {
+                self.end_fight_on_held_dungeon_finish(d.timestamp_ms);
             }
         }
 
@@ -2057,6 +2300,19 @@ impl Meter {
         // twins) is still held open by `other_living_boss`'s co-engagement
         // rule, which sees them because the party is hitting both.
         if self.scene_id.is_some_and(phase::is_boss_select_scene) {
+            return false;
+        }
+        // PR #395 review, finding O3: the instance's own terminal state
+        // outranks a stale objective (issue #391). `apply_dungeon_state`
+        // stores `End`/`Settlement` *before* dispatching, so a run whose
+        // last objective never reported `complete` would otherwise keep this
+        // gate closed for the rest of the instance and hold the completion
+        // signal forever. `IsFinishTarget` while the state is still `Active`
+        // stays gated on both paths.
+        if matches!(
+            self.dungeon_state,
+            Some(EDungeonState::End | EDungeonState::Settlement)
+        ) {
             return false;
         }
         if !self.dungeon_state.is_some_and(|s| s != EDungeonState::Null) {
@@ -2943,6 +3199,11 @@ impl Meter {
                     if self.fight_cfg.end_on_boss_death && was_tracked_boss {
                         self.end_fight_on_boss_death(entity, timestamp_ms);
                     }
+                    // issue #391: same ordering, and the same
+                    // `end_on_boss_death` gate, as the other death paths.
+                    if self.fight_cfg.end_on_boss_death {
+                        self.end_fight_on_held_dungeon_finish(timestamp_ms);
+                    }
                 }
                 // A monster's `AttrState` going alive again (a respawn, or a
                 // false-negative on an earlier dead reading) is not handled
@@ -3295,6 +3556,14 @@ impl Meter {
             }
         }
 
+        // issue #391: the other death signal, after
+        // `end_fight_on_boss_death` above has had its chance — and the one
+        // that covers a boss no table recognizes, which never reaches that
+        // path at all.
+        if self.fight_cfg.end_on_boss_death && e.curr_hp == Some(0) {
+            self.end_fight_on_held_dungeon_finish(e.timestamp_ms);
+        }
+
         // PR #223 review, finding 1: deliberately the *post*-`recompute_boss`
         // identity, not `was_tracked_boss`. The two checks ask opposite
         // questions of the same sync. A death asks "was this the boss we were
@@ -3625,6 +3894,10 @@ impl Meter {
         // cleared-only-some-of-them defect class issue #336 step 3
         // removes.
         self.fight_lifecycle.reset();
+        // issue #391: a held dungeon completion signal describes the fight
+        // that was just thrown away — every reset reason drops it, so the
+        // next fight's kill cannot be ended by the previous one's signal.
+        self.dungeon_finish_seen.clear();
         self.last_reset_ms = Some(now_ms);
         // No enemy has `took_damage` anymore, so this clears `boss_entity`.
         // Otherwise a stale `boss_entity` from the previous pull would still
@@ -12427,6 +12700,21 @@ mod tests {
             })
         }
 
+        /// [`hp`] with an explicit current HP out of the same 100 pool —
+        /// what issue #391's "the boss is still alive with HP left" rule
+        /// reads.
+        fn hp_at(uid: i64, monster_id: u32, curr: u64, ts: u64) -> ProtocolEvent {
+            ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster)
+                    .expect("in-range test uid"),
+                uid,
+                curr_hp: Some(curr),
+                max_hp: Some(100),
+                monster_id: Some(monster_id),
+                timestamp_ms: ts,
+            })
+        }
+
         fn dungeon_state(state: EDungeonState) -> ProtocolEvent {
             ProtocolEvent::DungeonState {
                 state,
@@ -12490,7 +12778,13 @@ mod tests {
         #[test]
         fn dungeon_state_end_latches_the_fight_end_at_the_last_damage_time() {
             let mut m = Meter::new();
-            m.apply(&dmg(1, 100, 1_000));
+            // issue #391: the latch is now gated on a confirmed kill — an
+            // enemy this fight damaged, and no damaged enemy left standing —
+            // so the fought target is killed off before the signal lands.
+            // `HUNT_BOSS` is unrecognized, so nothing but the signal can end
+            // this fight, and `EnemyHp` does not move `last_event_ms`.
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 1_100));
             m.apply(&dungeon_state(EDungeonState::End));
 
             assert_eq!(m.fight_end_ms(), Some(1_000));
@@ -12500,7 +12794,8 @@ mod tests {
         #[test]
         fn dungeon_state_settlement_latches_the_fight_end_at_the_last_damage_time() {
             let mut m = Meter::new();
-            m.apply(&dmg(1, 100, 1_000));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 1_100));
             m.apply(&dungeon_state(EDungeonState::Settlement));
 
             assert_eq!(m.fight_end_ms(), Some(1_000));
@@ -12592,7 +12887,8 @@ mod tests {
         #[test]
         fn is_finish_target_var_with_a_nonzero_value_latches_the_fight_end() {
             let mut m = Meter::new();
-            m.apply(&dmg(1, 100, 1_000));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 1_100));
             m.apply(&var("IsFinishTarget", 1));
 
             assert_eq!(m.fight_end_ms(), Some(1_000));
@@ -12615,6 +12911,372 @@ mod tests {
             m.apply(&dmg(1, 100, 1_000));
             m.apply(&var("music_value", 999));
 
+            assert_eq!(m.fight_end_ms(), None);
+        }
+
+        /// The Guild Hunt Hard bosses of issue #391 (80015-80018), none of
+        /// which is in `MonsterTableBossIds.json` — so `end_fight_on_boss_death`
+        /// never fires for them and nothing but the dungeon's own completion
+        /// signal can end those fights.
+        const HUNT_BOSS: u32 = 80_017;
+
+        /// issue #391, Sea-Ringed Reef (scene 6565): the server re-sends
+        /// `IsFinishTarget` every ~3s for the whole encounter while the boss's
+        /// HP falls monotonically. Level-triggered, every re-send ended the
+        /// fight and the next hit fired `ResetReason::NewFight`, snapping the
+        /// timer to 0:00 on that same 3s period. A completion signal must
+        /// never end a fight whose fought target is still standing.
+        #[test]
+        fn a_repeated_completion_signal_never_ends_the_fight_while_the_boss_is_alive() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, BOSS, 99, 1_000));
+
+            for wave in 0..20u64 {
+                let ts = 1_000 + (wave + 1) * 3_000;
+                assert_eq!(m.apply(&var("IsFinishTarget", 1)), None, "wave {wave}");
+                assert_eq!(m.apply(&boss_hit(BOSS_UID, ts, false)), None, "wave {wave}");
+                assert_eq!(
+                    m.apply(&hp_at(BOSS_UID, BOSS, 99 - wave, ts)),
+                    None,
+                    "wave {wave}"
+                );
+                assert_eq!(m.fight_end_ms(), None, "wave {wave} ended the fight");
+                assert_eq!(
+                    m.fight_start_ms(),
+                    Some(1_000),
+                    "wave {wave} restarted the clock"
+                );
+            }
+
+            // The kill is the only thing that ends it, once. 4601's stand-in
+            // is a recognized boss, so `end_fight_on_boss_death` gets there
+            // first and the cause stays `BossDeath`.
+            m.apply(&hp_at(BOSS_UID, BOSS, 0, 61_000));
+            assert_eq!(m.fight_end_ms(), Some(61_000));
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::BossDeath));
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+
+            // Trailing damage inside `post_end_grace_ms` folds into the
+            // held fight rather than starting a new one.
+            assert_eq!(m.apply(&boss_hit(BOSS_UID, 61_300, false)), None);
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+            assert_eq!(m.fight_end_ms(), Some(61_000));
+        }
+
+        /// issue #391, Guild Hunt Hard (scene 12023): the completion signal
+        /// lands a few hundred ms *before* the kill, at 0.0-0.9% boss HP, on
+        /// a boss no boss table recognizes. Held while that target is alive,
+        /// it latches on the kill itself — one end, stamped at the kill, with
+        /// the dungeon's cause, and no `NewFight` from the trailing damage.
+        #[test]
+        fn a_completion_signal_before_an_unrecognized_boss_dies_ends_once_at_the_kill() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 100, 1_000));
+            m.apply(&boss_hit(BOSS_UID, 5_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 1, 5_000));
+
+            m.apply(&dungeon_state(EDungeonState::End));
+            assert_eq!(m.fight_end_ms(), None, "ended over a living boss");
+
+            // More damage after the signal, still no end.
+            assert_eq!(m.apply(&boss_hit(BOSS_UID, 5_300, false)), None);
+            assert_eq!(m.fight_end_ms(), None);
+
+            assert_eq!(m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 5_500)), None);
+            assert_eq!(m.fight_end_ms(), Some(5_500));
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+            assert_eq!(m.fight_state(5_600), FightState::Ended);
+
+            // The reset issue #391 is a report of.
+            assert_eq!(m.apply(&boss_hit(BOSS_UID, 5_800, false)), None);
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+            assert_eq!(m.fight_end_ms(), Some(5_500));
+
+            // The second `dungeon_ended` the logs show ~5s later: a no-op.
+            assert_eq!(m.apply(&dungeon_state(EDungeonState::End)), None);
+            assert_eq!(m.fight_end_ms(), Some(5_500));
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+        }
+
+        /// issue #391: with nothing the party was fighting left standing, the
+        /// dungeon's word is authoritative and the end latches immediately —
+        /// §3's original behavior, unchanged.
+        #[test]
+        fn a_completion_signal_with_no_live_target_still_ends_the_fight_immediately() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 1_100));
+            assert_eq!(m.fight_end_ms(), None, "unrecognized boss ended the fight");
+
+            m.apply(&dungeon_state(EDungeonState::End));
+            assert_eq!(m.fight_end_ms(), Some(1_000));
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+        }
+
+        /// issue #391: `boss_entity` can sit on a *corpse* — `rank_boss`
+        /// ranks `recognized` above `alive`, and §8's objective gate keeps
+        /// the fight open past a recognized boss's death — while the party
+        /// is still being fought by something else. Reading the tracked
+        /// boss's death as "nothing is standing" latched the signal in the
+        /// middle of that fight; the damaged-enemy scan behind it sees the
+        /// add that is actually up.
+        #[test]
+        fn a_signal_arriving_while_the_tracked_boss_is_a_corpse_looks_past_it() {
+            const ADD_UID: i64 = 11;
+
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&objective(100, Some(0), Some(false)));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, BOSS, 50, 1_000));
+            m.apply(&hp_at(BOSS_UID, BOSS, 0, 2_000));
+            assert_eq!(m.fight_end_ms(), None, "§8's gate did not hold the fight");
+
+            // The add the party turns to next: damaged, alive, and — being
+            // unrecognized — ranked *below* the recognized corpse, so
+            // `boss_entity` stays on the dead boss.
+            m.apply(&boss_hit(ADD_UID, 3_000, false));
+            m.apply(&hp_at(ADD_UID, HUNT_BOSS, 80, 3_000));
+            m.apply(&var("IsFinishTarget", 1));
+
+            assert_eq!(m.fight_end_ms(), None, "ended over a living add");
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+        }
+
+        /// Abyssal Nappo's first form (issue #391): a `MonsterTableBossIds`
+        /// entry, so `end_fight_on_boss_death` recognizes it...
+        const NAPPO: u32 = 4_601;
+        /// ...and the form the same uid re-templates into mid-pull, which is
+        /// *not* in that table.
+        const NAPPO_NEXT: u32 = 4_607;
+
+        /// issue #391: a uid re-templating onto a new `monster_id` wipes the
+        /// whole `EnemyState` (issue #317), `took_damage` with it, so the
+        /// meter momentarily knows of no damaged enemy at all. That is not a
+        /// finished fight, and the ~3s completion re-send that lands in the
+        /// gap must not latch on it — doing so restarts the fight on the next
+        /// hit, which is the oscillation this issue is a report of.
+        #[test]
+        fn a_re_templated_uid_does_not_let_a_repeated_signal_end_the_fight() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, NAPPO, 60, 1_000));
+            m.apply(&var("IsFinishTarget", 1));
+            assert_eq!(m.fight_end_ms(), None, "ended over a living boss");
+
+            // The re-template: same uid, new form, damaged set now empty.
+            m.apply(&hp_at(BOSS_UID, NAPPO_NEXT, 100, 2_000));
+            m.apply(&var("IsFinishTarget", 1));
+            assert_eq!(m.fight_end_ms(), None, "ended on the wiped damaged set");
+            assert_eq!(m.fight_start_ms(), Some(1_000), "restarted the clock");
+
+            // PR #395 review, finding O8a: a bystander dying inside that gap
+            // is not this fight's kill. `any(took_damage)` would have read
+            // the *empty* damaged set plus a corpse as "the fight is over";
+            // `fought_target_killed` asks for a corpse this fight damaged,
+            // and uid 12 was never touched.
+            m.apply(&hp_at(12, HUNT_BOSS, 0, 2_500));
+            assert_eq!(m.fight_end_ms(), None, "ended on an undamaged corpse");
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+
+            // The party keeps hitting the new form; still held.
+            assert_eq!(m.apply(&boss_hit(BOSS_UID, 3_000, false)), None);
+            m.apply(&hp_at(BOSS_UID, NAPPO_NEXT, 40, 3_000));
+            m.apply(&var("IsFinishTarget", 1));
+            assert_eq!(m.fight_end_ms(), None);
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+
+            // The kill resolves the held signal, exactly once.
+            m.apply(&hp_at(BOSS_UID, NAPPO_NEXT, 0, 4_000));
+            assert_eq!(m.fight_end_ms(), Some(4_000));
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+            m.apply(&var("IsFinishTarget", 1));
+            assert_eq!(m.fight_end_ms(), Some(4_000));
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+        }
+
+        /// issue #391: a completion signal that arrives while the meter knows
+        /// of no damaged enemy at all is held, not latched — the empty set
+        /// says "nothing to end yet", not "everything is dead".
+        #[test]
+        fn a_completion_signal_with_no_damaged_enemy_is_held_not_latched() {
+            let mut m = Meter::new();
+            m.apply(&dmg(1, 100, 1_000));
+            m.apply(&var("IsFinishTarget", 1));
+
+            assert_eq!(m.fight_end_ms(), None);
+        }
+
+        /// issue #391 (issues #256/#210/#211): a held signal does not route
+        /// around §8's gate. While the instance's own objective is still
+        /// incomplete, the boss dying is a phase, and the held signal keeps
+        /// waiting exactly as `end_fight_on_boss_death` does.
+        #[test]
+        fn a_held_signal_does_not_end_the_fight_while_the_objective_is_incomplete() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&objective(100, Some(0), Some(false)));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 50, 1_000));
+            // Held via §7's producer, not `End`: the instance's own terminal
+            // state now outranks the objective (PR #395 review, finding O3),
+            // so only an `Active` instance can still be gated here.
+            m.apply(&var("IsFinishTarget", 1));
+            assert_eq!(m.fight_end_ms(), None);
+
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 2_000));
+            assert_eq!(m.fight_end_ms(), None, "latched through the §8 gate");
+
+            // Once the objective completes, the gate lifts and the already-
+            // held signal resolves on its own (PR #395 review, finding O2)
+            // — no second producer event needed.
+            m.apply(&objective(100, None, Some(true)));
+            assert_eq!(m.fight_end_ms(), Some(1_000));
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+        }
+
+        /// PR #395 review, finding O1: the immediate-latch path must apply
+        /// the *same* §8 gate the deferred path does. A signal that arrives
+        /// after the kill, while the instance's objective is still
+        /// incomplete, used to latch outright while the identical signal
+        /// arriving one packet earlier was held — the outcome depended on
+        /// which side of the killing blow the signal landed.
+        #[test]
+        fn a_completion_signal_after_the_kill_is_held_while_the_objective_is_incomplete() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&objective(100, Some(0), Some(false)));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 100, 1_000));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 2_000));
+            assert_eq!(m.fight_end_ms(), None, "§8's gate did not hold the fight");
+
+            m.apply(&var("IsFinishTarget", 1));
+            assert_eq!(m.fight_end_ms(), None, "latched past the objective gate");
+
+            // Objective complete: the gate lifts and the already-held signal
+            // resolves on its own (PR #395 review, finding O2) — no re-send
+            // of the producer needed.
+            m.apply(&objective(100, None, Some(true)));
+            assert_eq!(m.fight_end_ms(), Some(1_000));
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+        }
+
+        /// PR #395 review, finding O3: `apply_dungeon_state` stores `End`
+        /// *before* dispatching, so a run whose last objective never
+        /// reported `complete` would keep §8's gate shut for the rest of the
+        /// instance and hold the completion signal forever. The instance's
+        /// own terminal state outranks that stale objective.
+        #[test]
+        fn an_end_state_outranks_an_incomplete_objective() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&objective(100, Some(0), Some(false)));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 100, 1_000));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 2_000));
+            assert_eq!(m.fight_end_ms(), None);
+
+            m.apply(&dungeon_state(EDungeonState::End));
+            assert_eq!(m.fight_end_ms(), Some(1_000));
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+        }
+
+        /// PR #395 review, finding O6: an add the party clipped once and
+        /// whose HP no packet ever carried is indistinguishable from a
+        /// corpse. Treating it as alive held every completion signal in the
+        /// instance open; the fallback scan therefore requires an observed
+        /// `curr_hp`. The tracked boss keeps the conservative reading.
+        #[test]
+        fn a_damaged_add_with_unobserved_hp_does_not_hold_a_resolved_signal() {
+            const ADD_UID: i64 = 11;
+
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 50, 1_000));
+            // Damaged, never HP-synced: no `EnemyHp` packet ever names it.
+            m.apply(&boss_hit(ADD_UID, 2_000, false));
+
+            m.apply(&dungeon_state(EDungeonState::End));
+            assert_eq!(m.fight_end_ms(), None, "ended over the living boss");
+
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 2_000));
+            assert_eq!(m.fight_end_ms(), Some(2_000), "the add held the signal");
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+        }
+
+        /// PR #395 review, finding O5: `end_on_boss_death: false` turns off
+        /// instant end-on-kill, and the dungeon hold must not hand it back
+        /// through a death path. The kill no longer resolves the held
+        /// signal; a later re-send of the signal itself still does, because
+        /// by then the kill is a fact the dungeon's own word confirms.
+        #[test]
+        fn a_death_does_not_resolve_a_held_signal_when_end_on_boss_death_is_off() {
+            let mut m = Meter::with_fight_config(FightConfig {
+                end_on_boss_death: false,
+                ..Default::default()
+            });
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 50, 1_000));
+            m.apply(&dungeon_state(EDungeonState::End));
+            assert_eq!(m.fight_end_ms(), None);
+
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 2_000));
+            assert_eq!(m.fight_end_ms(), None, "the death path ended the fight");
+
+            m.apply(&dungeon_state(EDungeonState::End));
+            assert_eq!(m.fight_end_ms(), Some(1_000));
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+        }
+
+        /// issue #391: the held signal belongs to the fight it arrived in.
+        /// A reset clears it, so a kill in the *next* fight cannot be ended
+        /// by the previous fight's stale completion signal.
+        #[test]
+        fn a_held_completion_signal_does_not_survive_a_reset() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 50, 1_000));
+            m.apply(&dungeon_state(EDungeonState::End));
+            assert_eq!(m.fight_end_ms(), None);
+
+            m.reset(ResetReason::Manual, 6_000);
+
+            m.apply(&boss_hit(BOSS_UID, 7_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 40, 7_000));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 8_000));
+
+            assert_eq!(m.fight_end_ms(), None);
+            assert_eq!(m.fight_end_cause(), None);
+            assert_eq!(m.fight_start_ms(), Some(7_000));
+        }
+
+        /// issue #391: nothing resolves a held signal on a clock. The party
+        /// stops hitting a boss it had engaged after the signal; issue #151
+        /// suppresses the idle timeout for that boss, and the held signal
+        /// must not stand in for a timer of its own.
+        #[test]
+        fn a_lull_after_a_held_completion_signal_does_not_end_the_fight() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, BOSS, 40, 1_000));
+            m.apply(&dungeon_state(EDungeonState::End));
+            assert_eq!(m.fight_end_ms(), None);
+
+            assert_eq!(m.tick(12_000), FightState::Active);
+            assert_eq!(m.fight_end_ms(), None);
+            assert_eq!(m.tick(30_000), FightState::Active);
             assert_eq!(m.fight_end_ms(), None);
         }
 
@@ -12752,6 +13414,77 @@ mod tests {
             m.apply(&boss_hit(BOSS_UID, 2_000, true));
 
             assert_eq!(m.fight_state(2_100), FightState::Ended);
+        }
+
+        /// PR #395 review, finding O2: a removal is one more way the gate a
+        /// held signal is waiting on can lift, exactly like a transition
+        /// that completes it — the removed-objective path must re-check the
+        /// hold too, not only the transition path.
+        #[test]
+        fn a_removed_objective_lifts_the_gate_on_a_held_signal() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&objective(100, Some(0), Some(false)));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 50, 1_000));
+            m.apply(&var("IsFinishTarget", 1));
+            assert_eq!(m.fight_end_ms(), None);
+
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 2_000));
+            assert_eq!(m.fight_end_ms(), None, "latched through the §8 gate");
+
+            m.apply(&objective_removed(100));
+            assert_eq!(m.fight_end_ms(), Some(1_000));
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+        }
+
+        /// PR #395 review, finding S2: `dungeon_finish_seen` stays
+        /// most-recent-last. A producer already held that fires again moves
+        /// to the back rather than staying put, so the name
+        /// `end_fight_on_held_dungeon_finish`/`latch_dungeon_end` attribute
+        /// the resolution to is always whichever producer signalled last.
+        #[test]
+        fn the_latched_source_is_the_most_recent_producer() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&objective(100, Some(0), Some(false)));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 50, 1_000));
+
+            m.apply(&var("IsFinishTarget", 1));
+            m.apply(&dungeon_state(EDungeonState::End));
+            m.apply(&var("IsFinishTarget", 1));
+
+            assert_eq!(
+                m.dungeon_finish_seen,
+                vec!["dungeon_state_end", "is_finish_target"]
+            );
+        }
+
+        /// PR #395 review, finding O8b: a completion signal belongs to the
+        /// scene that produced it. A held signal must not survive the meter
+        /// leaving that scene, or a stale producer could end whatever fight
+        /// comes next.
+        #[test]
+        fn a_scene_transition_drops_a_held_completion_signal() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 }); // Tina's Mindrealm
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 50, 1_000));
+            m.apply(&dungeon_state(EDungeonState::End));
+            assert_eq!(m.fight_end_ms(), None);
+
+            m.apply(&ProtocolEvent::Scene { level_map_id: 8 }); // town, not a dungeon
+            assert!(m.dungeon_finish_seen.is_empty());
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::SceneChanged));
+
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 2_000));
+            assert_eq!(
+                m.fight_end_cause(),
+                Some(FightEndCause::SceneChanged),
+                "the dropped signal must not resurrect and re-end the fight"
+            );
         }
     }
 
