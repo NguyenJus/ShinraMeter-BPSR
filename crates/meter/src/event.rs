@@ -32,6 +32,15 @@ pub fn uid_of(uuid: i64) -> i64 {
     uuid >> 16
 }
 
+/// Whether `uid` fits in the 48-bit display-uid field that a uuid's top 48
+/// bits (`uuid >> 16`) can hold, i.e. whether shifting it left 16 and back
+/// right 16 (sign-extending) is lossless. Used by
+/// [`EntityId::from_display_uid`] to reject wire uids that would otherwise
+/// silently lose their high bits.
+pub fn fits_display_uid(uid: i64) -> bool {
+    (uid << 16) >> 16 == uid
+}
+
 /// Bit offset of the entity-type field inside a uuid, and its width (5
 /// bits). See [`kind_of`] for the full layout.
 const ENT_TYPE_SHIFT: u32 = 6;
@@ -122,7 +131,16 @@ impl EntityId {
     /// a kind, reconstructing the uuid such a uid would have with both flag
     /// bits clear, so a uid-only source and the AOI channel agree on the
     /// same id for any entity that is neither a summon nor client-side.
+    ///
+    /// issue #388: `uid` must fit in the 48-bit display-uid field (see
+    /// [`fits_display_uid`]) — shifting an out-of-range uid left 16 would
+    /// silently drop its high bits rather than panicking, so any uid that
+    /// doesn't round-trip through the shift returns [`EntityId::UNKNOWN`]
+    /// instead of an id that collides with an unrelated entity.
     pub fn from_display_uid(uid: i64, kind: EntityKind) -> Self {
+        if !fits_display_uid(uid) {
+            return EntityId::UNKNOWN;
+        }
         let type_bits = match kind {
             EntityKind::Player => ENT_CHAR,
             EntityKind::Monster => ENT_MONSTER,
@@ -653,6 +671,39 @@ mod tests {
         let unknown = EntityId::from_display_uid(5, EntityKind::Unknown);
         assert_eq!(unknown.uuid(), 5i64 << 16);
         assert_eq!(kind_of(unknown.uuid()), EntityKind::Unknown);
+    }
+
+    /// issue #388: a wire uid that doesn't fit in the 48-bit display-uid
+    /// field would silently lose its high bits when shifted left 16, rather
+    /// than being rejected, letting it collide with an unrelated entity.
+    #[test]
+    fn from_display_uid_rejects_uids_that_overflow_the_48_bit_field() {
+        assert_eq!(
+            EntityId::from_display_uid(1i64 << 47, EntityKind::Player),
+            EntityId::UNKNOWN
+        );
+        assert_eq!(
+            EntityId::from_display_uid(i64::MIN, EntityKind::Player),
+            EntityId::UNKNOWN
+        );
+        assert_eq!(
+            EntityId::from_display_uid(i64::MAX, EntityKind::Player),
+            EntityId::UNKNOWN
+        );
+    }
+
+    /// The boundary just inside the 48-bit field, and a negative in-range
+    /// uid, must still round-trip through `display_uid()`/`kind()`.
+    #[test]
+    fn from_display_uid_round_trips_in_range_uids() {
+        let max_uid = (1i64 << 47) - 1;
+        let player = EntityId::from_display_uid(max_uid, EntityKind::Player);
+        assert_eq!(player.display_uid(), max_uid);
+        assert_eq!(player.kind(), EntityKind::Player);
+
+        let negative = EntityId::from_display_uid(-1, EntityKind::Monster);
+        assert_eq!(negative.display_uid(), -1);
+        assert_eq!(negative.kind(), EntityKind::Monster);
     }
 
     // -- kind_of / uid_of (issue #371, migrated from bpsr-protocol's

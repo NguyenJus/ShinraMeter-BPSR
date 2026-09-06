@@ -269,6 +269,18 @@ mod tests {
         );
     }
 
+    /// issue #388: an out-of-range wire uid with no shadow entry must
+    /// resolve to `UNKNOWN`, not to a reconstruction that silently dropped
+    /// its high bits and could collide with an unrelated entity.
+    #[test]
+    fn resolve_uid_returns_unknown_for_an_out_of_range_uid_with_no_shadow_hit() {
+        let table = EntityTable::new();
+        assert_eq!(
+            table.resolve_uid(1i64 << 47, EntityKind::Player),
+            EntityId::UNKNOWN
+        );
+    }
+
     /// A shadow hit of the wrong kind is refused: a roster `char_id` is a
     /// player, and a monster that happens to share the number is not it.
     #[test]

@@ -11,7 +11,7 @@ use crate::pb::Class;
 /// copy of the wire's uuid bit layout. See `bpsr_meter::event::kind_of` for
 /// the layout and its sourcing, and `bpsr_meter::event::EntityKind` for the
 /// type itself.
-pub use bpsr_meter::{EntityKind, kind_of, uid_of};
+pub use bpsr_meter::{EntityKind, fits_display_uid, kind_of, uid_of};
 
 /// Which of the (evidenced) `pb::EDamageType` buckets a hit's `value`
 /// belongs in (issue #338). Deliberately narrower than the wire enum: `Miss`

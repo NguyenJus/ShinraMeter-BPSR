@@ -17,7 +17,7 @@ use crate::blob;
 use crate::entity::{EntityId, EntityTable};
 use crate::event::{
     CastEvent, DamageEvent, DisappearReason, EDungeonState, EntityKind, PlayerInfo, ProtocolEvent,
-    damage_kind_of, kind_of, uid_of,
+    damage_kind_of, fits_display_uid, kind_of, uid_of,
 };
 use crate::frame::{
     Desync, MAX_TAIL_LEN, Notify, SERVICE_UUID, TEAM_NTF_SERVICE_UUID, parse_frame, split_frames,
@@ -505,7 +505,10 @@ fn on_sync_container_data(
     // treated as absent — the same zero-is-absent rule `scene_id_from_attrs`
     // (crates/protocol/src/attrs.rs) uses, borrowed here and applied to
     // `scene_data` just below.
-    if v_data.char_id != 0 {
+    // issue #388: an out-of-range char_id is treated as absent here too —
+    // the Player row below is dropped for the same reason, so LocalPlayer
+    // shouldn't hand out a uid nothing else in the entity table recognizes.
+    if v_data.char_id != 0 && fits_display_uid(v_data.char_id) {
         out.push(ProtocolEvent::LocalPlayer {
             uid: v_data.char_id,
         });
@@ -545,8 +548,17 @@ fn on_sync_container_data(
     // `CharSerialize.char_id` is a bare uid with no type bits or flags, so the
     // table's shadow map is what ties it back to the uuid the AOI channel is
     // already using for this player (issue #335).
+    //
+    // issue #388: `char_id` is unvalidated wire input — an out-of-range
+    // value with no shadow-map hit resolves to `UNKNOWN` rather than a
+    // reconstruction that silently dropped its high bits, so the row is
+    // dropped rather than filed under that shared id.
+    let entity = entities.resolve_uid(v_data.char_id, EntityKind::Player);
+    if entity == EntityId::UNKNOWN {
+        return;
+    }
     out.push(ProtocolEvent::Player(PlayerInfo {
-        entity: entities.resolve_uid(v_data.char_id, EntityKind::Player),
+        entity,
         uid: v_data.char_id,
         name,
         class,
@@ -639,6 +651,20 @@ fn on_notify_join_team(
         if uid == 0 {
             continue;
         }
+        // Same bare-uid resolution `on_sync_container_data` does (issue
+        // #335): a roster member is a player, so a shadow-map hit of any
+        // other kind is refused by `resolve_uid`.
+        //
+        // issue #388: an out-of-range `uid` with no shadow-map hit resolves
+        // to `UNKNOWN` rather than a reconstruction that silently dropped
+        // its high bits, so this member is dropped from the roster entirely
+        // rather than filed under that shared id (issue #389: a
+        // roster-without-a-Player-row would otherwise still land in
+        // `TeamRoster`).
+        let entity = entities.resolve_uid(uid, EntityKind::Player);
+        if entity == EntityId::UNKNOWN {
+            continue;
+        }
         roster.push(uid);
         let name = social
             .and_then(|s| s.basic_data.as_ref())
@@ -665,10 +691,7 @@ fn on_notify_join_team(
             continue;
         }
         out.push(ProtocolEvent::Player(PlayerInfo {
-            // Same bare-uid resolution `on_sync_container_data` does (issue
-            // #335): a roster member is a player, so a shadow-map hit of any
-            // other kind is refused by `resolve_uid`.
-            entity: entities.resolve_uid(uid, EntityKind::Player),
+            entity,
             uid,
             name,
             class,
@@ -1992,6 +2015,30 @@ mod tests {
         assert_eq!(out, vec![ProtocolEvent::Scene { level_map_id: 8 }]);
     }
 
+    /// issue #388: a `char_id` outside the 48-bit display-uid field cannot
+    /// be reconstructed into a valid entity id without silently dropping
+    /// its high bits, so `resolve_uid` returns `UNKNOWN` and the `Player`
+    /// row is dropped entirely rather than filed under that shared id.
+    /// `LocalPlayer` is narrowed the same way — an out-of-range char_id is
+    /// treated as absent there too, so nothing fires at all.
+    #[test]
+    fn container_data_out_of_range_char_id_yields_no_player() {
+        let out_of_range = 1i64 << 47;
+        let n = container_notify(pb::CharSerialize {
+            char_id: out_of_range,
+            char_base: Some(pb::CharBaseInfo {
+                char_id: out_of_range,
+                name: "Ari".to_string(),
+                fight_point: 0,
+            }),
+            scene_data: None,
+            profession_list: None,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out, Vec::new());
+    }
+
     #[test]
     fn container_data_zero_char_id_with_char_base_yields_no_player() {
         // A zero char_id cannot key a Player row either, even when
@@ -2210,6 +2257,26 @@ mod tests {
             ProtocolEvent::TeamRoster { members } => assert_eq!(members, &vec![999]),
             other => panic!("expected TeamRoster, got {other:?}"),
         }
+    }
+
+    /// issue #388/#389: a member whose `char_id` is outside the 48-bit
+    /// display-uid range resolves to `EntityId::UNKNOWN` (same as
+    /// `on_sync_container_data`'s out-of-range handling), so it must be
+    /// dropped from the roster entirely rather than filed under that shared
+    /// id with no accompanying `Player` row. As the roster's only member,
+    /// this also means no `TeamRoster` event fires at all — an empty
+    /// roster is suppressed the same way a fully-uidless payload is.
+    #[test]
+    fn notify_join_team_member_with_out_of_range_char_id_yields_no_event() {
+        let out_of_range = 1i64 << 47;
+        let request = pb::NotifyJoinTeamRequest {
+            base_info: Some(pb::TeamBaseInfo {}),
+            member_data: vec![full_team_member(out_of_range, "Ari", 1, 12_345)],
+        };
+        let n = team_notify_for(request);
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert_eq!(out, Vec::new());
     }
 
     /// A member with a name but no profession/attr data still yields a
