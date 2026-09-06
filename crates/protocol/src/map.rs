@@ -267,14 +267,15 @@ mod tests {
     #[test]
     fn map_event_enemy_gone_carries_reason_through() {
         let ev = ProtocolEvent::EnemyGone {
-            entity: EntityId::from_display_uid(7, EntityKind::Monster),
+            entity: EntityId::from_display_uid(7, EntityKind::Monster).expect("in-range test uid"),
             uid: 7,
             reason: Some(DisappearReason::TransferLeave),
         };
         assert_eq!(
             map_event(ev, 0, None, None),
             meter::ProtocolEvent::EnemyGone {
-                entity: meter::EntityId::from_display_uid(7, meter::EntityKind::Monster),
+                entity: meter::EntityId::from_display_uid(7, meter::EntityKind::Monster)
+                    .expect("in-range test uid"),
                 uid: 7,
                 reason: Some(meter::DisappearReason::TransferLeave),
             }
@@ -284,14 +285,15 @@ mod tests {
     #[test]
     fn map_event_enemy_gone_with_no_reason() {
         let ev = ProtocolEvent::EnemyGone {
-            entity: EntityId::from_display_uid(9, EntityKind::Monster),
+            entity: EntityId::from_display_uid(9, EntityKind::Monster).expect("in-range test uid"),
             uid: 9,
             reason: None,
         };
         assert_eq!(
             map_event(ev, 0, None, None),
             meter::ProtocolEvent::EnemyGone {
-                entity: meter::EntityId::from_display_uid(9, meter::EntityKind::Monster),
+                entity: meter::EntityId::from_display_uid(9, meter::EntityKind::Monster)
+                    .expect("in-range test uid"),
                 uid: 9,
                 reason: None,
             }
@@ -301,14 +303,15 @@ mod tests {
     #[test]
     fn map_event_enemy_gone_with_unrecognized_wire_reason() {
         let ev = ProtocolEvent::EnemyGone {
-            entity: EntityId::from_display_uid(3, EntityKind::Monster),
+            entity: EntityId::from_display_uid(3, EntityKind::Monster).expect("in-range test uid"),
             uid: 3,
             reason: Some(DisappearReason::Unknown(99)),
         };
         assert_eq!(
             map_event(ev, 0, None, None),
             meter::ProtocolEvent::EnemyGone {
-                entity: meter::EntityId::from_display_uid(3, meter::EntityKind::Monster),
+                entity: meter::EntityId::from_display_uid(3, meter::EntityKind::Monster)
+                    .expect("in-range test uid"),
                 uid: 3,
                 reason: Some(meter::DisappearReason::Unknown(99)),
             }
@@ -340,7 +343,8 @@ mod tests {
         use crate::event::{DamageEvent, EntityKind};
 
         let d = DamageEvent {
-            attacker: crate::entity::EntityId::from_display_uid(1, EntityKind::Player),
+            attacker: crate::entity::EntityId::from_display_uid(1, EntityKind::Player)
+                .expect("in-range test uid"),
             attacker_uid: 1,
             attacker_kind: EntityKind::Player,
             skill_id: 1,
@@ -351,7 +355,8 @@ mod tests {
             is_miss: false,
             is_heal: false,
             kind: DamageKind::Absorbed,
-            target: crate::entity::EntityId::from_display_uid(2, EntityKind::Monster),
+            target: crate::entity::EntityId::from_display_uid(2, EntityKind::Monster)
+                .expect("in-range test uid"),
             target_uid: 2,
             target_kind: EntityKind::Monster,
             timestamp_ms: 0,

@@ -123,9 +123,9 @@ impl EntityTable {
     /// The shadow hit is only accepted when its kind matches — a party
     /// roster's `char_id` is a player, and resolving it onto a monster that
     /// happens to share the number would be worse than the fallback.
-    pub fn resolve_uid(&self, display_uid: i64, kind: EntityKind) -> EntityId {
+    pub fn resolve_uid(&self, display_uid: i64, kind: EntityKind) -> Option<EntityId> {
         match self.live_for_display_uid(display_uid) {
-            Some(id) if id.kind() == kind => id,
+            Some(id) if id.kind() == kind => Some(id),
             _ => EntityId::from_display_uid(display_uid, kind),
         }
     }
@@ -172,11 +172,15 @@ mod tests {
     use super::*;
 
     fn player_uuid(uid: i64) -> i64 {
-        EntityId::from_display_uid(uid, EntityKind::Player).uuid()
+        EntityId::from_display_uid(uid, EntityKind::Player)
+            .expect("in-range test uid")
+            .uuid()
     }
 
     fn monster_uuid(uid: i64) -> i64 {
-        EntityId::from_display_uid(uid, EntityKind::Monster).uuid()
+        EntityId::from_display_uid(uid, EntityKind::Monster)
+            .expect("in-range test uid")
+            .uuid()
     }
 
     #[test]
@@ -201,11 +205,11 @@ mod tests {
     #[test]
     fn from_display_uid_reconstructs_the_aoi_channels_own_id() {
         assert_eq!(
-            EntityId::from_display_uid(77, EntityKind::Player),
+            EntityId::from_display_uid(77, EntityKind::Player).expect("in-range test uid"),
             EntityId::from_uuid(player_uuid(77))
         );
         assert_eq!(
-            EntityId::from_display_uid(77, EntityKind::Monster),
+            EntityId::from_display_uid(77, EntityKind::Monster).expect("in-range test uid"),
             EntityId::from_uuid(monster_uuid(77))
         );
     }
@@ -257,7 +261,7 @@ mod tests {
     fn resolve_uid_prefers_the_live_holder_over_the_reconstruction() {
         let mut table = EntityTable::new();
         let live = table.observe(player_uuid(7) | (1 << 14), 1_000);
-        assert_eq!(table.resolve_uid(7, EntityKind::Player), live);
+        assert_eq!(table.resolve_uid(7, EntityKind::Player), Some(live));
     }
 
     #[test]
@@ -265,8 +269,17 @@ mod tests {
         let table = EntityTable::new();
         assert_eq!(
             table.resolve_uid(7, EntityKind::Player),
-            EntityId::from_uuid(player_uuid(7))
+            Some(EntityId::from_uuid(player_uuid(7)))
         );
+    }
+
+    /// issue #388: an out-of-range wire uid with no shadow entry must
+    /// resolve to `None`, not to a reconstruction that silently dropped
+    /// its high bits and could collide with an unrelated entity.
+    #[test]
+    fn resolve_uid_returns_none_for_an_out_of_range_uid_with_no_shadow_hit() {
+        let table = EntityTable::new();
+        assert!(table.resolve_uid(1i64 << 47, EntityKind::Player).is_none());
     }
 
     /// A shadow hit of the wrong kind is refused: a roster `char_id` is a
@@ -277,7 +290,7 @@ mod tests {
         table.observe(monster_uuid(7), 1_000);
         assert_eq!(
             table.resolve_uid(7, EntityKind::Player),
-            EntityId::from_uuid(player_uuid(7))
+            Some(EntityId::from_uuid(player_uuid(7)))
         );
     }
 
