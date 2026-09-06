@@ -201,12 +201,18 @@ fn sanitize_into(src: &Path, dst: &Path) -> Result<SanitizeReport, HistoryError>
             // uid half for the pseudonym and keep the low 16 bits verbatim:
             // two rows that shared a recycled display uid in the live fight
             // differ only in those bits, and the sanitized copy must keep
-            // them distinct too. A pre-v3 row (`NULL`) gets the same bare
-            // reconstruction `sqlite::SqliteHistory::load` falls back to.
-            let low_bits = entity
-                .unwrap_or(EntityId::from_display_uid(*uid, EntityKind::Player).0 as i64)
-                & 0xFFFF;
-            let new_entity = (new_uid << 16) | low_bits;
+            // them distinct too. A pre-v3 row (`NULL`) has no stored `entity`
+            // to take bits from, so it is rebuilt from the (always in-range)
+            // pseudonym `new_uid` instead of the raw stored uid, which may be
+            // out of range.
+            let new_entity = match entity {
+                Some(e) => (new_uid << 16) | (e & 0xFFFF),
+                None => {
+                    EntityId::from_display_uid(new_uid, EntityKind::Player)
+                        .expect("pseudonym uid is in range")
+                        .0 as i64
+                }
+            };
             tx.execute(
                 "UPDATE encounter_players SET uid = ?1, entity = ?2, name = ?3
                  WHERE encounter_id = ?4 AND slot = ?5",
@@ -274,7 +280,9 @@ mod tests {
     fn sample_player(uid: i64, name: &str) -> PlayerRecord {
         PlayerRecord {
             uid,
-            entity: EntityId::from_display_uid(uid, EntityKind::Player).0 as i64,
+            entity: EntityId::from_display_uid(uid, EntityKind::Player)
+                .expect("in-range test uid")
+                .0 as i64,
             name: name.to_string(),
             class: Some(Class::FrostMage),
             ability_score: Some(999),
@@ -478,7 +486,9 @@ mod tests {
         );
         assert_eq!(
             new_entity,
-            EntityId::from_display_uid(new_uid, EntityKind::Player).0 as i64,
+            EntityId::from_display_uid(new_uid, EntityKind::Player)
+                .expect("in-range test uid")
+                .0 as i64,
             "entity must be re-derived from the remapped uid"
         );
 
@@ -494,7 +504,9 @@ mod tests {
         let mut store = SqliteHistory::open(&src, RetentionPolicy::default()).unwrap();
         let mut a = sample_player(1, "Alice");
         let mut b = sample_player(1, "Bob");
-        a.entity = EntityId::from_display_uid(1, EntityKind::Player).0 as i64;
+        a.entity = EntityId::from_display_uid(1, EntityKind::Player)
+            .expect("in-range test uid")
+            .0 as i64;
         b.entity = a.entity | 0x1;
         store
             .insert(&sample_record(1_000, 10_000, vec![a, b]))
@@ -521,6 +533,59 @@ mod tests {
             "entity uid half follows the pseudonym"
         );
         assert_eq!(rows[1].1 & 0xFFFF, (rows[0].1 & 0xFFFF) | 0x1);
+
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&dst);
+    }
+
+    /// issue #388/#390: a pre-v3 row's stored `uid` can be outside the
+    /// 48-bit display-uid field, so the `NULL`-entity fallback must rebuild
+    /// `entity` from the (always in-range) pseudonym `new_uid` rather than
+    /// the raw out-of-range `uid` — otherwise `from_display_uid` on the raw
+    /// uid returns `None` and the row loses its `ENT_CHAR` bits.
+    #[test]
+    fn sanitize_copy_rebuilds_a_null_entity_from_the_pseudonym_when_the_uid_is_out_of_range() {
+        let src = temp_db_path("seed-oor-null-entity");
+        let out_of_range_uid = 1i64 << 47;
+        {
+            drop(SqliteHistory::open(&src, RetentionPolicy::default()).unwrap());
+            let conn = Connection::open(&src).unwrap();
+            conn.execute(
+                "INSERT INTO encounters (
+                    ended_at_ms, duration_ms, total_damage, total_dps, boss_monster_id,
+                    boss_name, is_boss, scene_id, scene_name, title, subtitle,
+                    player_count, meter_version, local_uid
+                 ) VALUES (1000, 10000, 10000, 1000.0, 7, 'Boss', 1, 3, 'Scene', 'Boss',
+                           'Scene', 1, '0.2.2', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO encounter_players (
+                    encounter_id, slot, uid, entity, name, class, ability_score,
+                    season_strength, imagine_0, imagine_1, imagine_tier_0, imagine_tier_1,
+                    damage, dps, share_pct, crit_pct, lucky_pct, hits, deaths
+                 ) VALUES (1, 0, ?1, NULL, 'Alice', 'FrostMage', 999, 42, 1, NULL, 3, NULL,
+                           5000, 500.0, 33.3, 12.5, 6.25, 40, 2)",
+                rusqlite::params![out_of_range_uid],
+            )
+            .unwrap();
+            drop(conn);
+        }
+
+        let dst = temp_db_path("out-oor-null-entity");
+        sanitize_copy(&src, &dst).unwrap();
+
+        let conn = Connection::open(&dst).unwrap();
+        let (new_uid, new_entity): (i64, i64) = conn
+            .query_row("SELECT uid, entity FROM encounter_players", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+
+        let entity = EntityId(new_entity as u64);
+        assert_eq!(entity.kind(), EntityKind::Player);
+        assert_eq!(entity.display_uid(), new_uid);
 
         let _ = fs::remove_file(&src);
         let _ = fs::remove_file(&dst);

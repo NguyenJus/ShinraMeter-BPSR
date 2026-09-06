@@ -896,12 +896,12 @@ mod tests {
     /// only care about the attr walk, so the canonical reconstruction is
     /// exactly as good as a captured uuid here.
     fn pid(u: i64) -> EntityId {
-        EntityId::from_display_uid(u, crate::event::EntityKind::Player)
+        EntityId::from_display_uid(u, crate::event::EntityKind::Player).expect("in-range test uid")
     }
 
     /// The monster counterpart of `pid`.
     fn mid(u: i64) -> EntityId {
-        EntityId::from_display_uid(u, crate::event::EntityKind::Monster)
+        EntityId::from_display_uid(u, crate::event::EntityKind::Monster).expect("in-range test uid")
     }
 
     use super::*;
@@ -1865,7 +1865,8 @@ mod tests {
             raw_data: raw,
         }];
         let info = player_info_from_attrs(
-            EntityId::from_display_uid(7, crate::event::EntityKind::Player),
+            EntityId::from_display_uid(7, crate::event::EntityKind::Player)
+                .expect("in-range test uid"),
             &attrs,
             None,
         );
@@ -1875,7 +1876,8 @@ mod tests {
     #[test]
     fn player_info_from_attrs_shield_absent_when_no_shield_attr() {
         let info = player_info_from_attrs(
-            EntityId::from_display_uid(7, crate::event::EntityKind::Player),
+            EntityId::from_display_uid(7, crate::event::EntityKind::Player)
+                .expect("in-range test uid"),
             &[],
             None,
         );
@@ -1894,7 +1896,8 @@ mod tests {
             raw_data: Vec::new(),
         }];
         let info = player_info_from_attrs(
-            EntityId::from_display_uid(7, crate::event::EntityKind::Player),
+            EntityId::from_display_uid(7, crate::event::EntityKind::Player)
+                .expect("in-range test uid"),
             &attrs,
             None,
         );
