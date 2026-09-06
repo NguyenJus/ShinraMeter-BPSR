@@ -141,7 +141,10 @@ fn attr_state_only_death_latches_a_wipe_end_to_end() {
 /// decodes such a state to `None` — no `EntityState` event at all — so
 /// `Encounter::apply_entity_state` is never even called for it; this pins
 /// that end to end, then confirms the hold *does* release on a real
-/// explicit-alive signal (`ActorStateDefault`, 0).
+/// explicit-alive signal (`ActorStateDefault`, 0). A probe against a
+/// still-alive player before the wipe even happens pins the other half of
+/// the misread: an ambiguous `AttrState` must never be read as a death
+/// either.
 #[test]
 fn ambiguous_attr_state_does_not_release_a_wipe_hold() {
     let scenario = Scenario::new("ambiguous_attr_state_holds_wipe")
@@ -154,6 +157,13 @@ fn ambiguous_attr_state_does_not_release_a_wipe_hold() {
         .hit(P_ARIA, M_BOSS, 101, 40_000)
         .at(2_500)
         .hit(P_BRIN, M_BOSS, 202, 25_000)
+        // An ambiguous `AttrState` against a still-alive player, probed
+        // before the wipe even happens, must not be misread as a death.
+        .at(3_000)
+        .player_state_raw(P_ARIA, 27)
+        .at(3_500)
+        .tick()
+        .capture("ambiguous_attr_state_holds_wipe_before_wipe")
         // Both players go down, wiping the party and latching the hold.
         .at(5_000)
         .player_killed_by(M_BOSS, P_ARIA, 900, 9_999)
@@ -181,13 +191,24 @@ fn ambiguous_attr_state_does_not_release_a_wipe_hold() {
     let mut rig = Rig::new();
     let captures = rig.run(&scenario);
 
-    assert_eq!(captures.len(), 3);
+    assert_eq!(captures.len(), 4);
 
-    let after_wipe = &captures[0];
+    let before_wipe = &captures[0];
+    assert_eq!(
+        before_wipe.fight_state,
+        FightState::Active,
+        "an ambiguous AttrState on a live player must not be read as a death"
+    );
+    assert_eq!(
+        before_wipe.hold_kind, None,
+        "an ambiguous AttrState on a live player must not be read as a death"
+    );
+
+    let after_wipe = &captures[1];
     assert_eq!(after_wipe.fight_state, FightState::Ended);
     assert_eq!(after_wipe.hold_kind, Some(HoldKind::Wipe));
 
-    let after_ambiguous = &captures[1];
+    let after_ambiguous = &captures[2];
     assert_eq!(
         after_ambiguous.fight_state,
         FightState::Ended,
@@ -199,13 +220,19 @@ fn ambiguous_attr_state_does_not_release_a_wipe_hold() {
         "an ambiguous AttrState (Resurrection, 27) must not release the wipe hold"
     );
 
-    let after_release = &captures[2];
+    let after_release = &captures[3];
+    assert_eq!(
+        after_release.fight_state,
+        FightState::Ended,
+        "releasing the hold lifts it but leaves the fight Ended"
+    );
     assert_eq!(
         after_release.hold_kind, None,
         "an explicit alive AttrState (ActorStateDefault, 0) does release the wipe hold \
          once enough of the roster is back up"
     );
 
+    assert_golden(before_wipe);
     assert_golden(after_wipe);
     assert_golden(after_ambiguous);
     assert_golden(after_release);
