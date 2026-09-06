@@ -12705,7 +12705,8 @@ mod tests {
         /// reads.
         fn hp_at(uid: i64, monster_id: u32, curr: u64, ts: u64) -> ProtocolEvent {
             ProtocolEvent::EnemyHp(EnemyHp {
-                entity: EntityId::from_display_uid(uid, EntityKind::Monster),
+                entity: EntityId::from_display_uid(uid, EntityKind::Monster)
+                    .expect("in-range test uid"),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(100),
