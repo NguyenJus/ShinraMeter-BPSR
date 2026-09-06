@@ -1,9 +1,9 @@
-scenario=dungeon_ended_by_flow_signal
-at_ms=3000
+scenario=dungeon_end_held_signal_resolves_at_the_kill
+at_ms=4000
 fight_state=Ended
-fight_end_cause=dungeon_ended
+fight_end_cause=boss_death
 hold_kind=-
-duration_ms=1
+duration_ms=1500
 total_damage=60000
 total_dps=60000.00
 encounter.boss_monster_id=103

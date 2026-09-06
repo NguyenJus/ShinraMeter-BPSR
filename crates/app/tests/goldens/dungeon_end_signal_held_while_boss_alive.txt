@@ -1,9 +1,9 @@
-scenario=leaving_to_open_world_holds_the_numbers
-at_ms=14000
-fight_state=Ended
-fight_end_cause=boss_death
+scenario=dungeon_end_signal_held_while_boss_alive
+at_ms=3000
+fight_state=Active
+fight_end_cause=-
 hold_kind=-
-duration_ms=1500
+duration_ms=500
 total_damage=60000
 total_dps=60000.00
 encounter.boss_monster_id=103
