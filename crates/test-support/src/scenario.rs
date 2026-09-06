@@ -311,12 +311,20 @@ impl Scenario {
     /// #339/#272) for a player uid: `dead = true` encodes
     /// `EActorState::ActorStateDead` (9), `dead = false` encodes
     /// `ActorStateDefault` (0).
-    pub fn player_state(mut self, uid: i64, dead: bool) -> Self {
+    pub fn player_state(self, uid: i64, dead: bool) -> Self {
+        self.player_state_raw(uid, if dead { 9 } else { 0 })
+    }
+
+    /// Like [`Self::player_state`], but takes the raw `EActorState` value
+    /// instead of collapsing it to dead/alive — needed to exercise
+    /// ambiguous states (issue #389) that `bpsr_protocol::attrs::actor_state_is_dead`
+    /// classifies as neither: e.g. `Resurrection` (27), which must not be
+    /// read as an explicit alive signal and so must never release an
+    /// active wipe hold.
+    pub fn player_state_raw(mut self, uid: i64, state: i32) -> Self {
         let uuid = wire::player_uuid(uid);
-        let payload = wire::attr_delta_payload(
-            uuid,
-            vec![wire::varint_attr(attr_id::STATE, if dead { 9 } else { 0 })],
-        );
+        let payload =
+            wire::attr_delta_payload(uuid, vec![wire::varint_attr(attr_id::STATE, state as u64)]);
         let bytes = self.wrap_frame(opcode::SYNC_NEAR_DELTA_INFO, &payload);
         self.push_bytes(bytes);
         self

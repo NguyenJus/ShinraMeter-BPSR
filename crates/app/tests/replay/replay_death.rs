@@ -8,7 +8,7 @@
 //! Scripted `now_ms` values only — never wall-clock.
 
 use crate::common::{Rig, assert_golden};
-use bpsr_meter::FightState;
+use bpsr_meter::{FightState, HoldKind};
 use bpsr_test_support::scenario::Scenario;
 use bpsr_test_support::wire::prof;
 
@@ -131,4 +131,82 @@ fn attr_state_only_death_latches_a_wipe_end_to_end() {
     );
 
     assert_golden(capture);
+}
+
+/// Issue #389: an ambiguous decoded `AttrState` (issue #378's classification
+/// — `Resurrection (27)` here, but anything outside the known-dead/known-alive
+/// sets is the same) must not be read as an explicit alive signal and so
+/// must not release an active wipe hold. `bpsr_protocol::attrs::actor_state_is_dead`
+/// (exercised at the unit level in `crates/protocol/src/attrs.rs`) already
+/// decodes such a state to `None` — no `EntityState` event at all — so
+/// `Encounter::apply_entity_state` is never even called for it; this pins
+/// that end to end, then confirms the hold *does* release on a real
+/// explicit-alive signal (`ActorStateDefault`, 0).
+#[test]
+fn ambiguous_attr_state_does_not_release_a_wipe_hold() {
+    let scenario = Scenario::new("ambiguous_attr_state_holds_wipe")
+        .at(1_000)
+        .enter_scene(TOWERING_RUIN)
+        .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
+        .player_appear(P_BRIN, "Brin", prof::FROST_MAGE, 11_500)
+        .monster_appear(M_BOSS, IGNISOR, 1_000_000, 1_000_000)
+        .at(2_000)
+        .hit(P_ARIA, M_BOSS, 101, 40_000)
+        .at(2_500)
+        .hit(P_BRIN, M_BOSS, 202, 25_000)
+        // Both players go down, wiping the party and latching the hold.
+        .at(5_000)
+        .player_killed_by(M_BOSS, P_ARIA, 900, 9_999)
+        .at(6_000)
+        .player_state(P_BRIN, true)
+        .at(6_500)
+        .tick()
+        .capture("ambiguous_attr_state_holds_wipe_after_wipe")
+        // An ambiguous `AttrState` (Resurrection, 27) decodes to no
+        // explicit alive/dead signal at all (issue #378) and so must not
+        // touch the hold.
+        .at(7_000)
+        .player_state_raw(P_BRIN, 27)
+        .at(7_500)
+        .tick()
+        .capture("ambiguous_attr_state_holds_wipe_after_ambiguous")
+        // A real explicit-alive signal (`ActorStateDefault`, 0) does
+        // release it, once few enough of the roster is still down.
+        .at(8_000)
+        .player_state(P_BRIN, false)
+        .at(8_500)
+        .tick()
+        .capture("ambiguous_attr_state_holds_wipe_after_release");
+
+    let mut rig = Rig::new();
+    let captures = rig.run(&scenario);
+
+    assert_eq!(captures.len(), 3);
+
+    let after_wipe = &captures[0];
+    assert_eq!(after_wipe.fight_state, FightState::Ended);
+    assert_eq!(after_wipe.hold_kind, Some(HoldKind::Wipe));
+
+    let after_ambiguous = &captures[1];
+    assert_eq!(
+        after_ambiguous.fight_state,
+        FightState::Ended,
+        "the ambiguous AttrState must not resume/clear the held fight"
+    );
+    assert_eq!(
+        after_ambiguous.hold_kind,
+        Some(HoldKind::Wipe),
+        "an ambiguous AttrState (Resurrection, 27) must not release the wipe hold"
+    );
+
+    let after_release = &captures[2];
+    assert_eq!(
+        after_release.hold_kind, None,
+        "an explicit alive AttrState (ActorStateDefault, 0) does release the wipe hold \
+         once enough of the roster is back up"
+    );
+
+    assert_golden(after_wipe);
+    assert_golden(after_ambiguous);
+    assert_golden(after_release);
 }
