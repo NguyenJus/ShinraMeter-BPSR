@@ -508,6 +508,12 @@ fn on_sync_container_data(
     // issue #388: an out-of-range char_id is treated as absent here too —
     // the Player row below is dropped for the same reason, so LocalPlayer
     // shouldn't hand out a uid nothing else in the entity table recognizes.
+    if v_data.char_id != 0 && !fits_display_uid(v_data.char_id) {
+        log::debug!(
+            "bpsr-protocol: SyncContainerData char_id {} outside 48-bit display-uid range, dropped",
+            v_data.char_id
+        );
+    }
     if v_data.char_id != 0 && fits_display_uid(v_data.char_id) {
         out.push(ProtocolEvent::LocalPlayer {
             uid: v_data.char_id,
@@ -553,6 +559,10 @@ fn on_sync_container_data(
     // value with no shadow-map hit has no valid reconstruction, so the row
     // is dropped rather than filed under a colliding id.
     let Some(entity) = entities.resolve_uid(v_data.char_id, EntityKind::Player) else {
+        log::debug!(
+            "bpsr-protocol: SyncContainerData char_id {} did not resolve to a known entity, Player row dropped",
+            v_data.char_id
+        );
         return;
     };
     out.push(ProtocolEvent::Player(PlayerInfo {
@@ -583,10 +593,16 @@ fn on_sync_container_data(
 /// doc comment for the wire sourcing. `v_actor_uuid` missing entirely
 /// drops the packet — there is no uid to key a revive on — matching this
 /// module's non-panicking, nothing-to-report-is-not-an-error convention.
+/// A present but zero `v_actor_uuid` is treated the same way — the
+/// zero-is-absent rule this module applies elsewhere (e.g.
+/// `on_sync_container_data`'s `char_id`) — since uuid 0 names no real actor.
 fn on_notify_revive_user(msg: &pb::NotifyReviveUser, now_ms: u64, out: &mut Vec<ProtocolEvent>) {
     let Some(actor_uuid) = msg.v_actor_uuid else {
         return;
     };
+    if actor_uuid == 0 {
+        return;
+    }
     out.push(ProtocolEvent::Revive {
         entity: EntityId::from_uuid(actor_uuid),
         uid: uid_of(actor_uuid),
@@ -659,6 +675,9 @@ fn on_notify_join_team(
         // roster-without-a-Player-row would otherwise still land in
         // `TeamRoster`).
         let Some(entity) = entities.resolve_uid(uid, EntityKind::Player) else {
+            log::debug!(
+                "bpsr-protocol: NotifyJoinTeam member uid {uid} did not resolve to a known entity, dropped from roster"
+            );
             continue;
         };
         roster.push(uid);
@@ -721,6 +740,17 @@ fn on_notify_leave_team(msg: &pb::NotifyLeaveTeam, out: &mut Vec<ProtocolEvent>)
     let Some(request) = &msg.v_request else {
         return;
     };
+    // issue #388: an out-of-range char_id has no valid reconstruction (same
+    // narrowing `on_notify_join_team`'s roster loop applies to its member
+    // uids), so it is treated the same as a zero char_id: dropped rather
+    // than filed under a colliding id.
+    if request.char_id != 0 && !fits_display_uid(request.char_id) {
+        log::debug!(
+            "bpsr-protocol: NotifyLeaveTeam char_id {} outside 48-bit display-uid range, dropped",
+            request.char_id
+        );
+        return;
+    }
     if request.char_id == 0 {
         return;
     }
@@ -2016,7 +2046,10 @@ mod tests {
     /// its high bits, so `resolve_uid` returns `None` and the `Player`
     /// row is dropped entirely rather than filed under that shared id.
     /// `LocalPlayer` is narrowed the same way — an out-of-range char_id is
-    /// treated as absent there too, so nothing fires at all.
+    /// treated as absent there too. `Scene` is unaffected by either of
+    /// those narrowings — it is keyed on `scene_data`, not `char_id` — so
+    /// it still fires even while both `LocalPlayer` and `Player` are
+    /// dropped.
     #[test]
     fn container_data_out_of_range_char_id_yields_no_player() {
         let out_of_range = 1i64 << 47;
@@ -2027,12 +2060,12 @@ mod tests {
                 name: "Ari".to_string(),
                 fight_point: 0,
             }),
-            scene_data: None,
+            scene_data: Some(pb::SceneData { level_map_id: 8 }),
             profession_list: None,
         });
         let mut out = Vec::new();
         decode_notify(&n, 0, &mut out, None);
-        assert_eq!(out, Vec::new());
+        assert_eq!(out, vec![ProtocolEvent::Scene { level_map_id: 8 }]);
     }
 
     #[test]
@@ -2413,6 +2446,20 @@ mod tests {
     fn notify_leave_team_zero_char_id_yields_no_event() {
         let n = leave_team_notify_for(pb::NotifyLeaveTeamRequest {
             char_id: 0,
+            leave_type: 0,
+        });
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.is_empty());
+    }
+
+    /// issue #388: an out-of-range char_id has no valid reconstruction, so
+    /// `on_notify_leave_team` drops it the same way it drops a zero
+    /// char_id — mirroring `on_notify_join_team`'s roster-member narrowing.
+    #[test]
+    fn notify_leave_team_out_of_range_char_id_yields_no_event() {
+        let n = leave_team_notify_for(pb::NotifyLeaveTeamRequest {
+            char_id: 1i64 << 47,
             leave_type: 0,
         });
         let mut out = Vec::new();
@@ -3388,6 +3435,25 @@ mod tests {
     #[test]
     fn notify_revive_user_missing_actor_uuid_emits_nothing() {
         let msg = pb::NotifyReviveUser { v_actor_uuid: None };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let n = Notify {
+            service_uuid: crate::frame::SERVICE_UUID,
+            method_id: opcode::NOTIFY_REVIVE_USER,
+            payload,
+        };
+        let mut out = Vec::new();
+        decode_notify(&n, 0, &mut out, None);
+        assert!(out.is_empty());
+    }
+
+    /// A present but zero `v_actor_uuid` names no real actor — same
+    /// zero-is-absent rule as the missing-field case above.
+    #[test]
+    fn notify_revive_user_zero_uuid_yields_no_event() {
+        let msg = pb::NotifyReviveUser {
+            v_actor_uuid: Some(0),
+        };
         let mut payload = Vec::new();
         msg.encode(&mut payload).unwrap();
         let n = Notify {
