@@ -1118,6 +1118,14 @@ impl Meter {
                             self.boss_monster_id(),
                         );
                     }
+                    // issue #391 (PR #395 review, finding O8b): a completion
+                    // signal belongs to the scene being left, not whatever
+                    // comes next — drop any held one on every scene
+                    // transition, `cut_short` or not, so a fight that
+                    // already latched under `SceneChanged` above can never
+                    // be re-ended by a stale producer, and the fresh
+                    // instance's own signals start from a clean hold.
+                    self.dungeon_finish_seen.clear();
 
                     // issue #191: only entering a *dungeon/raid* scene
                     // clears the roster immediately. That is the one
@@ -1538,12 +1546,22 @@ impl Meter {
             self.latch_dungeon_end(source, self.last_event_ms);
             return;
         }
-        // Once per distinct producer per fight (issue #69): the re-sends are
-        // a ~3s cadence, and every repeat of a producer already held is a
-        // silent no-op. A dungeon that fires both §3's and §7's producer logs
-        // both, so the capture names every signal the hold is standing on.
-        if !self.dungeon_finish_seen.contains(&source) {
+        // Most-recent-last (PR #395 review, finding S2): a producer already
+        // held that fires again is moved to the back rather than left in
+        // place, so `dungeon_finish_seen.last()` — what
+        // `end_fight_on_held_dungeon_finish` and `latch_dungeon_end` name as
+        // the resolving source — is always whichever producer signalled
+        // most recently, not whichever signalled first.
+        if let Some(pos) = self.dungeon_finish_seen.iter().position(|s| *s == source) {
+            self.dungeon_finish_seen.remove(pos);
             self.dungeon_finish_seen.push(source);
+        } else {
+            self.dungeon_finish_seen.push(source);
+            // Once per distinct producer per fight (issue #69): the re-sends
+            // are a ~3s cadence, and every repeat of a producer already held
+            // is a silent no-op. A dungeon that fires both §3's and §7's
+            // producer logs both, so the capture names every signal the hold
+            // is standing on.
             log::info!(
                 "encounter: dungeon completion signal source={source} held, \
                  target hp_pct={:.1} damaged_enemies={} (issue #391)",
@@ -1734,6 +1752,12 @@ impl Meter {
         let is_new_objective =
             Some(target_id) != prior_current && complete == Some(false) && nums == Some(0);
         if !is_new_objective {
+            // issue #391 (PR #395 review, finding O2): this update did not
+            // move the objective off the one a held completion signal is
+            // gated on, but it may still be what just marked that objective
+            // complete — re-check the hold every time the gate could have
+            // lifted, not only on a transition.
+            self.end_fight_on_held_dungeon_finish(self.last_event_ms);
             return None;
         }
 
@@ -1757,6 +1781,11 @@ impl Meter {
             self.reset(ResetReason::DungeonStarted, self.last_event_ms);
             Some(ResetReason::DungeonStarted)
         } else {
+            // issue #391 (PR #395 review, finding O2): the transition itself
+            // can be what lifts the gate a held completion signal is waiting
+            // on — re-check now rather than only on the next damage/death
+            // event.
+            self.end_fight_on_held_dungeon_finish(self.last_event_ms);
             None
         }
     }
@@ -1780,6 +1809,10 @@ impl Meter {
         if self.current_objective_id == Some(target_id) {
             self.current_objective_id = None;
         }
+        // issue #391 (PR #395 review, finding O2): clearing the gated
+        // objective can itself be what lifts a held completion signal's
+        // gate — re-check right away.
+        self.end_fight_on_held_dungeon_finish(self.last_event_ms);
     }
 
     fn apply_damage(&mut self, d: &DamageEvent) -> Option<ResetReason> {
@@ -13052,10 +13085,11 @@ mod tests {
             m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 2_000));
             assert_eq!(m.fight_end_ms(), None, "latched through the §8 gate");
 
-            // Once the objective completes, the next death path resolves it.
+            // Once the objective completes, the gate lifts and the already-
+            // held signal resolves on its own (PR #395 review, finding O2)
+            // — no second producer event needed.
             m.apply(&objective(100, None, Some(true)));
-            m.apply(&boss_hit(BOSS_UID, 3_000, true));
-            assert_eq!(m.fight_end_ms(), Some(3_000));
+            assert_eq!(m.fight_end_ms(), Some(1_000));
             assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
         }
 
@@ -13078,10 +13112,10 @@ mod tests {
             m.apply(&var("IsFinishTarget", 1));
             assert_eq!(m.fight_end_ms(), None, "latched past the objective gate");
 
-            // Objective complete: the gate is down, and the next ~3s re-send
-            // of the same signal resolves the fight.
+            // Objective complete: the gate lifts and the already-held signal
+            // resolves on its own (PR #395 review, finding O2) — no re-send
+            // of the producer needed.
             m.apply(&objective(100, None, Some(true)));
-            m.apply(&var("IsFinishTarget", 1));
             assert_eq!(m.fight_end_ms(), Some(1_000));
             assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
         }
@@ -13331,6 +13365,77 @@ mod tests {
             m.apply(&boss_hit(BOSS_UID, 2_000, true));
 
             assert_eq!(m.fight_state(2_100), FightState::Ended);
+        }
+
+        /// PR #395 review, finding O2: a removal is one more way the gate a
+        /// held signal is waiting on can lift, exactly like a transition
+        /// that completes it — the removed-objective path must re-check the
+        /// hold too, not only the transition path.
+        #[test]
+        fn a_removed_objective_lifts_the_gate_on_a_held_signal() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&objective(100, Some(0), Some(false)));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 50, 1_000));
+            m.apply(&var("IsFinishTarget", 1));
+            assert_eq!(m.fight_end_ms(), None);
+
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 2_000));
+            assert_eq!(m.fight_end_ms(), None, "latched through the §8 gate");
+
+            m.apply(&objective_removed(100));
+            assert_eq!(m.fight_end_ms(), Some(1_000));
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+        }
+
+        /// PR #395 review, finding S2: `dungeon_finish_seen` stays
+        /// most-recent-last. A producer already held that fires again moves
+        /// to the back rather than staying put, so the name
+        /// `end_fight_on_held_dungeon_finish`/`latch_dungeon_end` attribute
+        /// the resolution to is always whichever producer signalled last.
+        #[test]
+        fn the_latched_source_is_the_most_recent_producer() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&objective(100, Some(0), Some(false)));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 50, 1_000));
+
+            m.apply(&var("IsFinishTarget", 1));
+            m.apply(&dungeon_state(EDungeonState::End));
+            m.apply(&var("IsFinishTarget", 1));
+
+            assert_eq!(
+                m.dungeon_finish_seen,
+                vec!["dungeon_state_end", "is_finish_target"]
+            );
+        }
+
+        /// PR #395 review, finding O8b: a completion signal belongs to the
+        /// scene that produced it. A held signal must not survive the meter
+        /// leaving that scene, or a stale producer could end whatever fight
+        /// comes next.
+        #[test]
+        fn a_scene_transition_drops_a_held_completion_signal() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene { level_map_id: 1001 }); // Tina's Mindrealm
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 50, 1_000));
+            m.apply(&dungeon_state(EDungeonState::End));
+            assert_eq!(m.fight_end_ms(), None);
+
+            m.apply(&ProtocolEvent::Scene { level_map_id: 8 }); // town, not a dungeon
+            assert!(m.dungeon_finish_seen.is_empty());
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::SceneChanged));
+
+            m.apply(&hp_at(BOSS_UID, HUNT_BOSS, 0, 2_000));
+            assert_eq!(
+                m.fight_end_cause(),
+                Some(FightEndCause::SceneChanged),
+                "the dropped signal must not resurrect and re-end the fight"
+            );
         }
     }
 
