@@ -356,7 +356,8 @@ fn party_wipe_holds_as_wipe() {
         .hit(P_BRIN, M_BOSS, 202, 25_000)
         .at(3_000)
         .inject(ProtocolEvent::Damage(DamageEvent {
-            attacker: EntityId::from_display_uid(M_BOSS, EntityKind::Monster),
+            attacker: EntityId::from_display_uid(M_BOSS, EntityKind::Monster)
+                .expect("in-range test uid"),
             attacker_uid: M_BOSS,
             attacker_kind: EntityKind::Monster,
             skill_id: 901,
@@ -367,7 +368,8 @@ fn party_wipe_holds_as_wipe() {
             is_miss: false,
             is_heal: false,
             kind: DamageKind::Normal,
-            target: EntityId::from_display_uid(P_ARIA, EntityKind::Player),
+            target: EntityId::from_display_uid(P_ARIA, EntityKind::Player)
+                .expect("in-range test uid"),
             target_uid: P_ARIA,
             target_kind: EntityKind::Player,
             timestamp_ms: 3_000,
@@ -375,7 +377,8 @@ fn party_wipe_holds_as_wipe() {
         }))
         .at(3_500)
         .inject(ProtocolEvent::Damage(DamageEvent {
-            attacker: EntityId::from_display_uid(M_BOSS, EntityKind::Monster),
+            attacker: EntityId::from_display_uid(M_BOSS, EntityKind::Monster)
+                .expect("in-range test uid"),
             attacker_uid: M_BOSS,
             attacker_kind: EntityKind::Monster,
             skill_id: 901,
@@ -386,7 +389,8 @@ fn party_wipe_holds_as_wipe() {
             is_miss: false,
             is_heal: false,
             kind: DamageKind::Normal,
-            target: EntityId::from_display_uid(P_BRIN, EntityKind::Player),
+            target: EntityId::from_display_uid(P_BRIN, EntityKind::Player)
+                .expect("in-range test uid"),
             target_uid: P_BRIN,
             target_kind: EntityKind::Player,
             timestamp_ms: 3_500,

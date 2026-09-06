@@ -451,7 +451,10 @@ impl HistoryStore for SqliteHistory {
                 // `PlayerRecord::to_row` always has a real value to hand
                 // back rather than needing its own `Option`.
                 let entity = row.get::<_, Option<i64>>(1)?.unwrap_or_else(|| {
-                    EntityId::from_display_uid(uid, EntityKind::Player).0 as i64
+                    // An out-of-range pre-v3 uid deliberately loads as
+                    // UNKNOWN rather than dropping the row.
+                    EntityId::from_display_uid(uid, EntityKind::Player)
+                        .map_or(EntityId::UNKNOWN.0, |e| e.0) as i64
                 });
                 Ok(PlayerRecord {
                     uid,
@@ -538,7 +541,9 @@ mod tests {
     fn sample_player(uid: i64, name: &str) -> PlayerRecord {
         PlayerRecord {
             uid,
-            entity: EntityId::from_display_uid(uid, EntityKind::Player).0 as i64,
+            entity: EntityId::from_display_uid(uid, EntityKind::Player)
+                .expect("in-range test uid")
+                .0 as i64,
             name: name.to_string(),
             class: Some(Class::FrostMage),
             ability_score: Some(999),
@@ -1033,7 +1038,9 @@ mod tests {
     fn two_players_sharing_a_recycled_uid_stay_distinct_by_entity() {
         let mut store = SqliteHistory::in_memory(RetentionPolicy::default()).unwrap();
         let mut first = sample_player(1, "Alice");
-        first.entity = EntityId::from_display_uid(1, EntityKind::Player).0 as i64;
+        first.entity = EntityId::from_display_uid(1, EntityKind::Player)
+            .expect("in-range test uid")
+            .0 as i64;
         let mut second = sample_player(1, "Bob");
         second.entity = first.entity | 0x1;
         let id = store
@@ -1110,7 +1117,9 @@ mod tests {
         assert_eq!(loaded.local_uid, None);
         assert_eq!(
             loaded.players[0].entity,
-            EntityId::from_display_uid(1, EntityKind::Player).0 as i64
+            EntityId::from_display_uid(1, EntityKind::Player)
+                .expect("in-range test uid")
+                .0 as i64
         );
         assert_eq!(version, SCHEMA_VERSION);
         assert!(

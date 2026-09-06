@@ -858,6 +858,7 @@ mod tests {
                         1,
                         bpsr_meter::EntityKind::Player,
                     )
+                    .expect("in-range test uid")
                     .0 as i64,
                     name: "Alice".to_string(),
                     class: Some(Class::FrostMage),

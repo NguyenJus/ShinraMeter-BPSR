@@ -932,7 +932,8 @@ mod tests {
 
     fn damage(attacker_uid: i64, value: i64, ts: u64) -> proto::DamageEvent {
         proto::DamageEvent {
-            attacker: proto::EntityId::from_display_uid(attacker_uid, proto::EntityKind::Player),
+            attacker: proto::EntityId::from_display_uid(attacker_uid, proto::EntityKind::Player)
+                .expect("in-range test uid"),
             attacker_uid,
             attacker_kind: proto::EntityKind::Player,
             skill_id: 7,
@@ -943,7 +944,8 @@ mod tests {
             is_miss: false,
             is_heal: false,
             kind: proto::DamageKind::Normal,
-            target: proto::EntityId::from_display_uid(500, proto::EntityKind::Monster),
+            target: proto::EntityId::from_display_uid(500, proto::EntityKind::Monster)
+                .expect("in-range test uid"),
             target_uid: 500,
             target_kind: proto::EntityKind::Monster,
             timestamp_ms: ts,
@@ -1009,7 +1011,8 @@ mod tests {
     fn maps_player_info() {
         let mapped = map_event(
             proto::ProtocolEvent::Player(proto::PlayerInfo {
-                entity: proto::EntityId::from_display_uid(42, proto::EntityKind::Player),
+                entity: proto::EntityId::from_display_uid(42, proto::EntityKind::Player)
+                    .expect("in-range test uid"),
                 uid: 42,
                 name: Some("Foo".to_string()),
                 class: Some(proto::Class::Marksman),
@@ -1026,7 +1029,8 @@ mod tests {
         assert_eq!(
             mapped,
             meter::ProtocolEvent::Player(meter::PlayerInfo {
-                entity: meter::EntityId::from_display_uid(42, meter::EntityKind::Player),
+                entity: meter::EntityId::from_display_uid(42, meter::EntityKind::Player)
+                    .expect("in-range test uid"),
                 uid: 42,
                 name: Some("Foo".to_string()),
                 class: Some(meter::Class::Marksman),
@@ -1048,7 +1052,8 @@ mod tests {
         // wrong-slot or wrong-source tier mixup would fail this assertion.
         let mapped = map_event(
             proto::ProtocolEvent::Player(proto::PlayerInfo {
-                entity: proto::EntityId::from_display_uid(7, proto::EntityKind::Player),
+                entity: proto::EntityId::from_display_uid(7, proto::EntityKind::Player)
+                    .expect("in-range test uid"),
                 uid: 7,
                 name: None,
                 class: None,
@@ -1073,7 +1078,8 @@ mod tests {
     fn maps_player_info_leaves_imagines_none_when_skill_ids_is_empty() {
         let mapped = map_event(
             proto::ProtocolEvent::Player(proto::PlayerInfo {
-                entity: proto::EntityId::from_display_uid(8, proto::EntityKind::Player),
+                entity: proto::EntityId::from_display_uid(8, proto::EntityKind::Player)
+                    .expect("in-range test uid"),
                 uid: 8,
                 name: None,
                 class: None,
@@ -1098,7 +1104,8 @@ mod tests {
     fn maps_enemy_hp() {
         let mapped = map_event(
             proto::ProtocolEvent::EnemyHp(proto::EnemyHp {
-                entity: proto::EntityId::from_display_uid(10, proto::EntityKind::Monster),
+                entity: proto::EntityId::from_display_uid(10, proto::EntityKind::Monster)
+                    .expect("in-range test uid"),
                 uid: 10,
                 curr_hp: Some(55),
                 max_hp: Some(100),
@@ -1112,7 +1119,8 @@ mod tests {
         assert_eq!(
             mapped,
             meter::ProtocolEvent::EnemyHp(meter::EnemyHp {
-                entity: meter::EntityId::from_display_uid(10, meter::EntityKind::Monster),
+                entity: meter::EntityId::from_display_uid(10, meter::EntityKind::Monster)
+                    .expect("in-range test uid"),
                 uid: 10,
                 curr_hp: Some(55),
                 max_hp: Some(100),
@@ -1333,7 +1341,8 @@ mod tests {
             let mut p = Pipeline::with_names_cache_path(path.clone());
             p.step(
                 proto::ProtocolEvent::Player(proto::PlayerInfo {
-                    entity: proto::EntityId::from_display_uid(1, proto::EntityKind::Player),
+                    entity: proto::EntityId::from_display_uid(1, proto::EntityKind::Player)
+                        .expect("in-range test uid"),
                     uid: 1,
                     name: Some("Foo".to_string()),
                     class: None,
@@ -1374,7 +1383,8 @@ mod tests {
             let mut p = Pipeline::with_names_cache_path(path.clone());
             p.step(
                 proto::ProtocolEvent::Player(proto::PlayerInfo {
-                    entity: proto::EntityId::from_display_uid(1, proto::EntityKind::Player),
+                    entity: proto::EntityId::from_display_uid(1, proto::EntityKind::Player)
+                        .expect("in-range test uid"),
                     uid: 1,
                     name: Some("Foo".to_string()),
                     class: None,
@@ -1414,7 +1424,8 @@ mod tests {
         p.step(proto::ProtocolEvent::Damage(damage(5, 100, 1_000)), 1_000);
         p.step(
             proto::ProtocolEvent::Player(proto::PlayerInfo {
-                entity: proto::EntityId::from_display_uid(5, proto::EntityKind::Player),
+                entity: proto::EntityId::from_display_uid(5, proto::EntityKind::Player)
+                    .expect("in-range test uid"),
                 uid: 5,
                 name: Some("Late".to_string()),
                 class: Some(proto::Class::FrostMage),
@@ -1439,7 +1450,8 @@ mod tests {
         p.step(proto::ProtocolEvent::Damage(damage(9, 100, 1_000)), 1_000);
         p.step(
             proto::ProtocolEvent::Player(proto::PlayerInfo {
-                entity: proto::EntityId::from_display_uid(9, proto::EntityKind::Player),
+                entity: proto::EntityId::from_display_uid(9, proto::EntityKind::Player)
+                    .expect("in-range test uid"),
                 uid: 9,
                 name: None,
                 class: None,
@@ -1463,7 +1475,8 @@ mod tests {
         p.step(proto::ProtocolEvent::Damage(damage(10, 100, 1_000)), 1_000);
         p.step(
             proto::ProtocolEvent::Player(proto::PlayerInfo {
-                entity: proto::EntityId::from_display_uid(10, proto::EntityKind::Player),
+                entity: proto::EntityId::from_display_uid(10, proto::EntityKind::Player)
+                    .expect("in-range test uid"),
                 uid: 10,
                 name: None,
                 class: None,
@@ -1628,7 +1641,8 @@ mod tests {
                 // Overridden together with `target_uid` (issue #335): the
                 // identity is what the meter keys on, so leaving the base
                 // helper's would file every hit under one enemy.
-                target: proto::EntityId::from_display_uid(target_uid, proto::EntityKind::Monster),
+                target: proto::EntityId::from_display_uid(target_uid, proto::EntityKind::Monster)
+                    .expect("in-range test uid"),
                 target_uid,
                 is_dead,
                 ..damage(1, value, ts)
@@ -1646,7 +1660,8 @@ mod tests {
             ts: u64,
         ) -> proto::ProtocolEvent {
             proto::ProtocolEvent::EnemyHp(proto::EnemyHp {
-                entity: proto::EntityId::from_display_uid(uid, proto::EntityKind::Monster),
+                entity: proto::EntityId::from_display_uid(uid, proto::EntityKind::Monster)
+                    .expect("in-range test uid"),
                 uid,
                 curr_hp: Some(curr),
                 max_hp: Some(max),
@@ -1861,7 +1876,8 @@ mod tests {
             pipeline.step(proto::ProtocolEvent::Damage(damage(1, 100, 0)), 0);
             pipeline.step(
                 proto::ProtocolEvent::EnemyHp(proto::EnemyHp {
-                    entity: proto::EntityId::from_display_uid(500, proto::EntityKind::Monster),
+                    entity: proto::EntityId::from_display_uid(500, proto::EntityKind::Monster)
+                        .expect("in-range test uid"),
                     uid: 500,
                     curr_hp: Some(50),
                     max_hp: Some(100),
@@ -1961,7 +1977,8 @@ mod tests {
             // `step`'s own `record_fight_end` call.
             pipeline.step(
                 proto::ProtocolEvent::Cast(proto::event::CastEvent {
-                    caster: proto::EntityId::from_display_uid(1, proto::EntityKind::Player),
+                    caster: proto::EntityId::from_display_uid(1, proto::EntityKind::Player)
+                        .expect("in-range test uid"),
                     caster_uid: 1,
                     skill_id: 7,
                     timestamp_ms: after_idle,
