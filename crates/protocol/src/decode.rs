@@ -550,13 +550,11 @@ fn on_sync_container_data(
     // already using for this player (issue #335).
     //
     // issue #388: `char_id` is unvalidated wire input — an out-of-range
-    // value with no shadow-map hit resolves to `UNKNOWN` rather than a
-    // reconstruction that silently dropped its high bits, so the row is
-    // dropped rather than filed under that shared id.
-    let entity = entities.resolve_uid(v_data.char_id, EntityKind::Player);
-    if entity == EntityId::UNKNOWN {
+    // value with no shadow-map hit has no valid reconstruction, so the row
+    // is dropped rather than filed under a colliding id.
+    let Some(entity) = entities.resolve_uid(v_data.char_id, EntityKind::Player) else {
         return;
-    }
+    };
     out.push(ProtocolEvent::Player(PlayerInfo {
         entity,
         uid: v_data.char_id,
@@ -655,16 +653,14 @@ fn on_notify_join_team(
         // #335): a roster member is a player, so a shadow-map hit of any
         // other kind is refused by `resolve_uid`.
         //
-        // issue #388: an out-of-range `uid` with no shadow-map hit resolves
-        // to `UNKNOWN` rather than a reconstruction that silently dropped
-        // its high bits, so this member is dropped from the roster entirely
-        // rather than filed under that shared id (issue #389: a
+        // issue #388: an out-of-range `uid` with no shadow-map hit has no
+        // valid reconstruction, so this member is dropped from the roster
+        // entirely rather than filed under a colliding id (issue #389: a
         // roster-without-a-Player-row would otherwise still land in
         // `TeamRoster`).
-        let entity = entities.resolve_uid(uid, EntityKind::Player);
-        if entity == EntityId::UNKNOWN {
+        let Some(entity) = entities.resolve_uid(uid, EntityKind::Player) else {
             continue;
-        }
+        };
         roster.push(uid);
         let name = social
             .and_then(|s| s.basic_data.as_ref())
@@ -2017,7 +2013,7 @@ mod tests {
 
     /// issue #388: a `char_id` outside the 48-bit display-uid field cannot
     /// be reconstructed into a valid entity id without silently dropping
-    /// its high bits, so `resolve_uid` returns `UNKNOWN` and the `Player`
+    /// its high bits, so `resolve_uid` returns `None` and the `Player`
     /// row is dropped entirely rather than filed under that shared id.
     /// `LocalPlayer` is narrowed the same way — an out-of-range char_id is
     /// treated as absent there too, so nothing fires at all.
@@ -2107,7 +2103,8 @@ mod tests {
             vec![
                 ProtocolEvent::LocalPlayer { uid: 8 },
                 ProtocolEvent::Player(PlayerInfo {
-                    entity: EntityId::from_display_uid(8, EntityKind::Player),
+                    entity: EntityId::from_display_uid(8, EntityKind::Player)
+                        .expect("in-range test uid"),
                     uid: 8,
                     name: Some("Ari".to_string()),
                     class: None,
@@ -3295,7 +3292,10 @@ mod tests {
         decode_notify(&n, 0, &mut out, None);
         match &out[1] {
             ProtocolEvent::Player(p) => {
-                assert_eq!(p.entity, EntityId::from_display_uid(8, EntityKind::Player));
+                assert_eq!(
+                    p.entity,
+                    EntityId::from_display_uid(8, EntityKind::Player).expect("in-range test uid")
+                );
                 assert_eq!(p.entity.display_uid(), 8);
             }
             other => panic!("expected Player, got {other:?}"),

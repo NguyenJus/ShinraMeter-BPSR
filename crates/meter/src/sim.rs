@@ -123,7 +123,7 @@ fn player_info_event(uid: i64, ts: u64) -> SimEvent {
     SimEvent {
         timestamp_ms: ts,
         event: ProtocolEvent::Player(PlayerInfo {
-            entity: EntityId::from_display_uid(uid, EntityKind::Player),
+            entity: EntityId::from_display_uid(uid, EntityKind::Player).expect("in-range uid"),
             uid,
             name: Some(format!("Player{uid}")),
             class: Some(crate::event::Class::from(
@@ -142,7 +142,8 @@ fn boss_hp_event(boss_uid: i64, monster_id: u32, curr: u64, max: u64, ts: u64) -
     SimEvent {
         timestamp_ms: ts,
         event: ProtocolEvent::EnemyHp(crate::event::EnemyHp {
-            entity: EntityId::from_display_uid(boss_uid, EntityKind::Monster),
+            entity: EntityId::from_display_uid(boss_uid, EntityKind::Monster)
+                .expect("in-range uid"),
             uid: boss_uid,
             curr_hp: Some(curr),
             max_hp: Some(max),
@@ -160,7 +161,8 @@ fn hit_event(attacker_uid: i64, boss_uid: i64, ts: u64, rng: &mut Rng) -> SimEve
     SimEvent {
         timestamp_ms: ts,
         event: ProtocolEvent::Damage(DamageEvent {
-            attacker: EntityId::from_display_uid(attacker_uid, EntityKind::Player),
+            attacker: EntityId::from_display_uid(attacker_uid, EntityKind::Player)
+                .expect("in-range uid"),
             attacker_uid,
             attacker_kind: EntityKind::Player,
             skill_id: 1,
@@ -171,7 +173,8 @@ fn hit_event(attacker_uid: i64, boss_uid: i64, ts: u64, rng: &mut Rng) -> SimEve
             is_miss: false,
             is_heal: false,
             kind: DamageKind::Normal,
-            target: EntityId::from_display_uid(boss_uid, EntityKind::Monster),
+            target: EntityId::from_display_uid(boss_uid, EntityKind::Monster)
+                .expect("in-range uid"),
             target_uid: boss_uid,
             target_kind: EntityKind::Monster,
             timestamp_ms: ts,
