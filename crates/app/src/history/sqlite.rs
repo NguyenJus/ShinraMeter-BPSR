@@ -439,24 +439,35 @@ impl HistoryStore for SqliteHistory {
         let mut stmt = self.conn.prepare(
             "SELECT uid, entity, name, class, ability_score, season_strength, imagine_0,
                     imagine_1, imagine_tier_0, imagine_tier_1, damage, dps, share_pct, crit_pct,
-                    lucky_pct, hits, deaths
+                    lucky_pct, hits, deaths, slot
              FROM encounter_players WHERE encounter_id = ?1 ORDER BY slot",
         )?;
-        record.players = stmt
+        let loaded = stmt
             .query_map(params![id], |row| {
                 let uid: i64 = row.get(0)?;
+                let slot: i64 = row.get(17)?;
                 // Issue #379: a pre-v3 row has no stored `entity` and reads
                 // back `NULL` here; reconstruct the same `EntityId` a live
                 // encounter would have derived for a bare display uid, so
                 // `PlayerRecord::to_row` always has a real value to hand
                 // back rather than needing its own `Option`.
-                let entity = row.get::<_, Option<i64>>(1)?.unwrap_or_else(|| {
-                    // An out-of-range pre-v3 uid deliberately loads as
-                    // UNKNOWN rather than dropping the row.
-                    EntityId::from_display_uid(uid, EntityKind::Player)
-                        .map_or(EntityId::UNKNOWN.0, |e| e.0) as i64
-                });
-                Ok(PlayerRecord {
+                let entity = match row.get::<_, Option<i64>>(1)? {
+                    Some(entity) => entity,
+                    // Issue #392: a stored uid outside the 48-bit display-uid
+                    // field has no reconstructable identity, and filing it
+                    // under `EntityId::UNKNOWN` would merge every such row in
+                    // the database into one player. Drop the row instead.
+                    None => match EntityId::from_display_uid(uid, EntityKind::Player) {
+                        Some(entity) => entity.0 as i64,
+                        None => {
+                            log::warn!(
+                                "history: skipping pre-v3 row with out-of-range uid={uid} (issue #392)"
+                            );
+                            return Ok(None);
+                        }
+                    },
+                };
+                Ok(Some((slot, PlayerRecord {
                     uid,
                     entity,
                     name: row.get(2)?,
@@ -480,9 +491,17 @@ impl HistoryStore for SqliteHistory {
                     hits: u64::try_from(row.get::<_, i64>(15)?).unwrap_or(0),
                     deaths: u32::try_from(row.get::<_, i64>(16)?).unwrap_or(0),
                     skills: Vec::new(),
-                })
+                })))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        // A skipped row leaves a hole in the `slot` sequence, so the skill
+        // fan-out below can no longer use a player's index as its slot.
+        let mut slot_to_index: std::collections::HashMap<i64, usize> =
+            std::collections::HashMap::new();
+        for (slot, player) in loaded.into_iter().flatten() {
+            slot_to_index.insert(slot, record.players.len());
+            record.players.push(player);
+        }
 
         // Issue #222: one query for the whole encounter's breakdown, fanned
         // out by `slot` into the players just loaded (their index *is* their
@@ -496,7 +515,7 @@ impl HistoryStore for SqliteHistory {
         )?;
         let skills = stmt.query_map(params![id], |row| {
             Ok((
-                usize::try_from(row.get::<_, i64>(0)?).unwrap_or(usize::MAX),
+                row.get::<_, i64>(0)?,
                 SkillRecord {
                     skill_id: row.get(1)?,
                     damage: row.get(2)?,
@@ -514,7 +533,10 @@ impl HistoryStore for SqliteHistory {
         })?;
         for entry in skills {
             let (slot, skill) = entry?;
-            if let Some(player) = record.players.get_mut(slot) {
+            if let Some(player) = slot_to_index
+                .get(&slot)
+                .and_then(|index| record.players.get_mut(*index))
+            {
                 player.skills.push(skill);
             }
         }
@@ -1125,6 +1147,63 @@ mod tests {
         assert!(
             !bak_exists,
             "a migratable file is upgraded in place, never renamed aside"
+        );
+    }
+
+    /// Issue #392: a pre-v3 row whose stored `uid` falls outside the 48-bit
+    /// display-uid field has no reconstructable `EntityId`, and filing it
+    /// under `EntityId::UNKNOWN` would merge every such row into one player.
+    /// Skip those rows instead and keep the loadable ones.
+    #[test]
+    fn a_v2_row_with_an_out_of_range_uid_is_skipped() {
+        let path = crate::history::temp_history_path("v2-out-of-range-uid");
+        let _ = fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V1_SCHEMA).unwrap();
+            conn.execute_batch(SKILLS_DDL).unwrap();
+            conn.execute(
+                "INSERT INTO encounters (
+                    ended_at_ms, duration_ms, total_damage, total_dps, boss_monster_id,
+                    boss_name, is_boss, scene_id, scene_name, title, subtitle,
+                    player_count, meter_version
+                 ) VALUES (1000, 10000, 10000, 1000.0, 7, 'Boss', 1, 3, 'Scene', 'Boss',
+                           'Scene', 2, '0.2.2')",
+                [],
+            )
+            .unwrap();
+            for (slot, uid, name) in [(0i64, (1i64 << 47) + 1, "Garbage"), (1, 5, "Alice")] {
+                conn.execute(
+                    "INSERT INTO encounter_players (
+                        encounter_id, slot, uid, name, class, ability_score, season_strength,
+                        imagine_0, imagine_1, imagine_tier_0, imagine_tier_1,
+                        damage, dps, share_pct, crit_pct, lucky_pct, hits, deaths
+                     ) VALUES (1, ?1, ?2, ?3, 'FrostMage', 999, 42, 1, NULL, 3, NULL,
+                               5000, 500.0, 33.3, 12.5, 6.25, 40, 2)",
+                    params![slot, uid, name],
+                )
+                .unwrap();
+            }
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+
+        let store = SqliteHistory::open(&path, RetentionPolicy::default()).unwrap();
+        let loaded = store.load(1).unwrap().unwrap();
+        drop(store);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            loaded.players.len(),
+            1,
+            "the out-of-range row is skipped, not loaded as UNKNOWN"
+        );
+        assert_eq!(loaded.players[0].uid, 5);
+        assert_eq!(
+            loaded.players[0].entity,
+            EntityId::from_display_uid(5, EntityKind::Player)
+                .expect("in-range test uid")
+                .0 as i64
         );
     }
 

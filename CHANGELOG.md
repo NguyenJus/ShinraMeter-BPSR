@@ -4,6 +4,14 @@ All notable changes to ShinraMeter-BPSR are documented here. This project is
 a fan-made, unofficial tool for Blue Protocol: Star Resonance and is not
 affiliated with the game's publisher.
 
+## Unreleased
+
+### Fixed
+
+- Encounters saved by a pre-v3 build whose stored player uid is out of
+  range are no longer all loaded as the same unknown player, silently
+  merging distinct saved players; those rows are skipped instead.
+
 ## v0.2.6
 
 ### Added
