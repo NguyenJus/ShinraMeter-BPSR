@@ -646,11 +646,7 @@ pub(super) fn toggle_state_tint(active: bool) -> egui::Color32 {
 /// unit-testable without a live `egui::Context` or the platform layer's
 /// real atomics.
 pub(super) fn click_through_after_tray_request(click_through: bool, requested: bool) -> bool {
-    if requested {
-        false
-    } else {
-        click_through
-    }
+    if requested { false } else { click_through }
 }
 
 /// Paints the stat row's toggle cluster: Share, Reset (issue #82) and
@@ -690,11 +686,7 @@ pub(super) fn availability_label(
     label: &'static str,
     unavailable: &'static str,
 ) -> &'static str {
-    if active {
-        label
-    } else {
-        unavailable
-    }
+    if active { label } else { unavailable }
 }
 
 /// Splits the stat row's rect into the stat pills' area and the toggle
@@ -3606,8 +3598,8 @@ mod tests {
     /// landing — proves the guard stays set for every frame in between,
     /// not just the click.
     #[test]
-    fn screenshot_capture_guard_stays_set_through_the_captured_frame_and_every_frame_until_the_reply_lands(
-    ) {
+    fn screenshot_capture_guard_stays_set_through_the_captured_frame_and_every_frame_until_the_reply_lands()
+     {
         let mut capturing = false;
 
         // Frame 0: the Share click fires the request. This frame itself is
