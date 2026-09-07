@@ -4,6 +4,17 @@ All notable changes to ShinraMeter-BPSR are documented here. This project is
 a fan-made, unofficial tool for Blue Protocol: Star Resonance and is not
 affiliated with the game's publisher.
 
+## Unreleased
+
+### Changed
+
+- Log lines now carry a `pid=<pid>` field, so entries from two meter
+  instances sharing one log file can be told apart.
+- Startup now logs an `env overrides:` banner line recording which
+  `SHINRA_*` environment overrides were active for the session.
+- Loading and saving settings, and minimizing to or restoring from the
+  notification area, are now recorded in the log.
+
 ## v0.2.6
 
 ### Added

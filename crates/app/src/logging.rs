@@ -83,6 +83,20 @@ pub fn init() {
         Some(file) => builder.target(env_logger::Target::Pipe(Box::new(Tee::new(path, file)))),
         None => builder.target(env_logger::Target::Stderr),
     };
+    builder.format(|buf, record| {
+        let timestamp = buf.timestamp().to_string();
+        write!(
+            buf,
+            "{}",
+            format_line(
+                record.level(),
+                record.target(),
+                record.args(),
+                std::process::id(),
+                &timestamp,
+            )
+        )
+    });
     builder.init();
 
     // Deferred from above: the logger isn't live until `builder.init()`
@@ -106,6 +120,51 @@ pub fn init() {
             .unwrap_or_else(|| "<none, stderr only>".to_string()),
         log::max_level(),
     );
+
+    log::info!("{}", env_overrides_summary(|key| std::env::var(key).ok()));
+}
+
+/// Renders one log line, keeping env_logger's default field order and
+/// layout (`[<rfc3339 seconds> <LEVEL> <target>] <message>`) but inserting
+/// `pid=<pid>` right after the level, so lines from overlapping instances
+/// writing to the same log file (issue #401) can be told apart (issue #408).
+/// `timestamp` is pre-rendered by the caller (env_logger's `Formatter`
+/// already knows how) so this stays a pure, directly testable function.
+fn format_line(
+    level: log::Level,
+    target: &str,
+    args: &std::fmt::Arguments<'_>,
+    pid: u32,
+    timestamp: &str,
+) -> String {
+    format!("[{timestamp} {level:<5} pid={pid} {target}] {args}\n")
+}
+
+/// Builds the `env overrides: ...` startup-banner line (issue #407) so a log
+/// can be told apart as a demo/harness launch versus live play, and so which
+/// path overrides were active is on the record. `SHINRA_INSPECT_DUMP` is
+/// folded into the `inspect=` field alongside `SHINRA_INSPECT` since both
+/// gate the same packet-inspection feature. Takes a lookup closure rather
+/// than reading `std::env` directly so it is testable without mutating the
+/// process environment (racy across the crate's other env-reading tests).
+fn env_overrides_summary(mut lookup: impl FnMut(&str) -> Option<String>) -> String {
+    let demo = lookup("SHINRA_DEMO").unwrap_or_else(|| "unset".to_string());
+    let no_composition = lookup("SHINRA_NO_COMPOSITION").unwrap_or_else(|| "unset".to_string());
+    let history_db = lookup("SHINRA_HISTORY_DB");
+    let instance_lock = lookup("SHINRA_INSTANCE_LOCK");
+    let log_file = lookup("SHINRA_LOG_FILE");
+
+    let inspect = match (lookup("SHINRA_INSPECT"), lookup("SHINRA_INSPECT_DUMP")) {
+        (None, None) => "unset".to_string(),
+        (Some(inspect), None) => inspect,
+        (None, Some(dump)) => format!("dump={dump}"),
+        (Some(inspect), Some(dump)) => format!("{inspect} dump={dump}"),
+    };
+
+    format!(
+        "env overrides: demo={demo} inspect={inspect} no_composition={no_composition} \
+         history_db={history_db:?} instance_lock={instance_lock:?} log_file={log_file:?}"
+    )
 }
 
 /// Where the log file lives. See the module doc comment for the default and
@@ -452,6 +511,64 @@ mod tests {
     use bpsr_test_support::scratch_path;
 
     use super::*;
+
+    // -- env_overrides_summary -----------------------------------------
+
+    /// All SHINRA_* overrides unset — the common case — still yields a
+    /// stable, parseable line reporting each one as `unset` (issue #407),
+    /// rather than an empty or missing banner line.
+    #[test]
+    fn env_overrides_summary_reports_unset_when_nothing_is_set() {
+        let summary = env_overrides_summary(|_| None);
+        assert_eq!(
+            summary,
+            "env overrides: demo=unset inspect=unset no_composition=unset \
+             history_db=None instance_lock=None log_file=None"
+        );
+    }
+
+    /// Every override set, including `SHINRA_INSPECT_DUMP` folded into the
+    /// `inspect=` field alongside `SHINRA_INSPECT` (issue #407's ask groups
+    /// them since both gate the same packet-inspection feature).
+    #[test]
+    fn env_overrides_summary_reports_set_values_and_folds_inspect_dump() {
+        let summary = env_overrides_summary(|key| match key {
+            "SHINRA_DEMO" => Some("1".to_string()),
+            "SHINRA_INSPECT" => Some("1".to_string()),
+            "SHINRA_INSPECT_DUMP" => Some("/tmp/dump.jsonl".to_string()),
+            "SHINRA_NO_COMPOSITION" => Some("1".to_string()),
+            "SHINRA_HISTORY_DB" => Some("/tmp/history.sqlite".to_string()),
+            "SHINRA_INSTANCE_LOCK" => Some("/tmp/lock".to_string()),
+            "SHINRA_LOG_FILE" => Some("/tmp/log.txt".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            summary,
+            "env overrides: demo=1 inspect=1 dump=/tmp/dump.jsonl no_composition=1 \
+             history_db=Some(\"/tmp/history.sqlite\") instance_lock=Some(\"/tmp/lock\") \
+             log_file=Some(\"/tmp/log.txt\")"
+        );
+    }
+
+    // -- format_line ----------------------------------------------------
+
+    /// Prefixes each line with `pid=<pid>` right after the level, keeping the
+    /// rest of env_logger's default field order (issue #408) — so overlapping
+    /// instances writing to the same log file can be told apart.
+    #[test]
+    fn format_line_prefixes_pid_and_keeps_default_field_order() {
+        let line = format_line(
+            log::Level::Info,
+            "bpsr_capture::win",
+            &format_args!("capture: adopted target"),
+            3840,
+            "2026-09-07T02:30:35Z",
+        );
+        assert_eq!(
+            line,
+            "[2026-09-07T02:30:35Z INFO  pid=3840 bpsr_capture::win] capture: adopted target\n"
+        );
+    }
 
     // -- session_id ---------------------------------------------------------
 
