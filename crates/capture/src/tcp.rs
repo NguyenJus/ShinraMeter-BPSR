@@ -37,6 +37,25 @@ const MAX_STALL_BACKOFF: u32 = 64;
 /// trip doubles it immediately afterwards (see `stall_backoff`).
 const STALL_GUARD_REASON: &str = "stall_guard_re_anchor";
 
+/// Issue #405: wall-clock half of the stall guard's trip condition. A
+/// persistent hole (bytes genuinely never arriving, as opposed to a merely
+/// *late* retransmit — see #283) opens a gap and then just sits there: few
+/// pushes land on the stuck connection, so the push-count guard's
+/// exponential backoff (up to [`MAX_STALL_BACKOFF`]) can end up waiting
+/// several minutes before it trips — and #214's 180s "nothing reached the
+/// decoder" watchdog fires first and discards the whole cache instead (see
+/// `win.rs`'s restart path). `next_seq` sitting still for longer than this,
+/// while [`STALL_BYTES_BUDGET`] worth of bytes sit cached behind the gap, is
+/// re-anchored immediately regardless of `stall_pushes`/`stall_threshold`.
+const STALL_TIME_BUDGET_MS: u64 = 10_000;
+
+/// Issue #405: byte half of the wall-clock trip condition (see
+/// [`STALL_TIME_BUDGET_MS`]). Guards a quiet connection that just has not
+/// cached much yet — those are better left to the push-count guard, which
+/// still bounds how long they wait — from being re-anchored the instant the
+/// clock budget elapses.
+const STALL_BYTES_BUDGET: usize = 64 * 1024;
+
 /// Reassembles a TCP byte stream from possibly out-of-order / retransmitted
 /// segments, handling 32-bit sequence-number wraparound and recovering from
 /// a permanent gap (e.g. after a reconnect or zone change) via a stall guard.
@@ -79,6 +98,12 @@ pub struct TcpReassembler {
     /// already consumed: a buffer-cap trim or a stall-guard resync. Cleared
     /// by [`Self::take_loss`].
     loss: bool,
+    /// `now_ms` (caller-supplied, see [`Self::push`]) at which `next_seq`
+    /// last advanced. `None` only before the very first push. Drives the
+    /// wall-clock half of the stall guard (issue #405); the push-count half
+    /// (`stall_pushes`) is tracked separately since a busy-but-stuck stream
+    /// keeps pushing without ever advancing `next_seq`.
+    last_advance_ms: Option<u64>,
 }
 
 impl TcpReassembler {
@@ -107,6 +132,7 @@ impl TcpReassembler {
             stall_pushes: 0,
             stall_backoff: 1,
             loss: false,
+            last_advance_ms: None,
         }
     }
 
@@ -132,7 +158,14 @@ impl TcpReassembler {
     /// reported via [`Self::take_loss`]; callers holding downstream
     /// stateful state (e.g. a protocol decoder) should reset it when that
     /// returns `true`.
-    pub fn push(&mut self, seq: u32, payload: &[u8]) {
+    ///
+    /// `now_ms` is the caller's wall clock (e.g. `SystemTime`-since-epoch
+    /// milliseconds), injected rather than read internally so the stall
+    /// guard's wall-clock budget (issue #405) is host-testable with a driven
+    /// clock instead of a real sleep. Callers that never care about the
+    /// wall-clock trip (all the tests below bar the ones exercising it) can
+    /// pass a constant.
+    pub fn push(&mut self, seq: u32, payload: &[u8], now_ms: u64) {
         if payload.is_empty() {
             return;
         }
@@ -196,6 +229,7 @@ impl TcpReassembler {
         if after != before {
             // Forward progress: whatever gap was being waited on is gone.
             self.stall_pushes = 0;
+            self.last_advance_ms = Some(now_ms);
             // Progress with nothing left cached: the stream is fully caught
             // up, not just past the one gap that last tripped. Only this —
             // not merely surviving to the next push — earns back the
@@ -205,7 +239,26 @@ impl TcpReassembler {
             }
         } else if !self.cache.is_empty() || re_anchored {
             self.stall_pushes += 1;
-            if self.stall_pushes >= self.stall_threshold() {
+            // Issue #405: a persistent hole opens a gap and then goes quiet
+            // — few pushes land on the stuck connection, so the push-count
+            // guard's backoff (up to `MAX_STALL_BACKOFF`) can end up waiting
+            // minutes to trip, and the #214 180s watchdog fires first and
+            // discards the whole cache. Trip immediately, regardless of
+            // `stall_pushes`, once `next_seq` has been stuck for longer than
+            // `STALL_TIME_BUDGET_MS` *and* the cache behind the gap is
+            // holding more than `STALL_BYTES_BUDGET`.
+            let stuck_for_ms = self
+                .last_advance_ms
+                .map(|last| now_ms.saturating_sub(last))
+                .unwrap_or(0);
+            let budget_tripped =
+                stuck_for_ms > STALL_TIME_BUDGET_MS && self.gap_bytes() > STALL_BYTES_BUDGET;
+            if self.stall_pushes >= self.stall_threshold() || budget_tripped {
+                let trigger = if budget_tripped {
+                    "budget"
+                } else {
+                    "push_count"
+                };
                 match self.nearest_cached_seq() {
                     // Give up on the gap and restart from the cached segment
                     // nearest ahead of it, in modular order — keeping (not
@@ -218,7 +271,8 @@ impl TcpReassembler {
                         // `MAX_STALL_PUSHES` pushes — so `warn` is
                         // affordable for something this abnormal.
                         log::warn!(
-                            "tcp: stall guard tripped: stall_pushes={} next_seq={after} nearest={nearest} \
+                            "tcp: stall guard tripped: trigger={trigger} stall_pushes={} \
+                             stuck_for_ms={stuck_for_ms} next_seq={after} nearest={nearest} \
                              gap={} bytes cache_segments={} cache_bytes={}; re-anchoring on the nearest cached segment",
                             self.stall_pushes,
                             nearest.wrapping_sub(after),
@@ -231,7 +285,8 @@ impl TcpReassembler {
                     // so re-anchor on this segment and deliver it.
                     None => {
                         log::warn!(
-                            "tcp: stall guard tripped: stall_pushes={} next_seq={after} nearest=none; \
+                            "tcp: stall guard tripped: trigger={trigger} stall_pushes={} \
+                             stuck_for_ms={stuck_for_ms} next_seq={after} nearest=none; \
                              the peer re-anchored behind next_seq, so re-anchoring on the live segment at seq={seq}",
                             self.stall_pushes,
                         );
@@ -240,6 +295,7 @@ impl TcpReassembler {
                     }
                 }
                 self.loss = true;
+                self.last_advance_ms = Some(now_ms);
                 // The cluster that just tripped the guard is exactly the
                 // condition most likely to repeat right away (#283): back
                 // off so the next gap gets more real chances to fill
@@ -393,6 +449,12 @@ impl TcpReassembler {
         self.buffer.clear();
         self.next_seq = Some(seq);
         self.stall_pushes = 0;
+        // The new anchor has not "just advanced" in wall-clock terms — the
+        // caller supplies no `now_ms` here — so clear it rather than carry a
+        // stale timestamp from the abandoned flow forward: the wall-clock
+        // trip budget (#405) treats `None` as "not stuck", exactly as a
+        // freshly re-anchored stream should be read.
+        self.last_advance_ms = None;
         // An externally driven resync — win.rs adopting a brand-new server
         // connection onto this instance — starts a fresh flow, whose gaps
         // have nothing to do with the dead flow's. Carrying the old flow's
@@ -521,8 +583,8 @@ mod tests {
     #[test]
     fn in_order_segments_reassemble() {
         let mut r = TcpReassembler::new();
-        r.push(100, b"abc");
-        r.push(103, b"def");
+        r.push(100, b"abc", 0);
+        r.push(103, b"def", 0);
         assert_eq!(r.take_stream(), b"abcdef".to_vec());
     }
 
@@ -530,31 +592,31 @@ mod tests {
     fn out_of_order_segments_reassemble_in_order() {
         let mut r = TcpReassembler::new();
         // baseline segment establishes next_seq
-        r.push(100, b"AAA");
+        r.push(100, b"AAA", 0);
         // third segment arrives before the second: must be cached, not lost
-        r.push(106, b"CCC");
+        r.push(106, b"CCC", 0);
         // second segment fills the gap and should drain the cached third
-        r.push(103, b"BBB");
+        r.push(103, b"BBB", 0);
         assert_eq!(r.take_stream(), b"AAABBBCCC".to_vec());
     }
 
     #[test]
     fn duplicate_retransmit_ignored() {
         let mut r = TcpReassembler::new();
-        r.push(100, b"AAA");
+        r.push(100, b"AAA", 0);
         // retransmit of already-consumed bytes must be dropped, not re-appended
-        r.push(100, b"AAA");
+        r.push(100, b"AAA", 0);
         assert_eq!(r.take_stream(), b"AAA".to_vec());
     }
 
     #[test]
     fn stall_guard_resyncs_on_permanent_gap() {
         let mut r = TcpReassembler::new();
-        r.push(1000, b"AAA"); // next_seq = 1003
+        r.push(1000, b"AAA", 0); // next_seq = 1003
         // segment at 5000 can never be drained because the gap [1003,5000)
         // will never arrive; the stall guard must eventually give up on it.
         for _ in 0..TcpReassembler::MAX_STALL_PUSHES {
-            r.push(5000, b"X");
+            r.push(5000, b"X", 0);
         }
         // The guard re-anchors on the cached segment (5000) *and delivers
         // it* (#211) instead of discarding it, so next_seq lands just past
@@ -564,7 +626,7 @@ mod tests {
         assert_eq!(r.take_stream(), b"AAAX".to_vec());
         // recovery: a fresh segment right after it continues to be
         // delivered immediately instead of being cached forever.
-        r.push(5001, b"YES");
+        r.push(5001, b"YES", 0);
         assert_eq!(r.take_stream(), b"YES".to_vec());
     }
 
@@ -577,7 +639,7 @@ mod tests {
         // reproduces the real shape: a permanent gap, then a run of
         // DISTINCT never-repeated segments past it.
         let mut r = TcpReassembler::new();
-        r.push(1000, b"AAA"); // next_seq = 1003
+        r.push(1000, b"AAA", 0); // next_seq = 1003
         let _ = r.take_stream();
 
         // [1003, 2000) is a permanent gap: never pushed, not even once.
@@ -589,7 +651,7 @@ mod tests {
             // segments are laid out contiguously so a correct resync that
             // keeps the cache drains the whole run in one go.
             let payload = vec![(i % 256) as u8; SEG_LEN as usize];
-            r.push(seq, &payload);
+            r.push(seq, &payload, 0);
         }
 
         // The guard trips on the 256th push. It must re-anchor on the
@@ -610,7 +672,7 @@ mod tests {
         // right after the drained chain is delivered immediately, not
         // cached forever.
         let resumed_seq = 2000 + SEGS * SEG_LEN;
-        r.push(resumed_seq, b"NEW");
+        r.push(resumed_seq, b"NEW", 0);
         assert_eq!(r.take_stream(), b"NEW".to_vec());
     }
 
@@ -618,15 +680,15 @@ mod tests {
     fn sequence_wraparound_is_handled() {
         let mut r = TcpReassembler::new();
         // u32::MAX - 2 + 3 wraps past u32::MAX back to 0
-        r.push(u32::MAX - 2, b"AAA");
-        r.push(0, b"BBB");
+        r.push(u32::MAX - 2, b"AAA", 0);
+        r.push(0, b"BBB", 0);
         assert_eq!(r.take_stream(), b"AAABBB".to_vec());
     }
 
     #[test]
     fn buffer_cap_is_honoured() {
         let mut r = TcpReassembler::with_max_buffer(5);
-        r.push(0, b"ABCDEFGHIJ");
+        r.push(0, b"ABCDEFGHIJ", 0);
         let out = r.take_stream();
         assert_eq!(out.len(), 5);
         assert_eq!(out, b"FGHIJ".to_vec());
@@ -635,71 +697,71 @@ mod tests {
     #[test]
     fn empty_payload_is_ignored() {
         let mut r = TcpReassembler::new();
-        r.push(100, b"");
+        r.push(100, b"", 0);
         assert_eq!(r.take_stream(), Vec::<u8>::new());
     }
 
     #[test]
     fn resync_clears_cache_and_buffer_and_sets_next_seq() {
         let mut r = TcpReassembler::new();
-        r.push(100, b"AAA");
-        r.push(200, b"out-of-order");
+        r.push(100, b"AAA", 0);
+        r.push(200, b"out-of-order", 0);
         r.resync(500);
         assert_eq!(r.take_stream(), Vec::<u8>::new());
         assert_eq!(r.gap_bytes(), 0);
-        r.push(500, b"fresh");
+        r.push(500, b"fresh", 0);
         assert_eq!(r.take_stream(), b"fresh".to_vec());
     }
 
     #[test]
     fn gap_bytes_reports_cached_out_of_order_size() {
         let mut r = TcpReassembler::new();
-        r.push(100, b"AAA");
-        r.push(200, b"12345");
+        r.push(100, b"AAA", 0);
+        r.push(200, b"12345", 0);
         assert_eq!(r.gap_bytes(), 5);
     }
 
     #[test]
     fn partially_overlapping_retransmit_delivers_new_tail_bytes() {
         let mut r = TcpReassembler::new();
-        r.push(1000, &[b'A'; 100]); // [1000,1100) -> next_seq = 1100
+        r.push(1000, &[b'A'; 100], 0); // [1000,1100) -> next_seq = 1100
         let _ = r.take_stream();
         // Coalesced retransmit [1000,1300): re-sends the already-consumed
         // [1000,1100) prefix but also carries genuinely new bytes
         // [1100,1300) that must not be dropped.
         let mut payload = vec![b'A'; 100];
         payload.extend(std::iter::repeat_n(b'B', 200));
-        r.push(1000, &payload);
+        r.push(1000, &payload, 0);
         assert_eq!(r.take_stream(), vec![b'B'; 200]);
     }
 
     #[test]
     fn fully_consumed_retransmit_still_dropped() {
         let mut r = TcpReassembler::new();
-        r.push(1000, &[b'A'; 100]); // next_seq = 1100
+        r.push(1000, &[b'A'; 100], 0); // next_seq = 1100
         let _ = r.take_stream();
-        r.push(1000, &[b'A'; 100]); // fully behind next_seq: nothing new
+        r.push(1000, &[b'A'; 100], 0); // fully behind next_seq: nothing new
         assert_eq!(r.take_stream(), Vec::<u8>::new());
     }
 
     #[test]
     fn in_order_push_reports_no_loss() {
         let mut r = TcpReassembler::new();
-        r.push(100, b"abc");
+        r.push(100, b"abc", 0);
         assert!(!r.take_loss());
     }
 
     #[test]
     fn buffer_overflow_trim_reports_loss() {
         let mut r = TcpReassembler::with_max_buffer(5);
-        r.push(0, b"ABCDEFGHIJ");
+        r.push(0, b"ABCDEFGHIJ", 0);
         assert!(r.take_loss());
     }
 
     #[test]
     fn take_loss_resets_flag_after_reporting() {
         let mut r = TcpReassembler::with_max_buffer(5);
-        r.push(0, b"ABCDEFGHIJ");
+        r.push(0, b"ABCDEFGHIJ", 0);
         assert!(r.take_loss());
         assert!(!r.take_loss());
     }
@@ -707,9 +769,9 @@ mod tests {
     #[test]
     fn stall_guard_resync_reports_loss() {
         let mut r = TcpReassembler::new();
-        r.push(1000, b"AAA");
+        r.push(1000, b"AAA", 0);
         for _ in 0..TcpReassembler::MAX_STALL_PUSHES {
-            r.push(5000, b"X");
+            r.push(5000, b"X", 0);
         }
         assert!(r.take_loss());
     }
@@ -717,16 +779,16 @@ mod tests {
     #[test]
     fn overlapping_advance_purges_fully_covered_cache_entry_without_loss() {
         let mut r = TcpReassembler::new();
-        r.push(100, &[b'A'; 50]); // next_seq = 150
+        r.push(100, &[b'A'; 50], 0); // next_seq = 150
         let _ = r.take_stream();
-        r.push(300, b"stale"); // cached out-of-order; gap [150,300) unfilled
+        r.push(300, b"stale", 0); // cached out-of-order; gap [150,300) unfilled
         assert_eq!(r.gap_bytes(), 5);
         // This segment covers [150,400), advancing past the cached entry's
         // key (300) without ever landing exactly on it, so drain_contiguous
         // can never reach it and it must be purged. But every byte the entry
         // held was just delivered by the covering segment, so nothing is
         // discarded: reporting loss here would needlessly reset the decoder.
-        r.push(150, &[b'B'; 250]);
+        r.push(150, &[b'B'; 250], 0);
         assert_eq!(r.gap_bytes(), 0);
         assert_eq!(r.take_stream(), vec![b'B'; 250]);
         assert!(!r.take_loss());
@@ -735,13 +797,13 @@ mod tests {
     #[test]
     fn cache_entry_straddling_next_seq_has_its_tail_spliced_without_loss() {
         let mut r = TcpReassembler::new();
-        r.push(100, &[b'A'; 50]); // next_seq = 150
+        r.push(100, &[b'A'; 50], 0); // next_seq = 150
         let _ = r.take_stream();
-        r.push(300, &[b'C'; 100]); // cached [300,400)
+        r.push(300, &[b'C'; 100], 0); // cached [300,400)
         // [150,350) advances next_seq into the middle of the cached entry.
         // Its tail [350,400) is genuinely new data already in hand: it must
         // be spliced into the stream, not thrown away as "stale".
-        r.push(150, &[b'B'; 200]);
+        r.push(150, &[b'B'; 200], 0);
         let mut expected = vec![b'B'; 200];
         expected.extend(std::iter::repeat_n(b'C', 50));
         assert_eq!(r.take_stream(), expected);
@@ -752,15 +814,15 @@ mod tests {
     #[test]
     fn shorter_retransmit_does_not_truncate_a_longer_cached_segment() {
         let mut r = TcpReassembler::new();
-        r.push(100, b"AAA"); // next_seq = 103; [103,300) is an open gap
+        r.push(100, b"AAA", 0); // next_seq = 103; [103,300) is an open gap
         let _ = r.take_stream();
-        r.push(300, &[b'L'; 100]); // cached [300,400)
+        r.push(300, &[b'L'; 100], 0); // cached [300,400)
         // A repacketized retransmit re-sends only [300,350). Overwriting the
         // cache entry would silently discard the cached [350,400) bytes and
         // stall the stream at 350 until the guard fires.
-        r.push(300, &[b'S'; 50]);
+        r.push(300, &[b'S'; 50], 0);
         assert_eq!(r.gap_bytes(), 100);
-        r.push(103, &[b'G'; 197]); // fills the gap, draining the cached entry
+        r.push(103, &[b'G'; 197], 0); // fills the gap, draining the cached entry
         let mut expected = vec![b'G'; 197];
         expected.extend(std::iter::repeat_n(b'L', 100));
         assert_eq!(r.take_stream(), expected);
@@ -771,12 +833,12 @@ mod tests {
     fn straddling_splice_handles_sequence_wraparound() {
         let mut r = TcpReassembler::new();
         let base = u32::MAX - 99;
-        r.push(base, &[b'A'; 50]); // next_seq = base + 50
+        r.push(base, &[b'A'; 50], 0); // next_seq = base + 50
         let _ = r.take_stream();
         // [base+100, base+200) wraps past u32::MAX (key 0 in the cache).
-        r.push(base.wrapping_add(100), &[b'C'; 100]);
+        r.push(base.wrapping_add(100), &[b'C'; 100], 0);
         // advances next_seq to base+150, i.e. into the middle of that entry
-        r.push(base.wrapping_add(50), &[b'B'; 100]);
+        r.push(base.wrapping_add(50), &[b'B'; 100], 0);
         let mut expected = vec![b'B'; 100];
         expected.extend(std::iter::repeat_n(b'C', 50));
         assert_eq!(r.take_stream(), expected);
@@ -788,13 +850,13 @@ mod tests {
     fn stall_guard_resyncs_to_modular_lowest_cached_segment_across_wraparound() {
         let mut r = TcpReassembler::new();
         let base = 0xFFFF_FF00u32;
-        r.push(base, b"AAA"); // next_seq = base + 3
+        r.push(base, b"AAA", 0); // next_seq = base + 3
         let _ = r.take_stream();
         // A wraparound segment sits far ahead: 0x0000_0100 is the
         // numerically lowest raw u32 in the cache (the first BTreeMap key)
         // yet ~4 GiB *further* ahead of the stream than anything near
         // 0xFFFF_FFxx.
-        r.push(0x0000_0100, b"LATER");
+        r.push(0x0000_0100, b"LATER", 0);
         // The live stream resumes at 0xFFFF_FFF0, past a permanent gap. As
         // in the #211 regression test above, these are DISTINCT
         // never-repeated one-byte segments — a passive sniff of a lost
@@ -806,7 +868,7 @@ mod tests {
         const SEGS: u32 = TcpReassembler::MAX_STALL_PUSHES as u32 - 1;
         let resumed = 0xFFFF_FFF0u32;
         for i in 0..SEGS {
-            r.push(resumed.wrapping_add(i), &[i as u8]);
+            r.push(resumed.wrapping_add(i), &[i as u8], 0);
         }
         // Re-anchoring on 0x0000_0100 would park next_seq ~4 GiB ahead of
         // the live stream, after which every real segment looks like a
@@ -824,7 +886,7 @@ mod tests {
         // Only the far-ahead wraparound segment is still waiting, and the
         // stream keeps working: the next live segment lands at next_seq.
         assert_eq!(r.gap_bytes(), b"LATER".len());
-        r.push(resumed.wrapping_add(SEGS), b"OK");
+        r.push(resumed.wrapping_add(SEGS), b"OK", 0);
         assert_eq!(r.take_stream(), b"OK".to_vec());
     }
 
@@ -835,13 +897,13 @@ mod tests {
         // take_stream() calls still owns these bytes when the guard fires,
         // and the re-anchor is about *not* discarding data genuinely in
         // hand — the cache is not the only place such data lives.
-        r.push(1000, b"AAA"); // next_seq = 1003
-        r.push(1003, b"BBB"); // next_seq = 1006
+        r.push(1000, b"AAA", 0); // next_seq = 1003
+        r.push(1003, b"BBB", 0); // next_seq = 1006
         // [1006, 5000) is a permanent gap; the run past it never repeats,
         // and its 256th push is what trips the guard.
         const SEGS: u32 = TcpReassembler::MAX_STALL_PUSHES as u32;
         for i in 0..SEGS {
-            r.push(5000 + i, b"C");
+            r.push(5000 + i, b"C", 0);
         }
         // The guard re-anchors on the cached run and drains it, but the
         // earlier "AAABBB" was never handed out: dropping it would lose
@@ -860,7 +922,7 @@ mod tests {
     #[test]
     fn stall_guard_recovers_when_the_stream_re_anchors_behind_next_seq() {
         let mut r = TcpReassembler::new();
-        r.push(0x8000_0000, b"AAA"); // next_seq = 0x8000_0003
+        r.push(0x8000_0000, b"AAA", 0); // next_seq = 0x8000_0003
         let _ = r.take_stream();
         // The 4-tuple is reused after a reconnect and the fresh ISN lands in
         // the "behind" half of the sequence space (~50% likely). Every
@@ -869,43 +931,104 @@ mod tests {
         // is permanently dead with no loss reported.
         let fresh = 0x4000_0000u32;
         for i in 0..TcpReassembler::MAX_STALL_PUSHES as u32 {
-            r.push(fresh.wrapping_add(i * 3), b"BBB");
+            r.push(fresh.wrapping_add(i * 3), b"BBB", 0);
         }
         r.push(
             fresh.wrapping_add(TcpReassembler::MAX_STALL_PUSHES as u32 * 3),
             b"CCC",
+            0,
         );
         assert_eq!(r.take_stream(), b"BBBCCC".to_vec());
         assert!(r.take_loss());
     }
 
+    /// Issue #405: a persistent hole with only a handful of pushes on it
+    /// (nowhere near `MAX_STALL_PUSHES`) must still be re-anchored once
+    /// `next_seq` has been stuck for longer than `STALL_TIME_BUDGET_MS`
+    /// *and* the cache behind the gap holds more than `STALL_BYTES_BUDGET`
+    /// — the wall-clock/byte budget the push-count guard's exponential
+    /// backoff can otherwise leave waiting for minutes (racing #214's 180s
+    /// watchdog, which discards the cache instead of recovering it).
+    #[test]
+    fn a_persistent_hole_trips_the_wall_clock_byte_budget_with_few_pushes() {
+        let mut r = TcpReassembler::new();
+        r.push(1000, b"AAA", 0); // next_seq = 1003
+        // A single 70 KiB segment cached ahead of the permanent gap: well
+        // past STALL_BYTES_BUDGET (64 KiB), but this is only ONE push, far
+        // below MAX_STALL_PUSHES (256) — the push-count guard alone would
+        // never trip on this.
+        let big = vec![b'X'; 70 * 1024];
+        r.push(5000, &big, 0);
+        assert!(
+            !r.take_loss(),
+            "must not trip before the time budget elapses"
+        );
+
+        // Advance the wall clock past STALL_TIME_BUDGET_MS (10s) with one
+        // more push on the same stuck gap.
+        r.push(5000, &big, 10_001);
+        assert!(
+            r.take_loss(),
+            "a persistent hole past both the time and byte budgets must re-anchor"
+        );
+    }
+
+    /// The mirror image: below either budget, the guard must not trip early
+    /// just because the clock or cache crossed one threshold alone.
+    #[test]
+    fn a_hole_below_either_budget_does_not_trip_early() {
+        // Below the byte budget, but past the time budget: small cached
+        // gap, elapsed time alone must not be enough.
+        let mut r = TcpReassembler::new();
+        r.push(2000, b"AAA", 0); // next_seq = 2003
+        let small = vec![b'Y'; 1024]; // well under STALL_BYTES_BUDGET
+        r.push(6000, &small, 0);
+        r.push(6000, &small, 20_000); // far past STALL_TIME_BUDGET_MS
+        assert!(
+            !r.take_loss(),
+            "small cache behind the gap must not trip on time alone"
+        );
+
+        // Below the time budget, but past the byte budget: large cached
+        // gap, but the clock has not elapsed enough yet.
+        let mut r2 = TcpReassembler::new();
+        r2.push(3000, b"AAA", 0); // next_seq = 3003
+        let big = vec![b'Z'; 70 * 1024]; // well over STALL_BYTES_BUDGET
+        r2.push(7000, &big, 0);
+        r2.push(7000, &big, 5_000); // well under STALL_TIME_BUDGET_MS
+        assert!(
+            !r2.take_loss(),
+            "large cache behind the gap must not trip before the time budget elapses"
+        );
+    }
+
     #[test]
     fn repeated_keepalive_probes_do_not_force_a_resync() {
         let mut r = TcpReassembler::new();
-        r.push(1000, b"AAA"); // next_seq = 1003
+        r.push(1000, b"AAA", 0); // next_seq = 1003
         let _ = r.take_stream();
         // A TCP keepalive probe is one garbage byte at next_seq - 1. A
         // long-idle connection sends far more of them than the stall
         // threshold; they must not be mistaken for a re-anchored stream.
         for _ in 0..TcpReassembler::MAX_STALL_PUSHES * 2 {
-            r.push(1002, b"\0");
+            r.push(1002, b"\0", 0);
         }
         assert!(!r.take_loss());
         assert_eq!(r.take_stream(), Vec::<u8>::new());
-        r.push(1003, b"BBB");
+        r.push(1003, b"BBB", 0);
         assert_eq!(r.take_stream(), b"BBB".to_vec());
     }
 
     #[test]
     fn out_of_order_cache_is_bounded_while_the_stream_keeps_progressing() {
         let mut r = TcpReassembler::new();
-        r.push(0, b"A"); // next_seq = 1
+        r.push(0, b"A", 0); // next_seq = 1
         // One in-order byte per far-ahead 1 KiB segment: the forward
         // progress pins stall_pushes at 0, so the stall guard never bounds
         // the cache. Only a cache cap can.
         for i in 0..8_000u32 {
-            r.push(1 + i, b".");
-            r.push(1_000_000 + i * 1024, &[b'X'; 1024]);
+            r.push(1 + i, b".", 0);
+            r.push(1_000_000 + i * 1024, &[b'X'; 1024], 0);
         }
         assert!(
             r.gap_bytes() <= 4 * 1024 * 1024,
@@ -920,10 +1043,10 @@ mod tests {
     #[test]
     fn out_of_order_cache_bounds_a_flood_of_tiny_far_ahead_segments() {
         let mut r = TcpReassembler::with_limits(64 * 1024, 1024);
-        r.push(0, b"A"); // next_seq = 1
+        r.push(0, b"A", 0); // next_seq = 1
         for i in 0..5_000u32 {
-            r.push(1 + i, b"."); // forward progress: the stall guard never fires
-            r.push(1_000_000 + i * 4, b"X"); // 1-byte far-ahead junk
+            r.push(1 + i, b".", 0); // forward progress: the stall guard never fires
+            r.push(1_000_000 + i * 4, b"X", 0); // 1-byte far-ahead junk
         }
         // A payload-bytes-only cap would still admit ~1000 near-empty
         // entries, each costing far more than its single byte of payload;
@@ -938,14 +1061,14 @@ mod tests {
     #[test]
     fn cache_eviction_keeps_the_segments_nearest_the_gap() {
         let mut r = TcpReassembler::with_limits(64 * 1024, 300);
-        r.push(0, &[b'A'; 3]); // next_seq = 3
+        r.push(0, &[b'A'; 3], 0); // next_seq = 3
         let _ = r.take_stream();
-        r.push(103, &[b'N'; 100]); // just past a small gap: still drainable
-        r.push(10_000, &[b'F'; 100]); // far-ahead junk
-        r.push(20_000, &[b'F'; 100]); // far-ahead junk
+        r.push(103, &[b'N'; 100], 0); // just past a small gap: still drainable
+        r.push(10_000, &[b'F'; 100], 0); // far-ahead junk
+        r.push(20_000, &[b'F'; 100], 0); // far-ahead junk
         // Only one 100-byte entry fits under the cap, so eviction must drop
         // the speculative far-ahead junk, not the segment behind the gap.
-        r.push(3, &[b'G'; 100]); // fills [3,103)
+        r.push(3, &[b'G'; 100], 0); // fills [3,103)
         let mut expected = vec![b'G'; 100];
         expected.extend(std::iter::repeat_n(b'N', 100));
         assert_eq!(r.take_stream(), expected);
@@ -1031,8 +1154,8 @@ mod tests {
             install_capture();
             let base: u32 = 0x0121_0000;
             let mut r = TcpReassembler::new();
-            r.push(base, b"AAA");
-            r.push(base + 0x1000, b"BBB");
+            r.push(base, b"AAA", 0);
+            r.push(base + 0x1000, b"BBB", 0);
 
             assert!(logged("sequence gap"), "no gap line at all:\n{}", dump());
             assert!(
@@ -1055,9 +1178,9 @@ mod tests {
             install_capture();
             let base: u32 = 0x0221_0000;
             let mut r = TcpReassembler::new();
-            r.push(base, b"AAA");
+            r.push(base, b"AAA", 0);
             for i in 0..50u32 {
-                r.push(base + 0x1000 + i * 8, b"BBB");
+                r.push(base + 0x1000 + i * 8, b"BBB", 0);
             }
 
             assert_eq!(
@@ -1076,9 +1199,9 @@ mod tests {
             install_capture();
             let base: u32 = 0x0321_0000;
             let mut r = TcpReassembler::new();
-            r.push(base, b"AAA");
+            r.push(base, b"AAA", 0);
             for _ in 0..TcpReassembler::MAX_STALL_PUSHES {
-                r.push(base + 0x1000, b"X");
+                r.push(base + 0x1000, b"X", 0);
             }
 
             assert!(
@@ -1114,8 +1237,8 @@ mod tests {
             install_capture();
             let base: u32 = 0x0421_0000;
             let mut r = TcpReassembler::new();
-            r.push(base, b"AAAAA"); // 5 undrained buffered bytes
-            r.push(base + 0x1000, b"BBB"); // 3 cached bytes behind a gap
+            r.push(base, b"AAAAA", 0); // 5 undrained buffered bytes
+            r.push(base + 0x1000, b"BBB", 0); // 3 cached bytes behind a gap
             r.resync(base + 0x9000);
 
             assert!(logged("resync"), "no resync line at all:\n{}", dump());
@@ -1148,8 +1271,8 @@ mod tests {
             install_capture();
             let base: u32 = 0x0521_0000;
             let mut r = TcpReassembler::with_max_buffer(8);
-            r.push(base, b"AAAAAAAA");
-            r.push(base + 8, b"BBBB");
+            r.push(base, b"AAAAAAAA", 0);
+            r.push(base + 8, b"BBBB", 0);
 
             assert!(
                 logged("buffer cap") && logged("discarded_bytes=4"),
@@ -1182,7 +1305,7 @@ mod tests {
             install_capture();
             let base: u32 = 0x0621_0000;
             let mut r = TcpReassembler::new();
-            r.push(base, b"A"); // next_seq = base + 1
+            r.push(base, b"A", 0); // next_seq = base + 1
 
             // First cluster: a permanent gap immediately behind `next_seq`,
             // then exactly MAX_STALL_PUSHES distinct, mutually-contiguous
@@ -1193,7 +1316,7 @@ mod tests {
             const SEGS: u32 = TcpReassembler::MAX_STALL_PUSHES as u32;
             let cluster1 = base + 0x1000;
             for i in 0..SEGS {
-                r.push(cluster1 + i * SEG_LEN, &[b'X'; SEG_LEN as usize]);
+                r.push(cluster1 + i * SEG_LEN, &[b'X'; SEG_LEN as usize], 0);
             }
             let trip1_marker = format!("next_seq={}", base + 1);
             assert_eq!(
@@ -1213,7 +1336,7 @@ mod tests {
             let cluster2 = gap2_next_seq + 0x1000;
             const LATE_AFTER: u32 = TcpReassembler::MAX_STALL_PUSHES as u32 + 44; // > old threshold
             for i in 0..LATE_AFTER {
-                r.push(cluster2 + i * SEG_LEN, &[b'Y'; SEG_LEN as usize]);
+                r.push(cluster2 + i * SEG_LEN, &[b'Y'; SEG_LEN as usize], 0);
             }
             // Old fixed-256 behaviour would have already tripped a second
             // time inside that loop, discarding real, still-arriving data.
@@ -1228,7 +1351,7 @@ mod tests {
             // The segment that fills the second gap was merely late, not
             // lost: pushing it now must extend the stream immediately, with
             // no data ever discarded for this gap.
-            r.push(gap2_next_seq, b"LATE");
+            r.push(gap2_next_seq, b"LATE", 0);
             assert_eq!(
                 count_logged(&["stall guard tripped", &trip2_marker]),
                 0,
@@ -1250,10 +1373,10 @@ mod tests {
         fn trip_once(r: &mut TcpReassembler, base: u32) -> u32 {
             const SEG_LEN: u32 = 4;
             const SEGS: u32 = TcpReassembler::MAX_STALL_PUSHES as u32;
-            r.push(base, b"A"); // next_seq = base + 1
+            r.push(base, b"A", 0); // next_seq = base + 1
             let cluster = base + 0x1000;
             for i in 0..SEGS {
-                r.push(cluster + i * SEG_LEN, &[b'X'; SEG_LEN as usize]);
+                r.push(cluster + i * SEG_LEN, &[b'X'; SEG_LEN as usize], 0);
             }
             assert_eq!(
                 count_logged(&["stall guard tripped", &format!("next_seq={}", base + 1)]),
@@ -1282,14 +1405,14 @@ mod tests {
             // A duplicate of bytes already delivered, arriving with nothing
             // cached: entirely behind `next_seq`, and far too close to it to
             // read as the peer re-anchoring.
-            r.push(base + 0x1000, &[b'X'; 4]);
+            r.push(base + 0x1000, &[b'X'; 4], 0);
 
             // The backoff must still be 2, so a fresh cluster of exactly
             // MAX_STALL_PUSHES no-progress pushes stays under the threshold.
             const SEG_LEN: u32 = 4;
             let cluster = next_seq + 0x1000;
             for i in 0..TcpReassembler::MAX_STALL_PUSHES as u32 {
-                r.push(cluster + i * SEG_LEN, &[b'Y'; SEG_LEN as usize]);
+                r.push(cluster + i * SEG_LEN, &[b'Y'; SEG_LEN as usize], 0);
             }
             assert_eq!(
                 count_logged(&["stall guard tripped", &format!("next_seq={next_seq}")]),
@@ -1299,7 +1422,7 @@ mod tests {
             );
 
             // And the merely-late segment filling that gap still heals it.
-            r.push(next_seq, b"LATE");
+            r.push(next_seq, b"LATE", 0);
             let delivered = r.take_stream();
             assert!(
                 delivered.windows(4).any(|w| w == b"LATE"),
@@ -1328,7 +1451,7 @@ mod tests {
             const SEG_LEN: u32 = 4;
             let cluster = fresh + 0x1000;
             for i in 0..TcpReassembler::MAX_STALL_PUSHES as u32 {
-                r.push(cluster + i * SEG_LEN, &[b'Z'; SEG_LEN as usize]);
+                r.push(cluster + i * SEG_LEN, &[b'Z'; SEG_LEN as usize], 0);
             }
             assert_eq!(
                 count_logged(&["stall guard tripped", &format!("next_seq={fresh}")]),

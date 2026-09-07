@@ -44,6 +44,14 @@ pub const FLAG_SNIFF: u64 = 0x0001;
 /// `WINDIVERT_SHUTDOWN_RECV`.
 pub const SHUTDOWN_RECV: u32 = 0x1;
 
+/// `WINDIVERT_PARAM` values `WinDivertSetParam` accepts (issue #405). Only
+/// the three queue-tuning ones are used here; `WinDivert.h` also defines
+/// `VERSION_MAJOR`/`VERSION_MINOR`, which are read-only (`WinDivertGetParam`
+/// only) and irrelevant to this crate.
+pub const PARAM_QUEUE_LEN: u32 = 0;
+pub const PARAM_QUEUE_TIME: u32 = 1;
+pub const PARAM_QUEUE_SIZE: u32 = 2;
+
 /// `WINDIVERT_ADDRESS` from `windivert.h`: an 8-byte timestamp, 8 bytes of
 /// bitfields and reserved words, then a 64-byte per-layer union.
 ///
@@ -65,6 +73,7 @@ type OpenFn = unsafe extern "system" fn(*const c_char, u32, i16, u64) -> HANDLE;
 type RecvFn =
     unsafe extern "system" fn(HANDLE, *mut c_void, u32, *mut u32, *mut WinDivertAddress) -> BOOL;
 type ShutdownFn = unsafe extern "system" fn(HANDLE, u32) -> BOOL;
+type SetParamFn = unsafe extern "system" fn(HANDLE, u32, u64) -> BOOL;
 type CloseFn = unsafe extern "system" fn(HANDLE) -> BOOL;
 
 /// The unpacked, loaded WinDivert library and the entry points used here.
@@ -73,6 +82,7 @@ pub struct Api {
     recv: RecvFn,
     shutdown: ShutdownFn,
     close: CloseFn,
+    set_param: SetParamFn,
     /// Where the runtime was unpacked. Kept for the retry path and for
     /// diagnostics in the log.
     dir: PathBuf,
@@ -125,12 +135,13 @@ impl Api {
         // declared above (checked against `windivert.h` for the vendored
         // version); the returned pointers are copied out and stay valid as
         // long as `lib`, which this struct owns.
-        let (open, recv, shutdown, close) = unsafe {
+        let (open, recv, shutdown, close, set_param) = unsafe {
             (
                 *symbol::<OpenFn>(&lib, b"WinDivertOpen\0")?,
                 *symbol::<RecvFn>(&lib, b"WinDivertRecv\0")?,
                 *symbol::<ShutdownFn>(&lib, b"WinDivertShutdown\0")?,
                 *symbol::<CloseFn>(&lib, b"WinDivertClose\0")?,
+                *symbol::<SetParamFn>(&lib, b"WinDivertSetParam\0")?,
             )
         };
 
@@ -139,6 +150,7 @@ impl Api {
             recv,
             shutdown,
             close,
+            set_param,
             dir,
             _lib: lib,
         })
@@ -212,6 +224,29 @@ impl Api {
             return Err(std::io::Error::last_os_error());
         }
         Ok((packet_len as usize).min(buffer.len()))
+    }
+
+    /// Sets one `WINDIVERT_PARAM` on `handle` (issue #405).
+    ///
+    /// Returns the OS error on failure so the caller can log it; a rejected
+    /// parameter only leaves the driver on its (smaller) default, so no call
+    /// site here treats this as fatal.
+    ///
+    /// # Safety
+    /// `handle` must be a live handle from [`Self::open_sniff`].
+    pub unsafe fn set_param(
+        &self,
+        handle: HANDLE,
+        param: u32,
+        value: u64,
+    ) -> Result<(), std::io::Error> {
+        // SAFETY: delegated to the caller for `handle`; `param` and `value`
+        // are plain values passed by copy.
+        let ok = unsafe { (self.set_param)(handle, param, value) };
+        if !ok.as_bool() {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// # Safety
