@@ -116,13 +116,15 @@ pub const HANDOFF_VAR: &str = "SHINRA_INSTANCE_HANDOFF";
 /// rather than exiting, the successor eventually says so instead of hanging
 /// with no window and no message.
 ///
-/// Kept at 10s rather than shortened (issue #278 review): the joins on the
-/// outgoing side (`pipeline_thread`, the names-cache writer, the settings
-/// thread — see `main.rs`'s shutdown path) are each bounded at 5s since
-/// issue #401, but they run in sequence, so a shutdown where several
-/// threads are slow — e.g. the SQLite flush contending with disk I/O — can
-/// still outlast any one of those deadlines. A shorter ceiling would risk
-/// cutting off exactly the non-wedged case this wait exists to cover.
+/// Kept at 10s rather than shortened (issue #278 review): since issue #401
+/// the outgoing instance's *whole* shutdown — capture, pipeline, history,
+/// settings and inspect, joined in sequence in `main.rs` — shares one
+/// `SHUTDOWN_BUDGET` of 8s, rather than each of those joins getting its own
+/// 5s deadline (which, run in sequence, could add up to well past this
+/// wait). 10s keeps a two-second margin over that 8s budget, so a shutdown
+/// that spends its whole budget still finishes before this wait gives up —
+/// while a genuinely wedged predecessor is still bounded and eventually
+/// reported instead of hanging forever.
 const HANDOFF_WAIT: Duration = Duration::from_secs(10);
 
 /// How often the wait re-tries. Short enough that a normal handoff — a

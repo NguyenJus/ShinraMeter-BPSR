@@ -256,13 +256,19 @@ fn decide_instance(acquisition: single_instance::Acquisition) -> InstanceDecisio
     }
 }
 
-/// How long shutdown waits for any one worker thread before giving up on it.
+/// How long the whole shutdown path — capture, pipeline, history, settings
+/// and inspect, joined in sequence — is allowed to take, in total.
 ///
 /// Issue #401: a windowless process that never exits keeps the
 /// single-instance lock, and the user's only symptom is the next launch
-/// being refused with no window anywhere to close. A wedged thread must
-/// cost the shutdown a bounded delay, not the process's whole life.
-const SHUTDOWN_JOIN_DEADLINE: Duration = Duration::from_secs(5);
+/// being refused with no window anywhere to close. Five sequential 5s
+/// per-thread deadlines could add up to 25s, well past
+/// `single_instance::HANDOFF_WAIT` (10s) — so instead every join below
+/// shares this one budget, spent down as shutdown proceeds. Kept below
+/// `HANDOFF_WAIT` with margin so a relaunched instance's wait always
+/// outlasts the outgoing instance's whole shutdown, not just any one of
+/// its threads.
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(8);
 
 /// How often the bounded join re-checks, short enough that a normal
 /// shutdown — every thread already finishing — costs no visible delay.
@@ -523,10 +529,18 @@ fn main() -> eframe::Result {
     // every ordinary exit. With this order a queued `Quit` is always there
     // for `pipeline::drain_for_quit` to find.
     let _ = tx_command_shutdown.try_send(UiCommand::Quit);
+    // Issue #401: one shared budget for the whole shutdown path, spent down
+    // as each join below runs, rather than a fresh deadline per thread —
+    // see `SHUTDOWN_BUDGET`.
+    let shutdown_deadline = Instant::now() + SHUTDOWN_BUDGET;
     if let Some(handle) = capture {
-        handle.stop();
+        handle.stop_within(shutdown_deadline.saturating_duration_since(Instant::now()));
     }
-    join_with_timeout("pipeline", pipeline_thread, SHUTDOWN_JOIN_DEADLINE);
+    join_with_timeout(
+        "pipeline",
+        pipeline_thread,
+        shutdown_deadline.saturating_duration_since(Instant::now()),
+    );
     // Issue #39: both `HistoryHandle` clones are gone by now — the
     // pipeline's, joined just above, and `OverlayApp`'s own (moved into
     // `OverlayApp::new` above, not merely cloned into it), dropped when
@@ -535,18 +549,26 @@ fn main() -> eframe::Result {
     // Joining here is what normally lets the session's last encounter
     // actually reach disk — the same explicit-shutdown discipline
     // `CacheWriter::shutdown` follows. Since issue #401 this join is
-    // bounded: a history thread still flushing after
-    // `SHUTDOWN_JOIN_DEADLINE` is detached instead of awaited, so that
-    // flush can be lost — the warn line `join_with_timeout` logs when it
-    // detaches is what would say so.
+    // bounded: a history thread still flushing after the shutdown budget
+    // runs out is detached instead of awaited, so that flush can be lost —
+    // the warn line `join_with_timeout` logs when it detaches is what would
+    // say so.
     if let Some(thread) = history_thread {
-        join_with_timeout("history", thread, SHUTDOWN_JOIN_DEADLINE);
+        join_with_timeout(
+            "history",
+            thread,
+            shutdown_deadline.saturating_duration_since(Instant::now()),
+        );
     }
     // `OverlayApp` (and its `tx_settings`) is dropped by the time
     // `run_native` returns, which closes the settings-writer's channel and
     // lets its thread exit; joining here just makes sure the last-sent
     // settings value has finished being persisted before the process ends.
-    join_with_timeout("settings", settings_thread, SHUTDOWN_JOIN_DEADLINE);
+    join_with_timeout(
+        "settings",
+        settings_thread,
+        shutdown_deadline.saturating_duration_since(Instant::now()),
+    );
     // Capture has already stopped above, so its `Decoder`'s reference to the
     // sink is gone by now — this drops the last one, which is what lets
     // `DiagnosticSink`'s summary actually log (see `inspect::Handle::shutdown`).
@@ -558,7 +580,7 @@ fn main() -> eframe::Result {
         join_with_timeout(
             "inspect",
             std::thread::spawn(move || inspect_handle.shutdown()),
-            SHUTDOWN_JOIN_DEADLINE,
+            shutdown_deadline.saturating_duration_since(Instant::now()),
         );
     }
     // Issue #401: the last line of a healthy shutdown. A log that ends
@@ -700,6 +722,27 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "the bounded join must not wait for the thread"
         );
+    }
+
+    /// A zero remaining budget (the shared `SHUTDOWN_BUDGET` already spent
+    /// by earlier joins) must detach immediately rather than block for even
+    /// one poll interval.
+    #[test]
+    fn a_zero_deadline_detaches_a_running_thread_immediately() {
+        let (park_tx, park_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _ = park_rx.recv();
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(
+            join_with_timeout("zero-budget", handle, Duration::ZERO),
+            None
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "a zero deadline must not wait for even one poll interval"
+        );
+        let _ = park_tx.send(());
     }
 
     #[test]
