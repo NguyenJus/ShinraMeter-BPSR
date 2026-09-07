@@ -583,8 +583,10 @@ pub struct OverlayApp {
     /// permanent "frozen" banner.
     quit_requested: bool,
     /// Issue #340: the rect `draw_header` actually painted on the last
-    /// frame, or `None` before the first one. Measured once per frame at
-    /// the single `draw_header` call site in `ui` and read back through
+    /// frame, or `None` before the first one. Measured once per frame by
+    /// `measure_header_rect` at the single `draw_header` call site in `ui`
+    /// — from the layout cursor, since inside a `CentralPanel` the `Ui`'s
+    /// own `min_rect` is the whole panel — and read back through
     /// `measured_header_band_height`, so the sizing math follows the real
     /// header instead of a constant that has to be kept in step with it by
     /// hand.
@@ -1910,6 +1912,13 @@ impl eframe::App for OverlayApp {
                 // `pending_screenshot_bound` for whenever the async reply
                 // lands, instead of leaving that field for the crop to read
                 // fresh (and possibly stale) at reply time.
+                // Issue #340: the panel rect as it stands *before* the header
+                // paints — its top is where the header band begins, and
+                // `measure_header_rect` pairs it with the cursor the header
+                // leaves behind. Read here rather than after `draw_header`
+                // because `available_rect_before_wrap` shrinks from the top as
+                // the layout advances.
+                let header_panel = ui.available_rect_before_wrap();
                 let screenshot_requested = draw_header(
                     ui,
                     &ctx,
@@ -1932,14 +1941,13 @@ impl eframe::App for OverlayApp {
                     header_history,
                     &mut self.quit_requested,
                 );
-                // Issue #340: the header's real extent, measured the one place
-                // it can be — right after it painted, before anything else
-                // has been added to this `Ui`, so `min_rect` is the header
-                // band and nothing more (`draw_resize_handles` above only
-                // `interact`s, it allocates no space). Stashed on `self`
-                // below for the *next* frame's sizing math, the earliest a
-                // measurement can reach the code that needs it.
-                measured_header_rect = Some(ui.min_rect());
+                // Issue #340: the header's real extent, measured right after
+                // it painted, off the layout cursor it moved — *not* off
+                // `ui.min_rect()`, which a `CentralPanel` has already
+                // expanded to the whole panel (see `measure_header_rect`).
+                // Stashed on `self` below for the *next* frame's sizing math,
+                // the earliest a measurement can reach the code that needs it.
+                measured_header_rect = Some(measure_header_rect(ui, header_panel));
                 // Issue #156: whether this frame's wait for the reply has
                 // gone on long enough that it's never coming — computed
                 // before the guard call below so a timeout is fed into

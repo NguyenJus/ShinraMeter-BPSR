@@ -1479,6 +1479,35 @@ pub(super) fn measured_header_band_height(header_rect: Option<egui::Rect>) -> f3
     )
 }
 
+/// The rect `draw_header` just painted, measured from the layout cursor it
+/// moved rather than from the `Ui`'s own `min_rect`.
+///
+/// Issue #340 measured this as `ui.min_rect()` right after `draw_header`
+/// returned. That is wrong inside a `CentralPanel`: the panel calls
+/// `expand_to_include_rect(panel_rect)` on the `Ui` it hands its closure, so
+/// `min_rect` is the *whole panel* from the very first line of that closure
+/// — never the header alone. The band then measured as the full window
+/// height, and the next frame sized the header wash (gradient plus the 200pt
+/// `HEADER_WASH_EMBLEM_SIZE` watermark) to the entire window instead of the
+/// band, painting the emblem down across the player rows.
+///
+/// The cursor is not expanded that way: `panel` is the panel rect read
+/// *before* `draw_header` (so its `top` is where the header began, and its
+/// left/right are the panel's own), and `ui.cursor().top()` afterwards is
+/// where the header left the cursor — one pending `item_spacing.y` past the
+/// band's real bottom, which is subtracted back off here. Called from
+/// `OverlayApp::ui` and from this module's tests through this one function
+/// so the two can never drift.
+pub(super) fn measure_header_rect(ui: &egui::Ui, panel: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(panel.left(), panel.top()),
+        egui::pos2(
+            panel.right(),
+            ui.cursor().top() - ui.spacing().item_spacing.y,
+        ),
+    )
+}
+
 pub(super) fn header_band_height(button_row_height: f32) -> f32 {
     header_text_band_height() + HEADER_STAT_ROW_GAP + button_row_height
 }
@@ -4175,6 +4204,113 @@ mod tests {
              (and so the header wash's bottom edge) predicts {predicted} — a {}pt gap \
              would open at the banner/body seam",
             rows_top - predicted
+        );
+    }
+
+    /// The test screen the header-measurement tests below run on — the
+    /// default overlay width by a height tall enough that a header measured
+    /// as the whole panel is unmistakably different from one measured as the
+    /// band.
+    fn measure_test_screen() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(356.0, 448.0))
+    }
+
+    /// One frame of exactly what `OverlayApp::ui` does around `draw_header`:
+    /// a `CentralPanel`, the panel rect read before the header, `draw_header`
+    /// itself, then `measure_header_rect`. Returns that measurement and the
+    /// panel rect it was taken in.
+    fn measure_header_frame(previous_header_rect: Option<egui::Rect>) -> (egui::Rect, egui::Rect) {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(0);
+        let input = egui::RawInput {
+            screen_rect: Some(measure_test_screen()),
+            ..Default::default()
+        };
+
+        let mut measured = egui::Rect::ZERO;
+        let mut panel_rect = egui::Rect::ZERO;
+        let output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let panel = ui.available_rect_before_wrap();
+                draw_header(
+                    ui,
+                    &ctx,
+                    &snapshot,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    &mut WindowGesture::default(),
+                    previous_header_rect,
+                    false,
+                    true,
+                    &mut UpdateCheckState::default(),
+                    &unused_log_export_sender(),
+                    &mut 0,
+                    false,
+                    &mut false,
+                    None,
+                    &mut false,
+                );
+                measured = measure_header_rect(ui, panel);
+                panel_rect = ui.max_rect();
+            });
+        });
+        output.drop_without_applying_deltas();
+        (measured, panel_rect)
+    }
+
+    /// Issue #340's measurement must be the header band and nothing more,
+    /// taken where the app really takes it: inside an `egui::CentralPanel`.
+    /// The panel expands its child `Ui`'s `min_rect` to the whole panel, so
+    /// measuring that way reported the entire window as the header band —
+    /// which the next frame fed straight into the header wash's height.
+    #[test]
+    fn the_measured_header_rect_is_the_band_not_the_whole_central_panel() {
+        let (measured, panel) = measure_header_frame(None);
+
+        let budget = header_band_height(BUTTON_ROW_HEIGHT);
+        assert!(
+            (measured.height() - budget).abs() < 0.05,
+            "the header measured {}pt inside a CentralPanel, not the {budget}pt band \
+             it painted (panel is {}pt tall)",
+            measured.height(),
+            panel.height()
+        );
+        assert!(
+            measured.height() < panel.height() - 1.0,
+            "the measurement is the whole panel ({}pt), not the header band",
+            panel.height()
+        );
+    }
+
+    /// The consequence of the measurement above, one frame later: the header
+    /// wash (its slate gradient and the 200pt `HEADER_WASH_EMBLEM_SIZE`
+    /// watermark) is sized from the *previous* frame's measurement, so a
+    /// panel-sized measurement paints that emblem down across the player
+    /// rows. The wash must stop just below the band, at the first player row.
+    #[test]
+    fn the_second_frame_header_wash_stops_at_the_first_player_row() {
+        let (first_frame, _) = measure_header_frame(None);
+        let (measured, panel) = measure_header_frame(Some(first_frame));
+
+        let wash = header_wash_rect(
+            panel,
+            first_player_row_top_offset(measured.height()) - HEADER_WASH_INSET,
+        );
+        assert!(
+            wash.bottom() - panel.top() <= 80.0,
+            "the header wash runs {}pt down a {}pt panel — the emblem watermark \
+             would land in the player rows",
+            wash.bottom() - panel.top(),
+            panel.height()
         );
     }
 
