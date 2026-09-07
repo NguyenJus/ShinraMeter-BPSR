@@ -4,6 +4,18 @@ All notable changes to ShinraMeter-BPSR are documented here. This project is
 a fan-made, unofficial tool for Blue Protocol: Star Resonance and is not
 affiliated with the game's publisher.
 
+## Unreleased
+
+### Fixed
+
+- Resizing the window from its left, right, or top-corner edges near the
+  header works again: the title-bar drag band is registered after the resize
+  handles and wins every pixel they share, so it now insets `RESIZE_EDGE` on
+  both sides and starts a full `RESIZE_CORNER` below the top, clearing all
+  four zones the header touches. The measured header band is also clamped to
+  twice its budget, so a bad measurement can no longer cover the window and
+  swallow every resize grab (#400).
+
 ## v0.2.6
 
 ### Added
