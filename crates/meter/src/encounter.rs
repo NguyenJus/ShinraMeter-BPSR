@@ -3844,20 +3844,33 @@ impl Meter {
         // the winner actually changes — logging every call would reproduce
         // the #87 flood at boss-target granularity instead of attr-id
         // granularity.
-        // issue #410: why the target moved. `previous_dead` is the case
+        // issue #410: why the target moved. `previous_gone` and
+        // `previous_dead` are split because only the latter is the case
         // that made the reset line's `boss_hp_pct` misread as the dead
-        // boss's HP (the ranking prefers a live boss to a corpse), so it is
-        // the one worth naming; `first_seen` is the fight's first target
-        // and `higher_priority` is the ordinary re-rank among live enemies.
+        // boss's HP (the ranking prefers a live boss to a corpse); the
+        // former is `previous` having been dropped from `enemies`
+        // entirely (a server change, say), which carries no HP to
+        // misread. `no_candidate` is `reset`'s own signature: it clears
+        // `took_damage` on every enemy while the previous boss is still
+        // alive, so the very next `recompute_boss` finds nothing in the
+        // damaged-candidate set and drops `boss_entity` to `None` even
+        // though the old boss never died or left — that must not be
+        // reported as `higher_priority`, which implies a live challenger
+        // actually won. `first_seen` is the fight's first target and
+        // `higher_priority` is the ordinary re-rank among live enemies.
         let reason = match previous_boss_entity {
             None => "first_seen",
-            Some(previous) => {
-                if self.enemies.get(&previous).is_none_or(|e| !e.is_alive()) {
-                    "previous_dead"
-                } else {
-                    "higher_priority"
+            Some(previous) => match self.enemies.get(&previous) {
+                None => "previous_gone",
+                Some(e) if !e.is_alive() => "previous_dead",
+                Some(_) => {
+                    if self.boss_entity.is_none() {
+                        "no_candidate"
+                    } else {
+                        "higher_priority"
+                    }
                 }
-            }
+            },
         };
         if self.boss_entity != previous_boss_entity
             && let Some(msg) =
@@ -3915,19 +3928,19 @@ impl Meter {
         // `reset` is itself already an event, never a per-snapshot poll, so
         // this is naturally sparse (issue #69) — no transition-only guard
         // needed the way scene/boss logging above requires one.
-        // issue #410: only a *live* boss's HP describes the fight being
-        // reset. Once the fought boss is dead `recompute_boss` may have
-        // moved `boss_entity` onto an unrelated living add, whose HP the
-        // old bare `boss_hp_pct=` field then reported as if it were the
-        // boss's dying HP. `<none>` is the honest answer there.
+        // issue #410: report whichever entity `boss_entity` currently names,
+        // dead or alive, and let `alive` say which -- filtering dead bosses
+        // out here made a post-kill reset's `boss_hp_pct` indistinguishable
+        // from a fight where no boss was ever tracked (`<none>` either way).
+        // `<none>` now means only that: no boss target at all.
         let boss = self
             .boss_entity
             .and_then(|entity| self.enemies.get(&entity).map(|e| (entity, e)))
-            .filter(|(_, e)| e.is_alive())
             .map(|(entity, e)| BossHpSnapshot {
                 pct: e.pct(),
                 uid: entity.display_uid(),
                 monster_id: e.monster_id,
+                alive: e.is_alive(),
             });
         // issue #284: live down-state, not cumulative deaths — see
         // `party_is_wiped`'s doc comment for why `deaths > 0` is the wrong
@@ -4626,6 +4639,11 @@ struct BossHpSnapshot {
     /// Display uid (issue #335). An enemy uid is not player data.
     uid: i64,
     monster_id: Option<u32>,
+    /// issue #410: a dead boss still prints here, with `alive: false`.
+    /// `<none>` on the reset line means no boss target at all -- the boss
+    /// died and `recompute_boss` moved on, or nothing was ever tracked --
+    /// not "the boss was dead", which `alive` alone now answers.
+    alive: bool,
 }
 
 fn reset_log(
@@ -4642,7 +4660,10 @@ fn reset_log(
                 None => "<unknown>".to_string(),
             };
             let monster_id = b.monster_id.map_or(-1i64, i64::from);
-            format!("{pct} (uid={} monster_id={monster_id})", b.uid)
+            format!(
+                "{pct} (uid={} monster_id={monster_id} alive={})",
+                b.uid, b.alive
+            )
         }
     };
     format!(
@@ -12217,6 +12238,50 @@ mod tests {
             );
         }
 
+        /// issue #410: `reset` clears `took_damage` on every enemy while
+        /// leaving the previous boss alive and in `enemies`, so the very
+        /// next `recompute_boss` finds nothing in the damaged-candidate set
+        /// and drops `boss_entity` to `None` even though the old boss never
+        /// died or left. That transition must not be reported as
+        /// `higher_priority` (which implies a live challenger won) or as
+        /// `previous_dead` (the boss is not dead).
+        #[test]
+        fn a_manual_reset_dropping_a_live_boss_logs_no_candidate() {
+            install_capture();
+
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: ek(10),
+                uid: 10,
+                curr_hp: Some(100),
+                max_hp: Some(100),
+                monster_id: Some(DIAG_BOSS),
+                timestamp_ms: 0,
+            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 10,
+                    target_kind: EntityKind::Monster,
+                    value: 10,
+                    timestamp_ms: 0,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
+            assert_eq!(m.boss_entity, Some(ek(10)));
+
+            m.reset(ResetReason::Manual, 1_000);
+            assert_eq!(m.boss_entity, None);
+
+            assert!(
+                logged("boss target cleared reason=no_candidate"),
+                "a Manual reset that drops boss_entity while the previous \
+                 boss is still alive must log reason=no_candidate"
+            );
+        }
+
         /// Issue #284: `reset`'s `party_down` used to be
         /// `players.values().filter(|p| p.deaths > 0).count()` — a
         /// cumulative "ever died" tally that a battle rez can never bring
@@ -12547,17 +12612,36 @@ mod tests {
                     pct: Some(97.4),
                     uid: 20,
                     monster_id: Some(103),
+                    alive: true,
                 }),
                 0,
                 4,
             );
             assert!(msg.contains("reason=BossHpRollback"));
             // issue #410: the HP always names the entity it belongs to.
-            assert!(msg.contains("boss_hp_pct=97.4 (uid=20 monster_id=103)"));
+            assert!(msg.contains("boss_hp_pct=97.4 (uid=20 monster_id=103 alive=true)"));
             assert!(msg.contains("party_down=0 known_players=4"));
 
-            // ...and the same shape with everyone dead. No live boss, so
-            // the HP reading is `<none>` rather than an unrelated add's.
+            // ...a post-kill reset, where the boss is dead but still the
+            // tracked target: `alive=false` says so, rather than the old
+            // `<none>` that made this indistinguishable from no boss ever
+            // having been tracked at all.
+            let msg = reset_log(
+                ResetReason::NewFight,
+                Some(BossHpSnapshot {
+                    pct: Some(0.0),
+                    uid: 20,
+                    monster_id: Some(103),
+                    alive: false,
+                }),
+                4,
+                4,
+            );
+            assert!(msg.contains("reason=NewFight"));
+            assert!(msg.contains("boss_hp_pct=0.0 (uid=20 monster_id=103 alive=false)"));
+            assert!(msg.contains("party_down=4 known_players=4"));
+
+            // ...and no boss ever tracked at all: `<none>`.
             let msg = reset_log(ResetReason::NewFight, None, 4, 4);
             assert!(msg.contains("reason=NewFight"));
             assert!(msg.contains("boss_hp_pct=<none>"));
@@ -12566,12 +12650,29 @@ mod tests {
 
         #[test]
         fn fight_end_and_reset_logs_never_leak_a_player_name_or_uid() {
-            // No live boss: the only uid this line can ever carry is an
-            // enemy's (issue #410), which is not player data, so the
-            // no-player-uid property is pinned on the shape that has none.
+            // No boss tracked at all: nothing to carry a uid.
             let msg = reset_log(ResetReason::Manual, None, 1, 4);
             assert!(!msg.contains("uid"));
             assert!(!msg.contains("Player"));
+
+            // A boss tracked: the only uid this line may ever carry is the
+            // boss's own (issue #410), which is not player data, so this
+            // pins that exactly one `uid=` appears and it is the boss's.
+            let msg = reset_log(
+                ResetReason::Manual,
+                Some(BossHpSnapshot {
+                    pct: Some(50.0),
+                    uid: 20,
+                    monster_id: Some(103),
+                    alive: true,
+                }),
+                1,
+                4,
+            );
+            assert_eq!(msg.matches("uid=").count(), 1);
+            assert!(msg.contains("uid=20"));
+            assert!(!msg.contains("Player"));
+
             let msg = fight_end_log(FightEndCause::Wipe, Some(103), None);
             assert!(!msg.contains("uid"));
         }

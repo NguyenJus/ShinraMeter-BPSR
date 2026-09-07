@@ -138,24 +138,26 @@ impl HistoryHandle {
 }
 
 /// Builds the one-line INFO summary for a `Record` outcome (issue #409): a
-/// successful insert (`id` some) or a skip below the minimum duration
-/// (`min_duration_ms`) (`id` none) both get a line, so the log alone can
-/// confirm whether a given fight actually reached `history.sqlite`.
-/// `EncounterRecord` carries no end cause today, so the line reports the
-/// fields it does carry rather than inventing one.
+/// successful insert (`id` some) or a skip below the retention floor (`id`
+/// none) both get a line, so the log alone can confirm whether a given
+/// fight actually reached `history.sqlite`. `EncounterRecord` carries no end
+/// cause today, so the line reports the fields it does carry rather than
+/// inventing one.
 fn describe_recorded(id: Option<i64>, record: &EncounterRecord) -> String {
-    let scene = record.scene_name.as_deref();
-    let title = record.title.as_str();
+    let scene = record
+        .scene_name
+        .as_deref()
+        .unwrap_or(record.title.as_str());
     let boss = record.boss_name.as_deref();
     let duration_ms = record.duration_ms;
     let players = record.players.len();
     match id {
         Some(id) => format!(
-            "history: recorded encounter id={id} scene={scene:?} title={title:?} boss={boss:?} \
+            "history: recorded encounter id={id} scene={scene:?} boss={boss:?} \
              duration_ms={duration_ms} players={players}"
         ),
         None => format!(
-            "history: skipped encounter below the minimum duration scene={scene:?} title={title:?} \
+            "history: skipped encounter below the retention floor scene={scene:?} \
              boss={boss:?} duration_ms={duration_ms} players={players}"
         ),
     }
@@ -428,12 +430,12 @@ mod tests {
     }
 
     #[test]
-    fn describe_recorded_names_a_skip_below_the_minimum_duration() {
+    fn describe_recorded_names_a_skip_below_the_retention_floor() {
         let record = sample_record("Trash Pull");
 
         let line = describe_recorded(None, &record);
 
-        assert!(line.starts_with("history: skipped encounter below the minimum duration "));
+        assert!(line.starts_with("history: skipped encounter below the retention floor "));
         assert!(!line.contains("id="));
     }
 }
