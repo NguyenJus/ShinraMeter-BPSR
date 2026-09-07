@@ -155,15 +155,20 @@ impl ColumnEmphasis {
     /// by color, not by size or weight, so this exists to keep the "which
     /// size" question centralized rather than to actually vary it.
     ///
+    /// Regular at every level, `Counter` included: the source's death
+    /// counter (`DeathsDT`, Styles.xaml:1241-1257) is a plain
+    /// `MetricTextBlockStyle` `TextBlock` (Styles.xaml:1125-1134 —
+    /// `FontSize="13"`, no `FontWeight` setter), so the count is no bolder
+    /// than the columns beside it.
+    ///
     /// `Counter` reports the font its *pill* lays the value out in
-    /// (`stat_pill` -> `pill_text_size` -> `bold(pill.size)`), not a font
-    /// `draw_row` ever passes to `paint_text` — that is what lets the column
-    /// width-budget tests measure the pill column the same way they measure
-    /// every other one.
+    /// (`stat_pill` -> `pill_text_size`), not a font `draw_row` ever passes
+    /// to `paint_text` — that is what lets the column width-budget tests
+    /// measure the pill column the same way they measure every other one.
     pub(super) fn font(self) -> egui::FontId {
         match self {
             Self::Value | Self::Stat | Self::Percent => regular(FONT_SIZE_ROW),
-            Self::Counter => bold(FONT_SIZE_COUNTER),
+            Self::Counter => regular(FONT_SIZE_COUNTER),
         }
     }
 
@@ -320,6 +325,37 @@ pub(super) fn column_clip_rect(rect: egui::Rect, anchor: f32, width: f32) -> egu
     )
 }
 
+/// Where one stat column's text is painted, and how it is aligned there.
+///
+/// Right-aligned on the column's anchor for every column but one, matching
+/// `MetricTextBlockStyle`'s `TextAlignment="Right"` (Styles.xaml:1125-1134):
+/// a digit-count change shifts only that column's text, never its anchor.
+/// The exception is crit %, the single metric template in the source that
+/// overrides that alignment — `CritRateDT` is `HorizontalAlignment="Center"
+/// Margin="2 0"` (Styles.xaml:1219-1226) — so it is centered in the span
+/// its anchor and nominal `width` bound, i.e. `column_clip_rect`'s slot.
+/// `LuckyPct` has no counterpart in the source (it is our own extra
+/// column); it is centered too so that it reads as a matched pair with the
+/// crit % beside it rather than as a lone right-aligned percentage.
+///
+/// Pure, so both the alignment choice and the resulting x are unit-testable
+/// without a live painter — same reasoning as `column_clip_rect`.
+pub(super) fn column_text_placement(
+    kind: ColumnKind,
+    rect: egui::Rect,
+    anchor_x: f32,
+    width: f32,
+) -> (egui::Pos2, egui::Align2) {
+    let y = rect.center().y;
+    match kind {
+        ColumnKind::CritPct | ColumnKind::LuckyPct => (
+            egui::pos2(anchor_x - width / 2.0, y),
+            egui::Align2::CENTER_CENTER,
+        ),
+        _ => (egui::pos2(anchor_x, y), egui::Align2::RIGHT_CENTER),
+    }
+}
+
 /// Row layout that's identical across every row in a frame — the enabled
 /// column kinds, their `StatColumn` specs, and the anchors `column_anchors`
 /// derived from them — computed once by `draw_rows` and handed to every
@@ -386,6 +422,21 @@ pub(super) fn draw_row(
         paints.accent_left,
         paints.accent_right,
     )));
+    // The accent's rounded right cap (`SHARE_BAR_ACCENT_CAP`): flat, in the
+    // gradient's own right-end color, so it continues the mesh seamlessly
+    // and only adds the source's `CornerRadius="0 1 1 0"` rounding.
+    if let Some(cap) = paints.accent_cap {
+        ui.painter().rect_filled(
+            cap,
+            egui::CornerRadius {
+                nw: 0,
+                ne: SHARE_BAR_ACCENT_CAP_RADIUS,
+                sw: 0,
+                se: SHARE_BAR_ACCENT_CAP_RADIUS,
+            },
+            paints.accent_right,
+        );
+    }
 
     // Per-row hover highlight (decision 7): a horizontal gradient peaking
     // near the row's left edge, painted over the share bar and under the
@@ -475,7 +526,7 @@ pub(super) fn draw_row(
     // real painted extent `paint_text` just handed back, not a fixed
     // offset), so the suffix always starts flush against the name however
     // wide it rendered. Dimmed relative to the name's own opaque white
-    // (`NAME_SUFFIX_ALPHA`) so it reads as secondary metadata trailing the
+    // (`NAME_SUFFIX_RGB`) so it reads as secondary metadata trailing the
     // name, not as part of the name itself.
     //
     // Deliberately unclipped and never truncated/elided (issue #168
@@ -495,7 +546,7 @@ pub(super) fn draw_row(
             egui::Align2::LEFT_CENTER,
             &format!(" {suffix}"),
             regular(FONT_SIZE_ROW_SUFFIX),
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, NAME_SUFFIX_ALPHA),
+            egui::Color32::from_rgb(NAME_SUFFIX_RGB.0, NAME_SUFFIX_RGB.1, NAME_SUFFIX_RGB.2),
             false,
         );
     }
@@ -547,10 +598,13 @@ pub(super) fn draw_row(
                 StatPill::counter(&text, skull, column.color),
             );
         } else {
+            // Right-aligned on the anchor, except for the centered crit-%
+            // (and Lucky-%) column — see `column_text_placement`.
+            let (pos, align) = column_text_placement(*kind, rect, *anchor_x, column.width);
             paint_text(
                 &painter,
-                egui::pos2(*anchor_x, rect.center().y),
-                egui::Align2::RIGHT_CENTER,
+                pos,
+                align,
                 &text,
                 emphasis.font(),
                 column.color,
@@ -585,7 +639,7 @@ pub(super) fn paint_counter_pill(
     // Capped at the row's own height for the same reason the header's pills
     // are capped at the button row's (`pill_size`): a pill taller than its
     // container would overlap the rows above and below it.
-    let size = pill_size(text_size, pill.icon_side, row.height());
+    let size = pill_size(text_size, pill.icon_side, pill.metrics, row.height());
     paint_stat_pill(
         painter,
         counter_pill_rect(row, anchor, size),
@@ -617,13 +671,16 @@ pub(super) fn counter_pill_rect(row: egui::Rect, anchor: f32, size: egui::Vec2) 
 pub(super) const SHARE_BAR_RGB_HEALER: (u8, u8, u8) = (131, 196, 154);
 pub(super) const SHARE_BAR_RGB_TANK: (u8, u8, u8) = (104, 166, 205);
 pub(super) const SHARE_BAR_RGB_DAMAGE: (u8, u8, u8) = (219, 135, 135);
-/// Fallback for `Class::Unknown` (or a row with no `Class` at all). A
-/// desaturated grey rather than any role's hue: reusing a role color here
-/// (as this once did with `SHARE_BAR_RGB_TANK`'s blue) would make an
-/// unclassified row indistinguishable from a confirmed row of that role, so
-/// this must stay visually distinct from all three colors above (issue #44's
-/// second open question).
-pub(super) const SHARE_BAR_RGB_UNKNOWN: (u8, u8, u8) = (140, 140, 140);
+/// Fallback for `Class::Unknown` (or a row with no `Class` at all). The
+/// source's own fallback hue: `RoleToColorConverter` seeds its result with
+/// `Colors.SlateGray` (`#708090`, RoleToColorConverter.cs:14) and overwrites
+/// it only for a recognized `PlayerRole`. A desaturated blue-grey rather
+/// than any role's hue: reusing a role color here (as this once did with
+/// `SHARE_BAR_RGB_TANK`'s blue) would make an unclassified row
+/// indistinguishable from a confirmed row of that role, so this must stay
+/// visually distinct from all three colors above (issue #44's second open
+/// question).
+pub(super) const SHARE_BAR_RGB_UNKNOWN: (u8, u8, u8) = (0x70, 0x80, 0x90);
 
 /// RGB for the `CritPct` stat column's text. Sampled directly from the
 /// reference meter screenshots — `docs/reference/new-shinra-ex.webp` and
@@ -656,6 +713,19 @@ pub(super) const SHARE_BAR_ACCENT_LEFT_ALPHA: u8 = 26;
 /// height so it stays sane — never taller than the row itself — at small
 /// row heights.
 pub(super) const SHARE_BAR_ACCENT_THICKNESS: f32 = 2.0;
+
+/// Width of the accent line's rounded right cap, and the radius it is
+/// rounded by. The source's accent `Border` is `Height="2"` with
+/// `CornerRadius="0 1 1 0"` (PlayerStatsControl.xaml:50-63) - square on the
+/// left, rounded by 1 on the right - which a gradient mesh cannot express,
+/// so `share_bar_paints` carves the last point of the accent off into a
+/// `rect_filled` cap that carries the rounding. One point wide because that
+/// is exactly the source's radius: any wider and the flat, fully opaque cap
+/// would visibly eat into the gradient.
+pub(super) const SHARE_BAR_ACCENT_CAP: f32 = 1.0;
+/// Corner radius of `SHARE_BAR_ACCENT_CAP`'s cap rect - the right pair of
+/// the source's `CornerRadius="0 1 1 0"`.
+pub(super) const SHARE_BAR_ACCENT_CAP_RADIUS: u8 = 1;
 
 /// A two-triangle gradient quad. egui has no gradient brush, so the
 /// source's `LinearGradientBrush`es are reproduced as meshes with
@@ -728,9 +798,16 @@ pub(super) struct ShareBarPaints {
     /// The accent line. Issue #73: its width now matches `fill_rect`'s
     /// width exactly, so the accent underline stops exactly where the
     /// gradient fill stops rather than always spanning the full row.
+    /// The graded part of the accent line only: the last
+    /// `SHARE_BAR_ACCENT_CAP` points are carved off into `accent_cap`.
     pub(super) accent_rect: egui::Rect,
     pub(super) accent_left: egui::Color32,
     pub(super) accent_right: egui::Color32,
+    /// The accent's rounded right cap, painted flat in `accent_right`
+    /// rather than graded so it can carry the source's `CornerRadius="0 1 1
+    /// 0"`. `None` when the bar is too narrow to spend a point on a cap
+    /// (a zero `bar_frac` has no accent at all to cap).
+    pub(super) accent_cap: Option<egui::Rect>,
 }
 
 /// Maps a row's `Class` to its share-bar hue (issue #44). `None` — either no
@@ -798,10 +875,22 @@ pub(super) fn share_bar_paints(
     let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(bar_width, rect.height()));
 
     let thickness = SHARE_BAR_ACCENT_THICKNESS.min(rect.height());
+    // The accent's own right end is capped (`SHARE_BAR_ACCENT_CAP`) rather
+    // than graded, so the mesh stops a point short of the fill's right edge
+    // and the cap covers that point. Below that width there is nothing left
+    // to grade, so the whole accent becomes the cap.
+    let cap_width = SHARE_BAR_ACCENT_CAP.min(bar_width);
+    let accent_top = rect.max.y - thickness;
     let accent_rect = egui::Rect::from_min_size(
-        egui::pos2(rect.min.x, rect.max.y - thickness),
-        egui::vec2(bar_width, thickness),
+        egui::pos2(rect.min.x, accent_top),
+        egui::vec2(bar_width - cap_width, thickness),
     );
+    let accent_cap = (cap_width > 0.0).then(|| {
+        egui::Rect::from_min_size(
+            egui::pos2(accent_rect.max.x, accent_top),
+            egui::vec2(cap_width, thickness),
+        )
+    });
 
     let (r, g, b) = share_bar_rgb(class);
     let fill_bottom = egui::Color32::from_rgba_unmultiplied(r, g, b, SHARE_BAR_FILL_BOTTOM_ALPHA);
@@ -814,6 +903,7 @@ pub(super) fn share_bar_paints(
         accent_rect,
         accent_left,
         accent_right,
+        accent_cap,
     }
 }
 
@@ -1565,7 +1655,13 @@ mod tests {
         let rect = share_bar_rect();
         let paints = share_bar_paints(rect, 1.0, None);
         assert_eq!(paints.fill_rect.width(), rect.width());
-        assert_eq!(paints.accent_rect.width(), rect.width());
+        // The accent spans it too, minus the point its rounded right cap
+        // (`SHARE_BAR_ACCENT_CAP`) is carved out of.
+        assert_eq!(
+            paints.accent_rect.width(),
+            rect.width() - SHARE_BAR_ACCENT_CAP
+        );
+        assert_eq!(paints.accent_cap.expect("a cap").right(), rect.right());
     }
 
     /// Issue #73: the accent line's width now matches the fill's width
@@ -1577,6 +1673,8 @@ mod tests {
         let paints = share_bar_paints(rect, 0.0, None);
         assert_eq!(paints.fill_rect.width(), 0.0);
         assert_eq!(paints.accent_rect.width(), 0.0);
+        // And nothing to cap either.
+        assert_eq!(paints.accent_cap, None);
     }
 
     /// Issue #73: the accent line used to always span the row's full width
@@ -1587,7 +1685,10 @@ mod tests {
         let rect = share_bar_rect();
         let paints = share_bar_paints(rect, 0.4, None);
         assert_eq!(paints.fill_rect.width(), rect.width() * 0.4);
-        assert_eq!(paints.accent_rect.width(), paints.fill_rect.width());
+        assert_eq!(
+            paints.accent_rect.width() + SHARE_BAR_ACCENT_CAP,
+            paints.fill_rect.width()
+        );
     }
 
     /// The accent line is what makes the share boundary read crisply, so it
@@ -1599,6 +1700,30 @@ mod tests {
         let paints = share_bar_paints(rect, 0.5, None);
         assert_eq!(paints.accent_rect.bottom(), rect.bottom());
         assert_eq!(paints.accent_rect.height(), SHARE_BAR_ACCENT_THICKNESS);
+    }
+
+    /// The source caps the accent's right end: its accent `Border` is
+    /// `CornerRadius="0 1 1 0"` (PlayerStatsControl.xaml:50-63), i.e. the
+    /// two right corners rounded by 1. The graded mesh cannot round, so the
+    /// last `SHARE_BAR_ACCENT_CAP` points of the accent are split off into
+    /// a rounded, fully opaque cap rect painted at the mesh's right end.
+    #[test]
+    fn share_bar_accent_ends_in_a_rounded_right_cap() {
+        let rect = share_bar_rect();
+        let paints = share_bar_paints(rect, 0.5, None);
+        let cap = paints.accent_cap.expect("a half-width bar has room to cap");
+
+        assert_eq!(cap.width(), SHARE_BAR_ACCENT_CAP);
+        assert_eq!(cap.left(), paints.accent_rect.right());
+        assert_eq!(cap.right(), paints.fill_rect.right());
+        assert_eq!(cap.top(), paints.accent_rect.top());
+        assert_eq!(cap.bottom(), paints.accent_rect.bottom());
+        // Together they still cover exactly the fill's width: the cap is
+        // carved out of the accent, not added beyond it.
+        assert_eq!(
+            paints.accent_rect.width() + cap.width(),
+            paints.fill_rect.width()
+        );
     }
 
     /// A row short enough that the fixed accent thickness would exceed its
@@ -1884,6 +2009,10 @@ mod tests {
     /// `SHARE_BAR_RGB_TANK`'s blue, before this test existed).
     #[test]
     fn share_bar_fallback_hue_differs_from_every_role_hue() {
+        // The source's own fallback: `RoleToColorConverter` starts at
+        // `Colors.SlateGray` and only replaces it for a known `PlayerRole`
+        // (RoleToColorConverter.cs:14).
+        assert_eq!(SHARE_BAR_RGB_UNKNOWN, (0x70, 0x80, 0x90));
         assert_ne!(SHARE_BAR_RGB_UNKNOWN, SHARE_BAR_RGB_HEALER);
         assert_ne!(SHARE_BAR_RGB_UNKNOWN, SHARE_BAR_RGB_TANK);
         assert_ne!(SHARE_BAR_RGB_UNKNOWN, SHARE_BAR_RGB_DAMAGE);
@@ -1978,8 +2107,11 @@ mod tests {
         // 56.0 and landing here at `427.0`. Issue #187 then bumped
         // `ICON_SIZE` (18 -> 20) and `IMAGINE_SIZE` (14 -> 16), widening
         // `ICON_GUTTER_WIDTH` by `6.0` (2 for the icon, 2 * 2 for the two
-        // Imagine slots) and landing here at `433.0`.
-        assert_eq!(default_inner_width(), 433.0);
+        // Imagine slots) and landing here at `433.0`. Trimming
+        // `COLUMN_RIGHT_MARGIN` to the source's `2 0` + `1` (4.0 -> 3.0)
+        // then took a point back off, landing at `432.0`.
+        assert_eq!(default_inner_width(), 432.0);
+        assert_eq!(COLUMN_RIGHT_MARGIN, 3.0);
     }
 
     #[test]
@@ -2124,15 +2256,15 @@ mod tests {
             "suffix {suffix_box:?} must share the name's baseline row {name_box:?}"
         );
 
-        // Dimmed: the same white as the name, at `NAME_SUFFIX_ALPHA`.
+        // Dimmed: the source's own `#888` grey (`NAME_SUFFIX_RGB`), opaque
+        // — a darker hue than the name's white, not a faded one.
         let (suffix_index, suffix_color) = frame.text_paint(&suffix_text);
         let (name_index, name_color) = frame.text_paint(&row.name);
-        assert_eq!(
-            suffix_color,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, NAME_SUFFIX_ALPHA)
-        );
+        let (r, g, b) = NAME_SUFFIX_RGB;
+        assert_eq!(suffix_color, egui::Color32::from_rgb(r, g, b));
+        assert_eq!(suffix_color.a(), 255, "the source's `#888` is opaque");
         assert!(
-            suffix_color.a() < name_color.a(),
+            suffix_color.r() < name_color.r(),
             "suffix {suffix_color:?} must be dimmer than the name {name_color:?}"
         );
 
@@ -2190,6 +2322,11 @@ mod tests {
     fn the_counter_shares_the_row_metric_and_is_the_only_pill() {
         assert_eq!(ColumnEmphasis::Counter.font().size, FONT_SIZE_ROW);
         assert_eq!(FONT_SIZE_COUNTER, FONT_SIZE_ROW);
+        // And its *weight*: the source's `DeathsDT` counter is plain
+        // `MetricTextBlockStyle` (Styles.xaml:1125-1134, used at
+        // :1241-1257) — `FontSize="13"`, no `FontWeight` — so no row
+        // column is bold.
+        assert_eq!(ColumnEmphasis::Counter.font(), regular(FONT_SIZE_COUNTER));
         assert!(ColumnEmphasis::Counter.is_pill());
         for other in [
             ColumnEmphasis::Value,
@@ -2197,6 +2334,118 @@ mod tests {
             ColumnEmphasis::Percent,
         ] {
             assert!(!other.is_pill(), "{other:?} should not be a pill");
+        }
+    }
+
+    /// Crit % (and our own Lucky % beside it) reads centered in its slot,
+    /// not right-aligned like every other column: the source's `CritRateDT`
+    /// (Styles.xaml:1219-1226) is the one metric template that overrides
+    /// `MetricTextBlockStyle`'s right alignment with
+    /// `HorizontalAlignment="Center"`.
+    #[test]
+    fn crit_and_lucky_percent_center_in_their_column_the_rest_stay_right_aligned() {
+        let row = row_rect();
+        for kind in [ColumnKind::CritPct, ColumnKind::LuckyPct] {
+            let (pos, align) = column_text_placement(kind, row, 250.0, 40.0);
+            assert_eq!(align, egui::Align2::CENTER_CENTER, "{kind:?}");
+            assert_eq!(pos.x, 230.0, "{kind:?} must sit at its column's center");
+            assert_eq!(pos.y, row.center().y, "{kind:?}");
+        }
+        for kind in [ColumnKind::Dps, ColumnKind::Damage, ColumnKind::Hits] {
+            let (pos, align) = column_text_placement(kind, row, 250.0, 40.0);
+            assert_eq!(align, egui::Align2::RIGHT_CENTER, "{kind:?}");
+            assert_eq!(pos.x, 250.0, "{kind:?} must end on its column anchor");
+        }
+    }
+
+    /// Issue #400: the Deaths counter — the rightmost column — must stay
+    /// inside the window at a width the user can really drag to. The
+    /// header's stat row used to overflow and thereby widen the
+    /// `CentralPanel`'s `Ui` (see
+    /// `the_stat_row_overflow_does_not_widen_the_panel` in `header.rs`),
+    /// and `draw_rows` read that widened `available_width` as its
+    /// viewport, anchoring the counter past the right border where the
+    /// window clipped it away. Rendered as `OverlayApp::ui` sequences it —
+    /// header, seam allocation, rows — and measured on the *unclipped*
+    /// shape, since the symptom is precisely a shape the clip rect ate.
+    #[test]
+    fn the_deaths_counter_stays_inside_a_narrow_window() {
+        const WIDTH: f32 = 356.0;
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let mut snapshot = rows_test_snapshot(2);
+        // A death count no other column in this snapshot paints, so the
+        // text search below can only match the counter pill's own label.
+        for row in &mut snapshot.rows {
+            row.deaths = 7;
+        }
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(WIDTH, 236.0),
+            )),
+            ..Default::default()
+        };
+
+        let output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                draw_header(
+                    ui,
+                    &ctx,
+                    &snapshot,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    &mut WindowGesture::default(),
+                    None,
+                    false,
+                    true,
+                    &mut UpdateCheckState::default(),
+                    &unused_log_export_sender(),
+                    &mut 0,
+                    false,
+                    &mut false,
+                    None,
+                    &mut false,
+                );
+                ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), SEPARATOR_HEIGHT),
+                    egui::Sense::hover(),
+                );
+                draw_rows(ui, &snapshot, &Settings::default(), &icons, &mut None);
+            });
+        });
+
+        fn deaths_text(shape: &egui::Shape, found: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == "7" => {
+                    found.push(egui::Rect::from_min_size(text.pos, text.galley.size()));
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| deaths_text(s, found)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for clipped in &output.shapes {
+            deaths_text(&clipped.shape, &mut found);
+        }
+        output.drop_without_applying_deltas();
+
+        assert!(!found.is_empty(), "no death counter was painted at all");
+        let limit = WIDTH - COLUMN_RIGHT_MARGIN + 0.5;
+        for rect in found {
+            assert!(
+                rect.right() <= limit,
+                "the deaths counter ends at {}pt in a {WIDTH}pt window",
+                rect.right()
+            );
         }
     }
 

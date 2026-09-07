@@ -868,6 +868,8 @@ pub(super) fn draw_skill_window(
         // stayed solid while the window around it faded.
         fill: opacity.apply(SKILL_PANEL_FILL),
         stroke: None,
+        metrics: PillMetrics::COUNTER,
+        bold: false,
     };
     // Issue #254: the same chrome as the Deaths pill — one cluster, one
     // look — led by the stopwatch the main header's fight timer already
@@ -883,12 +885,17 @@ pub(super) fn draw_skill_window(
     });
 
     let deaths_text_size = pill_text_size(&painter, &deaths_pill);
-    let deaths_pill_size = pill_size(deaths_text_size, deaths_pill.icon_side, SKILL_PILL_HEIGHT);
+    let deaths_pill_size = pill_size(
+        deaths_text_size,
+        deaths_pill.icon_side,
+        deaths_pill.metrics,
+        SKILL_PILL_HEIGHT,
+    );
     let death_time_sizes = death_time_pill.as_ref().map(|pill| {
         let text_size = pill_text_size(&painter, pill);
         (
             text_size,
-            pill_size(text_size, pill.icon_side, SKILL_PILL_HEIGHT),
+            pill_size(text_size, pill.icon_side, pill.metrics, SKILL_PILL_HEIGHT),
         )
     });
     // The close button's rect is derived here, ahead of its own paint
@@ -1992,12 +1999,15 @@ mod tests {
             corner_radius: egui::CornerRadius::same(SKILL_PILL_CORNER_RADIUS),
             fill: SKILL_PANEL_FILL,
             stroke: None,
+            metrics: PillMetrics::COUNTER,
+            bold: false,
         };
         let death_time_text = skill_death_time_text(row.dead_ms).unwrap();
         let painter = egui::Painter::new(ctx.clone(), egui::LayerId::debug(), screen_rect);
         let deaths_width = pill_size(
             pill_text_size(&painter, &deaths_pill),
             deaths_pill.icon_side,
+            deaths_pill.metrics,
             SKILL_PILL_HEIGHT,
         )
         .x;
@@ -2008,6 +2018,7 @@ mod tests {
         let death_time_width = pill_size(
             pill_text_size(&painter, &death_time_pill),
             death_time_pill.icon_side,
+            death_time_pill.metrics,
             SKILL_PILL_HEIGHT,
         )
         .x;
