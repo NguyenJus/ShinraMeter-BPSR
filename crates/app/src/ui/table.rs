@@ -35,17 +35,46 @@ pub(super) fn row_content_width(viewport_width: f32, stat_columns_total: f32) ->
 /// the reference `ScrollBar`'s `GridRoot Width="8"`
 /// (`DamageMeter.UI/Resources/Styles.xaml` ~830-853). Unlike egui's default
 /// floating bar (0pt allocated, paints on top of the content), a solid bar
-/// takes its width out of the row list's own layout — `draw_rows` reserves
-/// it out of the viewport itself before computing `content_width`, so the
-/// row content never lays out into the strip the bar occupies.
+/// takes its width out of the row list's own layout — but only while it is
+/// actually showing. `draw_rows` reserves it out of the viewport itself,
+/// conditional on `row_list_overflows`, before computing `content_width`,
+/// so the row content never lays out into the strip the bar occupies once
+/// it shows, and never loses that strip for nothing when it doesn't.
 pub(super) const ROW_SCROLL_BAR_WIDTH: f32 = 8.0;
+
+/// Whether the row list's vertical scroll bar will actually show this frame
+/// (issue #404 follow-up): egui's non-floating bar with
+/// `ScrollBarVisibility::VisibleWhenNeeded` allocates 0pt of layout space
+/// when the content fits inside the viewport, and the full `bar_width`
+/// only once the content overflows it — so `draw_rows` must reserve
+/// `ROW_SCROLL_BAR_WIDTH` conditionally on the same fact, or every
+/// non-overflowing row list ends up permanently narrower than it needs to
+/// be, with a dead strip on the right where the bar never paints.
+///
+/// A pure function of the row count and the viewport height rather than a
+/// read of the `ScrollArea`'s own state (`scroll_area::State::show_scroll`
+/// is private in egui 0.36.1), so it's unit-testable without a live
+/// `Ui`/`ScrollArea` — the same reasoning `row_content_width` already
+/// follows. `item_spacing.y` is zeroed inside the row list's content `Ui`
+/// (see `draw_rows`), so the content height is exactly `row_count as f32 *
+/// ROW_HEIGHT`, with no per-row gap to add in.
+pub(super) fn row_list_overflows(row_count: usize, viewport_height: f32) -> bool {
+    row_count as f32 * ROW_HEIGHT > viewport_height
+}
 
 /// The row list's solid-bar handle color, the reference's thumb
 /// `Foreground="#8C8C8C"`.
 const ROW_SCROLL_HANDLE_RGB: egui::Color32 = egui::Color32::from_rgb(0x8C, 0x8C, 0x8C);
 
-/// The reference thumb's `CornerRadius="5"`.
-const ROW_SCROLL_HANDLE_CORNER_RADIUS: u8 = 5;
+/// The reference thumb's `CornerRadius="5"`, clamped down to `4` — half of
+/// `ROW_SCROLL_BAR_WIDTH` (8pt) — because epaint's tessellator clamps any
+/// corner radius to half the smaller rect side
+/// (`clamp_corner_radius`, `epaint/src/tessellator.rs`), so `5` would still
+/// only ever paint as `4` on this 8pt-wide bar. `4` is therefore both the
+/// largest value that actually paints here and, after the reference itself
+/// goes through the same clamp on its 8pt-wide pill, a pixel match rather
+/// than an approximation.
+const ROW_SCROLL_HANDLE_CORNER_RADIUS: u8 = 4;
 
 /// The row list's `ScrollArea` style (issue #404): a solid bar rather than
 /// egui's default `ScrollStyle::floating()`, sized and positioned to match
@@ -117,11 +146,20 @@ pub(super) fn draw_rows(
 
         // The solid bar takes its `ROW_SCROLL_BAR_WIDTH` out of the
         // viewport itself (unlike the old floating bar's 0pt
-        // allocation), so `content_width` has to leave room for it up
-        // front — otherwise the row content lays out into the strip
-        // the bar occupies once it actually shows.
+        // allocation), but only while it's actually showing
+        // (`row_list_overflows`) — so `content_width` leaves room for it
+        // up front only then, otherwise the row content lays out into
+        // the strip the bar occupies once it actually shows, and a list
+        // that fits without scrolling isn't left permanently narrower
+        // for a bar that never paints.
+        let scroll_bar_reserved = if row_list_overflows(snapshot.rows.len(), ui.available_height())
+        {
+            ROW_SCROLL_BAR_WIDTH
+        } else {
+            0.0
+        };
         let content_width = row_content_width(
-            ui.available_width() - ROW_SCROLL_BAR_WIDTH,
+            ui.available_width() - scroll_bar_reserved,
             stat_columns_total,
         );
 
@@ -605,7 +643,7 @@ pub(super) fn draw_row(
                 // `Response::on_hover_text`, whose `Tooltip::for_enabled`
                 // gate makes every tooltip wait out the global
                 // `interaction.tooltip_delay`. Only these icons opt out of
-                // that wait — see `IMAGINE_HOVER_DELAY_SECS`.
+                // that wait — see `imagine_hover_ready`.
                 let response = ui.interact(
                     slot,
                     ui.id().with(("imagine", row.uid, i)),
@@ -1151,24 +1189,50 @@ pub(super) fn imagine_hover_text(name: &str, tier: Option<i32>) -> String {
     }
 }
 
-/// How long the pointer must rest on a filled Imagine slot before its
-/// name+tier popup appears (issue #396). Zero: the popup shows on the very
-/// first frame the pointer is over the slot. egui's own tooltip path waits
-/// `Style::interaction::tooltip_delay` (0.5s by default, and the whole rest
-/// of the UI still wants that), which on these 16pt icons reads as the
-/// popup being broken rather than deliberate — a row is scanned icon by
-/// icon, so every slot would cost half a second. `draw_row` therefore opens
-/// the Imagine popup itself instead of going through the delayed
-/// `Response::on_hover_text`, and this constant is the only wait it honors.
-pub(super) const IMAGINE_HOVER_DELAY_SECS: f32 = 0.0;
-
-/// Whether a filled Imagine slot's hover popup should be showing this
-/// frame (issue #396): the pointer is over the slot and has been still for
-/// at least `IMAGINE_HOVER_DELAY_SECS` — which at zero is simply "the slot
-/// is hovered", with no wait at all.
+/// Whether a filled Imagine slot's hover popup should be showing this frame
+/// (issue #396): the slot is hovered, the pointer isn't mid-scroll, no
+/// popup is open, and — unlike egui's own tooltip path
+/// (`Response::on_hover_text`, `Tooltip::for_enabled`) — there is no
+/// `Style::interaction::tooltip_delay` wait on top of that. On these 16pt
+/// icons that 0.5s default delay reads as the popup being broken rather
+/// than deliberate, since a row is scanned icon by icon and every slot
+/// would cost half a second; `draw_row` therefore opens the Imagine popup
+/// itself through `egui::Tooltip::for_widget` rather than the delayed
+/// path, and this function is what stands in for `Tooltip::
+/// should_show_tooltip`'s delay check.
+///
+/// The other guards `should_show_tooltip` applies (egui 0.36.1
+/// `containers/tooltip.rs` ~221-330) are kept rather than dropped:
+/// `Tooltip::for_widget` skips *all* of them, not just the delay, so
+/// without this a slot could show its popup while the pointer is
+/// mid-scroll or while an unrelated popup (the settings menu, a
+/// context menu) is open. The scroll guard mirrors
+/// `time_since_last_scroll < tooltip_delay`, including its
+/// `request_repaint_after_secs` so the popup still appears the instant the
+/// delay lapses rather than waiting for some other repaint to notice. The
+/// open-popup guard mirrors `any_open_popups` (`fs.layers.get(&response.
+/// layer_id).is_some_and(|l| !l.open_popups.is_empty())`), but reads
+/// through `Context::any_popup_open` rather than the private per-layer
+/// `PassState` field `should_show_tooltip` itself reads
+/// (`Context::prev_pass_state` is `pub(crate)`, unreachable from here) —
+/// slightly more conservative (any layer, not just this response's), which
+/// only ever suppresses a popup egui's own path would also have suppressed.
 pub(super) fn imagine_hover_ready(response: &egui::Response) -> bool {
-    response.hovered()
-        && response.ctx.input(|i| i.pointer.time_since_last_movement()) >= IMAGINE_HOVER_DELAY_SECS
+    if !response.hovered() {
+        return false;
+    }
+    if response.ctx.any_popup_open() {
+        return false;
+    }
+    let tooltip_delay = response.ctx.global_style().interaction.tooltip_delay;
+    let time_since_last_scroll = response.ctx.input(|i| i.time_since_last_scroll());
+    if time_since_last_scroll < tooltip_delay {
+        response
+            .ctx
+            .request_repaint_after_secs(tooltip_delay - time_since_last_scroll);
+        return false;
+    }
+    true
 }
 
 /// Whether a filled Imagine slot should get the gold max-tier ring (issue
@@ -1304,9 +1368,10 @@ mod tests {
     /// `interaction.tooltip_delay` (0.5s) has elapsed. `apply_theme` leaves
     /// that global delay at its real value here on purpose — this test is
     /// precisely about not paying it — so the popup can only show if
-    /// `draw_row` opens the Imagine slot's popup itself, gated on
-    /// `IMAGINE_HOVER_DELAY_SECS`, rather than through the delayed
-    /// `Response::on_hover_text` path.
+    /// `draw_row` opens the Imagine slot's popup itself through
+    /// `imagine_hover_ready`, which keeps every other `should_show_tooltip`
+    /// guard (no mid-scroll, no other popup open) but skips only the delay,
+    /// rather than through the delayed `Response::on_hover_text` path.
     ///
     /// The slot's rect is read back from the frame that painted it: the
     /// Imagine icon is the only mesh blitted with that Imagine's texture,
@@ -1316,10 +1381,6 @@ mod tests {
     /// milliseconds, far short of the 0.5s the delayed path needs.
     #[test]
     fn an_imagine_icon_shows_its_hover_popup_within_a_few_frames() {
-        assert_eq!(
-            IMAGINE_HOVER_DELAY_SECS, 0.0,
-            "this test asserts the popup is immediate, which is what a zero delay means"
-        );
         const IMAGINE_ID: i32 = 3901;
         let imagine = imagines::imagine_of_skill_id(IMAGINE_ID).expect("a curated Imagine id");
 
@@ -2424,17 +2485,52 @@ mod tests {
         );
     }
 
+    /// Issue #404 follow-up: `row_list_overflows` (and therefore
+    /// `draw_rows`' reservation) is a pure function of row count and
+    /// viewport height — `ROW_HEIGHT * 2.0` for one row never overflows,
+    /// `ROW_HEIGHT * 0.5` for one row always does, since one full row
+    /// already exceeds that viewport.
+    #[test]
+    fn row_list_overflows_is_true_only_once_the_rows_exceed_the_viewport() {
+        assert!(!row_list_overflows(1, ROW_HEIGHT * 2.0));
+        assert!(row_list_overflows(1, ROW_HEIGHT * 0.5));
+    }
+
     /// Issue #404: the row list's `ScrollArea` now paints a solid, 8pt
     /// vertical scroll bar rather than egui's default floating one, and a
     /// solid bar (unlike a floating one) allocates its own layout space
-    /// rather than drawing on top of the content. `draw_rows` must reserve
-    /// that `ROW_SCROLL_BAR_WIDTH` out of the viewport itself, so the row
-    /// content never lays out wider than what's actually left once the bar
-    /// takes its slice — comfortably above the `MIN_COLUMN_SCALE` floor
-    /// here, so this isolates the scroll bar's own reservation from that
-    /// separate narrowing behavior.
+    /// rather than drawing on top of the content — but only while it is
+    /// actually showing. `draw_rows` must reserve that
+    /// `ROW_SCROLL_BAR_WIDTH` out of the viewport itself when the rows
+    /// overflow it, so the row content never lays out wider than what's
+    /// actually left once the bar takes its slice — comfortably above the
+    /// `MIN_COLUMN_SCALE` floor here, so this isolates the scroll bar's own
+    /// reservation from that separate narrowing behavior.
     #[test]
-    fn row_content_reserves_the_solid_scroll_bars_allocated_width() {
+    fn row_content_reserves_the_solid_scroll_bars_allocated_width_when_rows_overflow() {
+        let snapshot = rows_test_snapshot(3);
+        let stat_columns_total: f32 = stat_columns_for(&Settings::default().ordered_columns())
+            .iter()
+            .map(|c| c.width)
+            .sum();
+        let floor = stat_columns_total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
+        let viewport = floor + 200.0;
+        let viewport_height = ROW_HEIGHT * 2.0;
+        let content = rows_content_size(&snapshot, viewport, viewport_height);
+        let expected = viewport - ROW_SCROLL_BAR_WIDTH;
+        assert!(
+            (content.x - expected).abs() < 0.5,
+            "content {content:?} must leave {ROW_SCROLL_BAR_WIDTH}pt out of the {viewport}pt \
+             viewport for the solid vertical scroll bar, landing at {expected}"
+        );
+    }
+
+    /// Issue #404 follow-up: when the rows *don't* overflow the viewport,
+    /// the solid bar never shows (`VisibleWhenNeeded`), so `draw_rows` must
+    /// not reserve `ROW_SCROLL_BAR_WIDTH` for it — leaving that strip
+    /// permanently unused would be a regression this test exists to catch.
+    #[test]
+    fn row_content_reserves_nothing_when_rows_do_not_overflow() {
         let snapshot = rows_test_snapshot(1);
         let stat_columns_total: f32 = stat_columns_for(&Settings::default().ordered_columns())
             .iter()
@@ -2442,12 +2538,12 @@ mod tests {
             .sum();
         let floor = stat_columns_total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
         let viewport = floor + 200.0;
-        let content = rows_content_size(&snapshot, viewport, ROW_HEIGHT * 2.0);
-        let expected = viewport - ROW_SCROLL_BAR_WIDTH;
+        let viewport_height = ROW_HEIGHT * 2.0;
+        let content = rows_content_size(&snapshot, viewport, viewport_height);
         assert!(
-            (content.x - expected).abs() < 0.5,
-            "content {content:?} must leave {ROW_SCROLL_BAR_WIDTH}pt out of the {viewport}pt \
-             viewport for the solid vertical scroll bar, landing at {expected}"
+            (content.x - viewport).abs() < 0.5,
+            "content {content:?} must match the full {viewport}pt viewport when the single row \
+             doesn't overflow it and the scroll bar never shows"
         );
     }
 
