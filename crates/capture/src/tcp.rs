@@ -99,7 +99,8 @@ pub struct TcpReassembler {
     /// by [`Self::take_loss`].
     loss: bool,
     /// `now_ms` (caller-supplied, see [`Self::push`]) at which `next_seq`
-    /// last advanced. `None` only before the very first push. Drives the
+    /// last advanced. `None` before the first push and after any resync,
+    /// until the next push (progress or not) seeds it. Drives the
     /// wall-clock half of the stall guard (issue #405); the push-count half
     /// (`stall_pushes`) is tracked separately since a busy-but-stuck stream
     /// keeps pushing without ever advancing `next_seq`.
@@ -247,10 +248,13 @@ impl TcpReassembler {
             // `stall_pushes`, once `next_seq` has been stuck for longer than
             // `STALL_TIME_BUDGET_MS` *and* the cache behind the gap is
             // holding more than `STALL_BYTES_BUDGET`.
-            let stuck_for_ms = self
-                .last_advance_ms
-                .map(|last| now_ms.saturating_sub(last))
-                .unwrap_or(0);
+            let stuck_for_ms = match self.last_advance_ms {
+                Some(last) => now_ms.saturating_sub(last),
+                None => {
+                    self.last_advance_ms = Some(now_ms);
+                    0
+                }
+            };
             let budget_tripped =
                 stuck_for_ms > STALL_TIME_BUDGET_MS && self.gap_bytes() > STALL_BYTES_BUDGET;
             if self.stall_pushes >= self.stall_threshold() || budget_tripped {
@@ -451,9 +455,10 @@ impl TcpReassembler {
         self.stall_pushes = 0;
         // The new anchor has not "just advanced" in wall-clock terms — the
         // caller supplies no `now_ms` here — so clear it rather than carry a
-        // stale timestamp from the abandoned flow forward: the wall-clock
-        // trip budget (#405) treats `None` as "not stuck", exactly as a
-        // freshly re-anchored stream should be read.
+        // stale timestamp from the abandoned flow forward. The first
+        // no-progress push after a resync seeds the clock off its own
+        // `now_ms`, so the wall-clock trip budget (#405) starts counting
+        // from that push rather than being disabled indefinitely.
         self.last_advance_ms = None;
         // An externally driven resync — win.rs adopting a brand-new server
         // connection onto this instance — starts a fresh flow, whose gaps
@@ -999,6 +1004,32 @@ mod tests {
         assert!(
             !r2.take_loss(),
             "large cache behind the gap must not trip before the time budget elapses"
+        );
+    }
+
+    /// After a `resync` (win.rs adopting a new connection), `last_advance_ms`
+    /// is cleared. If the first push after that never advances `next_seq`
+    /// (e.g. the adopting packet itself lands past a gap), the wall-clock
+    /// budget must not stay disabled forever — the first no-progress push
+    /// seeds the clock, and a later push past the time budget still trips.
+    #[test]
+    fn a_no_progress_push_after_resync_still_seeds_the_wall_clock_budget() {
+        let mut r = TcpReassembler::new();
+        r.resync(1000); // next_seq = 1000, last_advance_ms cleared to None
+        let big = vec![b'X'; 70 * 1024]; // well over STALL_BYTES_BUDGET
+        // First no-progress push after the resync: seeds last_advance_ms at
+        // t=0 rather than tripping immediately.
+        r.push(5000, &big, 0);
+        assert!(
+            !r.take_loss(),
+            "must not trip on the very push that seeds the clock"
+        );
+
+        // A later no-progress push, past the time budget from the seed.
+        r.push(5000, &big, STALL_TIME_BUDGET_MS + 1);
+        assert!(
+            r.take_loss(),
+            "a persistent gap must still trip the wall-clock budget after a resync"
         );
     }
 

@@ -18,10 +18,10 @@
 
 use std::ffi::{CString, c_void};
 use std::mem::MaybeUninit;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bpsr_protocol::{Decoder, InspectSink, ProtocolEvent};
 use crossbeam_channel::Sender;
@@ -212,6 +212,7 @@ const QUEUE_SIZE: u64 = 33_554_432;
 /// Non-fatal by design: a driver that rejects a parameter simply keeps its
 /// default, and capture on default limits is still better than no capture.
 fn set_queue_params(api: &Api, handle: HANDLE) {
+    let mut failed = 0usize;
     for (param, value) in [
         (crate::driver::PARAM_QUEUE_LEN, QUEUE_LEN),
         (crate::driver::PARAM_QUEUE_TIME, QUEUE_TIME_MS),
@@ -221,12 +222,17 @@ fn set_queue_params(api: &Api, handle: HANDLE) {
         // and no other thread has it yet.
         if let Err(err) = unsafe { api.set_param(handle, param, value) } {
             log::warn!("capture: WinDivertSetParam(param={param}, value={value}) failed: {err}");
-            return;
+            failed += 1;
+            continue;
         }
     }
-    log::info!(
-        "capture: windivert queue params set len={QUEUE_LEN} time_ms={QUEUE_TIME_MS} size={QUEUE_SIZE}"
-    );
+    if failed == 0 {
+        log::info!(
+            "capture: windivert queue params set len={QUEUE_LEN} time_ms={QUEUE_TIME_MS} size={QUEUE_SIZE}"
+        );
+    } else {
+        log::warn!("capture: {failed} of 3 windivert queue params kept driver defaults");
+    }
 }
 
 /// Opens a WinDivert sniff-mode handle on all non-loopback TCP/IP traffic
@@ -748,9 +754,10 @@ fn log_heartbeat(beat: &Heartbeat) {
     }
 }
 
+/// Monotonic milliseconds since this process started capturing — not an
+/// epoch timestamp — so a forward wall-clock step cannot spuriously trip the
+/// stall guard's time budget.
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
