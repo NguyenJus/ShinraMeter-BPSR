@@ -588,10 +588,12 @@ pub(super) fn draw_row(
     // just handed back, not the whole name slot, so an empty stretch of row
     // left of the columns stays inert (and the window drag band under it
     // keeps working). Registered after the row's own response so this
-    // narrower rect wins the pixels it overlaps.
+    // narrower rect wins the pixels it overlaps. Keyed on `row.entity`, not
+    // `row.uid` — uid is documented non-unique (see the right-click path
+    // below, which uses entity for the same reason).
     ui.interact(
         name_rect,
-        ui.id().with(("name", row.uid)),
+        ui.id().with(("name", row.entity)),
         egui::Sense::hover(),
     )
     .on_hover_text(name_hover_text(row.ability_score, row.season_strength));
@@ -1111,7 +1113,7 @@ pub(super) fn name_hover_text(ability: Option<u32>, season: Option<u32>) -> Stri
         v.map_or_else(|| "—".to_string(), |v| v.to_string())
     }
     format!(
-        "Ability score: {}\nSeason score: {}",
+        "Ability score: {}\nSeason strength: {}",
         value(ability),
         value(season)
     )
@@ -1250,7 +1252,7 @@ mod tests {
     fn name_hover_text_lists_both_scores() {
         assert_eq!(
             name_hover_text(Some(45_000), Some(1_234)),
-            "Ability score: 45000\nSeason score: 1234"
+            "Ability score: 45000\nSeason strength: 1234"
         );
     }
 
@@ -1259,7 +1261,7 @@ mod tests {
     fn name_hover_text_marks_a_missing_score_with_a_dash() {
         assert_eq!(
             name_hover_text(None, None),
-            "Ability score: \u{2014}\nSeason score: \u{2014}"
+            "Ability score: \u{2014}\nSeason strength: \u{2014}"
         );
     }
 
