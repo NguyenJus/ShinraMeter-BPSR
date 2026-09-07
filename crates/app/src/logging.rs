@@ -140,30 +140,52 @@ fn format_line(
     format!("[{timestamp} {level:<5} pid={pid} {target}] {args}\n")
 }
 
+/// Renders one `env_overrides_summary` field value: `"unset"` for `None`,
+/// the plain value for `Some` — unless the value is empty or contains
+/// whitespace, in which case it's wrapped in double quotes (unescaped, so
+/// Windows backslash paths aren't doubled) to keep the banner line
+/// unambiguous to read and parse.
+fn render_override(value: Option<String>) -> String {
+    match value {
+        None => "unset".to_string(),
+        Some(v) if v.is_empty() || v.chars().any(char::is_whitespace) => format!("\"{v}\""),
+        Some(v) => v,
+    }
+}
+
 /// Builds the `env overrides: ...` startup-banner line (issue #407) so a log
 /// can be told apart as a demo/harness launch versus live play, and so which
-/// path overrides were active is on the record. `SHINRA_INSPECT_DUMP` is
+/// overrides were active is on the record. `SHINRA_INSPECT_DUMP` is
 /// folded into the `inspect=` field alongside `SHINRA_INSPECT` since both
 /// gate the same packet-inspection feature. Takes a lookup closure rather
 /// than reading `std::env` directly so it is testable without mutating the
 /// process environment (racy across the crate's other env-reading tests).
 fn env_overrides_summary(mut lookup: impl FnMut(&str) -> Option<String>) -> String {
-    let demo = lookup("SHINRA_DEMO").unwrap_or_else(|| "unset".to_string());
-    let no_composition = lookup("SHINRA_NO_COMPOSITION").unwrap_or_else(|| "unset".to_string());
-    let history_db = lookup("SHINRA_HISTORY_DB");
-    let instance_lock = lookup("SHINRA_INSTANCE_LOCK");
-    let log_file = lookup("SHINRA_LOG_FILE");
+    let demo = render_override(lookup("SHINRA_DEMO"));
+    let no_composition = render_override(lookup("SHINRA_NO_COMPOSITION"));
+    let history_db = render_override(lookup("SHINRA_HISTORY_DB"));
+    let instance_lock = render_override(lookup("SHINRA_INSTANCE_LOCK"));
+    let instance_handoff = render_override(lookup("SHINRA_INSTANCE_HANDOFF"));
+    let log_file = render_override(lookup("SHINRA_LOG_FILE"));
+    let inspect_max_bytes = render_override(lookup("SHINRA_INSPECT_MAX_BYTES"));
 
     let inspect = match (lookup("SHINRA_INSPECT"), lookup("SHINRA_INSPECT_DUMP")) {
         (None, None) => "unset".to_string(),
-        (Some(inspect), None) => inspect,
-        (None, Some(dump)) => format!("dump={dump}"),
-        (Some(inspect), Some(dump)) => format!("{inspect} dump={dump}"),
+        (Some(inspect), None) => render_override(Some(inspect)),
+        (None, Some(dump)) => format!("dump={}", render_override(Some(dump))),
+        (Some(inspect), Some(dump)) => {
+            format!(
+                "{} dump={}",
+                render_override(Some(inspect)),
+                render_override(Some(dump))
+            )
+        }
     };
 
     format!(
-        "env overrides: demo={demo} inspect={inspect} no_composition={no_composition} \
-         history_db={history_db:?} instance_lock={instance_lock:?} log_file={log_file:?}"
+        "env overrides: demo={demo} inspect={inspect} inspect_max_bytes={inspect_max_bytes} \
+         no_composition={no_composition} history_db={history_db} instance_lock={instance_lock} \
+         instance_handoff={instance_handoff} log_file={log_file}"
     )
 }
 
@@ -522,8 +544,9 @@ mod tests {
         let summary = env_overrides_summary(|_| None);
         assert_eq!(
             summary,
-            "env overrides: demo=unset inspect=unset no_composition=unset \
-             history_db=None instance_lock=None log_file=None"
+            "env overrides: demo=unset inspect=unset inspect_max_bytes=unset \
+             no_composition=unset history_db=unset instance_lock=unset \
+             instance_handoff=unset log_file=unset"
         );
     }
 
@@ -536,18 +559,34 @@ mod tests {
             "SHINRA_DEMO" => Some("1".to_string()),
             "SHINRA_INSPECT" => Some("1".to_string()),
             "SHINRA_INSPECT_DUMP" => Some("/tmp/dump.jsonl".to_string()),
+            "SHINRA_INSPECT_MAX_BYTES" => Some("4096".to_string()),
             "SHINRA_NO_COMPOSITION" => Some("1".to_string()),
             "SHINRA_HISTORY_DB" => Some("/tmp/history.sqlite".to_string()),
             "SHINRA_INSTANCE_LOCK" => Some("/tmp/lock".to_string()),
+            "SHINRA_INSTANCE_HANDOFF" => Some("1".to_string()),
             "SHINRA_LOG_FILE" => Some("/tmp/log.txt".to_string()),
             _ => None,
         });
         assert_eq!(
             summary,
-            "env overrides: demo=1 inspect=1 dump=/tmp/dump.jsonl no_composition=1 \
-             history_db=Some(\"/tmp/history.sqlite\") instance_lock=Some(\"/tmp/lock\") \
-             log_file=Some(\"/tmp/log.txt\")"
+            "env overrides: demo=1 inspect=1 dump=/tmp/dump.jsonl inspect_max_bytes=4096 \
+             no_composition=1 history_db=/tmp/history.sqlite instance_lock=/tmp/lock \
+             instance_handoff=1 log_file=/tmp/log.txt"
         );
+    }
+
+    /// Empty or whitespace-containing override values are quoted (without
+    /// escaping, so Windows backslash paths render literally) so the banner
+    /// line stays unambiguous to read and parse (issue #407 finding O4).
+    #[test]
+    fn env_overrides_summary_quotes_empty_and_whitespace_values() {
+        let summary = env_overrides_summary(|key| match key {
+            "SHINRA_DEMO" => Some(String::new()),
+            "SHINRA_LOG_FILE" => Some("C:\\Users\\Justin Nguyen\\log.txt".to_string()),
+            _ => None,
+        });
+        assert!(summary.contains("demo=\"\""));
+        assert!(summary.contains("log_file=\"C:\\Users\\Justin Nguyen\\log.txt\""));
     }
 
     // -- format_line ----------------------------------------------------
