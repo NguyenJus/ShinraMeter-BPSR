@@ -161,13 +161,19 @@ pub(super) const SKILL_SCROLL_BAR_WIDTH: f32 = 6.0;
 /// because `Color32::from_white_alpha`, which is exactly this, is not `const`.
 pub(super) const SKILL_CLOSE_HOVER_FILL: egui::Color32 =
     egui::Color32::from_rgba_premultiplied(0x11, 0x11, 0x11, 0x11);
-/// The reference's `CornerRadius="17"` header pill.
-pub(super) const SKILL_PILL_CORNER_RADIUS: u8 = 17;
-/// Header pill height, measured at 34px in the reference (issue #200) —
-/// exactly `2 * SKILL_PILL_CORNER_RADIUS`, i.e. a true stadium. It used to
-/// be derived from the header band instead, which made it 40 tall against a
-/// 17 radius: a rounded rectangle with flat sides, not the reference's pill.
-pub(super) const SKILL_PILL_HEIGHT: f32 = 34.0;
+/// The death pills' actual painted radius. The reference's `Skills.xaml`
+/// pill is `CornerRadius="17"` against a 34px tall border, but the death
+/// pills here go through `PillMetrics::COUNTER`, whose 24pt floor
+/// (`COUNTER_PILL_HEIGHT`) always wins under `SKILL_PILL_MAX_HEIGHT`'s cap —
+/// so what actually paints is a 24pt stadium, and egui clamps any radius
+/// past half that (12) down to fit it. 17 pinned a radius the pill never
+/// reaches, which read as a rounded rectangle, not a stadium.
+pub(super) const SKILL_PILL_CORNER_RADIUS: u8 = 12;
+/// Cap on the death pills' height — 34px, the reference's `Skills.xaml`
+/// measurement (issue #200). `pill_size` only ever hits this ceiling for
+/// text tall enough to clear `PillMetrics::COUNTER`'s 24pt floor; at the
+/// pill font's actual size the floor wins and the pills paint 24pt tall.
+pub(super) const SKILL_PILL_MAX_HEIGHT: f32 = 34.0;
 /// Gap between two adjacent header pills (issue #254) — the reference's
 /// `Margin="0,0,10,0"` on every `Border` in the header's pill `StackPanel`
 /// (`Skills.xaml`), which is what separates its Deaths, death-time, aggro
@@ -868,6 +874,8 @@ pub(super) fn draw_skill_window(
         // stayed solid while the window around it faded.
         fill: opacity.apply(SKILL_PANEL_FILL),
         stroke: None,
+        metrics: PillMetrics::COUNTER,
+        bold: false,
     };
     // Issue #254: the same chrome as the Deaths pill — one cluster, one
     // look — led by the stopwatch the main header's fight timer already
@@ -883,12 +891,22 @@ pub(super) fn draw_skill_window(
     });
 
     let deaths_text_size = pill_text_size(&painter, &deaths_pill);
-    let deaths_pill_size = pill_size(deaths_text_size, deaths_pill.icon_side, SKILL_PILL_HEIGHT);
+    let deaths_pill_size = pill_size(
+        deaths_text_size,
+        deaths_pill.icon_side,
+        deaths_pill.metrics,
+        SKILL_PILL_MAX_HEIGHT,
+    );
     let death_time_sizes = death_time_pill.as_ref().map(|pill| {
         let text_size = pill_text_size(&painter, pill);
         (
             text_size,
-            pill_size(text_size, pill.icon_side, SKILL_PILL_HEIGHT),
+            pill_size(
+                text_size,
+                pill.icon_side,
+                pill.metrics,
+                SKILL_PILL_MAX_HEIGHT,
+            ),
         )
     });
     // The close button's rect is derived here, ahead of its own paint
@@ -1440,13 +1458,21 @@ mod tests {
         );
     }
 
-    /// The header pill measures 34px tall in the reference — exactly twice
-    /// `Skills.xaml`'s `CornerRadius="17"`, i.e. a true stadium. Deriving
-    /// the height from the header band instead made it 40 tall against a 17
-    /// radius, which is visibly not one.
+    /// The death pills go through `PillMetrics::COUNTER`, whose 24pt floor
+    /// wins under `SKILL_PILL_MAX_HEIGHT`'s 34pt cap for any text at the
+    /// pill font's actual size — so what paints is a 24pt stadium, and
+    /// `SKILL_PILL_CORNER_RADIUS` has to match that, not the reference's
+    /// 34px-tall `CornerRadius="17"` pill, which never renders here.
     #[test]
     fn skill_header_pill_is_a_stadium() {
-        assert_eq!(SKILL_PILL_HEIGHT, 2.0 * f32::from(SKILL_PILL_CORNER_RADIUS));
+        let text_size = egui::vec2(12.0, 13.0);
+        let size = pill_size(
+            text_size,
+            COUNTER_GLYPH_SIDE,
+            PillMetrics::COUNTER,
+            SKILL_PILL_MAX_HEIGHT,
+        );
+        assert_eq!(size.y, 2.0 * f32::from(SKILL_PILL_CORNER_RADIUS));
     }
 
     /// Band heights measured off the reference: header 2..70, tab strip
@@ -1992,13 +2018,16 @@ mod tests {
             corner_radius: egui::CornerRadius::same(SKILL_PILL_CORNER_RADIUS),
             fill: SKILL_PANEL_FILL,
             stroke: None,
+            metrics: PillMetrics::COUNTER,
+            bold: false,
         };
         let death_time_text = skill_death_time_text(row.dead_ms).unwrap();
         let painter = egui::Painter::new(ctx.clone(), egui::LayerId::debug(), screen_rect);
         let deaths_width = pill_size(
             pill_text_size(&painter, &deaths_pill),
             deaths_pill.icon_side,
-            SKILL_PILL_HEIGHT,
+            deaths_pill.metrics,
+            SKILL_PILL_MAX_HEIGHT,
         )
         .x;
         let death_time_pill = StatPill {
@@ -2008,7 +2037,8 @@ mod tests {
         let death_time_width = pill_size(
             pill_text_size(&painter, &death_time_pill),
             death_time_pill.icon_side,
-            SKILL_PILL_HEIGHT,
+            death_time_pill.metrics,
+            SKILL_PILL_MAX_HEIGHT,
         )
         .x;
         // The name runs far past the space before the cluster, so issue

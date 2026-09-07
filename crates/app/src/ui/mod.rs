@@ -583,8 +583,10 @@ pub struct OverlayApp {
     /// permanent "frozen" banner.
     quit_requested: bool,
     /// Issue #340: the rect `draw_header` actually painted on the last
-    /// frame, or `None` before the first one. Measured once per frame at
-    /// the single `draw_header` call site in `ui` and read back through
+    /// frame, or `None` before the first one. Measured once per frame by
+    /// `measure_header_rect` at the single `draw_header` call site in `ui`
+    /// — from the layout cursor, since inside a `CentralPanel` the `Ui`'s
+    /// own `min_rect` is the whole panel — and read back through
     /// `measured_header_band_height`, so the sizing math follows the real
     /// header instead of a constant that has to be kept in step with it by
     /// hand.
@@ -1910,6 +1912,13 @@ impl eframe::App for OverlayApp {
                 // `pending_screenshot_bound` for whenever the async reply
                 // lands, instead of leaving that field for the crop to read
                 // fresh (and possibly stale) at reply time.
+                // Issue #340: the panel rect as it stands *before* the header
+                // paints — its top is where the header band begins, and
+                // `measure_header_rect` pairs it with the cursor the header
+                // leaves behind. Read here rather than after `draw_header`
+                // because `available_rect_before_wrap` shrinks from the top as
+                // the layout advances.
+                let header_panel = ui.available_rect_before_wrap();
                 let screenshot_requested = draw_header(
                     ui,
                     &ctx,
@@ -1932,14 +1941,13 @@ impl eframe::App for OverlayApp {
                     header_history,
                     &mut self.quit_requested,
                 );
-                // Issue #340: the header's real extent, measured the one place
-                // it can be — right after it painted, before anything else
-                // has been added to this `Ui`, so `min_rect` is the header
-                // band and nothing more (`draw_resize_handles` above only
-                // `interact`s, it allocates no space). Stashed on `self`
-                // below for the *next* frame's sizing math, the earliest a
-                // measurement can reach the code that needs it.
-                measured_header_rect = Some(ui.min_rect());
+                // Issue #340: the header's real extent, measured right after
+                // it painted, off the layout cursor it moved — *not* off
+                // `ui.min_rect()`, which a `CentralPanel` has already
+                // expanded to the whole panel (see `measure_header_rect`).
+                // Stashed on `self` below for the *next* frame's sizing math,
+                // the earliest a measurement can reach the code that needs it.
+                measured_header_rect = Some(measure_header_rect(ui, header_panel));
                 // Issue #156: whether this frame's wait for the reply has
                 // gone on long enough that it's never coming — computed
                 // before the guard call below so a timeout is fed into
@@ -1977,7 +1985,18 @@ impl eframe::App for OverlayApp {
                     ui.colored_label(egui::Color32::from_rgb(220, 80, 80), msg.as_str());
                 }
 
-                ui.separator();
+                // Issue #399: the reference (`MainView.xaml`) draws no line
+                // between the header grid and the player-row
+                // `ItemsControl` — the header wash's own masked fade is the
+                // whole transition — so this is a blank allocation of
+                // exactly what `ui.separator()` used to occupy here. Every
+                // offset downstream (`first_player_row_top_offset`, the
+                // wash's height, `default_inner_height`) is unchanged; only
+                // the painted line is gone.
+                ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), SEPARATOR_HEIGHT),
+                    egui::Sense::hover(),
+                );
                 // Issue #96: captured before `draw_rows` consumes the space —
                 // `rows_top` is where the scroll area starts,
                 // `rows_area_height` is all of what's left in the panel for
@@ -2984,9 +3003,14 @@ const DEFAULT_VISIBLE_ROWS: usize = 20;
 /// contiguous — there is no separate inter-row gap to add on top of this.
 const ROW_HEIGHT: f32 = 30.0;
 
-/// egui's fixed height for `ui.separator()`'s own painted line
-/// (`Style::separator_style`'s `spacing: 6.0`) — a constant of egui's, not
-/// anything `apply_theme` overrides.
+/// Height of the blank seam between the header band and the row list —
+/// egui's own fixed height for a `ui.separator()` (`Style::separator_style`'s
+/// `spacing: 6.0`), which is what used to be placed there. Issue #399 kept
+/// the space and dropped the line: the reference `MainView.xaml` has no
+/// element between the header grid and the player rows, so the seam is now
+/// `allocate_exact_size`'d blank and every offset derived from this
+/// constant (`first_player_row_top_offset`, the header wash's height,
+/// `default_inner_height`) is exactly as it was.
 const SEPARATOR_HEIGHT: f32 = 6.0;
 
 /// Vertical gap egui's layout inserts between consecutive widgets
@@ -3004,13 +3028,15 @@ const ITEM_SPACING_Y: f32 = 2.0;
 /// name" budget.
 const NAME_LEFT_PAD: f32 = 2.0;
 
-/// Alpha `draw_row` paints the `AbilityScore`/`SeasonStrength` name-suffix
-/// text at (issue #168) — a dimmed variant of the name's own opaque white,
-/// so the bracketed score reads as secondary metadata trailing the name
-/// rather than as part of the name itself. `0x99` (~60%) is dim enough to
-/// read as de-emphasized against the name's full white while staying
-/// comfortably legible against the row background.
-const NAME_SUFFIX_ALPHA: u8 = 0x99;
+/// RGB `draw_row` paints the `AbilityScore`/`SeasonStrength` name-suffix
+/// text in (issue #168), so the bracketed score reads as secondary metadata
+/// trailing the name rather than as part of the name itself. The source
+/// dims the trailing `Run` in its name `TextBlock` (the player's level)
+/// exactly this way — `Foreground="#888" FontSize="11"`
+/// (PlayerStatsControl.xaml:130-132) — an opaque grey rather than a faded
+/// white, which keeps the suffix's contrast the same over the share bar as
+/// it is over bare background.
+const NAME_SUFFIX_RGB: (u8, u8, u8) = (0x88, 0x88, 0x88);
 
 /// Budgeted width for the name itself. `draw_row` paints names unclipped,
 /// regular weight and proportional at `FONT_SIZE_ROW` (issues #56, #62) —
@@ -3025,8 +3051,11 @@ const NAME_WIDTH_BUDGET: f32 = 150.0;
 const NAME_COLUMN_GAP: f32 = 10.0;
 
 /// Right-edge margin, matching the `margin` `draw_rows` passes to
-/// `column_anchors` for the rightmost column's anchor.
-const COLUMN_RIGHT_MARGIN: f32 = 4.0;
+/// `column_anchors` for the rightmost column's anchor. The source spends
+/// exactly 3 points here: its rightmost metric `TextBlock` carries
+/// `Margin="2 0"` (PlayerStatsControl.xaml) inside a `PlayersContainer`
+/// whose own `Margin="1"` (MainView.xaml) adds the last point.
+const COLUMN_RIGHT_MARGIN: f32 = 3.0;
 
 /// Issue #84: the floor `draw_rows` holds `column_anchors`' shrink-to-fit
 /// `scale` factor at once a narrow viewport would otherwise push it lower.
@@ -4251,17 +4280,31 @@ mod tests {
                 .collect()
         }
 
-        /// The box of the largest untextured mesh the header painted — the
-        /// background wash's own gradient quad (`gradient_mesh`), which is
-        /// the only near-panel-wide mesh in the band carrying no texture of
-        /// its own (glyph blits all carry one; every other fill in the
-        /// header is a `Shape::Rect`).
+        /// The box the header's background wash actually painted its
+        /// gradient into: the union of every *widest* untextured mesh in
+        /// the frame. Untextured because glyph blits all carry a texture
+        /// and every other fill in the header is a `Shape::Rect`; widest
+        /// because the wash is the only near-panel-wide mesh in the band.
+        ///
+        /// A union rather than a single quad since the wash gained the
+        /// source's `OpacityMask` (`header_wash_gradient_strips`): it is
+        /// now `HEADER_WASH_MASK_STRIPS` stacked quads of one width, not
+        /// one, and picking the largest alone would measure a sixteenth of
+        /// it.
         pub(super) fn gradient_box(&self) -> egui::Rect {
-            self.images
-                .iter()
-                .filter(|(id, rect)| *id == egui::TextureId::default() && rect.is_positive())
-                .map(|(_, rect)| *rect)
-                .max_by(|a, b| a.area().total_cmp(&b.area()))
+            let untextured = || {
+                self.images
+                    .iter()
+                    .filter(|(id, rect)| *id == egui::TextureId::default() && rect.is_positive())
+                    .map(|(_, rect)| *rect)
+            };
+            let widest = untextured()
+                .map(|rect| rect.width())
+                .max_by(f32::total_cmp)
+                .expect("the header painted no untextured mesh");
+            untextured()
+                .filter(|rect| (rect.width() - widest).abs() < 0.5)
+                .reduce(egui::Rect::union)
                 .expect("the header painted no untextured mesh")
         }
 
@@ -5086,7 +5129,7 @@ mod tests {
         /// z-order (egui paints shapes in call order) — that is how the
         /// inline name suffix is proven to paint *before* the stat-column
         /// loop. The `Color32` is the galley's own text color, which is
-        /// what makes the suffix's dimming (`NAME_SUFFIX_ALPHA`) checkable
+        /// what makes the suffix's dimming (`NAME_SUFFIX_RGB`) checkable
         /// from the painted output rather than from the call site.
         pub(super) texts: Vec<(String, egui::Rect, egui::Color32)>,
         meshes: Vec<egui::Rect>,

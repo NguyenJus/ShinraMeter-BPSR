@@ -120,12 +120,12 @@ pub(super) fn draw_header(
     //
     // Issue #158 (offset corrected by #297): `band_height` alone stops
     // `2 * ITEM_SPACING_Y + SEPARATOR_HEIGHT` (10pt) short of the first
-    // player row — `OverlayApp::ui` puts a `ui.separator()` between the
-    // header and the rows, and egui's vertical layout pays its ordinary
-    // `ITEM_SPACING_Y` gap on both sides of it (once landing the separator,
-    // once landing the first row after it), none of which is inside the
-    // band. Sizing the wash to just `band_height` left that strip showing
-    // the bare panel fill (with the separator's faint line inside it)
+    // player row — `OverlayApp::ui` allocates a blank `SEPARATOR_HEIGHT`
+    // band between the header and the rows, and egui's vertical layout pays
+    // its ordinary `ITEM_SPACING_Y` gap on both sides of it (once landing
+    // that band, once landing the first row after it), none of which is
+    // inside the header band. Sizing the wash to just `band_height` left
+    // that strip showing the bare panel fill
     // between the wash's bottom edge and the first row — a hard, visible
     // cutoff, not a fade, and (#297) a seam once either region carries its
     // own background image rather than the same-colored default artwork.
@@ -193,7 +193,9 @@ pub(super) fn draw_header(
             opacity.apply(HEADER_EMBLEM_COLOR),
         );
     }
-    for (segment_rect, color) in title_separator_segments(title_separator_rect(title_row)) {
+    for (segment_rect, color) in
+        title_separator_segments(title_separator_rect(title_row, text_band_height))
+    {
         ui.painter().rect_filled(segment_rect, 0.0, color);
     }
     // The menu control (issue #54, #71), in the strip at the right of the
@@ -263,6 +265,11 @@ pub(super) fn draw_header(
                 quit_requested,
             );
         });
+    // The subtitle sits `HEADER_TITLE_SUBTITLE_GAP` under the title (the
+    // source's `Margin="2 4 0 0"`), not the layout's own `ITEM_SPACING_Y`;
+    // egui already inserted one of those after the title row, so only the
+    // remainder is added here — the same shape as the stat row's gap below.
+    ui.add_space(HEADER_TITLE_SUBTITLE_GAP - ITEM_SPACING_Y);
     draw_subtitle_line(ui, subtitle.as_deref().unwrap_or(""));
 
     // The gap above the stat row is `HEADER_STAT_ROW_GAP`, not the layout's
@@ -271,7 +278,37 @@ pub(super) fn draw_header(
     // one `ITEM_SPACING_Y` after the row above, so only the remainder is
     // added here.
     ui.add_space(HEADER_STAT_ROW_GAP - ITEM_SPACING_Y);
-    ui.horizontal(|ui| {
+    // Issue #400: the row is laid out in a *child* `Ui` over a rect this
+    // one allocates up front, not in a plain `ui.horizontal`. A horizontal
+    // layout that overflows its parent grows that parent's `min_rect` and
+    // `max_rect` (`Region::expand_to_include_rect`), and at a narrow window
+    // this row does overflow — the pills are sized from their own ink, so
+    // below roughly 372pt of panel the toggle cluster runs past the right
+    // edge. That growth used to reach the `CentralPanel`'s `Ui`, and
+    // `draw_rows` then read the widened `available_width` as its viewport
+    // and anchored the rightmost column (the Deaths counter) outside the
+    // window. `new_child` allocates nothing in the parent, so the overflow
+    // is simply clipped instead. The explicit `allocate_exact_size` keeps
+    // the cursor advance identical to the old `ui.horizontal`, whose height
+    // was the pills' own `interact_size.y` — the same `BUTTON_ROW_HEIGHT`
+    // `header_band_height` budgets for.
+    let row_size = egui::vec2(ui.available_width(), BUTTON_ROW_HEIGHT);
+    let (row_rect, _) = ui.allocate_exact_size(row_size, egui::Sense::hover());
+    let (pills_rect, cluster_rect) = split_stat_row(row_rect);
+    let mut pills_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(pills_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    pills_ui.set_clip_rect(pills_rect.intersect(ui.clip_rect()));
+    let mut cluster_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(cluster_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    cluster_ui.set_clip_rect(cluster_rect.intersect(ui.clip_rect()));
+    {
+        let ui = &mut pills_ui;
         // The whole row is inset from the panel's left content edge
         // (`HEADER_STAT_ROW_INSET_X`, issue #91). `add_space` in a
         // horizontal layout advances the cursor directly, with no
@@ -312,17 +349,16 @@ pub(super) fn draw_header(
                 icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
             ),
         );
-        toggle_cluster(
-            ui,
-            tx_command,
-            icons,
-            capturing,
-            share_active,
-            has_history,
-            open_history,
-        )
-    })
-    .inner
+    }
+    toggle_cluster(
+        &mut cluster_ui,
+        tx_command,
+        icons,
+        capturing,
+        share_active,
+        has_history,
+        open_history,
+    )
 }
 
 // -- toggle cluster (issue #62, #82, #167) --------------------------------
@@ -419,6 +455,19 @@ pub(super) const TOGGLE_ALWAYS_ON_TOP_SIDE: f32 = 14.0;
 pub(super) const TOGGLE_HISTORY_SIDE: f32 = 14.0;
 pub(super) const TOGGLE_GAP: f32 = 5.0;
 pub(super) const TOGGLE_PAD_X: f32 = 4.0;
+
+/// Width of the stat row's Share/Reset/History pill (issue #82, #186), the
+/// same padding-glyph-gap sum `toggle_cluster` used to compute inline.
+/// Pulled out into its own constant so `draw_header` can reserve exactly
+/// this much width on the right of the stat row *before* laying out the
+/// stat pills — see the reservation's own comment for why the cluster can
+/// no longer size itself from whatever the pills left behind.
+pub(super) const STAT_ROW_TOGGLE_CLUSTER_WIDTH: f32 = 2.0 * TOGGLE_PAD_X
+    + TOGGLE_MOUSE_SIDE
+    + TOGGLE_GAP
+    + TOGGLE_CLOUD_SIDE
+    + TOGGLE_GAP
+    + TOGGLE_HISTORY_SIDE;
 
 /// Gap, in points, between the title row's toggle pill (issue #185) and the
 /// dropdown chevron's reserved strip to its right. `TOGGLE_PAD_X`'s value,
@@ -640,6 +689,35 @@ pub(super) fn availability_label(
     if active { label } else { unavailable }
 }
 
+/// Splits the stat row's rect into the stat pills' area and the toggle
+/// cluster's, reserving the cluster's fixed `STAT_ROW_TOGGLE_CLUSTER_WIDTH`
+/// on the *right* of `row_rect` before the pills get a say. `draw_header`
+/// used to lay the pills and the cluster out in one shared child `Ui`,
+/// sized purely by the layout cursor's left-to-right advance — so at a
+/// narrow window (below ~372pt of panel) the pills' own ink pushed the
+/// cluster's `allocate_exact_size` rect past `row_ui`'s clip rect, and
+/// `toggle_cluster`'s `is_rect_visible` early return silently dropped
+/// Share/Reset/History with no other way to reach Reset. The cluster's
+/// width is fixed and known up front, so reserving its slot first — in a
+/// `Ui` of its own, with the pills given whatever width is left over in a
+/// second one — makes the pills (informational) the thing that clips at a
+/// narrow width, never the controls. Pure so the split is unit-testable
+/// without a live `egui::Context`; `draw_header` is the only caller.
+pub(super) fn split_stat_row(row_rect: egui::Rect) -> (egui::Rect, egui::Rect) {
+    let cluster_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH,
+            row_rect.top(),
+        ),
+        row_rect.max,
+    );
+    let pills_rect = egui::Rect::from_min_max(
+        row_rect.min,
+        egui::pos2(cluster_rect.left(), row_rect.bottom()),
+    );
+    (pills_rect, cluster_rect)
+}
+
 pub(super) fn toggle_cluster(
     ui: &mut egui::Ui,
     tx_command: &Sender<UiCommand>,
@@ -650,12 +728,7 @@ pub(super) fn toggle_cluster(
     open_history: &mut bool,
 ) -> bool {
     let height = ui.spacing().interact_size.y;
-    let width = 2.0 * TOGGLE_PAD_X
-        + TOGGLE_MOUSE_SIDE
-        + TOGGLE_GAP
-        + TOGGLE_CLOUD_SIDE
-        + TOGGLE_GAP
-        + TOGGLE_HISTORY_SIDE;
+    let width = STAT_ROW_TOGGLE_CLUSTER_WIDTH;
     let (rect, _response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
 
     if !ui.is_rect_visible(rect) {
@@ -1351,13 +1424,26 @@ pub(super) const TITLE_TEXT_COLOR: egui::Color32 = egui::Color32::WHITE;
 /// `header_text_band_height`). Still not part of `default_inner_height`,
 /// which keeps the opening size it was measured at (see its doc).
 ///
-/// `TITLE_LINE_HEIGHT (22) + ITEM_SPACING_Y (2) + SUBTITLE_LINE_HEIGHT (16)
-/// == 40.0`. Issue #91 grew both line heights off the source's original
-/// `Height="36"` grid (`20 + 2 + 14`): pixel-measured against
+/// `TITLE_LINE_HEIGHT (22) + HEADER_TITLE_SUBTITLE_GAP (4) +
+/// SUBTITLE_LINE_HEIGHT (16) == 42.0`. Issue #91 grew both line heights off
+/// the source's original `Height="36"` grid (`20 + 2 + 14`): pixel-measured against
 /// `docs/reference/new-shinra-ex.webp`, the reference's area name clears its
 /// own descenders and the separator above it with more room than a 14pt line
 /// box leaves.
 pub(super) const SUBTITLE_LINE_HEIGHT: f32 = 16.0;
+
+/// Gap between the title line and the subtitle line — the source's
+/// area-name `Margin="2 4 0 0"`
+/// (`DamageMeter.UI/HUD/Controls/MainView.xaml`), whose `4` top component is
+/// the air it leaves under the boss name. Its own constant rather than the
+/// layout's ordinary `ITEM_SPACING_Y` (2.0), which is what these two rows
+/// used to be stacked with: `draw_header` pays the remainder explicitly and
+/// `header_text_band_height` budgets the whole of it, so the painted rows
+/// and the band's height stay one number.
+///
+/// It is also what the accent stroke sits in — `title_separator_rect`
+/// centers its `TITLE_SEPARATOR_THICKNESS` in this gap.
+pub(super) const HEADER_TITLE_SUBTITLE_GAP: f32 = 4.0;
 
 /// Subtitle text color — the source's `#5fff`, white at ~1/3 alpha.
 pub(super) const SUBTITLE_TEXT_COLOR: egui::Color32 =
@@ -1381,11 +1467,15 @@ pub(super) const HEADER_GUTTER_WIDTH: f32 = 34.0;
 pub(super) const HEADER_TEXT_PAD_X: f32 = 2.0;
 
 /// Width reserved at the *right* end of the title/subtitle rows — the
-/// source's `ComboBoxToggleButton` chevron column, `Width="32"`.
+/// source's `ComboBoxToggleButton` chevron column: a `Path Width="10"` in a
+/// column with `Margin="10 0"` (`DamageMeter.UI/Resources/Styles.xaml`
+/// 229-231), i.e. `10 + 2 * 10 = 30`. The same 30 shows up as the
+/// `ComboBox` `ContentMargin="1 1 30 1"` right inset (:318), which is what
+/// keeps the source's content clear of the chevron.
 ///
 /// Issue #54's collapse chevron is what occupies that strip — `chevron_rect`
 /// centers its box in exactly this width, on the title row.
-pub(super) const HEADER_RIGHT_CONTROL_WIDTH: f32 = 32.0;
+pub(super) const HEADER_RIGHT_CONTROL_WIDTH: f32 = 30.0;
 
 /// The sub-rect of a header row that title/subtitle text may actually paint
 /// into: indented on the left by the fixed `HEADER_GUTTER_WIDTH` +
@@ -1479,20 +1569,50 @@ pub(super) fn measured_header_band_height(header_rect: Option<egui::Rect>) -> f3
     )
 }
 
+/// The rect `draw_header` just painted, measured from the layout cursor it
+/// moved rather than from the `Ui`'s own `min_rect`.
+///
+/// Issue #340 measured this as `ui.min_rect()` right after `draw_header`
+/// returned. That is wrong inside a `CentralPanel`: the panel calls
+/// `expand_to_include_rect(panel_rect)` on the `Ui` it hands its closure, so
+/// `min_rect` is the *whole panel* from the very first line of that closure
+/// — never the header alone. The band then measured as the full window
+/// height, and the next frame sized the header wash (gradient plus the 200pt
+/// `HEADER_WASH_EMBLEM_SIZE` watermark) to the entire window instead of the
+/// band, painting the emblem down across the player rows.
+///
+/// The cursor is not expanded that way: `panel` is the panel rect read
+/// *before* `draw_header` (so its `top` is where the header began, and its
+/// left/right are the panel's own), and `ui.cursor().top()` afterwards is
+/// where the header left the cursor — one pending `item_spacing.y` past the
+/// band's real bottom, which is subtracted back off here. Called from
+/// `OverlayApp::ui` and from this module's tests through this one function
+/// so the two can never drift.
+pub(super) fn measure_header_rect(ui: &egui::Ui, panel: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(panel.left(), panel.top()),
+        egui::pos2(
+            panel.right(),
+            ui.cursor().top() - ui.spacing().item_spacing.y,
+        ),
+    )
+}
+
 pub(super) fn header_band_height(button_row_height: f32) -> f32 {
     header_text_band_height() + HEADER_STAT_ROW_GAP + button_row_height
 }
 
 /// Issue #158 (corrected by issue #297): the panel-top-relative y where the
 /// first player row actually begins — which is *not* `band_height`.
-/// `OverlayApp::ui` puts a `ui.separator()` (`SEPARATOR_HEIGHT`, egui's own
-/// fixed 6.0) between the header and the row list, and egui's vertical
-/// layout pays its ordinary `ITEM_SPACING_Y` gap *twice* around it: once
-/// between the header's last widget and the separator, and again between
-/// the separator and the first row — `egui::Ui::cursor`'s own doc comment
+/// `OverlayApp::ui` allocates a blank `SEPARATOR_HEIGHT` band (egui's own
+/// fixed 6.0, what its `ui.separator()` used to occupy here before issue
+/// #399 dropped the line the reference does not draw) between the header
+/// and the row list, and egui's vertical layout pays its ordinary
+/// `ITEM_SPACING_Y` gap *twice* around it: once between the header's last
+/// widget and that band, and again between the band and the first row — `egui::Ui::cursor`'s own doc comment
 /// is explicit that the cursor always sits one `item_spacing` past the
-/// latest child, so placing the separator consumes the first gap and its
-/// own advance opens the second. So the band's own bottom edge is
+/// latest child, so placing that band consumes the first gap and its own
+/// advance opens the second. So the band's own bottom edge is
 /// `2 * ITEM_SPACING_Y + SEPARATOR_HEIGHT` short of where the rows start,
 /// not `ITEM_SPACING_Y + SEPARATOR_HEIGHT` (issue #297: the row backdrop
 /// image painted at the old, one-gap offset left a bare sliver of panel
@@ -1509,7 +1629,8 @@ pub(super) fn first_player_row_top_offset(band_height: f32) -> f32 {
 }
 
 /// Height of the header's *text* rows alone: the title line, the gap, and
-/// the subtitle line under it (issue #91's `22 + 2 + 16`, grown from the
+/// the subtitle line under it (`22 + 4 + 16`: issue #91's line heights over
+/// the source's own `Margin="2 4 0 0"` subtitle gap, grown from the
 /// source's `Height="36"` grid).
 ///
 /// Unconditional. The subtitle's line and gap are reserved whether or not a
@@ -1534,7 +1655,7 @@ pub(super) fn first_player_row_top_offset(band_height: f32) -> f32 {
 /// The background wash is deliberately *not* bounded by this either (issue
 /// #91): it spans the whole `header_band_height`, stat row included.
 pub(super) fn header_text_band_height() -> f32 {
-    TITLE_LINE_HEIGHT + ITEM_SPACING_Y + SUBTITLE_LINE_HEIGHT
+    TITLE_LINE_HEIGHT + HEADER_TITLE_SUBTITLE_GAP + SUBTITLE_LINE_HEIGHT
 }
 
 /// Paints the header's title line (boss name/id/placeholder) at a fixed
@@ -1594,13 +1715,13 @@ pub(super) const HEADER_EMBLEM_BOTTOM_BLEED: f32 = 8.0;
 /// Margin="-26 0 0 -8"` `Path` that `header_emblem_rect`'s constants are
 /// measured off) carries no `Opacity` attribute of its own — only the wash's
 /// separate blown-up copy does (`Opacity=".05"`, already encoded as
-/// `HEADER_WASH_EMBLEM_COLOR`'s alpha `13`). So there is no reference number
-/// to port here (issue #252); `0x80` (half alpha) is a chosen value, not a
-/// measured one — it matches this module's own established "dimmed but
-/// legible" idiom (`TOOLBAR_ICON_TINT`'s half-white) rather than painting
-/// the mark fully opaque as a bare `Color32::from_rgb` implied.
+/// `HEADER_WASH_EMBLEM_COLOR`'s alpha `13`). So the alpha here is the
+/// source's: opaque slate gray. Issue #252's `0x80` was a chosen half-alpha
+/// admitted in this comment to be "not a measured one"; the app's own
+/// opacity slider (`Opacity::apply` at the blit in `draw_header`) is what
+/// fades this mark, exactly as it fades every other painted surface.
 pub(super) const HEADER_EMBLEM_COLOR: egui::Color32 =
-    egui::Color32::from_rgba_unmultiplied_const(0x70, 0x80, 0x90, 0x80);
+    egui::Color32::from_rgba_unmultiplied_const(0x70, 0x80, 0x90, 0xFF);
 
 /// Where the header emblem's 60x60 box sits: bled off the left of the title
 /// row `row`, and vertically centered on the header's text band
@@ -1616,8 +1737,8 @@ pub(super) const HEADER_EMBLEM_COLOR: egui::Color32 =
 /// and that is not what this mark is. It decorates the title and area-name
 /// rows, the ones `header_text_rect` indents by `HEADER_GUTTER_WIDTH` to
 /// make room for it, so it is centered on those rows (plus the source's
-/// negative bottom margin) and rides high in the band: top edge 6pt above
-/// the panel, bottom edge 14pt below the text band. Both numbers are the
+/// negative bottom margin) and rides high in the band: top edge 5pt above
+/// the panel, bottom edge 13pt below the text band. Both numbers are the
 /// design.
 ///
 /// What is *no longer* true is that a clip is what keeps its lower blade
@@ -1651,10 +1772,22 @@ pub(super) fn header_emblem_rect(row: egui::Rect, text_band_height: f32) -> egui
 
 /// The decorative panel behind the header rows: a diagonal SlateGray
 /// gradient (`#50708090` -> transparent) with a very faint, oversized
-/// `Svg.HPBar` bleeding off its right edge. The source additionally applies
-/// a vertical `OpacityMask` (white -> transparent at .9); egui has no
-/// opacity masks, and the diagonal gradient already falls to zero by the
-/// bottom-right, so the mask is deliberately not reproduced.
+/// `Svg.HPBar` bleeding off its right edge, the whole thing behind the
+/// source's vertical `OpacityMask` (white at the top -> transparent at
+/// `.9` of the border's height).
+///
+/// That mask used to be skipped here, on the reasoning that the diagonal
+/// gradient already reaches zero by the bottom-right. It does — but only
+/// *there*: the bottom-*left* corner is still at `HEADER_WASH_TOP_ALPHA /
+/// 2`, and the oversized emblem is painted at a flat alpha across the
+/// whole rect, so the wash ended in a hard slate edge at its bottom (which
+/// is the first player row's top, `first_player_row_top_offset`) instead of
+/// dissolving into the rows. `header_wash_mask` reproduces the mask, and
+/// `header_wash_gradient_strips` / `header_wash_emblem_strips` apply it to
+/// both layers. The one liberty taken: the source's brush is relative to a
+/// fixed `Height="98"` border, ours to the wash rect, whose height is
+/// derived from the measured header content (issues #81/#91/#158) — the
+/// mask is a fraction of whatever that rect turns out to be.
 ///
 /// Issue #81 replaced a fixed `98.0`pt run — taller than the drag band
 /// itself, so its tail bled into the player rows — with a height derived
@@ -1662,9 +1795,9 @@ pub(super) fn header_emblem_rect(row: egui::Rect, text_band_height: f32) -> egui
 /// (`header_band_height`), stat-pill row included. The gradient and the
 /// oversized emblem share one rect, so both now run the full band. Issue
 /// #91 believed that made both flush with the first player row; issue #158
-/// found the band's own bottom edge is actually 8pt short of it (the
-/// `ui.separator()` between the header and the rows, plus the layout's
-/// `ITEM_SPACING_Y` gap before it, are both outside the band) and extended
+/// found the band's own bottom edge is actually 8pt short of it (the blank
+/// `SEPARATOR_HEIGHT` band between the header and the rows, plus the
+/// layout's `ITEM_SPACING_Y` gap before it, are both outside the band) and extended
 /// the wash past the band to `first_player_row_top_offset` so it now really
 /// does stop flush with the first player row. No fixed constant is left to
 /// drift out of sync with the content it sits behind.
@@ -1691,9 +1824,154 @@ pub(super) const HEADER_WASH_EMBLEM_SIZE: f32 = 200.0;
 /// clearing the toggle glyph boxes without touching the wash's size, alpha
 /// or the toggle cluster's own layout.
 pub(super) const HEADER_WASH_EMBLEM_BLEED: f32 = 17.0;
-/// `Opacity=".05"` on a SlateGray fill.
+/// How far above the wash's centerline the watermark's box rides, in
+/// points: the source's `Margin="0 -20 -25 20"` on a
+/// `VerticalAlignment="Center"` `Path`
+/// (`DamageMeter.UI/HUD/Controls/MainView.xaml`). A `-20` top paired with a
+/// `+20` bottom leaves the box's own height untouched and shifts the
+/// centered square up by the margin — unlike the gutter emblem's lone
+/// negative bottom margin (`HEADER_EMBLEM_BOTTOM_BLEED`), which grows the
+/// height it is centered in instead. `header_wash_emblem_rect` subtracts it
+/// from the centered y.
+pub(super) const HEADER_WASH_EMBLEM_RISE: f32 = 20.0;
+/// `Opacity=".05"` on a SlateGray fill — the alpha the wash emblem is
+/// painted at at the *top* of the wash. Everything below is dimmer: the
+/// source's `OpacityMask` scales this down to nothing by
+/// `HEADER_WASH_MASK_END` (`header_wash_emblem_strips`), so the watermark
+/// fades out rather than ending in a straight line at the first player row.
 pub(super) const HEADER_WASH_EMBLEM_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(0x70, 0x80, 0x90, 13);
+
+/// Fraction of the wash's height at which the source's `OpacityMask` brush
+/// reaches its transparent stop (`<GradientStop Offset=".9"
+/// Color="Transparent" />`). Below this the wash is not painted at all.
+pub(super) const HEADER_WASH_MASK_END: f32 = 0.9;
+
+/// Number of horizontal strips the masked wash is painted as. egui
+/// interpolates a mesh's vertex colors linearly across each quad, and the
+/// product of the diagonal gradient and this vertical mask is not linear,
+/// so one quad cannot express it — the fade is approximated strip by
+/// strip, the same trick `title_separator_segments` plays horizontally
+/// with `TITLE_SEPARATOR_SEGMENTS`.
+pub(super) const HEADER_WASH_MASK_STRIPS: usize = 16;
+
+/// The source's `OpacityMask` as a plain function of how far down the wash
+/// a point sits: `1.0` at its top edge, falling linearly to `0.0` at
+/// `HEADER_WASH_MASK_END`, and `0.0` for the last tenth. Clamped at both
+/// ends, so a point above or below the wash gets the nearest stop rather
+/// than an extrapolated (and possibly negative) factor.
+pub(super) fn header_wash_mask(y_frac: f32) -> f32 {
+    (1.0 - y_frac / HEADER_WASH_MASK_END).clamp(0.0, 1.0)
+}
+
+/// The wash's slate at `alpha`, faded by the window opacity — the single
+/// place the wash's fills are built, so the gradient, its mask and the
+/// window-opacity slider can never disagree about what a fill means. The
+/// RGB is `HEADER_WASH_EMBLEM_COLOR`'s own — every caller of that constant
+/// only ever reads its `.a()` and gets the rest of the color from here, so
+/// the `0x70/0x80/0x90` SlateGray literal exists exactly once rather than
+/// copy-pasted between the two.
+fn header_wash_slate(alpha: f32, opacity: Opacity) -> egui::Color32 {
+    opacity.apply(egui::Color32::from_rgba_unmultiplied(
+        HEADER_WASH_EMBLEM_COLOR.r(),
+        HEADER_WASH_EMBLEM_COLOR.g(),
+        HEADER_WASH_EMBLEM_COLOR.b(),
+        alpha.clamp(0.0, 255.0).round() as u8,
+    ))
+}
+
+/// The masked diagonal gradient's `[left, right]` colors at `y_frac` down
+/// the wash: the source's `LinearGradientBrush` with no explicit points is
+/// a top-left -> bottom-right diagonal, so a horizontal slice through it
+/// runs from `HEADER_WASH_TOP_ALPHA` -> half that on the left edge and
+/// half -> zero on the right, all of it scaled by `header_wash_mask`.
+fn header_wash_row_colors(y_frac: f32, opacity: Opacity) -> [egui::Color32; 2] {
+    let mask = header_wash_mask(y_frac);
+    let top = f32::from(HEADER_WASH_TOP_ALPHA);
+    let mid = top / 2.0;
+    [
+        header_wash_slate((top + (mid - top) * y_frac) * mask, opacity),
+        header_wash_slate((mid - mid * y_frac) * mask, opacity),
+    ]
+}
+
+/// The wash's gradient as the `HEADER_WASH_MASK_STRIPS` quads it is painted
+/// as: `(rect, [top-left, top-right, bottom-left, bottom-right])`, in
+/// `gradient_mesh`'s argument order. The strips tile `wash` from its top
+/// edge down to `HEADER_WASH_MASK_END` of its height and stop there — below
+/// that the source's `OpacityMask` has zeroed everything out, so there is
+/// nothing to paint. Pure, so the mask's shape is unit-testable without a
+/// painter (the same factoring as `title_separator_segments`).
+pub(super) fn header_wash_gradient_strips(
+    wash: egui::Rect,
+    opacity: Opacity,
+) -> Vec<(egui::Rect, [egui::Color32; 4])> {
+    (0..HEADER_WASH_MASK_STRIPS)
+        .map(|i| {
+            let top_frac = strip_frac(i);
+            let bottom_frac = strip_frac(i + 1);
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(wash.left(), wash.top() + top_frac * wash.height()),
+                egui::pos2(wash.right(), wash.top() + bottom_frac * wash.height()),
+            );
+            let [tl, tr] = header_wash_row_colors(top_frac, opacity);
+            let [bl, br] = header_wash_row_colors(bottom_frac, opacity);
+            (rect, [tl, tr, bl, br])
+        })
+        .collect()
+}
+
+/// Fraction of the wash's height strip boundary `i` sits at — `0.0` at the
+/// top, `HEADER_WASH_MASK_END` at the last strip's bottom edge.
+fn strip_frac(i: usize) -> f32 {
+    i as f32 / HEADER_WASH_MASK_STRIPS as f32 * HEADER_WASH_MASK_END
+}
+
+/// The wash's oversized `Svg.HPBar` watermark under the same
+/// `OpacityMask`, as `(rect, uv, [top-left, top-right, bottom-left,
+/// bottom-right])` per strip. `painter.image` takes one flat tint for the
+/// whole blit, which cannot fade, so the watermark is drawn as a textured
+/// mesh instead: each strip is the slice of `header_wash_emblem_rect` that
+/// falls inside it, its `uv` addresses that same slice of the image (0..1
+/// over the full `HEADER_WASH_EMBLEM_SIZE` box, so the art is not
+/// restretched strip by strip), and its corner tints are
+/// `HEADER_WASH_EMBLEM_COLOR` scaled by `header_wash_mask` at the strip's
+/// own top and bottom. Strips whose slice is empty are the caller's to
+/// skip; the rects that overhang the wash (`HEADER_WASH_EMBLEM_BLEED`) rely
+/// on its clip rect exactly as the single blit used to.
+pub(super) fn header_wash_emblem_strips(
+    wash: egui::Rect,
+    opacity: Opacity,
+) -> Vec<(egui::Rect, egui::Rect, [egui::Color32; 4])> {
+    let emblem = header_wash_emblem_rect(wash);
+    let alpha = f32::from(HEADER_WASH_EMBLEM_COLOR.a());
+    let uv_y = |y: f32| (y - emblem.top()) / emblem.height();
+
+    (0..HEADER_WASH_MASK_STRIPS)
+        .map(|i| {
+            let top_frac = strip_frac(i);
+            let bottom_frac = strip_frac(i + 1);
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(wash.left(), wash.top() + top_frac * wash.height()),
+                egui::pos2(wash.right(), wash.top() + bottom_frac * wash.height()),
+            )
+            .intersect(emblem);
+            let uv = egui::Rect::from_min_max(
+                egui::pos2(
+                    (rect.left() - emblem.left()) / emblem.width(),
+                    uv_y(rect.top()),
+                ),
+                egui::pos2(
+                    (rect.right() - emblem.left()) / emblem.width(),
+                    uv_y(rect.bottom()),
+                ),
+            );
+            let top = header_wash_slate(alpha * header_wash_mask(top_frac), opacity);
+            let bottom = header_wash_slate(alpha * header_wash_mask(bottom_frac), opacity);
+            (rect, uv, [top, top, bottom, bottom])
+        })
+        .collect()
+}
 
 /// Where the wash panel sits for a central panel of `panel`: inset from the
 /// panel's left, top and right edges by `HEADER_WASH_INSET`, and running down
@@ -1709,16 +1987,17 @@ pub(super) fn header_wash_rect(panel: egui::Rect, height: f32) -> egui::Rect {
     )
 }
 
-/// Where the wash's oversized emblem sits inside a wash of `wash`: vertically
-/// centered on it and right-aligned so exactly `HEADER_WASH_EMBLEM_BLEED`
-/// points overhang its right edge. Taller than the wash as well as wider, so
-/// both the overhang and the top/bottom overflow rely on the caller's clip
-/// rect.
+/// Where the wash's oversized emblem sits inside a wash of `wash`: centered
+/// on it and then lifted `HEADER_WASH_EMBLEM_RISE` (the source's `-20`
+/// top / `+20` bottom margin pair), and right-aligned so exactly
+/// `HEADER_WASH_EMBLEM_BLEED` points overhang its right edge. Taller than the
+/// wash as well as wider, so both the overhang and the top/bottom overflow
+/// rely on the caller's clip rect.
 pub(super) fn header_wash_emblem_rect(wash: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(
         egui::pos2(
             wash.right() + HEADER_WASH_EMBLEM_BLEED - HEADER_WASH_EMBLEM_SIZE,
-            wash.center().y - HEADER_WASH_EMBLEM_SIZE / 2.0,
+            wash.center().y - HEADER_WASH_EMBLEM_SIZE / 2.0 - HEADER_WASH_EMBLEM_RISE,
         ),
         egui::Vec2::splat(HEADER_WASH_EMBLEM_SIZE),
     )
@@ -1730,7 +2009,7 @@ pub(super) fn header_wash_emblem_rect(wash: egui::Rect) -> egui::Rect {
 /// the panel's rounded corners. `panel` is the whole central panel's rect
 /// (not the drag band); `height` (issue #158, `first_player_row_top_offset`
 /// of `header_band_height` less `HEADER_WASH_INSET`) is what actually
-/// bounds the wash — the whole header band plus the separator gap below
+/// bounds the wash — the whole header band plus the blank seam gap below
 /// it, stopping exactly where the first player row begins
 /// (`wash_covers_the_stat_pill_row_but_stops_at_the_first_player_row`).
 ///
@@ -1775,25 +2054,30 @@ pub(super) fn draw_header_wash(
 
     // Top-left brightest, fading to zero at the bottom-right — the source's
     // `LinearGradientBrush` with no explicit start/end points defaults to
-    // that diagonal.
-    let slate = |a: u8| opacity.apply(egui::Color32::from_rgba_unmultiplied(0x70, 0x80, 0x90, a));
-    let mid_alpha = HEADER_WASH_TOP_ALPHA / 2;
-    painter.add(egui::Shape::mesh(gradient_mesh(
-        wash_rect,
-        slate(HEADER_WASH_TOP_ALPHA),
-        slate(mid_alpha),
-        slate(mid_alpha),
-        slate(0),
-    )));
+    // that diagonal — under the source's vertical `OpacityMask`, which is
+    // why this is a stack of strips rather than one quad.
+    for (rect, [tl, tr, bl, br]) in header_wash_gradient_strips(wash_rect, opacity) {
+        painter.add(egui::Shape::mesh(gradient_mesh(rect, tl, tr, bl, br)));
+    }
 
     if let Some(emblem) = icons.glyphs.get(GlyphIcon::Emblem) {
-        let emblem_rect = header_wash_emblem_rect(wash_rect);
-        painter.image(
-            emblem.id(),
-            emblem_rect,
-            UV_FULL,
-            opacity.apply(HEADER_WASH_EMBLEM_COLOR),
-        );
+        for (rect, uv, colors) in header_wash_emblem_strips(wash_rect, opacity) {
+            if !rect.is_positive() {
+                continue;
+            }
+            let mut mesh = egui::Mesh::with_texture(emblem.id());
+            for (pos, uv, color) in [
+                (rect.left_top(), uv.left_top(), colors[0]),
+                (rect.right_top(), uv.right_top(), colors[1]),
+                (rect.left_bottom(), uv.left_bottom(), colors[2]),
+                (rect.right_bottom(), uv.right_bottom(), colors[3]),
+            ] {
+                mesh.vertices.push(egui::epaint::Vertex { pos, uv, color });
+            }
+            mesh.add_triangle(0, 1, 2);
+            mesh.add_triangle(1, 3, 2);
+            painter.add(egui::Shape::mesh(mesh));
+        }
     }
 }
 
@@ -1868,9 +2152,8 @@ pub(super) const TITLE_SEPARATOR_THICKNESS: f32 = 2.0;
 /// 13pt title glyphs. Pixel-measured against the reference render, the
 /// stroke actually sits in the gap between the title and subtitle rows: 5pt
 /// below the title baseline and ~5pt above the subtitle's cap-top, which for
-/// our geometry is exactly the title row's bottom edge (see
-/// `title_separator_rect`), inside the `ITEM_SPACING_Y` gap egui's vertical
-/// layout already leaves there.
+/// our geometry is where the gutter emblem's right tip is — and the tip, not
+/// the gap, is what `title_separator_rect` anchors to.
 pub(super) const TITLE_SEPARATOR_LEFT_BLEED: f32 = 5.0;
 
 /// Number of thin strips `title_separator_segments` divides the fade into.
@@ -1879,16 +2162,45 @@ pub(super) const TITLE_SEPARATOR_LEFT_BLEED: f32 = 5.0;
 pub(super) const TITLE_SEPARATOR_SEGMENTS: usize = 24;
 
 /// The rect the fading title separator is painted over, for a title row
-/// `title_row`: it bleeds `TITLE_SEPARATOR_LEFT_BLEED` back into the gutter
-/// from the title's own left edge and clears the chevron's reserved strip on
-/// the right, sitting flush against the title row's bottom edge — the gap
-/// between the title and subtitle rows in the reference render (see the
-/// `TITLE_SEPARATOR_LEFT_BLEED` doc comment for why this isn't the source
-/// margin's literal `7.5`).
-pub(super) fn title_separator_rect(title_row: egui::Rect) -> egui::Rect {
+/// `title_row` and the header text band (`text_band_height`) that starts at
+/// that row's top: it bleeds `TITLE_SEPARATOR_LEFT_BLEED` back into the
+/// gutter from the title's own left edge and clears the chevron's reserved
+/// strip on the right, sitting vertically on the *gutter emblem's right
+/// tip* (see the `TITLE_SEPARATOR_LEFT_BLEED` doc comment for why this
+/// isn't the source margin's literal `7.5`).
+///
+/// The tip, not the title/subtitle gap. In the reference render the stroke
+/// is the diamond's tip drawn onward to the right: the two are the same
+/// opaque SlateGray, they meet exactly, and that is why the 5pt left bleed
+/// is invisible there — it lies on the mark. Pinning the stroke to the gap
+/// instead put it ~2pt high of the tip, so the bleed cut across the
+/// diamond's outline rather than vanishing into it.
+///
+/// The tip is at the emblem *box's* vertical center, so that is what this
+/// centers on: `assets/icons/svg/emblem.svg`'s `viewBox` is the square
+/// `2.617 2.639 53.366 53.366` and its path is the diamond whose corners
+/// are that square's edge midpoints — the left and right corners are both
+/// at `y = 29.322`, which is the viewBox's own vertical center
+/// (`2.639 + 53.366 / 2`).
+///
+/// Rounded relative to `title_row.top()`, not to the absolute coordinate:
+/// `title_row` itself can sit at a fractional y (e.g. `.top() == 0.5`, one
+/// half-band down from a panel whose own origin isn't whole), and rounding
+/// `tip_y` outright would round *that* offset away too, landing the stroke
+/// off the tip by up to half a point and, at the wrong fractional origin,
+/// leaking it past the title/subtitle gap the row's own layout promises.
+/// Rounding the offset from `title_row.top()` instead keeps the stroke
+/// pinned to the tip *within the row*, whatever the row's own origin is —
+/// which only lands on whole pixel rows in turn when `title_row.top()`
+/// itself does, i.e. at `pixels_per_point == 1.0` and a whole-pixel panel
+/// origin; at other scales or origins this rounding still avoids a
+/// sub-pixel-wide half-covered row, just not one aligned to the physical
+/// pixel grid.
+pub(super) fn title_separator_rect(title_row: egui::Rect, text_band_height: f32) -> egui::Rect {
     let left = title_row.left() + HEADER_GUTTER_WIDTH - TITLE_SEPARATOR_LEFT_BLEED;
     let right = (title_row.right() - HEADER_RIGHT_CONTROL_WIDTH).max(left);
-    let top = title_row.bottom();
+    let tip_y = header_emblem_rect(title_row, text_band_height).center().y;
+    let top = title_row.top() + (tip_y - title_row.top() - TITLE_SEPARATOR_THICKNESS / 2.0).round();
     egui::Rect::from_min_max(
         egui::pos2(left, top),
         egui::pos2(right, top + TITLE_SEPARATOR_THICKNESS),
@@ -2037,7 +2349,7 @@ mod tests {
         let wash = frame.gradient_box();
         let panel_min = wash.min - egui::Vec2::splat(HEADER_WASH_INSET);
         let text_band_bottom = panel_min.y + header_text_band_height();
-        // Where the box wants to end — 14pt below the text band, inside the
+        // Where the box wants to end — 13pt below the text band, inside the
         // stat row's span, and the depth the paint has to actually reach.
         let box_bottom = header_emblem_rect(
             egui::Rect::from_min_size(panel_min, egui::vec2(wash.width(), TITLE_LINE_HEIGHT)),
@@ -2053,8 +2365,9 @@ mod tests {
         let emblems = frame.glyph_boxes(GlyphIcon::Emblem);
         assert_eq!(
             emblems.len(),
-            2,
-            "expected the gutter mark and the wash wallpaper: {emblems:?}"
+            1 + HEADER_WASH_MASK_STRIPS,
+            "expected the gutter mark plus the wash wallpaper's masked \
+             strips (`header_wash_emblem_strips`): {emblems:?}"
         );
         // The gutter mark bleeds off the panel's left edge; the wash
         // wallpaper is right-aligned to the wash. Leftmost is the gutter.
@@ -2230,18 +2543,21 @@ mod tests {
         let timer = pill_size(
             measure("120:00", FONT_SIZE_TIMER),
             PILL_GLYPH_SIDE,
+            PillMetrics::HEADER,
             row_height,
         )
         .x;
         let dps = pill_size(
             measure("99.99M/s", FONT_SIZE_PILL_VALUE),
             PILL_GLYPH_SIDE,
+            PillMetrics::HEADER,
             row_height,
         )
         .x;
         let dmg = pill_size(
             measure("99.99B", FONT_SIZE_PILL_VALUE),
             PILL_GLYPH_SIDE,
+            PillMetrics::HEADER,
             row_height,
         )
         .x;
@@ -2361,6 +2677,33 @@ mod tests {
         assert_eq!(
             button_count, 3,
             "expected Share, Reset and History to each expose a Button role, got {button_count}"
+        );
+    }
+
+    /// Regression for the toggle cluster's silent-drop bug: at a stat row
+    /// no wider than `MIN_INNER_SIZE.x` (issue #400's overflow floor, well
+    /// past the ~372pt panel width the pills alone start overflowing at),
+    /// `split_stat_row`'s cluster half must still land entirely inside
+    /// `row_rect` — the reservation is unconditional on the row's own
+    /// width, not on the pills leaving enough room behind. Reset has no
+    /// other entry point, so if this ever fails again the button is gone.
+    #[test]
+    fn split_stat_row_keeps_the_toggle_cluster_inside_a_narrow_row() {
+        let row_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(MIN_INNER_SIZE.x, BUTTON_ROW_HEIGHT),
+        );
+        let (pills_rect, cluster_rect) = split_stat_row(row_rect);
+
+        assert!(
+            row_rect.contains_rect(cluster_rect),
+            "the toggle cluster {cluster_rect:?} spills outside the stat row {row_rect:?}"
+        );
+        assert_eq!(cluster_rect.width(), STAT_ROW_TOGGLE_CLUSTER_WIDTH);
+        assert_eq!(cluster_rect.right(), row_rect.right());
+        assert!(
+            pills_rect.right() <= cluster_rect.left(),
+            "the pills area {pills_rect:?} overlaps the toggle cluster {cluster_rect:?}"
         );
     }
 
@@ -3509,6 +3852,18 @@ mod tests {
     /// The title/subtitle text rect starts at the fixed gutter width and
     /// stops short of the strip reserved for issue #54's chevron, at every
     /// width the window can be dragged to.
+    /// The reserved right strip is the source's own, measured: the
+    /// `ComboBoxToggleButton` template's chevron is a `Path Width="10"` in a
+    /// column with `Margin="10 0"` (`DamageMeter.UI/Resources/Styles.xaml`),
+    /// i.e. a 30pt strip, and the same style reserves it on the content side
+    /// as `ContentMargin="1 1 30 1"`. There is no `Width="32"` anywhere in
+    /// the source, which is what this constant used to claim to be.
+    #[test]
+    fn the_right_control_strip_is_the_sources_thirty_point_chevron_column() {
+        assert_eq!(HEADER_RIGHT_CONTROL_WIDTH, 30.0);
+        assert_eq!(HEADER_RIGHT_CONTROL_WIDTH, 10.0 + 2.0 * 10.0);
+    }
+
     #[test]
     fn header_text_rect_is_indented_and_clears_the_right_control() {
         for width in [MIN_INNER_SIZE.x, default_inner_width(), 1_200.0] {
@@ -3641,7 +3996,7 @@ mod tests {
     #[test]
     fn title_separator_sits_below_the_title_row_and_clears_the_chevron() {
         let row = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, 20.0));
-        let rect = title_separator_rect(row);
+        let rect = title_separator_rect(row, header_text_band_height());
         let segments = title_separator_segments(rect);
         assert_eq!(
             segments.first().unwrap().0.left(),
@@ -3651,8 +4006,29 @@ mod tests {
             (segments.last().unwrap().0.right() - (row.right() - HEADER_RIGHT_CONTROL_WIDTH)).abs()
                 < 0.01
         );
-        assert_eq!(rect.top(), row.bottom());
-        assert_eq!(rect.bottom(), row.bottom() + TITLE_SEPARATOR_THICKNESS);
+        assert_eq!(rect.height(), TITLE_SEPARATOR_THICKNESS);
+    }
+
+    /// The stroke is the gutter emblem's right tip drawn onward to the
+    /// right, so it is centered on the emblem box's vertical center — the
+    /// tip's own row, `emblem.svg`'s `viewBox` being square and its diamond
+    /// having its corners at that square's edge midpoints. Measured on a
+    /// live screenshot, the old title/subtitle-gap placement sat ~2pt above
+    /// the tip and cut across the diamond's outline with its left bleed.
+    #[test]
+    fn the_title_separator_is_centered_on_the_gutter_emblems_tip() {
+        let row =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, TITLE_LINE_HEIGHT));
+        let band = header_text_band_height();
+        let separator = title_separator_rect(row, band);
+        let tip_y = header_emblem_rect(row, band).center().y;
+        assert!(
+            (separator.center().y - tip_y).abs() <= 0.5,
+            "separator center {} is off the emblem tip {tip_y}",
+            separator.center().y
+        );
+        // Whole points, so the 2pt stroke lands on whole pixel rows.
+        assert_eq!(separator.top(), separator.top().round());
     }
 
     /// Regression for the misread WPF margin (`TITLE_SEPARATOR_TOP_OFFSET`,
@@ -3680,14 +4056,14 @@ mod tests {
         let ink_bottom =
             row.top() + (row.height() - galley.rect.height()) / 2.0 + galley.rect.bottom();
 
-        let rect = title_separator_rect(row);
+        let rect = title_separator_rect(row, header_text_band_height());
         assert!(
             rect.top() >= ink_bottom,
             "separator top {} cuts through the title's ink bottom {ink_bottom}",
             rect.top()
         );
         assert!(
-            rect.bottom() <= row.bottom() + ITEM_SPACING_Y,
+            rect.bottom() <= row.bottom() + HEADER_TITLE_SUBTITLE_GAP,
             "separator bottom {} drifts past the title/subtitle gap",
             rect.bottom()
         );
@@ -3879,12 +4255,12 @@ mod tests {
     fn header_band_height_covers_both_text_rows_both_gaps_and_the_button_row() {
         let button_row_height = 18.0;
         let expected = TITLE_LINE_HEIGHT
-            + ITEM_SPACING_Y
+            + HEADER_TITLE_SUBTITLE_GAP
             + SUBTITLE_LINE_HEIGHT
             + HEADER_STAT_ROW_GAP
             + button_row_height;
         assert_eq!(header_band_height(button_row_height), expected);
-        assert_eq!(header_band_height(BUTTON_ROW_HEIGHT), 68.0);
+        assert_eq!(header_band_height(BUTTON_ROW_HEIGHT), 70.0);
     }
 
     /// Issue #91 regression. The header must be a fixed-height band whether
@@ -3903,9 +4279,9 @@ mod tests {
     fn a_missing_area_name_does_not_collapse_the_header_or_lift_the_stat_row() {
         // The band, and the stat row's offset into it, are single numbers —
         // there is no longer a subtitle-present/absent pair to diverge.
-        assert_eq!(header_band_height(BUTTON_ROW_HEIGHT), 68.0);
+        assert_eq!(header_band_height(BUTTON_ROW_HEIGHT), 70.0);
         let stat_row_top = header_text_band_height() + HEADER_STAT_ROW_GAP;
-        assert_eq!(stat_row_top, 46.0);
+        assert_eq!(stat_row_top, 48.0);
 
         // Painted truth: `header_test_snapshot` has no scene at all, so it
         // is exactly the idle state that used to collapse the band.
@@ -3937,6 +4313,45 @@ mod tests {
         );
     }
 
+    /// The reference's subtitle `Margin="2 4 0 0"`
+    /// (`DamageMeter.UI/HUD/Controls/MainView.xaml`, the area-name
+    /// `TextBlock`): 4pt of air between the boss name's line box and the
+    /// area name's, not the layout's ordinary 2pt — wide enough that the
+    /// 2pt accent stroke, which hangs off the gutter emblem's tip rather
+    /// than off this gap (`title_separator_rect`), still falls inside it
+    /// instead of into either row's ink.
+    #[test]
+    fn the_title_and_subtitle_are_four_points_apart() {
+        assert_eq!(
+            header_text_band_height(),
+            TITLE_LINE_HEIGHT + 4.0 + SUBTITLE_LINE_HEIGHT
+        );
+
+        let row =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, TITLE_LINE_HEIGHT));
+        let separator = title_separator_rect(row, header_text_band_height());
+        assert!(separator.top() >= row.bottom());
+        assert!(separator.bottom() <= row.bottom() + HEADER_TITLE_SUBTITLE_GAP);
+    }
+
+    /// Same invariant as the test above, but with a `title_row` whose top
+    /// sits at a fractional coordinate (0.5pt) rather than a whole one.
+    /// Rounding `tip_y` in absolute space (the bug this regresses)
+    /// straddled the stroke across +24.5..+26.5 here, 0.5pt past
+    /// `row.bottom() + HEADER_TITLE_SUBTITLE_GAP` and into the subtitle's
+    /// own line box — `title_separator_rect` must instead round the offset
+    /// from `title_row.top()`, so a fractional row origin shifts the stroke
+    /// wholesale rather than widening or displacing it out of the gap.
+    #[test]
+    fn the_title_and_subtitle_stay_four_points_apart_at_a_fractional_row_origin() {
+        let row =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.5), egui::vec2(380.0, TITLE_LINE_HEIGHT));
+        let separator = title_separator_rect(row, header_text_band_height());
+        assert!(separator.top() >= row.bottom());
+        assert!(separator.bottom() <= row.bottom() + HEADER_TITLE_SUBTITLE_GAP);
+        assert_eq!(separator.height(), TITLE_SEPARATOR_THICKNESS);
+    }
+
     /// Issue #91's header grid: `TITLE_LINE_HEIGHT + ITEM_SPACING_Y +
     /// SUBTITLE_LINE_HEIGHT == 40.0`, grown from the source's `Height="36"`
     /// (`20 + 2 + 14`) so the boss name and area name each get the vertical
@@ -3945,8 +4360,8 @@ mod tests {
     /// without this test catching it.
     #[test]
     fn the_title_and_subtitle_lines_add_up_to_the_source_header_grid() {
-        let total = TITLE_LINE_HEIGHT + ITEM_SPACING_Y + SUBTITLE_LINE_HEIGHT;
-        assert_eq!(total, 40.0);
+        let total = TITLE_LINE_HEIGHT + HEADER_TITLE_SUBTITLE_GAP + SUBTITLE_LINE_HEIGHT;
+        assert_eq!(total, 42.0);
         // …and the text band is that grid, whole, always (issue #91).
         assert_eq!(header_text_band_height(), total);
     }
@@ -3958,7 +4373,7 @@ mod tests {
     #[test]
     fn the_stat_row_gap_is_wider_than_the_ordinary_row_spacing() {
         const { assert!(HEADER_STAT_ROW_GAP > ITEM_SPACING_Y) };
-        assert_eq!(header_band_height(BUTTON_ROW_HEIGHT), 68.0);
+        assert_eq!(header_band_height(BUTTON_ROW_HEIGHT), 70.0);
     }
 
     /// The emblem is bled off the title row's left edge and overhangs the
@@ -3992,9 +4407,9 @@ mod tests {
     ///
     /// That asymmetry is the design, not an oversight — issue #91 squared it
     /// up on the assumption it was a bug and had to be reverted, so the
-    /// numbers are pinned here. Against issue #91's 40pt text band the
-    /// formula centres 60pt on `40 + 8 = 48`: top 6pt above the band (cut by
-    /// the panel's own top edge) and bottom at `row.top() + 54`, 14pt below
+    /// numbers are pinned here. Against the 42pt text band the
+    /// formula centres 60pt on `42 + 8 = 50`: top 5pt above the band (cut by
+    /// the panel's own top edge) and bottom at `row.top() + 55`, 13pt below
     /// it — painted in full, down inside the stat row's height, which the
     /// row's own inset keeps clear of. See `header_emblem_rect`.
     #[test]
@@ -4005,8 +4420,8 @@ mod tests {
 
         let band = header_text_band_height();
         let rect = header_emblem_rect(row, band);
-        assert_eq!(rect.top(), row.top() - 6.0);
-        assert_eq!(rect.bottom(), row.top() + 54.0);
+        assert_eq!(rect.top(), row.top() - 5.0);
+        assert_eq!(rect.bottom(), row.top() + 55.0);
 
         let above = row.top() - rect.top();
         let below = rect.bottom() - (row.top() + band);
@@ -4047,7 +4462,7 @@ mod tests {
         let band = header_band_height(BUTTON_ROW_HEIGHT);
         assert_eq!(band, text + HEADER_STAT_ROW_GAP + BUTTON_ROW_HEIGHT);
         assert!(text < band);
-        assert_eq!(text, 40.0);
+        assert_eq!(text, 42.0);
     }
 
     /// …but never past the panel's own rounded, stroked border: the image
@@ -4110,12 +4525,15 @@ mod tests {
     /// sliver of bare panel fill shows between the two images at the
     /// banner/body seam.
     ///
-    /// This drives `draw_header` and a real `ui.separator()` through an
-    /// actual `egui::Ui` (the same layout `OverlayApp::ui` uses) rather than
-    /// trusting the pure functions to agree with egui's own bookkeeping:
-    /// `Ui::cursor` already carries one pending `item_spacing` past the last
-    /// widget it placed, so the separator's *own* trailing advance adds a
-    /// second one that `first_player_row_top_offset` must also count.
+    /// This drives `draw_header` and a real `SEPARATOR_HEIGHT` allocation
+    /// through an actual `egui::Ui` (the same layout `OverlayApp::ui` uses)
+    /// rather than trusting the pure functions to agree with egui's own
+    /// bookkeeping: `Ui::cursor` already carries one pending `item_spacing`
+    /// past the last widget it placed, so the allocation's *own* trailing
+    /// advance adds a second one that `first_player_row_top_offset` must
+    /// also count. Issue #399 removed the painted line from that seam (the
+    /// reference has none) but kept the gap it occupied, so every offset
+    /// below is unchanged — this test is what proves it.
     #[test]
     fn the_row_area_begins_exactly_where_first_player_row_top_offset_predicts() {
         let ctx = egui::Context::default();
@@ -4160,9 +4578,13 @@ mod tests {
                 &mut false,
             );
             // Exactly what `OverlayApp::ui` does between `draw_header` and
-            // `draw_row_backdrop`: one `ui.separator()`, then read the
-            // cursor it left behind.
-            ui.separator();
+            // `draw_row_backdrop`: one blank `SEPARATOR_HEIGHT` allocation
+            // where its `ui.separator()` used to be (the reference draws no
+            // line at this seam), then read the cursor it left behind.
+            ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), SEPARATOR_HEIGHT),
+                egui::Sense::hover(),
+            );
             rows_top = ui.available_rect_before_wrap().top();
         });
         output.drop_without_applying_deltas();
@@ -4175,6 +4597,186 @@ mod tests {
              (and so the header wash's bottom edge) predicts {predicted} — a {}pt gap \
              would open at the banner/body seam",
             rows_top - predicted
+        );
+    }
+
+    /// The test screen the header-measurement tests below run on — the
+    /// default overlay width by a height tall enough that a header measured
+    /// as the whole panel is unmistakably different from one measured as the
+    /// band.
+    fn measure_test_screen() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(356.0, 448.0))
+    }
+
+    /// One frame of exactly what `OverlayApp::ui` does around `draw_header`:
+    /// a `CentralPanel`, the panel rect read before the header, `draw_header`
+    /// itself, then `measure_header_rect`. Returns that measurement and the
+    /// panel rect it was taken in.
+    fn measure_header_frame(previous_header_rect: Option<egui::Rect>) -> (egui::Rect, egui::Rect) {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(0);
+        let input = egui::RawInput {
+            screen_rect: Some(measure_test_screen()),
+            ..Default::default()
+        };
+
+        let mut measured = egui::Rect::ZERO;
+        let mut panel_rect = egui::Rect::ZERO;
+        let output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let panel = ui.available_rect_before_wrap();
+                draw_header(
+                    ui,
+                    &ctx,
+                    &snapshot,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    &mut WindowGesture::default(),
+                    previous_header_rect,
+                    false,
+                    true,
+                    &mut UpdateCheckState::default(),
+                    &unused_log_export_sender(),
+                    &mut 0,
+                    false,
+                    &mut false,
+                    None,
+                    &mut false,
+                );
+                measured = measure_header_rect(ui, panel);
+                panel_rect = ui.max_rect();
+            });
+        });
+        output.drop_without_applying_deltas();
+        (measured, panel_rect)
+    }
+
+    /// Issue #340's measurement must be the header band and nothing more,
+    /// taken where the app really takes it: inside an `egui::CentralPanel`.
+    /// The panel expands its child `Ui`'s `min_rect` to the whole panel, so
+    /// measuring that way reported the entire window as the header band —
+    /// which the next frame fed straight into the header wash's height.
+    #[test]
+    fn the_measured_header_rect_is_the_band_not_the_whole_central_panel() {
+        let (measured, panel) = measure_header_frame(None);
+
+        let budget = header_band_height(BUTTON_ROW_HEIGHT);
+        assert!(
+            (measured.height() - budget).abs() < 0.05,
+            "the header measured {}pt inside a CentralPanel, not the {budget}pt band \
+             it painted (panel is {}pt tall)",
+            measured.height(),
+            panel.height()
+        );
+        assert!(
+            measured.height() < panel.height() - 1.0,
+            "the measurement is the whole panel ({}pt), not the header band",
+            panel.height()
+        );
+    }
+
+    /// Issue #400: at a window narrower than the stat row's own ink, that
+    /// row used to overflow the `Ui` it paints into — and egui grows a
+    /// parent's `min_rect` *and* `max_rect` to include an overflowing
+    /// child (`Region::expand_to_include_rect`), so the `CentralPanel`'s
+    /// own `Ui` came out of `draw_header` wider than the window. The rows
+    /// below then read that phantom width as their viewport and laid the
+    /// columns out past the right border (see
+    /// `the_deaths_counter_stays_inside_a_narrow_window` in `table.rs`).
+    /// The row is laid out in a child `Ui` now, so overflow is clipped
+    /// rather than published upwards.
+    #[test]
+    fn the_stat_row_overflow_does_not_widen_the_panel() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        // Worst-case pill text (a raid boss's totals) in a window narrower
+        // than the stat row's own ink.
+        let snapshot = header_test_snapshot(30_100_000_000);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(300.0, 236.0),
+            )),
+            ..Default::default()
+        };
+
+        let (mut before, mut after) = (0.0f32, 0.0f32);
+        let (mut right_before, mut right_after) = (0.0f32, 0.0f32);
+        let output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                before = ui.available_width();
+                right_before = ui.max_rect().right();
+                draw_header(
+                    ui,
+                    &ctx,
+                    &snapshot,
+                    &tx_command,
+                    SettingsHandle {
+                        settings: &mut settings,
+                        tx_settings: &tx_settings,
+                    },
+                    &icons,
+                    &mut WindowGesture::default(),
+                    None,
+                    false,
+                    true,
+                    &mut UpdateCheckState::default(),
+                    &unused_log_export_sender(),
+                    &mut 0,
+                    false,
+                    &mut false,
+                    None,
+                    &mut false,
+                );
+                after = ui.available_width();
+                right_after = ui.max_rect().right();
+            });
+        });
+        output.drop_without_applying_deltas();
+
+        assert!(
+            (after - before).abs() < 0.01,
+            "the header widened the panel from {before}pt to {after}pt of available width"
+        );
+        assert!(
+            (right_after - right_before).abs() < 0.01,
+            "the header pushed the panel's right edge from {right_before} to {right_after}"
+        );
+    }
+
+    /// The consequence of the measurement above, one frame later: the header
+    /// wash (its slate gradient and the 200pt `HEADER_WASH_EMBLEM_SIZE`
+    /// watermark) is sized from the *previous* frame's measurement, so a
+    /// panel-sized measurement paints that emblem down across the player
+    /// rows. The wash must stop just below the band, at the first player row.
+    #[test]
+    fn the_second_frame_header_wash_stops_at_the_first_player_row() {
+        let (first_frame, _) = measure_header_frame(None);
+        let (measured, panel) = measure_header_frame(Some(first_frame));
+
+        let wash = header_wash_rect(
+            panel,
+            first_player_row_top_offset(measured.height()) - HEADER_WASH_INSET,
+        );
+        assert!(
+            wash.bottom() - panel.top() <= 80.0,
+            "the header wash runs {}pt down a {}pt panel — the emblem watermark \
+             would land in the player rows",
+            wash.bottom() - panel.top(),
+            panel.height()
         );
     }
 
@@ -4208,18 +4810,110 @@ mod tests {
     }
 
     /// The wash emblem hangs off the wash's right edge by exactly the
-    /// source's `-25` right margin, and is vertically centered on the wash —
-    /// the mirror of the gutter emblem's left-edge bleed, and the reason the
-    /// wash must be painted through its own clip rect.
+    /// source's `-25` right margin, and rides `20`pt above the wash's
+    /// centerline — the source's `Margin="0 -20 -25 20"` on a
+    /// `VerticalAlignment="Center"` box, whose `-20` top / `+20` bottom pair
+    /// lifts the centered square rather than resizing it. The mirror of the
+    /// gutter emblem's left-edge bleed, and the reason the wash must be
+    /// painted through its own clip rect.
     #[test]
     fn the_wash_emblem_bleeds_off_the_right_edge_by_the_named_overhang() {
         let wash = header_wash_rect(wash_test_panel(), WASH_TEST_HEIGHT);
         let emblem = header_wash_emblem_rect(wash);
         assert_eq!(emblem.right() - wash.right(), HEADER_WASH_EMBLEM_BLEED);
         assert!(emblem.left() > wash.left());
-        assert_eq!(emblem.center().y, wash.center().y);
+        assert_eq!(emblem.center().y, wash.center().y - 20.0);
         assert_eq!(emblem.width(), HEADER_WASH_EMBLEM_SIZE);
         assert_eq!(emblem.height(), HEADER_WASH_EMBLEM_SIZE);
+    }
+
+    /// The source's `OpacityMask` on the wash `Border`: a top-to-bottom
+    /// brush, white at the top and transparent at `.9` of the height, so
+    /// the wash's last tenth is gone entirely. `header_wash_mask` is that
+    /// brush as a pure fraction of the wash's own height.
+    #[test]
+    fn the_wash_opacity_mask_falls_from_one_to_zero_at_nine_tenths() {
+        assert_eq!(header_wash_mask(0.0), 1.0);
+        assert!((header_wash_mask(0.45) - 0.5).abs() < 1e-6);
+        assert_eq!(header_wash_mask(0.9), 0.0);
+        assert_eq!(header_wash_mask(1.0), 0.0);
+        // Clamped outside the wash rather than extrapolating past either
+        // stop: above the wash is still fully opaque, below it still gone.
+        assert_eq!(header_wash_mask(-1.0), 1.0);
+        assert_eq!(header_wash_mask(4.0), 0.0);
+    }
+
+    /// The masked gradient, as the strips it is actually painted as: they
+    /// tile the wash from its top edge down to `HEADER_WASH_MASK_END` of
+    /// its height and stop — the last tenth is fully masked out, so it is
+    /// not painted at all — and the bottom of the last strip is where the
+    /// gradient has faded to nothing, which is what keeps a hard slate edge
+    /// from landing on the first player row.
+    #[test]
+    fn the_wash_gradient_strips_tile_the_masked_span_and_end_transparent() {
+        let wash = header_wash_rect(wash_test_panel(), WASH_TEST_HEIGHT);
+        let strips = header_wash_gradient_strips(wash, Opacity::OPAQUE);
+
+        assert_eq!(strips.len(), HEADER_WASH_MASK_STRIPS);
+        let (first, first_colors) = strips[0];
+        assert_eq!(first.top(), wash.top());
+        assert_eq!(first.left(), wash.left());
+        assert_eq!(first.right(), wash.right());
+        // The source's brightest stop, undimmed, at the very top-left.
+        assert_eq!(first_colors[0].a(), HEADER_WASH_TOP_ALPHA);
+
+        for pair in strips.windows(2) {
+            assert_eq!(pair[0].1[2], pair[1].1[0], "strip colors must meet");
+            assert_eq!(pair[0].1[3], pair[1].1[1], "strip colors must meet");
+            assert_eq!(pair[0].0.bottom(), pair[1].0.top(), "strips must tile");
+        }
+
+        let (last, last_colors) = strips[HEADER_WASH_MASK_STRIPS - 1];
+        assert!(
+            (last.bottom() - (wash.top() + HEADER_WASH_MASK_END * wash.height())).abs() < 0.01,
+            "the painted span ends at {}, not at {HEADER_WASH_MASK_END} of the wash",
+            last.bottom()
+        );
+        assert_eq!(last_colors[2].a(), 0, "bottom-left of the last strip");
+        assert_eq!(last_colors[3].a(), 0, "bottom-right of the last strip");
+    }
+
+    /// The same mask over the oversized `Svg.HPBar` watermark: it is blitted
+    /// strip by strip so its flat `HEADER_WASH_EMBLEM_COLOR` alpha fades
+    /// with depth instead of ending abruptly at the wash's bottom edge, and
+    /// each strip's UVs address the slice of the 200pt image that actually
+    /// falls inside it, so the picture is not restretched per strip.
+    #[test]
+    fn the_wash_emblem_strips_fade_the_watermark_out_by_the_mask_stop() {
+        let wash = header_wash_rect(wash_test_panel(), WASH_TEST_HEIGHT);
+        let emblem = header_wash_emblem_rect(wash);
+        let strips = header_wash_emblem_strips(wash, Opacity::OPAQUE);
+
+        assert_eq!(strips.len(), HEADER_WASH_MASK_STRIPS);
+        for (rect, uv, colors) in &strips {
+            assert!(
+                emblem.contains_rect(*rect),
+                "{rect:?} escapes the emblem box"
+            );
+            assert!(
+                (uv.top() - (rect.top() - emblem.top()) / emblem.height()).abs() < 1e-4,
+                "the strip's UVs must address its own slice of the image"
+            );
+            assert!((uv.bottom() - (rect.bottom() - emblem.top()) / emblem.height()).abs() < 1e-4);
+            for color in colors {
+                assert!(
+                    color.a() <= HEADER_WASH_EMBLEM_COLOR.a(),
+                    "the mask can only dim the watermark, never brighten it"
+                );
+            }
+            assert_eq!(colors[0], colors[1], "a strip's top tint is uniform");
+            assert_eq!(colors[2], colors[3], "a strip's bottom tint is uniform");
+        }
+
+        assert_eq!(strips[0].2[0].a(), HEADER_WASH_EMBLEM_COLOR.a());
+        let last = strips[HEADER_WASH_MASK_STRIPS - 1].2;
+        assert_eq!(last[2].a(), 0, "the watermark is gone by the mask's stop");
+        assert_eq!(last[3].a(), 0);
     }
 
     /// Issue #255's live-window pass shrank `HEADER_WASH_EMBLEM_BLEED` from
@@ -4289,7 +4983,7 @@ mod tests {
     /// `header_band_height` itself (that left an 8pt gap of bare panel fill,
     /// with the separator's faint line inside it, between the wash and the
     /// first row) but `first_player_row_top_offset` — the band plus the
-    /// `ui.separator()` and the layout gap before it, which is where the
+    /// blank `SEPARATOR_HEIGHT` seam and the layout gap before it, which is where the
     /// first player row genuinely starts. What it must still never do is
     /// bleed *past* that row, which is exactly where the old fixed `98.0`pt
     /// wash went wrong.
@@ -4353,11 +5047,20 @@ mod tests {
         // fixed value for it.
         let panel_top = gradient.top() - HEADER_WASH_INSET;
         let first_player_row_top = panel_top + first_player_row_top_offset(band);
+        // The wash *rect* still runs to the first player row; its painted
+        // ink stops at `HEADER_WASH_MASK_END` of that, because the source's
+        // `OpacityMask` has already faded it to nothing there (issue #399).
+        // Deriving the expected bottom from `first_player_row_top` keeps
+        // this tied to the same offset issue #158 pinned it to: a wash that
+        // shrank back to the bare header band would still fail here.
+        let painted_bottom =
+            gradient.top() + HEADER_WASH_MASK_END * (first_player_row_top - gradient.top());
         assert!(
-            (gradient.bottom() - first_player_row_top).abs() < 0.01,
-            "the wash gradient's bottom is {}, not the first player row's \
-             top at {first_player_row_top} — a wash that stops at the bare \
-             header band leaves a gap of bare panel fill above the rows",
+            (gradient.bottom() - painted_bottom).abs() < 0.01,
+            "the wash gradient's bottom is {}, not the {painted_bottom} its \
+             mask fades out at above the first player row at \
+             {first_player_row_top} — a wash that stops at the bare header \
+             band leaves a gap of bare panel fill above the rows",
             gradient.bottom()
         );
 
@@ -4399,14 +5102,19 @@ mod tests {
         }
     }
 
-    /// Issue #252: the gutter emblem's own baked-in alpha must be strictly
-    /// translucent — a bare `Color32::from_rgb` (implicit `0xFF`) painted
-    /// the mark fully opaque, which is the bug this issue fixes.
+    /// The gutter emblem carries the source's own opacity, which is none:
+    /// its `Path Width="60" Height="60" ... Fill="SlateGray"`
+    /// (`DamageMeter.UI/HUD/Controls/MainView.xaml`) has no `Opacity`
+    /// attribute at all — only the wash's blown-up copy does
+    /// (`Opacity=".05"`, `HEADER_WASH_EMBLEM_COLOR`). Issue #252's `0x80`
+    /// was a chosen half-alpha, not a measured one; the opacity slider
+    /// (asserted above) is what fades this mark now.
     #[test]
-    fn header_emblem_color_is_not_fully_opaque() {
+    fn header_emblem_color_is_the_sources_opaque_slate_gray() {
+        assert_eq!(HEADER_EMBLEM_COLOR.a(), 0xFF);
         assert!(
-            HEADER_EMBLEM_COLOR.a() < 255,
-            "HEADER_EMBLEM_COLOR must carry a real alpha, not implicit full opacity"
+            HEADER_WASH_EMBLEM_COLOR.a() < HEADER_EMBLEM_COLOR.a(),
+            "only the wash's copy carries the source's `Opacity=\".05\"`"
         );
     }
 
@@ -4421,7 +5129,7 @@ mod tests {
         // `header_band_height`, which is what the function itself calls) so
         // this stays an independent statement of the sum.
         let band = TITLE_LINE_HEIGHT
-            + ITEM_SPACING_Y
+            + HEADER_TITLE_SUBTITLE_GAP
             + SUBTITLE_LINE_HEIGHT
             + HEADER_STAT_ROW_GAP
             + BUTTON_ROW_HEIGHT;
@@ -4439,8 +5147,11 @@ mod tests {
         // the default window has to budget them too or it opens 18pt short
         // of the 20 rows it promises. Issue #297 then grew it to `678.0`:
         // the missing second `ITEM_SPACING_Y` around the separator was a
-        // real 2pt gap at the banner/body seam, not just a test bug.
-        assert_eq!(default_inner_height(None), 678.0);
+        // real 2pt gap at the banner/body seam, not just a test bug, and
+        // the source's `Margin="2 4 0 0"` title/subtitle gap
+        // (`HEADER_TITLE_SUBTITLE_GAP`, 2pt wider than the layout spacing it
+        // replaced) grew it again to `680.0`.
+        assert_eq!(default_inner_height(None), 680.0);
     }
 
     #[test]

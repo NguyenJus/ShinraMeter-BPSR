@@ -69,14 +69,84 @@ pub(super) const COUNTER_GLYPH_SIDE: f32 = 12.0;
 /// highlight behind the text.
 pub(super) const PILL_PAD_X: f32 = 8.0;
 
-/// Vertical padding above and below a pill's text. Small: the pill's height
-/// is capped at the button row's height (`pill_size`) so the header band
-/// budget (`header_band_height`) stays correct, and the text is what should
-/// consume that budget.
-pub(super) const PILL_PAD_Y: f32 = 2.0;
+/// Extra inset on the *text* end of a header pill, on top of `PILL_PAD_X`:
+/// the source's value TextBlock carries `Margin="5 3"` *inside* a border
+/// whose `Padding` is `"8 0"`
+/// (`DamageMeter.UI/HUD/Controls/MainView.xaml` 250, 436), so the value
+/// starts 13pt in while the glyph end keeps the bare 8.
+pub(super) const PILL_TEXT_INSET: f32 = 5.0;
 
-/// Gap between a pill's value text and its icon.
-pub(super) const PILL_ICON_GAP: f32 = 5.0;
+/// Vertical padding above and below a pill's text — the source value
+/// TextBlock's `Margin="5 3"` (`MainView.xaml:250`). Only ever visible on a
+/// pill whose text is short enough not to reach the fixed height the border
+/// styles give it.
+pub(super) const PILL_PAD_Y: f32 = 3.0;
+
+/// Gap between a header pill's value text and its icon: the glyph's own
+/// `Margin="5 0 0 0"` after the value's trailing `5`
+/// (`MainView.xaml` 449, 473).
+pub(super) const PILL_ICON_GAP: f32 = 10.0;
+
+/// Height of issue #49's row counter pill — the source's `MetricBorderStyle`
+/// `Height="24"` (`DamageMeter.UI/Resources/Styles.xaml` 1147-1153). A floor
+/// rather than a fixed size only because a row shorter than 24pt must still
+/// clip it (`pill_size`'s cap).
+pub(super) const COUNTER_PILL_HEIGHT: f32 = 24.0;
+
+/// Inset before a counter pill's skull — the source `MetricPathStyle`
+/// `Margin="6 4 3 4"` (`Styles.xaml` 1241-1250).
+pub(super) const COUNTER_PILL_PAD_LEFT: f32 = 6.0;
+
+/// Gap between a counter pill's skull and its count — the right half of the
+/// same `Margin="6 4 3 4"` (`Styles.xaml:1250`).
+pub(super) const COUNTER_PILL_ICON_GAP: f32 = 3.0;
+
+/// Inset after a counter pill's count — the count's own `Margin="0 0 6 1"`
+/// (`Styles.xaml` 1251-1257).
+pub(super) const COUNTER_PILL_PAD_RIGHT: f32 = 6.0;
+
+/// The fixed set of insets one pill kind lays its content out with. A struct
+/// because the header's ovals and issue #49's row counter come from two
+/// different source styles with two different padding schemes, and sharing
+/// one set of `PILL_*` constants between them silently gives one of them the
+/// other's chrome.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct PillMetrics {
+    /// Inset between the pill's edge and the *value text*, on whichever end
+    /// the text sits (`icon_first` decides which).
+    pub(super) text_pad: f32,
+    /// Inset between the pill's edge and the *icon*, on the other end.
+    pub(super) icon_pad: f32,
+    /// Gap between the value text and the icon.
+    pub(super) icon_gap: f32,
+    /// Padding above and below the value text.
+    pub(super) pad_y: f32,
+    /// Floor on the pill's height, before the caller's cap is applied.
+    pub(super) min_height: f32,
+}
+
+impl PillMetrics {
+    /// The header band's timer/DPS/damage ovals — the source's
+    /// `Padding="8 0"` border around a `Margin="5 3"` value, with a fixed
+    /// `Height="22"` (`MainView.xaml` 435, 459).
+    pub(super) const HEADER: Self = Self {
+        text_pad: PILL_PAD_X + PILL_TEXT_INSET,
+        icon_pad: PILL_PAD_X,
+        icon_gap: PILL_ICON_GAP,
+        pad_y: PILL_PAD_Y,
+        min_height: BUTTON_ROW_HEIGHT,
+    };
+
+    /// Issue #49's per-row death counter — the source's `MetricBorderStyle`,
+    /// which shares none of the header's insets (`Styles.xaml` 1147-1257).
+    pub(super) const COUNTER: Self = Self {
+        text_pad: COUNTER_PILL_PAD_RIGHT,
+        icon_pad: COUNTER_PILL_PAD_LEFT,
+        icon_gap: COUNTER_PILL_ICON_GAP,
+        pad_y: PILL_PAD_Y,
+        min_height: COUNTER_PILL_HEIGHT,
+    };
+}
 
 /// One stat pill's content. A struct rather than a long argument list
 /// because issue #49's death counter and issue #59's timer readout need
@@ -119,6 +189,14 @@ pub(super) struct StatPill<'a> {
     /// because the chrome is per-call-site and a stroked pill elsewhere
     /// stays a one-line change.
     pub(super) stroke: Option<egui::Stroke>,
+    /// The insets this pill lays its content out with.
+    pub(super) metrics: PillMetrics,
+    /// Paint (and measure) the value bold. Only the timer is: the source's
+    /// duration is `FontWeight="DemiBold"` (`MainView.xaml:428`) while every
+    /// other stat text is `GeneralStatTextStyle`'s `Normal`
+    /// (`Styles.xaml` 240-251), the row counter's count included
+    /// (`Styles.xaml` 1251-1257).
+    pub(super) bold: bool,
 }
 
 impl<'a> StatPill<'a> {
@@ -137,6 +215,8 @@ impl<'a> StatPill<'a> {
             corner_radius: egui::CornerRadius::same((BUTTON_ROW_HEIGHT / 2.0) as u8),
             fill: PILL_FILL,
             stroke: None,
+            metrics: PillMetrics::HEADER,
+            bold: false,
         }
     }
 
@@ -171,6 +251,8 @@ impl<'a> StatPill<'a> {
             corner_radius: egui::CornerRadius::same((BUTTON_ROW_HEIGHT / 2.0) as u8),
             fill: TIMER_PILL_FILL,
             stroke: None,
+            metrics: PillMetrics::HEADER,
+            bold: true,
         }
     }
 
@@ -199,6 +281,8 @@ impl<'a> StatPill<'a> {
             corner_radius: egui::CornerRadius::same(12),
             fill: COUNTER_PILL_FILL,
             stroke: None,
+            metrics: PillMetrics::COUNTER,
+            bold: false,
         }
     }
 }
@@ -218,9 +302,16 @@ pub(crate) const DEATH_COUNT_RGB: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
 /// `draw_header`'s button row, whose height `header_band_height` budgets as
 /// `BUTTON_ROW_HEIGHT`. A pill taller than that would silently grow the
 /// header band past the drag surface `draw_header` registered for it.
-pub(super) fn pill_size(text_size: egui::Vec2, icon_side: f32, max_height: f32) -> egui::Vec2 {
-    let width = 2.0 * PILL_PAD_X + text_size.x + PILL_ICON_GAP + icon_side;
-    let height = (text_size.y + 2.0 * PILL_PAD_Y).min(max_height);
+pub(super) fn pill_size(
+    text_size: egui::Vec2,
+    icon_side: f32,
+    metrics: PillMetrics,
+    max_height: f32,
+) -> egui::Vec2 {
+    let width = metrics.text_pad + text_size.x + metrics.icon_gap + icon_side + metrics.icon_pad;
+    let height = (text_size.y + 2.0 * metrics.pad_y)
+        .max(metrics.min_height)
+        .min(max_height);
     egui::vec2(width, height)
 }
 
@@ -233,12 +324,14 @@ pub(super) fn pill_content_layout(
     text_size: egui::Vec2,
     icon_side: f32,
     icon_first: bool,
+    metrics: PillMetrics,
 ) -> (egui::Pos2, egui::Rect) {
-    let left = rect.left() + PILL_PAD_X;
     let (text_x, icon_x) = if icon_first {
-        (left + icon_side + PILL_ICON_GAP, left)
+        let icon_x = rect.left() + metrics.icon_pad;
+        (icon_x + icon_side + metrics.icon_gap, icon_x)
     } else {
-        (left, left + text_size.x + PILL_ICON_GAP)
+        let text_x = rect.left() + metrics.text_pad;
+        (text_x, text_x + text_size.x + metrics.icon_gap)
     };
     let y = rect.center().y;
     (
@@ -256,7 +349,12 @@ pub(super) fn pill_content_layout(
 /// doesn't have; see `toggle_cluster`).
 pub(super) fn stat_pill(ui: &mut egui::Ui, pill: StatPill<'_>) -> egui::Response {
     let text_size = pill_text_size(ui.painter(), &pill);
-    let size = pill_size(text_size, pill.icon_side, ui.spacing().interact_size.y);
+    let size = pill_size(
+        text_size,
+        pill.icon_side,
+        pill.metrics,
+        ui.spacing().interact_size.y,
+    );
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
 
     if ui.is_rect_visible(rect) {
@@ -271,8 +369,13 @@ pub(super) fn stat_pill(ui: &mut egui::Ui, pill: StatPill<'_>) -> egui::Response
 /// own to allocate from, it paints into a row rect that was already
 /// allocated, at an x the column anchors dictate.
 pub(super) fn pill_text_size(painter: &egui::Painter, pill: &StatPill<'_>) -> egui::Vec2 {
+    let font = if pill.bold {
+        bold(pill.size)
+    } else {
+        regular(pill.size)
+    };
     let mut size = painter
-        .layout_no_wrap(pill.value.to_owned(), bold(pill.size), pill.value_color)
+        .layout_no_wrap(pill.value.to_owned(), font, pill.value_color)
         .rect
         .size();
     // The value is painted through `paint_bold_text`, which on the faux-bold
@@ -281,7 +384,7 @@ pub(super) fn pill_text_size(painter: &egui::Painter, pill: &StatPill<'_>) -> eg
     // epaint measured. Counting it here keeps the pill's width and its
     // icon's x (both derived from this) matching the ink instead of eating
     // the difference out of `PILL_ICON_GAP`.
-    if !fonts::has_real_bold() {
+    if pill.bold && !fonts::has_real_bold() {
         size.x += FAUX_BOLD_OFFSET;
     }
     size
@@ -300,15 +403,25 @@ pub(super) fn paint_stat_pill(
     if let Some(stroke) = pill.stroke {
         painter.rect_stroke(rect, pill.corner_radius, stroke, egui::StrokeKind::Inside);
     }
-    let (text_pos, icon_rect) =
-        pill_content_layout(rect, text_size, pill.icon_side, pill.icon_first);
-    paint_bold_text(
+    let (text_pos, icon_rect) = pill_content_layout(
+        rect,
+        text_size,
+        pill.icon_side,
+        pill.icon_first,
+        pill.metrics,
+    );
+    paint_text(
         painter,
         text_pos,
         egui::Align2::LEFT_CENTER,
         pill.value,
-        pill.size,
+        if pill.bold {
+            bold(pill.size)
+        } else {
+            regular(pill.size)
+        },
         pill.value_color,
+        pill.bold,
     );
     if let Some(id) = pill.icon {
         painter.image(id, icon_rect, UV_FULL, pill.icon_color);
@@ -495,8 +608,97 @@ mod tests {
     #[test]
     fn pill_width_is_padding_plus_text_plus_gap_plus_icon() {
         let text = egui::vec2(40.0, 15.0);
-        let size = pill_size(text, 14.0, 22.0);
-        assert_eq!(size.x, 2.0 * PILL_PAD_X + text.x + PILL_ICON_GAP + 14.0);
+        let size = pill_size(text, 14.0, PillMetrics::HEADER, 22.0);
+        assert_eq!(
+            size.x,
+            PillMetrics::HEADER.text_pad
+                + text.x
+                + PILL_ICON_GAP
+                + 14.0
+                + PillMetrics::HEADER.icon_pad
+        );
+    }
+
+    /// The source's DPS and damage borders are `Height="22"` fixed
+    /// (`DamageMeter.UI/HUD/Controls/MainView.xaml` 435, 459), not
+    /// text-derived: a short value must not shrink the oval below the
+    /// button row it shares with the timer.
+    #[test]
+    fn header_value_pills_are_floored_at_the_sources_fixed_height() {
+        let size = pill_size(
+            egui::vec2(30.0, 10.0),
+            PILL_GLYPH_SIDE,
+            PillMetrics::HEADER,
+            BUTTON_ROW_HEIGHT,
+        );
+        assert_eq!(size.y, BUTTON_ROW_HEIGHT);
+        assert_eq!(PillMetrics::HEADER.min_height, BUTTON_ROW_HEIGHT);
+    }
+
+    /// The value's inset is the source's TextBlock `Margin="5 3"` *inside*
+    /// the border's `Padding="8 0"` (`MainView.xaml` 250, 436) — 13pt on the
+    /// text end, a bare 8 on the icon's — and the glyph's own
+    /// `Margin="5 0 0 0"` after a `Padding` of 5 makes the text-to-icon gap
+    /// 10 (`:449`, `:473`).
+    #[test]
+    fn header_pill_insets_come_from_the_sources_margins() {
+        assert_eq!(PILL_TEXT_INSET, 5.0);
+        assert_eq!(PILL_ICON_GAP, 10.0);
+        assert_eq!(PILL_PAD_Y, 3.0);
+        assert_eq!(PillMetrics::HEADER.text_pad, PILL_PAD_X + PILL_TEXT_INSET);
+        assert_eq!(PillMetrics::HEADER.icon_pad, PILL_PAD_X);
+
+        let text = egui::vec2(40.0, 15.0);
+        let size = pill_size(text, 14.0, PillMetrics::HEADER, 40.0);
+        assert_eq!(
+            size.x,
+            PILL_PAD_X + PILL_TEXT_INSET + text.x + PILL_ICON_GAP + 14.0 + PILL_PAD_X
+        );
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size);
+        let (text_pos, icon_rect) =
+            pill_content_layout(rect, text, 14.0, false, PillMetrics::HEADER);
+        assert_eq!(text_pos.x, rect.left() + PILL_PAD_X + PILL_TEXT_INSET);
+        assert!((icon_rect.left() - (text_pos.x + text.x + PILL_ICON_GAP)).abs() < 0.01);
+    }
+
+    /// `GeneralStatTextStyle` is `FontWeight="Normal"` (`Styles.xaml`
+    /// 240-251); only the timer's own style is DemiBold
+    /// (`MainView.xaml:428`). The row counter's count is regular 13 too
+    /// (`Styles.xaml` 1241-1257).
+    #[test]
+    fn only_the_timer_pill_paints_its_value_bold() {
+        assert!(StatPill::timer("02:39", None).bold);
+        assert!(!StatPill::header("30.10B", None).bold);
+        assert!(!StatPill::counter("2", None, egui::Color32::WHITE).bold);
+    }
+
+    /// The row counter is the source's `MetricBorderStyle`: `Height="24"`,
+    /// `CornerRadius="12"` (`Styles.xaml` 1147-1153), with the skull's
+    /// `Margin="6 4 3 4"` and the count's `Margin="0 0 6 1"` (:1241-1257)
+    /// giving 6 / 3 / 6 across the pill — none of the header's insets.
+    #[test]
+    fn the_counter_pill_wears_the_sources_metric_border_chrome() {
+        assert_eq!(COUNTER_PILL_HEIGHT, 24.0);
+        assert_eq!(PillMetrics::COUNTER.icon_pad, COUNTER_PILL_PAD_LEFT);
+        assert_eq!(PillMetrics::COUNTER.icon_gap, COUNTER_PILL_ICON_GAP);
+        assert_eq!(PillMetrics::COUNTER.text_pad, COUNTER_PILL_PAD_RIGHT);
+
+        let text = egui::vec2(12.0, 13.0);
+        let size = pill_size(text, COUNTER_GLYPH_SIDE, PillMetrics::COUNTER, 32.0);
+        assert_eq!(size.y, COUNTER_PILL_HEIGHT);
+        assert_eq!(
+            size.x,
+            COUNTER_PILL_PAD_LEFT
+                + COUNTER_GLYPH_SIDE
+                + COUNTER_PILL_ICON_GAP
+                + text.x
+                + COUNTER_PILL_PAD_RIGHT
+        );
+        // Clamped by the row it sits in, never taller than it.
+        assert_eq!(
+            pill_size(text, COUNTER_GLYPH_SIDE, PillMetrics::COUNTER, 20.0).y,
+            20.0
+        );
     }
 
     /// The height cap is what keeps the pills from silently growing
@@ -506,7 +708,12 @@ mod tests {
     #[test]
     fn pill_height_never_exceeds_the_row_it_sits_in() {
         for text_height in [10.0, 15.0, 40.0] {
-            let size = pill_size(egui::vec2(30.0, text_height), 14.0, BUTTON_ROW_HEIGHT);
+            let size = pill_size(
+                egui::vec2(30.0, text_height),
+                14.0,
+                PillMetrics::HEADER,
+                BUTTON_ROW_HEIGHT,
+            );
             assert!(
                 size.y <= BUTTON_ROW_HEIGHT,
                 "a {text_height}pt text grew the pill to {}pt",
@@ -515,27 +722,29 @@ mod tests {
         }
     }
 
-    /// A short text still gets a pill shorter than the cap — the clamp is a
-    /// ceiling, not a fixed height.
+    /// The caller's cap outranks the source's fixed height: a pill in a row
+    /// shorter than `min_height` is clipped to the row, never allowed to
+    /// overflow it.
     #[test]
-    fn pill_height_follows_its_text_below_the_cap() {
-        let size = pill_size(egui::vec2(30.0, 10.0), 14.0, 18.0);
-        assert_eq!(size.y, 10.0 + 2.0 * PILL_PAD_Y);
+    fn the_height_cap_outranks_the_sources_fixed_height() {
+        let size = pill_size(egui::vec2(30.0, 10.0), 14.0, PillMetrics::HEADER, 18.0);
+        assert_eq!(size.y, 18.0);
     }
 
     /// Header layout: value first, icon after it, both inside the padding.
     #[test]
     fn pill_content_sits_inside_its_padding_with_the_icon_trailing() {
         let text = egui::vec2(40.0, 15.0);
-        let size = pill_size(text, 14.0, 18.0);
+        let size = pill_size(text, 14.0, PillMetrics::HEADER, 18.0);
         let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), size);
-        let (text_pos, icon_rect) = pill_content_layout(rect, text, 14.0, false);
+        let (text_pos, icon_rect) =
+            pill_content_layout(rect, text, 14.0, false, PillMetrics::HEADER);
 
-        assert_eq!(text_pos.x, rect.left() + PILL_PAD_X);
+        assert_eq!(text_pos.x, rect.left() + PillMetrics::HEADER.text_pad);
         assert_eq!(text_pos.y, rect.center().y);
         assert!(icon_rect.left() >= text_pos.x + text.x);
         assert!(
-            (icon_rect.right() - (rect.right() - PILL_PAD_X)).abs() < 0.01,
+            (icon_rect.right() - (rect.right() - PillMetrics::HEADER.icon_pad)).abs() < 0.01,
             "icon should end exactly one padding short of the pill's right edge"
         );
         assert_eq!(icon_rect.center().y, rect.center().y);
@@ -547,14 +756,15 @@ mod tests {
     #[test]
     fn pill_content_can_lead_with_its_icon() {
         let text = egui::vec2(40.0, 15.0);
-        let size = pill_size(text, 14.0, 18.0);
+        let size = pill_size(text, 14.0, PillMetrics::COUNTER, 18.0);
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size);
-        let (text_pos, icon_rect) = pill_content_layout(rect, text, 14.0, true);
+        let (text_pos, icon_rect) =
+            pill_content_layout(rect, text, 14.0, true, PillMetrics::COUNTER);
 
-        assert_eq!(icon_rect.left(), rect.left() + PILL_PAD_X);
+        assert_eq!(icon_rect.left(), rect.left() + COUNTER_PILL_PAD_LEFT);
         assert!(text_pos.x >= icon_rect.right());
         assert!(
-            (rect.right() - PILL_PAD_X - (text_pos.x + text.x)).abs() < 0.01,
+            (rect.right() - COUNTER_PILL_PAD_RIGHT - (text_pos.x + text.x)).abs() < 0.01,
             "the value should end exactly one padding short of the right edge"
         );
     }
@@ -580,7 +790,12 @@ mod tests {
             ("damage", StatPill::header("30.10B", None)),
         ] {
             let text = ctx.fonts_mut(|f| {
-                f.layout_no_wrap(pill.value.to_owned(), bold(pill.size), pill.value_color)
+                let font = if pill.bold {
+                    bold(pill.size)
+                } else {
+                    regular(pill.size)
+                };
+                f.layout_no_wrap(pill.value.to_owned(), font, pill.value_color)
                     .rect
                     .size()
             });
@@ -591,17 +806,23 @@ mod tests {
                 !pill.icon_first,
                 "{name}: the header reads value-then-icon, not icon-first"
             );
-            let size = pill_size(text, pill.icon_side, BUTTON_ROW_HEIGHT);
+            let size = pill_size(text, pill.icon_side, pill.metrics, BUTTON_ROW_HEIGHT);
             let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size);
             let (text_pos, icon_rect) =
-                pill_content_layout(rect, text, pill.icon_side, pill.icon_first);
+                pill_content_layout(rect, text, pill.icon_side, pill.icon_first, pill.metrics);
             // `paint_bold_text` anchors LEFT_CENTER, so this is the box the
             // value actually covers.
             let text_rect =
                 egui::Rect::from_min_size(egui::pos2(text_pos.x, text_pos.y - text.y / 2.0), text);
 
             assert!(
-                (size.x - (2.0 * PILL_PAD_X + text.x + PILL_ICON_GAP + pill.icon_side)).abs()
+                (size.x
+                    - (pill.metrics.text_pad
+                        + text.x
+                        + PILL_ICON_GAP
+                        + pill.icon_side
+                        + pill.metrics.icon_pad))
+                    .abs()
                     < 0.01,
                 "{name}: pill width {} is not padding + text {} + gap + icon",
                 size.x,
@@ -977,12 +1198,14 @@ mod tests {
         // widest plausible one, the same reasoning the in-game ceilings in
         // `ColumnKind::spec` use, not the field type's `u32::MAX`.
         let pill = StatPill::counter("99", None, column.color);
+        // Regular weight, like `pill_text_size` measures it: the source's
+        // count is `Styles.xaml`'s plain 13 (:1251-1257), not DemiBold.
         let text_size = ctx.fonts_mut(|f| {
-            f.layout_no_wrap(pill.value.to_owned(), bold(pill.size), pill.value_color)
+            f.layout_no_wrap(pill.value.to_owned(), regular(pill.size), pill.value_color)
                 .rect
                 .size()
         });
-        let pill_width = pill_size(text_size, pill.icon_side, ROW_HEIGHT).x;
+        let pill_width = pill_size(text_size, pill.icon_side, pill.metrics, ROW_HEIGHT).x;
 
         assert!(
             pill_width <= column.width,
@@ -1012,15 +1235,17 @@ mod tests {
         let row = row_rect();
         let anchor = row.right() - COLUMN_RIGHT_MARGIN;
         let pill = StatPill::counter("99", None, column.color);
+        // Regular weight, like `pill_text_size` measures it: the source's
+        // count is `Styles.xaml`'s plain 13 (:1251-1257), not DemiBold.
         let text_size = ctx.fonts_mut(|f| {
-            f.layout_no_wrap(pill.value.to_owned(), bold(pill.size), pill.value_color)
+            f.layout_no_wrap(pill.value.to_owned(), regular(pill.size), pill.value_color)
                 .rect
                 .size()
         });
         let pill_rect = counter_pill_rect(
             row,
             anchor,
-            pill_size(text_size, pill.icon_side, row.height()),
+            pill_size(text_size, pill.icon_side, pill.metrics, row.height()),
         );
         let clip = column_clip_rect(row, anchor, column.width);
 
@@ -1039,6 +1264,7 @@ mod tests {
             let size = pill_size(
                 egui::vec2(12.0, text_height),
                 COUNTER_GLYPH_SIDE,
+                PillMetrics::COUNTER,
                 ROW_HEIGHT,
             );
             assert!(size.y <= ROW_HEIGHT, "a {text_height}pt text overflowed");
