@@ -385,6 +385,15 @@ impl Rect {
 #[cfg(any(windows, test))]
 const HEADER_BAND_HEIGHT: i32 = 32;
 
+/// Physical-pixel distance the drag band starts below the window's top
+/// edge, before `HEADER_BAND_HEIGHT` even begins. `ui::header_drag_band`
+/// drops the band by the whole `ui::RESIZE_CORNER` (14pt) so it clears the
+/// top corner resize squares; at the 2x scale this file conservatively
+/// assumes, that is 28 physical px this file must not count as reachable
+/// drag surface.
+#[cfg(any(windows, test))]
+const HEADER_BAND_TOP_INSET: i32 = 28;
+
 /// Minimum width, in physical pixels, of the header band that must land
 /// inside some monitor's work area for a saved position to count as
 /// recoverable by dragging.
@@ -457,15 +466,15 @@ fn band_is_reachable(band: Rect, monitors: &[Rect]) -> bool {
 }
 
 /// The strip of `window` that `ui::draw_header` registers as the drag
-/// surface: the top `HEADER_BAND_HEIGHT` physical pixels across the full
-/// width.
+/// surface: `HEADER_BAND_HEIGHT` physical pixels starting
+/// `HEADER_BAND_TOP_INSET` below the top, across the full width.
 #[cfg(any(windows, test))]
 fn header_band(window: Rect) -> Rect {
     Rect {
         left: window.left,
-        top: window.top,
+        top: window.top + HEADER_BAND_TOP_INSET,
         right: window.right,
-        bottom: window.top + HEADER_BAND_HEIGHT,
+        bottom: window.top + HEADER_BAND_TOP_INSET + HEADER_BAND_HEIGHT,
     }
 }
 
@@ -492,7 +501,8 @@ fn window_is_reachable(window: Rect, monitors: &[Rect]) -> bool {
 /// screen"
 ///
 /// The overlay is borderless, and the drag surface in `ui::draw_header` —
-/// the top `HEADER_BAND_HEIGHT` px across the window's full width — is the
+/// `HEADER_BAND_HEIGHT` px starting `HEADER_BAND_TOP_INSET` below the top,
+/// across the window's full width — is the
 /// *only* way the user can move it (which it does by tracking the pointer
 /// itself, not via any OS move loop). So "acceptable" isn't "fully on some monitor": a window sitting
 /// mostly off a monitor's edge, with just enough header showing to grab, is
@@ -3864,6 +3874,24 @@ mod tests {
         let (w, h) = (window.width(), window.height());
         assert!(x >= remaining.left && x + w <= remaining.right);
         assert!(y >= remaining.top && y + h <= remaining.bottom);
+    }
+
+    #[test]
+    fn window_with_only_the_corner_inset_on_screen_is_unreachable() {
+        // The drag band starts HEADER_BAND_TOP_INSET below the window's top
+        // (issue #400's corner inset). Positioned so exactly the window's
+        // top HEADER_BAND_TOP_INSET px sit inside the work area, the band
+        // itself (everything from there down) is entirely off screen, so
+        // this window has no reachable band at all even though part of the
+        // window technically touches the monitor.
+        let monitor = rect(0, 0, 1920, 1040);
+        let window = rect(
+            100,
+            1040 - HEADER_BAND_TOP_INSET,
+            500,
+            1040 - HEADER_BAND_TOP_INSET + 300,
+        );
+        assert!(corrected_position(window, &[monitor]).is_some());
     }
 
     #[test]

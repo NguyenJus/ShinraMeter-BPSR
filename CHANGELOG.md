@@ -15,7 +15,7 @@ affiliated with the game's publisher.
   four zones the header touches. A measured header band outside the
   plausible range is also discarded in favour of the constant budget, so a
   bad measurement can no longer cover the window and swallow every resize
-  grab (#400).
+  grab (#400); the skill window's drag band gets the same corner inset.
 
 ## v0.2.6
 
