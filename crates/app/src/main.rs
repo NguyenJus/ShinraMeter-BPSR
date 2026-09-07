@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use bpsr_app::{
     fonts, history, inspect, logging, paths, pipeline, platform, settings, single_instance, ui,
@@ -229,8 +231,10 @@ enum InstanceDecision {
         warning: Option<String>,
     },
     /// Another live instance already owns the meter slot: exit before
-    /// capture ever opens a WinDivert handle.
-    Exit,
+    /// capture ever opens a WinDivert handle. `pid`, when the holder wrote
+    /// one into the lock file, names the process the user has to end
+    /// (issue #401) — the lingering copy has no window to close.
+    Exit { pid: Option<u32> },
 }
 
 fn decide_instance(acquisition: single_instance::Acquisition) -> InstanceDecision {
@@ -239,7 +243,7 @@ fn decide_instance(acquisition: single_instance::Acquisition) -> InstanceDecisio
             guard: Some(guard),
             warning: None,
         },
-        single_instance::Acquisition::AlreadyRunning => InstanceDecision::Exit,
+        single_instance::Acquisition::AlreadyRunning(pid) => InstanceDecision::Exit { pid },
         // A guard that cannot be evaluated must not be able to stop the app:
         // refusing to start because the *lock* is broken would be a worse
         // failure than the duplicate rows it exists to prevent.
@@ -250,6 +254,45 @@ fn decide_instance(acquisition: single_instance::Acquisition) -> InstanceDecisio
             )),
         },
     }
+}
+
+/// How long shutdown waits for any one worker thread before giving up on it.
+///
+/// Issue #401: a windowless process that never exits keeps the
+/// single-instance lock, and the user's only symptom is the next launch
+/// being refused with no window anywhere to close. A wedged thread must
+/// cost the shutdown a bounded delay, not the process's whole life.
+const SHUTDOWN_JOIN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How often the bounded join re-checks, short enough that a normal
+/// shutdown — every thread already finishing — costs no visible delay.
+const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// [`JoinHandle::join`] with a deadline: polls [`JoinHandle::is_finished`]
+/// and, once `deadline` passes, logs which thread is still alive and
+/// *detaches* it (drops the handle) instead of blocking forever.
+///
+/// Detaching is safe here because the caller is on its way out of `main`:
+/// the abandoned thread dies with the process, and the process ending is
+/// exactly what releases the single-instance lock. Returns the thread's
+/// value when it was joined, `None` when it was detached or panicked.
+fn join_with_timeout<T>(name: &str, handle: JoinHandle<T>, deadline: Duration) -> Option<T> {
+    let started = Instant::now();
+    while !handle.is_finished() {
+        let waited = started.elapsed();
+        if waited >= deadline {
+            log::warn!(
+                "shutdown: thread {name} still alive after {}ms; detaching",
+                deadline.as_millis()
+            );
+            drop(handle);
+            return None;
+        }
+        std::thread::sleep(JOIN_POLL_INTERVAL.min(deadline - waited));
+    }
+    let value = handle.join().ok();
+    log::info!("shutdown: thread {name} joined");
+    value
 }
 
 /// `--version`/`-V` early exit (issue #341): CI's Windows smoke job needs a
@@ -291,9 +334,10 @@ fn main() -> eframe::Result {
             }
             guard
         }
-        InstanceDecision::Exit => {
-            log::error!("{}", single_instance::ALREADY_RUNNING_MESSAGE);
-            platform::warn_already_running(single_instance::ALREADY_RUNNING_MESSAGE);
+        InstanceDecision::Exit { pid } => {
+            let message = single_instance::already_running_message(pid);
+            log::error!("{message}");
+            platform::warn_already_running(&message);
             return Ok(());
         }
     };
@@ -470,7 +514,7 @@ fn main() -> eframe::Result {
     if let Some(handle) = capture {
         handle.stop();
     }
-    let _ = pipeline_thread.join();
+    join_with_timeout("pipeline", pipeline_thread, SHUTDOWN_JOIN_DEADLINE);
     // Issue #39: both `HistoryHandle` clones are gone by now — the
     // pipeline's, joined just above, and `OverlayApp`'s own (moved into
     // `OverlayApp::new` above, not merely cloned into it), dropped when
@@ -480,19 +524,23 @@ fn main() -> eframe::Result {
     // reached disk — the same explicit-shutdown discipline
     // `CacheWriter::shutdown` follows.
     if let Some(thread) = history_thread {
-        let _ = thread.join();
+        join_with_timeout("history", thread, SHUTDOWN_JOIN_DEADLINE);
     }
     // `OverlayApp` (and its `tx_settings`) is dropped by the time
     // `run_native` returns, which closes the settings-writer's channel and
     // lets its thread exit; joining here just makes sure the last-sent
     // settings value has finished being persisted before the process ends.
-    let _ = settings_thread.join();
+    join_with_timeout("settings", settings_thread, SHUTDOWN_JOIN_DEADLINE);
     // Capture has already stopped above, so its `Decoder`'s reference to the
     // sink is gone by now — this drops the last one, which is what lets
     // `DiagnosticSink`'s summary actually log (see `inspect::Handle::shutdown`).
     if let Some(inspect_handle) = inspect_handle {
         inspect_handle.shutdown();
     }
+    // Issue #401: the last line of a healthy shutdown. A log that ends
+    // without it says the process never reached the end of `main` — which,
+    // with no window left, is otherwise indistinguishable from a clean exit.
+    log::info!("shutdown: complete");
 
     result
 }
@@ -581,7 +629,7 @@ mod tests {
                 assert!(guard.is_some(), "the winning guard must be kept alive");
                 assert!(warning.is_none());
             }
-            InstanceDecision::Exit => panic!("expected Continue"),
+            InstanceDecision::Exit { .. } => panic!("expected Continue"),
         }
     }
 
@@ -591,7 +639,7 @@ mod tests {
         let _first = single_instance::acquire_at(&path);
         let second = single_instance::acquire_at(&path);
         assert!(
-            matches!(decide_instance(second), InstanceDecision::Exit),
+            matches!(decide_instance(second), InstanceDecision::Exit { .. }),
             "a second live instance must be told to exit, not to continue"
         );
     }
@@ -605,8 +653,38 @@ mod tests {
                 let warning = warning.expect("an unavailable guard should still warn");
                 assert!(warning.contains("disk full"));
             }
-            InstanceDecision::Exit => panic!("a broken guard must not stop the app (issue #277)"),
+            InstanceDecision::Exit { .. } => {
+                panic!("a broken guard must not stop the app (issue #277)")
+            }
         }
+    }
+
+    // -- join_with_timeout (issue #401) --------------------------------------
+
+    #[test]
+    fn a_wedged_thread_is_detached_rather_than_joined_forever() {
+        let handle = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(30));
+            7u32
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(
+            join_with_timeout("wedged", handle, Duration::from_millis(50)),
+            None
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the bounded join must not wait for the thread"
+        );
+    }
+
+    #[test]
+    fn a_finished_thread_is_joined_and_yields_its_value() {
+        let handle = std::thread::spawn(|| 7u32);
+        assert_eq!(
+            join_with_timeout("quick", handle, Duration::from_secs(5)),
+            Some(7)
+        );
     }
 
     // -- version_requested (issue #341) --------------------------------------

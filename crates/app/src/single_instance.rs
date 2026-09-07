@@ -14,7 +14,10 @@
 //! that duplicate, not the numbers in them.
 //!
 //! The guard is an advisory lock on a file next to the log and the database
-//! ([`lock_file_path`]), held for the life of the process. The OS drops the
+//! ([`lock_file_path`]), held for the life of the process. The holder writes
+//! its pid into that file so a refused copy can name the process to end
+//! (issue #401), but the pid is diagnostic only — the lock stays the sole
+//! authority on whether the slot is taken. The OS drops the
 //! lock when the process ends however it ends, so a crashed instance never
 //! leaves a stale lock behind that would lock the user out of their own
 //! meter — which is why this is a file lock rather than a pid file.
@@ -56,8 +59,11 @@ pub struct InstanceGuard {
 pub enum Acquisition {
     /// This process now owns the meter slot.
     Acquired(InstanceGuard),
-    /// Another live instance already owns it; this one must not start.
-    AlreadyRunning,
+    /// Another live instance already owns it; this one must not start. The
+    /// pid is whatever the holder wrote into the lock file (issue #401), so
+    /// the refused copy can name the process to end when it has no window —
+    /// `None` if the file was empty or unreadable.
+    AlreadyRunning(Option<u32>),
     /// The lock could not be evaluated at all (unwritable directory, a
     /// filesystem without locking). Startup continues without a guard —
     /// refusing to run because the *guard* is broken would be a worse bug
@@ -96,12 +102,11 @@ pub const HANDOFF_VAR: &str = "SHINRA_INSTANCE_HANDOFF";
 ///
 /// Kept at 10s rather than shortened (issue #278 review): the joins on the
 /// outgoing side (`pipeline_thread`, the names-cache writer, the settings
-/// thread — see `main.rs`'s shutdown path) block on `JoinHandle::join` with
-/// no internal timeout of their own, so nothing bounds how long a slow but
-/// healthy shutdown — e.g. the SQLite flush contending with disk I/O — can
-/// take. A shorter ceiling would risk cutting off exactly the non-wedged
-/// case this wait exists to cover; there was no evidence here that 5s is
-/// still safe.
+/// thread — see `main.rs`'s shutdown path) are each bounded at 5s since
+/// issue #401, but they run in sequence, so a shutdown where several
+/// threads are slow — e.g. the SQLite flush contending with disk I/O — can
+/// still outlast any one of those deadlines. A shorter ceiling would risk
+/// cutting off exactly the non-wedged case this wait exists to cover.
 const HANDOFF_WAIT: Duration = Duration::from_secs(10);
 
 /// How often the wait re-tries. Short enough that a normal handoff — a
@@ -176,7 +181,7 @@ pub fn acquire() -> Acquisition {
 /// armed — so a handoff that wins immediately logs nothing extra.
 fn acquire_with_logged_handoff(path: &Path, wait: Duration) -> Acquisition {
     match acquire_at(path) {
-        Acquisition::AlreadyRunning => {}
+        Acquisition::AlreadyRunning(_) => {}
         settled => return settled,
     }
     log::info!(
@@ -192,7 +197,7 @@ fn acquire_with_logged_handoff(path: &Path, wait: Duration) -> Acquisition {
             path.display(),
             started.elapsed().as_secs_f64()
         ),
-        Acquisition::AlreadyRunning => log::warn!(
+        Acquisition::AlreadyRunning(_) => log::warn!(
             "gave up waiting for the previous instance to release {} after {}s; it may be stuck rather than exiting",
             path.display(),
             wait.as_secs()
@@ -215,12 +220,12 @@ pub fn acquire_at_within(path: &Path, wait: Duration) -> Acquisition {
     let deadline = Instant::now() + wait;
     loop {
         match acquire_at(path) {
-            Acquisition::AlreadyRunning => {}
+            Acquisition::AlreadyRunning(_) => {}
             settled => return settled,
         }
         let now = Instant::now();
         if now >= deadline {
-            return Acquisition::AlreadyRunning;
+            return Acquisition::AlreadyRunning(read_pid(path));
         }
         std::thread::sleep(RETRY_INTERVAL.min(deadline - now));
     }
@@ -229,9 +234,11 @@ pub fn acquire_at_within(path: &Path, wait: Duration) -> Acquisition {
 /// [`acquire`] against an explicit path — the testable half.
 ///
 /// The lock is taken on a handle that stays open inside the returned guard.
-/// The pid written into the file is diagnostic only: nothing reads it back,
-/// because a pid on disk cannot distinguish "still running" from "crashed,
-/// and the number has since been reused".
+/// The pid written into the file is diagnostic only: it is read back solely
+/// to name the holder in the refusal (issue #401), never to decide whether
+/// the slot is free — a pid on disk cannot distinguish "still running" from
+/// "crashed, and the number has since been reused". The lock itself remains
+/// the only authority on that.
 pub fn acquire_at(path: &Path) -> Acquisition {
     if let Err(err) = paths::ensure_parent_dir(path) {
         let parent = path.parent().unwrap_or(path);
@@ -260,7 +267,7 @@ pub fn acquire_at(path: &Path) -> Acquisition {
 
     match file.try_lock() {
         Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Acquisition::AlreadyRunning,
+        Err(TryLockError::WouldBlock) => return Acquisition::AlreadyRunning(read_pid(path)),
         Err(TryLockError::Error(err)) => {
             return Acquisition::Unavailable(format!("could not lock {} ({err})", path.display()));
         }
@@ -275,11 +282,26 @@ pub fn acquire_at(path: &Path) -> Acquisition {
     Acquisition::Acquired(InstanceGuard { _file: file })
 }
 
+/// The pid the lock's holder wrote into the file, if it is still there and
+/// still parses. Best-effort: a torn, empty or missing file just means the
+/// refusal cannot name a process.
+fn read_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 /// What the refused instance says before it exits — one line, naming the
 /// notification area, because that is where the instance it lost to almost
 /// certainly is.
-pub const ALREADY_RUNNING_MESSAGE: &str = "ShinraMeter-BPSR is already running; look for it in the notification area. \
-     A second copy would write every fight to the history twice, so this one is exiting (issue #277).";
+pub fn already_running_message(pid: Option<u32>) -> String {
+    let holder = match pid {
+        Some(pid) => format!(" (pid {pid})"),
+        None => String::new(),
+    };
+    format!(
+        "ShinraMeter-BPSR is already running{holder}; look for it in the notification area. \
+         A second copy would write every fight to the history twice, so this one is exiting (issue #277)."
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -311,7 +333,7 @@ mod tests {
         assert!(matches!(first, Acquisition::Acquired(_)));
 
         assert!(
-            matches!(acquire_at(&path), Acquisition::AlreadyRunning),
+            matches!(acquire_at(&path), Acquisition::AlreadyRunning(_)),
             "a second acquisition must not succeed while the first guard is alive"
         );
 
@@ -398,7 +420,7 @@ mod tests {
         assert!(
             matches!(
                 acquire_at_within(&path, Duration::from_millis(150)),
-                Acquisition::AlreadyRunning
+                Acquisition::AlreadyRunning(_)
             ),
             "waiting must not turn into letting a real second instance run"
         );
@@ -418,7 +440,7 @@ mod tests {
         let started = Instant::now();
         assert!(matches!(
             acquire_at_within(&path, Duration::ZERO),
-            Acquisition::AlreadyRunning
+            Acquisition::AlreadyRunning(_)
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
 
@@ -447,6 +469,31 @@ mod tests {
         assert_eq!(handoff_wait(Some("")), Duration::ZERO);
         assert_eq!(handoff_wait(Some("0")), Duration::ZERO);
         assert_eq!(handoff_wait(Some("1")), HANDOFF_WAIT);
+    }
+
+    /// Issue #401: a lingering windowless instance is only actionable if the
+    /// refused copy can say *which* process to end.
+    #[test]
+    fn a_refused_instance_reports_the_holding_pid() {
+        let path = lock_path("pid-reported");
+        let first = acquire_at(&path);
+        assert!(matches!(first, Acquisition::Acquired(_)));
+
+        match acquire_at(&path) {
+            Acquisition::AlreadyRunning(pid) => {
+                assert_eq!(pid, Some(std::process::id()));
+            }
+            other => panic!("expected AlreadyRunning, got {other:?}"),
+        }
+
+        drop(first);
+    }
+
+    #[test]
+    fn the_message_names_the_holding_pid_when_it_is_known() {
+        let named = already_running_message(Some(4321));
+        assert!(named.contains("(pid 4321)"), "{named}");
+        assert!(!already_running_message(None).contains("pid"));
     }
 
     #[test]
