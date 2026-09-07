@@ -294,14 +294,21 @@ pub(super) fn draw_header(
     // `header_band_height` budgets for.
     let row_size = egui::vec2(ui.available_width(), BUTTON_ROW_HEIGHT);
     let (row_rect, _) = ui.allocate_exact_size(row_size, egui::Sense::hover());
-    let mut row_ui = ui.new_child(
+    let (pills_rect, cluster_rect) = split_stat_row(row_rect);
+    let mut pills_ui = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(row_rect)
+            .max_rect(pills_rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    row_ui.set_clip_rect(row_rect.intersect(ui.clip_rect()));
+    pills_ui.set_clip_rect(pills_rect.intersect(ui.clip_rect()));
+    let mut cluster_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(cluster_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    cluster_ui.set_clip_rect(cluster_rect.intersect(ui.clip_rect()));
     {
-        let ui = &mut row_ui;
+        let ui = &mut pills_ui;
         // The whole row is inset from the panel's left content edge
         // (`HEADER_STAT_ROW_INSET_X`, issue #91). `add_space` in a
         // horizontal layout advances the cursor directly, with no
@@ -342,16 +349,16 @@ pub(super) fn draw_header(
                 icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
             ),
         );
-        toggle_cluster(
-            ui,
-            tx_command,
-            icons,
-            capturing,
-            share_active,
-            has_history,
-            open_history,
-        )
     }
+    toggle_cluster(
+        &mut cluster_ui,
+        tx_command,
+        icons,
+        capturing,
+        share_active,
+        has_history,
+        open_history,
+    )
 }
 
 // -- toggle cluster (issue #62, #82, #167) --------------------------------
@@ -448,6 +455,19 @@ pub(super) const TOGGLE_ALWAYS_ON_TOP_SIDE: f32 = 14.0;
 pub(super) const TOGGLE_HISTORY_SIDE: f32 = 14.0;
 pub(super) const TOGGLE_GAP: f32 = 5.0;
 pub(super) const TOGGLE_PAD_X: f32 = 4.0;
+
+/// Width of the stat row's Share/Reset/History pill (issue #82, #186), the
+/// same padding-glyph-gap sum `toggle_cluster` used to compute inline.
+/// Pulled out into its own constant so `draw_header` can reserve exactly
+/// this much width on the right of the stat row *before* laying out the
+/// stat pills — see the reservation's own comment for why the cluster can
+/// no longer size itself from whatever the pills left behind.
+pub(super) const STAT_ROW_TOGGLE_CLUSTER_WIDTH: f32 = 2.0 * TOGGLE_PAD_X
+    + TOGGLE_MOUSE_SIDE
+    + TOGGLE_GAP
+    + TOGGLE_CLOUD_SIDE
+    + TOGGLE_GAP
+    + TOGGLE_HISTORY_SIDE;
 
 /// Gap, in points, between the title row's toggle pill (issue #185) and the
 /// dropdown chevron's reserved strip to its right. `TOGGLE_PAD_X`'s value,
@@ -626,7 +646,11 @@ pub(super) fn toggle_state_tint(active: bool) -> egui::Color32 {
 /// unit-testable without a live `egui::Context` or the platform layer's
 /// real atomics.
 pub(super) fn click_through_after_tray_request(click_through: bool, requested: bool) -> bool {
-    if requested { false } else { click_through }
+    if requested {
+        false
+    } else {
+        click_through
+    }
 }
 
 /// Paints the stat row's toggle cluster: Share, Reset (issue #82) and
@@ -666,7 +690,40 @@ pub(super) fn availability_label(
     label: &'static str,
     unavailable: &'static str,
 ) -> &'static str {
-    if active { label } else { unavailable }
+    if active {
+        label
+    } else {
+        unavailable
+    }
+}
+
+/// Splits the stat row's rect into the stat pills' area and the toggle
+/// cluster's, reserving the cluster's fixed `STAT_ROW_TOGGLE_CLUSTER_WIDTH`
+/// on the *right* of `row_rect` before the pills get a say. `draw_header`
+/// used to lay the pills and the cluster out in one shared child `Ui`,
+/// sized purely by the layout cursor's left-to-right advance — so at a
+/// narrow window (below ~372pt of panel) the pills' own ink pushed the
+/// cluster's `allocate_exact_size` rect past `row_ui`'s clip rect, and
+/// `toggle_cluster`'s `is_rect_visible` early return silently dropped
+/// Share/Reset/History with no other way to reach Reset. The cluster's
+/// width is fixed and known up front, so reserving its slot first — in a
+/// `Ui` of its own, with the pills given whatever width is left over in a
+/// second one — makes the pills (informational) the thing that clips at a
+/// narrow width, never the controls. Pure so the split is unit-testable
+/// without a live `egui::Context`; `draw_header` is the only caller.
+pub(super) fn split_stat_row(row_rect: egui::Rect) -> (egui::Rect, egui::Rect) {
+    let cluster_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH,
+            row_rect.top(),
+        ),
+        row_rect.max,
+    );
+    let pills_rect = egui::Rect::from_min_max(
+        row_rect.min,
+        egui::pos2(cluster_rect.left(), row_rect.bottom()),
+    );
+    (pills_rect, cluster_rect)
 }
 
 pub(super) fn toggle_cluster(
@@ -679,12 +736,7 @@ pub(super) fn toggle_cluster(
     open_history: &mut bool,
 ) -> bool {
     let height = ui.spacing().interact_size.y;
-    let width = 2.0 * TOGGLE_PAD_X
-        + TOGGLE_MOUSE_SIDE
-        + TOGGLE_GAP
-        + TOGGLE_CLOUD_SIDE
-        + TOGGLE_GAP
-        + TOGGLE_HISTORY_SIDE;
+    let width = STAT_ROW_TOGGLE_CLUSTER_WIDTH;
     let (rect, _response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
 
     if !ui.is_rect_visible(rect) {
@@ -1822,12 +1874,16 @@ pub(super) fn header_wash_mask(y_frac: f32) -> f32 {
 
 /// The wash's slate at `alpha`, faded by the window opacity — the single
 /// place the wash's fills are built, so the gradient, its mask and the
-/// window-opacity slider can never disagree about what a fill means.
+/// window-opacity slider can never disagree about what a fill means. The
+/// RGB is `HEADER_WASH_EMBLEM_COLOR`'s own — every caller of that constant
+/// only ever reads its `.a()` and gets the rest of the color from here, so
+/// the `0x70/0x80/0x90` SlateGray literal exists exactly once rather than
+/// copy-pasted between the two.
 fn header_wash_slate(alpha: f32, opacity: Opacity) -> egui::Color32 {
     opacity.apply(egui::Color32::from_rgba_unmultiplied(
-        0x70,
-        0x80,
-        0x90,
+        HEADER_WASH_EMBLEM_COLOR.r(),
+        HEADER_WASH_EMBLEM_COLOR.g(),
+        HEADER_WASH_EMBLEM_COLOR.b(),
         alpha.clamp(0.0, 255.0).round() as u8,
     ))
 }
@@ -2135,13 +2191,24 @@ pub(super) const TITLE_SEPARATOR_SEGMENTS: usize = 24;
 /// at `y = 29.322`, which is the viewBox's own vertical center
 /// (`2.639 + 53.366 / 2`).
 ///
-/// Rounded to whole points so the 2pt stroke lands on whole pixel rows at
-/// the usual 1.0 scale instead of straddling two half-covered ones.
+/// Rounded relative to `title_row.top()`, not to the absolute coordinate:
+/// `title_row` itself can sit at a fractional y (e.g. `.top() == 0.5`, one
+/// half-band down from a panel whose own origin isn't whole), and rounding
+/// `tip_y` outright would round *that* offset away too, landing the stroke
+/// off the tip by up to half a point and, at the wrong fractional origin,
+/// leaking it past the title/subtitle gap the row's own layout promises.
+/// Rounding the offset from `title_row.top()` instead keeps the stroke
+/// pinned to the tip *within the row*, whatever the row's own origin is —
+/// which only lands on whole pixel rows in turn when `title_row.top()`
+/// itself does, i.e. at `pixels_per_point == 1.0` and a whole-pixel panel
+/// origin; at other scales or origins this rounding still avoids a
+/// sub-pixel-wide half-covered row, just not one aligned to the physical
+/// pixel grid.
 pub(super) fn title_separator_rect(title_row: egui::Rect, text_band_height: f32) -> egui::Rect {
     let left = title_row.left() + HEADER_GUTTER_WIDTH - TITLE_SEPARATOR_LEFT_BLEED;
     let right = (title_row.right() - HEADER_RIGHT_CONTROL_WIDTH).max(left);
     let tip_y = header_emblem_rect(title_row, text_band_height).center().y;
-    let top = (tip_y - TITLE_SEPARATOR_THICKNESS / 2.0).round();
+    let top = title_row.top() + (tip_y - title_row.top() - TITLE_SEPARATOR_THICKNESS / 2.0).round();
     egui::Rect::from_min_max(
         egui::pos2(left, top),
         egui::pos2(right, top + TITLE_SEPARATOR_THICKNESS),
@@ -2618,6 +2685,33 @@ mod tests {
         assert_eq!(
             button_count, 3,
             "expected Share, Reset and History to each expose a Button role, got {button_count}"
+        );
+    }
+
+    /// Regression for the toggle cluster's silent-drop bug: at a stat row
+    /// no wider than `MIN_INNER_SIZE.x` (issue #400's overflow floor, well
+    /// past the ~372pt panel width the pills alone start overflowing at),
+    /// `split_stat_row`'s cluster half must still land entirely inside
+    /// `row_rect` — the reservation is unconditional on the row's own
+    /// width, not on the pills leaving enough room behind. Reset has no
+    /// other entry point, so if this ever fails again the button is gone.
+    #[test]
+    fn split_stat_row_keeps_the_toggle_cluster_inside_a_narrow_row() {
+        let row_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(MIN_INNER_SIZE.x, BUTTON_ROW_HEIGHT),
+        );
+        let (pills_rect, cluster_rect) = split_stat_row(row_rect);
+
+        assert!(
+            row_rect.contains_rect(cluster_rect),
+            "the toggle cluster {cluster_rect:?} spills outside the stat row {row_rect:?}"
+        );
+        assert_eq!(cluster_rect.width(), STAT_ROW_TOGGLE_CLUSTER_WIDTH);
+        assert_eq!(cluster_rect.right(), row_rect.right());
+        assert!(
+            pills_rect.right() <= cluster_rect.left(),
+            "the pills area {pills_rect:?} overlaps the toggle cluster {cluster_rect:?}"
         );
     }
 
@@ -3512,8 +3606,8 @@ mod tests {
     /// landing — proves the guard stays set for every frame in between,
     /// not just the click.
     #[test]
-    fn screenshot_capture_guard_stays_set_through_the_captured_frame_and_every_frame_until_the_reply_lands()
-     {
+    fn screenshot_capture_guard_stays_set_through_the_captured_frame_and_every_frame_until_the_reply_lands(
+    ) {
         let mut capturing = false;
 
         // Frame 0: the Share click fires the request. This frame itself is
@@ -4246,6 +4340,24 @@ mod tests {
         let separator = title_separator_rect(row, header_text_band_height());
         assert!(separator.top() >= row.bottom());
         assert!(separator.bottom() <= row.bottom() + HEADER_TITLE_SUBTITLE_GAP);
+    }
+
+    /// Same invariant as the test above, but with a `title_row` whose top
+    /// sits at a fractional coordinate (0.5pt) rather than a whole one.
+    /// Rounding `tip_y` in absolute space (the bug this regresses)
+    /// straddled the stroke across +24.5..+26.5 here, 0.5pt past
+    /// `row.bottom() + HEADER_TITLE_SUBTITLE_GAP` and into the subtitle's
+    /// own line box — `title_separator_rect` must instead round the offset
+    /// from `title_row.top()`, so a fractional row origin shifts the stroke
+    /// wholesale rather than widening or displacing it out of the gap.
+    #[test]
+    fn the_title_and_subtitle_stay_four_points_apart_at_a_fractional_row_origin() {
+        let row =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.5), egui::vec2(380.0, TITLE_LINE_HEIGHT));
+        let separator = title_separator_rect(row, header_text_band_height());
+        assert!(separator.top() >= row.bottom());
+        assert!(separator.bottom() <= row.bottom() + HEADER_TITLE_SUBTITLE_GAP);
+        assert_eq!(separator.height(), TITLE_SEPARATOR_THICKNESS);
     }
 
     /// Issue #91's header grid: `TITLE_LINE_HEIGHT + ITEM_SPACING_Y +

@@ -98,10 +98,17 @@ pub(super) fn draw_rows(
                 &stat_columns,
                 COLUMN_RIGHT_MARGIN,
             );
+            let scale = column_scale_from_widths(
+                avail.left(),
+                avail.left() + content_width,
+                &stat_columns.iter().map(|c| c.width).collect::<Vec<_>>(),
+                COLUMN_RIGHT_MARGIN,
+            );
             let layout = RowLayout {
                 kinds: &columns,
                 columns: &stat_columns,
                 anchors: &anchors,
+                scale,
                 settings,
             };
 
@@ -263,13 +270,7 @@ pub(super) fn column_anchors_from_widths(
     widths: &[f32],
     margin: f32,
 ) -> Vec<f32> {
-    let total_width: f32 = widths.iter().sum();
-    let available = (rect_right - rect_left - margin).max(0.0);
-    let scale = if total_width > available && total_width > 0.0 {
-        available / total_width
-    } else {
-        1.0
-    };
+    let scale = column_scale_from_widths(rect_left, rect_right, widths, margin);
 
     let mut anchors = Vec::with_capacity(widths.len());
     let mut x = rect_right - margin;
@@ -279,6 +280,34 @@ pub(super) fn column_anchors_from_widths(
     }
     anchors.reverse();
     anchors
+}
+
+/// The proportional shrink `column_anchors_from_widths` applies to every
+/// column's *nominal* width when the row is too narrow to fit them all at
+/// full size — `1.0` whenever there's room, `< 1.0` in a compressed row.
+///
+/// Split out of `column_anchors_from_widths` (rather than left as a local
+/// there) so a caller that needs a column's *real*, on-screen slot width —
+/// not just its right-aligned anchor — can multiply this into `width`
+/// itself. `column_text_placement`'s CritPct/LuckyPct centering is exactly
+/// that caller: centering on the nominal `width` instead of `width * scale`
+/// places the centered text `(1 - scale) * width / 2` left of its real slot
+/// in a compressed row, which can overlap the right-aligned column to its
+/// left (see `centered_column_text_stays_inside_its_scaled_slot_in_a_
+/// compressed_row`).
+pub(super) fn column_scale_from_widths(
+    rect_left: f32,
+    rect_right: f32,
+    widths: &[f32],
+    margin: f32,
+) -> f32 {
+    let total_width: f32 = widths.iter().sum();
+    let available = (rect_right - rect_left - margin).max(0.0);
+    if total_width > available && total_width > 0.0 {
+        available / total_width
+    } else {
+        1.0
+    }
 }
 
 /// The horizontal clip rect for one stat column's painted text: bounded on
@@ -338,6 +367,14 @@ pub(super) fn column_clip_rect(rect: egui::Rect, anchor: f32, width: f32) -> egu
 /// column); it is centered too so that it reads as a matched pair with the
 /// crit % beside it rather than as a lone right-aligned percentage.
 ///
+/// `width` here must be the column's *real*, on-screen slot width — its
+/// nominal `StatColumn::width` scaled by `column_scale_from_widths` — not
+/// the bare nominal width `column_clip_rect` uses. `column_anchors_from_
+/// widths` shrinks every column's slot proportionally in a row too narrow
+/// to fit them all at full size; centering on the unscaled width there
+/// would center the text `(1 - scale) * width / 2` left of where its slot
+/// actually is, which can bleed into the right-aligned column to its left.
+///
 /// Pure, so both the alignment choice and the resulting x are unit-testable
 /// without a live painter — same reasoning as `column_clip_rect`.
 pub(super) fn column_text_placement(
@@ -368,6 +405,13 @@ pub(super) struct RowLayout<'a> {
     pub(super) kinds: &'a [ColumnKind],
     pub(super) columns: &'a [StatColumn],
     pub(super) anchors: &'a [f32],
+    /// The same proportional shrink baked into `anchors`
+    /// (`column_scale_from_widths`), carried alongside them so `draw_row`
+    /// can scale a column's nominal `width` down to its real slot width for
+    /// `column_text_placement`'s CritPct/LuckyPct centering — see that
+    /// function's doc comment. `1.0` whenever the row is wide enough that
+    /// `anchors` needed no scaling at all.
+    pub(super) scale: f32,
     /// Issue #168: `draw_row` needs the live `Settings` (not just `kinds`,
     /// which now excludes `AbilityScore`/`SeasonStrength` — see
     /// `Settings::stat_columns`) to compose the name-suffix text via
@@ -599,8 +643,12 @@ pub(super) fn draw_row(
             );
         } else {
             // Right-aligned on the anchor, except for the centered crit-%
-            // (and Lucky-%) column — see `column_text_placement`.
-            let (pos, align) = column_text_placement(*kind, rect, *anchor_x, column.width);
+            // (and Lucky-%) column — see `column_text_placement`. Scaled by
+            // `layout.scale` (see `RowLayout::scale`) so centering lands on
+            // the column's real slot even in a compressed row, not its
+            // nominal width.
+            let (pos, align) =
+                column_text_placement(*kind, rect, *anchor_x, column.width * layout.scale);
             paint_text(
                 &painter,
                 pos,
@@ -718,13 +766,26 @@ pub(super) const SHARE_BAR_ACCENT_THICKNESS: f32 = 2.0;
 /// rounded by. The source's accent `Border` is `Height="2"` with
 /// `CornerRadius="0 1 1 0"` (PlayerStatsControl.xaml:50-63) - square on the
 /// left, rounded by 1 on the right - which a gradient mesh cannot express,
-/// so `share_bar_paints` carves the last point of the accent off into a
-/// `rect_filled` cap that carries the rounding. One point wide because that
-/// is exactly the source's radius: any wider and the flat, fully opaque cap
-/// would visibly eat into the gradient.
-pub(super) const SHARE_BAR_ACCENT_CAP: f32 = 1.0;
+/// so `share_bar_paints` carves the last points of the accent off into a
+/// `rect_filled` cap that carries the rounding.
+///
+/// Equal to `SHARE_BAR_ACCENT_THICKNESS` (2.0), not the source's 1pt corner
+/// radius: `Painter::rect_filled` clamps a rect's corner radius to
+/// `min(width, height) / 2`, so a 1-wide cap on a 2pt-tall bar clamps
+/// `SHARE_BAR_ACCENT_CAP_RADIUS` down to 0.5 and the corner never actually
+/// rounds — it just reads as a dimmed, antialiased notch where the flat
+/// cap color meets the gradient. At `2.0` wide the cap rect is 2x2, so
+/// `min(width, height) / 2` is exactly `1.0` and the radius survives the
+/// clamp unchanged (`share_bar_accent_ends_in_a_rounded_right_cap`). When
+/// `bar_width` itself is narrower than this cap (`cap_width` below), the
+/// entire accent *is* the cap — painted flat rather than graded, which
+/// reads correctly for a bar that thin regardless.
+pub(super) const SHARE_BAR_ACCENT_CAP: f32 = 2.0;
 /// Corner radius of `SHARE_BAR_ACCENT_CAP`'s cap rect - the right pair of
-/// the source's `CornerRadius="0 1 1 0"`.
+/// the source's `CornerRadius="0 1 1 0"`. Chosen alongside
+/// `SHARE_BAR_ACCENT_CAP` so the two survive egui's `min(width, height) / 2`
+/// corner-radius clamp instead of being silently flattened by it - see that
+/// constant's doc comment.
 pub(super) const SHARE_BAR_ACCENT_CAP_RADIUS: u8 = 1;
 
 /// A two-triangle gradient quad. egui has no gradient brush, so the
@@ -805,7 +866,7 @@ pub(super) struct ShareBarPaints {
     pub(super) accent_right: egui::Color32,
     /// The accent's rounded right cap, painted flat in `accent_right`
     /// rather than graded so it can carry the source's `CornerRadius="0 1 1
-    /// 0"`. `None` when the bar is too narrow to spend a point on a cap
+    /// 0"`. `None` when the bar is too narrow to spend any width on a cap
     /// (a zero `bar_frac` has no accent at all to cap).
     pub(super) accent_cap: Option<egui::Rect>,
 }
@@ -1655,7 +1716,7 @@ mod tests {
         let rect = share_bar_rect();
         let paints = share_bar_paints(rect, 1.0, None);
         assert_eq!(paints.fill_rect.width(), rect.width());
-        // The accent spans it too, minus the point its rounded right cap
+        // The accent spans it too, minus the span its rounded right cap
         // (`SHARE_BAR_ACCENT_CAP`) is carved out of.
         assert_eq!(
             paints.accent_rect.width(),
@@ -1707,6 +1768,15 @@ mod tests {
     /// two right corners rounded by 1. The graded mesh cannot round, so the
     /// last `SHARE_BAR_ACCENT_CAP` points of the accent are split off into
     /// a rounded, fully opaque cap rect painted at the mesh's right end.
+    ///
+    /// `SHARE_BAR_ACCENT_CAP` is deliberately equal to
+    /// `SHARE_BAR_ACCENT_THICKNESS` (both 2.0), not the source's 1pt
+    /// corner radius, because `Painter::rect_filled` clamps a rect's corner
+    /// radius to `min(width, height) / 2` — a 1-wide cap on this 2pt-tall
+    /// bar would clamp `SHARE_BAR_ACCENT_CAP_RADIUS` down to 0.5 and never
+    /// actually round, reading as a dimmed antialiased notch instead. This
+    /// asserts the *would-be* clamped radius is not smaller than the radius
+    /// this file paints with, i.e. that the corner survives the clamp.
     #[test]
     fn share_bar_accent_ends_in_a_rounded_right_cap() {
         let rect = share_bar_rect();
@@ -1723,6 +1793,17 @@ mod tests {
         assert_eq!(
             paints.accent_rect.width() + cap.width(),
             paints.fill_rect.width()
+        );
+        // The radius egui will actually paint with, after its
+        // `min(width, height) / 2` clamp, must not have shrunk below the
+        // radius this file configured — otherwise the corner silently
+        // stops rounding.
+        let clamped_radius =
+            (cap.width().min(cap.height()) / 2.0).min(f32::from(SHARE_BAR_ACCENT_CAP_RADIUS));
+        assert_eq!(
+            clamped_radius,
+            f32::from(SHARE_BAR_ACCENT_CAP_RADIUS),
+            "SHARE_BAR_ACCENT_CAP_RADIUS must survive egui's corner-radius clamp"
         );
     }
 
@@ -2356,6 +2437,44 @@ mod tests {
             assert_eq!(align, egui::Align2::RIGHT_CENTER, "{kind:?}");
             assert_eq!(pos.x, 250.0, "{kind:?} must end on its column anchor");
         }
+    }
+
+    /// The centering bug this guards against: `column_text_placement` used
+    /// to be handed a column's bare nominal `StatColumn::width`, but
+    /// `column_anchors_from_widths` scales every column's *slot* down by
+    /// `column_scale_from_widths` in a row too narrow to fit them all at
+    /// full size. Centering on the unscaled width there placed the text
+    /// `(1 - scale) * width / 2` left of where its slot actually sits,
+    /// which can overlap the right-aligned column to its left. `draw_row`
+    /// must instead scale the width itself (`column.width * layout.scale`)
+    /// before calling `column_text_placement` — this asserts that scaled
+    /// call lands the text exactly on the real, scaled slot's center.
+    #[test]
+    fn centered_column_text_stays_inside_its_scaled_slot_in_a_compressed_row() {
+        let widths = [56.0_f32, 40.0, 40.0];
+        let rect_left = 0.0;
+        let margin = 4.0;
+        // Narrower than the columns' combined width plus margin, so
+        // `column_scale_from_widths` must shrink below 1.0.
+        let total: f32 = widths.iter().sum();
+        let rect_right = total * 0.5;
+
+        let scale = column_scale_from_widths(rect_left, rect_right, &widths, margin);
+        assert!(scale < 1.0, "row must actually be compressed for this test");
+        let anchors = column_anchors_from_widths(rect_left, rect_right, &widths, margin);
+
+        let crit_index = 1;
+        let scaled_width = widths[crit_index] * scale;
+        let expected_center = anchors[crit_index] - scaled_width / 2.0;
+
+        let row = row_rect();
+        let (pos, align) =
+            column_text_placement(ColumnKind::CritPct, row, anchors[crit_index], scaled_width);
+        assert_eq!(align, egui::Align2::CENTER_CENTER);
+        assert_eq!(
+            pos.x, expected_center,
+            "centered text must sit at the scaled slot's center, not the nominal width's"
+        );
     }
 
     /// Issue #400: the Deaths counter — the rightmost column — must stay
