@@ -1557,20 +1557,36 @@ pub(super) const HEADER_STAT_ROW_INSET_X: f32 = HEADER_GUTTER_WIDTH + HEADER_TEX
 /// that measurement — or its absence, on the very first frame — into the
 /// number those consumers size against.
 ///
-/// Issue #400: the measurement is *clamped* to twice the constant budget.
-/// `measure_header_rect` reads a layout cursor, and a cursor that has not
-/// been moved by the header (or a future panel that expands the `Ui` the way
-/// issue #340's `min_rect` did) measures the band as the whole window. Every
-/// consumer sizes off this number — including the title-bar drag band, which
-/// is registered after `draw_resize_handles` and therefore wins the hit test
-/// wherever it overlaps them — so an unclamped bad measurement swallows
-/// every resize grab in the window at once (the v0.3.0 symptom). Twice the
-/// budget is far more headroom than any restyling needs and still far short
-/// of a window height.
+/// Issue #400: a measurement outside the plausible range is *rejected in
+/// favour of the budget*. `measure_header_rect` reads a layout cursor, and a
+/// cursor that has not been moved by the header (or a future panel that
+/// expands the `Ui` the way issue #340's `min_rect` did) measures the band
+/// as the whole window. Every consumer sizes off this number — including
+/// the title-bar drag band, which is registered after `draw_resize_handles`
+/// and therefore wins the hit test wherever it overlaps them — so an
+/// unrejected bad measurement swallows every resize grab in the window at
+/// once (the v0.3.0 symptom). The plausible range runs from
+/// `BUTTON_ROW_HEIGHT` (the header can never measure shorter than its own
+/// button row) to `MAX_MEASURED_HEADER_BAND_HEIGHT`; anything outside it
+/// falls back to the constant budget.
 pub(super) fn measured_header_band_height(header_rect: Option<egui::Rect>) -> f32 {
     let budget = header_band_height(BUTTON_ROW_HEIGHT);
-    header_rect.map_or(budget, |rect| rect.height().min(2.0 * budget))
+    header_rect.map_or(budget, |rect| {
+        let h = rect.height();
+        if (BUTTON_ROW_HEIGHT..=MAX_MEASURED_HEADER_BAND_HEIGHT).contains(&h) {
+            h
+        } else {
+            budget
+        }
+    })
 }
+
+/// The tallest band that still clears the south strip and bottom corner
+/// squares at the minimum window height. A measurement any taller than this
+/// cannot be a real header band — at `MIN_INNER_SIZE.y` it would already
+/// overlap the resize zones along the window's bottom edge — so
+/// `measured_header_band_height` rejects it in favour of the budget.
+const MAX_MEASURED_HEADER_BAND_HEIGHT: f32 = super::MIN_INNER_SIZE.y - RESIZE_CORNER;
 
 /// The title bar's drag surface, carved out of the header band's paint rect
 /// so it never overlaps a `resize_zones` grab strip.
@@ -1583,13 +1599,15 @@ pub(super) fn measured_header_band_height(header_rect: Option<egui::Rect>) -> f3
 /// at the top corners. A single `Rect` cannot express "wider below the
 /// corners", so the top is dropped by the whole `RESIZE_CORNER` and the
 /// sides by `RESIZE_EDGE`: that clears all four zones exactly, and at the
-/// 70pt band budget it still leaves 56pt of full-width title bar to grab,
-/// so the window stays comfortably draggable.
+/// 70pt band budget it still leaves a 56pt-tall band spanning the width
+/// between the two side strips (minus the chevron and toggle pill, which
+/// take their own clicks), so the window stays comfortably draggable.
 pub(super) fn header_drag_band(header_paint_clip: egui::Rect) -> egui::Rect {
     let mut band = header_paint_clip;
     band.min.y += RESIZE_CORNER;
     band.min.x += RESIZE_EDGE;
     band.max.x -= RESIZE_EDGE;
+    debug_assert!(band.height() > 0.0);
     band
 }
 
@@ -4264,8 +4282,8 @@ mod tests {
     /// the sizing with it instead of leaving it pinned to the constant.
     #[test]
     fn measured_header_band_height_uses_the_rect_the_header_actually_painted() {
-        let painted = egui::Rect::from_min_size(egui::pos2(4.0, 7.0), egui::vec2(300.0, 81.0));
-        assert_eq!(measured_header_band_height(Some(painted)), 81.0);
+        let painted = egui::Rect::from_min_size(egui::pos2(4.0, 7.0), egui::vec2(300.0, 74.0));
+        assert_eq!(measured_header_band_height(Some(painted)), 74.0);
         let shorter = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 50.0));
         assert_eq!(measured_header_band_height(Some(shorter)), 50.0);
     }
@@ -4293,17 +4311,56 @@ mod tests {
     }
 
     /// Issue #400: a measurement that came out as the whole window (the
-    /// v0.3.0 regression) is clamped, so the band can never cover the
+    /// v0.3.0 regression) is rejected, so the band can never cover the
     /// window and swallow every resize grab.
     #[test]
-    fn measured_header_band_height_clamps_a_full_window_measurement() {
+    fn measured_header_band_height_rejects_a_full_window_measurement() {
         let budget = header_band_height(BUTTON_ROW_HEIGHT);
         let whole_window =
             egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(420.0, 900.0));
-        assert_eq!(
-            measured_header_band_height(Some(whole_window)),
-            2.0 * budget
+        assert_eq!(measured_header_band_height(Some(whole_window)), budget);
+    }
+
+    /// A whole-window measurement at the minimum window height is exactly
+    /// the case `MAX_MEASURED_HEADER_BAND_HEIGHT` exists to catch: it must
+    /// still fall back to the budget, and the resulting drag band must not
+    /// positively intersect a single resize zone at the minimum size or at
+    /// an ordinary window size.
+    #[test]
+    fn measured_header_band_height_rejects_a_whole_window_measurement_at_the_minimum_size() {
+        let budget = header_band_height(BUTTON_ROW_HEIGHT);
+        let whole_window = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(MIN_INNER_SIZE.x, MIN_INNER_SIZE.y),
         );
+        assert_eq!(measured_header_band_height(Some(whole_window)), budget);
+
+        for size in [MIN_INNER_SIZE, egui::vec2(420.0, 300.0)] {
+            let window = egui::Rect::from_min_size(egui::pos2(120.0, 80.0), size);
+            let header = egui::Rect::from_min_size(window.min, egui::vec2(window.width(), budget));
+            let band = header_drag_band(header);
+            for (zone, dir, _) in resize_zones(window) {
+                let overlap = band.intersect(zone);
+                assert!(
+                    !overlap.is_positive(),
+                    "drag band {band:?} overlaps the {dir:?} resize zone {zone:?} at window size {size:?}"
+                );
+            }
+        }
+    }
+
+    /// Issue #400: a zero-height or negative-height measurement (both seen
+    /// from a layout cursor that has not advanced) must fall back to the
+    /// budget rather than producing an unusable or inverted band.
+    #[test]
+    fn measured_header_band_height_rejects_a_degenerate_measurement() {
+        let budget = header_band_height(BUTTON_ROW_HEIGHT);
+        let zero_height = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 0.0));
+        assert_eq!(measured_header_band_height(Some(zero_height)), budget);
+
+        let negative_height =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, -ITEM_SPACING_Y));
+        assert_eq!(measured_header_band_height(Some(negative_height)), budget);
     }
 
     /// egui stacks title + subtitle + stat row, so the band pays two gaps,
