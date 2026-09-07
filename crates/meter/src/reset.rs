@@ -102,15 +102,18 @@ impl Default for ResetConfig {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct EnemyState {
-    /// Whether `Meter::end_fight_on_boss_death` has already logged its
-    /// issue #256 refusal diagnostic for this enemy in this fight (issue
-    /// #410). All four death signals can reach that refusal for one
-    /// corpse, and the guard below it (`fight_end_ms().is_some()`) is
-    /// `None` exactly when the death is refused - so without this marker
-    /// the same line printed two or three times a second apart and read
-    /// like two separate deaths. Cleared by `Meter::reset`, alongside
+    /// The last `(other_living_boss.is_some(), dungeon_objective_still_running)`
+    /// pair `Meter::end_fight_on_boss_death` logged its issue #256 refusal
+    /// diagnostic for, for this enemy in this fight (issue #410). All four
+    /// death signals can reach that refusal for one corpse, and the guard
+    /// below it (`fight_end_ms().is_some()`) is `None` exactly when the
+    /// death is refused - so without this marker the same line printed two
+    /// or three times a second apart and read like two separate deaths.
+    /// Keyed on the guard pair rather than a plain bool so a refusal whose
+    /// *reason* changed (e.g. the other boss died in between) still logs
+    /// once more. Cleared to `None` by `Meter::reset`, alongside
     /// `took_damage`, so a later pull on the same enemy logs again.
-    pub boss_death_refusal_logged: bool,
+    pub boss_death_refusal_logged: Option<(bool, bool)>,
     pub curr_hp: Option<u64>,
     pub max_hp: Option<u64>,
     /// High-water mark of every `curr_hp` ever observed for this enemy
@@ -284,7 +287,7 @@ mod tests {
             peak_hp: Some(max_hp),
             lowest_pct,
             took_damage: true,
-            boss_death_refusal_logged: false,
+            boss_death_refusal_logged: None,
             last_damaged_ms: Some(0),
             death_order: None,
             monster_id: None,
@@ -300,7 +303,7 @@ mod tests {
             peak_hp: Some(peak_hp),
             lowest_pct,
             took_damage: true,
-            boss_death_refusal_logged: false,
+            boss_death_refusal_logged: None,
             last_damaged_ms: Some(0),
             death_order: None,
             monster_id: None,

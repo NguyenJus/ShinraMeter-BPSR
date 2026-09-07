@@ -2271,18 +2271,26 @@ impl Meter {
         // not end its fight, never a per-packet flood. Both guards and every
         // input either of them read are named, so one capture is enough to
         // decide the next case without another round of guessing.
-        // issue #410: one line per enemy per fight. All four death
-        // signals can reach this refusal for the same corpse (the only
-        // dedup below it, `fight_end_ms().is_some()`, is `None` exactly
-        // when the death is refused), which printed the same line twice a
-        // second apart and read as two deaths. `reset` clears the marker,
-        // so a later pull on the same enemy logs again.
-        let first_refusal = self
+        // issue #410: one line per enemy per fight *per distinct guard
+        // pair*. All four death signals can reach this refusal for the
+        // same corpse (the only dedup below it, `fight_end_ms().is_some()`,
+        // is `None` exactly when the death is refused), which printed the
+        // same line twice a second apart and read as two deaths. Keyed on
+        // `(other_boss.is_some(), objective_holds)` rather than a plain
+        // bool so a refusal for a *different* reason (e.g. the other boss
+        // died in between, or the objective completed) still logs — only a
+        // repeat of the exact same reason is suppressed. `reset` clears the
+        // marker, so a later pull on the same enemy logs again.
+        let key = (other_boss.is_some(), objective_holds);
+        let should_log = self
             .enemies
             .get_mut(&entity)
-            .is_some_and(|e| !std::mem::replace(&mut e.boss_death_refusal_logged, true));
-        if !first_refusal {
+            .is_some_and(|e| e.boss_death_refusal_logged != Some(key));
+        if !should_log {
             return;
+        }
+        if let Some(e) = self.enemies.get_mut(&entity) {
+            e.boss_death_refusal_logged = Some(key);
         }
         log::info!(
             "{}",
@@ -3430,6 +3438,7 @@ impl Meter {
         // than on the map key. Two live entities sharing one display uid is
         // vanishingly rare among party members, but dropping both is the
         // right reading of "this uid left the party" either way.
+        let before = self.players.len();
         let mut pruned = 0u32;
         self.players.retain(|entity, p| {
             let keep = entity.display_uid() != uid;
@@ -3442,14 +3451,16 @@ impl Meter {
         // issue #410: `known_players` in the reset line shrinks after every
         // roster change and read like a party-size bug, because nothing in
         // this crate ever logged the roster changing. Sparse by
-        // construction (issue #69): one line per join/leave push. A party
-        // uid is player data, but this one is already the subject of the
-        // event the meter is acting on, and the resulting size is what
-        // makes the reset line's denominator readable.
-        log::info!(
-            "encounter: team member left uid={uid} roster_size={}",
-            self.players.len()
-        );
+        // construction (issue #69): one line per join/leave push, and only
+        // when the retain actually removed a row — a no-op prune (the uid
+        // was never in `players`) has nothing to report. Counts only - no
+        // uid, no name, matching `apply_team_roster`'s line.
+        if self.players.len() != before {
+            log::info!(
+                "encounter: team member left roster_size={}",
+                self.players.len()
+            );
+        }
     }
 
     /// `ProtocolEvent::TeamRoster` (issue #343): the authoritative
@@ -3487,6 +3498,7 @@ impl Meter {
         if members.is_empty() || !self.in_dungeon_scene() || self.fight_end_ms().is_some() {
             return;
         }
+        let before = self.players.len();
         let mut pruned = 0u32;
         let local_uid = self.local_uid;
         self.players.retain(|entity, p| {
@@ -3499,8 +3511,12 @@ impl Meter {
         });
         self.preload_count = self.preload_count.saturating_sub(pruned);
         // issue #410: the other half of the roster trail, same rationale as
-        // `apply_team_member_left`'s line. Counts only - no uid, no name.
-        log::info!("encounter: team roster updated size={}", self.players.len());
+        // `apply_team_member_left`'s line. Fires only on an actual
+        // membership change (the retain pruned a row), not on every roster
+        // push. Counts only - no uid, no name.
+        if self.players.len() != before {
+            log::info!("encounter: team roster updated size={}", self.players.len());
+        }
     }
 
     fn apply_enemy_hp(&mut self, e: &EnemyHp) -> Option<ResetReason> {
@@ -3967,7 +3983,7 @@ impl Meter {
             enemy.took_damage = false;
             // issue #410: per-fight, like `took_damage` - the next pull's
             // refusal (if any) is news again.
-            enemy.boss_death_refusal_logged = false;
+            enemy.boss_death_refusal_logged = None;
             // `death_order` deliberately survives (PR #144 review, finding
             // 2). A reset is bookkeeping, not a resurrection: it says nothing
             // about whether the corpse is back on its feet, and the rest of
@@ -4547,11 +4563,6 @@ fn fight_end_log(
     }
 }
 
-/// Builds the `reset` diagnostic line. The boss HP percentage and the
-/// party down count are what make a `BossHpRollback` and a genuine wipe
-/// distinguishable in a log (issue #151's diagnostics gap, issue #154):
-/// the rollback shape alone reads the same either way. Counts only — never
-/// a player name or uid.
 /// Which signal told the meter a boss was dead (issue #410).
 ///
 /// Four independent paths reach [`Meter::end_fight_on_boss_death`], and
@@ -4646,6 +4657,12 @@ struct BossHpSnapshot {
     alive: bool,
 }
 
+/// Builds the `reset` diagnostic line. The boss HP percentage and the
+/// party down count are what make a `BossHpRollback` and a genuine wipe
+/// distinguishable in a log (issue #151's diagnostics gap, issue #154):
+/// the rollback shape alone reads the same either way. Player data is
+/// counts only - never a player name or uid; the uid it prints belongs to
+/// the boss enemy (issue #410).
 fn reset_log(
     reason: ResetReason,
     boss: Option<BossHpSnapshot>,
@@ -12193,6 +12210,14 @@ mod tests {
                 .unwrap_or(false)
         }
 
+        /// How many captured lines contain `needle`.
+        fn logged_count(needle: &str) -> usize {
+            CAPTURED
+                .lock()
+                .map(|captured| captured.iter().filter(|line| line.contains(needle)).count())
+                .unwrap_or(0)
+        }
+
         #[test]
         fn a_server_change_logs_the_boss_the_fight_was_on() {
             // PR #163 review, finding 3: the `ServerChanged` arm cleared
@@ -12440,6 +12465,199 @@ mod tests {
                      objective_complete=Some(false)"
                 )),
                 "the diagnostic line must name every guard input, not just say a boss death was dropped"
+            );
+        }
+
+        /// issue #410: the refusal dedup is keyed on the guard pair
+        /// (`other_living_boss.is_some()`, `dungeon_objective_still_running`),
+        /// not on the enemy alone — a second refusal *for a different
+        /// reason* is new information and must still log.
+        ///
+        /// The second signal is delivered by calling
+        /// `end_fight_on_boss_death` directly rather than by feeding another
+        /// packet: every one of the four death paths first checks that the
+        /// dying enemy is still `boss_entity`, and the moment a *second*
+        /// boss is alive and damaged the ranking has already moved
+        /// `boss_entity` onto it — so no packet sequence can drive the same
+        /// corpse through two different guard pairs. The dedup below the
+        /// gate is what this test is about, so it is exercised where it
+        /// lives.
+        #[test]
+        fn boss_death_refusal_logs_again_when_the_guard_pair_changes() {
+            install_capture();
+
+            const DYING_UID: i64 = 40;
+            const OTHER_BOSS_UID: i64 = 41;
+            let needle = format!(
+                "encounter: boss death of uid={DYING_UID} monster_id={DIAG_BOSS} did not end the fight"
+            );
+            let dying = EntityId::from_display_uid(DYING_UID, EntityKind::Monster)
+                .expect("in-range test uid");
+            let mut m = Meter::new();
+
+            m.apply(&ProtocolEvent::DungeonState {
+                state: EDungeonState::Active,
+                scene_uuid: None,
+            });
+            m.apply(&ProtocolEvent::DungeonObjective {
+                target_id: 700,
+                nums: Some(0),
+                complete: Some(false),
+            });
+
+            // The dying boss outranks the other one on max HP, so it is
+            // `boss_entity` when its own death lands.
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: dying,
+                uid: DYING_UID,
+                curr_hp: Some(200),
+                max_hp: Some(200),
+                monster_id: Some(DIAG_BOSS),
+                timestamp_ms: 0,
+            }));
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(OTHER_BOSS_UID, EntityKind::Monster)
+                    .expect("in-range test uid"),
+                uid: OTHER_BOSS_UID,
+                curr_hp: Some(100),
+                max_hp: Some(100),
+                monster_id: Some(DIAG_BOSS),
+                timestamp_ms: 0,
+            }));
+            for target in [DYING_UID, OTHER_BOSS_UID] {
+                m.apply(&ProtocolEvent::Damage(
+                    DamageEvent {
+                        attacker_uid: 1,
+                        attacker_kind: EntityKind::Player,
+                        target_uid: target,
+                        target_kind: EntityKind::Monster,
+                        value: 50,
+                        timestamp_ms: 1_000,
+                        ..Default::default()
+                    }
+                    .test_reconstructed(),
+                ));
+            }
+            // First refusal: the other boss is alive and engaged and the
+            // objective is still running — key = (true, true).
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: DYING_UID,
+                    target_kind: EntityKind::Monster,
+                    value: 200,
+                    is_dead: true,
+                    timestamp_ms: 2_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
+            assert_eq!(m.fight_end_ms(), None);
+            assert_eq!(logged_count(&needle), 1, "the first refusal must log");
+
+            // The other boss dies too, so the *reason* the corpse's death
+            // did not end the fight changes: key = (false, true), the
+            // objective alone.
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: OTHER_BOSS_UID,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    is_dead: true,
+                    timestamp_ms: 3_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
+            assert_eq!(m.fight_end_ms(), None);
+            m.end_fight_on_boss_death(dying, 4_000, DeathSignal::HpSync);
+            assert_eq!(m.fight_end_ms(), None);
+            assert_eq!(
+                logged_count(&needle),
+                2,
+                "a refusal for a different guard pair on the same corpse must log again"
+            );
+        }
+
+        /// issue #410: the counterpart to the test above — a second refusal
+        /// for the *same* reason on the same corpse must stay silent.
+        #[test]
+        fn boss_death_refusal_stays_silent_on_a_repeat_of_the_same_guard_pair() {
+            install_capture();
+
+            const DYING_UID: i64 = 50;
+            let needle = format!(
+                "encounter: boss death of uid={DYING_UID} monster_id={DIAG_BOSS} did not end the fight"
+            );
+            let mut m = Meter::new();
+
+            m.apply(&ProtocolEvent::DungeonState {
+                state: EDungeonState::Active,
+                scene_uuid: None,
+            });
+            m.apply(&ProtocolEvent::DungeonObjective {
+                target_id: 700,
+                nums: Some(0),
+                complete: Some(false),
+            });
+
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(DYING_UID, EntityKind::Monster)
+                    .expect("in-range test uid"),
+                uid: DYING_UID,
+                curr_hp: Some(100),
+                max_hp: Some(100),
+                monster_id: Some(DIAG_BOSS),
+                timestamp_ms: 0,
+            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: DYING_UID,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    timestamp_ms: 1_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
+            // First refusal: key = (false, true).
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: DYING_UID,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    is_dead: true,
+                    timestamp_ms: 2_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
+            assert_eq!(m.fight_end_ms(), None);
+            assert_eq!(logged_count(&needle), 1);
+
+            // A second death signal (HpSync) for the same corpse, same
+            // guard pair: (false, true) again — must not log a second time.
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(DYING_UID, EntityKind::Monster)
+                    .expect("in-range test uid"),
+                uid: DYING_UID,
+                curr_hp: Some(0),
+                max_hp: Some(100),
+                monster_id: Some(DIAG_BOSS),
+                timestamp_ms: 3_000,
+            }));
+            assert_eq!(m.fight_end_ms(), None);
+            assert_eq!(
+                logged_count(&needle),
+                1,
+                "a repeat refusal for the same guard pair must not log again"
             );
         }
 
