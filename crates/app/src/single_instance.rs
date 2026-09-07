@@ -15,12 +15,19 @@
 //!
 //! The guard is an advisory lock on a file next to the log and the database
 //! ([`lock_file_path`]), held for the life of the process. The holder writes
-//! its pid into that file so a refused copy can name the process to end
-//! (issue #401), but the pid is diagnostic only — the lock stays the sole
-//! authority on whether the slot is taken. The OS drops the
-//! lock when the process ends however it ends, so a crashed instance never
-//! leaves a stale lock behind that would lock the user out of their own
-//! meter — which is why this is a file lock rather than a pid file.
+//! its pid into a sibling file (the lock file itself with its extension
+//! swapped for `.pid`) so a refused copy can name the process to end (issue
+//! #401), but the pid is diagnostic only — the lock stays the sole authority
+//! on whether the slot is taken. The pid lives outside the locked file
+//! because the lock is a whole-file byte-range lock: on Windows that lock is
+//! mandatory, so the holder's own process could not read its contents back
+//! even if it wanted to, and reading it from a second process would race the
+//! holder's write. The OS drops the lock when the process ends however it
+//! ends, so a crashed instance never leaves a stale lock behind that would
+//! lock the user out of their own meter — which is why this is a file lock
+//! rather than a pid file. The sidecar pid file *can* go stale after a
+//! crash (the lock's release is what matters, not the sidecar), so the
+//! guard removes it on a clean exit and [`read_pid`] is best-effort only.
 //!
 //! `SHINRA_INSTANCE_LOCK` overrides the path, which is also the escape hatch
 //! for deliberately running two builds side by side: point them at different
@@ -52,6 +59,15 @@ pub struct InstanceGuard {
     /// The lock lives on the open handle, not on the file's contents: the
     /// field is never read, only kept from being dropped.
     _file: File,
+    /// The sidecar pid file's path, so a clean drop can remove it — best
+    /// effort, so a stale pid does not linger after a crash-free exit.
+    pid_path: PathBuf,
+}
+
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.pid_path);
+    }
 }
 
 /// What [`acquire_at`] found.
@@ -231,14 +247,21 @@ pub fn acquire_at_within(path: &Path, wait: Duration) -> Acquisition {
     }
 }
 
+/// The sidecar file a holder's pid is written into: the lock file's path
+/// with its extension swapped for `.pid`. Deliberately not the locked file
+/// itself — see the module doc comment for why.
+fn pid_file_path(path: &Path) -> PathBuf {
+    path.with_extension("pid")
+}
+
 /// [`acquire`] against an explicit path — the testable half.
 ///
 /// The lock is taken on a handle that stays open inside the returned guard.
-/// The pid written into the file is diagnostic only: it is read back solely
-/// to name the holder in the refusal (issue #401), never to decide whether
-/// the slot is free — a pid on disk cannot distinguish "still running" from
-/// "crashed, and the number has since been reused". The lock itself remains
-/// the only authority on that.
+/// The pid written into the sidecar file is diagnostic only: it is read
+/// back solely to name the holder in the refusal (issue #401), never to
+/// decide whether the slot is free — a pid on disk cannot distinguish
+/// "still running" from "crashed, and the number has since been reused".
+/// The lock itself remains the only authority on that.
 pub fn acquire_at(path: &Path) -> Acquisition {
     if let Err(err) = paths::ensure_parent_dir(path) {
         let parent = path.parent().unwrap_or(path);
@@ -250,7 +273,7 @@ pub fn acquire_at(path: &Path) -> Acquisition {
 
     // Not `truncate(true)`: truncation happens *after* the lock is won, so a
     // losing instance never touches the winner's file contents.
-    let mut file = match OpenOptions::new()
+    let file = match OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
@@ -273,20 +296,47 @@ pub fn acquire_at(path: &Path) -> Acquisition {
         }
     }
 
-    // Best-effort breadcrumb for whoever reads the directory later; a failure
-    // here does not invalidate the lock we already hold.
-    let _ = file.set_len(0);
-    let _ = write!(file, "{}", std::process::id());
-    let _ = file.flush();
+    // Best-effort breadcrumb for whoever reads the directory later; a
+    // failure here does not invalidate the lock we already hold. Written to
+    // a temp file in the same directory and renamed into place so a reader
+    // never observes a torn write — `rename` is atomic on both platforms —
+    // and to an unlocked sidecar rather than the locked file itself, which
+    // a second process (or even this one) cannot read while the lock is
+    // held (mandatory on Windows).
+    let pid_path = pid_file_path(path);
+    let _ = write_pid_file(&pid_path, std::process::id());
 
-    Acquisition::Acquired(InstanceGuard { _file: file })
+    Acquisition::Acquired(InstanceGuard {
+        _file: file,
+        pid_path,
+    })
 }
 
-/// The pid the lock's holder wrote into the file, if it is still there and
-/// still parses. Best-effort: a torn, empty or missing file just means the
-/// refusal cannot name a process.
+/// Writes `pid` into `pid_path` via a temp file in the same directory
+/// followed by a rename, so a concurrent reader never sees a partial write.
+fn write_pid_file(pid_path: &Path, pid: u32) -> std::io::Result<()> {
+    let tmp_path = pid_path.with_extension("pid.tmp");
+    {
+        let mut tmp = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        write!(tmp, "{pid}")?;
+        tmp.flush()?;
+    }
+    std::fs::rename(&tmp_path, pid_path)
+}
+
+/// The pid the lock's holder wrote into the sidecar file, if it is still
+/// there and still parses. Best-effort: a missing, empty or stale file just
+/// means the refusal cannot name a process.
 fn read_pid(path: &Path) -> Option<u32> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    std::fs::read_to_string(pid_file_path(path))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// What the refused instance says before it exits — one line, naming the
@@ -502,9 +552,21 @@ mod tests {
         let guard = acquire_at(&path);
         assert!(matches!(guard, Acquisition::Acquired(_)));
         assert_eq!(
-            fs::read_to_string(&path).unwrap(),
+            fs::read_to_string(pid_file_path(&path)).unwrap(),
             std::process::id().to_string()
         );
         drop(guard);
+    }
+
+    /// The sidecar pid file must not outlive a clean exit — otherwise a
+    /// refused instance could name a pid that has long since been reused.
+    #[test]
+    fn dropping_the_guard_removes_the_sidecar_pid_file() {
+        let path = lock_path("pid-cleanup");
+        let guard = acquire_at(&path);
+        assert!(matches!(guard, Acquisition::Acquired(_)));
+        assert!(pid_file_path(&path).exists());
+        drop(guard);
+        assert!(!pid_file_path(&path).exists());
     }
 }

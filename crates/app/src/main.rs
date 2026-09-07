@@ -290,9 +290,21 @@ fn join_with_timeout<T>(name: &str, handle: JoinHandle<T>, deadline: Duration) -
         }
         std::thread::sleep(JOIN_POLL_INTERVAL.min(deadline - waited));
     }
-    let value = handle.join().ok();
-    log::info!("shutdown: thread {name} joined");
-    value
+    match handle.join() {
+        Ok(value) => {
+            log::info!("shutdown: thread {name} joined");
+            Some(value)
+        }
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".into());
+            log::error!("shutdown: thread {name} panicked: {msg}");
+            None
+        }
+    }
 }
 
 /// `--version`/`-V` early exit (issue #341): CI's Windows smoke job needs a
@@ -684,6 +696,21 @@ mod tests {
         assert_eq!(
             join_with_timeout("quick", handle, Duration::from_secs(5)),
             Some(7)
+        );
+    }
+
+    /// A panicked thread must not be logged as a clean join — it never
+    /// reached the end of its function, so its return value does not exist
+    /// (issue #401 review, O6). `join_with_timeout` should surface that as
+    /// `None`, the same as a still-running, detached thread, rather than
+    /// silently swallow the panic payload.
+    #[test]
+    fn a_panicked_thread_yields_none_rather_than_a_clean_join() {
+        let handle = std::thread::spawn(|| -> u32 { panic!("boom") });
+        // The panic's default output on stderr is expected and harmless.
+        assert_eq!(
+            join_with_timeout("panicky", handle, Duration::from_secs(5)),
+            None
         );
     }
 
