@@ -68,6 +68,21 @@ pub const SUBNET_ADOPTION_MAX_PAYLOAD: usize = 512;
 /// picking an unrelated constant) ties the floor to the one piece of
 /// protocol evidence that is actually load-bearing: nothing shorter than a
 /// frame header can carry a frame.
+///
+/// This floor has a trade-off: a genuine reconnect whose first
+/// server-to-client segment happens to be shorter than `MIN_FRAME_LEN` is
+/// rejected here too, and adoption then defers to a later segment. The
+/// subnet path anchors adoption at `frame_offset = 0`, so deferring to a
+/// later segment means the reassembler may resync mid-frame instead of at
+/// the true frame boundary. In practice this is not a live concern: the
+/// port exclusion ([`SUBNET_ADOPTION_EXCLUDED_SRC_PORT`]) alone already
+/// covers every false positive observed in the field logs behind #406, and
+/// this floor is kept on top of it specifically to catch keepalives arriving
+/// on other, non-excluded ports. If the once-per-connection rejection debug
+/// line (the `"payload_below_min"` reason string in
+/// [`subnet_adoption_rejection_reason`], logged from
+/// [`ServerDetector::detects_with`]) ever names a candidate that turns out
+/// to have been a real reconnect, drop this floor.
 pub const SUBNET_ADOPTION_MIN_PAYLOAD: usize = bpsr_protocol::frame::MIN_FRAME_LEN as usize;
 
 /// Source port excluded from the subnet-reconnect path (issue #406).
