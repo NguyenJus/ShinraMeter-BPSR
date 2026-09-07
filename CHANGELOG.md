@@ -12,8 +12,8 @@ affiliated with the game's publisher.
   instances sharing one log file can be told apart.
 - Startup now logs an `env overrides:` banner line recording which
   `SHINRA_*` environment overrides were active for the session.
-- Loading and saving settings, and minimizing to or restoring from the
-  notification area, are now recorded in the log.
+- Loading settings (including the case where no settings file exists yet)
+  is now logged at info, and successful saves at debug.
 
 ## v0.2.6
 

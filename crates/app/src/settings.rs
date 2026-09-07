@@ -949,7 +949,7 @@ fn save_to(path: &Path, settings: &Settings) {
         log::warn!("failed to move settings temp file into place: {err}");
         return;
     }
-    log::info!("settings: saved to {}", path.display());
+    log::debug!("settings: saved to {}", path.display());
 }
 
 #[cfg(test)]

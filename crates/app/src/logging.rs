@@ -84,17 +84,14 @@ pub fn init() {
         None => builder.target(env_logger::Target::Stderr),
     };
     builder.format(|buf, record| {
-        let timestamp = buf.timestamp().to_string();
-        write!(
+        let ts = buf.timestamp();
+        format_line(
             buf,
-            "{}",
-            format_line(
-                record.level(),
-                record.target(),
-                record.args(),
-                std::process::id(),
-                &timestamp,
-            )
+            record.level(),
+            record.target(),
+            record.args(),
+            std::process::id(),
+            ts,
         )
     });
     builder.init();
@@ -128,16 +125,18 @@ pub fn init() {
 /// layout (`[<rfc3339 seconds> <LEVEL> <target>] <message>`) but inserting
 /// `pid=<pid>` right after the level, so lines from overlapping instances
 /// writing to the same log file (issue #401) can be told apart (issue #408).
-/// `timestamp` is pre-rendered by the caller (env_logger's `Formatter`
-/// already knows how) so this stays a pure, directly testable function.
+/// `timestamp` is `Display`-only (env_logger's `Formatter::timestamp()`
+/// already knows how to render it) so this writes straight into `out`
+/// instead of allocating an intermediate `String`.
 fn format_line(
+    out: &mut impl std::io::Write,
     level: log::Level,
     target: &str,
     args: &std::fmt::Arguments<'_>,
     pid: u32,
-    timestamp: &str,
-) -> String {
-    format!("[{timestamp} {level:<5} pid={pid} {target}] {args}\n")
+    timestamp: impl std::fmt::Display,
+) -> std::io::Result<()> {
+    writeln!(out, "[{timestamp} {level:<5} pid={pid} {target}] {args}")
 }
 
 /// Renders one `env_overrides_summary` field value: `"unset"` for `None`,
@@ -596,15 +595,18 @@ mod tests {
     /// instances writing to the same log file can be told apart.
     #[test]
     fn format_line_prefixes_pid_and_keeps_default_field_order() {
-        let line = format_line(
+        let mut buf = Vec::new();
+        format_line(
+            &mut buf,
             log::Level::Info,
             "bpsr_capture::win",
             &format_args!("capture: adopted target"),
             3840,
             "2026-09-07T02:30:35Z",
-        );
+        )
+        .unwrap();
         assert_eq!(
-            line,
+            String::from_utf8(buf).unwrap(),
             "[2026-09-07T02:30:35Z INFO  pid=3840 bpsr_capture::win] capture: adopted target\n"
         );
     }
