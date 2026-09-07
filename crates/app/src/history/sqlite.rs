@@ -503,11 +503,15 @@ impl HistoryStore for SqliteHistory {
             record.players.push(player);
         }
 
-        // Issue #222: one query for the whole encounter's breakdown, fanned
-        // out by `slot` into the players just loaded (their index *is* their
-        // slot, since they came back ordered by it). An encounter written
-        // before schema v2 matches no rows here and keeps every player's
-        // breakdown empty — the pre-#222 behaviour, without a crash.
+        if record.players.is_empty() {
+            log::warn!("history: encounter {id} has no loadable players (issue #392)");
+            return Ok(None);
+        }
+
+        // Issue #222: one query for the whole encounter's breakdown, fanned out by
+        // slot through slot_to_index (a skipped #392 row leaves a hole, so a
+        // player's index is not its slot). An encounter written before schema
+        // v2 matches no rows here and keeps every player's breakdown empty.
         let mut stmt = self.conn.prepare(
             "SELECT slot, skill_id, damage, share_pct, crit_pct, max_crit, avg_crit,
                     avg_white, avg, hits, crit_hits, hits_per_min
@@ -1185,6 +1189,16 @@ mod tests {
                 )
                 .unwrap();
             }
+            for (slot, skill_id) in [(0i64, 111i64), (1, 222)] {
+                conn.execute(
+                    "INSERT INTO encounter_player_skills (
+                        encounter_id, slot, skill_slot, skill_id, damage, share_pct, crit_pct,
+                        max_crit, avg_crit, avg_white, avg, hits, crit_hits, hits_per_min
+                     ) VALUES (1, ?1, 0, ?2, 1000, 100.0, 0.0, 0, 0.0, 0.0, 0.0, 1, 0, 0.0)",
+                    params![slot, skill_id],
+                )
+                .unwrap();
+            }
             conn.pragma_update(None, "user_version", 2).unwrap();
         }
 
@@ -1204,6 +1218,57 @@ mod tests {
             EntityId::from_display_uid(5, EntityKind::Player)
                 .expect("in-range test uid")
                 .0 as i64
+        );
+        assert_eq!(
+            loaded.players[0].skills.len(),
+            1,
+            "the surviving player's skills must come from its own slot, not its index"
+        );
+        assert_eq!(loaded.players[0].skills[0].skill_id, 222);
+    }
+
+    /// Issue #392: if every row in an encounter is skipped as unloadable,
+    /// `load` must not hand back an encounter with an empty roster.
+    #[test]
+    fn a_v2_row_that_is_entirely_out_of_range_yields_no_encounter() {
+        let path = crate::history::temp_history_path("v2-out-of-range-uid-only");
+        let _ = fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V1_SCHEMA).unwrap();
+            conn.execute_batch(SKILLS_DDL).unwrap();
+            conn.execute(
+                "INSERT INTO encounters (
+                    ended_at_ms, duration_ms, total_damage, total_dps, boss_monster_id,
+                    boss_name, is_boss, scene_id, scene_name, title, subtitle,
+                    player_count, meter_version
+                 ) VALUES (1000, 10000, 10000, 1000.0, 7, 'Boss', 1, 3, 'Scene', 'Boss',
+                           'Scene', 1, '0.2.2')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO encounter_players (
+                    encounter_id, slot, uid, name, class, ability_score, season_strength,
+                    imagine_0, imagine_1, imagine_tier_0, imagine_tier_1,
+                    damage, dps, share_pct, crit_pct, lucky_pct, hits, deaths
+                 ) VALUES (1, 0, ?1, 'Garbage', 'FrostMage', 999, 42, 1, NULL, 3, NULL,
+                           5000, 500.0, 33.3, 12.5, 6.25, 40, 2)",
+                params![(1i64 << 47) + 1],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+
+        let store = SqliteHistory::open(&path, RetentionPolicy::default()).unwrap();
+        let loaded = store.load(1).unwrap();
+        drop(store);
+        let _ = fs::remove_file(&path);
+
+        assert!(
+            loaded.is_none(),
+            "an encounter with no loadable players must not be returned"
         );
     }
 

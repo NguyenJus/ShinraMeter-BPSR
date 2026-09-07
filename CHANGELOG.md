@@ -11,6 +11,8 @@ affiliated with the game's publisher.
 - Encounters saved by a pre-v3 build whose stored player uid is out of
   range are no longer all loaded as the same unknown player, silently
   merging distinct saved players; those rows are skipped instead.
+  The encounter's saved player count and damage totals still describe
+  the original roster.
 
 ## v0.2.6
 
