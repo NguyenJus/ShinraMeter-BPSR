@@ -532,9 +532,13 @@ fn main() -> eframe::Result {
     // `OverlayApp::new` above, not merely cloned into it), dropped when
     // `run_native` returned, before capture was even stopped — so the
     // history thread's channel is closed and it exits after draining.
-    // Joining here is what guarantees the session's last encounter actually
-    // reached disk — the same explicit-shutdown discipline
-    // `CacheWriter::shutdown` follows.
+    // Joining here is what normally lets the session's last encounter
+    // actually reach disk — the same explicit-shutdown discipline
+    // `CacheWriter::shutdown` follows. Since issue #401 this join is
+    // bounded: a history thread still flushing after
+    // `SHUTDOWN_JOIN_DEADLINE` is detached instead of awaited, so that
+    // flush can be lost — the warn line `join_with_timeout` logs when it
+    // detaches is what would say so.
     if let Some(thread) = history_thread {
         join_with_timeout("history", thread, SHUTDOWN_JOIN_DEADLINE);
     }
@@ -546,8 +550,16 @@ fn main() -> eframe::Result {
     // Capture has already stopped above, so its `Decoder`'s reference to the
     // sink is gone by now — this drops the last one, which is what lets
     // `DiagnosticSink`'s summary actually log (see `inspect::Handle::shutdown`).
+    // `inspect::Handle::shutdown` itself joins the dump-writer thread
+    // unboundedly, so — issue #401, finding O2 — it is run on its own
+    // thread and bounded the same way as the pipeline/history/settings
+    // joins above, instead of calling it here directly.
     if let Some(inspect_handle) = inspect_handle {
-        inspect_handle.shutdown();
+        join_with_timeout(
+            "inspect",
+            std::thread::spawn(move || inspect_handle.shutdown()),
+            SHUTDOWN_JOIN_DEADLINE,
+        );
     }
     // Issue #401: the last line of a healthy shutdown. A log that ends
     // without it says the process never reached the end of `main` — which,

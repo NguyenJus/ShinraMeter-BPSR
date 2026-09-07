@@ -82,6 +82,41 @@ const MAX_GAME_PID_LOOKUP_INTERVAL: Duration = Duration::from_secs(60);
 /// far better than a live thread that silently never emits again.
 const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 64;
 
+/// Issue #401 (finding O1): the same bound `main`'s `join_with_timeout`
+/// applies to the app's other shutdown threads, applied here to the two
+/// joins in [`CaptureHandle::shutdown_and_close`]. `CaptureHandle` is
+/// neither `Send` nor `Sync` (see [`CaptureHandle::restart_requester`]), so
+/// `main` cannot spawn a detached thread to call `stop()` on its behalf the
+/// way it does for the pipeline/history/settings handles — the bound has to
+/// live here instead.
+const SHUTDOWN_JOIN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How often [`shutdown_and_close`](CaptureHandle::shutdown_and_close)
+/// re-checks a join during the bounded wait.
+const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// [`JoinHandle::join`] with a deadline, mirroring `main`'s
+/// `join_with_timeout` (issue #401): polls
+/// [`JoinHandle::is_finished`] and, once `deadline` passes, logs which
+/// thread is still alive and returns `false` without joining instead of
+/// blocking forever. Detaching the handle (dropping it) is the caller's
+/// responsibility.
+fn join_with_timeout<T>(name: &str, handle: &JoinHandle<T>, deadline: Duration) -> bool {
+    let started = Instant::now();
+    while !handle.is_finished() {
+        let waited = started.elapsed();
+        if waited >= deadline {
+            log::warn!(
+                "capture shutdown: thread {name} still alive after {}ms; leaking driver handle",
+                deadline.as_millis()
+            );
+            return false;
+        }
+        thread::sleep(JOIN_POLL_INTERVAL.min(deadline - waited));
+    }
+    true
+}
+
 /// Handle to the running capture thread.
 pub struct CaptureHandle {
     stop: Arc<AtomicBool>,
@@ -168,18 +203,30 @@ impl CaptureHandle {
         unsafe {
             self.api.shutdown_recv(self.handle);
         }
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-        // The watchdog never touches the driver handle, but it is joined
-        // here anyway so the thread is gone before the process moves on —
-        // it notices the stop flag within one `WATCHDOG_TICK`.
+        // Issue #401 (O1): a capture thread wedged in something other than
+        // `WinDivertRecv` (e.g. still decoding a huge packet) must not hang
+        // the whole process shutdown. If it has not finished within the
+        // deadline, the join handle is dropped (leaking the thread, which
+        // dies with the process) and `WinDivertClose` below is skipped —
+        // closing the handle while that thread might still call into the
+        // driver with it would violate the SAFETY comment there, so leaking
+        // the OS handle for the OS to reclaim at exit is the safe choice.
+        let capture_thread_joined = match self.join.take() {
+            Some(join) => join_with_timeout("capture", &join, SHUTDOWN_JOIN_DEADLINE),
+            None => true,
+        };
+        // The watchdog never touches the driver handle, so it is always
+        // safe to bound its join independently of the capture thread's —
+        // it notices the stop flag within one `WATCHDOG_TICK` in the
+        // common case, and is simply leaked otherwise.
         if let Some(join) = self.heartbeat_join.take() {
-            let _ = join.join();
+            join_with_timeout("capture-heartbeat", &join, SHUTDOWN_JOIN_DEADLINE);
         }
-        // SAFETY: the capture thread has exited (or was never spawned with
-        // this handle outstanding), so nothing can use the handle after
-        // this point.
+        if !capture_thread_joined {
+            return;
+        }
+        // SAFETY: the capture thread has exited (checked above), so nothing
+        // can use the handle after this point.
         unsafe {
             self.api.close(self.handle);
         }

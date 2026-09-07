@@ -9,9 +9,10 @@ affiliated with the game's publisher.
 ### Fixed
 
 - Closing the meter can no longer leave a windowless process behind holding
-  the single-instance lock: shutdown now gives each worker thread five
-  seconds to finish, then logs which one is still alive and detaches it, and
-  ends with a `shutdown: complete` line so a truncated log is diagnosable.
+  the single-instance lock: shutdown now gives each worker thread — capture,
+  pipeline, history, settings and inspect — five seconds to finish, then
+  logs which one is still alive and detaches it, and ends with a
+  `shutdown: complete` line so a truncated log is diagnosable.
 - The "already running" dialog now names the pid of the process holding the
   lock, so a lingering copy can actually be found and ended.
 
