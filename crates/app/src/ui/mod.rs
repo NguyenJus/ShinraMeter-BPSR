@@ -2970,6 +2970,25 @@ pub(crate) fn fmt_duration(ms: u64) -> String {
     format!("{mins:02}:{secs:02}")
 }
 
+/// A total time spent dead as `mm:ss` (issues #254/#398), or an em dash when
+/// the row carries no measured total at all (a history row — see
+/// `PlayerRow::dead_ms`); an empty cell would read as "nobody was on the
+/// floor" rather than "not recorded".
+///
+/// Zero renders bare: nobody died, so the figure is exact and marking it as
+/// an estimate would be the lie. Anything else takes a `~` prefix, because
+/// the revive edge feeding the total is *inferred* from the player's next
+/// action rather than observed (`PlayerStats::dead_ms`), so the number is
+/// real but biased high — and it sits right beside the exact Deaths count,
+/// where an unmarked estimate would read as equally precise.
+pub(crate) fn fmt_death_time(dead_ms: Option<u64>) -> String {
+    match dead_ms {
+        None => "—".to_string(),
+        Some(0) => fmt_duration(0),
+        Some(ms) => format!("~{}", fmt_duration(ms)),
+    }
+}
+
 /// Damage-share percentage as `12.3%`.
 pub(crate) fn fmt_share(share_pct: f32) -> String {
     format!("{share_pct:.1}%")
@@ -4005,6 +4024,21 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(fmt_short(input), expected, "fmt_short({input})");
         }
+    }
+
+    /// Issue #398: no measured death time at all (a history row) is an em
+    /// dash — an unrecorded total, not a fight nobody died in.
+    #[test]
+    fn fmt_death_time_is_a_dash_when_unmeasured() {
+        assert_eq!(fmt_death_time(None), "\u{2014}");
+    }
+
+    /// Zero is exact, so it renders bare; anything else is inferred from the
+    /// revive edge and takes the estimate tilde.
+    #[test]
+    fn fmt_death_time_marks_a_nonzero_total_as_an_estimate() {
+        assert_eq!(fmt_death_time(Some(0)), "00:00");
+        assert_eq!(fmt_death_time(Some(84_000)), "~01:24");
     }
 
     #[test]

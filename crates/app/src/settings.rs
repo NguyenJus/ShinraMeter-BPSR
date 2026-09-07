@@ -17,8 +17,8 @@ use egui::Color32;
 
 use crate::custom_image::ImageSlot;
 use crate::ui::{
-    CRIT_PCT_RGB, DEATH_COUNT_RGB, LUCKY_PCT_RGB, STAT_TEXT_RGB, StatColumn, fmt_pct0, fmt_share,
-    fmt_short,
+    CRIT_PCT_RGB, DEATH_COUNT_RGB, LUCKY_PCT_RGB, STAT_TEXT_RGB, StatColumn, fmt_death_time,
+    fmt_pct0, fmt_share, fmt_short,
 };
 
 /// One selectable stat column. Declaration order here is also the
@@ -35,6 +35,7 @@ pub enum ColumnKind {
     LuckyPct,
     Hits,
     Deaths,
+    DeathTime,
 }
 
 impl ColumnKind {
@@ -54,7 +55,7 @@ impl ColumnKind {
     /// rather than as bare text (`ui`'s `ColumnEmphasis::Counter`), so
     /// keeping it at the end also keeps that chrome from sitting between two
     /// plain-text columns.
-    pub const ALL: [ColumnKind; 9] = [
+    pub const ALL: [ColumnKind; 10] = [
         ColumnKind::AbilityScore,
         ColumnKind::SeasonStrength,
         ColumnKind::Damage,
@@ -64,6 +65,7 @@ impl ColumnKind {
         ColumnKind::LuckyPct,
         ColumnKind::Hits,
         ColumnKind::Deaths,
+        ColumnKind::DeathTime,
     ];
 
     /// Label shown next to this column's checkbox in the settings menu.
@@ -78,6 +80,7 @@ impl ColumnKind {
             ColumnKind::LuckyPct => "Lucky %",
             ColumnKind::Hits => "Hits",
             ColumnKind::Deaths => "Deaths",
+            ColumnKind::DeathTime => "Death Time",
         }
     }
 
@@ -102,6 +105,7 @@ impl ColumnKind {
             ColumnKind::LuckyPct => "9%",
             ColumnKind::Hits => "1.20K",
             ColumnKind::Deaths => "2",
+            ColumnKind::DeathTime => "~00:24",
         }
     }
 
@@ -270,6 +274,23 @@ impl ColumnKind {
             ColumnKind::Deaths => StatColumn {
                 width: 48.0,
                 text: |row| row.deaths.to_string(),
+                color: Color32::from_rgb(DEATH_COUNT_RGB.0, DEATH_COUNT_RGB.1, DEATH_COUNT_RGB.2),
+            },
+            // Total time spent dead (issue #398), the Deaths counter's
+            // sibling: the same pill chrome and the same color, led by a
+            // stopwatch instead of a skull, exactly as the breakdown
+            // window's header cluster pairs the two (issue #254). Its
+            // formatter (`fmt_death_time`) carries the `~` estimate marker
+            // and the em dash for an unmeasured total; see it for why.
+            //
+            // `width` is measured like `Deaths`'s — the whole pill, not the
+            // string — by `ui`'s
+            // `death_time_column_width_fits_the_whole_counter_pill`, against
+            // `fmt_duration`'s `120:00` worst case plus the tilde, then
+            // rounded up to the next multiple of 8.
+            ColumnKind::DeathTime => StatColumn {
+                width: 88.0,
+                text: |row| fmt_death_time(row.dead_ms),
                 color: Color32::from_rgb(DEATH_COUNT_RGB.0, DEATH_COUNT_RGB.1, DEATH_COUNT_RGB.2),
             },
         }
@@ -1834,6 +1855,7 @@ mod tests {
                 ColumnKind::LuckyPct,
                 ColumnKind::Hits,
                 ColumnKind::Deaths,
+                ColumnKind::DeathTime,
             ]
         );
     }
@@ -1919,7 +1941,7 @@ mod tests {
 
     #[test]
     fn season_level_variant_no_longer_exists_in_all() {
-        assert_eq!(ColumnKind::ALL.len(), 9);
+        assert_eq!(ColumnKind::ALL.len(), 10);
         assert!(ColumnKind::ALL.iter().all(|c| c.label() != "Season Level"));
     }
 
@@ -1935,12 +1957,35 @@ mod tests {
         assert!(ColumnKind::Deaths.spec().width > 0.0);
     }
 
+    /// Issue #398: the total-death-time pill is the Deaths counter's
+    /// sibling, so it sits immediately after it — the two read as one
+    /// cluster (the breakdown window's header pairs them the same way),
+    /// never with a plain-text column wedged between two pills.
+    #[test]
+    fn death_time_follows_deaths_as_the_rightmost_column() {
+        assert_eq!(ColumnKind::ALL.last(), Some(&ColumnKind::DeathTime));
+        let deaths = ColumnKind::ALL
+            .iter()
+            .position(|k| *k == ColumnKind::Deaths)
+            .expect("Deaths is in ALL");
+        assert_eq!(
+            ColumnKind::ALL.get(deaths + 1),
+            Some(&ColumnKind::DeathTime)
+        );
+        assert_eq!(ColumnKind::DeathTime.label(), "Death Time");
+        assert!(ColumnKind::DeathTime.spec().width > 0.0);
+    }
+
     /// The reference render puts the skull counter at the row's right edge,
     /// past the percentage — so `Deaths` has to be last in the canonical
-    /// order, not merely present in it.
+    /// order but for issue #398's death-time sibling, not merely present in
+    /// it.
     #[test]
-    fn deaths_is_the_rightmost_column() {
-        assert_eq!(ColumnKind::ALL.last(), Some(&ColumnKind::Deaths));
+    fn deaths_is_the_rightmost_counted_column() {
+        assert_eq!(
+            ColumnKind::ALL[ColumnKind::ALL.len() - 2],
+            ColumnKind::Deaths
+        );
 
         let all = Settings {
             visible_columns: ColumnKind::ALL.to_vec(),
@@ -1948,7 +1993,7 @@ mod tests {
             window_size: None,
             ..Settings::default()
         };
-        assert_eq!(all.ordered_columns().last(), Some(&ColumnKind::Deaths));
+        assert_eq!(all.ordered_columns().last(), Some(&ColumnKind::DeathTime));
     }
 
     #[test]

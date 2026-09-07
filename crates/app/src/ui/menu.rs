@@ -682,6 +682,7 @@ pub(super) fn column_groups() -> &'static [ColumnGroup] {
                 ColumnKind::CritPct,
                 ColumnKind::LuckyPct,
                 ColumnKind::Deaths,
+                ColumnKind::DeathTime,
             ],
         },
     ];
@@ -1893,12 +1894,12 @@ mod tests {
 
     #[test]
     fn visible_count_text_counts_against_every_column() {
-        assert_eq!(visible_count_text(&Settings::default()), "4 of 9");
+        assert_eq!(visible_count_text(&Settings::default()), "4 of 10");
         let settings = Settings {
             visible_columns: ColumnKind::ALL.to_vec(),
             ..Default::default()
         };
-        assert_eq!(visible_count_text(&settings), "9 of 9");
+        assert_eq!(visible_count_text(&settings), "10 of 10");
     }
 
     /// Rounded, not truncated: 0.799 has to read as 80%, not 79%.

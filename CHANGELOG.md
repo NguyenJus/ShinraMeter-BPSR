@@ -4,6 +4,19 @@ All notable changes to ShinraMeter-BPSR are documented here. This project is
 a fan-made, unofficial tool for Blue Protocol: Star Resonance and is not
 affiliated with the game's publisher.
 
+## Unreleased
+
+### Added
+
+- The main table gains a Death time column next to Deaths, showing how
+  long each player spent on the floor this encounter as a counter pill.
+  It reads `—` when nothing was recorded and prefixes a `~` to any
+  non-zero total, since the revive edge behind it is inferred rather
+  than observed.
+- Hovering a player's name now shows their ability score and season
+  strength, so those two figures no longer need their own columns to be
+  readable.
+
 ## v0.2.6
 
 ### Added
