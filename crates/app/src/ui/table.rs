@@ -31,6 +31,38 @@ pub(super) fn row_content_width(viewport_width: f32, stat_columns_total: f32) ->
     viewport_width.max(floor_width)
 }
 
+/// Width of the row list's solid vertical scroll bar (issue #404), matching
+/// the reference `ScrollBar`'s `GridRoot Width="8"`
+/// (`DamageMeter.UI/Resources/Styles.xaml` ~830-853). Unlike egui's default
+/// floating bar (0pt allocated, paints on top of the content), a solid bar
+/// takes its width out of the row list's own layout — `draw_rows` reserves
+/// it out of the viewport itself before computing `content_width`, so the
+/// row content never lays out into the strip the bar occupies.
+pub(super) const ROW_SCROLL_BAR_WIDTH: f32 = 8.0;
+
+/// The row list's solid-bar handle color, the reference's thumb
+/// `Foreground="#8C8C8C"`.
+const ROW_SCROLL_HANDLE_RGB: egui::Color32 = egui::Color32::from_rgb(0x8C, 0x8C, 0x8C);
+
+/// The reference thumb's `CornerRadius="5"`.
+const ROW_SCROLL_HANDLE_CORNER_RADIUS: u8 = 5;
+
+/// The row list's `ScrollArea` style (issue #404): a solid bar rather than
+/// egui's default `ScrollStyle::floating()`, sized and positioned to match
+/// the reference — `bar_width` is the visible thumb/track width, and the
+/// margins are zeroed so the bar's total allocated width
+/// (`ScrollStyle::allocated_width`) is exactly `ROW_SCROLL_BAR_WIDTH`, with
+/// nothing extra for `draw_rows` to separately account for.
+fn row_scroll_style() -> egui::style::ScrollStyle {
+    egui::style::ScrollStyle {
+        floating: false,
+        bar_width: ROW_SCROLL_BAR_WIDTH,
+        bar_inner_margin: 0.0,
+        bar_outer_margin: 0.0,
+        ..egui::style::ScrollStyle::solid()
+    }
+}
+
 /// Returns the `ScrollArea`'s reported content size — larger than the
 /// viewport on whichever axis actually needed to scroll this frame — purely
 /// so tests can observe that without reaching into egui's persisted scroll
@@ -57,77 +89,112 @@ pub(super) fn draw_rows(
     let columns = settings.stat_columns();
     let stat_columns = stat_columns_for(&columns);
     let stat_columns_total: f32 = stat_columns.iter().map(|c| c.width).sum();
-    let content_width = row_content_width(ui.available_width(), stat_columns_total);
 
-    let output = egui::ScrollArea::both()
-        // Same footprint as a plain, unwrapped layout: the scroll area
-        // always fills the space `CentralPanel` gives it rather than
-        // shrinking to the content's size, so wrapping rows in it changes
-        // nothing when everything already fits.
-        .auto_shrink([false, false])
-        // Hidden entirely — no reserved gutter, no visible track — unless
-        // the content actually overflows, so a window sized to show every
-        // row and every column at full width paints pixel-identically to
-        // today's unscrolled layout. `apply_theme` never touches
-        // `style.spacing.scroll`, so this also inherits egui's default
-        // `ScrollStyle::floating()`: a thin, translucent bar that only
-        // fades in on hover and reserves no layout space even while
-        // visible — already the unobtrusive styling the row list needs,
-        // with nothing further to configure here.
-        .scroll_bar_visibility(
-            egui::containers::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
-        )
-        .show(ui, |ui| {
-            // True contiguous 30pt rows (decision 3): scoped to the scroll
-            // area's own content `Ui`, so the header and menus keep
-            // `apply_theme`'s `item_spacing` — rows' hover bands and accent
-            // lines must sit flush against their neighbors with no gap,
-            // which a nonzero `item_spacing.y` would reintroduce.
-            ui.spacing_mut().item_spacing.y = 0.0;
-            // A horizontal `ScrollArea` measures how much there is to
-            // scroll from what its content `Ui` actually ends up using; an
-            // empty `snapshot.rows` would otherwise paint nothing and
-            // report zero content width even when `content_width` (the
-            // floor above) exceeds the viewport.
-            ui.set_min_width(content_width);
+    // Issue #404: the row list gets a solid, 8pt vertical scroll bar with a
+    // static `#8C8C8C` handle and a transparent track, in place of egui's
+    // default floating one. The geometry (`spacing.scroll`) is harmless to
+    // set broadly, but the handle color and track transparency ride on
+    // `visuals.widgets.*`/`extreme_bg_color`, which every other widget
+    // (buttons, popups, the settings menu, ...) also reads — so the whole
+    // override is scoped to this `ui.scope`, not `apply_theme`, and never
+    // reaches anything outside the row list's own `ScrollArea`.
+    ui.scope(|ui| {
+        ui.style_mut().spacing.scroll = row_scroll_style();
+        let visuals = &mut ui.style_mut().visuals;
+        // Transparent track (issue #404): the solid style's own
+        // `dormant_background_opacity` is ignored for non-floating bars
+        // (egui always paints a solid track at full opacity), so
+        // transparency has to come from the color itself.
+        visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
+        for widget in [
+            &mut visuals.widgets.inactive,
+            &mut visuals.widgets.hovered,
+            &mut visuals.widgets.active,
+        ] {
+            widget.bg_fill = ROW_SCROLL_HANDLE_RGB;
+            widget.corner_radius = egui::CornerRadius::same(ROW_SCROLL_HANDLE_CORNER_RADIUS);
+        }
 
-            let avail = ui.available_rect_before_wrap();
-            let anchors = column_anchors(
-                avail.left(),
-                avail.left() + content_width,
-                &stat_columns,
-                COLUMN_RIGHT_MARGIN,
-            );
-            let scale = column_scale_from_widths(
-                avail.left(),
-                avail.left() + content_width,
-                &stat_columns.iter().map(|c| c.width).collect::<Vec<_>>(),
-                COLUMN_RIGHT_MARGIN,
-            );
-            let layout = RowLayout {
-                kinds: &columns,
-                columns: &stat_columns,
-                anchors: &anchors,
-                scale,
-                settings,
-            };
+        // The solid bar takes its `ROW_SCROLL_BAR_WIDTH` out of the
+        // viewport itself (unlike the old floating bar's 0pt
+        // allocation), so `content_width` has to leave room for it up
+        // front — otherwise the row content lays out into the strip
+        // the bar occupies once it actually shows.
+        let content_width = row_content_width(
+            ui.available_width() - ROW_SCROLL_BAR_WIDTH,
+            stat_columns_total,
+        );
 
-            // Issue #73: each row's damage-share bar is now scaled to the
-            // *top row's* damage rather than to its share of total
-            // encounter damage, so the highest-damage row always fills the
-            // full bar width. `snapshot.rows` is already sorted descending
-            // by damage (`Encounter::snapshot`), so the top row's damage is
-            // just the first row's, computed once here rather than once
-            // per row inside `draw_row`.
-            let top_damage = snapshot.rows.first().map(|r| r.damage).unwrap_or(0);
+        egui::ScrollArea::both()
+            // Same footprint as a plain, unwrapped layout: the scroll
+            // area always fills the space `CentralPanel` gives it
+            // rather than shrinking to the content's size, so wrapping
+            // rows in it changes nothing when everything already fits.
+            .auto_shrink([false, false])
+            // Hidden entirely — no reserved gutter, no visible track —
+            // unless the content actually overflows, so a window sized
+            // to show every row and every column at full width paints
+            // pixel-identically to today's unscrolled layout.
+            .scroll_bar_visibility(
+                egui::containers::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+            )
+            .show(ui, |ui| {
+                // True contiguous 30pt rows (decision 3): scoped to the
+                // scroll area's own content `Ui`, so the header and
+                // menus keep `apply_theme`'s `item_spacing` — rows'
+                // hover bands and accent lines must sit flush against
+                // their neighbors with no gap, which a nonzero
+                // `item_spacing.y` would reintroduce.
+                ui.spacing_mut().item_spacing.y = 0.0;
+                // A horizontal `ScrollArea` measures how much there is
+                // to scroll from what its content `Ui` actually ends up
+                // using; an empty `snapshot.rows` would otherwise paint
+                // nothing and report zero content width even when
+                // `content_width` (the floor above) exceeds the
+                // viewport.
+                ui.set_min_width(content_width);
 
-            for row in &snapshot.rows {
-                if let Some(uid) = draw_row(ui, row, &layout, icons, top_damage, content_width) {
-                    *opened = Some(uid);
+                let avail = ui.available_rect_before_wrap();
+                let anchors = column_anchors(
+                    avail.left(),
+                    avail.left() + content_width,
+                    &stat_columns,
+                    COLUMN_RIGHT_MARGIN,
+                );
+                let scale = column_scale_from_widths(
+                    avail.left(),
+                    avail.left() + content_width,
+                    &stat_columns.iter().map(|c| c.width).collect::<Vec<_>>(),
+                    COLUMN_RIGHT_MARGIN,
+                );
+                let layout = RowLayout {
+                    kinds: &columns,
+                    columns: &stat_columns,
+                    anchors: &anchors,
+                    scale,
+                    settings,
+                };
+
+                // Issue #73: each row's damage-share bar is now scaled
+                // to the *top row's* damage rather than to its share of
+                // total encounter damage, so the highest-damage row
+                // always fills the full bar width. `snapshot.rows` is
+                // already sorted descending by damage (`Encounter::
+                // snapshot`), so the top row's damage is just the first
+                // row's, computed once here rather than once per row
+                // inside `draw_row`.
+                let top_damage = snapshot.rows.first().map(|r| r.damage).unwrap_or(0);
+
+                for row in &snapshot.rows {
+                    if let Some(uid) = draw_row(ui, row, &layout, icons, top_damage, content_width)
+                    {
+                        *opened = Some(uid);
+                    }
                 }
-            }
-        });
-    output.content_size
+            })
+            .content_size
+    })
+    .inner
 }
 
 /// How prominently one stat column's text is painted (issue #56). The
@@ -534,12 +601,25 @@ pub(super) fn draw_row(
                         egui::Stroke::new(IMAGINE_MAX_TIER_RING_WIDTH, IMAGINE_MAX_TIER_RING_COLOR),
                     );
                 }
-                ui.interact(
+                // Issue #396: the popup is opened here rather than with
+                // `Response::on_hover_text`, whose `Tooltip::for_enabled`
+                // gate makes every tooltip wait out the global
+                // `interaction.tooltip_delay`. Only these icons opt out of
+                // that wait — see `IMAGINE_HOVER_DELAY_SECS`.
+                let response = ui.interact(
                     slot,
                     ui.id().with(("imagine", row.uid, i)),
                     egui::Sense::hover(),
-                )
-                .on_hover_text(imagine_hover_text(im.name, tier));
+                );
+                if imagine_hover_ready(&response) {
+                    let text = imagine_hover_text(im.name, tier);
+                    egui::Tooltip::for_widget(&response).show(|ui| {
+                        // Same guard `on_hover_text` applies: keeps `Area`
+                        // auto-sizing from shrinking the popup.
+                        ui.set_max_width(ui.spacing().tooltip_width);
+                        ui.add(egui::Label::new(text));
+                    });
+                }
             }
             None => {
                 ui.painter()
@@ -1071,6 +1151,26 @@ pub(super) fn imagine_hover_text(name: &str, tier: Option<i32>) -> String {
     }
 }
 
+/// How long the pointer must rest on a filled Imagine slot before its
+/// name+tier popup appears (issue #396). Zero: the popup shows on the very
+/// first frame the pointer is over the slot. egui's own tooltip path waits
+/// `Style::interaction::tooltip_delay` (0.5s by default, and the whole rest
+/// of the UI still wants that), which on these 16pt icons reads as the
+/// popup being broken rather than deliberate — a row is scanned icon by
+/// icon, so every slot would cost half a second. `draw_row` therefore opens
+/// the Imagine popup itself instead of going through the delayed
+/// `Response::on_hover_text`, and this constant is the only wait it honors.
+pub(super) const IMAGINE_HOVER_DELAY_SECS: f32 = 0.0;
+
+/// Whether a filled Imagine slot's hover popup should be showing this
+/// frame (issue #396): the pointer is over the slot and has been still for
+/// at least `IMAGINE_HOVER_DELAY_SECS` — which at zero is simply "the slot
+/// is hovered", with no wait at all.
+pub(super) fn imagine_hover_ready(response: &egui::Response) -> bool {
+    response.hovered()
+        && response.ctx.input(|i| i.pointer.time_since_last_movement()) >= IMAGINE_HOVER_DELAY_SECS
+}
+
 /// Whether a filled Imagine slot should get the gold max-tier ring (issue
 /// #170): `tier >= IMAGINE_MAX_TIER`. `None` (unresolved/no tier data) and
 /// any tier below the max both yield `false` — see `IMAGINE_MAX_TIER`'s doc
@@ -1198,6 +1298,91 @@ mod tests {
     use super::*;
     use crate::ui::tests::*;
     // -- Imagine tier hover text / gold ring (issues #169/#170) -------------
+
+    /// Issue #396: the hover popup on an Imagine icon must appear as soon
+    /// as the pointer is over the slot, not after egui's global
+    /// `interaction.tooltip_delay` (0.5s) has elapsed. `apply_theme` leaves
+    /// that global delay at its real value here on purpose — this test is
+    /// precisely about not paying it — so the popup can only show if
+    /// `draw_row` opens the Imagine slot's popup itself, gated on
+    /// `IMAGINE_HOVER_DELAY_SECS`, rather than through the delayed
+    /// `Response::on_hover_text` path.
+    ///
+    /// The slot's rect is read back from the frame that painted it: the
+    /// Imagine icon is the only mesh blitted with that Imagine's texture,
+    /// so its mesh bounds *are* the slot. Two hovered frames follow (the
+    /// first arms a just-opened `Area`, which sizes itself before it
+    /// paints); at `RawInput`'s default frame time that is a few tens of
+    /// milliseconds, far short of the 0.5s the delayed path needs.
+    #[test]
+    fn an_imagine_icon_shows_its_hover_popup_within_a_few_frames() {
+        assert_eq!(
+            IMAGINE_HOVER_DELAY_SECS, 0.0,
+            "this test asserts the popup is immediate, which is what a zero delay means"
+        );
+        const IMAGINE_ID: i32 = 3901;
+        let imagine = imagines::imagine_of_skill_id(IMAGINE_ID).expect("a curated Imagine id");
+
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let texture_id = icons
+            .imagines
+            .get(imagine.icon)
+            .expect("the curated Imagine's icon is embedded")
+            .id();
+        let mut snapshot = rows_test_snapshot(1);
+        for row in &mut snapshot.rows {
+            row.imagines = [Some(IMAGINE_ID), None];
+            row.imagine_tiers = [None, None];
+        }
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 236.0));
+        let run = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events,
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                draw_rows(ui, &snapshot, &Settings::default(), &icons, &mut None);
+            });
+            let shapes = output.shapes.clone();
+            output.drop_without_applying_deltas();
+            shapes
+        };
+
+        fn mesh_bounds(shape: &egui::Shape, want: egui::TextureId, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Mesh(mesh) if mesh.texture_id == want => out.push(mesh.calc_bounds()),
+                egui::Shape::Vec(shapes) => {
+                    for s in shapes {
+                        mesh_bounds(s, want, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let layout_shapes = run(Vec::new());
+        let mut slots = Vec::new();
+        for clipped in &layout_shapes {
+            mesh_bounds(&clipped.shape, texture_id, &mut slots);
+        }
+        let slot = *slots.first().expect("the Imagine icon must be painted");
+
+        let hover = || egui::Event::PointerMoved(slot.center());
+        run(vec![hover()]);
+        let hovered_shapes = run(vec![hover()]);
+        let mut texts = Vec::new();
+        for clipped in &hovered_shapes {
+            collect_text_shapes(&clipped.shape, &mut texts);
+        }
+
+        assert!(
+            texts.iter().any(|text| text == imagine.name),
+            "hovering an Imagine slot must show its popup right away, but the \
+             painted text was {texts:?}"
+        );
+    }
 
     #[test]
     fn imagine_hover_text_plain_name_when_tier_is_zero() {
@@ -2236,6 +2421,33 @@ mod tests {
         assert!(
             content > viewport,
             "content {content} must exceed the {viewport}pt viewport, or the ScrollArea has nothing to scroll to"
+        );
+    }
+
+    /// Issue #404: the row list's `ScrollArea` now paints a solid, 8pt
+    /// vertical scroll bar rather than egui's default floating one, and a
+    /// solid bar (unlike a floating one) allocates its own layout space
+    /// rather than drawing on top of the content. `draw_rows` must reserve
+    /// that `ROW_SCROLL_BAR_WIDTH` out of the viewport itself, so the row
+    /// content never lays out wider than what's actually left once the bar
+    /// takes its slice — comfortably above the `MIN_COLUMN_SCALE` floor
+    /// here, so this isolates the scroll bar's own reservation from that
+    /// separate narrowing behavior.
+    #[test]
+    fn row_content_reserves_the_solid_scroll_bars_allocated_width() {
+        let snapshot = rows_test_snapshot(1);
+        let stat_columns_total: f32 = stat_columns_for(&Settings::default().ordered_columns())
+            .iter()
+            .map(|c| c.width)
+            .sum();
+        let floor = stat_columns_total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
+        let viewport = floor + 200.0;
+        let content = rows_content_size(&snapshot, viewport, ROW_HEIGHT * 2.0);
+        let expected = viewport - ROW_SCROLL_BAR_WIDTH;
+        assert!(
+            (content.x - expected).abs() < 0.5,
+            "content {content:?} must leave {ROW_SCROLL_BAR_WIDTH}pt out of the {viewport}pt \
+             viewport for the solid vertical scroll bar, landing at {expected}"
         );
     }
 

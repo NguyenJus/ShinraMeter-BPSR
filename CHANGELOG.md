@@ -4,6 +4,16 @@ All notable changes to ShinraMeter-BPSR are documented here. This project is
 a fan-made, unofficial tool for Blue Protocol: Star Resonance and is not
 affiliated with the game's publisher.
 
+## Unreleased
+
+### Changed
+
+- The player-row scroll bar is now a solid, always-legible thin bar on
+  a transparent track, and rows reserve room for it so nothing under it
+  is clipped.
+- Hovering an Imagine icon now shows its name and tier immediately
+  instead of after a noticeable delay.
+
 ## v0.2.6
 
 ### Added
