@@ -18,7 +18,6 @@
 
 use std::ffi::{CString, c_void};
 use std::mem::MaybeUninit;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -33,7 +32,7 @@ use crate::backoff::{next_game_pids, recv_error_backoff, should_refresh_game_pid
 use crate::detect::{Conn, ServerDetector, decide_packet};
 use crate::driver::{Api, WinDivertAddress};
 use crate::error::CaptureError;
-use crate::owner::{self, StreamOwnerLookup, SystemOwnerLookup};
+use crate::owner::{self, SystemOwnerLookup};
 use crate::restart::CaptureRestart;
 use crate::tcp::TcpReassembler;
 use crate::throughput::{
@@ -559,8 +558,8 @@ fn recv_loop(
         // line. Report the displacement explicitly so both connections are
         // visible in the log.
         if let Some(old) = decision.replaced {
-            log::info!(
-                "capture: adoption displaced still-tracked connection {old} (no FIN/RST observed on it; signature match on {conn}, issue #406)"
+            log::warn!(
+                "capture: replaced tracked connection {old} with {conn} without FIN/RST (reason=signature_match, issue #406)"
             );
         }
         if decision.skip {
@@ -585,21 +584,11 @@ fn recv_loop(
             // Issue #406: the issue #337 ownership filter is the other reason
             // an adoption can look surprising after the fact, so report its
             // state on the same line instead of leaving it to be inferred
-            // from a separate pid-lookup entry elsewhere in the log. This is
-            // the adopted connection's *actual* owner, looked up once here
-            // (not the cached `game_pids` set, which says nothing about
-            // whether this particular connection matched it) — mirrors the
-            // lookup `owner_allows_adoption` already performed to decide
-            // whether to allow the adoption in the first place.
+            // from a separate pid-lookup entry elsewhere in the log.
             let owner_state = if game_pids.is_empty() {
                 "unfiltered".to_string()
             } else {
-                let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(conn.dst)), conn.dst_port);
-                let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(conn.src)), conn.src_port);
-                match owner_lookup.owner_pid(local, remote) {
-                    Some(pid) => format!("pid={pid} (in game_pids)"),
-                    None => format!("unknown (fail-open, pids={game_pids:?})"),
-                }
+                format!("pids={game_pids:?}")
             };
             log::info!(
                 "capture: adopted game-server connection {conn} at seq={seq} \
