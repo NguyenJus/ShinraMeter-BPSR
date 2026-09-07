@@ -193,7 +193,9 @@ pub(super) fn draw_header(
             opacity.apply(HEADER_EMBLEM_COLOR),
         );
     }
-    for (segment_rect, color) in title_separator_segments(title_separator_rect(title_row)) {
+    for (segment_rect, color) in
+        title_separator_segments(title_separator_rect(title_row, text_band_height))
+    {
         ui.painter().rect_filled(segment_rect, 0.0, color);
     }
     // The menu control (issue #54, #71), in the strip at the right of the
@@ -2102,8 +2104,8 @@ pub(super) const TITLE_SEPARATOR_THICKNESS: f32 = 2.0;
 /// 13pt title glyphs. Pixel-measured against the reference render, the
 /// stroke actually sits in the gap between the title and subtitle rows: 5pt
 /// below the title baseline and ~5pt above the subtitle's cap-top, which for
-/// our geometry is the middle of the `HEADER_TITLE_SUBTITLE_GAP` under the
-/// title row (see `title_separator_rect`).
+/// our geometry is where the gutter emblem's right tip is — and the tip, not
+/// the gap, is what `title_separator_rect` anchors to.
 pub(super) const TITLE_SEPARATOR_LEFT_BLEED: f32 = 5.0;
 
 /// Number of thin strips `title_separator_segments` divides the fade into.
@@ -2112,21 +2114,34 @@ pub(super) const TITLE_SEPARATOR_LEFT_BLEED: f32 = 5.0;
 pub(super) const TITLE_SEPARATOR_SEGMENTS: usize = 24;
 
 /// The rect the fading title separator is painted over, for a title row
-/// `title_row`: it bleeds `TITLE_SEPARATOR_LEFT_BLEED` back into the gutter
-/// from the title's own left edge and clears the chevron's reserved strip on
-/// the right, sitting centered in the `HEADER_TITLE_SUBTITLE_GAP` — the gap
-/// between the title and subtitle rows in the reference render (see the
-/// `TITLE_SEPARATOR_LEFT_BLEED` doc comment for why this isn't the source
-/// margin's literal `7.5`).
-pub(super) fn title_separator_rect(title_row: egui::Rect) -> egui::Rect {
+/// `title_row` and the header text band (`text_band_height`) that starts at
+/// that row's top: it bleeds `TITLE_SEPARATOR_LEFT_BLEED` back into the
+/// gutter from the title's own left edge and clears the chevron's reserved
+/// strip on the right, sitting vertically on the *gutter emblem's right
+/// tip* (see the `TITLE_SEPARATOR_LEFT_BLEED` doc comment for why this
+/// isn't the source margin's literal `7.5`).
+///
+/// The tip, not the title/subtitle gap. In the reference render the stroke
+/// is the diamond's tip drawn onward to the right: the two are the same
+/// opaque SlateGray, they meet exactly, and that is why the 5pt left bleed
+/// is invisible there — it lies on the mark. Pinning the stroke to the gap
+/// instead put it ~2pt high of the tip, so the bleed cut across the
+/// diamond's outline rather than vanishing into it.
+///
+/// The tip is at the emblem *box's* vertical center, so that is what this
+/// centers on: `assets/icons/svg/emblem.svg`'s `viewBox` is the square
+/// `2.617 2.639 53.366 53.366` and its path is the diamond whose corners
+/// are that square's edge midpoints — the left and right corners are both
+/// at `y = 29.322`, which is the viewBox's own vertical center
+/// (`2.639 + 53.366 / 2`).
+///
+/// Rounded to whole points so the 2pt stroke lands on whole pixel rows at
+/// the usual 1.0 scale instead of straddling two half-covered ones.
+pub(super) fn title_separator_rect(title_row: egui::Rect, text_band_height: f32) -> egui::Rect {
     let left = title_row.left() + HEADER_GUTTER_WIDTH - TITLE_SEPARATOR_LEFT_BLEED;
     let right = (title_row.right() - HEADER_RIGHT_CONTROL_WIDTH).max(left);
-    // Centered in the title/subtitle gap rather than welded to the title
-    // row's underside: the gap is `HEADER_TITLE_SUBTITLE_GAP` (4pt) and the
-    // stroke is `TITLE_SEPARATOR_THICKNESS` (2pt), so 1pt of air is left
-    // above and below it — which is where the reference render puts it,
-    // between the two rows.
-    let top = title_row.bottom() + (HEADER_TITLE_SUBTITLE_GAP - TITLE_SEPARATOR_THICKNESS) / 2.0;
+    let tip_y = header_emblem_rect(title_row, text_band_height).center().y;
+    let top = (tip_y - TITLE_SEPARATOR_THICKNESS / 2.0).round();
     egui::Rect::from_min_max(
         egui::pos2(left, top),
         egui::pos2(right, top + TITLE_SEPARATOR_THICKNESS),
@@ -3895,7 +3910,7 @@ mod tests {
     #[test]
     fn title_separator_sits_below_the_title_row_and_clears_the_chevron() {
         let row = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, 20.0));
-        let rect = title_separator_rect(row);
+        let rect = title_separator_rect(row, header_text_band_height());
         let segments = title_separator_segments(rect);
         assert_eq!(
             segments.first().unwrap().0.left(),
@@ -3905,11 +3920,29 @@ mod tests {
             (segments.last().unwrap().0.right() - (row.right() - HEADER_RIGHT_CONTROL_WIDTH)).abs()
                 < 0.01
         );
-        assert_eq!(
-            rect.top(),
-            row.bottom() + (HEADER_TITLE_SUBTITLE_GAP - TITLE_SEPARATOR_THICKNESS) / 2.0
-        );
         assert_eq!(rect.height(), TITLE_SEPARATOR_THICKNESS);
+    }
+
+    /// The stroke is the gutter emblem's right tip drawn onward to the
+    /// right, so it is centered on the emblem box's vertical center — the
+    /// tip's own row, `emblem.svg`'s `viewBox` being square and its diamond
+    /// having its corners at that square's edge midpoints. Measured on a
+    /// live screenshot, the old title/subtitle-gap placement sat ~2pt above
+    /// the tip and cut across the diamond's outline with its left bleed.
+    #[test]
+    fn the_title_separator_is_centered_on_the_gutter_emblems_tip() {
+        let row =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, TITLE_LINE_HEIGHT));
+        let band = header_text_band_height();
+        let separator = title_separator_rect(row, band);
+        let tip_y = header_emblem_rect(row, band).center().y;
+        assert!(
+            (separator.center().y - tip_y).abs() <= 0.5,
+            "separator center {} is off the emblem tip {tip_y}",
+            separator.center().y
+        );
+        // Whole points, so the 2pt stroke lands on whole pixel rows.
+        assert_eq!(separator.top(), separator.top().round());
     }
 
     /// Regression for the misread WPF margin (`TITLE_SEPARATOR_TOP_OFFSET`,
@@ -3937,7 +3970,7 @@ mod tests {
         let ink_bottom =
             row.top() + (row.height() - galley.rect.height()) / 2.0 + galley.rect.bottom();
 
-        let rect = title_separator_rect(row);
+        let rect = title_separator_rect(row, header_text_band_height());
         assert!(
             rect.top() >= ink_bottom,
             "separator top {} cuts through the title's ink bottom {ink_bottom}",
@@ -4197,9 +4230,10 @@ mod tests {
     /// The reference's subtitle `Margin="2 4 0 0"`
     /// (`DamageMeter.UI/HUD/Controls/MainView.xaml`, the area-name
     /// `TextBlock`): 4pt of air between the boss name's line box and the
-    /// area name's, not the layout's ordinary 2pt — and the 2pt accent
-    /// stroke sits centered in that gap, the way the reference render puts
-    /// it between the two rows rather than welded to the title's underside.
+    /// area name's, not the layout's ordinary 2pt — wide enough that the
+    /// 2pt accent stroke, which hangs off the gutter emblem's tip rather
+    /// than off this gap (`title_separator_rect`), still falls inside it
+    /// instead of into either row's ink.
     #[test]
     fn the_title_and_subtitle_are_four_points_apart() {
         assert_eq!(
@@ -4209,9 +4243,9 @@ mod tests {
 
         let row =
             egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(380.0, TITLE_LINE_HEIGHT));
-        let separator = title_separator_rect(row);
-        assert_eq!(separator.top(), row.bottom() + 1.0);
-        assert_eq!(separator.bottom(), row.bottom() + 3.0);
+        let separator = title_separator_rect(row, header_text_band_height());
+        assert!(separator.top() >= row.bottom());
+        assert!(separator.bottom() <= row.bottom() + HEADER_TITLE_SUBTITLE_GAP);
     }
 
     /// Issue #91's header grid: `TITLE_LINE_HEIGHT + ITEM_SPACING_Y +
