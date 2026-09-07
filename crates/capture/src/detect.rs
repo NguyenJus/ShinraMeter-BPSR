@@ -54,6 +54,38 @@ const MAX_SIGNATURE_CANDIDATES: usize = 1000;
 /// dead capture with no trace.
 pub const SUBNET_ADOPTION_MAX_PAYLOAD: usize = 512;
 
+/// Payload-size floor for the subnet-reconnect path (issue #406).
+///
+/// [`bpsr_protocol::frame::MIN_FRAME_LEN`] (6 bytes: a 4-byte length prefix
+/// plus the 2-byte packet type it must carry at minimum) is the smallest
+/// byte sequence the decoder can ever treat as one real protocol frame; a
+/// payload shorter than that cannot be a genuine reconnect handshake no
+/// matter what its bytes are, only a keepalive/probe. The field log behind
+/// #406 caught exactly this: a 1-byte keepalive on the known /16, arriving
+/// the instant the previous stream tore down, satisfied every other
+/// `subnet_adoption_eligible` check and was adopted over the real,
+/// still-forthcoming reconnect. Mirroring `MIN_FRAME_LEN` here (rather than
+/// picking an unrelated constant) ties the floor to the one piece of
+/// protocol evidence that is actually load-bearing: nothing shorter than a
+/// frame header can carry a frame.
+pub const SUBNET_ADOPTION_MIN_PAYLOAD: usize = bpsr_protocol::frame::MIN_FRAME_LEN as usize;
+
+/// Source port excluded from the subnet-reconnect path (issue #406).
+///
+/// Every adoption of a source-port-5003 connection found across the
+/// project's field logs (12 occurrences, `sed`'d from
+/// `ShinraMeter-BPSR.log*`) was bogus: eight were exactly the 1-byte
+/// keepalive this issue is about, one was 6 bytes, one was a 1400-byte
+/// decoy already caught by [`SUBNET_ADOPTION_MAX_PAYLOAD`], and the rest
+/// were duplicate log lines for the same 1-byte packet. Not one real
+/// game-server adoption in those logs ever used port 5003; the real
+/// reconnects land in the observed 10000-11999 game-server port range.
+/// Excluding the port outright (rather than only relying on the new size
+/// floor) closes this specific, repeatedly-observed false-positive source
+/// even for a future keepalive that happens to clear
+/// [`SUBNET_ADOPTION_MIN_PAYLOAD`].
+pub const SUBNET_ADOPTION_EXCLUDED_SRC_PORT: u16 = 5003;
+
 /// A TCP 4-tuple identifying one connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Conn {
@@ -253,13 +285,20 @@ fn is_private(addr: [u8; 4]) -> bool {
 ///   bytes and their raw sequence number is one below the first data byte
 ///   (SYN consumes a sequence number), so resyncing the reassembler onto one
 ///   opens a phantom 1-byte gap that stalls the stream.
-/// * **Size.** Capped at [`SUBNET_ADOPTION_MAX_PAYLOAD`] (issue #258): a
-///   full-MTU-sized payload on a brand-new connection is bulk data from an
-///   unrelated, co-located service, not the small handshake fragment a real
-///   reconnect sends first.
+/// * **Size.** Bounded to
+///   `[`[`SUBNET_ADOPTION_MIN_PAYLOAD`]`, `[`SUBNET_ADOPTION_MAX_PAYLOAD`]`]`
+///   (issues #406, #258): below the floor, the payload cannot even hold one
+///   protocol frame header and is a keepalive/probe, not a reconnect; above
+///   the ceiling, a full-MTU-sized payload on a brand-new connection is bulk
+///   data from an unrelated, co-located service, not the small handshake
+///   fragment a real reconnect sends first.
+/// * **Port.** [`SUBNET_ADOPTION_EXCLUDED_SRC_PORT`] is excluded outright
+///   (issue #406): every field-log adoption from that source port was a
+///   false positive, never a real reconnect.
 pub fn subnet_adoption_eligible(conn: &Conn, payload: &[u8], known_subnet: [u8; 2]) -> bool {
-    !payload.is_empty()
+    payload.len() >= SUBNET_ADOPTION_MIN_PAYLOAD
         && payload.len() <= SUBNET_ADOPTION_MAX_PAYLOAD
+        && conn.src_port != SUBNET_ADOPTION_EXCLUDED_SRC_PORT
         && !is_private(conn.src)
         && [conn.src[0], conn.src[1]] == known_subnet
 }
@@ -543,6 +582,16 @@ pub struct AdoptionDecision {
     /// fall back to `0` — the packet's own `seq`, exactly today's
     /// pre-#293 behavior for those two paths.
     pub frame_offset: usize,
+    /// The previously-tracked connection this adoption silently displaced,
+    /// if any (issue #406). `detects_with` runs the signature scan *before*
+    /// the `server_adopted` gate, so a signature match on a new connection
+    /// can adopt over a still-live tracked one with no FIN/RST at all — the
+    /// exact "adopted with no torn down line" shape #406 reported. `Some`
+    /// only when `newly_adopted` is `true` and a connection was already
+    /// tracked at the start of this call; `None` on a fresh adoption (no
+    /// prior connection) or on any non-adopting decision. The caller
+    /// (win.rs) must log this so the displacement is visible.
+    pub replaced: Option<Conn>,
 }
 
 /// Issue #337's process-ownership filter, bundled into one value so
@@ -636,6 +685,10 @@ pub fn decide_packet(
 ) -> AdoptionDecision {
     let role = classify_connection(conn, known_server.as_ref());
     let torn_down = is_teardown_of_known(role, fin, rst);
+    // Captured before any mutation below: this is "whatever was tracked
+    // when this packet arrived", which is exactly what an adoption in the
+    // `Unrelated` arm below would silently displace (issue #406).
+    let previously_tracked = *known_server;
     if torn_down {
         *known_server = None;
     }
@@ -646,6 +699,7 @@ pub fn decide_packet(
             skip: true,
             newly_adopted: false,
             frame_offset: 0,
+            replaced: None,
         },
         ConnStreamRole::Adopted => AdoptionDecision {
             role,
@@ -653,6 +707,7 @@ pub fn decide_packet(
             skip: false,
             newly_adopted: false,
             frame_offset: 0,
+            replaced: None,
         },
         ConnStreamRole::Unrelated => {
             // Ownership is checked *lazily*, via `detects_with`'s `allow`
@@ -682,6 +737,7 @@ pub fn decide_packet(
                     skip: true,
                     newly_adopted: false,
                     frame_offset: 0,
+                    replaced: None,
                 }
             } else {
                 *known_server = Some(*conn);
@@ -702,6 +758,13 @@ pub fn decide_packet(
                     skip: false,
                     newly_adopted: true,
                     frame_offset,
+                    // `torn_down` is always `false` here (`Unrelated`'s role
+                    // never counts as a teardown of the tracked connection —
+                    // see `is_teardown_of_known`), so this is exactly the
+                    // #406 case: whatever was tracked before this call is
+                    // being replaced by this adoption with no FIN/RST at
+                    // all.
+                    replaced: previously_tracked,
                 }
             }
         }
@@ -1116,6 +1179,44 @@ mod tests {
         assert!(d.detects(&server_to_client([203, 0, 113, 9], 5001), &payload, false));
     }
 
+    // --- subnet-path minimum payload / port exclusion (issue #406) ---
+
+    #[test]
+    fn subnet_path_rejects_a_one_byte_payload_on_port_5003() {
+        // Regression for issue #406: every historical adoption of a source
+        // port 5003 connection in the field logs was bogus (a 1-byte
+        // keepalive in 8 of 9 cases, never a real reconnect), and the real
+        // game-server reconnect always arrived on a different port. A
+        // 1-byte payload is also well below any real protocol frame
+        // (SUBNET_ADOPTION_MIN_PAYLOAD), so this must be rejected on both
+        // grounds.
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        assert!(!d.detects(&server_to_client([203, 0, 113, 9], 5003), &[0x00], false));
+    }
+
+    #[test]
+    fn subnet_path_accepts_a_minimum_size_payload_on_a_game_port() {
+        // A payload at the minimum still adopts, as long as it isn't on the
+        // excluded port 5003.
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        let payload = vec![0u8; SUBNET_ADOPTION_MIN_PAYLOAD];
+        assert!(d.detects(&server_to_client([203, 0, 113, 9], 10131), &payload, false));
+    }
+
+    #[test]
+    fn subnet_path_rejects_a_payload_below_the_minimum_on_a_game_port() {
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        let payload = vec![0u8; SUBNET_ADOPTION_MIN_PAYLOAD - 1];
+        assert!(!d.detects(&server_to_client([203, 0, 113, 9], 10131), &payload, false));
+    }
+
+    #[test]
+    fn subnet_path_rejects_a_large_payload_on_port_5003_even_below_the_max() {
+        let mut d = detector_knowing(&server_to_client([203, 0, 113, 7], 5000));
+        let payload = vec![0u8; SUBNET_ADOPTION_MAX_PAYLOAD];
+        assert!(!d.detects(&server_to_client([203, 0, 113, 9], 5003), &payload, false));
+    }
+
     #[test]
     fn subnet_path_rejects_a_full_mtu_decoy_ahead_of_the_real_login_return() {
         // The exact issue #258 shape: a teardown re-arms detection
@@ -1415,6 +1516,55 @@ mod tests {
         assert_eq!(known_server, None);
     }
 
+    #[test]
+    fn decide_packet_reports_a_replaced_connection_on_a_signature_match_while_adopted() {
+        // Issue #406: `detects_with` runs the signature scan before the
+        // `server_adopted` gate, so a signature match on a new connection
+        // can silently displace a still-live tracked connection with no
+        // FIN/RST at all. The decision must surface that displacement so
+        // the caller can log it, instead of leaving no trace (as the field
+        // log excerpt in #406 showed).
+        let mut detector = ServerDetector::new();
+        let previously_adopted = server_to_client([203, 0, 113, 7], 5000);
+        let mut known_server = Some(previously_adopted);
+        detector.adopt(&previously_adopted);
+
+        let new_conn = server_to_client([203, 0, 113, 8], 6000);
+        let payload = login_return_payload();
+        let decision = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &new_conn,
+            &payload,
+            false,
+            false,
+            &OwnershipFilter::none(),
+        );
+        assert!(decision.newly_adopted);
+        assert!(!decision.torn_down);
+        assert_eq!(decision.replaced, Some(previously_adopted));
+        assert_eq!(known_server, Some(new_conn));
+    }
+
+    #[test]
+    fn decide_packet_reports_no_replaced_connection_on_a_fresh_adoption() {
+        let mut detector = ServerDetector::new();
+        let mut known_server = None;
+        let conn = server_to_client([203, 0, 113, 7], 5000);
+        let payload = login_return_payload();
+        let decision = decide_packet(
+            &mut detector,
+            &mut known_server,
+            &conn,
+            &payload,
+            false,
+            false,
+            &OwnershipFilter::none(),
+        );
+        assert!(decision.newly_adopted);
+        assert_eq!(decision.replaced, None);
+    }
+
     /// issue #337 perf follow-up: the ownership lookup `detects_with`'s
     /// `allow` callback wraps must never run for a packet that fails the
     /// cheap signature/evidence checks on its own -- that's the whole point
@@ -1540,7 +1690,11 @@ mod tests {
         // already consumed one slot via its own `adopt`, so only
         // `MAX_SUBNET_CONNECTIONS - 1` more fit.
         for port in 6000..6000 + (ServerDetector::MAX_SUBNET_CONNECTIONS as u16 - 1) {
-            assert!(d.detects(&server_to_client([203, 0, 113, 201], port), b"ok", false));
+            assert!(d.detects(
+                &server_to_client([203, 0, 113, 201], port),
+                b"ok payload",
+                false
+            ));
         }
     }
 

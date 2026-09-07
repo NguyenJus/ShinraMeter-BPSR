@@ -550,6 +550,18 @@ fn recv_loop(
             last_game_pid_lookup = None;
             game_pid_lookup_interval = GAME_PID_LOOKUP_INITIAL_INTERVAL;
         }
+        // Issue #406: detection runs the signature scan *before* the
+        // "already adopted" gate, so a signature match on a different
+        // connection can displace a still-live tracked one with no FIN/RST at
+        // all. The teardown branch above never fires for that, which is why
+        // the logs showed an "adopted" line with no preceding "torn down"
+        // line. Report the displacement explicitly so both connections are
+        // visible in the log.
+        if let Some(old) = decision.replaced {
+            log::warn!(
+                "capture: replaced tracked connection {old} with {conn} without FIN/RST (reason=signature_match, issue #406)"
+            );
+        }
         if decision.skip {
             // Either the client→server half of the adopted connection
             // (recognized, so detection/adoption does not ping-pong on it,
@@ -569,9 +581,18 @@ fn recv_loop(
             // capture observed the connection from its very start — not
             // true for a mid-connection attach (issue #282).
             let resync_seq = seq.wrapping_add(decision.frame_offset as u32);
+            // Issue #406: the issue #337 ownership filter is the other reason
+            // an adoption can look surprising after the fact, so report its
+            // state on the same line instead of leaving it to be inferred
+            // from a separate pid-lookup entry elsewhere in the log.
+            let owner_state = if game_pids.is_empty() {
+                "unfiltered".to_string()
+            } else {
+                format!("pids={game_pids:?}")
+            };
             log::info!(
                 "capture: adopted game-server connection {conn} at seq={seq} \
-                 frame_offset={} ({} payload bytes)",
+                 frame_offset={} ({} payload bytes) owner={owner_state}",
                 decision.frame_offset,
                 payload.len(),
             );
