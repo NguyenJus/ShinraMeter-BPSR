@@ -590,7 +590,7 @@ pub struct AdoptionDecision {
     /// only when `newly_adopted` is `true` and a connection was already
     /// tracked at the start of this call; `None` on a fresh adoption (no
     /// prior connection) or on any non-adopting decision. The caller
-    /// (win.rs) must log this so the displacement is visible.
+    /// (win.rs) logs this at info level so the displacement is visible.
     pub replaced: Option<Conn>,
 }
 
