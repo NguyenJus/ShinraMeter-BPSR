@@ -6955,6 +6955,34 @@ mod tests {
             assert_eq!(snap.encounter.scene_boss_name, Some(CURATED_BOSS));
         }
 
+        /// Issue #420: every Sea-Ringed Reef difficulty tier is a
+        /// single-boss dungeon whose final boss is Abyssal Nappo, so the
+        /// header must name it on entry rather than going blank until the
+        /// pull. 5900 is the base scene; 6561/6562 are its Unstable Space
+        /// tiers and 6563-6565 its Chaotic tiers.
+        const REEF_SCENES: &[u32] = &[5900, 6561, 6562, 6563, 6564, 6565];
+
+        #[test]
+        fn every_sea_ringed_reef_tier_names_abyssal_nappo_before_any_hit_lands() {
+            for &scene in REEF_SCENES {
+                let mut m = Meter::new();
+                m.apply(&ProtocolEvent::Scene {
+                    level_map_id: scene,
+                });
+
+                let snap = m.snapshot(1_000);
+                assert_eq!(
+                    snap.encounter.scene_boss_name,
+                    Some("Abyssal Nappo"),
+                    "scene {scene} should name its curated final boss"
+                );
+                assert!(
+                    !snap.encounter.multi_boss_scene,
+                    "scene {scene} is not a raid"
+                );
+            }
+        }
+
         #[test]
         fn an_open_world_scene_names_no_boss() {
             // Scene 8 ("Asterleeds") is not a dungeon at all, so it can never
@@ -13648,12 +13676,110 @@ mod tests {
             assert_eq!(m.fight_end_ms(), None);
             assert_eq!(m.fight_start_ms(), Some(1_000));
 
-            // The kill resolves the held signal, exactly once.
+            // The kill resolves the held signal, exactly once. The cause is
+            // `BossDeath` rather than `DungeonEnded` because issue #421 added
+            // the intermediate re-template forms to the boss-id table, so
+            // `end_fight_on_boss_death` now gets there first — the same end,
+            // at the same timestamp, attributed to the death that caused it.
             m.apply(&hp_at(BOSS_UID, NAPPO_NEXT, 0, 4_000));
             assert_eq!(m.fight_end_ms(), Some(4_000));
-            assert_eq!(m.fight_end_cause(), Some(FightEndCause::DungeonEnded));
+            assert_eq!(m.fight_end_cause(), Some(FightEndCause::BossDeath));
             assert_eq!(m.fight_start_ms(), Some(1_000));
             m.apply(&var("IsFinishTarget", 1));
+            assert_eq!(m.fight_end_ms(), Some(4_000));
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+        }
+
+        /// Issue #421: the *whole* Abyssal Nappo re-template cycle, in the
+        /// order a real Sea-Ringed Reef pull shows it. 4601 and 4621 are
+        /// `MonsterTableBossIds` entries; 4607 and 4612-4615 are not, and a
+        /// given pull skips some of the middle ids.
+        const NAPPO_CYCLE: &[u32] = &[4_601, 4_607, 4_612, 4_613, 4_614, 4_615, 4_621];
+
+        /// issue #421: each hop of the cycle presents as the old form
+        /// reading 0 HP (the transition animation) immediately followed by
+        /// the same uid reporting the next `monster_id` at full health. The
+        /// forms that *are* recognized bosses (4601, 4621) therefore reach
+        /// `end_fight_on_boss_death`, and before the Abyssal Nappo phase
+        /// group existed the very next hit on the new form read as a brand
+        /// new fight — the meter-wide reset this issue is a report of.
+        #[test]
+        fn the_full_abyssal_nappo_re_template_cycle_never_starts_a_new_fight() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: 5_900,
+            });
+            let mut ts = 1_000;
+            m.apply(&boss_hit(BOSS_UID, ts, false));
+            m.apply(&hp_at(BOSS_UID, NAPPO_CYCLE[0], 100, ts));
+
+            for pair in NAPPO_CYCLE.windows(2) {
+                let (old, new) = (pair[0], pair[1]);
+                // The party burns the current form down...
+                ts += 1_000;
+                assert_eq!(
+                    m.apply(&boss_hit(BOSS_UID, ts, false)),
+                    None,
+                    "hitting form {old} reset the meter"
+                );
+                m.apply(&hp_at(BOSS_UID, old, 0, ts));
+                // ...and it re-templates onto the next one, full health.
+                ts += 100;
+                m.apply(&hp_at(BOSS_UID, new, 100, ts));
+                // The first hit on the new form must not read as a new fight.
+                ts += 100;
+                assert_eq!(
+                    m.apply(&boss_hit(BOSS_UID, ts, false)),
+                    None,
+                    "the hop {old} -> {new} reset the meter"
+                );
+                assert_eq!(
+                    m.fight_start_ms(),
+                    Some(1_000),
+                    "the hop {old} -> {new} restarted the fight clock"
+                );
+                assert_eq!(
+                    m.fight_end_ms(),
+                    None,
+                    "the hop {old} -> {new} ended the fight over a living boss"
+                );
+            }
+
+            // Only the last form's death is the end of the pull.
+            ts += 1_000;
+            m.apply(&hp_at(BOSS_UID, 4_621, 0, ts));
+            assert_eq!(m.fight_end_ms(), Some(ts));
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+        }
+
+        /// issue #421: a real pull does not visit every form — it skips.
+        /// A hop straight from the first form to a middle one and on to the
+        /// last must hold exactly like the consecutive hops above, which is
+        /// what makes this a *group* rather than a chain of adjacent pairs.
+        #[test]
+        fn an_abyssal_nappo_hop_that_skips_forms_still_holds_the_fight() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: 6_565,
+            });
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, 4_601, 100, 1_000));
+
+            // 4601 -> 4614, skipping 4607 and 4612-4613 entirely.
+            m.apply(&hp_at(BOSS_UID, 4_601, 0, 2_000));
+            m.apply(&hp_at(BOSS_UID, 4_614, 100, 2_100));
+            assert_eq!(m.apply(&boss_hit(BOSS_UID, 2_200, false)), None);
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+            assert_eq!(m.fight_end_ms(), None);
+
+            // 4614 -> 4621, skipping 4615.
+            m.apply(&hp_at(BOSS_UID, 4_614, 0, 3_000));
+            m.apply(&hp_at(BOSS_UID, 4_621, 100, 3_100));
+            assert_eq!(m.apply(&boss_hit(BOSS_UID, 3_200, false)), None);
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+            assert_eq!(m.fight_end_ms(), None);
+
+            m.apply(&hp_at(BOSS_UID, 4_621, 0, 4_000));
             assert_eq!(m.fight_end_ms(), Some(4_000));
             assert_eq!(m.fight_start_ms(), Some(1_000));
         }

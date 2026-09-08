@@ -111,6 +111,16 @@ const BOSS_PHASE_GROUPS: &[&[u32]] = &[
     &[103110, 103111, 103301, 103302],
     // Goblin King: Aegis form and Staff form.
     &[203, 204],
+    // Abyssal Nappo (issues #317/#391/#421): Sea-Ringed Reef's final boss
+    // re-templates one live uid through this whole cycle inside a single
+    // pull, and a hop is observed as the old form reading 0 HP followed by
+    // the new one at full health — a boss death, as far as anything
+    // downstream can tell, so every hop ended the fight and the next hit
+    // read as a brand new one. Only 4601 and 4621 carry `MonsterType == 2`;
+    // the five middle forms are added back by `BOSS_ID_MANUAL_OVERRIDES` in
+    // `scripts/gen-name-tables.py`, since a group may only list boss ids and
+    // `resumes_held_fight` checks bosshood before the grouping.
+    &[4601, 4607, 4612, 4613, 4614, 4615, 4621],
 ];
 
 /// Whether `a` and `b` are two *different* phases of the same curated
