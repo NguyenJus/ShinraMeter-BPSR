@@ -172,6 +172,19 @@ BOSS_ID_MANUAL_OVERRIDES: dict[int, str] = {
     # its own encounter, so it is kept rather than silently losing its header
     # display when the source of truth switched to MonsterType.
     61_220: "Storm Goblin King",
+    # Abyssal Nappo's intermediate re-template forms (issues #317/#391/#421).
+    # Sea-Ringed Reef's final boss cycles ONE live uid through
+    # 4601 -> 4607 -> 4612-4615 -> 4621; only the first and last of those
+    # carry `MonsterType == 2`, the five ids below are the same boss mid-pull
+    # under a different template and read as ordinary mobs without this. That
+    # cost the meter both the header caption and — because
+    # `phase::BOSS_PHASE_GROUPS` may only list boss ids — the phase-resume
+    # window that keeps a form transition from reading as a finished fight.
+    4_607: "Abyssal Nappo",
+    4_612: "Abyssal Nappo",
+    4_613: "Abyssal Nappo",
+    4_614: "Abyssal Nappo",
+    4_615: "Abyssal Nappo",
 }
 
 # World Dominator / Resonance registry range (issue #313, generalized by

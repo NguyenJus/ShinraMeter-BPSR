@@ -27,10 +27,40 @@
     "boss_id": 1152,
     "boss": "Kartgriff"
   },
+  "5900": {
+    "scene": "Sea-Ringed Reef",
+    "boss_id": 4601,
+    "boss": "Abyssal Nappo"
+  },
   "6521": {
     "scene": "Chaotic - Mech Facility",
     "boss_id": 33500,
     "boss": "Thanatos - Final Form"
+  },
+  "6561": {
+    "scene": "Unstable Space - Sea-Ringed Reef",
+    "boss_id": 4601,
+    "boss": "Abyssal Nappo"
+  },
+  "6562": {
+    "scene": "Unstable Space - Sea-Ringed Reef",
+    "boss_id": 4601,
+    "boss": "Abyssal Nappo"
+  },
+  "6563": {
+    "scene": "Chaotic - Sea-Ringed Reef",
+    "boss_id": 4601,
+    "boss": "Abyssal Nappo"
+  },
+  "6564": {
+    "scene": "Chaotic - Sea-Ringed Reef",
+    "boss_id": 4601,
+    "boss": "Abyssal Nappo"
+  },
+  "6565": {
+    "scene": "Chaotic - Sea-Ringed Reef",
+    "boss_id": 4601,
+    "boss": "Abyssal Nappo"
   },
   "8002": {
     "scene": "Canyon Battle",
