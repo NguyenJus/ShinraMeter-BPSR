@@ -192,9 +192,9 @@ pub(super) fn column_emphasis(kind: ColumnKind) -> ColumnEmphasis {
         ColumnKind::SharePct | ColumnKind::CritPct | ColumnKind::LuckyPct => {
             ColumnEmphasis::Percent
         }
-        // Issue #49. The only pill-painted column; see `ColumnEmphasis::
-        // Counter`.
-        ColumnKind::Deaths => ColumnEmphasis::Counter,
+        // Issues #49/#398. The two pill-painted columns; see
+        // `ColumnEmphasis::Counter`.
+        ColumnKind::Deaths | ColumnKind::DeathTime => ColumnEmphasis::Counter,
         ColumnKind::Damage
         | ColumnKind::Hits
         | ColumnKind::AbilityScore
@@ -583,6 +583,21 @@ pub(super) fn draw_row(
     // reads correctly at the columns' fixed anchors no matter how far the
     // suffix bleeds under them. Do not add a clip rect or a length cap
     // here — that would be undoing this decision, not fixing an oversight.
+    // Issue #397: the name is the row's hover surface for the two static
+    // character stats. Sensed over the *painted* name extent `paint_text`
+    // just handed back, not the whole name slot, so an empty stretch of row
+    // left of the columns stays inert (and the window drag band under it
+    // keeps working). Registered after the row's own response so this
+    // narrower rect wins the pixels it overlaps. Keyed on `row.entity`, not
+    // `row.uid` — uid is documented non-unique (see the right-click path
+    // below, which uses entity for the same reason).
+    ui.interact(
+        name_rect,
+        ui.id().with(("name", row.entity)),
+        egui::Sense::hover(),
+    )
+    .on_hover_text(name_hover_text(row.ability_score, row.season_strength));
+
     if let Some(suffix) = name_suffix(row, layout.settings) {
         paint_text(
             ui.painter(),
@@ -611,6 +626,12 @@ pub(super) fn draw_row(
     // PNG failed to decode — never expected, the bytes are compile-time
     // constants) degrades to an empty icon box, see `StatPill::icon`.
     let skull = icons.glyphs.get(GlyphIcon::Skull).map(|t| t.id());
+    // Issue #398's death-time pill, resolved once for the same reason: the
+    // stopwatch the header's fight timer already uses, since neither
+    // vendored icon set has a dedicated death-time mark and a second clock
+    // reads as "time" on sight (the same choice the breakdown window's
+    // death-time pill made in issue #254).
+    let timer = icons.glyphs.get(GlyphIcon::Timer).map(|t| t.id());
 
     for ((anchor_x, column), kind) in layout.anchors.iter().zip(layout.columns).zip(layout.kinds) {
         let text = (column.text)(row);
@@ -639,7 +660,14 @@ pub(super) fn draw_row(
                 &painter,
                 rect,
                 *anchor_x,
-                StatPill::counter(&text, skull, column.color),
+                StatPill::counter(
+                    &text,
+                    match kind {
+                        ColumnKind::DeathTime => timer,
+                        _ => skull,
+                    },
+                    column.color,
+                ),
             );
         } else {
             // Right-aligned on the anchor, except for the centered crit-%
@@ -1071,6 +1099,26 @@ pub(super) fn imagine_hover_text(name: &str, tier: Option<i32>) -> String {
     }
 }
 
+/// Hover-tooltip text for a player's name (issue #397): the two static
+/// character stats the row itself has no room for, one per line.
+///
+/// Both are `Option` because neither reaches the meter from combat packets
+/// — they arrive only with a player-info packet (`ability_score`/
+/// `season_strength`), which may never be seen for a stranger in the party.
+/// An unseen score is an em dash rather than `0`: a real zero and "never
+/// observed" are different facts, and the tooltip exists precisely to
+/// report which one this is.
+pub(super) fn name_hover_text(ability: Option<u32>, season: Option<u32>) -> String {
+    fn value(v: Option<u32>) -> String {
+        v.map_or_else(|| "—".to_string(), |v| v.to_string())
+    }
+    format!(
+        "Ability score: {}\nSeason strength: {}",
+        value(ability),
+        value(season)
+    )
+}
+
 /// Whether a filled Imagine slot should get the gold max-tier ring (issue
 /// #170): `tier >= IMAGINE_MAX_TIER`. `None` (unresolved/no tier data) and
 /// any tier below the max both yield `false` — see `IMAGINE_MAX_TIER`'s doc
@@ -1198,6 +1246,24 @@ mod tests {
     use super::*;
     use crate::ui::tests::*;
     // -- Imagine tier hover text / gold ring (issues #169/#170) -------------
+
+    /// Issue #397: both scores present read as two labelled lines.
+    #[test]
+    fn name_hover_text_lists_both_scores() {
+        assert_eq!(
+            name_hover_text(Some(45_000), Some(1_234)),
+            "Ability score: 45000\nSeason strength: 1234"
+        );
+    }
+
+    /// Issue #397: an unseen score is an em dash, never a fabricated zero.
+    #[test]
+    fn name_hover_text_marks_a_missing_score_with_a_dash() {
+        assert_eq!(
+            name_hover_text(None, None),
+            "Ability score: \u{2014}\nSeason strength: \u{2014}"
+        );
+    }
 
     #[test]
     fn imagine_hover_text_plain_name_when_tier_is_zero() {
@@ -2384,17 +2450,22 @@ mod tests {
 
     // --- death-count column (issue #49) ---------------------------------
 
-    /// The dispatch that makes this column chrome rather than text. Exactly
-    /// one column is a pill — if a second ever becomes one, `draw_row`'s
-    /// single `paint_counter_pill` call needs revisiting first.
+    /// The dispatch that makes these columns chrome rather than text. The
+    /// death count and the time spent dead (issue #398) are the only pills —
+    /// if a third ever becomes one, `draw_row`'s pill dispatch needs
+    /// revisiting first.
     #[test]
-    fn deaths_is_the_only_column_painted_as_a_pill() {
+    fn deaths_and_death_time_are_the_columns_painted_as_pills() {
         assert_eq!(column_emphasis(ColumnKind::Deaths), ColumnEmphasis::Counter);
+        assert_eq!(
+            column_emphasis(ColumnKind::DeathTime),
+            ColumnEmphasis::Counter
+        );
         let pills: Vec<_> = ColumnKind::ALL
             .into_iter()
             .filter(|kind| column_emphasis(*kind).is_pill())
             .collect();
-        assert_eq!(pills, vec![ColumnKind::Deaths]);
+        assert_eq!(pills, vec![ColumnKind::Deaths, ColumnKind::DeathTime]);
     }
 
     /// The counter shares the row's flat metric size (issue #62) — it is the

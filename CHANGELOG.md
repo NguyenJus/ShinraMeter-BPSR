@@ -6,6 +6,17 @@ affiliated with the game's publisher.
 
 ## Unreleased
 
+### Added
+
+- The main table gains a Death time column next to Deaths, showing how
+  long each player spent on the floor this encounter as a counter pill.
+  It reads `—` when nothing was recorded and prefixes a `~` to any
+  non-zero total, since the revive edge behind it is inferred rather
+  than observed.
+- Hovering a player's name now shows their ability score and season
+  strength, so those two figures no longer need their own columns to be
+  readable.
+
 ### Changed
 
 - Log lines now carry a `pid=<pid>` field, so entries from two meter
