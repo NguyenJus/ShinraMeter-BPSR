@@ -57,7 +57,7 @@ const MAX_PRELOADED_PLAYERS: u32 = 64;
 /// needs bounding: "alive and damaged at some point" also describes a boss
 /// the party gave up on and left standing, since `EnemyState::is_alive`
 /// reads a boss never observed dying as alive forever, and nothing but a
-/// `ServerChanged` ever clears `enemies`.
+/// `ServerChanged` or a real scene change ever clears `enemies`.
 ///
 /// Nothing structural separates those two cases — both are "damaged, then a
 /// reset, then something else takes a hit" — so the separator is elapsed
@@ -347,13 +347,16 @@ pub struct Meter {
     boss_entity: Option<EntityId>,
     /// Current dungeon/instance id (issue #9 slice 2), from the most recent
     /// `ProtocolEvent::Scene`. Survives `Meter::reset` (a manual reset or a
-    /// boss-HP rollback both stay in the same dungeon); cleared only on
-    /// `ServerChanged`, in `apply` directly rather than in `reset` itself.
+    /// boss-HP rollback both stay in the same dungeon) and, since issue
+    /// #422, a `ServerChanged` too — a capture-side re-adoption is not a
+    /// game event, and which scene the party is in is not a fact about
+    /// which TCP flow is being decoded. Only a `Scene` naming a different
+    /// id replaces it.
     scene_id: Option<u32>,
     /// The most recent scene id an actual `ProtocolEvent::Scene` reported,
-    /// **not** cleared by `ServerChanged` (issue #295). `scene_id` goes
-    /// `None` across a reconnect because the destination is genuinely
-    /// unknown until the next `Scene` packet — but by the time that packet
+    /// **not** cleared by `ServerChanged` (issue #295). `scene_id` used to
+    /// go `None` across a reconnect (until issue #422 kept it) — but by the
+    /// time the next `Scene` packet
     /// arrives, comparing its id against the *previous* confirmed scene is
     /// no longer ambiguous, and every real capture sends `ServerChanged`
     /// immediately before the `Scene` that follows a zone transition. Using
@@ -397,8 +400,9 @@ pub struct Meter {
     ///
     /// `snapshot` renders this instead of live state for as long as the
     /// fight is held ([`FightState::Ended`]). Zoning out of a dungeon
-    /// discards the live answer — `ServerChanged` clears `enemies`,
-    /// `boss_entity` and `scene_id`, then the town's `Scene` event lands —
+    /// discards the live answer — the town's `Scene` event clears
+    /// `enemies`, `boss_entity` and `scene_id` (issue #422: the
+    /// `ServerChanged` that precedes it only clears `enemies`) —
     /// while the fight's rows, totals and clock stay frozen on screen, so
     /// without this capture the header would caption a raid's damage
     /// breakdown with "No target" and the name of the town the player just
@@ -428,8 +432,8 @@ pub struct Meter {
     /// `DungeonStarted` reset or a raid-boss-reset both stay inside the
     /// same instance), and is cleared only when the instance itself goes
     /// away — an explicit `DungeonState::Null` (§4), a `ServerChanged`, or
-    /// entering a different dungeon/raid scene (mirroring the `enemies`/
-    /// `boss_entity` clears at both of those points).
+    /// entering a different dungeon/raid scene (mirroring the `enemies`
+    /// clear at both of those points).
     dungeon_state: Option<EDungeonState>,
     /// Every dungeon objective seen this instance, keyed by target id
     /// (issue #139 §1). Survives `Meter::reset` for the same reason
@@ -1080,10 +1084,11 @@ impl Meter {
                 // would otherwise stamp a fight still genuinely in progress
                 // as cut short by a "departure" that never happened, the
                 // instant a late-attaching meter finally learns where it
-                // is. `ServerChanged` having cleared `scene_id` is *not*
-                // this case — `last_known_scene_id` is still set then, so
-                // the check below still runs and issue #295's fast reset
-                // still fires on a confirmed different scene.
+                // is. A reconnect is *not* this case — since issue #422
+                // `scene_id` survives it outright, and even before that
+                // `last_known_scene_id` was still set, so the check below
+                // still runs and issue #295's fast reset still fires on a
+                // confirmed different scene.
                 let first_ever_scene_learn =
                     self.scene_id.is_none() && self.last_known_scene_id.is_none();
                 if !first_ever_scene_learn && self.scene_id != Some(*level_map_id) {
@@ -1163,13 +1168,13 @@ impl Meter {
                     //
                     // And gated on `self.last_known_scene_id` rather than
                     // the live `self.scene_id` (issue #295): `scene_id`
-                    // itself goes `None` across a `ServerChanged`, since the
-                    // destination really is unknown until this very packet
-                    // — and every real zone transition in capture sends a
-                    // `ServerChanged` first, so comparing against `scene_id`
+                    // itself used to go `None` across a `ServerChanged`
+                    // (issue #422 keeps it now), and every real zone
+                    // transition in capture sends a `ServerChanged` first,
+                    // so comparing against `scene_id`
                     // here always saw `None` in production and could never
-                    // resolve immediately. `last_known_scene_id` is not
-                    // cleared by `ServerChanged`, so by the time this packet
+                    // resolve immediately. `last_known_scene_id` has never
+                    // been cleared by `ServerChanged`, so by the time this packet
                     // lands the comparison is no longer ambiguous: a
                     // different id from the last one actually confirmed
                     // *is* a genuinely new instance, and the same id is the
@@ -7345,13 +7350,45 @@ mod tests {
             m.apply(&hp(10, 100, 100, 0));
             assert_eq!(m.boss_entity, Some(ek(10)));
 
-            m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 1_000 });
+            m.apply(&ProtocolEvent::ServerChanged {
+                timestamp_ms: 1_000,
+            });
             assert_eq!(
                 m.scene_id,
                 Some(4_242),
                 "the scene survives a decoder restart"
             );
             assert_eq!(m.boss_entity, Some(ek(10)), "and so does the boss target");
+        }
+
+        /// Issue #422, the other half: the boss target the reconnect kept
+        /// must stay *inert* until `recompute_boss` re-points it at an
+        /// enemy of the new session. `enemies` is still cleared, and every
+        /// reader of `boss_entity` that can reach the header or the
+        /// end-of-fight heuristics goes through that map - so a retained
+        /// uid cannot caption a stale boss name or report a target still
+        /// standing when the meter knows of no enemies at all.
+        #[test]
+        fn the_boss_kept_across_a_server_change_is_inert_while_enemies_is_empty() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 100, 100, 0));
+            assert_eq!(m.boss_monster_id(), Some(BOSS));
+
+            m.apply(&ProtocolEvent::ServerChanged {
+                timestamp_ms: 1_000,
+            });
+            assert_eq!(m.boss_entity, Some(ek(10)));
+            assert!(m.enemies.is_empty());
+            assert_eq!(
+                m.boss_monster_id(),
+                None,
+                "the retained uid names no monster the new session knows"
+            );
+            assert!(
+                m.fought_target_alive().is_none(),
+                "and cannot report a target still standing"
+            );
         }
 
         // -- issue #157: trash must not hold the reset heuristic ---------

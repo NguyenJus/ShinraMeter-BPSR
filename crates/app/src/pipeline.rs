@@ -449,7 +449,11 @@ impl Pipeline {
     /// The tail of `step`, shared with `flush_pending_server_change` so a
     /// deferred event reaches the meter through exactly the same path a
     /// live one does.
-    fn apply_mapped(&mut self, ev: meter::ProtocolEvent, now_ms: u64) -> Option<meter::ResetReason> {
+    fn apply_mapped(
+        &mut self,
+        ev: meter::ProtocolEvent,
+        now_ms: u64,
+    ) -> Option<meter::ResetReason> {
         let reason = self.meter.apply(&ev);
         if let Some(reason) = reason {
             log::debug!("meter reset: {reason:?}");

@@ -118,7 +118,10 @@ fn server_change_holds_the_numbers() {
         // adopted connection has decoded anything, so the pipeline parks the
         // fight end until a frame confirms it or the grace window closes.
         // Nothing decodes after the reconnect here, so it is this tick -
-        // `publish`'s, in production - that lands it.
+        // `publish`'s, in production - that lands it. It is also why the
+        // golden's `fight_state` reads `Ended` rather than `Idle`: the
+        // scenario never ticked before, so that field was the harness's
+        // never-updated initial value, not a statement about the meter.
         .tick()
         .capture("server_change_reset");
 
