@@ -19,6 +19,11 @@ affiliated with the game's publisher.
 
 ### Changed
 
+- The player-row scroll bar is now a solid, always-legible thin bar on
+  a transparent track, and rows reserve room for it so nothing under it
+  is clipped.
+- Hovering an Imagine icon now shows its name and tier immediately
+  instead of after a noticeable delay.
 - Log lines now carry a `pid=<pid>` field, so entries from two meter
   instances sharing one log file can be told apart.
 - Startup now logs an `env overrides:` banner line recording which
