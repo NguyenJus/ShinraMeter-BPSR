@@ -83,6 +83,38 @@ const MAX_GAME_PID_LOOKUP_INTERVAL: Duration = Duration::from_secs(60);
 /// far better than a live thread that silently never emits again.
 const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 64;
 
+/// How often [`shutdown_and_close`](CaptureHandle::shutdown_and_close)
+/// re-checks a join during the bounded wait.
+const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Fallback deadline for [`CaptureHandle::stop`] and the `Drop` impl, used
+/// when the caller has no shutdown budget of its own to pass to
+/// [`CaptureHandle::stop_within`]. `crates/app`'s `main.rs` always calls
+/// `stop_within` with its remaining `SHUTDOWN_BUDGET` share instead.
+const DEFAULT_SHUTDOWN_JOIN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// [`JoinHandle::join`] with a deadline, mirroring `main`'s
+/// `join_with_timeout` (issue #401): polls
+/// [`JoinHandle::is_finished`] and, once `deadline` passes, logs which
+/// thread is still alive and returns `false` without joining instead of
+/// blocking forever. Detaching the handle (dropping it) is the caller's
+/// responsibility.
+fn join_with_timeout<T>(name: &str, handle: &JoinHandle<T>, deadline: Duration) -> bool {
+    let started = Instant::now();
+    while !handle.is_finished() {
+        let waited = started.elapsed();
+        if waited >= deadline {
+            log::warn!(
+                "capture shutdown: thread {name} still alive after {}ms; leaking driver handle",
+                deadline.as_millis()
+            );
+            return false;
+        }
+        thread::sleep(JOIN_POLL_INTERVAL.min(deadline - waited));
+    }
+    true
+}
+
 /// Handle to the running capture thread.
 pub struct CaptureHandle {
     stop: Arc<AtomicBool>,
@@ -136,7 +168,18 @@ impl CaptureHandle {
         self.restart.clone()
     }
 
-    /// Signals the capture thread to stop and waits for it to exit.
+    /// Signals the capture thread to stop and waits for it to exit, bounded
+    /// by [`DEFAULT_SHUTDOWN_JOIN_DEADLINE`].
+    ///
+    /// A thin wrapper over [`Self::stop_within`] for callers (the `Drop`
+    /// impl included) that have no shared shutdown budget of their own to
+    /// pass down.
+    pub fn stop(mut self) {
+        self.shutdown_and_close(DEFAULT_SHUTDOWN_JOIN_DEADLINE);
+    }
+
+    /// Signals the capture thread to stop and waits up to `deadline` for it
+    /// to exit.
     ///
     /// `WinDivertRecv` blocks waiting for the next packet, which on a quiet
     /// link (typically: the game already exited) may never return — so
@@ -144,19 +187,25 @@ impl CaptureHandle {
     /// driver-documented way to unblock a thread parked in a recv on the
     /// same handle from another thread.
     ///
+    /// `deadline` (issue #401 follow-up) is the caller's remaining share of
+    /// the app-wide `SHUTDOWN_BUDGET` in `crates/app`'s `main.rs`, not a
+    /// fixed local constant — capture is one of several sequential joins on
+    /// the shutdown path, so how long it may take depends on how much
+    /// budget is left when it runs, not on capture alone.
+    ///
     /// Does the same work `Drop` would; the `closed` guard in
     /// `shutdown_and_close` makes the `Drop` that runs when `self` falls out
     /// of scope here a no-op, so the driver handle is still closed exactly
     /// once and nothing in `self` (the `stop`/`restart` `Arc`s included) is
     /// leaked.
-    pub fn stop(mut self) {
-        self.shutdown_and_close();
+    pub fn stop_within(mut self, deadline: Duration) {
+        self.shutdown_and_close(deadline);
     }
 
     /// Shared teardown: signal, unblock `recv`, join the thread, close the
     /// handle. Idempotent — guarded by `closed` — so it is safe to call from
-    /// both `stop` and the `Drop` that follows it.
-    fn shutdown_and_close(&mut self) {
+    /// both `stop`/`stop_within` and the `Drop` that follows either.
+    fn shutdown_and_close(&mut self, deadline: Duration) {
         if self.closed {
             return;
         }
@@ -169,18 +218,30 @@ impl CaptureHandle {
         unsafe {
             self.api.shutdown_recv(self.handle);
         }
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-        // The watchdog never touches the driver handle, but it is joined
-        // here anyway so the thread is gone before the process moves on —
-        // it notices the stop flag within one `WATCHDOG_TICK`.
+        // Issue #401 (O1): a capture thread wedged in something other than
+        // `WinDivertRecv` (e.g. still decoding a huge packet) must not hang
+        // the whole process shutdown. If it has not finished within the
+        // deadline, the join handle is dropped (leaking the thread, which
+        // dies with the process) and `WinDivertClose` below is skipped —
+        // closing the handle while that thread might still call into the
+        // driver with it would violate the SAFETY comment there, so leaking
+        // the OS handle for the OS to reclaim at exit is the safe choice.
+        let capture_thread_joined = match self.join.take() {
+            Some(join) => join_with_timeout("capture", &join, deadline),
+            None => true,
+        };
+        // The watchdog never touches the driver handle, so it is always
+        // safe to bound its join independently of the capture thread's —
+        // it notices the stop flag within one `WATCHDOG_TICK` in the
+        // common case, and is simply leaked otherwise.
         if let Some(join) = self.heartbeat_join.take() {
-            let _ = join.join();
+            join_with_timeout("capture-heartbeat", &join, deadline);
         }
-        // SAFETY: the capture thread has exited (or was never spawned with
-        // this handle outstanding), so nothing can use the handle after
-        // this point.
+        if !capture_thread_joined {
+            return;
+        }
+        // SAFETY: the capture thread has exited (checked above), so nothing
+        // can use the handle after this point.
         unsafe {
             self.api.close(self.handle);
         }
@@ -189,13 +250,15 @@ impl CaptureHandle {
 
 impl Drop for CaptureHandle {
     /// Runs `WinDivertShutdown`/join/`WinDivertClose` if the handle is
-    /// dropped without an explicit `stop()` — e.g. an unwind out of
-    /// `eframe::run_native` — so the driver handle and capture thread are
-    /// never leaked until process exit. `stop()` performs this same teardown
-    /// itself; the `closed` guard in `shutdown_and_close` makes this a no-op
-    /// when it then runs on the same handle.
+    /// dropped without an explicit `stop()`/`stop_within()` — e.g. an unwind
+    /// out of `eframe::run_native` — so the driver handle and capture thread
+    /// are never leaked until process exit. `stop()`/`stop_within()` perform
+    /// this same teardown themselves; the `closed` guard in
+    /// `shutdown_and_close` makes this a no-op when it then runs on the same
+    /// handle. An unprompted drop has no caller-supplied budget to spend, so
+    /// it falls back to [`DEFAULT_SHUTDOWN_JOIN_DEADLINE`].
     fn drop(&mut self) {
-        self.shutdown_and_close();
+        self.shutdown_and_close(DEFAULT_SHUTDOWN_JOIN_DEADLINE);
     }
 }
 

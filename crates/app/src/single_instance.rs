@@ -14,10 +14,20 @@
 //! that duplicate, not the numbers in them.
 //!
 //! The guard is an advisory lock on a file next to the log and the database
-//! ([`lock_file_path`]), held for the life of the process. The OS drops the
-//! lock when the process ends however it ends, so a crashed instance never
-//! leaves a stale lock behind that would lock the user out of their own
-//! meter — which is why this is a file lock rather than a pid file.
+//! ([`lock_file_path`]), held for the life of the process. The holder writes
+//! its pid into a sibling file (the lock file itself with its extension
+//! swapped for `.pid`) so a refused copy can name the process to end (issue
+//! #401), but the pid is diagnostic only — the lock stays the sole authority
+//! on whether the slot is taken. The pid lives outside the locked file
+//! because the lock is a whole-file byte-range lock: on Windows that lock is
+//! mandatory, so the holder's own process could not read its contents back
+//! even if it wanted to, and reading it from a second process would race the
+//! holder's write. The OS drops the lock when the process ends however it
+//! ends, so a crashed instance never leaves a stale lock behind that would
+//! lock the user out of their own meter — which is why this is a file lock
+//! rather than a pid file. The sidecar pid file *can* go stale after a
+//! crash (the lock's release is what matters, not the sidecar), so the
+//! guard removes it on a clean exit and [`read_pid`] is best-effort only.
 //!
 //! `SHINRA_INSTANCE_LOCK` overrides the path, which is also the escape hatch
 //! for deliberately running two builds side by side: point them at different
@@ -49,6 +59,15 @@ pub struct InstanceGuard {
     /// The lock lives on the open handle, not on the file's contents: the
     /// field is never read, only kept from being dropped.
     _file: File,
+    /// The sidecar pid file's path, so a clean drop can remove it — best
+    /// effort, so a stale pid does not linger after a crash-free exit.
+    pid_path: PathBuf,
+}
+
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.pid_path);
+    }
 }
 
 /// What [`acquire_at`] found.
@@ -56,8 +75,11 @@ pub struct InstanceGuard {
 pub enum Acquisition {
     /// This process now owns the meter slot.
     Acquired(InstanceGuard),
-    /// Another live instance already owns it; this one must not start.
-    AlreadyRunning,
+    /// Another live instance already owns it; this one must not start. The
+    /// pid is whatever the holder wrote into the lock file (issue #401), so
+    /// the refused copy can name the process to end when it has no window —
+    /// `None` if the file was empty or unreadable.
+    AlreadyRunning(Option<u32>),
     /// The lock could not be evaluated at all (unwritable directory, a
     /// filesystem without locking). Startup continues without a guard —
     /// refusing to run because the *guard* is broken would be a worse bug
@@ -94,14 +116,15 @@ pub const HANDOFF_VAR: &str = "SHINRA_INSTANCE_HANDOFF";
 /// rather than exiting, the successor eventually says so instead of hanging
 /// with no window and no message.
 ///
-/// Kept at 10s rather than shortened (issue #278 review): the joins on the
-/// outgoing side (`pipeline_thread`, the names-cache writer, the settings
-/// thread — see `main.rs`'s shutdown path) block on `JoinHandle::join` with
-/// no internal timeout of their own, so nothing bounds how long a slow but
-/// healthy shutdown — e.g. the SQLite flush contending with disk I/O — can
-/// take. A shorter ceiling would risk cutting off exactly the non-wedged
-/// case this wait exists to cover; there was no evidence here that 5s is
-/// still safe.
+/// Kept at 10s rather than shortened (issue #278 review): since issue #401
+/// the outgoing instance's *whole* shutdown — capture, pipeline, history,
+/// settings and inspect, joined in sequence in `main.rs` — shares one
+/// `SHUTDOWN_BUDGET` of 8s, rather than each of those joins getting its own
+/// 5s deadline (which, run in sequence, could add up to well past this
+/// wait). 10s keeps a two-second margin over that 8s budget, so a shutdown
+/// that spends its whole budget still finishes before this wait gives up —
+/// while a genuinely wedged predecessor is still bounded and eventually
+/// reported instead of hanging forever.
 const HANDOFF_WAIT: Duration = Duration::from_secs(10);
 
 /// How often the wait re-tries. Short enough that a normal handoff — a
@@ -176,7 +199,7 @@ pub fn acquire() -> Acquisition {
 /// armed — so a handoff that wins immediately logs nothing extra.
 fn acquire_with_logged_handoff(path: &Path, wait: Duration) -> Acquisition {
     match acquire_at(path) {
-        Acquisition::AlreadyRunning => {}
+        Acquisition::AlreadyRunning(_) => {}
         settled => return settled,
     }
     log::info!(
@@ -192,7 +215,7 @@ fn acquire_with_logged_handoff(path: &Path, wait: Duration) -> Acquisition {
             path.display(),
             started.elapsed().as_secs_f64()
         ),
-        Acquisition::AlreadyRunning => log::warn!(
+        Acquisition::AlreadyRunning(_) => log::warn!(
             "gave up waiting for the previous instance to release {} after {}s; it may be stuck rather than exiting",
             path.display(),
             wait.as_secs()
@@ -215,23 +238,32 @@ pub fn acquire_at_within(path: &Path, wait: Duration) -> Acquisition {
     let deadline = Instant::now() + wait;
     loop {
         match acquire_at(path) {
-            Acquisition::AlreadyRunning => {}
+            Acquisition::AlreadyRunning(_) => {}
             settled => return settled,
         }
         let now = Instant::now();
         if now >= deadline {
-            return Acquisition::AlreadyRunning;
+            return Acquisition::AlreadyRunning(read_pid(path));
         }
         std::thread::sleep(RETRY_INTERVAL.min(deadline - now));
     }
 }
 
+/// The sidecar file a holder's pid is written into: the lock file's path
+/// with its extension swapped for `.pid`. Deliberately not the locked file
+/// itself — see the module doc comment for why.
+fn pid_file_path(path: &Path) -> PathBuf {
+    path.with_extension("pid")
+}
+
 /// [`acquire`] against an explicit path — the testable half.
 ///
 /// The lock is taken on a handle that stays open inside the returned guard.
-/// The pid written into the file is diagnostic only: nothing reads it back,
-/// because a pid on disk cannot distinguish "still running" from "crashed,
-/// and the number has since been reused".
+/// The pid written into the sidecar file is diagnostic only: it is read
+/// back solely to name the holder in the refusal (issue #401), never to
+/// decide whether the slot is free — a pid on disk cannot distinguish
+/// "still running" from "crashed, and the number has since been reused".
+/// The lock itself remains the only authority on that.
 pub fn acquire_at(path: &Path) -> Acquisition {
     if let Err(err) = paths::ensure_parent_dir(path) {
         let parent = path.parent().unwrap_or(path);
@@ -243,7 +275,7 @@ pub fn acquire_at(path: &Path) -> Acquisition {
 
     // Not `truncate(true)`: truncation happens *after* the lock is won, so a
     // losing instance never touches the winner's file contents.
-    let mut file = match OpenOptions::new()
+    let file = match OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
@@ -260,26 +292,68 @@ pub fn acquire_at(path: &Path) -> Acquisition {
 
     match file.try_lock() {
         Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Acquisition::AlreadyRunning,
+        Err(TryLockError::WouldBlock) => return Acquisition::AlreadyRunning(read_pid(path)),
         Err(TryLockError::Error(err)) => {
             return Acquisition::Unavailable(format!("could not lock {} ({err})", path.display()));
         }
     }
 
-    // Best-effort breadcrumb for whoever reads the directory later; a failure
-    // here does not invalidate the lock we already hold.
-    let _ = file.set_len(0);
-    let _ = write!(file, "{}", std::process::id());
-    let _ = file.flush();
+    // Best-effort breadcrumb for whoever reads the directory later; a
+    // failure here does not invalidate the lock we already hold. Written to
+    // a temp file in the same directory and renamed into place so a reader
+    // never observes a torn write — `rename` is atomic on both platforms —
+    // and to an unlocked sidecar rather than the locked file itself, which
+    // a second process (or even this one) cannot read while the lock is
+    // held (mandatory on Windows).
+    let pid_path = pid_file_path(path);
+    let _ = write_pid_file(&pid_path, std::process::id());
 
-    Acquisition::Acquired(InstanceGuard { _file: file })
+    Acquisition::Acquired(InstanceGuard {
+        _file: file,
+        pid_path,
+    })
+}
+
+/// Writes `pid` into `pid_path` via a temp file in the same directory
+/// followed by a rename, so a concurrent reader never sees a partial write.
+fn write_pid_file(pid_path: &Path, pid: u32) -> std::io::Result<()> {
+    let tmp_path = pid_path.with_extension("pid.tmp");
+    {
+        let mut tmp = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        write!(tmp, "{pid}")?;
+        tmp.flush()?;
+    }
+    std::fs::rename(&tmp_path, pid_path)
+}
+
+/// The pid the lock's holder wrote into the sidecar file, if it is still
+/// there and still parses. Best-effort: a missing, empty or stale file just
+/// means the refusal cannot name a process.
+fn read_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(pid_file_path(path))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// What the refused instance says before it exits — one line, naming the
 /// notification area, because that is where the instance it lost to almost
 /// certainly is.
-pub const ALREADY_RUNNING_MESSAGE: &str = "ShinraMeter-BPSR is already running; look for it in the notification area. \
-     A second copy would write every fight to the history twice, so this one is exiting (issue #277).";
+pub fn already_running_message(pid: Option<u32>) -> String {
+    let holder = match pid {
+        Some(pid) => format!(" (pid {pid})"),
+        None => String::new(),
+    };
+    format!(
+        "ShinraMeter-BPSR is already running{holder}; look for it in the notification area. \
+         A second copy would write every fight to the history twice, so this one is exiting (issue #277)."
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -311,7 +385,7 @@ mod tests {
         assert!(matches!(first, Acquisition::Acquired(_)));
 
         assert!(
-            matches!(acquire_at(&path), Acquisition::AlreadyRunning),
+            matches!(acquire_at(&path), Acquisition::AlreadyRunning(_)),
             "a second acquisition must not succeed while the first guard is alive"
         );
 
@@ -398,7 +472,7 @@ mod tests {
         assert!(
             matches!(
                 acquire_at_within(&path, Duration::from_millis(150)),
-                Acquisition::AlreadyRunning
+                Acquisition::AlreadyRunning(_)
             ),
             "waiting must not turn into letting a real second instance run"
         );
@@ -418,7 +492,7 @@ mod tests {
         let started = Instant::now();
         assert!(matches!(
             acquire_at_within(&path, Duration::ZERO),
-            Acquisition::AlreadyRunning
+            Acquisition::AlreadyRunning(_)
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
 
@@ -449,15 +523,52 @@ mod tests {
         assert_eq!(handoff_wait(Some("1")), HANDOFF_WAIT);
     }
 
+    /// Issue #401: a lingering windowless instance is only actionable if the
+    /// refused copy can say *which* process to end.
+    #[test]
+    fn a_refused_instance_reports_the_holding_pid() {
+        let path = lock_path("pid-reported");
+        let first = acquire_at(&path);
+        assert!(matches!(first, Acquisition::Acquired(_)));
+
+        match acquire_at(&path) {
+            Acquisition::AlreadyRunning(pid) => {
+                assert_eq!(pid, Some(std::process::id()));
+            }
+            other => panic!("expected AlreadyRunning, got {other:?}"),
+        }
+
+        drop(first);
+    }
+
+    #[test]
+    fn the_message_names_the_holding_pid_when_it_is_known() {
+        let named = already_running_message(Some(4321));
+        assert!(named.contains("(pid 4321)"), "{named}");
+        assert!(!already_running_message(None).contains("pid"));
+    }
+
     #[test]
     fn the_lock_file_records_the_holders_pid() {
         let path = lock_path("pid");
         let guard = acquire_at(&path);
         assert!(matches!(guard, Acquisition::Acquired(_)));
         assert_eq!(
-            fs::read_to_string(&path).unwrap(),
+            fs::read_to_string(pid_file_path(&path)).unwrap(),
             std::process::id().to_string()
         );
         drop(guard);
+    }
+
+    /// The sidecar pid file must not outlive a clean exit — otherwise a
+    /// refused instance could name a pid that has long since been reused.
+    #[test]
+    fn dropping_the_guard_removes_the_sidecar_pid_file() {
+        let path = lock_path("pid-cleanup");
+        let guard = acquire_at(&path);
+        assert!(matches!(guard, Acquisition::Acquired(_)));
+        assert!(pid_file_path(&path).exists());
+        drop(guard);
+        assert!(!pid_file_path(&path).exists());
     }
 }

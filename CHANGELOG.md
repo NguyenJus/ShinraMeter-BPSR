@@ -17,6 +17,13 @@ affiliated with the game's publisher.
 
 ### Fixed
 
+- Closing the meter can no longer leave a windowless process behind holding
+  the single-instance lock: shutdown across capture, pipeline, history,
+  settings and inspect is now bounded to eight seconds as a whole, then
+  logs which worker thread is still alive and detaches it, and ends with a
+  `shutdown: complete` line so a truncated log is diagnosable.
+- The "already running" dialog now names the pid of the process holding the
+  lock, so a lingering copy can actually be found and ended.
 - Capture no longer wedges for minutes on a single lost TCP segment. The
   reassembler's stall guard now also trips on a wall-clock/byte budget (a hole
   stuck for more than 10s while more than 64 KiB has piled up behind it), so a
