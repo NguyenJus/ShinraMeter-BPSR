@@ -18,10 +18,11 @@
 
 use std::ffi::{CString, c_void};
 use std::mem::MaybeUninit;
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bpsr_protocol::{Decoder, InspectSink, ProtocolEvent};
 use crossbeam_channel::Sender;
@@ -32,7 +33,7 @@ use crate::backoff::{next_game_pids, recv_error_backoff, should_refresh_game_pid
 use crate::detect::{Conn, ServerDetector, decide_packet};
 use crate::driver::{Api, WinDivertAddress};
 use crate::error::CaptureError;
-use crate::owner::{self, SystemOwnerLookup};
+use crate::owner::{self, StreamOwnerLookup, SystemOwnerLookup};
 use crate::restart::CaptureRestart;
 use crate::tcp::TcpReassembler;
 use crate::throughput::{
@@ -81,6 +82,38 @@ const MAX_GAME_PID_LOOKUP_INTERVAL: Duration = Duration::from_secs(60);
 /// the event channel and is how the failure reaches the rest of the app —
 /// far better than a live thread that silently never emits again.
 const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 64;
+
+/// How often [`shutdown_and_close`](CaptureHandle::shutdown_and_close)
+/// re-checks a join during the bounded wait.
+const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Fallback deadline for [`CaptureHandle::stop`] and the `Drop` impl, used
+/// when the caller has no shutdown budget of its own to pass to
+/// [`CaptureHandle::stop_within`]. `crates/app`'s `main.rs` always calls
+/// `stop_within` with its remaining `SHUTDOWN_BUDGET` share instead.
+const DEFAULT_SHUTDOWN_JOIN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// [`JoinHandle::join`] with a deadline, mirroring `main`'s
+/// `join_with_timeout` (issue #401): polls
+/// [`JoinHandle::is_finished`] and, once `deadline` passes, logs which
+/// thread is still alive and returns `false` without joining instead of
+/// blocking forever. Detaching the handle (dropping it) is the caller's
+/// responsibility.
+fn join_with_timeout<T>(name: &str, handle: &JoinHandle<T>, deadline: Duration) -> bool {
+    let started = Instant::now();
+    while !handle.is_finished() {
+        let waited = started.elapsed();
+        if waited >= deadline {
+            log::warn!(
+                "capture shutdown: thread {name} still alive after {}ms; leaking driver handle",
+                deadline.as_millis()
+            );
+            return false;
+        }
+        thread::sleep(JOIN_POLL_INTERVAL.min(deadline - waited));
+    }
+    true
+}
 
 /// Handle to the running capture thread.
 pub struct CaptureHandle {
@@ -135,7 +168,18 @@ impl CaptureHandle {
         self.restart.clone()
     }
 
-    /// Signals the capture thread to stop and waits for it to exit.
+    /// Signals the capture thread to stop and waits for it to exit, bounded
+    /// by [`DEFAULT_SHUTDOWN_JOIN_DEADLINE`].
+    ///
+    /// A thin wrapper over [`Self::stop_within`] for callers (the `Drop`
+    /// impl included) that have no shared shutdown budget of their own to
+    /// pass down.
+    pub fn stop(mut self) {
+        self.shutdown_and_close(DEFAULT_SHUTDOWN_JOIN_DEADLINE);
+    }
+
+    /// Signals the capture thread to stop and waits up to `deadline` for it
+    /// to exit.
     ///
     /// `WinDivertRecv` blocks waiting for the next packet, which on a quiet
     /// link (typically: the game already exited) may never return — so
@@ -143,19 +187,25 @@ impl CaptureHandle {
     /// driver-documented way to unblock a thread parked in a recv on the
     /// same handle from another thread.
     ///
+    /// `deadline` (issue #401 follow-up) is the caller's remaining share of
+    /// the app-wide `SHUTDOWN_BUDGET` in `crates/app`'s `main.rs`, not a
+    /// fixed local constant — capture is one of several sequential joins on
+    /// the shutdown path, so how long it may take depends on how much
+    /// budget is left when it runs, not on capture alone.
+    ///
     /// Does the same work `Drop` would; the `closed` guard in
     /// `shutdown_and_close` makes the `Drop` that runs when `self` falls out
     /// of scope here a no-op, so the driver handle is still closed exactly
     /// once and nothing in `self` (the `stop`/`restart` `Arc`s included) is
     /// leaked.
-    pub fn stop(mut self) {
-        self.shutdown_and_close();
+    pub fn stop_within(mut self, deadline: Duration) {
+        self.shutdown_and_close(deadline);
     }
 
     /// Shared teardown: signal, unblock `recv`, join the thread, close the
     /// handle. Idempotent — guarded by `closed` — so it is safe to call from
-    /// both `stop` and the `Drop` that follows it.
-    fn shutdown_and_close(&mut self) {
+    /// both `stop`/`stop_within` and the `Drop` that follows either.
+    fn shutdown_and_close(&mut self, deadline: Duration) {
         if self.closed {
             return;
         }
@@ -168,18 +218,30 @@ impl CaptureHandle {
         unsafe {
             self.api.shutdown_recv(self.handle);
         }
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-        // The watchdog never touches the driver handle, but it is joined
-        // here anyway so the thread is gone before the process moves on —
-        // it notices the stop flag within one `WATCHDOG_TICK`.
+        // Issue #401 (O1): a capture thread wedged in something other than
+        // `WinDivertRecv` (e.g. still decoding a huge packet) must not hang
+        // the whole process shutdown. If it has not finished within the
+        // deadline, the join handle is dropped (leaking the thread, which
+        // dies with the process) and `WinDivertClose` below is skipped —
+        // closing the handle while that thread might still call into the
+        // driver with it would violate the SAFETY comment there, so leaking
+        // the OS handle for the OS to reclaim at exit is the safe choice.
+        let capture_thread_joined = match self.join.take() {
+            Some(join) => join_with_timeout("capture", &join, deadline),
+            None => true,
+        };
+        // The watchdog never touches the driver handle, so it is always
+        // safe to bound its join independently of the capture thread's —
+        // it notices the stop flag within one `WATCHDOG_TICK` in the
+        // common case, and is simply leaked otherwise.
         if let Some(join) = self.heartbeat_join.take() {
-            let _ = join.join();
+            join_with_timeout("capture-heartbeat", &join, deadline);
         }
-        // SAFETY: the capture thread has exited (or was never spawned with
-        // this handle outstanding), so nothing can use the handle after
-        // this point.
+        if !capture_thread_joined {
+            return;
+        }
+        // SAFETY: the capture thread has exited (checked above), so nothing
+        // can use the handle after this point.
         unsafe {
             self.api.close(self.handle);
         }
@@ -188,13 +250,52 @@ impl CaptureHandle {
 
 impl Drop for CaptureHandle {
     /// Runs `WinDivertShutdown`/join/`WinDivertClose` if the handle is
-    /// dropped without an explicit `stop()` — e.g. an unwind out of
-    /// `eframe::run_native` — so the driver handle and capture thread are
-    /// never leaked until process exit. `stop()` performs this same teardown
-    /// itself; the `closed` guard in `shutdown_and_close` makes this a no-op
-    /// when it then runs on the same handle.
+    /// dropped without an explicit `stop()`/`stop_within()` — e.g. an unwind
+    /// out of `eframe::run_native` — so the driver handle and capture thread
+    /// are never leaked until process exit. `stop()`/`stop_within()` perform
+    /// this same teardown themselves; the `closed` guard in
+    /// `shutdown_and_close` makes this a no-op when it then runs on the same
+    /// handle. An unprompted drop has no caller-supplied budget to spend, so
+    /// it falls back to [`DEFAULT_SHUTDOWN_JOIN_DEADLINE`].
     fn drop(&mut self) {
-        self.shutdown_and_close();
+        self.shutdown_and_close(DEFAULT_SHUTDOWN_JOIN_DEADLINE);
+    }
+}
+
+/// WinDivert 2.x maxima for the three queue-tuning parameters (issue #405).
+///
+/// The defaults (4096 packets / 2000 ms / 4 MiB) are small enough that a busy
+/// raid can overrun the kernel queue before the recv thread drains it, which
+/// shows up downstream as a stalled TCP stream rather than as an error.
+const QUEUE_LEN: u64 = 16384;
+const QUEUE_TIME_MS: u64 = 16000;
+const QUEUE_SIZE: u64 = 33_554_432;
+
+/// Raises the driver's queue limits on a freshly opened handle.
+///
+/// Non-fatal by design: a driver that rejects a parameter simply keeps its
+/// default, and capture on default limits is still better than no capture.
+fn set_queue_params(api: &Api, handle: HANDLE) {
+    let mut failed = 0usize;
+    for (param, value) in [
+        (crate::driver::PARAM_QUEUE_LEN, QUEUE_LEN),
+        (crate::driver::PARAM_QUEUE_TIME, QUEUE_TIME_MS),
+        (crate::driver::PARAM_QUEUE_SIZE, QUEUE_SIZE),
+    ] {
+        // SAFETY: `handle` was just returned by `open_sniff`, is still open,
+        // and no other thread has it yet.
+        if let Err(err) = unsafe { api.set_param(handle, param, value) } {
+            log::warn!("capture: WinDivertSetParam(param={param}, value={value}) failed: {err}");
+            failed += 1;
+            continue;
+        }
+    }
+    if failed == 0 {
+        log::info!(
+            "capture: windivert queue params set len={QUEUE_LEN} time_ms={QUEUE_TIME_MS} size={QUEUE_SIZE}"
+        );
+    } else {
+        log::warn!("capture: {failed} of 3 windivert queue params kept driver defaults");
     }
 }
 
@@ -211,6 +312,7 @@ pub fn start_capture(
     let filter = CString::new(FILTER).expect("FILTER is a literal without interior NULs");
     let api = crate::driver::api()?;
     let handle = api.open_sniff(&filter)?;
+    set_queue_params(api, handle);
 
     let stop = Arc::new(AtomicBool::new(false));
     let restart = CaptureRestart::new();
@@ -399,6 +501,21 @@ fn recv_loop(
             // connection while `next_seq` still points into the wedged
             // stream's sequence space — which is the state the restart
             // exists to escape (#211, #214).
+            //
+            // Issue #405: when that cache is non-empty, this is exactly the
+            // #214 watchdog's "nothing reached the decoder in 180s" path
+            // throwing away real, already-captured game data — as opposed
+            // to a clean restart with nothing cached. Log what is about to
+            // be lost before it goes, or the two cases stay
+            // indistinguishable in the log.
+            let (discarded_segments, discarded_bytes) =
+                (reassembler.gap_segments(), reassembler.gap_bytes());
+            if discarded_segments > 0 {
+                log::warn!(
+                    "capture: restart discarded {discarded_segments} cached segment(s) / \
+                     {discarded_bytes} byte(s) behind a gap (issue #405)"
+                );
+            }
             reassembler = TcpReassembler::new();
             // The stall evidence goes with it: the packets that funded the
             // verdict belonged to a connection that is no longer tracked,
@@ -550,6 +667,18 @@ fn recv_loop(
             last_game_pid_lookup = None;
             game_pid_lookup_interval = GAME_PID_LOOKUP_INITIAL_INTERVAL;
         }
+        // Issue #406: detection runs the signature scan *before* the
+        // "already adopted" gate, so a signature match on a different
+        // connection can displace a still-live tracked one with no FIN/RST at
+        // all. The teardown branch above never fires for that, which is why
+        // the logs showed an "adopted" line with no preceding "torn down"
+        // line. Report the displacement explicitly so both connections are
+        // visible in the log.
+        if let Some(old) = decision.replaced {
+            log::info!(
+                "capture: adoption displaced still-tracked connection {old} (no FIN/RST observed on it; signature match on {conn}, issue #406)"
+            );
+        }
         if decision.skip {
             // Either the client→server half of the adopted connection
             // (recognized, so detection/adoption does not ping-pong on it,
@@ -569,9 +698,28 @@ fn recv_loop(
             // capture observed the connection from its very start — not
             // true for a mid-connection attach (issue #282).
             let resync_seq = seq.wrapping_add(decision.frame_offset as u32);
+            // Issue #406: the issue #337 ownership filter is the other reason
+            // an adoption can look surprising after the fact, so report its
+            // state on the same line instead of leaving it to be inferred
+            // from a separate pid-lookup entry elsewhere in the log. This is
+            // the adopted connection's *actual* owner, looked up once here
+            // (not the cached `game_pids` set, which says nothing about
+            // whether this particular connection matched it) — mirrors the
+            // lookup `owner_allows_adoption` already performed to decide
+            // whether to allow the adoption in the first place.
+            let owner_state = if game_pids.is_empty() {
+                "unfiltered".to_string()
+            } else {
+                let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(conn.dst)), conn.dst_port);
+                let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(conn.src)), conn.src_port);
+                match owner_lookup.owner_pid(local, remote) {
+                    Some(pid) => format!("pid={pid} (in game_pids)"),
+                    None => format!("unknown (fail-open, pids={game_pids:?})"),
+                }
+            };
             log::info!(
                 "capture: adopted game-server connection {conn} at seq={seq} \
-                 frame_offset={} ({} payload bytes)",
+                 frame_offset={} ({} payload bytes) owner={owner_state}",
                 decision.frame_offset,
                 payload.len(),
             );
@@ -584,7 +732,7 @@ fn recv_loop(
         }
 
         let payload_packet = !payload.is_empty();
-        reassembler.push(seq, payload);
+        reassembler.push(seq, payload, now_ms());
         if reassembler.take_loss() {
             log::info!(
                 "capture: reassembly reported a break in the byte stream; resetting the decoder"
@@ -701,9 +849,10 @@ fn log_heartbeat(beat: &Heartbeat) {
     }
 }
 
+/// Monotonic milliseconds since this process started capturing — not an
+/// epoch timestamp — so a forward wall-clock step cannot spuriously trip the
+/// stall guard's time budget.
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }

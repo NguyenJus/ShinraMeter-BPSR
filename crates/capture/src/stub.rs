@@ -30,6 +30,11 @@ impl CaptureHandle {
 
     /// No-op: there is no running capture thread to stop.
     pub fn stop(self) {}
+
+    /// No-op, mirroring [`crate::win::CaptureHandle::stop_within`]'s
+    /// signature so `crates/app` can call it unconditionally: there is no
+    /// running capture thread here to bound a join on.
+    pub fn stop_within(self, _deadline: std::time::Duration) {}
 }
 
 /// Always fails with [`CaptureError::UnsupportedPlatform`] on non-Windows
