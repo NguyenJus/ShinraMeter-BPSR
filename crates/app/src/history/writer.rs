@@ -137,6 +137,32 @@ impl HistoryHandle {
     }
 }
 
+/// Builds the one-line INFO summary for a `Record` outcome (issue #409): a
+/// successful insert (`id` some) or a skip below the retention floor (`id`
+/// none) both get a line, so the log alone can confirm whether a given
+/// fight actually reached `history.sqlite`. `EncounterRecord` carries no end
+/// cause today, so the line reports the fields it does carry rather than
+/// inventing one.
+fn describe_recorded(id: Option<i64>, record: &EncounterRecord) -> String {
+    let scene = record
+        .scene_name
+        .as_deref()
+        .unwrap_or(record.title.as_str());
+    let boss = record.boss_name.as_deref();
+    let duration_ms = record.duration_ms;
+    let players = record.players.len();
+    match id {
+        Some(id) => format!(
+            "history: recorded encounter id={id} scene={scene:?} boss={boss:?} \
+             duration_ms={duration_ms} players={players}"
+        ),
+        None => format!(
+            "history: skipped encounter below the retention floor scene={scene:?} \
+             boss={boss:?} duration_ms={duration_ms} players={players}"
+        ),
+    }
+}
+
 /// The thread body: blocks on `rx`, dispatching each request against
 /// `store`, until every `HistoryHandle` clone (and so every `Sender`) is
 /// dropped and `recv` finally errs. Every `HistoryError` is logged here —
@@ -147,11 +173,13 @@ impl HistoryHandle {
 fn run(mut store: SqliteHistory, rx: Receiver<HistoryRequest>) {
     while let Ok(req) = rx.recv() {
         match req {
-            HistoryRequest::Record(record) => {
-                if let Err(err) = store.insert(&record) {
+            HistoryRequest::Record(record) => match store.insert(&record) {
+                Ok(Some(id)) => log::info!("{}", describe_recorded(Some(id), &record)),
+                Ok(None) => log::info!("{}", describe_recorded(None, &record)),
+                Err(err) => {
                     log::warn!("history: failed to record an encounter: {err}");
                 }
-            }
+            },
             HistoryRequest::List { limit, reply } => match store.list(limit) {
                 Ok(rows) => {
                     let _ = reply.send(HistoryEvent::Listed(rows));
@@ -386,5 +414,28 @@ mod tests {
 
         let _ = std::fs::remove_file(&file);
         assert!(result.is_none());
+    }
+
+    // -- issue #409: recorded/skipped fights get a log line -----------------
+
+    #[test]
+    fn describe_recorded_names_a_successful_insert() {
+        let record = sample_record("Boss Fight");
+
+        let line = describe_recorded(Some(7), &record);
+
+        assert!(line.starts_with("history: recorded encounter id=7 "));
+        assert!(line.contains("duration_ms=10000"));
+        assert!(line.contains("players=1"));
+    }
+
+    #[test]
+    fn describe_recorded_names_a_skip_below_the_retention_floor() {
+        let record = sample_record("Trash Pull");
+
+        let line = describe_recorded(None, &record);
+
+        assert!(line.starts_with("history: skipped encounter below the retention floor "));
+        assert!(!line.contains("id="));
     }
 }
