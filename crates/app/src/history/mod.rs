@@ -58,14 +58,17 @@ pub fn history_db_path() -> PathBuf {
 /// `EntityId::from_display_uid`), recomputes `encounters.player_count` for
 /// every encounter that lost a row, and drops any encounter left with no
 /// players at all, so the history list stops showing a player count that
-/// disagrees with what `load` can actually return.
+/// disagrees with what `load` can actually return. v4 → v5 (issue #424) is
+/// likewise a data cleanup: it backfills `title` (and `boss_name` where the
+/// id resolves) for the non-boss encounters saved with an empty title before
+/// `ui::header::history_title` existed, so no history row is left blank.
 /// A file stamped with an *older* known version is migrated forward in place
 /// by `sqlite::migrate`, so an existing history survives the upgrade with
 /// its older encounters simply carrying no skill rows / no local uid / no
 /// stored entity. Only a version this build has never heard of (a downgrade,
 /// or a hand-edited file) is still renamed aside and replaced, since there
 /// is nothing to migrate *from*.
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 /// Retention rules, applied inside every `HistoryStore::insert` (spec §5.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
