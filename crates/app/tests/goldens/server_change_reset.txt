@@ -1,6 +1,6 @@
 scenario=server_change_reset
 at_ms=13000
-fight_state=Idle
+fight_state=Ended
 fight_end_cause=server_changed
 hold_kind=-
 duration_ms=10000

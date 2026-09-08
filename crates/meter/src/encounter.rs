@@ -1302,8 +1302,7 @@ impl Meter {
                 // issue #138: a server change (reconnect/zone transition)
                 // only invalidates state keyed on identifiers that are
                 // valid within one server session — uids are re-issued by
-                // the new server, and the scene id is unknown until the
-                // next `EnterScene`. It deliberately does **not** clear
+                // the new server. It deliberately does **not** clear
                 // `players`/totals itself: those are display state, and a
                 // reconnect does not make them wrong — issue #152 relies on
                 // exactly that to keep a held fight's numbers on screen
@@ -1346,7 +1345,6 @@ impl Meter {
 
                 self.prune_stale_preloads();
                 self.enemies.clear();
-                self.boss_entity = None;
                 // issue #316: same reason as the `Scene` arm's
                 // `entering_dungeon` clear above — a reconnect empties
                 // `enemies`, and a stale `fight_end_boss_id` armed against
@@ -1355,16 +1353,31 @@ impl Meter {
                 // window expired on its own, instead of starting the next
                 // fight immediately.
                 self.fight_lifecycle.disarm_phase_resume();
+                // issue #422: `scene_id` and `boss_entity` deliberately
+                // survive. This event is emitted by capture on every
+                // *adoption*, which includes the 180s starvation
+                // watchdog's decoder restart and every mis-adoption that
+                // corrects itself — none of which is a game event, and all
+                // of which used to log "encounter: scene cleared" and leave
+                // the meter scene-less (no dungeon detection, no
+                // scene-gated resets) until the next `Scene` packet. A
+                // stationary player is sent no `Scene` packet at all, so in
+                // the field log that was over three minutes. Which scene
+                // the party is in, and which boss it is fighting, are facts
+                // about the game session that no reconnect makes wrong:
+                // when a reconnect really does land somewhere else, the
+                // `Scene` arm above sees a different id and clears both
+                // itself. `enemies` still goes, because uids do not
+                // survive — which is what makes the retained `boss_entity`
+                // inert (`boss_monster_id`/`fought_target_alive` both read
+                // through `enemies`) until `recompute_boss` re-points it.
+                //
                 // issue #139: as invalid across a reconnect as
-                // `enemies`/`boss_entity` — the new server session may not
+                // `enemies` — the new server session may not
                 // even land back in the same dungeon, let alone the same
                 // objective sequence, so nothing about the old instance's
                 // dungeon-state tracking can be trusted to describe it.
                 self.clear_dungeon_instance_state();
-                if let Some(msg) = scene_transition_log(self.scene_id, None) {
-                    log::info!("{msg}");
-                }
-                self.scene_id = None;
 
                 // issue #154: the wipe hold's re-engagement test reads the
                 // enemy map that was just cleared, so it can no longer
@@ -7310,7 +7323,35 @@ mod tests {
                 "player rows must survive a reconnect"
             );
             assert!(m.enemies.is_empty());
-            assert!(m.boss_entity.is_none());
+        }
+
+        /// Issue #422: a capture-side restart (the 180s starvation
+        /// watchdog) or a re-adoption reaches the meter as `ServerChanged`
+        /// and used to log "encounter: scene cleared", leaving the meter
+        /// scene-less - no dungeon detection, no scene-gated resets - until
+        /// the next real `Scene` packet. In the field log that was three
+        /// minutes, with the player standing still, because a stationary
+        /// player is sent no scene packet at all. The scene and the boss
+        /// being fought are facts about the game session, not about which
+        /// TCP flow the capture happens to be decoding, so only a real
+        /// scene packet clears them now.
+        #[test]
+        fn server_changed_keeps_the_scene_and_the_boss_target() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: 4_242,
+            });
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 100, 100, 0));
+            assert_eq!(m.boss_entity, Some(ek(10)));
+
+            m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 1_000 });
+            assert_eq!(
+                m.scene_id,
+                Some(4_242),
+                "the scene survives a decoder restart"
+            );
+            assert_eq!(m.boss_entity, Some(ek(10)), "and so does the boss target");
         }
 
         // -- issue #157: trash must not hold the reset heuristic ---------
@@ -7873,7 +7914,7 @@ mod tests {
         /// `fight_end_ms` to the `ServerChanged` timestamp — freezing the
         /// clock across the zoning gap and arming the `NewFight` path —
         /// while keeping the accumulated stats, and must invalidate the
-        /// uid-keyed entity state and the scene id.
+        /// uid-keyed entity state (but not the scene, issue #422).
         #[test]
         fn server_change_mid_fight_latches_the_clock_and_keeps_the_stats() {
             let mut m = Meter::new();
@@ -7900,10 +7941,10 @@ mod tests {
                 "the clock latches to the ServerChanged timestamp, not fight_start_ms drifting"
             );
             assert!(m.enemies.is_empty(), "uids are re-issued by the new server");
-            assert!(m.boss_entity.is_none());
-            assert!(
-                m.scene_id.is_none(),
-                "the scene is unknown until the next EnterScene"
+            assert_eq!(
+                m.scene_id,
+                Some(7),
+                "issue #422: the scene is a game fact a reconnect does not change"
             );
             // issue #152: the live scene is gone, but the *snapshot* is a
             // held fight's snapshot — its header names the fight whose
@@ -12127,14 +12168,17 @@ mod tests {
             assert_eq!(snap.encounter.scene_id, Some(1001));
         }
 
+        /// Issue #422: a server change is also what a capture-side decoder
+        /// restart looks like, so it no longer clears the scene - only a
+        /// real `Scene` packet does.
         #[test]
-        fn scene_clears_on_server_change() {
+        fn scene_survives_a_server_change() {
             let mut m = Meter::new();
             m.apply(&ProtocolEvent::Scene { level_map_id: 1001 });
             m.apply(&ProtocolEvent::ServerChanged { timestamp_ms: 1000 });
             let snap = m.snapshot(2000);
-            assert_eq!(snap.encounter.scene_id, None);
-            assert_eq!(snap.encounter.scene_name, None);
+            assert_eq!(snap.encounter.scene_id, Some(1001));
+            assert_eq!(snap.encounter.scene_name, Some("Tina's Mindrealm"));
         }
 
         #[test]

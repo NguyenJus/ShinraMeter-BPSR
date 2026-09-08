@@ -114,6 +114,12 @@ fn server_change_holds_the_numbers() {
         .at(12_000)
         .inject(ProtocolEvent::ServerChanged)
         .at(13_000)
+        // Issue #423: capture emits `ServerChanged` on adoption, before the
+        // adopted connection has decoded anything, so the pipeline parks the
+        // fight end until a frame confirms it or the grace window closes.
+        // Nothing decodes after the reconnect here, so it is this tick -
+        // `publish`'s, in production - that lands it.
+        .tick()
         .capture("server_change_reset");
 
     let mut rig = Rig::new();

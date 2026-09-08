@@ -310,7 +310,32 @@ pub struct Pipeline {
     /// to tell "capture is quiet because nothing is happening" apart from
     /// "capture is gone and this will never change again."
     capture_alive: bool,
+    /// Issue #423: the moment capture adopted a connection and announced
+    /// `ServerChanged`, held back until that connection proves it can
+    /// decode a frame.
+    ///
+    /// Capture emits the event on *adoption*, which is a guess: it has seen
+    /// one plausible packet on a flow, not a decodable frame. A mis-adoption
+    /// (the field log's 1-byte port-5003 flow) is displaced by the real flow
+    /// a few hundred milliseconds later, and applying the fight end
+    /// immediately truncated a fight that was never interrupted. So the end
+    /// waits here for one of three outcomes: a decoded frame arrives and
+    /// confirms it ([`Pipeline::flush_pending_server_change`]), another
+    /// adoption displaces it before anything decoded and it is dropped
+    /// ([`Pipeline::arm_server_change`]), or
+    /// [`SERVER_CHANGE_GRACE_MS`] passes on the tick and it applies anyway.
+    ///
+    /// Stamped with the adoption moment, not the confirming frame's, so the
+    /// fight clock still freezes where the connection actually broke.
+    pending_server_change: Option<u64>,
 }
+
+/// How long a deferred `ServerChanged` waits for the newly adopted
+/// connection to decode a frame before it is applied unconfirmed (issue
+/// #423). Longer than the ~400ms a mis-adoption took to self-correct in the
+/// field log, and far shorter than [`meter::FightConfig::idle_timeout_ms`],
+/// so a connection that really did die still ends its fight promptly.
+const SERVER_CHANGE_GRACE_MS: u64 = 1_000;
 
 impl Pipeline {
     pub fn new() -> Self {
@@ -322,6 +347,7 @@ impl Pipeline {
             pending_fight_end: None,
             held_fight_start_ms: None,
             capture_alive: true,
+            pending_server_change: None,
         }
     }
 
@@ -340,6 +366,7 @@ impl Pipeline {
             pending_fight_end: None,
             held_fight_start_ms: None,
             capture_alive: true,
+            pending_server_change: None,
         }
     }
 
@@ -376,7 +403,54 @@ impl Pipeline {
     /// replayable (`crates/app/tests/`): events carrying no timestamp of
     /// their own — `ServerChanged` above all — are stamped with it.
     pub fn step(&mut self, ev: proto::ProtocolEvent, now_ms: u64) -> Option<meter::ResetReason> {
-        let reason = self.meter.apply(&map_event(ev, now_ms));
+        // Issue #423: an adoption is a claim, not evidence. Park it and let
+        // the next decoded frame — or the grace window in `tick` — decide.
+        if matches!(ev, proto::ProtocolEvent::ServerChanged) {
+            self.arm_server_change(now_ms);
+            return None;
+        }
+        // Anything else came off the decoder, so the adopted connection
+        // works: a parked server change is now confirmed and applies first,
+        // before the frame that confirmed it.
+        self.flush_pending_server_change(now_ms);
+        self.apply_mapped(map_event(ev, now_ms), now_ms)
+    }
+
+    /// Parks a capture adoption's `ServerChanged` (issue #423).
+    ///
+    /// An adoption arriving while one is still parked means the previous
+    /// one never decoded a thing and has just been displaced — it was a
+    /// mis-adoption, and the flow replacing it is the correction, not a new
+    /// server. Both are dropped: the parked one because it was never real,
+    /// and the new one because re-parking it would end the fight the moment
+    /// the recovered flow decoded its first frame, which is exactly the
+    /// truncation issue #423 is about.
+    fn arm_server_change(&mut self, now_ms: u64) {
+        if let Some(armed_ms) = self.pending_server_change.take() {
+            log::info!(
+                "capture: adoption at {armed_ms}ms was displaced {}ms later without decoding a \
+                 frame; dropping its deferred server_changed fight end (issue #423)",
+                now_ms.saturating_sub(armed_ms),
+            );
+            return;
+        }
+        self.pending_server_change = Some(now_ms);
+    }
+
+    /// Applies a parked `ServerChanged`, if there is one, at the moment the
+    /// adoption happened rather than now (issue #423).
+    fn flush_pending_server_change(&mut self, now_ms: u64) {
+        let Some(timestamp_ms) = self.pending_server_change.take() else {
+            return;
+        };
+        self.apply_mapped(meter::ProtocolEvent::ServerChanged { timestamp_ms }, now_ms);
+    }
+
+    /// The tail of `step`, shared with `flush_pending_server_change` so a
+    /// deferred event reaches the meter through exactly the same path a
+    /// live one does.
+    fn apply_mapped(&mut self, ev: meter::ProtocolEvent, now_ms: u64) -> Option<meter::ResetReason> {
+        let reason = self.meter.apply(&ev);
         if let Some(reason) = reason {
             log::debug!("meter reset: {reason:?}");
             self.save_names_cache();
@@ -441,6 +515,19 @@ impl Pipeline {
     /// held meter (`bpsr_meter::Meter::fight_state` answers the same question
     /// without advancing anything).
     pub fn tick(&mut self, now_ms: u64) -> meter::FightState {
+        // Issue #423: an adoption nothing ever confirmed still has to land —
+        // a connection that really died decodes nothing ever again, and the
+        // fight it interrupted must not stay open forever.
+        if self
+            .pending_server_change
+            .is_some_and(|armed_ms| now_ms.saturating_sub(armed_ms) >= SERVER_CHANGE_GRACE_MS)
+        {
+            log::info!(
+                "capture: no frame decoded within {SERVER_CHANGE_GRACE_MS}ms of the adoption; \
+                 applying the deferred server_changed (issue #423)"
+            );
+            self.flush_pending_server_change(now_ms);
+        }
         self.meter.tick(now_ms)
     }
 
@@ -1287,6 +1374,11 @@ mod tests {
         p.step(proto::ProtocolEvent::Damage(damage(1, 700, base)), base);
         let reason = p.step(proto::ProtocolEvent::ServerChanged, base + 1_000);
         assert_eq!(reason, None);
+        // Issue #423: the adoption is parked until something confirms it.
+        // Nothing decodes here, so the grace window is what lands it - at
+        // the adoption's own timestamp, which is what the freeze below is
+        // measured against.
+        p.tick(base + 1_000 + SERVER_CHANGE_GRACE_MS);
 
         let snap = p.snapshot(base + 2_000);
         assert_eq!(snap.total_damage, 700);
@@ -1302,6 +1394,98 @@ mod tests {
         assert_eq!(
             later.duration_ms, 1_000,
             "duration must stay pinned while held"
+        );
+    }
+
+    /// A decoded frame from the newly adopted connection: any event the
+    /// decoder can actually produce works as confirmation, and a `Player`
+    /// frame is the one with no side effects on the fight clock.
+    fn player_frame(uid: i64) -> proto::ProtocolEvent {
+        proto::ProtocolEvent::Player(proto::PlayerInfo {
+            entity: proto::EntityId::from_display_uid(uid, proto::EntityKind::Player)
+                .expect("in-range test uid"),
+            uid,
+            name: Some("Foo".to_string()),
+            class: Some(proto::Class::Marksman),
+            ability_score: None,
+            season_level: None,
+            season_strength: None,
+            skill_ids: Vec::new(),
+            position: None,
+            target_position: None,
+            shield: None,
+        })
+    }
+
+    /// Issue #423: capture emits `ServerChanged` the moment it adopts a
+    /// connection - before that connection has proved it can decode a
+    /// single frame. The fight end is therefore deferred until the newly
+    /// adopted flow produces one, and only then applies, stamped with the
+    /// adoption moment rather than the confirming frame's.
+    #[test]
+    fn a_server_change_confirmed_by_a_decoded_frame_ends_the_fight() {
+        let mut p = Pipeline::new();
+        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)), 1_000);
+        p.step(proto::ProtocolEvent::ServerChanged, 2_000);
+        assert_eq!(
+            p.fight_end_cause(),
+            None,
+            "the adoption alone must not end the fight"
+        );
+
+        p.step(player_frame(1), 2_100);
+        assert_eq!(
+            p.fight_end_cause(),
+            Some(meter::FightEndCause::ServerChanged),
+            "the first decoded frame confirms the adoption"
+        );
+        assert_eq!(
+            p.snapshot(9_000).duration_ms,
+            1_000,
+            "the clock freezes at the adoption moment, not the confirming frame"
+        );
+    }
+
+    /// Issue #423, the field log's shape: capture adopts a 1-byte
+    /// port-5003 flow mid-fight, that flow decodes nothing, and 400ms later
+    /// the real flow displaces it. Nothing was ever interrupted, so the
+    /// fight must survive both adoptions - including the frames the
+    /// recovered flow decodes right after.
+    #[test]
+    fn a_server_change_displaced_before_decoding_anything_never_ends_the_fight() {
+        let mut p = Pipeline::new();
+        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)), 1_000);
+        p.step(proto::ProtocolEvent::ServerChanged, 2_000);
+        p.step(proto::ProtocolEvent::ServerChanged, 2_400);
+
+        p.step(player_frame(1), 2_500);
+        assert_eq!(
+            p.fight_end_cause(),
+            None,
+            "a mis-adoption that self-corrects must not truncate the fight"
+        );
+        assert_eq!(p.tick(2_600), meter::FightState::Active);
+    }
+
+    /// Issue #423: the deferral is bounded. A connection that really did
+    /// die never decodes anything again, so the parked fight end applies on
+    /// its own once the grace window closes.
+    #[test]
+    fn an_unconfirmed_server_change_applies_once_the_grace_window_closes() {
+        let mut p = Pipeline::new();
+        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)), 1_000);
+        p.step(proto::ProtocolEvent::ServerChanged, 2_000);
+
+        assert_eq!(
+            p.tick(2_000 + SERVER_CHANGE_GRACE_MS - 1),
+            meter::FightState::Active
+        );
+        assert_eq!(p.fight_end_cause(), None);
+
+        p.tick(2_000 + SERVER_CHANGE_GRACE_MS);
+        assert_eq!(
+            p.fight_end_cause(),
+            Some(meter::FightEndCause::ServerChanged)
         );
     }
 
