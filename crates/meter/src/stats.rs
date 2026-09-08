@@ -423,9 +423,10 @@ pub struct PlayerRow {
     /// like `deaths`.
     ///
     /// `None` means *not measured*, not zero: a row replayed out of the
-    /// history database predates the column that would carry it, and the
-    /// UI hides the pill for those rather than claiming a saved encounter
-    /// had no deaths on the floor.
+    /// history database predates the column that would carry it. The
+    /// breakdown window header still hides its pill for those rows, but the
+    /// main table's Death Time column paints an em dash rather than
+    /// claiming a saved encounter had no deaths on the floor.
     pub dead_ms: Option<u64>,
     /// This player's per-skill breakdown, damage-descending (issue #16). One
     /// row per raw skill id — the reference's sub-skill "short name"

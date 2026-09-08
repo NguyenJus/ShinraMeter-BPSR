@@ -745,35 +745,18 @@ pub(super) fn skill_header_pill_cluster_width(
 }
 
 /// The death-time pill's text (issue #254), or `None` when there is no pill
-/// to draw at all.
+/// to draw at all (a history row with no measured death time — see
+/// `PlayerRow::dead_ms`).
 ///
-/// - `None` in, `None` out: a history row carries no death time (see
-///   `PlayerRow::dead_ms`), and an empty capsule would read as "nobody was
-///   on the floor" rather than "not recorded".
-/// - Zero renders as a bare `00:00`. Nobody died, so the figure is exact,
-///   and marking it as an estimate would be the lie — the tilde below is
-///   reserved for numbers that actually are estimated.
-/// - Anything else takes a `~` prefix: `~00:12`. The revive edge feeding
-///   this total is *inferred* from the player's next action, not observed
-///   (`PlayerStats::dead_ms`), so the number is real but biased high, and
-///   it sits one pill away from the exact Deaths counter. The tilde is the
-///   cheapest honest marker available here: these header capsules are bare
-///   painted ovals with no widget behind them — the header's whole width is
-///   a drag band — so a tooltip would mean carving a hover region out of
-///   that band, and a dimmer tint would read as "less important" rather
-///   than "less certain", on top of being invisible to anyone who never
-///   sees the two side by side.
-///
-/// Formatted `mm:ss` through `fmt_duration`, matching the reference's
-/// `interval.ToString(@"mm\:ss")` (`Skills.xaml.cs`) and the fight timer in
-/// the main window's header.
+/// Delegates to `fmt_death_time` for the zero-bare/nonzero-`~` formatting
+/// rule and its rationale; this header pill just turns that dash case into
+/// "no pill" instead of painting the dash itself, since these header
+/// capsules are bare painted ovals with no widget behind them — the
+/// header's whole width is a drag band — so a tooltip would mean carving a
+/// hover region out of that band, and a dimmer tint would read as "less
+/// important" rather than "less certain".
 pub(super) fn skill_death_time_text(dead_ms: Option<u64>) -> Option<String> {
-    let ms = dead_ms?;
-    Some(if ms == 0 {
-        fmt_duration(0)
-    } else {
-        format!("~{}", fmt_duration(ms))
-    })
+    dead_ms.map(|ms| fmt_death_time(Some(ms)))
 }
 
 pub(super) fn draw_skill_window(

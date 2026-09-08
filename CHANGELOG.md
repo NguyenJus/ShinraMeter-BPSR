@@ -6,6 +6,17 @@ affiliated with the game's publisher.
 
 ## Unreleased
 
+### Added
+
+- The main table gains a Death time column next to Deaths, showing how
+  long each player spent on the floor this encounter as a counter pill.
+  It reads `—` when nothing was recorded and prefixes a `~` to any
+  non-zero total, since the revive edge behind it is inferred rather
+  than observed.
+- Hovering a player's name now shows their ability score and season
+  strength, so those two figures no longer need their own columns to be
+  readable.
+
 ### Changed
 
 - Log lines now carry a `pid=<pid>` field, so entries from two meter
@@ -25,6 +36,12 @@ affiliated with the game's publisher.
   plausible range is also discarded in favour of the constant budget, so a
   bad measurement can no longer cover the window and swallow every resize
   grab (#400); the skill window's drag band gets the same corner inset.
+- Encounters saved by a pre-v3 build whose stored player uid is out of
+  range are no longer all loaded as the same unknown player, silently
+  merging distinct saved players; those rows are skipped instead.
+  Affected rows are removed and the encounter's player count recomputed
+  the first time the history database is opened; damage totals still
+  describe the original fight.
 - Closing the meter can no longer leave a windowless process behind holding
   the single-instance lock: shutdown across capture, pipeline, history,
   settings and inspect is now bounded to eight seconds as a whole, then
