@@ -19,10 +19,10 @@
 use std::ffi::{CString, c_void};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bpsr_protocol::{Decoder, InspectSink, ProtocolEvent};
 use crossbeam_channel::Sender;
@@ -199,6 +199,43 @@ impl Drop for CaptureHandle {
     }
 }
 
+/// WinDivert 2.x maxima for the three queue-tuning parameters (issue #405).
+///
+/// The defaults (4096 packets / 2000 ms / 4 MiB) are small enough that a busy
+/// raid can overrun the kernel queue before the recv thread drains it, which
+/// shows up downstream as a stalled TCP stream rather than as an error.
+const QUEUE_LEN: u64 = 16384;
+const QUEUE_TIME_MS: u64 = 16000;
+const QUEUE_SIZE: u64 = 33_554_432;
+
+/// Raises the driver's queue limits on a freshly opened handle.
+///
+/// Non-fatal by design: a driver that rejects a parameter simply keeps its
+/// default, and capture on default limits is still better than no capture.
+fn set_queue_params(api: &Api, handle: HANDLE) {
+    let mut failed = 0usize;
+    for (param, value) in [
+        (crate::driver::PARAM_QUEUE_LEN, QUEUE_LEN),
+        (crate::driver::PARAM_QUEUE_TIME, QUEUE_TIME_MS),
+        (crate::driver::PARAM_QUEUE_SIZE, QUEUE_SIZE),
+    ] {
+        // SAFETY: `handle` was just returned by `open_sniff`, is still open,
+        // and no other thread has it yet.
+        if let Err(err) = unsafe { api.set_param(handle, param, value) } {
+            log::warn!("capture: WinDivertSetParam(param={param}, value={value}) failed: {err}");
+            failed += 1;
+            continue;
+        }
+    }
+    if failed == 0 {
+        log::info!(
+            "capture: windivert queue params set len={QUEUE_LEN} time_ms={QUEUE_TIME_MS} size={QUEUE_SIZE}"
+        );
+    } else {
+        log::warn!("capture: {failed} of 3 windivert queue params kept driver defaults");
+    }
+}
+
 /// Opens a WinDivert sniff-mode handle on all non-loopback TCP/IP traffic
 /// and spawns a thread that reassembles the detected game-server's TCP
 /// stream and emits decoded [`ProtocolEvent`]s on `tx`. `inspect_sink`
@@ -212,6 +249,7 @@ pub fn start_capture(
     let filter = CString::new(FILTER).expect("FILTER is a literal without interior NULs");
     let api = crate::driver::api()?;
     let handle = api.open_sniff(&filter)?;
+    set_queue_params(api, handle);
 
     let stop = Arc::new(AtomicBool::new(false));
     let restart = CaptureRestart::new();
@@ -400,6 +438,21 @@ fn recv_loop(
             // connection while `next_seq` still points into the wedged
             // stream's sequence space — which is the state the restart
             // exists to escape (#211, #214).
+            //
+            // Issue #405: when that cache is non-empty, this is exactly the
+            // #214 watchdog's "nothing reached the decoder in 180s" path
+            // throwing away real, already-captured game data — as opposed
+            // to a clean restart with nothing cached. Log what is about to
+            // be lost before it goes, or the two cases stay
+            // indistinguishable in the log.
+            let (discarded_segments, discarded_bytes) =
+                (reassembler.gap_segments(), reassembler.gap_bytes());
+            if discarded_segments > 0 {
+                log::warn!(
+                    "capture: restart discarded {discarded_segments} cached segment(s) / \
+                     {discarded_bytes} byte(s) behind a gap (issue #405)"
+                );
+            }
             reassembler = TcpReassembler::new();
             // The stall evidence goes with it: the packets that funded the
             // verdict belonged to a connection that is no longer tracked,
@@ -616,7 +669,7 @@ fn recv_loop(
         }
 
         let payload_packet = !payload.is_empty();
-        reassembler.push(seq, payload);
+        reassembler.push(seq, payload, now_ms());
         if reassembler.take_loss() {
             log::info!(
                 "capture: reassembly reported a break in the byte stream; resetting the decoder"
@@ -733,9 +786,10 @@ fn log_heartbeat(beat: &Heartbeat) {
     }
 }
 
+/// Monotonic milliseconds since this process started capturing — not an
+/// epoch timestamp — so a forward wall-clock step cannot spuriously trip the
+/// stall guard's time budget.
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }

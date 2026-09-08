@@ -15,6 +15,16 @@ affiliated with the game's publisher.
 - Loading settings (including the case where no settings file exists yet)
   is now logged at info, and successful saves at debug.
 
+### Fixed
+
+- Capture no longer wedges for minutes on a single lost TCP segment. The
+  reassembler's stall guard now also trips on a wall-clock/byte budget (a hole
+  stuck for more than 10s while more than 64 KiB has piled up behind it), so a
+  quiet-but-stuck connection re-anchors promptly instead of waiting for enough
+  pushes to accumulate. The kernel-side WinDivert packet queue is also raised
+  to the driver's maxima (16384 packets / 16000 ms / 32 MiB) at handle open,
+  so a busy raid is far less likely to overrun it in the first place.
+
 ## v0.2.6
 
 ### Added
