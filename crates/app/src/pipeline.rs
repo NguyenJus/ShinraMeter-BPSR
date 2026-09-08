@@ -393,10 +393,15 @@ impl Pipeline {
     /// including one on the far side of a `ServerChanged` reconnect, issue
     /// #138 — or `Scene` resolving to a dungeon/raid id different from the
     /// one already held (issue #191). A `ServerChanged` event itself never
-    /// triggers a reset: it carries no destination scene id, so it only
-    /// invalidates entity/scene state and freezes the fight clock, leaving
-    /// the displayed stats on screen for the `Scene` event that follows to
-    /// judge once the destination is known.
+    /// triggers a reset: it carries no destination scene id, so it is
+    /// parked ([`Self::pending_server_change`], issue #423) rather than
+    /// applied immediately, and is only applied on the next decoded frame
+    /// or once [`SERVER_CHANGE_GRACE_MS`] elapses on [`Self::tick`] —
+    /// stamped, when it lands, with the moment the adoption happened rather
+    /// than the moment it was flushed. It no longer clears scene state at
+    /// all (issue #422): the fight clock still freezes and the displayed
+    /// stats stay on screen for the `Scene` event that follows to judge
+    /// once the destination is known.
     ///
     /// `now_ms` is supplied by the caller rather than read off the wall
     /// clock inside, so the whole pipeline stays deterministic and
@@ -407,6 +412,7 @@ impl Pipeline {
         // the next decoded frame — or the grace window in `tick` — decide.
         if matches!(ev, proto::ProtocolEvent::ServerChanged) {
             self.arm_server_change(now_ms);
+            self.finish_step(now_ms);
             return None;
         }
         // Anything else came off the decoder, so the adopted connection
@@ -425,6 +431,14 @@ impl Pipeline {
     /// and the new one because re-parking it would end the fight the moment
     /// the recovered flow decoded its first frame, which is exactly the
     /// truncation issue #423 is about.
+    ///
+    /// This also means a genuine reconnect that happens to be preceded by a
+    /// mis-adoption — two adoptions with nothing decoded between them — is
+    /// dropped along with the mis-adoption: `ServerChanged` carries no flow
+    /// identity, so there is no way to tell A->B->A (a correction) from
+    /// A->B->C (two real reconnects) apart from timing. When that happens,
+    /// the fight end falls back to the ordinary idle timeout, or to the
+    /// next dungeon `Scene` event's reset, whichever comes first.
     fn arm_server_change(&mut self, now_ms: u64) {
         if let Some(armed_ms) = self.pending_server_change.take() {
             log::info!(
@@ -446,6 +460,24 @@ impl Pipeline {
         self.apply_mapped(meter::ProtocolEvent::ServerChanged { timestamp_ms }, now_ms);
     }
 
+    /// Flushes a parked `ServerChanged` on shutdown, regardless of how long
+    /// it has been parked.
+    ///
+    /// `tick`'s grace window (`SERVER_CHANGE_GRACE_MS`) only fires on a
+    /// ticker tick that never comes once the pipeline thread is on its way
+    /// out: a `ServerChanged` parked less than a second before quit would
+    /// otherwise never be flushed, and `run`'s final `publish` would see the
+    /// fight it interrupted as still `Active` instead of `Ended`, dropping
+    /// it from history. Called immediately before each of `run`'s two
+    /// quit-path `publish` calls.
+    pub fn flush_server_change_for_shutdown(&mut self, now_ms: u64) {
+        log::info!(
+            "capture: flushing any parked server_changed on shutdown so its fight end is not \
+             dropped from history"
+        );
+        self.flush_pending_server_change(now_ms);
+    }
+
     /// The tail of `step`, shared with `flush_pending_server_change` so a
     /// deferred event reaches the meter through exactly the same path a
     /// live one does.
@@ -459,6 +491,18 @@ impl Pipeline {
             log::debug!("meter reset: {reason:?}");
             self.save_names_cache();
         }
+        self.finish_step(now_ms);
+        reason
+    }
+
+    /// The post-`meter.apply` tail shared by every path that can end or
+    /// reset a fight: `apply_mapped` (a mapped event landed) and `step`'s
+    /// `ServerChanged` branch (a capture adoption is parked, not applied to
+    /// the meter yet, but can still be the reason the fight currently held
+    /// needs to end — see `arm_server_change`). Keeping this in one place
+    /// means both paths see `record_fight_end` on the same tick their event
+    /// arrived, instead of only the next `publish` ticker.
+    fn finish_step(&mut self, now_ms: u64) {
         // Pipeline-robustness audit, finding 3: `record_fight_end` used to
         // run only from `publish`'s 100ms ticker, so a fight that both ended
         // (e.g. a boss death, which `Meter::apply` latches synchronously)
@@ -469,7 +513,6 @@ impl Pipeline {
         // too costs nothing on every other event; it only ever writes once
         // per ended fight, same as the ticker-driven call in `publish`.
         self.record_fight_end(self.meter.fight_state(now_ms), now_ms);
-        reason
     }
 
     /// Manual reset, triggered by the overlay's Reset button.
@@ -907,6 +950,7 @@ fn run(
                         // Issue #321: flush any fight already sitting in
                         // `FightState::Ended` before the thread exits, same
                         // as the commands arm below.
+                        pipeline.flush_server_change_for_shutdown(now_ms());
                         publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus, &repaint, &mut last_published);
                         log::info!(
                             "capture channel closed after a quit was requested; this is an \
@@ -969,6 +1013,7 @@ fn run(
                     ),
                 };
                 if let Some(reason) = quit_reason {
+                    pipeline.flush_server_change_for_shutdown(now_ms());
                     publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus, &repaint, &mut last_published);
                     log::info!("{reason}");
                     break;
@@ -1471,6 +1516,28 @@ mod tests {
         assert_eq!(p.tick(2_600), meter::FightState::Active);
     }
 
+    /// A mis-adoption that self-corrects, but with no frame ever decoded to
+    /// confirm the recovery — just a tick well past the grace window.
+    /// `ServerChanged` carries no flow identity, so `arm_server_change` has
+    /// no way to tell this apart from a genuine reconnect that happens to
+    /// follow a mis-adoption (A->B->A vs. A->B->C): both drop the parked
+    /// fight end, falling back to the ordinary idle timeout / next dungeon
+    /// `Scene` reset instead of ending the fight here.
+    #[test]
+    fn two_server_changes_with_nothing_decoded_between_them_fall_back_to_idle_timeout() {
+        let mut p = Pipeline::new();
+        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)), 1_000);
+        p.step(proto::ProtocolEvent::ServerChanged, 2_000);
+        p.step(proto::ProtocolEvent::ServerChanged, 2_400);
+
+        assert_eq!(p.tick(4_000), meter::FightState::Active);
+        assert_eq!(
+            p.fight_end_cause(),
+            None,
+            "both server changes must be dropped, leaving the fight to the idle timeout"
+        );
+    }
+
     /// Issue #423: the deferral is bounded. A connection that really did
     /// die never decodes anything again, so the parked fight end applies on
     /// its own once the grace window closes.
@@ -1490,6 +1557,32 @@ mod tests {
         assert_eq!(
             p.fight_end_cause(),
             Some(meter::FightEndCause::ServerChanged)
+        );
+    }
+
+    /// Review finding: `run`'s quit paths call `publish` once and break, so
+    /// a `ServerChanged` parked less than `SERVER_CHANGE_GRACE_MS` before
+    /// quit would never see `tick`'s grace window fire — there is no next
+    /// tick — and its fight end would never reach history.
+    /// `flush_server_change_for_shutdown` must land it unconditionally.
+    #[test]
+    fn shutdown_flush_lands_a_parked_server_change_still_inside_the_grace_window() {
+        let mut p = Pipeline::new();
+        p.step(proto::ProtocolEvent::Damage(damage(1, 700, 1_000)), 1_000);
+        p.step(proto::ProtocolEvent::ServerChanged, 2_000);
+        assert_eq!(
+            p.fight_end_cause(),
+            None,
+            "the adoption alone must not end the fight"
+        );
+
+        // Still well inside the grace window - `tick` would not flush this
+        // on its own.
+        p.flush_server_change_for_shutdown(2_100);
+        assert_eq!(
+            p.fight_end_cause(),
+            Some(meter::FightEndCause::ServerChanged),
+            "shutdown must flush a parked server_changed regardless of the grace window"
         );
     }
 

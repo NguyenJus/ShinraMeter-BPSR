@@ -353,22 +353,6 @@ pub struct Meter {
     /// which TCP flow is being decoded. Only a `Scene` naming a different
     /// id replaces it.
     scene_id: Option<u32>,
-    /// The most recent scene id an actual `ProtocolEvent::Scene` reported,
-    /// **not** cleared by `ServerChanged` (issue #295). `scene_id` used to
-    /// go `None` across a reconnect (until issue #422 kept it) — but by the
-    /// time the next `Scene` packet
-    /// arrives, comparing its id against the *previous* confirmed scene is
-    /// no longer ambiguous, and every real capture sends `ServerChanged`
-    /// immediately before the `Scene` that follows a zone transition. Using
-    /// `scene_id` itself for that comparison (as the `Scene` arm's
-    /// `entering_dungeon` gate once did) meant the comparison always saw
-    /// `None` in production and could never tell a genuinely new dungeon
-    /// from a late reconnect-confirmation of the one just left — so the
-    /// fast `SceneChanged` reset never fired outside a unit test, and a
-    /// fight held since the previous instance sat un-reset until either
-    /// real combat (`NewFight`) or that dungeon's own `Playing` packet
-    /// (`DungeonStarted`) eventually caught it, sometimes minutes later.
-    last_known_scene_id: Option<u32>,
     /// Where this encounter is in the fight lifecycle (issue #336 step 3),
     /// and the only place that answer is stored.
     ///
@@ -400,9 +384,10 @@ pub struct Meter {
     ///
     /// `snapshot` renders this instead of live state for as long as the
     /// fight is held ([`FightState::Ended`]). Zoning out of a dungeon
-    /// discards the live answer — the town's `Scene` event clears
-    /// `enemies`, `boss_entity` and `scene_id` (issue #422: the
-    /// `ServerChanged` that precedes it only clears `enemies`) —
+    /// discards the live answer — the preceding `ServerChanged` clears
+    /// `enemies` (issue #422), which is what makes the retained
+    /// `boss_entity` inert, and the town's `Scene` event that follows only
+    /// overwrites `scene_id` —
     /// while the fight's rows, totals and clock stay frozen on screen, so
     /// without this capture the header would caption a raid's damage
     /// breakdown with "No target" and the name of the town the player just
@@ -520,7 +505,6 @@ impl Meter {
             last_reset_ms: None,
             boss_entity: None,
             scene_id: None,
-            last_known_scene_id: None,
             fight_lifecycle: FightLifecycle::Idle,
             fight_identity: None,
             deaths_seen: 0,
@@ -1062,7 +1046,7 @@ impl Meter {
                 // instance, so log only when the resolved id actually
                 // changes — never per packet, which would just be a smaller
                 // version of the #87 flood this exists to avoid.
-                if let Some(msg) = scene_transition_log(self.scene_id, Some(*level_map_id)) {
+                if let Some(msg) = scene_transition_log(self.scene_id, *level_map_id) {
                     log::info!("{msg}");
                 }
                 // issue #191: a repeat sync reporting the *same* scene id
@@ -1071,26 +1055,23 @@ impl Meter {
                 // numbers on screen for the user to screenshot as long as
                 // they're in the instance it was fought in.
                 let mut reason = None;
-                // issue #293: a genuinely first-ever scene learn — neither
-                // `scene_id` (this session) nor `last_known_scene_id`
-                // (survives `ServerChanged`, see issue #295 above) has ever
-                // been set — must not be treated as a scene *change*. That
-                // is exactly what a mid-instance attach looks like: there
-                // was no `ENTER_SCENE` to see (it fired once, before the
-                // meter existed), so the first `Scene` this session ever
-                // gets is `SyncContainerData`'s full-state push, which can
-                // land well after damage already has. Below this guard
-                // assumes a real transition — `cut_short`/`latch_fight_end`
-                // would otherwise stamp a fight still genuinely in progress
-                // as cut short by a "departure" that never happened, the
-                // instant a late-attaching meter finally learns where it
-                // is. A reconnect is *not* this case — since issue #422
-                // `scene_id` survives it outright, and even before that
-                // `last_known_scene_id` was still set, so the check below
-                // still runs and issue #295's fast reset still fires on a
-                // confirmed different scene.
-                let first_ever_scene_learn =
-                    self.scene_id.is_none() && self.last_known_scene_id.is_none();
+                // issue #293: a genuinely first-ever scene learn — `scene_id`
+                // has never been set — must not be treated as a scene
+                // *change*. That is exactly what a mid-instance attach looks
+                // like: there was no `ENTER_SCENE` to see (it fired once,
+                // before the meter existed), so the first `Scene` this
+                // session ever gets is `SyncContainerData`'s full-state
+                // push, which can land well after damage already has. Below
+                // this guard assumes a real transition —
+                // `cut_short`/`latch_fight_end` would otherwise stamp a
+                // fight still genuinely in progress as cut short by a
+                // "departure" that never happened, the instant a
+                // late-attaching meter finally learns where it is. A
+                // reconnect is *not* this case — since issue #422 `scene_id`
+                // survives it outright, so the check below still runs and
+                // issue #295's fast reset still fires on a confirmed
+                // different scene.
+                let first_ever_scene_learn = self.scene_id.is_none();
                 if !first_ever_scene_learn && self.scene_id != Some(*level_map_id) {
                     // issue #12: drop preloaded roster rows nobody ever
                     // damaged, logging a summary first — a stale party
@@ -1166,16 +1147,15 @@ impl Meter {
                     // had no such hit to eventually clean it up at all),
                     // but not eliminated by it.
                     //
-                    // And gated on `self.last_known_scene_id` rather than
-                    // the live `self.scene_id` (issue #295): `scene_id`
-                    // itself used to go `None` across a `ServerChanged`
-                    // (issue #422 keeps it now), and every real zone
-                    // transition in capture sends a `ServerChanged` first,
-                    // so comparing against `scene_id`
-                    // here always saw `None` in production and could never
-                    // resolve immediately. `last_known_scene_id` has never
-                    // been cleared by `ServerChanged`, so by the time this packet
-                    // lands the comparison is no longer ambiguous: a
+                    // And gated on `self.scene_id`, the last confirmed scene
+                    // id (issue #295), which since issue #422 is `scene_id`
+                    // itself: it used to go `None` across a `ServerChanged`,
+                    // which — since every real zone transition in capture
+                    // sends a `ServerChanged` first — meant comparing
+                    // against it here always saw `None` in production and
+                    // could never resolve immediately. Issue #422 stopped
+                    // clearing it on `ServerChanged`, so by the time this
+                    // packet lands the comparison is no longer ambiguous: a
                     // different id from the last one actually confirmed
                     // *is* a genuinely new instance, and the same id is the
                     // *late* confirmation of the instance the currently-held
@@ -1197,9 +1177,7 @@ impl Meter {
                     // here would drop it — death counts included — before
                     // anything ever sees it.
                     let entering_dungeon = tables::is_dungeon_scene(*level_map_id)
-                        && self
-                            .last_known_scene_id
-                            .is_some_and(|id| id != *level_map_id);
+                        && self.scene_id.is_some_and(|id| id != *level_map_id);
                     if entering_dungeon && !cut_short && !self.is_held() {
                         self.reset(ResetReason::SceneChanged, self.last_event_ms);
                         // PR #198 review, finding 1: `reset` is shared with
@@ -1300,7 +1278,6 @@ impl Meter {
                     }
                 }
                 self.scene_id = Some(*level_map_id);
-                self.last_known_scene_id = Some(*level_map_id);
                 reason
             }
             ProtocolEvent::ServerChanged { timestamp_ms } => {
@@ -1371,11 +1348,15 @@ impl Meter {
                 // the party is in, and which boss it is fighting, are facts
                 // about the game session that no reconnect makes wrong:
                 // when a reconnect really does land somewhere else, the
-                // `Scene` arm above sees a different id and clears both
-                // itself. `enemies` still goes, because uids do not
-                // survive — which is what makes the retained `boss_entity`
-                // inert (`boss_monster_id`/`fought_target_alive` both read
-                // through `enemies`) until `recompute_boss` re-points it.
+                // `Scene` arm above sees a different id: if it's a
+                // different *dungeon*, that arm's `entering_dungeon` reset
+                // clears `enemies`/`boss_entity`; if it's a non-dungeon
+                // destination, the arm just overwrites `scene_id`. Here,
+                // ahead of any `Scene` packet, `enemies` still goes, because
+                // uids do not survive — which is what makes the retained
+                // `boss_entity` inert (`boss_monster_id`/
+                // `fought_target_alive` both read through `enemies`) until
+                // `recompute_boss` re-points it.
                 //
                 // issue #139: as invalid across a reconnect as
                 // `enemies` — the new server session may not
@@ -4461,22 +4442,16 @@ fn buff_rows(stats: &PlayerStats, dps_duration_ms: u64) -> Vec<SkillRow> {
 
 /// Builds the "scene changed" diagnostic line (issue #69), or `None` when
 /// `new_scene_id` matches `previous` — the transition-only guard that keeps
-/// this out of the #87-style flood. `new_scene_id` is `Option<u32>` so this
-/// can also represent a clear-to-`None` transition (the `ServerChanged` arm
-/// of `Meter::apply`, mirroring how [`boss_transition_log`] handles a
-/// cleared boss target) rather than only ever moving between two concrete
-/// scenes. Split out from `Meter::apply` as a pure function so the decision
-/// (log or not, and what) is unit-testable without a log-capturing harness.
-fn scene_transition_log(previous: Option<u32>, new_scene_id: Option<u32>) -> Option<String> {
-    if previous == new_scene_id {
+/// this out of the #87-style flood. Split out from `Meter::apply` as a pure
+/// function so the decision (log or not, and what) is unit-testable without
+/// a log-capturing harness.
+fn scene_transition_log(previous: Option<u32>, new_scene_id: u32) -> Option<String> {
+    if previous == Some(new_scene_id) {
         return None;
     }
-    Some(match new_scene_id {
-        None => "encounter: scene cleared".to_string(),
-        Some(id) => match tables::scene_name(id) {
-            Some(name) => format!("encounter: scene changed to id={id} name={name}"),
-            None => format!("encounter: scene changed to id={id} name=<unresolved>"),
-        },
+    Some(match tables::scene_name(new_scene_id) {
+        Some(name) => format!("encounter: scene changed to id={new_scene_id} name={name}"),
+        None => format!("encounter: scene changed to id={new_scene_id} name=<unresolved>"),
     })
 }
 
@@ -12744,30 +12719,20 @@ mod tests {
 
         #[test]
         fn scene_transition_log_fires_only_when_the_id_changes() {
-            assert!(scene_transition_log(None, Some(8)).is_some());
-            assert!(scene_transition_log(Some(8), Some(8)).is_none());
-            assert!(scene_transition_log(Some(8), Some(9)).is_some());
-            // Scene clearing (a real transition, e.g. on `ServerChanged`) still logs.
-            assert!(scene_transition_log(Some(8), None).is_some());
-            // No-op stays silent even when both sides are already empty.
-            assert!(scene_transition_log(None, None).is_none());
+            assert!(scene_transition_log(None, 8).is_some());
+            assert!(scene_transition_log(Some(8), 8).is_none());
+            assert!(scene_transition_log(Some(8), 9).is_some());
         }
 
         #[test]
         fn scene_transition_log_reports_the_resolved_name_or_says_it_did_not_resolve() {
-            let msg = scene_transition_log(None, Some(8)).unwrap();
+            let msg = scene_transition_log(None, 8).unwrap();
             assert!(msg.contains("id=8"));
             assert!(msg.contains("Asterleeds"));
 
-            let msg = scene_transition_log(None, Some(999_999)).unwrap();
+            let msg = scene_transition_log(None, 999_999).unwrap();
             assert!(msg.contains("id=999999"));
             assert!(msg.contains("<unresolved>"));
-        }
-
-        #[test]
-        fn scene_transition_log_reports_a_clear() {
-            let msg = scene_transition_log(Some(8), None).unwrap();
-            assert!(msg.contains("cleared"));
         }
 
         #[test]
