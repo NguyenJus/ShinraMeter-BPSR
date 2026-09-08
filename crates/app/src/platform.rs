@@ -2396,7 +2396,7 @@ fn hide_to_tray(hwnd: windows::Win32::Foundation::HWND) {
     // `#[must_use]` `BOOL` reports whether the window *was* visible, not
     // whether the call succeeded, so there is nothing to check.
     let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
-    log::info!("overlay minimized to the notification area");
+    log::info!("ui: window minimized to the notification area");
 }
 
 /// Un-hides and re-activates the overlay wherever it already is, and drops
@@ -2425,7 +2425,7 @@ fn restore_from_tray(hwnd: windows::Win32::Foundation::HWND) {
         let _ = SetForegroundWindow(hwnd);
     }
     remove_tray_icon(hwnd);
-    log::info!("overlay restored from the notification area");
+    log::info!("ui: window restored from the notification area");
 }
 
 /// The work area (`MONITORINFO.rcWork`) of the monitor `hwnd` sits on, or
