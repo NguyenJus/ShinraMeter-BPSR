@@ -137,8 +137,10 @@ const WIPE_HOLD_RELEASE_MS: u64 = 60_000;
 ///
 /// Deliberately measured against `players.len()` rather than a party size
 /// from the roster packet: `players` is the only roster this crate has, and
-/// it is what both wipe paths already read. Note that the `party_down=N/M`
-/// figure in the `reset`/issue #151 log lines counts players with
+/// it is what both wipe paths already read. Note that the
+/// `party_down=N known_players=M` figures in the `reset`/issue #151 log
+/// lines (spelled `party_down=N/M` before issue #410 renamed the
+/// denominator to what it actually measures) count players with
 /// `deaths > 0` — cumulative, per issue #212 — so it is an upper bound on
 /// how many were down at any one instant and cannot be used to calibrate
 /// this constant directly.
@@ -2021,7 +2023,11 @@ impl Meter {
             // than after the idle timeout, so the meter freezes on the kill
             // instead of on a straggler's last tick of DoT damage.
             if self.fight_cfg.end_on_boss_death && d.is_dead && was_tracked_boss {
-                self.end_fight_on_boss_death(target_key(d), d.timestamp_ms);
+                self.end_fight_on_boss_death(
+                    target_key(d),
+                    d.timestamp_ms,
+                    DeathSignal::DamageIsDead,
+                );
             }
             // issue #391: after `end_fight_on_boss_death` has had its
             // chance, so a recognized boss keeps `cause=boss_death`. Gated
@@ -2201,7 +2207,7 @@ impl Meter {
     /// Ruins' Caprahorn pair, which spawns inside a boss-select scene same
     /// as the sequential raids do — still counts, exactly as it does
     /// outside a boss-select scene.
-    fn end_fight_on_boss_death(&mut self, entity: EntityId, now_ms: u64) {
+    fn end_fight_on_boss_death(&mut self, entity: EntityId, now_ms: u64, via: DeathSignal) {
         // The display number, for the diagnostics below only — `entity` is
         // what indexes `enemies` (issue #335).
         let uid = entity.display_uid();
@@ -2241,7 +2247,15 @@ impl Meter {
         // break that field.
         let objective_holds = self.dungeon_objective_still_running();
         if other_boss.is_none() && !objective_holds {
-            self.latch_fight_end(FightEndCause::BossDeath, now_ms, now_ms, monster_id);
+            // issue #410: the `boss_death` end line names the signal that
+            // produced it, the way #395 gave `dungeon_ended` a producer.
+            self.latch_fight_end_with_reason(
+                FightEndCause::BossDeath,
+                now_ms,
+                now_ms,
+                monster_id,
+                Some(via.as_str()),
+            );
             if let Some(id) = monster_id {
                 self.fight_lifecycle.arm_phase_resume(id);
             }
@@ -2257,20 +2271,45 @@ impl Meter {
         // not end its fight, never a per-packet flood. Both guards and every
         // input either of them read are named, so one capture is enough to
         // decide the next case without another round of guessing.
+        // issue #410: one line per enemy per fight *per distinct guard
+        // pair*. All four death signals can reach this refusal for the
+        // same corpse (the only dedup below it, `fight_end_ms().is_some()`,
+        // is `None` exactly when the death is refused), which printed the
+        // same line twice a second apart and read as two deaths. Keyed on
+        // `(other_boss.is_some(), objective_holds)` rather than a plain
+        // bool so a refusal for a *different* reason (e.g. the other boss
+        // died in between, or the objective completed) still logs — only a
+        // repeat of the exact same reason is suppressed. `reset` clears the
+        // marker, so a later pull on the same enemy logs again.
+        let key = (other_boss.is_some(), objective_holds);
+        let should_log = self
+            .enemies
+            .get_mut(&entity)
+            .is_some_and(|e| e.boss_death_refusal_logged != Some(key));
+        if !should_log {
+            return;
+        }
+        if let Some(e) = self.enemies.get_mut(&entity) {
+            e.boss_death_refusal_logged = Some(key);
+        }
         log::info!(
-            "encounter: boss death of uid={uid} monster_id={} did not end the fight: \
-             other_living_boss={} dungeon_objective_still_running={objective_holds} \
-             scene={} boss_select={} dungeon_state={:?} current_objective={:?} \
-             objective_complete={:?} (issue #256)",
-            monster_id.map_or(-1i64, i64::from),
-            other_boss.map_or(-1, EntityId::display_uid),
-            self.scene_id.map_or(-1i64, i64::from),
-            self.scene_id.is_some_and(phase::is_boss_select_scene),
-            self.dungeon_state,
-            self.current_objective_id,
-            self.current_objective_id
-                .and_then(|id| self.objectives.get(&id))
-                .and_then(|obj| obj.complete),
+            "{}",
+            boss_death_refused_line(
+                via,
+                RefusalContext {
+                    uid,
+                    monster_id,
+                    other_boss,
+                    objective_holds,
+                    scene_id: self.scene_id,
+                    dungeon_state: self.dungeon_state,
+                    current_objective_id: self.current_objective_id,
+                    objective_complete: self
+                        .current_objective_id
+                        .and_then(|id| self.objectives.get(&id))
+                        .and_then(|obj| obj.complete),
+                }
+            )
         );
     }
 
@@ -2360,6 +2399,20 @@ impl Meter {
         observed_ms: u64,
         boss_monster_id: Option<u32>,
     ) {
+        self.latch_fight_end_with_reason(cause, end_ms, observed_ms, boss_monster_id, None);
+    }
+
+    /// [`Self::latch_fight_end`] plus the `reason=` field issue #410 asked
+    /// for: what, specifically, produced this cause. Only the boss-death
+    /// path has one to give today (the [`DeathSignal`] that fired).
+    fn latch_fight_end_with_reason(
+        &mut self,
+        cause: FightEndCause,
+        end_ms: u64,
+        observed_ms: u64,
+        boss_monster_id: Option<u32>,
+        reason: Option<&str>,
+    ) {
         if self.fight_end_ms().is_some() {
             return;
         }
@@ -2375,7 +2428,7 @@ impl Meter {
         if !self.fight_lifecycle.end(end_ms, observed_ms, cause, armed) {
             return;
         }
-        log::info!("{}", fight_end_log(cause, boss_monster_id));
+        log::info!("{}", fight_end_log(cause, boss_monster_id, reason));
     }
 
     /// The monster id of the currently selected boss target, if it has one.
@@ -2596,7 +2649,7 @@ impl Meter {
         );
         self.mark_enemy_dead(entity);
         self.recompute_boss();
-        self.end_fight_on_boss_death(entity, now_ms);
+        self.end_fight_on_boss_death(entity, now_ms, DeathSignal::Despawn);
     }
 
     /// Whether some enemy other than `dying_uid` is a recognized boss that
@@ -3197,7 +3250,7 @@ impl Meter {
                     let was_tracked_boss = self.boss_entity == Some(entity);
                     self.recompute_boss();
                     if self.fight_cfg.end_on_boss_death && was_tracked_boss {
-                        self.end_fight_on_boss_death(entity, timestamp_ms);
+                        self.end_fight_on_boss_death(entity, timestamp_ms, DeathSignal::AttrState);
                     }
                     // issue #391: same ordering, and the same
                     // `end_on_boss_death` gate, as the other death paths.
@@ -3385,6 +3438,7 @@ impl Meter {
         // than on the map key. Two live entities sharing one display uid is
         // vanishingly rare among party members, but dropping both is the
         // right reading of "this uid left the party" either way.
+        let before = self.players.len();
         let mut pruned = 0u32;
         self.players.retain(|entity, p| {
             let keep = entity.display_uid() != uid;
@@ -3394,6 +3448,19 @@ impl Meter {
             keep
         });
         self.preload_count = self.preload_count.saturating_sub(pruned);
+        // issue #410: `known_players` in the reset line shrinks after every
+        // roster change and read like a party-size bug, because nothing in
+        // this crate ever logged the roster changing. Sparse by
+        // construction (issue #69): one line per join/leave push, and only
+        // when the retain actually removed a row — a no-op prune (the uid
+        // was never in `players`) has nothing to report. Counts only - no
+        // uid, no name, matching `apply_team_roster`'s line.
+        if self.players.len() != before {
+            log::info!(
+                "encounter: team member left roster_size={}",
+                self.players.len()
+            );
+        }
     }
 
     /// `ProtocolEvent::TeamRoster` (issue #343): the authoritative
@@ -3431,6 +3498,7 @@ impl Meter {
         if members.is_empty() || !self.in_dungeon_scene() || self.fight_end_ms().is_some() {
             return;
         }
+        let before = self.players.len();
         let mut pruned = 0u32;
         let local_uid = self.local_uid;
         self.players.retain(|entity, p| {
@@ -3442,6 +3510,13 @@ impl Meter {
             keep
         });
         self.preload_count = self.preload_count.saturating_sub(pruned);
+        // issue #410: the other half of the roster trail, same rationale as
+        // `apply_team_member_left`'s line. Fires only on an actual
+        // membership change (the retain pruned a row), not on every roster
+        // push. Counts only - no uid, no name.
+        if self.players.len() != before {
+            log::info!("encounter: team roster updated size={}", self.players.len());
+        }
     }
 
     fn apply_enemy_hp(&mut self, e: &EnemyHp) -> Option<ResetReason> {
@@ -3552,7 +3627,7 @@ impl Meter {
             if self.fight_cfg.end_on_boss_death
                 && self.enemies.get(&key).and_then(|x| x.curr_hp) == Some(0)
             {
-                self.end_fight_on_boss_death(key, e.timestamp_ms);
+                self.end_fight_on_boss_death(key, e.timestamp_ms, DeathSignal::HpSync);
             }
         }
 
@@ -3785,9 +3860,37 @@ impl Meter {
         // the winner actually changes — logging every call would reproduce
         // the #87 flood at boss-target granularity instead of attr-id
         // granularity.
+        // issue #410: why the target moved. `previous_gone` and
+        // `previous_dead` are split because only the latter is the case
+        // that made the reset line's `boss_hp_pct` misread as the dead
+        // boss's HP (the ranking prefers a live boss to a corpse); the
+        // former is `previous` having been dropped from `enemies`
+        // entirely (a server change, say), which carries no HP to
+        // misread. `no_candidate` is `reset`'s own signature: it clears
+        // `took_damage` on every enemy while the previous boss is still
+        // alive, so the very next `recompute_boss` finds nothing in the
+        // damaged-candidate set and drops `boss_entity` to `None` even
+        // though the old boss never died or left — that must not be
+        // reported as `higher_priority`, which implies a live challenger
+        // actually won. `first_seen` is the fight's first target and
+        // `higher_priority` is the ordinary re-rank among live enemies.
+        let reason = match previous_boss_entity {
+            None => "first_seen",
+            Some(previous) => match self.enemies.get(&previous) {
+                None => "previous_gone",
+                Some(e) if !e.is_alive() => "previous_dead",
+                Some(_) => {
+                    if self.boss_entity.is_none() {
+                        "no_candidate"
+                    } else {
+                        "higher_priority"
+                    }
+                }
+            },
+        };
         if self.boss_entity != previous_boss_entity
             && let Some(msg) =
-                boss_transition_log(previous_boss_entity, self.boss_entity, monster_id)
+                boss_transition_log(previous_boss_entity, self.boss_entity, monster_id, reason)
         {
             log::info!("{msg}");
         }
@@ -3841,10 +3944,20 @@ impl Meter {
         // `reset` is itself already an event, never a per-snapshot poll, so
         // this is naturally sparse (issue #69) — no transition-only guard
         // needed the way scene/boss logging above requires one.
-        let boss_hp_pct = self
+        // issue #410: report whichever entity `boss_entity` currently names,
+        // dead or alive, and let `alive` say which -- filtering dead bosses
+        // out here made a post-kill reset's `boss_hp_pct` indistinguishable
+        // from a fight where no boss was ever tracked (`<none>` either way).
+        // `<none>` now means only that: no boss target at all.
+        let boss = self
             .boss_entity
-            .and_then(|uid| self.enemies.get(&uid))
-            .and_then(|e| e.pct());
+            .and_then(|entity| self.enemies.get(&entity).map(|e| (entity, e)))
+            .map(|(entity, e)| BossHpSnapshot {
+                pct: e.pct(),
+                uid: entity.display_uid(),
+                monster_id: e.monster_id,
+                alive: e.is_alive(),
+            });
         // issue #284: live down-state, not cumulative deaths — see
         // `party_is_wiped`'s doc comment for why `deaths > 0` is the wrong
         // read (a battle rez can never bring that counter back down, so it
@@ -3853,7 +3966,7 @@ impl Meter {
         let party_down = self.players.values().filter(|p| !p.alive).count();
         log::info!(
             "{}",
-            reset_log(reason, boss_hp_pct, party_down, self.players.len())
+            reset_log(reason, boss, party_down, self.players.len())
         );
         self.players.clear();
         // issue #12/#145 finding 1: `players` just got cleared, so any
@@ -3868,6 +3981,9 @@ impl Meter {
         for enemy in self.enemies.values_mut() {
             enemy.lowest_pct = None;
             enemy.took_damage = false;
+            // issue #410: per-fight, like `took_damage` - the next pull's
+            // refusal (if any) is news again.
+            enemy.boss_death_refusal_logged = None;
             // `death_order` deliberately survives (PR #144 review, finding
             // 2). A reset is bookkeeping, not a resurrection: it says nothing
             // about whether the corpse is back on its feet, and the rest of
@@ -4372,25 +4488,24 @@ fn boss_transition_log(
     previous: Option<EntityId>,
     new: Option<EntityId>,
     monster_id: Option<u32>,
+    reason: &str,
 ) -> Option<String> {
     if previous == new {
         return None;
     }
     Some(match new.map(EntityId::display_uid) {
-        None => "encounter: boss target cleared".to_string(),
+        None => format!("encounter: boss target cleared reason={reason}"),
         Some(uid) => match monster_id {
             Some(id) => {
                 let recognized = tables::is_boss_monster(id);
-                match tables::monster_name(id) {
-                    Some(name) => format!(
-                        "encounter: boss target changed to uid={uid} monster_id={id} recognized_boss={recognized} name={name}"
-                    ),
-                    None => format!(
-                        "encounter: boss target changed to uid={uid} monster_id={id} recognized_boss={recognized} name=<unresolved>"
-                    ),
-                }
+                let name = tables::monster_name(id).unwrap_or("<unresolved>");
+                format!(
+                    "encounter: boss target changed to uid={uid} monster_id={id} recognized_boss={recognized} name={name} reason={reason}"
+                )
             }
-            None => format!("encounter: boss target changed to uid={uid} monster_id=<unknown>"),
+            None => format!(
+                "encounter: boss target changed to uid={uid} monster_id=<unknown> reason={reason}"
+            ),
         },
     })
 }
@@ -4427,34 +4542,149 @@ fn monster_id_change_log(uid: i64, old: Option<u32>, new: u32) -> Option<String>
 /// never a player name or uid, since these logs get shared for debugging
 /// (`crates/app/src/logging.rs`). Pure, like the builders around it, for
 /// the same testability reason.
-fn fight_end_log(cause: FightEndCause, boss_monster_id: Option<u32>) -> String {
+fn fight_end_log(
+    cause: FightEndCause,
+    boss_monster_id: Option<u32>,
+    reason: Option<&str>,
+) -> String {
     let cause = cause.label();
+    // issue #410: appended rather than inserted, so every field an
+    // existing log reader (or test) keys off keeps its position.
+    let reason = match reason {
+        Some(reason) => format!(" reason={reason}"),
+        None => String::new(),
+    };
     match boss_monster_id {
         Some(id) => {
             let name = tables::monster_name(id).unwrap_or("<unresolved>");
-            format!("encounter: fight ended cause={cause} boss_monster_id={id} name={name}")
+            format!("encounter: fight ended cause={cause} boss_monster_id={id} name={name}{reason}")
         }
-        None => format!("encounter: fight ended cause={cause} boss_monster_id=<unknown>"),
+        None => format!("encounter: fight ended cause={cause} boss_monster_id=<unknown>{reason}"),
     }
+}
+
+/// Which signal told the meter a boss was dead (issue #410).
+///
+/// Four independent paths reach [`Meter::end_fight_on_boss_death`], and
+/// until now the refusal diagnostic they share could not say which one it
+/// came from - two lines one second apart read as two deaths rather than
+/// as two signals for the same one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeathSignal {
+    /// A `Damage` packet carrying `is_dead`.
+    DamageIsDead,
+    /// An `EnemyHp` sync landing on `curr_hp == 0`.
+    HpSync,
+    /// An `AttrState` update reporting the entity dead.
+    AttrState,
+    /// A despawn treated as a death (issues #215/#276).
+    Despawn,
+}
+
+impl DeathSignal {
+    /// The log spelling, matching issue #410's requested vocabulary.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DamageIsDead => "damage_is_dead",
+            Self::HpSync => "hp_sync",
+            Self::AttrState => "attr_state",
+            Self::Despawn => "despawn",
+        }
+    }
+}
+
+/// Every guard input [`boss_death_refused_line`] reports, bundled so the
+/// builder stays a two-argument pure function.
+#[derive(Clone, Copy, Debug)]
+struct RefusalContext {
+    /// The dying boss's *display* uid (issue #335).
+    uid: i64,
+    monster_id: Option<u32>,
+    /// `Meter::other_living_boss`'s answer - the first guard.
+    other_boss: Option<EntityId>,
+    /// `Meter::dungeon_objective_still_running` - the second guard.
+    objective_holds: bool,
+    scene_id: Option<u32>,
+    dungeon_state: Option<EDungeonState>,
+    current_objective_id: Option<i32>,
+    objective_complete: Option<bool>,
+}
+
+/// Builds the "boss death did not end the fight" diagnostic (issue #256),
+/// naming the death signal that produced it (issue #410). Pure, like the
+/// builders around it, for the same testability reason. Its caller gates
+/// it to one line per enemy per fight, so a death seen by several signals
+/// logs once.
+fn boss_death_refused_line(via: DeathSignal, ctx: RefusalContext) -> String {
+    let RefusalContext {
+        uid,
+        monster_id,
+        other_boss,
+        objective_holds,
+        scene_id,
+        dungeon_state,
+        current_objective_id,
+        objective_complete,
+    } = ctx;
+    format!(
+        "encounter: boss death of uid={uid} monster_id={} did not end the fight: \
+         other_living_boss={} dungeon_objective_still_running={objective_holds} \
+         scene={} boss_select={} dungeon_state={dungeon_state:?} current_objective={current_objective_id:?} \
+         objective_complete={objective_complete:?} via={} (issue #256)",
+        monster_id.map_or(-1i64, i64::from),
+        other_boss.map_or(-1, EntityId::display_uid),
+        scene_id.map_or(-1i64, i64::from),
+        scene_id.is_some_and(phase::is_boss_select_scene),
+        via.as_str(),
+    )
+}
+
+/// The boss the `reset` diagnostic's HP reading belongs to (issue #410).
+/// `reset` used to print a bare `boss_hp_pct=`, which `recompute_boss` can
+/// have re-pointed at an unrelated live add after the fought boss died -
+/// reading as if the boss died at 10 % HP. Naming the entity makes the two
+/// cases distinguishable; a dead (or absent) boss prints `<none>` instead.
+#[derive(Clone, Copy, Debug)]
+struct BossHpSnapshot {
+    pct: Option<f64>,
+    /// Display uid (issue #335). An enemy uid is not player data.
+    uid: i64,
+    monster_id: Option<u32>,
+    /// issue #410: a dead boss still prints here, with `alive: false`.
+    /// `<none>` on the reset line means no boss target at all -- the boss
+    /// died and `recompute_boss` moved on, or nothing was ever tracked --
+    /// not "the boss was dead", which `alive` alone now answers.
+    alive: bool,
 }
 
 /// Builds the `reset` diagnostic line. The boss HP percentage and the
 /// party down count are what make a `BossHpRollback` and a genuine wipe
 /// distinguishable in a log (issue #151's diagnostics gap, issue #154):
-/// the rollback shape alone reads the same either way. Counts only — never
-/// a player name or uid.
+/// the rollback shape alone reads the same either way. Player data is
+/// counts only - never a player name or uid; the uid it prints belongs to
+/// the boss enemy (issue #410).
 fn reset_log(
     reason: ResetReason,
-    boss_hp_pct: Option<f64>,
+    boss: Option<BossHpSnapshot>,
     party_down: usize,
-    party_known: usize,
+    known_players: usize,
 ) -> String {
-    let hp = match boss_hp_pct {
-        Some(pct) => format!("{pct:.1}"),
-        None => "<unknown>".to_string(),
+    let hp = match boss {
+        None => "<none>".to_string(),
+        Some(b) => {
+            let pct = match b.pct {
+                Some(pct) => format!("{pct:.1}"),
+                None => "<unknown>".to_string(),
+            };
+            let monster_id = b.monster_id.map_or(-1i64, i64::from);
+            format!(
+                "{pct} (uid={} monster_id={monster_id} alive={})",
+                b.uid, b.alive
+            )
+        }
     };
     format!(
-        "encounter: reset reason={reason:?} boss_hp_pct={hp} party_down={party_down}/{party_known}"
+        "encounter: reset reason={reason:?} boss_hp_pct={hp} party_down={party_down} known_players={known_players}"
     )
 }
 
@@ -11980,6 +12210,14 @@ mod tests {
                 .unwrap_or(false)
         }
 
+        /// How many captured lines contain `needle`.
+        fn logged_count(needle: &str) -> usize {
+            CAPTURED
+                .lock()
+                .map(|captured| captured.iter().filter(|line| line.contains(needle)).count())
+                .unwrap_or(0)
+        }
+
         #[test]
         fn a_server_change_logs_the_boss_the_fight_was_on() {
             // PR #163 review, finding 3: the `ServerChanged` arm cleared
@@ -12022,6 +12260,50 @@ mod tests {
             assert!(
                 logged(&format!("cause=server_changed boss_monster_id={DIAG_BOSS}")),
                 "the fight-end line must still name the boss the fight was on"
+            );
+        }
+
+        /// issue #410: `reset` clears `took_damage` on every enemy while
+        /// leaving the previous boss alive and in `enemies`, so the very
+        /// next `recompute_boss` finds nothing in the damaged-candidate set
+        /// and drops `boss_entity` to `None` even though the old boss never
+        /// died or left. That transition must not be reported as
+        /// `higher_priority` (which implies a live challenger won) or as
+        /// `previous_dead` (the boss is not dead).
+        #[test]
+        fn a_manual_reset_dropping_a_live_boss_logs_no_candidate() {
+            install_capture();
+
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: ek(10),
+                uid: 10,
+                curr_hp: Some(100),
+                max_hp: Some(100),
+                monster_id: Some(DIAG_BOSS),
+                timestamp_ms: 0,
+            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 10,
+                    target_kind: EntityKind::Monster,
+                    value: 10,
+                    timestamp_ms: 0,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
+            assert_eq!(m.boss_entity, Some(ek(10)));
+
+            m.reset(ResetReason::Manual, 1_000);
+            assert_eq!(m.boss_entity, None);
+
+            assert!(
+                logged("boss target cleared reason=no_candidate"),
+                "a Manual reset that drops boss_entity while the previous \
+                 boss is still alive must log reason=no_candidate"
             );
         }
 
@@ -12089,7 +12371,7 @@ mod tests {
             m.reset(ResetReason::Manual, 3_000);
 
             assert!(
-                logged("party_down=0/2"),
+                logged("party_down=0 known_players=2"),
                 "nobody is down right now, so the reset diagnostic must not \
                  report the one player who merely died earlier in the pull"
             );
@@ -12186,6 +12468,199 @@ mod tests {
             );
         }
 
+        /// issue #410: the refusal dedup is keyed on the guard pair
+        /// (`other_living_boss.is_some()`, `dungeon_objective_still_running`),
+        /// not on the enemy alone — a second refusal *for a different
+        /// reason* is new information and must still log.
+        ///
+        /// The second signal is delivered by calling
+        /// `end_fight_on_boss_death` directly rather than by feeding another
+        /// packet: every one of the four death paths first checks that the
+        /// dying enemy is still `boss_entity`, and the moment a *second*
+        /// boss is alive and damaged the ranking has already moved
+        /// `boss_entity` onto it — so no packet sequence can drive the same
+        /// corpse through two different guard pairs. The dedup below the
+        /// gate is what this test is about, so it is exercised where it
+        /// lives.
+        #[test]
+        fn boss_death_refusal_logs_again_when_the_guard_pair_changes() {
+            install_capture();
+
+            const DYING_UID: i64 = 40;
+            const OTHER_BOSS_UID: i64 = 41;
+            let needle = format!(
+                "encounter: boss death of uid={DYING_UID} monster_id={DIAG_BOSS} did not end the fight"
+            );
+            let dying = EntityId::from_display_uid(DYING_UID, EntityKind::Monster)
+                .expect("in-range test uid");
+            let mut m = Meter::new();
+
+            m.apply(&ProtocolEvent::DungeonState {
+                state: EDungeonState::Active,
+                scene_uuid: None,
+            });
+            m.apply(&ProtocolEvent::DungeonObjective {
+                target_id: 700,
+                nums: Some(0),
+                complete: Some(false),
+            });
+
+            // The dying boss outranks the other one on max HP, so it is
+            // `boss_entity` when its own death lands.
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: dying,
+                uid: DYING_UID,
+                curr_hp: Some(200),
+                max_hp: Some(200),
+                monster_id: Some(DIAG_BOSS),
+                timestamp_ms: 0,
+            }));
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(OTHER_BOSS_UID, EntityKind::Monster)
+                    .expect("in-range test uid"),
+                uid: OTHER_BOSS_UID,
+                curr_hp: Some(100),
+                max_hp: Some(100),
+                monster_id: Some(DIAG_BOSS),
+                timestamp_ms: 0,
+            }));
+            for target in [DYING_UID, OTHER_BOSS_UID] {
+                m.apply(&ProtocolEvent::Damage(
+                    DamageEvent {
+                        attacker_uid: 1,
+                        attacker_kind: EntityKind::Player,
+                        target_uid: target,
+                        target_kind: EntityKind::Monster,
+                        value: 50,
+                        timestamp_ms: 1_000,
+                        ..Default::default()
+                    }
+                    .test_reconstructed(),
+                ));
+            }
+            // First refusal: the other boss is alive and engaged and the
+            // objective is still running — key = (true, true).
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: DYING_UID,
+                    target_kind: EntityKind::Monster,
+                    value: 200,
+                    is_dead: true,
+                    timestamp_ms: 2_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
+            assert_eq!(m.fight_end_ms(), None);
+            assert_eq!(logged_count(&needle), 1, "the first refusal must log");
+
+            // The other boss dies too, so the *reason* the corpse's death
+            // did not end the fight changes: key = (false, true), the
+            // objective alone.
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: OTHER_BOSS_UID,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    is_dead: true,
+                    timestamp_ms: 3_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
+            assert_eq!(m.fight_end_ms(), None);
+            m.end_fight_on_boss_death(dying, 4_000, DeathSignal::HpSync);
+            assert_eq!(m.fight_end_ms(), None);
+            assert_eq!(
+                logged_count(&needle),
+                2,
+                "a refusal for a different guard pair on the same corpse must log again"
+            );
+        }
+
+        /// issue #410: the counterpart to the test above — a second refusal
+        /// for the *same* reason on the same corpse must stay silent.
+        #[test]
+        fn boss_death_refusal_stays_silent_on_a_repeat_of_the_same_guard_pair() {
+            install_capture();
+
+            const DYING_UID: i64 = 50;
+            let needle = format!(
+                "encounter: boss death of uid={DYING_UID} monster_id={DIAG_BOSS} did not end the fight"
+            );
+            let mut m = Meter::new();
+
+            m.apply(&ProtocolEvent::DungeonState {
+                state: EDungeonState::Active,
+                scene_uuid: None,
+            });
+            m.apply(&ProtocolEvent::DungeonObjective {
+                target_id: 700,
+                nums: Some(0),
+                complete: Some(false),
+            });
+
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(DYING_UID, EntityKind::Monster)
+                    .expect("in-range test uid"),
+                uid: DYING_UID,
+                curr_hp: Some(100),
+                max_hp: Some(100),
+                monster_id: Some(DIAG_BOSS),
+                timestamp_ms: 0,
+            }));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: DYING_UID,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    timestamp_ms: 1_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
+            // First refusal: key = (false, true).
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: DYING_UID,
+                    target_kind: EntityKind::Monster,
+                    value: 100,
+                    is_dead: true,
+                    timestamp_ms: 2_000,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
+            assert_eq!(m.fight_end_ms(), None);
+            assert_eq!(logged_count(&needle), 1);
+
+            // A second death signal (HpSync) for the same corpse, same
+            // guard pair: (false, true) again — must not log a second time.
+            m.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: EntityId::from_display_uid(DYING_UID, EntityKind::Monster)
+                    .expect("in-range test uid"),
+                uid: DYING_UID,
+                curr_hp: Some(0),
+                max_hp: Some(100),
+                monster_id: Some(DIAG_BOSS),
+                timestamp_ms: 3_000,
+            }));
+            assert_eq!(m.fight_end_ms(), None);
+            assert_eq!(
+                logged_count(&needle),
+                1,
+                "a repeat refusal for the same guard pair must not log again"
+            );
+        }
+
         #[test]
         fn scene_transition_log_fires_only_when_the_id_changes() {
             assert!(scene_transition_log(None, Some(8)).is_some());
@@ -12216,13 +12691,17 @@ mod tests {
 
         #[test]
         fn boss_transition_log_fires_only_when_the_uid_changes() {
-            assert!(boss_transition_log(None, Some(ek(10)), Some(103)).is_some());
-            assert!(boss_transition_log(Some(ek(10)), Some(ek(10)), Some(103)).is_none());
-            assert!(boss_transition_log(Some(ek(10)), Some(ek(11)), Some(103)).is_some());
+            assert!(boss_transition_log(None, Some(ek(10)), Some(103), "first_seen").is_some());
+            assert!(
+                boss_transition_log(Some(ek(10)), Some(ek(10)), Some(103), "first_seen").is_none()
+            );
+            assert!(
+                boss_transition_log(Some(ek(10)), Some(ek(11)), Some(103), "first_seen").is_some()
+            );
             // Boss target clearing (a real transition) still logs.
-            assert!(boss_transition_log(Some(ek(10)), None, None).is_some());
+            assert!(boss_transition_log(Some(ek(10)), None, None, "first_seen").is_some());
             // No-op stays silent even when both sides are already empty.
-            assert!(boss_transition_log(None, None, None).is_none());
+            assert!(boss_transition_log(None, None, None, "first_seen").is_none());
         }
 
         #[test]
@@ -12248,7 +12727,7 @@ mod tests {
         #[test]
         fn boss_transition_log_reports_recognition_and_the_resolved_name() {
             // Recognized boss id with a catalogued name.
-            let msg = boss_transition_log(None, Some(ek(10)), Some(103)).unwrap();
+            let msg = boss_transition_log(None, Some(ek(10)), Some(103), "first_seen").unwrap();
             assert!(msg.contains("monster_id=103"));
             assert!(msg.contains("recognized_boss=true"));
             assert!(msg.contains("name=Ignisor"));
@@ -12257,16 +12736,16 @@ mod tests {
             // name still resolved if catalogued (boss_monster_id itself is
             // real data regardless of recognition — see `EncounterInfo`'s
             // doc comment).
-            let msg = boss_transition_log(None, Some(ek(10)), Some(10_900)).unwrap();
+            let msg = boss_transition_log(None, Some(ek(10)), Some(10_900), "first_seen").unwrap();
             assert!(msg.contains("recognized_boss=false"));
 
             // Unknown monster id entirely.
-            let msg = boss_transition_log(None, Some(ek(10)), None).unwrap();
+            let msg = boss_transition_log(None, Some(ek(10)), None, "first_seen").unwrap();
             assert!(msg.contains("uid=10"));
             assert!(msg.contains("monster_id=<unknown>"));
 
             // Boss target cleared.
-            let msg = boss_transition_log(Some(ek(10)), None, None).unwrap();
+            let msg = boss_transition_log(Some(ek(10)), None, None, "first_seen").unwrap();
             assert!(msg.contains("cleared"));
         }
 
@@ -12297,45 +12776,122 @@ mod tests {
 
         #[test]
         fn fight_end_log_names_the_cause_and_the_boss() {
-            let msg = fight_end_log(FightEndCause::BossDeath, Some(103));
+            let msg = fight_end_log(FightEndCause::BossDeath, Some(103), None);
             assert!(msg.contains("cause=boss_death"));
             assert!(msg.contains("boss_monster_id=103"));
             assert!(msg.contains("name=Ignisor"));
 
-            let msg = fight_end_log(FightEndCause::IdleTimeout, Some(999_999));
+            let msg = fight_end_log(FightEndCause::IdleTimeout, Some(999_999), None);
             assert!(msg.contains("cause=idle_timeout"));
             assert!(msg.contains("<unresolved>"));
 
-            let msg = fight_end_log(FightEndCause::Wipe, None);
+            let msg = fight_end_log(FightEndCause::Wipe, None, None);
             assert!(msg.contains("cause=wipe"));
             assert!(msg.contains("boss_monster_id=<unknown>"));
 
-            let msg = fight_end_log(FightEndCause::ServerChanged, None);
+            let msg = fight_end_log(FightEndCause::ServerChanged, None, None);
             assert!(msg.contains("cause=server_changed"));
+        }
+
+        /// issue #410: the refusal diagnostic must name *which* death
+        /// signal reached `end_fight_on_boss_death`, so two lines a second
+        /// apart are readable as two signals for one death rather than as
+        /// two deaths. Pure builder, so one test covers every signal.
+        #[test]
+        fn boss_death_refused_line_names_the_death_signal() {
+            let ctx = RefusalContext {
+                uid: 20,
+                monster_id: Some(103),
+                other_boss: None,
+                objective_holds: true,
+                scene_id: None,
+                dungeon_state: Some(EDungeonState::Active),
+                current_objective_id: Some(700),
+                objective_complete: Some(false),
+            };
+            assert!(
+                boss_death_refused_line(DeathSignal::DamageIsDead, ctx)
+                    .contains("via=damage_is_dead")
+            );
+            assert!(boss_death_refused_line(DeathSignal::HpSync, ctx).contains("via=hp_sync"));
+            assert!(
+                boss_death_refused_line(DeathSignal::AttrState, ctx).contains("via=attr_state")
+            );
+            assert!(boss_death_refused_line(DeathSignal::Despawn, ctx).contains("via=despawn"));
         }
 
         #[test]
         fn reset_log_reports_the_boss_hp_and_the_party_down_count() {
             // The pair issue #151 could not tell apart in a log: a rollback
             // with the party up...
-            let msg = reset_log(ResetReason::BossHpRollback, Some(97.4), 0, 4);
+            let msg = reset_log(
+                ResetReason::BossHpRollback,
+                Some(BossHpSnapshot {
+                    pct: Some(97.4),
+                    uid: 20,
+                    monster_id: Some(103),
+                    alive: true,
+                }),
+                0,
+                4,
+            );
             assert!(msg.contains("reason=BossHpRollback"));
-            assert!(msg.contains("boss_hp_pct=97.4"));
-            assert!(msg.contains("party_down=0/4"));
+            // issue #410: the HP always names the entity it belongs to.
+            assert!(msg.contains("boss_hp_pct=97.4 (uid=20 monster_id=103 alive=true)"));
+            assert!(msg.contains("party_down=0 known_players=4"));
 
-            // ...and the same shape with everyone dead.
+            // ...a post-kill reset, where the boss is dead but still the
+            // tracked target: `alive=false` says so, rather than the old
+            // `<none>` that made this indistinguishable from no boss ever
+            // having been tracked at all.
+            let msg = reset_log(
+                ResetReason::NewFight,
+                Some(BossHpSnapshot {
+                    pct: Some(0.0),
+                    uid: 20,
+                    monster_id: Some(103),
+                    alive: false,
+                }),
+                4,
+                4,
+            );
+            assert!(msg.contains("reason=NewFight"));
+            assert!(msg.contains("boss_hp_pct=0.0 (uid=20 monster_id=103 alive=false)"));
+            assert!(msg.contains("party_down=4 known_players=4"));
+
+            // ...and no boss ever tracked at all: `<none>`.
             let msg = reset_log(ResetReason::NewFight, None, 4, 4);
             assert!(msg.contains("reason=NewFight"));
-            assert!(msg.contains("boss_hp_pct=<unknown>"));
-            assert!(msg.contains("party_down=4/4"));
+            assert!(msg.contains("boss_hp_pct=<none>"));
+            assert!(msg.contains("party_down=4 known_players=4"));
         }
 
         #[test]
         fn fight_end_and_reset_logs_never_leak_a_player_name_or_uid() {
-            let msg = reset_log(ResetReason::Manual, Some(50.0), 1, 4);
+            // No boss tracked at all: nothing to carry a uid.
+            let msg = reset_log(ResetReason::Manual, None, 1, 4);
             assert!(!msg.contains("uid"));
             assert!(!msg.contains("Player"));
-            let msg = fight_end_log(FightEndCause::Wipe, Some(103));
+
+            // A boss tracked: the only uid this line may ever carry is the
+            // boss's own (issue #410), which is not player data, so this
+            // pins that exactly one `uid=` appears and it is the boss's.
+            let msg = reset_log(
+                ResetReason::Manual,
+                Some(BossHpSnapshot {
+                    pct: Some(50.0),
+                    uid: 20,
+                    monster_id: Some(103),
+                    alive: true,
+                }),
+                1,
+                4,
+            );
+            assert_eq!(msg.matches("uid=").count(), 1);
+            assert!(msg.contains("uid=20"));
+            assert!(!msg.contains("Player"));
+
+            let msg = fight_end_log(FightEndCause::Wipe, Some(103), None);
             assert!(!msg.contains("uid"));
         }
     }

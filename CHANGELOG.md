@@ -6,6 +6,15 @@ affiliated with the game's publisher.
 
 ## Unreleased
 
+### Changed
+
+- Log lines now carry a `pid=<pid>` field, so entries from two meter
+  instances sharing one log file can be told apart.
+- Startup now logs an `env overrides:` banner line recording which
+  `SHINRA_*` environment overrides were active for the session.
+- Loading settings (including the case where no settings file exists yet)
+  is now logged at info, and successful saves at debug.
+
 ### Fixed
 
 - Encounters saved by a pre-v3 build whose stored player uid is out of
