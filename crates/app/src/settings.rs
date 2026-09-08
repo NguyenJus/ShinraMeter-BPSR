@@ -898,14 +898,19 @@ fn load_from(path: &Path) -> Settings {
     let contents = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(err) => {
-            if err.kind() != std::io::ErrorKind::NotFound {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                log::info!("settings: no file at {}; using defaults", path.display());
+            } else {
                 log::warn!("failed to read settings at {}: {err}", path.display());
             }
             return Settings::default();
         }
     };
     match serde_json::from_str::<Settings>(&contents) {
-        Ok(settings) => settings.sanitized(),
+        Ok(settings) => {
+            log::info!("settings: loaded from {}", path.display());
+            settings.sanitized()
+        }
         Err(err) => {
             log::warn!("failed to parse settings at {}: {err}", path.display());
             Settings::default()
@@ -942,7 +947,9 @@ fn save_to(path: &Path, settings: &Settings) {
     }
     if let Err(err) = fs::rename(&tmp_path, path) {
         log::warn!("failed to move settings temp file into place: {err}");
+        return;
     }
+    log::debug!("settings: saved to {}", path.display());
 }
 
 #[cfg(test)]

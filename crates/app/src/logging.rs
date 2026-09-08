@@ -83,6 +83,17 @@ pub fn init() {
         Some(file) => builder.target(env_logger::Target::Pipe(Box::new(Tee::new(path, file)))),
         None => builder.target(env_logger::Target::Stderr),
     };
+    builder.format(|buf, record| {
+        let ts = buf.timestamp();
+        format_line(
+            buf,
+            record.level(),
+            record.target(),
+            record.args(),
+            std::process::id(),
+            ts,
+        )
+    });
     builder.init();
 
     // Deferred from above: the logger isn't live until `builder.init()`
@@ -106,6 +117,75 @@ pub fn init() {
             .unwrap_or_else(|| "<none, stderr only>".to_string()),
         log::max_level(),
     );
+
+    log::info!("{}", env_overrides_summary(|key| std::env::var(key).ok()));
+}
+
+/// Renders one log line, keeping env_logger's default field order and
+/// layout (`[<rfc3339 seconds> <LEVEL> <target>] <message>`) but inserting
+/// `pid=<pid>` right after the level, so lines from overlapping instances
+/// writing to the same log file (issue #401) can be told apart (issue #408).
+/// `timestamp` is `Display`-only (env_logger's `Formatter::timestamp()`
+/// already knows how to render it) so this writes straight into `out`
+/// instead of allocating an intermediate `String`.
+fn format_line(
+    out: &mut impl std::io::Write,
+    level: log::Level,
+    target: &str,
+    args: &std::fmt::Arguments<'_>,
+    pid: u32,
+    timestamp: impl std::fmt::Display,
+) -> std::io::Result<()> {
+    writeln!(out, "[{timestamp} {level:<5} pid={pid} {target}] {args}")
+}
+
+/// Renders one `env_overrides_summary` field value: `"unset"` for `None`,
+/// the plain value for `Some` — unless the value is empty or contains
+/// whitespace, in which case it's wrapped in double quotes (unescaped, so
+/// Windows backslash paths aren't doubled) to keep the banner line
+/// unambiguous to read and parse.
+fn render_override(value: Option<String>) -> String {
+    match value {
+        None => "unset".to_string(),
+        Some(v) if v.is_empty() || v.chars().any(char::is_whitespace) => format!("\"{v}\""),
+        Some(v) => v,
+    }
+}
+
+/// Builds the `env overrides: ...` startup-banner line (issue #407) so a log
+/// can be told apart as a demo/harness launch versus live play, and so which
+/// overrides were active is on the record. `SHINRA_INSPECT_DUMP` is
+/// folded into the `inspect=` field alongside `SHINRA_INSPECT` since both
+/// gate the same packet-inspection feature. Takes a lookup closure rather
+/// than reading `std::env` directly so it is testable without mutating the
+/// process environment (racy across the crate's other env-reading tests).
+fn env_overrides_summary(mut lookup: impl FnMut(&str) -> Option<String>) -> String {
+    let demo = render_override(lookup("SHINRA_DEMO"));
+    let no_composition = render_override(lookup("SHINRA_NO_COMPOSITION"));
+    let history_db = render_override(lookup("SHINRA_HISTORY_DB"));
+    let instance_lock = render_override(lookup("SHINRA_INSTANCE_LOCK"));
+    let instance_handoff = render_override(lookup("SHINRA_INSTANCE_HANDOFF"));
+    let log_file = render_override(lookup("SHINRA_LOG_FILE"));
+    let inspect_max_bytes = render_override(lookup("SHINRA_INSPECT_MAX_BYTES"));
+
+    let inspect = match (lookup("SHINRA_INSPECT"), lookup("SHINRA_INSPECT_DUMP")) {
+        (None, None) => "unset".to_string(),
+        (Some(inspect), None) => render_override(Some(inspect)),
+        (None, Some(dump)) => format!("dump={}", render_override(Some(dump))),
+        (Some(inspect), Some(dump)) => {
+            format!(
+                "{} dump={}",
+                render_override(Some(inspect)),
+                render_override(Some(dump))
+            )
+        }
+    };
+
+    format!(
+        "env overrides: demo={demo} inspect={inspect} inspect_max_bytes={inspect_max_bytes} \
+         no_composition={no_composition} history_db={history_db} instance_lock={instance_lock} \
+         instance_handoff={instance_handoff} log_file={log_file}"
+    )
 }
 
 /// Where the log file lives. See the module doc comment for the default and
@@ -452,6 +532,84 @@ mod tests {
     use bpsr_test_support::scratch_path;
 
     use super::*;
+
+    // -- env_overrides_summary -----------------------------------------
+
+    /// All SHINRA_* overrides unset — the common case — still yields a
+    /// stable, parseable line reporting each one as `unset` (issue #407),
+    /// rather than an empty or missing banner line.
+    #[test]
+    fn env_overrides_summary_reports_unset_when_nothing_is_set() {
+        let summary = env_overrides_summary(|_| None);
+        assert_eq!(
+            summary,
+            "env overrides: demo=unset inspect=unset inspect_max_bytes=unset \
+             no_composition=unset history_db=unset instance_lock=unset \
+             instance_handoff=unset log_file=unset"
+        );
+    }
+
+    /// Every override set, including `SHINRA_INSPECT_DUMP` folded into the
+    /// `inspect=` field alongside `SHINRA_INSPECT` (issue #407's ask groups
+    /// them since both gate the same packet-inspection feature).
+    #[test]
+    fn env_overrides_summary_reports_set_values_and_folds_inspect_dump() {
+        let summary = env_overrides_summary(|key| match key {
+            "SHINRA_DEMO" => Some("1".to_string()),
+            "SHINRA_INSPECT" => Some("1".to_string()),
+            "SHINRA_INSPECT_DUMP" => Some("/tmp/dump.jsonl".to_string()),
+            "SHINRA_INSPECT_MAX_BYTES" => Some("4096".to_string()),
+            "SHINRA_NO_COMPOSITION" => Some("1".to_string()),
+            "SHINRA_HISTORY_DB" => Some("/tmp/history.sqlite".to_string()),
+            "SHINRA_INSTANCE_LOCK" => Some("/tmp/lock".to_string()),
+            "SHINRA_INSTANCE_HANDOFF" => Some("1".to_string()),
+            "SHINRA_LOG_FILE" => Some("/tmp/log.txt".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            summary,
+            "env overrides: demo=1 inspect=1 dump=/tmp/dump.jsonl inspect_max_bytes=4096 \
+             no_composition=1 history_db=/tmp/history.sqlite instance_lock=/tmp/lock \
+             instance_handoff=1 log_file=/tmp/log.txt"
+        );
+    }
+
+    /// Empty or whitespace-containing override values are quoted (without
+    /// escaping, so Windows backslash paths render literally) so the banner
+    /// line stays unambiguous to read and parse (issue #407 finding O4).
+    #[test]
+    fn env_overrides_summary_quotes_empty_and_whitespace_values() {
+        let summary = env_overrides_summary(|key| match key {
+            "SHINRA_DEMO" => Some(String::new()),
+            "SHINRA_LOG_FILE" => Some("C:\\Users\\Justin Nguyen\\log.txt".to_string()),
+            _ => None,
+        });
+        assert!(summary.contains("demo=\"\""));
+        assert!(summary.contains("log_file=\"C:\\Users\\Justin Nguyen\\log.txt\""));
+    }
+
+    // -- format_line ----------------------------------------------------
+
+    /// Prefixes each line with `pid=<pid>` right after the level, keeping the
+    /// rest of env_logger's default field order (issue #408) — so overlapping
+    /// instances writing to the same log file can be told apart.
+    #[test]
+    fn format_line_prefixes_pid_and_keeps_default_field_order() {
+        let mut buf = Vec::new();
+        format_line(
+            &mut buf,
+            log::Level::Info,
+            "bpsr_capture::win",
+            &format_args!("capture: adopted target"),
+            3840,
+            "2026-09-07T02:30:35Z",
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "[2026-09-07T02:30:35Z INFO  pid=3840 bpsr_capture::win] capture: adopted target\n"
+        );
+    }
 
     // -- session_id ---------------------------------------------------------
 
