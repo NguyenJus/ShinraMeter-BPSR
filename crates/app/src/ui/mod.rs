@@ -91,7 +91,7 @@ use table::*;
 // These names are also pulled in by the globs above; the explicit
 // `pub(crate) use` shadows the glob binding, so removing a name here changes
 // what external callers see, not what `ui` sees.
-pub(crate) use header::{encounter_subtitle, encounter_title};
+pub(crate) use header::{encounter_subtitle, encounter_title, history_boss_name, history_title};
 pub(crate) use status::DEATH_COUNT_RGB;
 pub(crate) use table::{CRIT_PCT_RGB, LUCKY_PCT_RGB, STAT_TEXT_RGB, StatColumn};
 

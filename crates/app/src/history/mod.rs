@@ -376,7 +376,12 @@ pub fn record_from_snapshot(
         total_damage: snapshot.total_damage,
         total_dps: snapshot.total_dps,
         boss_monster_id: snapshot.encounter.boss_monster_id,
-        boss_name: snapshot.encounter.boss_name.map(str::to_string),
+        // Issue #424: `EncounterInfo::boss_name` is `None` for a non-boss
+        // pull even when the target's id resolves in the community
+        // monster-name table, so `crate::ui::history_boss_name` fills that
+        // in the same way `history_title` (used for `title` above by the
+        // caller) does, rather than persisting a `NULL` for a known target.
+        boss_name: crate::ui::history_boss_name(&snapshot.encounter),
         is_boss: snapshot.encounter.is_boss,
         scene_id: snapshot.encounter.scene_id,
         scene_name: snapshot.encounter.scene_name.map(str::to_string),
@@ -567,6 +572,22 @@ mod tests {
     fn record_from_snapshot_rejects_a_zero_damage_fight() {
         let snapshot = sample_snapshot(vec![sample_row(1, "Alice")], 0);
         assert!(record_from_snapshot(&snapshot, 1_000, "Title".to_string(), None).is_none());
+    }
+
+    #[test]
+    fn record_from_snapshot_resolves_boss_name_for_a_known_non_boss_id() {
+        // Issue #424: `EncounterInfo::boss_name` is only ever populated for
+        // a recognized boss, so a non-boss pull whose target is nonetheless
+        // known (monster id 33803 -> "Great Warhog") must not persist a
+        // `NULL` `boss_name` just because `is_boss` is false.
+        let mut snapshot = sample_snapshot(vec![sample_row(1, "Alice")], 1_000);
+        snapshot.encounter.is_boss = false;
+        snapshot.encounter.boss_name = None;
+        snapshot.encounter.boss_monster_id = Some(33_803);
+
+        let record = record_from_snapshot(&snapshot, 1_000, "Title".to_string(), None).unwrap();
+
+        assert_eq!(record.boss_name, Some("Great Warhog".to_string()));
     }
 
     #[test]
