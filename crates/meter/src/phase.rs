@@ -42,9 +42,12 @@
 /// # Where these ids came from
 ///
 /// Every id below is a `tables::is_boss_monster` id (asserted by a test in
-/// this module) whose `tables::monster_name` shows an explicit phase marker,
-/// found by scanning `tables.rs` for boss names containing `" - "` and
-/// `"Phase"`:
+/// this module), from two sources:
+///
+/// 1. `tables::monster_name` shows an explicit phase marker, found by
+///    scanning `tables.rs` for boss names containing `" - "` and `"Phase"`;
+/// 2. a boss whose same-uid re-template cycle was observed directly in
+///    field logs (issue #421), independent of anything its name says.
 ///
 /// * **Dragonbane Golem** — `- Right Cannon` (103110/103301) and
 ///   `- Left Cannon` (103111/103302). One golem with two separately
@@ -53,6 +56,8 @@
 /// * **Goblin King** — `- AegisTransformation` (203) and
 ///   `- Staff Transformation` (204): the two forms one Goblin King
 ///   transforms between.
+/// * **Abyssal Nappo** — 4601 -> 4607 -> 4612-4615 -> 4621, one uid
+///   re-templating through the cycle.
 ///
 /// **Paradox-Calamity Remnant** (`- Origin` 103100/103107/103108,
 /// `- Continuation` 103200/103207/103208, `- Final` 103300/103308/103309,
@@ -84,7 +89,10 @@
 ///
 /// One edit, here: append a `&[..]` slice listing the fight's monster ids
 /// (find them with `tables::monster_name`; ids for the same fight are almost
-/// always adjacent in the template-id space). Requirements, both enforced by
+/// always adjacent in the template-id space). An id with no `MonsterType ==
+/// 2` upstream must also be added to `BOSS_ID_MANUAL_OVERRIDES` in
+/// `scripts/gen-name-tables.py` (then `tables.rs` regenerated), since a
+/// group may only list `is_boss_monster` ids. Requirements, both enforced by
 /// the tests below so a typo fails the build rather than silently never
 /// matching:
 ///

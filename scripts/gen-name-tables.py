@@ -175,7 +175,7 @@ BOSS_ID_MANUAL_OVERRIDES: dict[int, str] = {
     # Abyssal Nappo's intermediate re-template forms (issues #317/#391/#421).
     # Sea-Ringed Reef's final boss cycles ONE live uid through
     # 4601 -> 4607 -> 4612-4615 -> 4621; only the first and last of those
-    # carry `MonsterType == 2`, the six ids below are the same boss mid-pull
+    # carry `MonsterType == 2`, the five ids below are the same boss mid-pull
     # under a different template and read as ordinary mobs without this. That
     # cost the meter both the header caption and — because
     # `phase::BOSS_PHASE_GROUPS` may only list boss ids — the phase-resume

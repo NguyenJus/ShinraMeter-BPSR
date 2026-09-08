@@ -2882,6 +2882,9 @@ impl Meter {
     ///   the `EnemyHp` that names it. Undecidable is not "new fight": clearing
     ///   here would also drop `fight_end_boss_id`, so the resume could never
     ///   be retried once the id arrived.
+    /// * the target is the same id that ended the fight — a corpse
+    ///   straggler; withheld, never resumed, per `same_phase_group`'s
+    ///   `a != b`.
     ///
     /// Withholding only defers — it never extends the hold. The window's own
     /// expiry ends it, after which every player hit clears the fight exactly
@@ -2904,10 +2907,11 @@ impl Meter {
         if self.enemies.is_empty() {
             return false;
         }
-        self.armed_phase_hold(d).is_some()
-            && !self
+        self.armed_phase_hold(d).is_some_and(|ended_by| {
+            !self
                 .target_monster_id(d)
-                .is_some_and(tables::is_boss_monster)
+                .is_some_and(|id| tables::is_boss_monster(id) && id != ended_by)
+        })
     }
 
     /// The monster id whose death ended the held fight, if that hold is
@@ -13635,8 +13639,9 @@ mod tests {
         /// Abyssal Nappo's first form (issue #391): a `MonsterTableBossIds`
         /// entry, so `end_fight_on_boss_death` recognizes it...
         const NAPPO: u32 = 4_601;
-        /// ...and the form the same uid re-templates into mid-pull, which is
-        /// *not* in that table.
+        /// ...and the form the same uid re-templates into mid-pull, which
+        /// has no `MonsterType == 2` upstream and is a boss only via
+        /// `BOSS_ID_MANUAL_OVERRIDES` (issue #421).
         const NAPPO_NEXT: u32 = 4_607;
 
         /// issue #391: a uid re-templating onto a new `monster_id` wipes the
@@ -13690,10 +13695,10 @@ mod tests {
             assert_eq!(m.fight_start_ms(), Some(1_000));
         }
 
-        /// Issue #421: the *whole* Abyssal Nappo re-template cycle, in the
-        /// order a real Sea-Ringed Reef pull shows it. 4601 and 4621 are
-        /// `MonsterTableBossIds` entries; 4607 and 4612-4615 are not, and a
-        /// given pull skips some of the middle ids.
+        /// The *whole* Abyssal Nappo re-template cycle, in the order a real
+        /// Sea-Ringed Reef pull shows it. 4601 and 4621 carry
+        /// `MonsterType == 2` upstream; 4607 and 4612-4615 are in the boss
+        /// table only through `BOSS_ID_MANUAL_OVERRIDES` (issue #421).
         const NAPPO_CYCLE: &[u32] = &[4_601, 4_607, 4_612, 4_613, 4_614, 4_615, 4_621];
 
         /// issue #421: each hop of the cycle presents as the old form
@@ -13753,6 +13758,46 @@ mod tests {
         }
 
         /// issue #421: a real pull does not visit every form — it skips.
+        /// Issue #421 review: 4607 becoming a recognized boss means a hit
+        /// on the *dead* 4607 corpse, arriving after it hit 0 but before
+        /// the next form's `EnemyHp` has named the uid, is neither a phase
+        /// resume (`same_phase_group` requires `a != b`, and this is still
+        /// 4607) nor withheld by the old `!is_boss_monster` guard (4607 is
+        /// now one) — so it used to read as a brand-new fight, wiping the
+        /// pull mid-transition on a straggling hit against the corpse.
+        #[test]
+        fn a_corpse_straggler_on_the_just_dead_middle_form_does_not_wipe_the_pull() {
+            let mut m = Meter::new();
+            m.apply(&ProtocolEvent::Scene {
+                level_map_id: 5_900,
+            });
+            m.apply(&boss_hit(BOSS_UID, 1_000, false));
+            m.apply(&hp_at(BOSS_UID, 4_601, 100, 1_000));
+
+            m.apply(&hp_at(BOSS_UID, 4_607, 100, 2_000));
+            assert_eq!(m.apply(&boss_hit(BOSS_UID, 2_500, false)), None);
+            m.apply(&hp_at(BOSS_UID, 4_607, 0, 3_000));
+            assert_eq!(m.fight_end_ms(), Some(3_000));
+
+            // Past `post_end_grace_ms`, still inside `phase_resume_window_ms`,
+            // and no `EnemyHp` for the next form has landed yet: the hit
+            // still lands on a uid last named 4607 -- the same id that
+            // ended the fight. A corpse straggler, not a new pull.
+            let straggler_ts = 3_000 + FightConfig::default().post_end_grace_ms + 1;
+            assert_eq!(m.apply(&boss_hit(BOSS_UID, straggler_ts, false)), None);
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+
+            // The next form finally names itself, and the party's first hit
+            // on it resumes the held fight rather than reading as new.
+            m.apply(&hp_at(BOSS_UID, 4_612, 100, straggler_ts + 100));
+            assert_eq!(
+                m.apply(&boss_hit(BOSS_UID, straggler_ts + 200, false)),
+                None
+            );
+            assert_eq!(m.fight_end_ms(), None);
+            assert_eq!(m.fight_start_ms(), Some(1_000));
+        }
+
         /// A hop straight from the first form to a middle one and on to the
         /// last must hold exactly like the consecutive hops above, which is
         /// what makes this a *group* rather than a chain of adjacent pairs.
