@@ -203,14 +203,15 @@ const SKILLS_DDL: &str = "CREATE TABLE IF NOT EXISTS encounter_player_skills (
     );";
 
 /// Upgrades a file stamped with the known older version `from` to
-/// `SCHEMA_VERSION`, in place. Every step here is *additive* by construction:
-/// no existing row is rewritten or dropped, so an interrupted upgrade leaves
-/// a file the previous version could still read, and a user's history is
-/// never wiped to gain a column.
+/// `SCHEMA_VERSION`, in place. Every step here is either additive DDL
+/// (`CREATE TABLE`/`ALTER TABLE ... ADD COLUMN`) or a bounded data cleanup:
+/// v3 → v4 drops rows `load` could never return anyway, and v4 → v5
+/// backfills empty titles. No step ever removes a column, so an interrupted
+/// upgrade still leaves a file the previous version can read.
 fn migrate(conn: &Connection, from: i32) -> Result<(), HistoryError> {
-    // Every step below is plain DDL (`CREATE TABLE`/`ALTER TABLE`), which
-    // SQLite runs transactionally like any other statement — safe to issue
-    // inside the caller's transaction alongside the `user_version` bump.
+    // The DDL steps below and the row-level DELETE/UPDATE steps further down
+    // all run inside the caller's transaction alongside the `user_version`
+    // bump, so SQLite applies (or rolls back) the whole migration atomically.
     // v1 → v2 (issue #222): per-skill totals. Nothing but a new table, so
     // encounters saved before it keep every field they had and simply have
     // no skill rows to hand back.
@@ -287,6 +288,48 @@ fn migrate(conn: &Connection, from: i32) -> Result<(), HistoryError> {
             log::info!(
                 "history db: v3 -> v4 migration removed {doomed_players} unreconstructable \
                  player row(s) and {doomed_encounters} now-empty encounter(s) (issue #392)"
+            );
+        }
+    }
+    // v4 -> v5 (issue #424): a non-boss pull saved before `history_title`
+    // existed stored an empty `title` (the live header deliberately leaves a
+    // non-boss target unnamed) and a `NULL` `boss_name`, so the history list
+    // shows a blank row nothing can identify. Backfill both from the same
+    // community monster-name table `ui::header::history_title` resolves
+    // against — that table lives in Rust, not SQL, so this walks the
+    // affected rows rather than being a single `UPDATE`. Only rows with an
+    // empty title and a non-NULL `boss_monster_id` are touched, and
+    // `boss_name` stays `NULL` when the table doesn't know the id, since
+    // `Monster #{id}` is a display fallback, not a name.
+    if from < 5 {
+        let stale: Vec<(i64, u32)> = conn
+            .prepare(
+                "SELECT id, boss_monster_id FROM encounters
+                 WHERE title = '' AND boss_monster_id IS NOT NULL",
+            )?
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|(id, monster_id)| Some((id, u32::try_from(monster_id).ok()?)))
+            .collect();
+        let mut named = 0usize;
+        for (id, monster_id) in &stale {
+            let name = bpsr_meter::tables::monster_name(*monster_id);
+            let title = name.map_or_else(|| format!("Monster #{monster_id}"), str::to_string);
+            if name.is_some() {
+                named += 1;
+            }
+            conn.execute(
+                "UPDATE encounters SET title = ?1, boss_name = COALESCE(boss_name, ?2)
+                 WHERE id = ?3",
+                params![title, name, id],
+            )?;
+        }
+        if !stale.is_empty() {
+            log::info!(
+                "history db: v4 -> v5 migration titled {} untitled encounter(s), {named} of \
+                 them from the monster-name table (issue #424)",
+                stale.len()
             );
         }
     }
@@ -1563,5 +1606,83 @@ mod tests {
         let _ = fs::remove_file(&bak_path);
 
         assert!(list.is_empty() && bak_exists);
+    }
+
+    /// Issue #424: rows saved before `history_title` existed stored an empty
+    /// `title` and a `NULL` `boss_name` for a non-boss pull, leaving the
+    /// history list with a blank row. The v4 -> v5 migration backfills both
+    /// from the same monster-name table `history_title` uses.
+    #[test]
+    fn a_v4_database_backfills_empty_non_boss_titles() {
+        let path = crate::history::temp_history_path("v4-title-backfill");
+        let _ = fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V1_SCHEMA).unwrap();
+            conn.execute_batch(SKILLS_DDL).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE encounters ADD COLUMN local_uid INTEGER;
+                 ALTER TABLE encounter_players ADD COLUMN entity INTEGER;",
+            )
+            .unwrap();
+            for (id, boss_id, title) in [
+                (1i64, Some(33_803i64), ""),
+                (2, Some(999_999), ""),
+                (3, Some(33_803), "Already Named"),
+            ] {
+                conn.execute(
+                    "INSERT INTO encounters (
+                        id, ended_at_ms, duration_ms, total_damage, total_dps,
+                        boss_monster_id, boss_name, is_boss, scene_id, scene_name,
+                        title, subtitle, player_count, meter_version
+                     ) VALUES (?1, 1000, 10000, 10000, 1000.0, ?2, NULL, 0, 3, 'Scene',
+                               ?3, 'Scene', 1, '0.2.2')",
+                    params![id, boss_id, title],
+                )
+                .unwrap();
+            }
+            conn.pragma_update(None, "user_version", 4).unwrap();
+        }
+
+        let store = SqliteHistory::open(&path, RetentionPolicy::default()).unwrap();
+        let mut rows = Vec::new();
+        {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT title, boss_name FROM encounters ORDER BY id")
+                .unwrap();
+            let mapped = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .unwrap();
+            for r in mapped {
+                rows.push(r.unwrap());
+            }
+        }
+        let version: i32 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        drop(store);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(
+            rows[0],
+            ("Great Warhog".to_string(), Some("Great Warhog".to_string())),
+            "a known non-boss id names both columns"
+        );
+        assert_eq!(
+            rows[1],
+            ("Monster #999999".to_string(), None),
+            "an unknown id still gets a usable title but no invented boss_name"
+        );
+        assert_eq!(
+            rows[2],
+            ("Already Named".to_string(), None),
+            "a row that already had a title is untouched"
+        );
     }
 }

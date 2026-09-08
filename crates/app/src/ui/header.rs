@@ -1355,8 +1355,10 @@ pub(super) fn handle_share_screenshot(
 /// in this precedence has to know about zoning: the header keeps naming the
 /// boss whose frozen numbers are on the rows below it.
 ///
-/// Also called by `pipeline::record_fight_end` so a saved encounter stores
-/// the *same* label the live header showed (issue #39, spec DECISION D2).
+/// `pipeline::record_fight_end` saves through `history_title`, which reuses
+/// this precedence wholesale and only fills in the non-boss blank this
+/// function leaves on purpose (issue #424), so a saved label matches the
+/// live header whenever the header showed one (issue #39, DECISION D2).
 pub(crate) fn encounter_title(e: &EncounterInfo) -> String {
     if e.is_boss {
         // `is_boss` is only ever true alongside a `Some` `boss_monster_id`
@@ -1379,6 +1381,44 @@ pub(crate) fn encounter_title(e: &EncounterInfo) -> String {
         None => "No target".to_string(),
         Some(_) => String::new(),
     }
+}
+
+/// Title used when *persisting* a finished fight to history (issue #424),
+/// as opposed to painting the live header. Shares `encounter_title`'s
+/// precedence wholesale — the two must never independently drift on how a
+/// *nameable* target is named — and only steps in for the one case that
+/// function leaves blank on purpose: a non-boss pull (`is_boss: false`)
+/// whose `boss_monster_id` is known. Live, that blank is the deliberate
+/// "not a boss, not naming it" omission `encounter_title`'s doc comment
+/// explains; persisted, an empty `title` makes the history list row
+/// unusable (issue #424), so this resolves the id via the community
+/// monster-name table (`bpsr_meter::tables::monster_name`) instead, falling
+/// back to the raw id (`Monster #{id}`) when even that table doesn't know
+/// it — never leaving the stored title empty.
+pub(crate) fn history_title(e: &EncounterInfo) -> String {
+    let live = encounter_title(e);
+    if !live.is_empty() {
+        return live;
+    }
+    match e.boss_monster_id {
+        Some(id) => history_boss_name(e).unwrap_or_else(|| format!("Monster #{id}")),
+        None => live,
+    }
+}
+
+/// `boss_name` used when persisting a finished fight to history (issue
+/// #424). `EncounterInfo::boss_name` is only ever populated for a
+/// recognized boss (`is_boss`; see its own doc comment), so a non-boss pull
+/// always saves `NULL` there today even when the target's name is known —
+/// this resolves it from the same community monster-name table
+/// `history_title` falls back to, so a saved row's `boss_name` is usable
+/// for a non-boss pull too.
+pub(crate) fn history_boss_name(e: &EncounterInfo) -> Option<String> {
+    e.boss_name.map(str::to_string).or_else(|| {
+        e.boss_monster_id
+            .and_then(bpsr_meter::tables::monster_name)
+            .map(str::to_string)
+    })
 }
 
 /// Header subtitle text (issue #9 slice 2): the scene name when known, else
@@ -4154,6 +4194,58 @@ mod tests {
     #[test]
     fn title_shows_placeholder_when_nothing_known() {
         assert_eq!(encounter_title(&EncounterInfo::default()), "No target");
+    }
+
+    // -- persisted (history) title/boss_name (issue #424) ------------------
+
+    #[test]
+    fn history_title_resolves_a_known_non_boss_id() {
+        // Same shape as `title_blank_for_named_but_non_boss_id` above, but
+        // through `history_title`: the live header deliberately leaves this
+        // blank, yet a saved encounter must still get a usable name — here,
+        // the community table's name for monster id 33803.
+        let e = EncounterInfo {
+            boss_monster_id: Some(33_803),
+            boss_name: None,
+            is_boss: false,
+            ..Default::default()
+        };
+        assert_eq!(encounter_title(&e), "", "live header stays blank here");
+        assert_eq!(history_title(&e), "Great Warhog");
+    }
+
+    #[test]
+    fn history_title_falls_back_to_a_raw_id_for_an_unresolved_non_boss_id() {
+        let e = EncounterInfo {
+            boss_monster_id: Some(999_999),
+            boss_name: None,
+            is_boss: false,
+            ..Default::default()
+        };
+        assert_eq!(history_title(&e), "Monster #999999");
+    }
+
+    #[test]
+    fn history_title_matches_the_live_header_when_it_is_non_empty() {
+        let e = EncounterInfo {
+            boss_monster_id: Some(103),
+            boss_name: Some("Rathalos"),
+            is_boss: true,
+            ..Default::default()
+        };
+        assert_eq!(history_title(&e), encounter_title(&e));
+        assert_eq!(history_title(&e), "Rathalos");
+    }
+
+    #[test]
+    fn history_boss_name_resolves_a_known_non_boss_id() {
+        let e = EncounterInfo {
+            boss_monster_id: Some(33_803),
+            boss_name: None,
+            is_boss: false,
+            ..Default::default()
+        };
+        assert_eq!(history_boss_name(&e), Some("Great Warhog".to_string()));
     }
 
     // -- live boss now wins over the remembered one (issue #131) -----------

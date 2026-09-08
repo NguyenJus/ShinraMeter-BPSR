@@ -58,14 +58,17 @@ pub fn history_db_path() -> PathBuf {
 /// `EntityId::from_display_uid`), recomputes `encounters.player_count` for
 /// every encounter that lost a row, and drops any encounter left with no
 /// players at all, so the history list stops showing a player count that
-/// disagrees with what `load` can actually return.
+/// disagrees with what `load` can actually return. v4 → v5 (issue #424) is
+/// likewise a data cleanup: it backfills `title` (and `boss_name` where the
+/// id resolves) for the non-boss encounters saved with an empty title before
+/// `ui::header::history_title` existed, so no history row is left blank.
 /// A file stamped with an *older* known version is migrated forward in place
 /// by `sqlite::migrate`, so an existing history survives the upgrade with
 /// its older encounters simply carrying no skill rows / no local uid / no
 /// stored entity. Only a version this build has never heard of (a downgrade,
 /// or a hand-edited file) is still renamed aside and replaced, since there
 /// is nothing to migrate *from*.
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 /// Retention rules, applied inside every `HistoryStore::insert` (spec §5.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,6 +293,10 @@ pub struct EncounterRecord {
     pub total_damage: i64,
     pub total_dps: f64,
     pub boss_monster_id: Option<u32>,
+    /// Since issue #424 this is populated for any target the monster-name
+    /// table resolves, boss or not, so it is `Some` for plenty of non-boss
+    /// fights. `is_boss` is the only field that actually says whether the
+    /// target was a boss.
     pub boss_name: Option<String>,
     pub is_boss: bool,
     pub scene_id: Option<u32>,
@@ -353,11 +360,14 @@ pub trait HistoryStore: Send {
 }
 
 /// Builds the record for a just-ended fight (spec §5.7). `title`/`subtitle`
-/// are supplied by the caller from `ui::encounter_title`/`encounter_subtitle`
+/// are supplied by the caller from `ui::history_title`/`ui::encounter_subtitle`
 /// (DECISION D2) — this module deliberately does not re-derive the naming
 /// rules, so a historical fight's label can never drift when the naming rule
-/// changes later. Returns `None` when the fight is not worth recording (D12:
-/// no rows, or no damage). The duration floor is *not* checked here — that is
+/// changes later. The single exception is `boss_name`, which is resolved
+/// here via `ui::history_boss_name` (issue #424) because
+/// `EncounterInfo::boss_name` is only ever set for a recognized boss.
+/// Returns `None` when the fight is not worth recording (D12: no rows, or no
+/// damage). The duration floor is *not* checked here — that is
 /// `HistoryStore::insert`'s job, since it is a `RetentionPolicy` concern, not
 /// a "did this fight happen" one.
 pub fn record_from_snapshot(
@@ -376,7 +386,12 @@ pub fn record_from_snapshot(
         total_damage: snapshot.total_damage,
         total_dps: snapshot.total_dps,
         boss_monster_id: snapshot.encounter.boss_monster_id,
-        boss_name: snapshot.encounter.boss_name.map(str::to_string),
+        // Issue #424: `EncounterInfo::boss_name` is `None` for a non-boss
+        // pull even when the target's id resolves in the community
+        // monster-name table, so `crate::ui::history_boss_name` fills that
+        // in the same way `history_title` (used for `title` above by the
+        // caller) does, rather than persisting a `NULL` for a known target.
+        boss_name: crate::ui::history_boss_name(&snapshot.encounter),
         is_boss: snapshot.encounter.is_boss,
         scene_id: snapshot.encounter.scene_id,
         scene_name: snapshot.encounter.scene_name.map(str::to_string),
@@ -567,6 +582,22 @@ mod tests {
     fn record_from_snapshot_rejects_a_zero_damage_fight() {
         let snapshot = sample_snapshot(vec![sample_row(1, "Alice")], 0);
         assert!(record_from_snapshot(&snapshot, 1_000, "Title".to_string(), None).is_none());
+    }
+
+    #[test]
+    fn record_from_snapshot_resolves_boss_name_for_a_known_non_boss_id() {
+        // Issue #424: `EncounterInfo::boss_name` is only ever populated for
+        // a recognized boss, so a non-boss pull whose target is nonetheless
+        // known (monster id 33803 -> "Great Warhog") must not persist a
+        // `NULL` `boss_name` just because `is_boss` is false.
+        let mut snapshot = sample_snapshot(vec![sample_row(1, "Alice")], 1_000);
+        snapshot.encounter.is_boss = false;
+        snapshot.encounter.boss_name = None;
+        snapshot.encounter.boss_monster_id = Some(33_803);
+
+        let record = record_from_snapshot(&snapshot, 1_000, "Title".to_string(), None).unwrap();
+
+        assert_eq!(record.boss_name, Some("Great Warhog".to_string()));
     }
 
     #[test]

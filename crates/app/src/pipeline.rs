@@ -21,7 +21,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select, tick};
 
 use crate::history::{self, writer::HistoryHandle};
 use crate::imagines;
-use crate::ui::{UiCommand, encounter_subtitle, encounter_title};
+use crate::ui::{UiCommand, encounter_subtitle, history_title};
 
 /// Snapshot publication rate (~10 Hz) — a ceiling on how often `publish`
 /// re-evaluates the meter, not the overlay's repaint cadence: issue #349
@@ -590,7 +590,7 @@ impl Pipeline {
         ended_at_ms: u64,
     ) -> Option<history::EncounterRecord> {
         let snapshot = self.meter.snapshot(now_ms);
-        let title = encounter_title(&snapshot.encounter);
+        let title = history_title(&snapshot.encounter);
         let subtitle = encounter_subtitle(&snapshot.encounter);
         history::record_from_snapshot(&snapshot, ended_at_ms, title, subtitle)
     }
