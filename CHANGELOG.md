@@ -28,6 +28,14 @@ affiliated with the game's publisher.
 
 ### Fixed
 
+- Resizing the window from its left, right, or top-corner edges near the
+  header works again: the title-bar drag band is registered after the resize
+  handles and wins every pixel they share, so it now insets `RESIZE_EDGE` on
+  both sides and starts a full `RESIZE_CORNER` below the top, clearing all
+  four zones the header touches. A measured header band outside the
+  plausible range is also discarded in favour of the constant budget, so a
+  bad measurement can no longer cover the window and swallow every resize
+  grab (#400); the skill window's drag band gets the same corner inset.
 - Encounters saved by a pre-v3 build whose stored player uid is out of
   range are no longer all loaded as the same unknown player, silently
   merging distinct saved players; those rows are skipped instead.

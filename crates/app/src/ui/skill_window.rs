@@ -609,13 +609,13 @@ pub(super) fn skill_header_rect(rect: egui::Rect) -> egui::Rect {
 /// (`scroll_area.rs`' `is_hovering_outer_rect`, which is
 /// `… && ui.ctx().dragged_id().is_none()`).
 ///
-/// Same shape and same reasoning as the main window's header band — see the
-/// "a drag surface spanning it would win the hit test and swallow every
-/// north-edge resize" note there. No bottom inset is needed: the south
-/// strip is a window height away.
+/// Same shape and same reasoning as the main window's `header_drag_band` in
+/// header.rs: the top drops by the whole `RESIZE_CORNER` so the band clears
+/// the two top corner squares, the sides by `RESIZE_EDGE`. No bottom inset
+/// is needed: the south strip is a window height away.
 pub(super) fn skill_drag_band(header_rect: egui::Rect) -> egui::Rect {
     let mut band = header_rect;
-    band.min.y += RESIZE_EDGE;
+    band.min.y += RESIZE_CORNER;
     band.min.x += RESIZE_EDGE;
     band.max.x -= RESIZE_EDGE;
     band
@@ -1783,24 +1783,28 @@ mod tests {
         let rect = skill_window_rect();
         let header = skill_header_rect(rect);
         let band = skill_drag_band(header);
-        assert_eq!(band.top(), header.top() + RESIZE_EDGE);
+        assert_eq!(band.top(), header.top() + RESIZE_CORNER);
         assert_eq!(band.left(), header.left() + RESIZE_EDGE);
         assert_eq!(band.right(), header.right() - RESIZE_EDGE);
         assert_eq!(band.bottom(), header.bottom());
     }
 
     /// The same inset, stated as the property that actually matters: every
-    /// edge resize strip keeps a live pixel the drag band does not cover.
+    /// resize zone — the four edge strips and the two top corner squares —
+    /// keeps a live pixel the drag band does not cover. Mirrors header.rs's
+    /// `header_drag_band_never_overlaps_a_resize_zone`.
     #[test]
     fn drag_band_leaves_every_edge_resize_zone_reachable() {
         let rect = skill_window_rect();
         let band = skill_drag_band(skill_header_rect(rect));
-        let zones = resize_zones(rect);
-        let (north, south, west, east) = (zones[0].0, zones[1].0, zones[2].0, zones[3].0);
-        assert!(band.top() >= north.bottom(), "north strip is covered");
-        assert!(band.left() >= west.right(), "west strip is covered");
-        assert!(band.right() <= east.left(), "east strip is covered");
-        assert!(band.bottom() <= south.top(), "south strip is covered");
+        assert!(band.width() > 0.0 && band.height() > 0.0);
+        for (zone, dir, _) in resize_zones(rect) {
+            let overlap = band.intersect(zone);
+            assert!(
+                !overlap.is_positive(),
+                "drag band {band:?} overlaps the {dir:?} resize zone {zone:?}"
+            );
+        }
     }
 
     /// Issue #218's scroll bug: a drag sense over the row list wedges
