@@ -229,8 +229,77 @@ fn migrate(conn: &Connection, from: i32) -> Result<(), HistoryError> {
              ALTER TABLE encounter_players ADD COLUMN entity INTEGER;",
         )?;
     }
+    // v3 → v4 (issue #392): a pre-v3 `encounter_players` row (no `entity`)
+    // whose stored `uid` falls outside the range `EntityId::from_display_uid`
+    // can reconstruct has no loadable identity — `load` already skips such
+    // rows (belt-and-braces below) but `encounters.player_count` was never
+    // updated to match, so the history list showed a count `load` could not
+    // actually return. This is a one-time data cleanup, not new DDL: remove
+    // those rows (and their skill rows), recompute `player_count` for every
+    // encounter that lost a row, and drop any encounter left with zero
+    // players so it also disappears from the list. `total_damage` and each
+    // surviving row's `share_pct` are left untouched — they record the real
+    // fight, not the reconstructable roster.
+    if from < 4 {
+        let doomed_players = conn.prepare(
+            "SELECT COUNT(*) FROM encounter_players WHERE entity IS NULL AND (uid < ?1 OR uid > ?2)",
+        )?.query_row(params![MIN_DISPLAY_UID, MAX_DISPLAY_UID], |row| row.get::<_, i64>(0))?;
+
+        conn.execute(
+            "DELETE FROM encounter_player_skills WHERE (encounter_id, slot) IN (
+                SELECT encounter_id, slot FROM encounter_players
+                WHERE entity IS NULL AND (uid < ?1 OR uid > ?2)
+            )",
+            params![MIN_DISPLAY_UID, MAX_DISPLAY_UID],
+        )?;
+        conn.execute(
+            "DELETE FROM encounter_players WHERE entity IS NULL AND (uid < ?1 OR uid > ?2)",
+            params![MIN_DISPLAY_UID, MAX_DISPLAY_UID],
+        )?;
+        conn.execute(
+            "UPDATE encounters SET player_count = (
+                SELECT COUNT(*) FROM encounter_players p WHERE p.encounter_id = encounters.id
+            )",
+            [],
+        )?;
+        let doomed_encounters = conn
+            .prepare(
+                "SELECT COUNT(*) FROM encounters WHERE id NOT IN (
+                SELECT DISTINCT encounter_id FROM encounter_players
+            )",
+            )?
+            .query_row([], |row| row.get::<_, i64>(0))?;
+        conn.execute(
+            "DELETE FROM encounter_player_skills WHERE encounter_id IN (
+                SELECT id FROM encounters WHERE id NOT IN (
+                    SELECT DISTINCT encounter_id FROM encounter_players
+                )
+            )",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM encounters WHERE id NOT IN (
+                SELECT DISTINCT encounter_id FROM encounter_players
+            )",
+            [],
+        )?;
+        if doomed_players > 0 || doomed_encounters > 0 {
+            log::info!(
+                "history db: v3 -> v4 migration removed {doomed_players} unreconstructable \
+                 player row(s) and {doomed_encounters} now-empty encounter(s) (issue #392)"
+            );
+        }
+    }
     Ok(())
 }
+
+/// The inclusive bounds `EntityId::from_display_uid` (`crates/meter/src/event.rs`)
+/// accepts: a `uid` must fit in the 48-bit signed display-uid field it packs
+/// into the reconstructed `EntityId`'s uuid, i.e. `-(2^47) ..= 2^47 - 1`.
+/// Shared by the v3 → v4 migration above and the read-time fallback in
+/// `load` so the two can never disagree about which rows are unreconstructable.
+const MIN_DISPLAY_UID: i64 = -(1i64 << 47);
+const MAX_DISPLAY_UID: i64 = (1i64 << 47) - 1;
 
 /// The reverse of `Class::name()` (`crates/meter/src/event.rs`), used to read
 /// the `class` column back. Every one of the ten `Class` variants is spelled
@@ -439,24 +508,40 @@ impl HistoryStore for SqliteHistory {
         let mut stmt = self.conn.prepare(
             "SELECT uid, entity, name, class, ability_score, season_strength, imagine_0,
                     imagine_1, imagine_tier_0, imagine_tier_1, damage, dps, share_pct, crit_pct,
-                    lucky_pct, hits, deaths
+                    lucky_pct, hits, deaths, slot
              FROM encounter_players WHERE encounter_id = ?1 ORDER BY slot",
         )?;
-        record.players = stmt
+        let loaded = stmt
             .query_map(params![id], |row| {
                 let uid: i64 = row.get(0)?;
+                let slot: i64 = row.get(17)?;
                 // Issue #379: a pre-v3 row has no stored `entity` and reads
                 // back `NULL` here; reconstruct the same `EntityId` a live
                 // encounter would have derived for a bare display uid, so
                 // `PlayerRecord::to_row` always has a real value to hand
                 // back rather than needing its own `Option`.
-                let entity = row.get::<_, Option<i64>>(1)?.unwrap_or_else(|| {
-                    // An out-of-range pre-v3 uid deliberately loads as
-                    // UNKNOWN rather than dropping the row.
-                    EntityId::from_display_uid(uid, EntityKind::Player)
-                        .map_or(EntityId::UNKNOWN.0, |e| e.0) as i64
-                });
-                Ok(PlayerRecord {
+                let entity = match row.get::<_, Option<i64>>(1)? {
+                    Some(entity) => entity,
+                    // Issue #392: a stored uid outside the 48-bit display-uid
+                    // field has no reconstructable identity, and filing it
+                    // under `EntityId::UNKNOWN` would merge every such row in
+                    // the database into one player. The v3 → v4 migration
+                    // (`migrate`, above) normally removes such rows — and
+                    // recomputes `encounters.player_count` to match — the
+                    // first time an older file is opened, so this is
+                    // belt-and-braces for a row that somehow still slips
+                    // through: drop it instead.
+                    None => match EntityId::from_display_uid(uid, EntityKind::Player) {
+                        Some(entity) => entity.0 as i64,
+                        None => {
+                            log::warn!(
+                                "history: skipping pre-v3 row with out-of-range uid={uid} (issue #392)"
+                            );
+                            return Ok(None);
+                        }
+                    },
+                };
+                Ok(Some((slot, PlayerRecord {
                     uid,
                     entity,
                     name: row.get(2)?,
@@ -480,15 +565,31 @@ impl HistoryStore for SqliteHistory {
                     hits: u64::try_from(row.get::<_, i64>(15)?).unwrap_or(0),
                     deaths: u32::try_from(row.get::<_, i64>(16)?).unwrap_or(0),
                     skills: Vec::new(),
-                })
+                })))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        // A skipped row leaves a hole in the `slot` sequence, so the skill
+        // fan-out below can no longer use a player's index as its slot.
+        let mut slot_to_index: std::collections::HashMap<i64, usize> =
+            std::collections::HashMap::new();
+        for (slot, player) in loaded.into_iter().flatten() {
+            slot_to_index.insert(slot, record.players.len());
+            record.players.push(player);
+        }
 
-        // Issue #222: one query for the whole encounter's breakdown, fanned
-        // out by `slot` into the players just loaded (their index *is* their
-        // slot, since they came back ordered by it). An encounter written
-        // before schema v2 matches no rows here and keeps every player's
-        // breakdown empty — the pre-#222 behaviour, without a crash.
+        // Belt-and-braces: the v3 → v4 migration normally drops an encounter
+        // that loses every player row before this point is ever reached, but
+        // an empty roster here (e.g. from a row that slipped past the
+        // migration) must still not be handed back as a loadable encounter.
+        if record.players.is_empty() {
+            log::warn!("history: encounter {id} has no loadable players (issue #392)");
+            return Ok(None);
+        }
+
+        // Issue #222: one query for the whole encounter's breakdown, fanned out by
+        // slot through slot_to_index (a skipped #392 row leaves a hole, so a
+        // player's index is not its slot). An encounter written before schema
+        // v2 matches no rows here and keeps every player's breakdown empty.
         let mut stmt = self.conn.prepare(
             "SELECT slot, skill_id, damage, share_pct, crit_pct, max_crit, avg_crit,
                     avg_white, avg, hits, crit_hits, hits_per_min
@@ -496,7 +597,7 @@ impl HistoryStore for SqliteHistory {
         )?;
         let skills = stmt.query_map(params![id], |row| {
             Ok((
-                usize::try_from(row.get::<_, i64>(0)?).unwrap_or(usize::MAX),
+                row.get::<_, i64>(0)?,
                 SkillRecord {
                     skill_id: row.get(1)?,
                     damage: row.get(2)?,
@@ -514,7 +615,10 @@ impl HistoryStore for SqliteHistory {
         })?;
         for entry in skills {
             let (slot, skill) = entry?;
-            if let Some(player) = record.players.get_mut(slot) {
+            if let Some(player) = slot_to_index
+                .get(&slot)
+                .and_then(|index| record.players.get_mut(*index))
+            {
                 player.skills.push(skill);
             }
         }
@@ -1125,6 +1229,280 @@ mod tests {
         assert!(
             !bak_exists,
             "a migratable file is upgraded in place, never renamed aside"
+        );
+    }
+
+    /// Issue #392: a pre-v3 row whose stored `uid` falls outside the 48-bit
+    /// display-uid field has no reconstructable `EntityId`, and filing it
+    /// under `EntityId::UNKNOWN` would merge every such row into one player.
+    /// Skip those rows instead and keep the loadable ones.
+    #[test]
+    fn a_v2_row_with_an_out_of_range_uid_is_skipped() {
+        let path = crate::history::temp_history_path("v2-out-of-range-uid");
+        let _ = fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V1_SCHEMA).unwrap();
+            conn.execute_batch(SKILLS_DDL).unwrap();
+            conn.execute(
+                "INSERT INTO encounters (
+                    ended_at_ms, duration_ms, total_damage, total_dps, boss_monster_id,
+                    boss_name, is_boss, scene_id, scene_name, title, subtitle,
+                    player_count, meter_version
+                 ) VALUES (1000, 10000, 10000, 1000.0, 7, 'Boss', 1, 3, 'Scene', 'Boss',
+                           'Scene', 2, '0.2.2')",
+                [],
+            )
+            .unwrap();
+            for (slot, uid, name) in [(0i64, (1i64 << 47) + 1, "Garbage"), (1, 5, "Alice")] {
+                conn.execute(
+                    "INSERT INTO encounter_players (
+                        encounter_id, slot, uid, name, class, ability_score, season_strength,
+                        imagine_0, imagine_1, imagine_tier_0, imagine_tier_1,
+                        damage, dps, share_pct, crit_pct, lucky_pct, hits, deaths
+                     ) VALUES (1, ?1, ?2, ?3, 'FrostMage', 999, 42, 1, NULL, 3, NULL,
+                               5000, 500.0, 33.3, 12.5, 6.25, 40, 2)",
+                    params![slot, uid, name],
+                )
+                .unwrap();
+            }
+            for (slot, skill_id) in [(0i64, 111i64), (1, 222)] {
+                conn.execute(
+                    "INSERT INTO encounter_player_skills (
+                        encounter_id, slot, skill_slot, skill_id, damage, share_pct, crit_pct,
+                        max_crit, avg_crit, avg_white, avg, hits, crit_hits, hits_per_min
+                     ) VALUES (1, ?1, 0, ?2, 1000, 100.0, 0.0, 0, 0.0, 0.0, 0.0, 1, 0, 0.0)",
+                    params![slot, skill_id],
+                )
+                .unwrap();
+            }
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+
+        let store = SqliteHistory::open(&path, RetentionPolicy::default()).unwrap();
+        let loaded = store.load(1).unwrap().unwrap();
+        drop(store);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            loaded.players.len(),
+            1,
+            "the out-of-range row is skipped, not loaded as UNKNOWN"
+        );
+        assert_eq!(loaded.players[0].uid, 5);
+        assert_eq!(
+            loaded.players[0].entity,
+            EntityId::from_display_uid(5, EntityKind::Player)
+                .expect("in-range test uid")
+                .0 as i64
+        );
+        assert_eq!(
+            loaded.players[0].skills.len(),
+            1,
+            "the surviving player's skills must come from its own slot, not its index"
+        );
+        assert_eq!(loaded.players[0].skills[0].skill_id, 222);
+    }
+
+    /// Issue #392: the v3 → v4 migration itself (not just the read-time
+    /// skip) must remove an unreconstructable pre-v3 row and its skills, and
+    /// recompute `encounters.player_count` so the history list agrees with
+    /// what `load` actually returns.
+    #[test]
+    fn migrating_a_v2_database_removes_out_of_range_rows_and_recomputes_player_count() {
+        let path = crate::history::temp_history_path("v2-migration-drops-out-of-range-uid");
+        let _ = fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V1_SCHEMA).unwrap();
+            conn.execute_batch(SKILLS_DDL).unwrap();
+            conn.execute(
+                "INSERT INTO encounters (
+                    ended_at_ms, duration_ms, total_damage, total_dps, boss_monster_id,
+                    boss_name, is_boss, scene_id, scene_name, title, subtitle,
+                    player_count, meter_version
+                 ) VALUES (1000, 10000, 10000, 1000.0, 7, 'Boss', 1, 3, 'Scene', 'Boss',
+                           'Scene', 2, '0.2.2')",
+                [],
+            )
+            .unwrap();
+            for (slot, uid, name) in [(0i64, (1i64 << 47) + 1, "Garbage"), (1, 5, "Alice")] {
+                conn.execute(
+                    "INSERT INTO encounter_players (
+                        encounter_id, slot, uid, name, class, ability_score, season_strength,
+                        imagine_0, imagine_1, imagine_tier_0, imagine_tier_1,
+                        damage, dps, share_pct, crit_pct, lucky_pct, hits, deaths
+                     ) VALUES (1, ?1, ?2, ?3, 'FrostMage', 999, 42, 1, NULL, 3, NULL,
+                               5000, 500.0, 33.3, 12.5, 6.25, 40, 2)",
+                    params![slot, uid, name],
+                )
+                .unwrap();
+            }
+            for (slot, skill_id) in [(0i64, 111i64), (1, 222)] {
+                conn.execute(
+                    "INSERT INTO encounter_player_skills (
+                        encounter_id, slot, skill_slot, skill_id, damage, share_pct, crit_pct,
+                        max_crit, avg_crit, avg_white, avg, hits, crit_hits, hits_per_min
+                     ) VALUES (1, ?1, 0, ?2, 1000, 100.0, 0.0, 0, 0.0, 0.0, 0.0, 1, 0, 0.0)",
+                    params![slot, skill_id],
+                )
+                .unwrap();
+            }
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+
+        let store = SqliteHistory::open(&path, RetentionPolicy::default()).unwrap();
+
+        let remaining_players: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM encounter_players WHERE uid = ?1",
+                params![(1i64 << 47) + 1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let remaining_skills: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM encounter_player_skills WHERE slot = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored_player_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT player_count FROM encounters WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let list = store.list(10).unwrap();
+        let loaded = store.load(1).unwrap().unwrap();
+        drop(store);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(remaining_players, 0, "the unreconstructable row is deleted");
+        assert_eq!(remaining_skills, 0, "its skill rows are deleted with it");
+        assert_eq!(stored_player_count, 1, "player_count is recomputed");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].player_count, 1);
+        assert_eq!(loaded.players.len(), 1);
+        assert_eq!(loaded.players[0].uid, 5);
+        assert_eq!(loaded.players[0].skills.len(), 1);
+        assert_eq!(loaded.players[0].skills[0].skill_id, 222);
+    }
+
+    /// Issue #392: if the migration removes every player row an encounter
+    /// had, the encounter itself (and any skill rows still pointing at it)
+    /// must be removed too, so it also disappears from `list`.
+    #[test]
+    fn migrating_a_v2_database_drops_an_encounter_left_with_no_players() {
+        let path = crate::history::temp_history_path("v2-migration-drops-empty-encounter");
+        let _ = fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V1_SCHEMA).unwrap();
+            conn.execute_batch(SKILLS_DDL).unwrap();
+            conn.execute(
+                "INSERT INTO encounters (
+                    ended_at_ms, duration_ms, total_damage, total_dps, boss_monster_id,
+                    boss_name, is_boss, scene_id, scene_name, title, subtitle,
+                    player_count, meter_version
+                 ) VALUES (1000, 10000, 10000, 1000.0, 7, 'Boss', 1, 3, 'Scene', 'Boss',
+                           'Scene', 1, '0.2.2')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO encounter_players (
+                    encounter_id, slot, uid, name, class, ability_score, season_strength,
+                    imagine_0, imagine_1, imagine_tier_0, imagine_tier_1,
+                    damage, dps, share_pct, crit_pct, lucky_pct, hits, deaths
+                 ) VALUES (1, 0, ?1, 'Garbage', 'FrostMage', 999, 42, 1, NULL, 3, NULL,
+                           5000, 500.0, 33.3, 12.5, 6.25, 40, 2)",
+                params![(1i64 << 47) + 1],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO encounter_player_skills (
+                    encounter_id, slot, skill_slot, skill_id, damage, share_pct, crit_pct,
+                    max_crit, avg_crit, avg_white, avg, hits, crit_hits, hits_per_min
+                 ) VALUES (1, 0, 0, 111, 1000, 100.0, 0.0, 0, 0.0, 0.0, 0.0, 1, 0, 0.0)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+
+        let store = SqliteHistory::open(&path, RetentionPolicy::default()).unwrap();
+        let list = store.list(10).unwrap();
+        let encounter_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM encounters", [], |row| row.get(0))
+            .unwrap();
+        let skill_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM encounter_player_skills", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        drop(store);
+        let _ = fs::remove_file(&path);
+
+        assert!(
+            list.is_empty(),
+            "the emptied encounter is gone from the list"
+        );
+        assert_eq!(encounter_count, 0);
+        assert_eq!(skill_count, 0, "its orphaned skill rows are gone too");
+    }
+
+    /// Issue #392: if every row in an encounter is skipped as unloadable,
+    /// `load` must not hand back an encounter with an empty roster.
+    #[test]
+    fn a_v2_row_that_is_entirely_out_of_range_yields_no_encounter() {
+        let path = crate::history::temp_history_path("v2-out-of-range-uid-only");
+        let _ = fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V1_SCHEMA).unwrap();
+            conn.execute_batch(SKILLS_DDL).unwrap();
+            conn.execute(
+                "INSERT INTO encounters (
+                    ended_at_ms, duration_ms, total_damage, total_dps, boss_monster_id,
+                    boss_name, is_boss, scene_id, scene_name, title, subtitle,
+                    player_count, meter_version
+                 ) VALUES (1000, 10000, 10000, 1000.0, 7, 'Boss', 1, 3, 'Scene', 'Boss',
+                           'Scene', 1, '0.2.2')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO encounter_players (
+                    encounter_id, slot, uid, name, class, ability_score, season_strength,
+                    imagine_0, imagine_1, imagine_tier_0, imagine_tier_1,
+                    damage, dps, share_pct, crit_pct, lucky_pct, hits, deaths
+                 ) VALUES (1, 0, ?1, 'Garbage', 'FrostMage', 999, 42, 1, NULL, 3, NULL,
+                           5000, 500.0, 33.3, 12.5, 6.25, 40, 2)",
+                params![(1i64 << 47) + 1],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+
+        let store = SqliteHistory::open(&path, RetentionPolicy::default()).unwrap();
+        let loaded = store.load(1).unwrap();
+        drop(store);
+        let _ = fs::remove_file(&path);
+
+        assert!(
+            loaded.is_none(),
+            "an encounter with no loadable players must not be returned"
         );
     }
 
