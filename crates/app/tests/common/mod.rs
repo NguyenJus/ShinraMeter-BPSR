@@ -249,7 +249,10 @@ impl Rig {
             Delivery::SplitAndReorder { order, .. } => order.clone(),
         };
         for idx in push_order {
-            self.reassembler.push(seqs[idx], &pieces[idx]);
+            // A frozen clock: this harness drives delivery order, not time,
+            // so the stall guard's wall-clock budget (#405) must never trip
+            // here. Its push-count half still applies.
+            self.reassembler.push(seqs[idx], &pieces[idx], 0);
         }
         // 5. A dropped segment invalidates whatever the decoder has
         //    buffered so far.
