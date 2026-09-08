@@ -17,6 +17,12 @@ affiliated with the game's publisher.
 
 ### Fixed
 
+- Encounters saved by a pre-v3 build whose stored player uid is out of
+  range are no longer all loaded as the same unknown player, silently
+  merging distinct saved players; those rows are skipped instead.
+  Affected rows are removed and the encounter's player count recomputed
+  the first time the history database is opened; damage totals still
+  describe the original fight.
 - Closing the meter can no longer leave a windowless process behind holding
   the single-instance lock: shutdown across capture, pipeline, history,
   settings and inspect is now bounded to eight seconds as a whole, then

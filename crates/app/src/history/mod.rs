@@ -52,13 +52,20 @@ pub fn history_db_path() -> PathBuf {
 /// #373, #379) added `encounters.local_uid` and `encounter_players.entity`,
 /// both nullable so a row from an older schema simply reads back `NULL` (see
 /// `EncounterRecord::to_snapshot` and `PlayerRecord::to_row`'s doc comments).
+/// v3 → v4 (issue #392) is a one-time data cleanup, not a DDL change: it
+/// deletes the pre-v3 `encounter_players` rows (and their skill rows) whose
+/// stored `uid` can never be reconstructed into an `EntityId` (see
+/// `EntityId::from_display_uid`), recomputes `encounters.player_count` for
+/// every encounter that lost a row, and drops any encounter left with no
+/// players at all, so the history list stops showing a player count that
+/// disagrees with what `load` can actually return.
 /// A file stamped with an *older* known version is migrated forward in place
 /// by `sqlite::migrate`, so an existing history survives the upgrade with
 /// its older encounters simply carrying no skill rows / no local uid / no
 /// stored entity. Only a version this build has never heard of (a downgrade,
 /// or a hand-edited file) is still renamed aside and replaced, since there
 /// is nothing to migrate *from*.
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// Retention rules, applied inside every `HistoryStore::insert` (spec §5.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
