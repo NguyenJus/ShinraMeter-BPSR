@@ -112,10 +112,11 @@ fn server_change_mid_pull_new_dungeon() {
         .hit(P_ARIA, M_BOSS, 101, 40_000)
         .at(10_000)
         .inject(bpsr_protocol::ProtocolEvent::ServerChanged)
-        // A tick between the reconnect and the new instance's `Scene`
-        // packet, matching the real TICK_INTERVAL (100ms) — without it the
-        // cut-short fight is destroyed before `record_fight_end` observes
-        // it, an ordering that can't happen live.
+        // This tick lands inside the grace window (`ServerChanged` was
+        // armed at 10_000), so the parked `ServerChanged` is still pending
+        // here; it's the `enter_scene` step at 11_000 that flushes it,
+        // before the `Scene` arm runs. The tick itself is kept only to
+        // mirror the real TICK_INTERVAL (100ms) cadence.
         .at(10_500)
         .tick()
         // The reconnect lands in a different instance, not the one just

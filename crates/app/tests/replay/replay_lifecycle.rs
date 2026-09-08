@@ -67,8 +67,8 @@ fn boss_hp_rollback_auto_reset() {
     // `took_damage`)...
     assert_eq!(capture.snapshot.encounter.boss_monster_id, None);
     assert!(!capture.snapshot.encounter.is_boss);
-    // ...but the scene is untouched by a `BossHpRollback` reset (only
-    // `ServerChanged` clears scene_id).
+    // ...but the scene is untouched by a `BossHpRollback` reset (since issue
+    // #422 nothing but a differing dungeon Scene resets it).
     assert_eq!(capture.snapshot.encounter.scene_id, Some(TOWERING_RUIN));
     // Issue #201: `scene_boss_name` now comes from the curated
     // `tables::SCENE_FINAL_BOSSES`, which does not cover this scene — nothing
@@ -89,8 +89,9 @@ fn boss_hp_rollback_auto_reset() {
 ///
 /// Issue #138: zoning/reconnecting is **not** a reset. The numbers the
 /// player is still reading stay on screen; only state keyed on
-/// server-session identifiers (`scene_id`, the enemy map, `boss_uid`) is
-/// invalidated, and the fight clock freezes at the reconnect moment so the
+/// server-session identifiers (the enemy map, and the derived boss lookup)
+/// is invalidated — `scene_id` and `boss_uid` survive per issue #422 — and
+/// the fight clock freezes at the reconnect moment so the
 /// held elapsed timer does not run while the connection is down. The next
 /// fight's first hit is what clears the stats (`ResetReason::NewFight`).
 ///
@@ -113,7 +114,17 @@ fn server_change_holds_the_numbers() {
         .hit(P_BRIN, M_BOSS, 202, 25_000)
         .at(12_000)
         .inject(ProtocolEvent::ServerChanged)
-        .at(13_000)
+        .at(13_500)
+        // Comfortably past the pipeline's 1s server-change grace window.
+        // Issue #423: capture emits `ServerChanged` on adoption, before the
+        // adopted connection has decoded anything, so the pipeline parks the
+        // fight end until a frame confirms it or the grace window closes.
+        // Nothing decodes after the reconnect here, so it is this tick -
+        // `publish`'s, in production - that lands it. It is also why the
+        // golden's `fight_state` reads `Ended` rather than `Idle`: the
+        // scenario never ticked before, so that field was the harness's
+        // never-updated initial value, not a statement about the meter.
+        .tick()
         .capture("server_change_reset");
 
     let mut rig = Rig::new();
