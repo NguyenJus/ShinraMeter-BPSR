@@ -1355,8 +1355,10 @@ pub(super) fn handle_share_screenshot(
 /// in this precedence has to know about zoning: the header keeps naming the
 /// boss whose frozen numbers are on the rows below it.
 ///
-/// Also called by `pipeline::record_fight_end` so a saved encounter stores
-/// the *same* label the live header showed (issue #39, spec DECISION D2).
+/// `pipeline::record_fight_end` saves through `history_title`, which reuses
+/// this precedence wholesale and only fills in the non-boss blank this
+/// function leaves on purpose (issue #424), so a saved label matches the
+/// live header whenever the header showed one (issue #39, DECISION D2).
 pub(crate) fn encounter_title(e: &EncounterInfo) -> String {
     if e.is_boss {
         // `is_boss` is only ever true alongside a `Some` `boss_monster_id`
@@ -4232,6 +4234,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(history_title(&e), encounter_title(&e));
+        assert_eq!(history_title(&e), "Rathalos");
     }
 
     #[test]

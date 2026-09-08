@@ -149,16 +149,17 @@ fn describe_recorded(id: Option<i64>, record: &EncounterRecord) -> String {
         .as_deref()
         .unwrap_or(record.title.as_str());
     let boss = record.boss_name.as_deref();
+    let is_boss = record.is_boss;
     let duration_ms = record.duration_ms;
     let players = record.players.len();
     match id {
         Some(id) => format!(
             "history: recorded encounter id={id} scene={scene:?} boss={boss:?} \
-             duration_ms={duration_ms} players={players}"
+             is_boss={is_boss} duration_ms={duration_ms} players={players}"
         ),
         None => format!(
             "history: skipped encounter below the retention floor scene={scene:?} \
-             boss={boss:?} duration_ms={duration_ms} players={players}"
+             boss={boss:?} is_boss={is_boss} duration_ms={duration_ms} players={players}"
         ),
     }
 }

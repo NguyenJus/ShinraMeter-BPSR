@@ -203,14 +203,15 @@ const SKILLS_DDL: &str = "CREATE TABLE IF NOT EXISTS encounter_player_skills (
     );";
 
 /// Upgrades a file stamped with the known older version `from` to
-/// `SCHEMA_VERSION`, in place. Every step here is *additive* by construction:
-/// no existing row is rewritten or dropped, so an interrupted upgrade leaves
-/// a file the previous version could still read, and a user's history is
-/// never wiped to gain a column.
+/// `SCHEMA_VERSION`, in place. Every step here is either additive DDL
+/// (`CREATE TABLE`/`ALTER TABLE ... ADD COLUMN`) or a bounded data cleanup:
+/// v3 → v4 drops rows `load` could never return anyway, and v4 → v5
+/// backfills empty titles. No step ever removes a column, so an interrupted
+/// upgrade still leaves a file the previous version can read.
 fn migrate(conn: &Connection, from: i32) -> Result<(), HistoryError> {
-    // Every step below is plain DDL (`CREATE TABLE`/`ALTER TABLE`), which
-    // SQLite runs transactionally like any other statement — safe to issue
-    // inside the caller's transaction alongside the `user_version` bump.
+    // The DDL steps below and the row-level DELETE/UPDATE steps further down
+    // all run inside the caller's transaction alongside the `user_version`
+    // bump, so SQLite applies (or rolls back) the whole migration atomically.
     // v1 → v2 (issue #222): per-skill totals. Nothing but a new table, so
     // encounters saved before it keep every field they had and simply have
     // no skill rows to hand back.
@@ -296,15 +297,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<(), HistoryError> {
     // shows a blank row nothing can identify. Backfill both from the same
     // community monster-name table `ui::header::history_title` resolves
     // against — that table lives in Rust, not SQL, so this walks the
-    // affected rows rather than being a single `UPDATE`. Only rows with no
-    // title at all and a non-NULL `boss_monster_id` are touched, and
+    // affected rows rather than being a single `UPDATE`. Only rows with an
+    // empty title and a non-NULL `boss_monster_id` are touched, and
     // `boss_name` stays `NULL` when the table doesn't know the id, since
     // `Monster #{id}` is a display fallback, not a name.
     if from < 5 {
         let stale: Vec<(i64, u32)> = conn
             .prepare(
                 "SELECT id, boss_monster_id FROM encounters
-                 WHERE (title IS NULL OR title = '') AND boss_monster_id IS NOT NULL",
+                 WHERE title = '' AND boss_monster_id IS NOT NULL",
             )?
             .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
             .collect::<Result<Vec<_>, _>>()?

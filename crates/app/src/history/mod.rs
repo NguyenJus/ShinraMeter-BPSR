@@ -293,6 +293,10 @@ pub struct EncounterRecord {
     pub total_damage: i64,
     pub total_dps: f64,
     pub boss_monster_id: Option<u32>,
+    /// Since issue #424 this is populated for any target the monster-name
+    /// table resolves, boss or not, so it is `Some` for plenty of non-boss
+    /// fights. `is_boss` is the only field that actually says whether the
+    /// target was a boss.
     pub boss_name: Option<String>,
     pub is_boss: bool,
     pub scene_id: Option<u32>,
@@ -356,11 +360,14 @@ pub trait HistoryStore: Send {
 }
 
 /// Builds the record for a just-ended fight (spec §5.7). `title`/`subtitle`
-/// are supplied by the caller from `ui::encounter_title`/`encounter_subtitle`
+/// are supplied by the caller from `ui::history_title`/`ui::encounter_subtitle`
 /// (DECISION D2) — this module deliberately does not re-derive the naming
 /// rules, so a historical fight's label can never drift when the naming rule
-/// changes later. Returns `None` when the fight is not worth recording (D12:
-/// no rows, or no damage). The duration floor is *not* checked here — that is
+/// changes later. The single exception is `boss_name`, which is resolved
+/// here via `ui::history_boss_name` (issue #424) because
+/// `EncounterInfo::boss_name` is only ever set for a recognized boss.
+/// Returns `None` when the fight is not worth recording (D12: no rows, or no
+/// damage). The duration floor is *not* checked here — that is
 /// `HistoryStore::insert`'s job, since it is a `RetentionPolicy` concern, not
 /// a "did this fight happen" one.
 pub fn record_from_snapshot(
