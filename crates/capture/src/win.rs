@@ -18,6 +18,7 @@
 
 use std::ffi::{CString, c_void};
 use std::mem::MaybeUninit;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -32,7 +33,7 @@ use crate::backoff::{next_game_pids, recv_error_backoff, should_refresh_game_pid
 use crate::detect::{Conn, ServerDetector, decide_packet};
 use crate::driver::{Api, WinDivertAddress};
 use crate::error::CaptureError;
-use crate::owner::{self, SystemOwnerLookup};
+use crate::owner::{self, StreamOwnerLookup, SystemOwnerLookup};
 use crate::restart::CaptureRestart;
 use crate::tcp::TcpReassembler;
 use crate::throughput::{
@@ -603,6 +604,18 @@ fn recv_loop(
             last_game_pid_lookup = None;
             game_pid_lookup_interval = GAME_PID_LOOKUP_INITIAL_INTERVAL;
         }
+        // Issue #406: detection runs the signature scan *before* the
+        // "already adopted" gate, so a signature match on a different
+        // connection can displace a still-live tracked one with no FIN/RST at
+        // all. The teardown branch above never fires for that, which is why
+        // the logs showed an "adopted" line with no preceding "torn down"
+        // line. Report the displacement explicitly so both connections are
+        // visible in the log.
+        if let Some(old) = decision.replaced {
+            log::info!(
+                "capture: adoption displaced still-tracked connection {old} (no FIN/RST observed on it; signature match on {conn}, issue #406)"
+            );
+        }
         if decision.skip {
             // Either the client→server half of the adopted connection
             // (recognized, so detection/adoption does not ping-pong on it,
@@ -622,9 +635,28 @@ fn recv_loop(
             // capture observed the connection from its very start — not
             // true for a mid-connection attach (issue #282).
             let resync_seq = seq.wrapping_add(decision.frame_offset as u32);
+            // Issue #406: the issue #337 ownership filter is the other reason
+            // an adoption can look surprising after the fact, so report its
+            // state on the same line instead of leaving it to be inferred
+            // from a separate pid-lookup entry elsewhere in the log. This is
+            // the adopted connection's *actual* owner, looked up once here
+            // (not the cached `game_pids` set, which says nothing about
+            // whether this particular connection matched it) — mirrors the
+            // lookup `owner_allows_adoption` already performed to decide
+            // whether to allow the adoption in the first place.
+            let owner_state = if game_pids.is_empty() {
+                "unfiltered".to_string()
+            } else {
+                let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(conn.dst)), conn.dst_port);
+                let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(conn.src)), conn.src_port);
+                match owner_lookup.owner_pid(local, remote) {
+                    Some(pid) => format!("pid={pid} (in game_pids)"),
+                    None => format!("unknown (fail-open, pids={game_pids:?})"),
+                }
+            };
             log::info!(
                 "capture: adopted game-server connection {conn} at seq={seq} \
-                 frame_offset={} ({} payload bytes)",
+                 frame_offset={} ({} payload bytes) owner={owner_state}",
                 decision.frame_offset,
                 payload.len(),
             );
