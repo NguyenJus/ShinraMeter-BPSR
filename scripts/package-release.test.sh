@@ -35,7 +35,7 @@ root="$work/repo"
 fake_exe="$work/ShinraMeter-BPSR.exe"
 printf 'MZ\220\000fake pe image' > "$fake_exe"
 
-# -- the version-bearing name release.yml builds ------------------------
+# -- a legacy version-bearing name (releases published before #444) ----
 asset="ShinraMeter-BPSR-v0.2.5-windows-x64.exe"
 if "$package" "$fake_exe" "$asset" > /dev/null && [[ -f "$root/$asset" ]]; then
   pass "stages the asset at <repo-root>/$asset"
@@ -57,12 +57,12 @@ else
   fail "leaves neither a zip nor a dist/ staging tree behind"
 fi
 
-# -- ci.yml's unversioned name (no tag on a branch build) ---------------
+# -- the unversioned name both workflows build (issue #444) -------------
 ci_asset="ShinraMeter-BPSR-windows-x64.exe"
 if "$package" "$fake_exe" "$ci_asset" > /dev/null && [[ -f "$root/$ci_asset" ]]; then
-  pass "stages ci.yml's unversioned asset name"
+  pass "stages the unversioned asset name both workflows build"
 else
-  fail "stages ci.yml's unversioned asset name"
+  fail "stages the unversioned asset name both workflows build"
 fi
 
 # Re-staging over an existing asset overwrites rather than failing: both
