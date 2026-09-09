@@ -9,7 +9,8 @@ between (issue #36):
 closer to what's on screen than a raw client dump — id 11019 is a bare "ID
 Placeholder" in the authoritative table below, but the community files call
 it "Boss - Darkened Python". Vendored verbatim under `crates/meter/data/`.
-(A handful of ids run the other way — see `MONSTER_NAME_MANUAL_OVERRIDES`.)
+(A handful of ids run the other way — see `MONSTER_NAME_MANUAL_OVERRIDES` and
+`SCENE_NAME_MANUAL_OVERRIDES`.)
 
 *Authoritative game tables* (MIT) from `Blue-Protocol-Source/BPSR-ZDPS`'s
 `Data/`. These are the full client tables the community files were derived
