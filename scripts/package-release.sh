@@ -10,12 +10,15 @@
 #
 # Issue #249: this used to wrap that single executable in a zip. It no longer
 # does — a zip whose only member is one .exe buys nothing but an extract step
-# (and a "why am I unzipping an .exe" moment for the user). What the zip *did*
-# carry was the version, in its own filename; with the wrapper gone that has
-# to live on the executable's filename instead, which is why this script
-# copies to a caller-supplied <asset-name> rather than preserving the plain
-# `ShinraMeter-BPSR.exe` name `cargo build` emits. Several downloaded builds in
-# one folder stay distinguishable that way.
+# (and a "why am I unzipping an .exe" moment for the user).
+#
+# This script copies to a caller-supplied <asset-name> rather than preserving
+# the plain `ShinraMeter-BPSR.exe` name `cargo build` emits so the platform
+# can be tagged onto the filename (`-windows-x64`). Issue #444: the name
+# carries no version — `update_check`'s in-place updater (issue #250)
+# replaces the file at its current path, so a version baked into the
+# filename would just go stale; the version is shown in the app/menu
+# instead.
 #
 # Both ci.yml and release.yml call this script so local and CI packaging
 # cannot drift from each other.

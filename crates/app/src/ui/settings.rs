@@ -777,7 +777,7 @@ mod tests {
     #[test]
     fn draw_header_menu_offers_an_install_button_when_the_release_has_an_asset() {
         let texts = header_menu_texts(UpdateCheckState::Done(Ok(update_available(Some(
-            "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/ShinraMeter-BPSR-v0.3.0-windows-x64.exe",
+            "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/ShinraMeter-BPSR-windows-x64.exe",
         )))));
         assert!(
             texts.contains(&"Update available: v0.3.0".to_string()),
