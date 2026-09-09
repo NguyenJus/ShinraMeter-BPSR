@@ -2793,7 +2793,7 @@ mod tests {
     /// Regression for the toggle cluster's silent-drop bug: at a stat row
     /// no wider than `MIN_INNER_SIZE.x` (issue #400's overflow floor, well
     /// past the ~372pt panel width the pills alone start overflowing at),
-    /// `split_stat_row`'s cluster half must still land entirely inside
+    /// the cluster rect `split_stat_row` returns must still land entirely inside
     /// `row_rect` — the reservation is unconditional on the row's own
     /// width, not on the pills leaving enough room behind. Reset has no
     /// other entry point, so if this ever fails again the button is gone.
@@ -2836,6 +2836,21 @@ mod tests {
             pills_right + STAT_ROW_PILLS_CLUSTER_GAP
         );
         assert_eq!(cluster_rect.width(), STAT_ROW_TOGGLE_CLUSTER_WIDTH);
+    }
+
+    /// `STAT_ROW_PILLS_CLUSTER_GAP` claims to match `apply_theme`'s
+    /// `item_spacing.x` — the gap the pills use between themselves — so
+    /// the cluster reads as a fourth member of the same run. Pin that
+    /// claim: if the theme's spacing moves, this fails instead of the
+    /// cluster silently drifting off-rhythm.
+    #[test]
+    fn stat_row_pills_cluster_gap_matches_the_theme_item_spacing() {
+        let ctx = egui::Context::default();
+        super::super::apply_theme(&ctx);
+        assert_eq!(
+            ctx.global_style().spacing.item_spacing.x,
+            STAT_ROW_PILLS_CLUSTER_GAP
+        );
     }
 
     /// PR #197 review: with no history thread the History button must be
