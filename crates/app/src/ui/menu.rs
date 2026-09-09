@@ -1208,70 +1208,74 @@ fn draw_menu_root(
             | UpdateCheckState::Installing { .. }
             | UpdateCheckState::Restarting
     );
-    if menu_row(
+    // Issue #434: the status used to grow as extra `ui.label`/`ui.
+    // horizontal` lines under this row, which wrapped inside the dropdown's
+    // fixed `HEADER_MENU_WIDTH`. It now reads in the row's own label,
+    // through `menu_row`'s existing single-line, ellipsis-truncating
+    // layout — the same mechanism every other row here already uses to
+    // stay on one line.
+    let label = update_check_row_label(update_check);
+    // A release page is worth linking to only once an update has actually
+    // been offered (`Done(Ok(UpdateAvailable))`, or its failed-install
+    // retry) — `UpToDate`, `Idle` and the error states have no release to
+    // point at.
+    let release_notes_url: Option<&str> = match update_check {
+        UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable { url, .. })) => Some(url),
+        UpdateCheckState::InstallFailed { available, .. } => match available {
+            CheckOutcome::UpdateAvailable { url, .. } => Some(url),
+            CheckOutcome::UpToDate => None,
+        },
+        _ => None,
+    };
+    // Fits inline only if the row's label plus the link both clear the
+    // row's own label band — measured against the same font/inset/icon-slot
+    // geometry `menu_row` lays the label out with. Too long, and the link
+    // moves to a hover tooltip instead of silently truncating out of the
+    // row (`menu_row`'s ellipsis would otherwise just eat it).
+    let row_available_width =
+        ui.available_width() - 2.0 * MENU_ROW_INSET - MENU_ICON_SLOT - MENU_ROW_LABEL_GAP;
+    let combined_with_link = release_notes_url.map(|_| format!("{label} · Release notes"));
+    let show_link_inline = combined_with_link.as_ref().is_some_and(|combined| {
+        ui.painter()
+            .layout_no_wrap(
+                combined.clone(),
+                regular(MENU_LABEL_FONT_SIZE),
+                egui::Color32::WHITE,
+            )
+            .size()
+            .x
+            <= row_available_width
+    });
+    let row_label = if show_link_inline {
+        combined_with_link.expect("show_link_inline implies combined_with_link is Some")
+    } else {
+        label
+    };
+    let response = menu_row(
         ui,
         MenuRow {
             icon: None,
-            label: "Check for updates",
+            label: &row_label,
             trailing: Trailing::None,
             enabled: !busy,
         },
-    )
-    .clicked()
-    {
-        *update_check = start_update_check();
-    }
-    // Issue #250: an "Update now" click can't assign `*update_check` from
-    // inside the match below, which borrows it — so the click is collected
-    // here and acted on once the match has ended.
-    let mut clicked_install: Option<CheckOutcome> = None;
-    match &*update_check {
-        UpdateCheckState::Idle => {}
-        UpdateCheckState::Checking { .. } => {
-            ui.horizontal(|ui| {
-                ui.add_space(MENU_ROW_INSET);
-                ui.label("Checking…");
-            });
+    );
+    let response = match release_notes_url {
+        Some(url) if !show_link_inline => response.on_hover_text(format!("Release notes: {url}")),
+        _ => response,
+    };
+    if response.clicked() {
+        match update_check {
+            UpdateCheckState::Done(Ok(available @ CheckOutcome::UpdateAvailable { .. })) => {
+                *update_check = start_update_install(available.clone());
+            }
+            UpdateCheckState::InstallFailed { available, .. } => {
+                *update_check = start_update_install(available.clone());
+            }
+            _ => {
+                *update_check = start_update_check();
+            }
         }
-        UpdateCheckState::Done(Ok(CheckOutcome::UpToDate)) => {
-            ui.horizontal(|ui| {
-                ui.add_space(MENU_ROW_INSET);
-                ui.label(format!("Up to date (v{})", env!("CARGO_PKG_VERSION")));
-            });
-        }
-        UpdateCheckState::Done(Ok(available @ CheckOutcome::UpdateAvailable { .. })) => {
-            draw_update_available(ui, available, &mut clicked_install);
-        }
-        UpdateCheckState::Done(Err(err)) => {
-            ui.horizontal(|ui| {
-                ui.add_space(MENU_ROW_INSET);
-                ui.label(format!("Update check failed: {err}"));
-            });
-        }
-        UpdateCheckState::Installing { available, .. } => {
-            let tag = update_tag(available);
-            ui.label(format!("Downloading {tag}…"));
-            // The install thread reports once, at the end — WinHTTP's read
-            // loop has no progress callback wired through
-            // `platform::http_get_bytes` — so this is a spinner, not a
-            // percentage. Claiming a percentage it cannot know would be
-            // worse than not showing one.
-            ui.spinner();
-        }
-        UpdateCheckState::Restarting => {
-            ui.label("Restarting…");
-        }
-        UpdateCheckState::InstallFailed { available, error } => {
-            // The offer is redrawn above the error on purpose: a failed
-            // download is usually transient (a dropped connection, a proxy
-            // hiccup), so the retry has to be one click away rather than
-            // behind a fresh check.
-            draw_update_available(ui, available, &mut clicked_install);
-            ui.label(format!("Update failed: {error}"));
-        }
-    }
-    if let Some(available) = clicked_install {
-        *update_check = start_update_install(available);
     }
 
     // Issue #203: a UI-settings reset (window size + opacity), distinct

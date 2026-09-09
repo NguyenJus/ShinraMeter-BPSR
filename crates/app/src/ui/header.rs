@@ -228,6 +228,13 @@ pub(super) fn draw_header(
     // id `Popup::menu(&chevron_response)` below keys its open state under.
     if !egui::Popup::is_id_open(ctx, egui::Popup::default_response_id(&chevron_response)) {
         reset_menu_page(ctx);
+        // Issue #434: a resolved "Check for updates" result must not
+        // survive the dropdown closing — otherwise a stale `Done`/
+        // `InstallFailed` from the last time it was opened keeps showing
+        // instead of the plain "Check for updates" row. `Checking`/
+        // `Installing`/`Restarting` are left alone; see that function's
+        // own doc comment for why.
+        reset_update_check_if_resolved(update_check);
     }
     // `CloseOnClickOutside` rather than the default `CloseOnClick` (issue
     // #93, now a standing rule — see `menu.rs`'s issue #120 block): this
@@ -2345,6 +2352,102 @@ pub(super) fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
 mod tests {
     use super::*;
     use crate::ui::tests::*;
+
+    /// Issue #434: `draw_header` calls `reset_update_check_if_resolved`
+    /// on every frame the popup is closed, the same frames it already
+    /// calls `reset_menu_page` on — so a resolved check does not survive
+    /// the dropdown closing and reopening, and the row reads "Check for
+    /// updates" again rather than a stale "Up to date"/"Update failed".
+    #[test]
+    fn draw_header_resets_a_resolved_update_check_when_the_popup_is_closed() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(0);
+        let mut update_check = UpdateCheckState::Done(Ok(CheckOutcome::UpToDate));
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header(
+                ui,
+                &ctx,
+                &snapshot,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut WindowGesture::default(),
+                None,
+                false,
+                true,
+                &mut update_check,
+                &unused_log_export_sender(),
+                &mut 0,
+                false,
+                &mut false,
+                None,
+                &mut false,
+            );
+        });
+        output.drop_without_applying_deltas();
+
+        assert!(
+            matches!(update_check, UpdateCheckState::Idle),
+            "a resolved check must reset to Idle once the popup is closed, got {update_check:?}"
+        );
+    }
+
+    /// Counterpart to the test above: an in-flight check must survive the
+    /// same closed-popup frames untouched — closing the dropdown must never
+    /// look like it dropped the thread draining into `Checking`.
+    #[test]
+    fn draw_header_leaves_an_in_flight_update_check_alone_when_the_popup_is_closed() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(0);
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let mut update_check = UpdateCheckState::Checking { rx };
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header(
+                ui,
+                &ctx,
+                &snapshot,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut WindowGesture::default(),
+                None,
+                false,
+                true,
+                &mut update_check,
+                &unused_log_export_sender(),
+                &mut 0,
+                false,
+                &mut false,
+                None,
+                &mut false,
+            );
+        });
+        output.drop_without_applying_deltas();
+
+        assert!(
+            matches!(update_check, UpdateCheckState::Checking { .. }),
+            "an in-flight check must survive a closed popup, got {update_check:?}"
+        );
+    }
+
     /// Issue #91: the timer is inset from the panel's left content edge by
     /// `HEADER_STAT_ROW_INSET_X` rather than sitting flush against the
     /// window border the way its old half-pill did. That gap is the whole

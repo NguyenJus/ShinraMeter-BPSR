@@ -62,66 +62,48 @@ pub(super) enum LandedUpdate {
     },
 }
 
-/// The tag out of a `CheckOutcome::UpdateAvailable`, for the states that
-/// carry one purely to name it. `UpToDate` has no tag and never reaches any
-/// of those states, so it degrades to a neutral word rather than widening
-/// every call site into a match.
-pub(super) fn update_tag(available: &CheckOutcome) -> &str {
-    match available {
-        CheckOutcome::UpdateAvailable { tag, .. } => tag,
-        CheckOutcome::UpToDate => "the update",
+/// The row label for the header dropdown's "Check for updates" row, in
+/// place of the extra `ui.label`/`ui.horizontal` lines the row used to grow
+/// underneath it (issue #434): those wrapped inside the dropdown's fixed
+/// 248px width, so the status now has to read in the row's own single-line,
+/// truncated label instead. Pure so it doubles as the source of truth for
+/// both `draw_header_menu`'s paint and the tests that pin exactly what each
+/// state reads as.
+pub(super) fn update_check_row_label(update_check: &UpdateCheckState) -> String {
+    match update_check {
+        UpdateCheckState::Idle => "Check for updates".to_string(),
+        UpdateCheckState::Checking { .. } => "Checking…".to_string(),
+        UpdateCheckState::Done(Ok(CheckOutcome::UpToDate)) => {
+            format!("Up to date (v{})", env!("CARGO_PKG_VERSION"))
+        }
+        UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable { tag, .. })) => {
+            format!("Update available: {tag}")
+        }
+        UpdateCheckState::Done(Err(err)) => format!("Update failed: {err}"),
+        UpdateCheckState::Installing { .. } => "Installing…".to_string(),
+        UpdateCheckState::Restarting => "Restarting…".to_string(),
+        UpdateCheckState::InstallFailed { error, .. } => format!("Install failed: {error}"),
     }
 }
 
-/// Draws the "an update exists, here's how to get it" row (issues #171 and
-/// #250). Shared by the fresh-result state and the failed-install state so
-/// a retry offers exactly the same affordances the first attempt did.
+/// Puts a resolved "Check for updates" result back to `Idle` when the
+/// header dropdown is closed (issue #434), so the row reads "Check for
+/// updates" again the next time it opens rather than still showing a stale
+/// `Done`/`InstallFailed` from whenever the last check or install attempt
+/// landed. Called from `draw_header` on the same frames that call
+/// `reset_menu_page` — every frame the popup is *not* open.
 ///
-/// Two shapes, decided by whether the release actually published a
-/// downloadable executable:
-///
-/// - With an asset (every release since issue #249): an "Update now" button
-///   that downloads it, swaps it over this executable and relaunches, plus
-///   a link to the release page for anyone who wants to read the notes
-///   first.
-/// - Without one — a release tagged before #249, which published a `.zip`,
-///   or one whose upload never finished: the plain "Download" link that was
-///   the whole affordance before #250. Offering an install button that
-///   cannot work would be worse than offering the browser.
-///
-/// `egui::OpenUrl` (what `hyperlink_to` sends through `ctx.output_mut`) is
-/// what eframe's native backend turns into an actual browser launch.
-///
-/// A click is reported through `clicked_install` rather than acted on here:
-/// the caller holds the `&mut UpdateCheckState` this row was rendered from,
-/// so the state change has to happen after this borrow ends.
-pub(super) fn draw_update_available(
-    ui: &mut egui::Ui,
-    available: &CheckOutcome,
-    clicked_install: &mut Option<CheckOutcome>,
-) {
-    let CheckOutcome::UpdateAvailable {
-        tag,
-        url,
-        asset_url,
-    } = available
-    else {
-        return;
-    };
-    ui.horizontal(|ui| {
-        ui.label(format!("Update available: {tag}"));
-        match asset_url {
-            Some(_) => {
-                if ui.button("Update now").clicked() {
-                    *clicked_install = Some(available.clone());
-                }
-                ui.hyperlink_to("Release notes", url.as_str());
-            }
-            None => {
-                ui.hyperlink_to("Download", url.as_str());
-            }
-        }
-    });
+/// Never touches `Checking`, `Installing` or `Restarting`: those are work
+/// still in flight (or, for `Restarting`, a terminal state the window is
+/// about to close under), and closing the dropdown must not make either
+/// look abandoned or silently drop the thread draining into it.
+pub(super) fn reset_update_check_if_resolved(update_check: &mut UpdateCheckState) {
+    if matches!(
+        update_check,
+        UpdateCheckState::Done(_) | UpdateCheckState::InstallFailed { .. }
+    ) {
+        *update_check = UpdateCheckState::Idle;
+    }
 }
 
 /// Starts a manual update check (issue #171): spawns a one-shot
@@ -173,10 +155,13 @@ pub(super) fn start_update_install(available: CheckOutcome) -> UpdateCheckState 
         ..
     } = &available
     else {
-        // Unreachable through the UI: `draw_update_available` only draws the
-        // "Update now" button when there *is* an asset. Reported as a failed
-        // install rather than panicked on, because an overlay that dies on a
-        // menu click is worse than one that says it cannot do the thing.
+        // Issue #434: reachable through the UI now that the "Check for
+        // updates" row's click always calls this for an `UpdateAvailable`
+        // offer, asset or not — there is no separate "Update now" button
+        // gating the call on `asset_url.is_some()` any more. Reported as a
+        // failed install rather than panicked on, because an overlay that
+        // dies on a menu click is worse than one that says it cannot do the
+        // thing.
         return UpdateCheckState::InstallFailed {
             available,
             error: "that release doesn't publish a downloadable executable".to_string(),
@@ -577,6 +562,7 @@ mod tests {
         let (_tx, rx) = crossbeam_channel::unbounded();
 
         let mut disabled_while = |update_check: &mut UpdateCheckState| {
+            let expected_label = update_check_row_label(update_check);
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 draw_header_menu(
                     ui,
@@ -602,7 +588,7 @@ mod tests {
             let disabled = update
                 .nodes
                 .iter()
-                .find(|(_, node)| node.label().is_some_and(|s| s == "Check for updates"))
+                .find(|(_, node)| node.label().is_some_and(|s| s == expected_label))
                 .map(|(_, node)| node.is_disabled());
             output.drop_without_applying_deltas();
             disabled
@@ -611,12 +597,12 @@ mod tests {
         assert_eq!(
             disabled_while(&mut UpdateCheckState::Checking { rx }),
             Some(true),
-            "the button must be disabled while a check is in flight"
+            "the row must be disabled while a check is in flight"
         );
         assert_eq!(
             disabled_while(&mut UpdateCheckState::Done(Err("boom".to_string()))),
             Some(false),
-            "a resolved check must leave the button clickable again, so the user can retry"
+            "a resolved check must leave the row clickable again, so the user can retry"
         );
     }
 
@@ -658,7 +644,7 @@ mod tests {
         }
         output.drop_without_applying_deltas();
 
-        let expected = "Update check failed: no network".to_string();
+        let expected = "Update failed: no network".to_string();
         assert!(
             texts.contains(&expected),
             "expected {expected:?} among the painted text, got {texts:?}"
@@ -711,16 +697,15 @@ mod tests {
         );
     }
 
-    /// Same shape as the test above, but for the update-available branch
-    /// of a release that publishes no downloadable executable — every
-    /// release tagged before issue #249 shipped a `.zip`, and issue #250's
-    /// installer has nothing to install for one. That case must keep the
-    /// pre-#250 affordance exactly: the tag, and a plain "Download" link to
-    /// the release page. The actual `href` isn't a painted string at all
-    /// (it's a `ViewportCommand::OpenUrl` queued on click, not text), so
-    /// this only covers what a render test can see.
+    /// Issue #434: a release with no downloadable asset (every release
+    /// tagged before issue #249, or one whose upload never finished) no
+    /// longer earns a separate "Download" link branch — the row reads the
+    /// same "Update available: vX" either way, and clicking it still tries
+    /// `start_update_install`, which itself resolves a missing asset to a
+    /// stated `InstallFailed` (see that function's tests) rather than the
+    /// row ever needing to know the difference up front.
     #[test]
-    fn draw_header_menu_falls_back_to_a_download_link_when_the_release_has_no_asset() {
+    fn draw_header_menu_shows_update_available_regardless_of_asset_presence() {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let icons = Icons::load(&ctx);
@@ -757,54 +742,25 @@ mod tests {
         output.drop_without_applying_deltas();
 
         assert!(
-            texts.contains(&"Update available: v0.3.0".to_string()),
+            texts
+                .iter()
+                .any(|t| t.starts_with("Update available: v0.3.0")),
             "expected the update-available line among the painted text, got {texts:?}"
         );
-        assert!(
-            texts.contains(&"Download".to_string()),
-            "expected the Download hyperlink's label among the painted text, got {texts:?}"
-        );
-        assert!(
-            !texts.contains(&"Update now".to_string()),
-            "an install button must not be offered for a release with no asset, got {texts:?}"
-        );
     }
 
-    /// Issue #250's headline change: a release that publishes an executable
-    /// offers to install it, and demotes the browser link to "Release
-    /// notes" rather than dropping it — reading the notes before updating
-    /// has to stay possible.
+    /// The in-flight install state has to name what it is doing; a dropdown
+    /// that went blank mid-download would read as a crash.
     #[test]
-    fn draw_header_menu_offers_an_install_button_when_the_release_has_an_asset() {
-        let texts = header_menu_texts(UpdateCheckState::Done(Ok(update_available(Some(
-            "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/ShinraMeter-BPSR-v0.3.0-windows-x64.exe",
-        )))));
-        assert!(
-            texts.contains(&"Update available: v0.3.0".to_string()),
-            "expected the update-available line, got {texts:?}"
-        );
-        assert!(
-            texts.contains(&"Update now".to_string()),
-            "expected the install button, got {texts:?}"
-        );
-        assert!(
-            texts.contains(&"Release notes".to_string()),
-            "expected the release-notes link, got {texts:?}"
-        );
-    }
-
-    /// The in-flight state has to name what it is doing; a dropdown that
-    /// went blank mid-download would read as a crash.
-    #[test]
-    fn draw_header_menu_shows_the_download_in_progress() {
+    fn draw_header_menu_shows_the_install_in_progress() {
         let (_tx, rx) = crossbeam_channel::unbounded();
         let texts = header_menu_texts(UpdateCheckState::Installing {
             available: update_available(Some("https://github.com/x/y.exe")),
             rx,
         });
         assert!(
-            texts.contains(&"Downloading v0.3.0…".to_string()),
-            "expected the downloading line, got {texts:?}"
+            texts.contains(&"Installing…".to_string()),
+            "expected the installing line, got {texts:?}"
         );
     }
 
@@ -817,22 +773,92 @@ mod tests {
         );
     }
 
-    /// A failed install must say what went wrong *and* leave the retry one
-    /// click away — a dropped connection is the common case, and making the
-    /// user re-run the whole check first would be gratuitous.
+    /// A failed install must say what went wrong; the retry stays one click
+    /// away because the row itself, not a separate button, is what starts
+    /// the install again.
     #[test]
-    fn draw_header_menu_shows_a_failed_install_and_re_offers_it() {
+    fn draw_header_menu_shows_a_failed_install() {
         let texts = header_menu_texts(UpdateCheckState::InstallFailed {
             available: update_available(Some("https://github.com/x/y.exe")),
             error: "the connection was reset".to_string(),
         });
         assert!(
-            texts.contains(&"Update failed: the connection was reset".to_string()),
+            texts.contains(&"Install failed: the connection was reset".to_string()),
             "expected the failure line, got {texts:?}"
         );
+    }
+
+    // -- issue #434: one line, and the row's own label reads the state --
+
+    /// Pins the exact label text for every `UpdateCheckState`, independent
+    /// of any `egui::Ui` — the single source of truth `draw_header_menu`'s
+    /// row and these tests both read from.
+    #[test]
+    fn update_check_row_label_covers_every_state() {
+        assert_eq!(
+            update_check_row_label(&UpdateCheckState::Idle),
+            "Check for updates"
+        );
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        assert_eq!(
+            update_check_row_label(&UpdateCheckState::Checking { rx }),
+            "Checking…"
+        );
+        assert_eq!(
+            update_check_row_label(&UpdateCheckState::Done(Ok(CheckOutcome::UpToDate))),
+            format!("Up to date (v{})", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            update_check_row_label(&UpdateCheckState::Done(Ok(update_available(None)))),
+            "Update available: v0.3.0"
+        );
+        assert_eq!(
+            update_check_row_label(&UpdateCheckState::Done(Err("no network".to_string()))),
+            "Update failed: no network"
+        );
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        assert_eq!(
+            update_check_row_label(&UpdateCheckState::Installing {
+                available: update_available(None),
+                rx,
+            }),
+            "Installing…"
+        );
+        assert_eq!(
+            update_check_row_label(&UpdateCheckState::Restarting),
+            "Restarting…"
+        );
+        assert_eq!(
+            update_check_row_label(&UpdateCheckState::InstallFailed {
+                available: update_available(None),
+                error: "the connection was reset".to_string(),
+            }),
+            "Install failed: the connection was reset"
+        );
+    }
+
+    /// Issue #434: closing the header dropdown must put a resolved check
+    /// back to `Idle` so it reads "Check for updates" again next time, but
+    /// must never touch one still in flight.
+    #[test]
+    fn reset_update_check_if_resolved_clears_done_but_preserves_checking() {
+        let mut done = UpdateCheckState::Done(Ok(CheckOutcome::UpToDate));
+        reset_update_check_if_resolved(&mut done);
+        assert!(matches!(done, UpdateCheckState::Idle));
+
+        let mut failed = UpdateCheckState::InstallFailed {
+            available: update_available(None),
+            error: "boom".to_string(),
+        };
+        reset_update_check_if_resolved(&mut failed);
+        assert!(matches!(failed, UpdateCheckState::Idle));
+
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let mut checking = UpdateCheckState::Checking { rx };
+        reset_update_check_if_resolved(&mut checking);
         assert!(
-            texts.contains(&"Update now".to_string()),
-            "expected the retry button, got {texts:?}"
+            matches!(checking, UpdateCheckState::Checking { .. }),
+            "an in-flight check must survive a menu close"
         );
     }
 
