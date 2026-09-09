@@ -3518,7 +3518,7 @@ pub fn scene_name(id: u32) -> Option<&'static str> {
         24650 => "Guardian 31",
         24651 => "Attack 31",
         24652 => "Support 31",
-        30001 => "Community Map 1",
+        30001 => "Homestead Courtyard",
         30101 => "Floor 1",
         30102 => "Floor 2",
         30103 => "Floor 3",
@@ -14910,6 +14910,16 @@ mod tests {
     fn unknown_ids_are_none() {
         assert_eq!(monster_name(0), None);
         assert_eq!(scene_name(0), None);
+    }
+
+    #[test]
+    fn manual_override_wins_for_a_curated_scene_name() {
+        // Issue #433: `SceneName.json` calls scene 30001 "Community Map 1",
+        // but the shipped client renders it as "Homestead Courtyard", which
+        // is what the reporter read off their own screen.
+        // `SCENE_NAME_MANUAL_OVERRIDES` in `scripts/gen-name-tables.py` pins
+        // this the same way `MONSTER_NAME_MANUAL_OVERRIDES` pins monsters.
+        assert_eq!(scene_name(30001), Some("Homestead Courtyard"));
     }
 
     #[test]

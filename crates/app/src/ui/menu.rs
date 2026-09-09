@@ -330,6 +330,15 @@ pub(super) fn menu_page_id() -> egui::Id {
     egui::Id::new("header_menu_page")
 }
 
+/// The `egui` temp-memory key holding whether the header dropdown was open
+/// on the *previous* frame (issue #434). `draw_header` needs the open→
+/// closed transition, not merely "closed", to reset a resolved update
+/// check, and `Popup`'s own open flag only says what this frame is; the
+/// same global-key reasoning as `menu_page_id` applies.
+pub(super) fn menu_popup_was_open_id() -> egui::Id {
+    egui::Id::new("header_menu_popup_was_open")
+}
+
 /// Puts the dropdown back on its root page. Called from `draw_header` on
 /// every frame the popup is *not* open, so a menu that was closed while
 /// drilled into Columns does not reopen there: a dropdown that remembers
@@ -1208,70 +1217,93 @@ fn draw_menu_root(
             | UpdateCheckState::Installing { .. }
             | UpdateCheckState::Restarting
     );
-    if menu_row(
+    // Issue #434: the status used to grow as extra `ui.label`/`ui.
+    // horizontal` lines under this row, which wrapped inside the dropdown's
+    // fixed `HEADER_MENU_WIDTH`. It now reads in the row's own label,
+    // through `menu_row`'s existing single-line, ellipsis-truncating
+    // layout — the same mechanism every other row here already uses to
+    // stay on one line.
+    let label = update_check_row_label(update_check);
+    let response = menu_row(
         ui,
         MenuRow {
             icon: None,
-            label: "Check for updates",
+            label: &label,
             trailing: Trailing::None,
             enabled: !busy,
         },
-    )
-    .clicked()
+    );
+    // Issue #434: the row is a single elided label, so anything longer than
+    // its ~208px band is unreadable in place — the error states put their
+    // full text in the tooltip, and the release page (which `Trailing` has
+    // no button variant to hold, and which must not be faked as an inline
+    // "link" that a plain label cannot open) names the gesture that opens
+    // it. Both lines share one tooltip so a failed install shows the reason
+    // and the release page together.
+    let mut hover_lines = Vec::new();
+    if matches!(
+        update_check,
+        UpdateCheckState::Done(Err(_)) | UpdateCheckState::InstallFailed { .. }
+    ) {
+        hover_lines.push(label.clone());
+    }
+    hover_lines.extend(release_notes_tooltip(update_check));
+    let response = if hover_lines.is_empty() {
+        response
+    } else {
+        response.on_hover_text(hover_lines.join("\n"))
+    };
+    if response.clicked() {
+        match update_check {
+            // An offer that carries a downloadable asset installs in place;
+            // its label says so ("Install {tag}").
+            UpdateCheckState::Done(Ok(
+                available @ CheckOutcome::UpdateAvailable {
+                    asset_url: Some(_), ..
+                },
+            ))
+            | UpdateCheckState::InstallFailed {
+                available:
+                    available @ CheckOutcome::UpdateAvailable {
+                        asset_url: Some(_), ..
+                    },
+                ..
+            } => {
+                *update_check = start_update_install(available.clone());
+            }
+            // An asset-less release (anything tagged before issue #249, or
+            // an upload that never finished) has nothing to download, so
+            // `start_update_install` would only loop straight back into
+            // `InstallFailed`. Open the release page instead — the label
+            // ("Open {tag} release page") promises exactly that.
+            UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable {
+                url,
+                asset_url: None,
+                ..
+            }))
+            | UpdateCheckState::InstallFailed {
+                available:
+                    CheckOutcome::UpdateAvailable {
+                        url,
+                        asset_url: None,
+                        ..
+                    },
+                ..
+            } => {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+            }
+            _ => {
+                *update_check = start_update_check();
+            }
+        }
+    }
+    // The release page stays reachable even when the primary click is spent
+    // on the install, which is the only way to reach it at all now that the
+    // old `hyperlink_to` line is gone.
+    if response.secondary_clicked()
+        && let Some(url) = release_notes_url(update_check)
     {
-        *update_check = start_update_check();
-    }
-    // Issue #250: an "Update now" click can't assign `*update_check` from
-    // inside the match below, which borrows it — so the click is collected
-    // here and acted on once the match has ended.
-    let mut clicked_install: Option<CheckOutcome> = None;
-    match &*update_check {
-        UpdateCheckState::Idle => {}
-        UpdateCheckState::Checking { .. } => {
-            ui.horizontal(|ui| {
-                ui.add_space(MENU_ROW_INSET);
-                ui.label("Checking…");
-            });
-        }
-        UpdateCheckState::Done(Ok(CheckOutcome::UpToDate)) => {
-            ui.horizontal(|ui| {
-                ui.add_space(MENU_ROW_INSET);
-                ui.label(format!("Up to date (v{})", env!("CARGO_PKG_VERSION")));
-            });
-        }
-        UpdateCheckState::Done(Ok(available @ CheckOutcome::UpdateAvailable { .. })) => {
-            draw_update_available(ui, available, &mut clicked_install);
-        }
-        UpdateCheckState::Done(Err(err)) => {
-            ui.horizontal(|ui| {
-                ui.add_space(MENU_ROW_INSET);
-                ui.label(format!("Update check failed: {err}"));
-            });
-        }
-        UpdateCheckState::Installing { available, .. } => {
-            let tag = update_tag(available);
-            ui.label(format!("Downloading {tag}…"));
-            // The install thread reports once, at the end — WinHTTP's read
-            // loop has no progress callback wired through
-            // `platform::http_get_bytes` — so this is a spinner, not a
-            // percentage. Claiming a percentage it cannot know would be
-            // worse than not showing one.
-            ui.spinner();
-        }
-        UpdateCheckState::Restarting => {
-            ui.label("Restarting…");
-        }
-        UpdateCheckState::InstallFailed { available, error } => {
-            // The offer is redrawn above the error on purpose: a failed
-            // download is usually transient (a dropped connection, a proxy
-            // hiccup), so the retry has to be one click away rather than
-            // behind a fresh check.
-            draw_update_available(ui, available, &mut clicked_install);
-            ui.label(format!("Update failed: {error}"));
-        }
-    }
-    if let Some(available) = clicked_install {
-        *update_check = start_update_install(available);
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
     }
 
     // Issue #203: a UI-settings reset (window size + opacity), distinct

@@ -226,8 +226,28 @@ pub(super) fn draw_header(
     // Cleared here, outside the popup body, because the body only runs
     // while the popup is open; `Popup::default_response_id` is exactly the
     // id `Popup::menu(&chevron_response)` below keys its open state under.
-    if !egui::Popup::is_id_open(ctx, egui::Popup::default_response_id(&chevron_response)) {
+    let popup_open =
+        egui::Popup::is_id_open(ctx, egui::Popup::default_response_id(&chevron_response));
+    if !popup_open {
         reset_menu_page(ctx);
+    }
+    // Issue #434: a resolved "Check for updates" result must not survive
+    // the dropdown closing — otherwise a stale `Done`/`InstallFailed` from
+    // the last time it was opened keeps showing instead of the plain "Check
+    // for updates" row. Only on the open→closed *transition*, though: doing
+    // it on every closed frame would also throw away a result that landed
+    // while the popup was shut, which nobody has seen yet. `Checking`/
+    // `Installing`/`Restarting` are left alone; see that function's own doc
+    // comment for why.
+    let was_open = ctx.data_mut(|data| {
+        let previous = data
+            .get_temp::<bool>(menu_popup_was_open_id())
+            .unwrap_or(false);
+        data.insert_temp(menu_popup_was_open_id(), popup_open);
+        previous
+    });
+    if was_open && !popup_open {
+        reset_update_check_if_resolved(update_check);
     }
     // `CloseOnClickOutside` rather than the default `CloseOnClick` (issue
     // #93, now a standing rule — see `menu.rs`'s issue #120 block): this
@@ -288,19 +308,13 @@ pub(super) fn draw_header(
     // `header_band_height` budgets for.
     let row_size = egui::vec2(ui.available_width(), BUTTON_ROW_HEIGHT);
     let (row_rect, _) = ui.allocate_exact_size(row_size, egui::Sense::hover());
-    let (pills_rect, cluster_rect) = split_stat_row(row_rect);
+    let pills_rect = reserved_pills_rect(row_rect);
     let mut pills_ui = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(pills_rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     pills_ui.set_clip_rect(pills_rect.intersect(ui.clip_rect()));
-    let mut cluster_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(cluster_rect)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-    );
-    cluster_ui.set_clip_rect(cluster_rect.intersect(ui.clip_rect()));
     {
         let ui = &mut pills_ui;
         // The whole row is inset from the panel's left content edge
@@ -332,18 +346,34 @@ pub(super) fn draw_header(
                 icons.glyphs.get(GlyphIcon::Speed).map(|t| t.id()),
             ),
         );
-        // Total damage for the fight (reference render's e.g. "30.10B"). The
-        // heart icon is the reference's own choice of glyph here; despite it
-        // this is `snapshot.total_damage` and nothing else — there is no
-        // party-HP figure anywhere in this codebase.
-        stat_pill(
+        // The selected boss's total health (issue #436) — the heart icon is
+        // the reference's own choice of glyph here, and until #436 this pill
+        // drew `snapshot.total_damage` under it, which climbed with the
+        // fight instead of reading as an HP figure. `total_damage` is kept
+        // on `Snapshot` for the rows/history that still want it; this pill
+        // no longer does.
+        let heart_pill = stat_pill(
             ui,
             StatPill::header(
-                &fmt_short(snapshot.total_damage),
+                &heart_pill_text(&snapshot.encounter),
                 icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
             ),
         );
+        if let Some(tooltip) = heart_pill_tooltip(&snapshot.encounter) {
+            heart_pill.on_hover_text(tooltip);
+        }
     }
+    // Placed *after* the pills have actually rendered (issue #435), from
+    // their real ink extent (`pills_ui.min_rect().right()`) rather than a
+    // fixed slot — see `split_stat_row`'s own comment for the narrow-row
+    // clamp this still keeps.
+    let cluster_rect = split_stat_row(row_rect, pills_ui.min_rect().right());
+    let mut cluster_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(cluster_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    cluster_ui.set_clip_rect(cluster_rect.intersect(ui.clip_rect()));
     toggle_cluster(
         &mut cluster_ui,
         tx_command,
@@ -462,6 +492,13 @@ pub(super) const STAT_ROW_TOGGLE_CLUSTER_WIDTH: f32 = 2.0 * TOGGLE_PAD_X
     + TOGGLE_CLOUD_SIDE
     + TOGGLE_GAP
     + TOGGLE_HISTORY_SIDE;
+
+/// Gap between the stat pills' rendered right edge and the toggle
+/// cluster that follows them (issue #435), matching `apply_theme`'s
+/// `item_spacing.x` (6.0) — the same gap the pills already use between
+/// each other — so the cluster reads as a fourth member of the same run
+/// rather than a separately-positioned block.
+pub(super) const STAT_ROW_PILLS_CLUSTER_GAP: f32 = 6.0;
 
 /// Gap, in points, between the title row's toggle pill (issue #185) and the
 /// dropdown chevron's reserved strip to its right. `TOGGLE_PAD_X`'s value,
@@ -683,33 +720,49 @@ pub(super) fn availability_label(
     if active { label } else { unavailable }
 }
 
-/// Splits the stat row's rect into the stat pills' area and the toggle
-/// cluster's, reserving the cluster's fixed `STAT_ROW_TOGGLE_CLUSTER_WIDTH`
-/// on the *right* of `row_rect` before the pills get a say. `draw_header`
-/// used to lay the pills and the cluster out in one shared child `Ui`,
-/// sized purely by the layout cursor's left-to-right advance — so at a
-/// narrow window (below ~372pt of panel) the pills' own ink pushed the
+/// Reserves the toggle cluster's fixed `STAT_ROW_TOGGLE_CLUSTER_WIDTH` on
+/// the *right* of `row_rect` for `draw_header` to size the pills' child
+/// `Ui` from — before the pills have actually rendered and so before
+/// their real right edge (`pills_right`, below) is known. This upper
+/// bound is what keeps the pills (informational) the thing that clips at
+/// a narrow window, never the controls: see `split_stat_row`'s own
+/// comment for the rest of that history (issue #400).
+pub(super) fn reserved_pills_rect(row_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        row_rect.min,
+        egui::pos2(
+            row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH,
+            row_rect.bottom(),
+        ),
+    )
+}
+
+/// Places the toggle cluster immediately after the stat pills' *actual*
+/// rendered right edge, `pills_right` — not pinned to a fixed slot
+/// regardless of how far short of it the pills' own ink reaches (issue
+/// #435). The gap between the cluster and the pills is
+/// `STAT_ROW_PILLS_CLUSTER_GAP`, the same gap the pills use between
+/// themselves, so the whole row reads as one run of controls.
+///
+/// The result is clamped so its left edge never passes
+/// `row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH`: `draw_header` used
+/// to lay the pills and the cluster out in one shared child `Ui`, sized
+/// purely by the layout cursor's left-to-right advance — so at a narrow
+/// window (below ~372pt of panel) the pills' own ink pushed the
 /// cluster's `allocate_exact_size` rect past `row_ui`'s clip rect, and
 /// `toggle_cluster`'s `is_rect_visible` early return silently dropped
 /// Share/Reset/History with no other way to reach Reset. The cluster's
-/// width is fixed and known up front, so reserving its slot first — in a
-/// `Ui` of its own, with the pills given whatever width is left over in a
-/// second one — makes the pills (informational) the thing that clips at a
-/// narrow width, never the controls. Pure so the split is unit-testable
-/// without a live `egui::Context`; `draw_header` is the only caller.
-pub(super) fn split_stat_row(row_rect: egui::Rect) -> (egui::Rect, egui::Rect) {
-    let cluster_rect = egui::Rect::from_min_max(
-        egui::pos2(
-            row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH,
-            row_rect.top(),
-        ),
-        row_rect.max,
-    );
-    let pills_rect = egui::Rect::from_min_max(
-        row_rect.min,
-        egui::pos2(cluster_rect.left(), row_rect.bottom()),
-    );
-    (pills_rect, cluster_rect)
+/// width is fixed and known up front, so this clamp reserves its slot
+/// unconditionally, no matter how far the pills' ink actually reaches.
+/// Pure so the split is unit-testable without a live `egui::Context`;
+/// `draw_header` is the only caller.
+pub(super) fn split_stat_row(row_rect: egui::Rect, pills_right: f32) -> egui::Rect {
+    let max_left = row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH;
+    let left = (pills_right + STAT_ROW_PILLS_CLUSTER_GAP).min(max_left);
+    egui::Rect::from_min_max(
+        egui::pos2(left, row_rect.top()),
+        egui::pos2(left + STAT_ROW_TOGGLE_CLUSTER_WIDTH, row_rect.bottom()),
+    )
 }
 
 pub(super) fn toggle_cluster(
@@ -1359,6 +1412,48 @@ pub(super) fn handle_share_screenshot(
 /// this precedence wholesale and only fills in the non-boss blank this
 /// function leaves on purpose (issue #424), so a saved label matches the
 /// live header whenever the header showed one (issue #39, DECISION D2).
+/// The header heart pill's text (issue #436): the selected boss's total
+/// health, or an em dash placeholder — the same "not known yet" convention
+/// `fmt_death_time` uses — when `Meter::snapshot` has no `boss_max_hp` for
+/// the current target.
+pub(crate) fn heart_pill_text(e: &EncounterInfo) -> String {
+    match e.boss_max_hp {
+        Some(max) => fmt_short(max as i64),
+        None => "\u{2014}".to_string(),
+    }
+}
+
+/// Thousands separators for the heart pill's tooltip (issue #436). The pill
+/// itself is abbreviated (`fmt_short`); the tooltip is the place the exact
+/// figure is spelled out, and an unseparated eight-digit raid HP pool is
+/// unreadable at a glance -- which is the only reason to hover it.
+fn fmt_grouped(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The heart pill's hover tooltip (issue #436): "Boss HP: {curr} / {max}"
+/// once both halves are known, `None` (no tooltip at all) otherwise — a
+/// half-known reading (e.g. a max with no current yet) isn't worth
+/// captioning.
+pub(crate) fn heart_pill_tooltip(e: &EncounterInfo) -> Option<String> {
+    match (e.boss_curr_hp, e.boss_max_hp) {
+        (Some(curr), Some(max)) => Some(format!(
+            "Boss HP: {} / {}",
+            fmt_grouped(curr),
+            fmt_grouped(max)
+        )),
+        _ => None,
+    }
+}
+
 pub(crate) fn encounter_title(e: &EncounterInfo) -> String {
     if e.is_boss {
         // `is_boss` is only ever true alongside a `Some` `boss_monster_id`
@@ -1861,21 +1956,26 @@ pub(super) fn header_emblem_rect(row: egui::Rect, text_band_height: f32) -> egui
 /// That mask used to be skipped here, on the reasoning that the diagonal
 /// gradient already reaches zero by the bottom-right. It does — but only
 /// *there*: the bottom-*left* corner is still at `HEADER_WASH_TOP_ALPHA /
-/// 2`, and the oversized emblem is painted at a flat alpha across the
-/// whole rect, so the wash ended in a hard slate edge at its bottom (which
-/// is the first player row's top, `first_player_row_top_offset`) instead of
+/// 2`, so the gradient ended in a hard slate edge at its bottom (which is
+/// the first player row's top, `first_player_row_top_offset`) instead of
 /// dissolving into the rows. `header_wash_mask` reproduces the mask, and
-/// `header_wash_gradient_strips` / `header_wash_emblem_strips` apply it to
-/// both layers. The one liberty taken: the source's brush is relative to a
-/// fixed `Height="98"` border, ours to the wash rect, whose height is
-/// derived from the measured header content (issues #81/#91/#158) — the
-/// mask is a fraction of whatever that rect turns out to be.
+/// `header_wash_gradient_strips` applies it to the gradient. The one liberty
+/// taken: the source's brush is relative to a fixed `Height="98"` border,
+/// ours to the wash rect, whose height is derived from the measured header
+/// content (issues #81/#91/#158) — the mask is a fraction of whatever that
+/// rect turns out to be.
+///
+/// Issue #437: the oversized emblem is *not* masked or clipped to this
+/// rect — see `header_wash_emblem_rect`/`draw_header_wash` — because doing
+/// so is what hid the mark almost entirely once the wash rect shrank to its
+/// correctly-measured, small header-band height (#399).
 ///
 /// Issue #81 replaced a fixed `98.0`pt run — taller than the drag band
 /// itself, so its tail bled into the player rows — with a height derived
 /// from the content. Issue #91 settles which content: the whole header band
-/// (`header_band_height`), stat-pill row included. The gradient and the
-/// oversized emblem share one rect, so both now run the full band. Issue
+/// (`header_band_height`), stat-pill row included. The gradient runs the
+/// full band (the oversized emblem has its own box and clip since issue
+/// #437, above). Issue
 /// #91 believed that made both flush with the first player row; issue #158
 /// found the band's own bottom edge is actually 8pt short of it (the blank
 /// `SEPARATOR_HEIGHT` band between the header and the rows, plus the
@@ -1894,8 +1994,10 @@ pub(super) const HEADER_WASH_TOP_ALPHA: u8 = 0x50;
 pub(super) const HEADER_WASH_EMBLEM_SIZE: f32 = 200.0;
 /// How far the wash emblem's right edge overhangs the wash's own right edge,
 /// in points: the source right-aligns the wash `Svg.HPBar` with a `-25` right
-/// margin, so its last 25pt hang off the panel and the wash's clip rect cuts
-/// them away — the mirror of the gutter emblem's `HEADER_EMBLEM_LEFT_BLEED`.
+/// margin, so its last 25pt hang off the panel and `draw_header_wash`'s clip
+/// rect (the panel itself, issue #437 — not the wash rect) cuts them away at
+/// the panel's right edge — the mirror of the gutter emblem's
+/// `HEADER_EMBLEM_LEFT_BLEED`.
 ///
 /// Nudged in from the source's literal `25` to `17` (issue #255's
 /// live-window pass): at `25` the emblem's circular arc edge sat almost
@@ -1906,21 +2008,19 @@ pub(super) const HEADER_WASH_EMBLEM_SIZE: f32 = 200.0;
 /// clearing the toggle glyph boxes without touching the wash's size, alpha
 /// or the toggle cluster's own layout.
 pub(super) const HEADER_WASH_EMBLEM_BLEED: f32 = 17.0;
-/// How far above the wash's centerline the watermark's box rides, in
-/// points: the source's `Margin="0 -20 -25 20"` on a
-/// `VerticalAlignment="Center"` `Path`
-/// (`DamageMeter.UI/HUD/Controls/MainView.xaml`). A `-20` top paired with a
-/// `+20` bottom leaves the box's own height untouched and shifts the
-/// centered square up by the margin — unlike the gutter emblem's lone
-/// negative bottom margin (`HEADER_EMBLEM_BOTTOM_BLEED`), which grows the
-/// height it is centered in instead. `header_wash_emblem_rect` subtracts it
-/// from the centered y.
-pub(super) const HEADER_WASH_EMBLEM_RISE: f32 = 20.0;
-/// `Opacity=".05"` on a SlateGray fill — the alpha the wash emblem is
-/// painted at at the *top* of the wash. Everything below is dimmer: the
-/// source's `OpacityMask` scales this down to nothing by
-/// `HEADER_WASH_MASK_END` (`header_wash_emblem_strips`), so the watermark
-/// fades out rather than ending in a straight line at the first player row.
+/// `Opacity=".05"` on a SlateGray fill — the flat alpha the wash emblem is
+/// painted at, everywhere in its box.
+///
+/// Issue #437: the wash gradient's `OpacityMask` (`header_wash_mask`,
+/// `HEADER_WASH_MASK_END`) no longer applies to this — the fade strips that
+/// used to blit the emblem through it (the since-removed
+/// `header_wash_emblem_strips`) also
+/// clipped its 200pt box down to the small wash band's own height, which is
+/// what actually hid the mark once the band-measurement fix (#399) made
+/// that band the true ~70-80pt header height instead of the whole window.
+/// The emblem is a single flat `painter.image()` blit again (matching
+/// v0.3.0), clipped to the panel rather than the wash rect, so its full box
+/// paints regardless of how tall the wash band measures.
 pub(super) const HEADER_WASH_EMBLEM_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(0x70, 0x80, 0x90, 13);
 
@@ -2009,52 +2109,6 @@ fn strip_frac(i: usize) -> f32 {
     i as f32 / HEADER_WASH_MASK_STRIPS as f32 * HEADER_WASH_MASK_END
 }
 
-/// The wash's oversized `Svg.HPBar` watermark under the same
-/// `OpacityMask`, as `(rect, uv, [top-left, top-right, bottom-left,
-/// bottom-right])` per strip. `painter.image` takes one flat tint for the
-/// whole blit, which cannot fade, so the watermark is drawn as a textured
-/// mesh instead: each strip is the slice of `header_wash_emblem_rect` that
-/// falls inside it, its `uv` addresses that same slice of the image (0..1
-/// over the full `HEADER_WASH_EMBLEM_SIZE` box, so the art is not
-/// restretched strip by strip), and its corner tints are
-/// `HEADER_WASH_EMBLEM_COLOR` scaled by `header_wash_mask` at the strip's
-/// own top and bottom. Strips whose slice is empty are the caller's to
-/// skip; the rects that overhang the wash (`HEADER_WASH_EMBLEM_BLEED`) rely
-/// on its clip rect exactly as the single blit used to.
-pub(super) fn header_wash_emblem_strips(
-    wash: egui::Rect,
-    opacity: Opacity,
-) -> Vec<(egui::Rect, egui::Rect, [egui::Color32; 4])> {
-    let emblem = header_wash_emblem_rect(wash);
-    let alpha = f32::from(HEADER_WASH_EMBLEM_COLOR.a());
-    let uv_y = |y: f32| (y - emblem.top()) / emblem.height();
-
-    (0..HEADER_WASH_MASK_STRIPS)
-        .map(|i| {
-            let top_frac = strip_frac(i);
-            let bottom_frac = strip_frac(i + 1);
-            let rect = egui::Rect::from_min_max(
-                egui::pos2(wash.left(), wash.top() + top_frac * wash.height()),
-                egui::pos2(wash.right(), wash.top() + bottom_frac * wash.height()),
-            )
-            .intersect(emblem);
-            let uv = egui::Rect::from_min_max(
-                egui::pos2(
-                    (rect.left() - emblem.left()) / emblem.width(),
-                    uv_y(rect.top()),
-                ),
-                egui::pos2(
-                    (rect.right() - emblem.left()) / emblem.width(),
-                    uv_y(rect.bottom()),
-                ),
-            );
-            let top = header_wash_slate(alpha * header_wash_mask(top_frac), opacity);
-            let bottom = header_wash_slate(alpha * header_wash_mask(bottom_frac), opacity);
-            (rect, uv, [top, top, bottom, bottom])
-        })
-        .collect()
-}
-
 /// Where the wash panel sits for a central panel of `panel`: inset from the
 /// panel's left, top and right edges by `HEADER_WASH_INSET`, and running down
 /// `height` points rather than to the panel's bottom. Pure geometry, so the
@@ -2069,30 +2123,46 @@ pub(super) fn header_wash_rect(panel: egui::Rect, height: f32) -> egui::Rect {
     )
 }
 
-/// Where the wash's oversized emblem sits inside a wash of `wash`: centered
-/// on it and then lifted `HEADER_WASH_EMBLEM_RISE` (the source's `-20`
-/// top / `+20` bottom margin pair), and right-aligned so exactly
-/// `HEADER_WASH_EMBLEM_BLEED` points overhang its right edge. Taller than the
-/// wash as well as wider, so both the overhang and the top/bottom overflow
-/// rely on the caller's clip rect.
+/// Where the wash's oversized emblem sits inside a wash of `wash`:
+/// top-anchored to the wash's own top edge (which is the header's top edge
+/// plus `HEADER_WASH_INSET`, regardless of how tall the wash band itself
+/// measures), and right-aligned so exactly `HEADER_WASH_EMBLEM_BLEED` points
+/// overhang its right edge. Taller than the wash as well as wider, so both
+/// the overhang and the bottom overflow rely on the caller's clip rect.
+///
+/// Issue #437: v0.3.0 centered this on the wash and rode `20`pt above its
+/// centerline (the source's `Margin="0 -20 -25 20"`) — reasonable when the
+/// wash was (through the #340 bug this docstring's neighbors describe)
+/// effectively the whole window, so its center sat well below the header.
+/// Once the band-measurement fix (#399) made the wash the true, small
+/// header band, centering on it put most of the 200pt box above the
+/// header entirely. Anchoring to the top edge instead keeps the box's top
+/// where the header itself begins and lets the box's bottom run down past
+/// the wash band into the rows, painted by `draw_header_wash` through a
+/// clip rect wide enough not to cut that overflow away.
 pub(super) fn header_wash_emblem_rect(wash: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(
         egui::pos2(
             wash.right() + HEADER_WASH_EMBLEM_BLEED - HEADER_WASH_EMBLEM_SIZE,
-            wash.center().y - HEADER_WASH_EMBLEM_SIZE / 2.0 - HEADER_WASH_EMBLEM_RISE,
+            wash.top(),
         ),
         egui::Vec2::splat(HEADER_WASH_EMBLEM_SIZE),
     )
 }
 
 /// Paints the header's decorative background wash — a diagonal gradient
-/// panel with a huge, nearly-invisible emblem bleeding off its right edge —
-/// clipped to its own rect so it can never bleed into the rows below or over
-/// the panel's rounded corners. `panel` is the whole central panel's rect
-/// (not the drag band); `height` (issue #158, `first_player_row_top_offset`
-/// of `header_band_height` less `HEADER_WASH_INSET`) is what actually
-/// bounds the wash — the whole header band plus the blank seam gap below
-/// it, stopping exactly where the first player row begins
+/// panel with a huge, nearly-invisible emblem bleeding off its right edge.
+/// The gradient is clipped to its own rect so it can never bleed into the
+/// rows below or over the panel's rounded corners; the emblem (issue #437)
+/// is deliberately clipped wider, to `panel` instead, so its oversized box
+/// can paint straight through into the row area behind it: the rows' own
+/// chrome is painted over it and, being translucent, is faintly tinted by
+/// it — the v0.3.0 look.
+/// `panel` is the whole central panel's rect (not the drag band); `height`
+/// (issue #158, `first_player_row_top_offset` of `header_band_height` less
+/// `HEADER_WASH_INSET`) is what actually bounds the gradient — the whole
+/// header band plus the blank seam gap below it, stopping exactly where the
+/// first player row begins
 /// (`wash_covers_the_stat_pill_row_but_stops_at_the_first_player_row`).
 ///
 /// The source rounds the wash's top corners (`CornerRadius="7 7 0 0"`); egui
@@ -2142,24 +2212,23 @@ pub(super) fn draw_header_wash(
         painter.add(egui::Shape::mesh(gradient_mesh(rect, tl, tr, bl, br)));
     }
 
+    // Issue #437: clipped to `panel`, not `wash_rect` — the emblem's 200pt
+    // box is top-anchored to the wash's own top edge (`header_wash_emblem_
+    // rect`) and taller than the small band the band-measurement fix (#399)
+    // now correctly measures, so a clip that stopped at the wash's own
+    // bottom (as the gradient's does) would cut nearly all of it away
+    // again. `panel` is the whole central panel, so the box's overflow
+    // paints straight through into the player rows behind them — this is
+    // called from `draw_header` before the rows are drawn, so their own ink
+    // lands on top of it.
     if let Some(emblem) = icons.glyphs.get(GlyphIcon::Emblem) {
-        for (rect, uv, colors) in header_wash_emblem_strips(wash_rect, opacity) {
-            if !rect.is_positive() {
-                continue;
-            }
-            let mut mesh = egui::Mesh::with_texture(emblem.id());
-            for (pos, uv, color) in [
-                (rect.left_top(), uv.left_top(), colors[0]),
-                (rect.right_top(), uv.right_top(), colors[1]),
-                (rect.left_bottom(), uv.left_bottom(), colors[2]),
-                (rect.right_bottom(), uv.right_bottom(), colors[3]),
-            ] {
-                mesh.vertices.push(egui::epaint::Vertex { pos, uv, color });
-            }
-            mesh.add_triangle(0, 1, 2);
-            mesh.add_triangle(1, 3, 2);
-            painter.add(egui::Shape::mesh(mesh));
-        }
+        let emblem_rect = header_wash_emblem_rect(wash_rect);
+        ui.painter().with_clip_rect(panel).image(
+            emblem.id(),
+            emblem_rect,
+            UV_FULL,
+            opacity.apply(HEADER_WASH_EMBLEM_COLOR),
+        );
     }
 }
 
@@ -2345,6 +2414,157 @@ pub(super) fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
 mod tests {
     use super::*;
     use crate::ui::tests::*;
+
+    /// Issue #434: `draw_header` calls `reset_update_check_if_resolved` on
+    /// the frame the popup goes from open to closed — so a resolved check
+    /// does not survive the dropdown closing and reopening, and the row
+    /// reads "Check for updates" again rather than a stale "Up to date"/
+    /// "Update failed". The previous frame is seeded as "open" directly,
+    /// since a test frame cannot open the real popup.
+    #[test]
+    fn draw_header_resets_a_resolved_update_check_when_the_popup_is_closed() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(0);
+        let mut update_check = UpdateCheckState::Done(Ok(CheckOutcome::UpToDate));
+        ctx.data_mut(|data| data.insert_temp(menu_popup_was_open_id(), true));
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header(
+                ui,
+                &ctx,
+                &snapshot,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut WindowGesture::default(),
+                None,
+                false,
+                true,
+                &mut update_check,
+                &unused_log_export_sender(),
+                &mut 0,
+                false,
+                &mut false,
+                None,
+                &mut false,
+            );
+        });
+        output.drop_without_applying_deltas();
+
+        assert!(
+            matches!(update_check, UpdateCheckState::Idle),
+            "a resolved check must reset to Idle once the popup is closed, got {update_check:?}"
+        );
+    }
+
+    /// The other half of the transition rule: a result that lands while the
+    /// dropdown is *already* closed has never been shown to anyone, so
+    /// resetting it would silently discard the answer the user asked for.
+    /// Resetting on every closed frame — rather than on open→closed — is
+    /// exactly what would break this.
+    #[test]
+    fn draw_header_keeps_a_result_that_landed_while_the_popup_was_already_closed() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(0);
+        let mut update_check = UpdateCheckState::Done(Ok(CheckOutcome::UpToDate));
+        // The popup was already shut on the previous frame, too.
+        ctx.data_mut(|data| data.insert_temp(menu_popup_was_open_id(), false));
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header(
+                ui,
+                &ctx,
+                &snapshot,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut WindowGesture::default(),
+                None,
+                false,
+                true,
+                &mut update_check,
+                &unused_log_export_sender(),
+                &mut 0,
+                false,
+                &mut false,
+                None,
+                &mut false,
+            );
+        });
+        output.drop_without_applying_deltas();
+
+        assert!(
+            matches!(
+                update_check,
+                UpdateCheckState::Done(Ok(CheckOutcome::UpToDate))
+            ),
+            "a result that landed while the popup was shut must survive, got {update_check:?}"
+        );
+    }
+
+    /// Counterpart to the test above: an in-flight check must survive the
+    /// same closed-popup frames untouched — closing the dropdown must never
+    /// look like it dropped the thread draining into `Checking`.
+    #[test]
+    fn draw_header_leaves_an_in_flight_update_check_alone_when_the_popup_is_closed() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(0);
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let mut update_check = UpdateCheckState::Checking { rx };
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header(
+                ui,
+                &ctx,
+                &snapshot,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut WindowGesture::default(),
+                None,
+                false,
+                true,
+                &mut update_check,
+                &unused_log_export_sender(),
+                &mut 0,
+                false,
+                &mut false,
+                None,
+                &mut false,
+            );
+        });
+        output.drop_without_applying_deltas();
+
+        assert!(
+            matches!(update_check, UpdateCheckState::Checking { .. }),
+            "an in-flight check must survive a closed popup, got {update_check:?}"
+        );
+    }
+
     /// Issue #91: the timer is inset from the panel's left content edge by
     /// `HEADER_STAT_ROW_INSET_X` rather than sitting flush against the
     /// window border the way its old half-pill did. That gap is the whole
@@ -2447,9 +2667,9 @@ mod tests {
         let emblems = frame.glyph_boxes(GlyphIcon::Emblem);
         assert_eq!(
             emblems.len(),
-            1 + HEADER_WASH_MASK_STRIPS,
-            "expected the gutter mark plus the wash wallpaper's masked \
-             strips (`header_wash_emblem_strips`): {emblems:?}"
+            2,
+            "expected the gutter mark plus the wash wallpaper's single \
+             watermark blit: {emblems:?}"
         );
         // The gutter mark bleeds off the panel's left edge; the wash
         // wallpaper is right-aligned to the wash. Leftmost is the gutter.
@@ -2497,6 +2717,49 @@ mod tests {
             gutter.right() <= panel_min.x + HEADER_GUTTER_WIDTH + 0.01,
             "gutter emblem ink runs to x={}, past the {HEADER_GUTTER_WIDTH}pt gutter",
             gutter.right()
+        );
+    }
+
+    /// Issue #437: the band-measurement fix (#399) left the wash wallpaper
+    /// clipped to the same small rect as the gradient, so the 200pt emblem's
+    /// visible slice shrank to whatever sliver of it fell inside the
+    /// ~70-80pt band — effectively nothing. The emblem must instead paint
+    /// through its own, wider clip (the panel), so its visible ink must
+    /// exceed the full wash band it decorates — note the painted gradient's
+    /// union is only the masked `HEADER_WASH_MASK_END` fraction of that
+    /// band, so the band itself is the taller bar to clear.
+    #[test]
+    fn the_wash_emblem_paints_past_the_wash_band_not_confined_to_it() {
+        let snapshot = header_test_snapshot(30_100_000_000);
+        let frame = header_painted_boxes(&snapshot);
+        let wash = frame.gradient_box();
+
+        let emblems = frame.glyph_boxes(GlyphIcon::Emblem);
+        // The gutter mark plus the wash's own single watermark blit — no
+        // longer the gutter mark plus `HEADER_WASH_MASK_STRIPS` fade strips.
+        assert_eq!(
+            emblems.len(),
+            2,
+            "expected the gutter mark plus one wash watermark blit: {emblems:?}"
+        );
+        let wash_emblem = emblems
+            .iter()
+            .copied()
+            .max_by(|a, b| a.right().total_cmp(&b.right()))
+            .expect("the header painted no wash emblem");
+
+        let wash_band_height = wash.height() / HEADER_WASH_MASK_END;
+        assert_eq!(
+            wash_emblem.top(),
+            wash.top(),
+            "the wash emblem's visible top must be the wash's top"
+        );
+        assert!(
+            wash_emblem.height() > wash_band_height + 1.0,
+            "the wash emblem's visible ink is {}pt tall, no taller than the \
+             {}pt wash band it decorates — it is still confined to the band",
+            wash_emblem.height(),
+            wash_band_height
         );
     }
 
@@ -2765,17 +3028,20 @@ mod tests {
     /// Regression for the toggle cluster's silent-drop bug: at a stat row
     /// no wider than `MIN_INNER_SIZE.x` (issue #400's overflow floor, well
     /// past the ~372pt panel width the pills alone start overflowing at),
-    /// `split_stat_row`'s cluster half must still land entirely inside
+    /// the cluster rect `split_stat_row` returns must still land entirely inside
     /// `row_rect` — the reservation is unconditional on the row's own
     /// width, not on the pills leaving enough room behind. Reset has no
     /// other entry point, so if this ever fails again the button is gone.
+    /// `pills_right` is passed as `row_rect.right()` here to model the
+    /// worst case: the pills' ink claims the entire reserved area and
+    /// still must not push the cluster past the row.
     #[test]
     fn split_stat_row_keeps_the_toggle_cluster_inside_a_narrow_row() {
         let row_rect = egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
             egui::vec2(MIN_INNER_SIZE.x, BUTTON_ROW_HEIGHT),
         );
-        let (pills_rect, cluster_rect) = split_stat_row(row_rect);
+        let cluster_rect = split_stat_row(row_rect, row_rect.right());
 
         assert!(
             row_rect.contains_rect(cluster_rect),
@@ -2783,9 +3049,42 @@ mod tests {
         );
         assert_eq!(cluster_rect.width(), STAT_ROW_TOGGLE_CLUSTER_WIDTH);
         assert_eq!(cluster_rect.right(), row_rect.right());
-        assert!(
-            pills_rect.right() <= cluster_rect.left(),
-            "the pills area {pills_rect:?} overlaps the toggle cluster {cluster_rect:?}"
+    }
+
+    /// Issue #435: the toggle cluster used to be pinned to a fixed
+    /// right-hand slot regardless of how far short of it the stat pills'
+    /// own ink actually reached, leaving a gap between the DPS/Damage
+    /// trio and Share/Reset/History at any width wider than the ~372pt
+    /// overflow floor. When there is slack (`pills_right` well short of
+    /// `row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH`) the cluster's
+    /// left edge must track `pills_right`, offset by the same
+    /// `STAT_ROW_PILLS_CLUSTER_GAP` the pills use between themselves.
+    #[test]
+    fn split_stat_row_tracks_the_pills_right_edge_when_there_is_slack() {
+        let row_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, BUTTON_ROW_HEIGHT));
+        let pills_right = 200.0;
+        let cluster_rect = split_stat_row(row_rect, pills_right);
+
+        assert_eq!(
+            cluster_rect.left(),
+            pills_right + STAT_ROW_PILLS_CLUSTER_GAP
+        );
+        assert_eq!(cluster_rect.width(), STAT_ROW_TOGGLE_CLUSTER_WIDTH);
+    }
+
+    /// `STAT_ROW_PILLS_CLUSTER_GAP` claims to match `apply_theme`'s
+    /// `item_spacing.x` — the gap the pills use between themselves — so
+    /// the cluster reads as a fourth member of the same run. Pin that
+    /// claim: if the theme's spacing moves, this fails instead of the
+    /// cluster silently drifting off-rhythm.
+    #[test]
+    fn stat_row_pills_cluster_gap_matches_the_theme_item_spacing() {
+        let ctx = egui::Context::default();
+        super::super::apply_theme(&ctx);
+        assert_eq!(
+            ctx.global_style().spacing.item_spacing.x,
+            STAT_ROW_PILLS_CLUSTER_GAP
         );
     }
 
@@ -4151,6 +4450,53 @@ mod tests {
         );
     }
 
+    // -- heart pill boss HP (issue #436) ------------------------------------
+
+    #[test]
+    fn heart_pill_text_shows_fmt_short_of_boss_max_hp_when_known() {
+        let encounter = EncounterInfo {
+            boss_max_hp: Some(1_500_000),
+            ..Default::default()
+        };
+        assert_eq!(heart_pill_text(&encounter), fmt_short(1_500_000));
+    }
+
+    #[test]
+    fn heart_pill_text_is_an_em_dash_when_boss_max_hp_is_unknown() {
+        assert_eq!(heart_pill_text(&EncounterInfo::default()), "\u{2014}");
+    }
+
+    #[test]
+    fn heart_pill_tooltip_shows_curr_and_max_when_both_known() {
+        let encounter = EncounterInfo {
+            boss_curr_hp: Some(400_000),
+            boss_max_hp: Some(1_500_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            heart_pill_tooltip(&encounter),
+            Some("Boss HP: 400,000 / 1,500,000".to_string())
+        );
+    }
+
+    #[test]
+    fn heart_pill_tooltip_is_none_when_either_half_is_unknown() {
+        let max_only = EncounterInfo {
+            boss_max_hp: Some(1_500_000),
+            ..Default::default()
+        };
+        assert_eq!(heart_pill_tooltip(&max_only), None);
+        assert_eq!(heart_pill_tooltip(&EncounterInfo::default()), None);
+    }
+
+    #[test]
+    fn fmt_grouped_separates_every_third_digit() {
+        assert_eq!(fmt_grouped(0), "0");
+        assert_eq!(fmt_grouped(999), "999");
+        assert_eq!(fmt_grouped(1_000), "1,000");
+        assert_eq!(fmt_grouped(1_500_000), "1,500,000");
+    }
+
     // -- encounter title/subtitle (issue #9 slice 2) -----------------------
 
     #[test]
@@ -5019,19 +5365,20 @@ mod tests {
     }
 
     /// The wash emblem hangs off the wash's right edge by exactly the
-    /// source's `-25` right margin, and rides `20`pt above the wash's
-    /// centerline — the source's `Margin="0 -20 -25 20"` on a
-    /// `VerticalAlignment="Center"` box, whose `-20` top / `+20` bottom pair
-    /// lifts the centered square rather than resizing it. The mirror of the
-    /// gutter emblem's left-edge bleed, and the reason the wash must be
-    /// painted through its own clip rect.
+    /// source's `-25` right margin (mirroring the gutter emblem's left-edge
+    /// bleed), and top-anchors to the wash's own top edge (issue #437) so
+    /// its top stays put regardless of how tall the wash band measures,
+    /// rather than centering on it and riding a fixed rise above the
+    /// centerline. The reason the wash must be painted through a clip rect
+    /// wider than the wash itself.
     #[test]
-    fn the_wash_emblem_bleeds_off_the_right_edge_by_the_named_overhang() {
+    fn the_wash_emblem_bleeds_off_the_right_edge_and_top_anchors_to_the_wash() {
         let wash = header_wash_rect(wash_test_panel(), WASH_TEST_HEIGHT);
         let emblem = header_wash_emblem_rect(wash);
         assert_eq!(emblem.right() - wash.right(), HEADER_WASH_EMBLEM_BLEED);
         assert!(emblem.left() > wash.left());
-        assert_eq!(emblem.center().y, wash.center().y - 20.0);
+        assert_eq!(emblem.top(), wash.top());
+        assert_eq!(emblem.bottom(), wash.top() + HEADER_WASH_EMBLEM_SIZE);
         assert_eq!(emblem.width(), HEADER_WASH_EMBLEM_SIZE);
         assert_eq!(emblem.height(), HEADER_WASH_EMBLEM_SIZE);
     }
@@ -5087,44 +5434,6 @@ mod tests {
         assert_eq!(last_colors[3].a(), 0, "bottom-right of the last strip");
     }
 
-    /// The same mask over the oversized `Svg.HPBar` watermark: it is blitted
-    /// strip by strip so its flat `HEADER_WASH_EMBLEM_COLOR` alpha fades
-    /// with depth instead of ending abruptly at the wash's bottom edge, and
-    /// each strip's UVs address the slice of the 200pt image that actually
-    /// falls inside it, so the picture is not restretched per strip.
-    #[test]
-    fn the_wash_emblem_strips_fade_the_watermark_out_by_the_mask_stop() {
-        let wash = header_wash_rect(wash_test_panel(), WASH_TEST_HEIGHT);
-        let emblem = header_wash_emblem_rect(wash);
-        let strips = header_wash_emblem_strips(wash, Opacity::OPAQUE);
-
-        assert_eq!(strips.len(), HEADER_WASH_MASK_STRIPS);
-        for (rect, uv, colors) in &strips {
-            assert!(
-                emblem.contains_rect(*rect),
-                "{rect:?} escapes the emblem box"
-            );
-            assert!(
-                (uv.top() - (rect.top() - emblem.top()) / emblem.height()).abs() < 1e-4,
-                "the strip's UVs must address its own slice of the image"
-            );
-            assert!((uv.bottom() - (rect.bottom() - emblem.top()) / emblem.height()).abs() < 1e-4);
-            for color in colors {
-                assert!(
-                    color.a() <= HEADER_WASH_EMBLEM_COLOR.a(),
-                    "the mask can only dim the watermark, never brighten it"
-                );
-            }
-            assert_eq!(colors[0], colors[1], "a strip's top tint is uniform");
-            assert_eq!(colors[2], colors[3], "a strip's bottom tint is uniform");
-        }
-
-        assert_eq!(strips[0].2[0].a(), HEADER_WASH_EMBLEM_COLOR.a());
-        let last = strips[HEADER_WASH_MASK_STRIPS - 1].2;
-        assert_eq!(last[2].a(), 0, "the watermark is gone by the mask's stop");
-        assert_eq!(last[3].a(), 0);
-    }
-
     /// Issue #255's live-window pass shrank `HEADER_WASH_EMBLEM_BLEED` from
     /// the source's literal `25` to `17` so the wash emblem stopped painting
     /// through the title row's toggle pill. Nothing tested that: the bleed's
@@ -5176,13 +5485,16 @@ mod tests {
 
     /// The wash emblem is drawn far larger than the band it decorates, so it
     /// overflows the wash vertically too — a change that made it fit would
-    /// mean it had stopped reading as an oversized watermark.
+    /// mean it had stopped reading as an oversized watermark. Issue #437:
+    /// it top-anchors to the wash's own top edge rather than centering on
+    /// it, so the overflow is entirely below the wash, not split above and
+    /// below it.
     #[test]
     fn the_wash_emblem_is_taller_than_the_wash_it_sits_in() {
         let wash = header_wash_rect(wash_test_panel(), WASH_TEST_HEIGHT);
         let emblem = header_wash_emblem_rect(wash);
         assert!(emblem.height() > wash.height());
-        assert!(emblem.top() < wash.top());
+        assert_eq!(emblem.top(), wash.top());
         assert!(emblem.bottom() > wash.bottom());
     }
 
