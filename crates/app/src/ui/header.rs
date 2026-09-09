@@ -341,11 +341,11 @@ pub(super) fn draw_header(
         let heart_pill = stat_pill(
             ui,
             StatPill::header(
-                &heart_pill_text(snapshot),
+                &heart_pill_text(&snapshot.encounter),
                 icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
             ),
         );
-        if let Some(tooltip) = heart_pill_tooltip(snapshot) {
+        if let Some(tooltip) = heart_pill_tooltip(&snapshot.encounter) {
             heart_pill.on_hover_text(tooltip);
         }
     }
@@ -1368,23 +1368,40 @@ pub(super) fn handle_share_screenshot(
 /// health, or an em dash placeholder — the same "not known yet" convention
 /// `fmt_death_time` uses — when `Meter::snapshot` has no `boss_max_hp` for
 /// the current target.
-pub(crate) fn heart_pill_text(snapshot: &Snapshot) -> String {
-    match snapshot.encounter.boss_max_hp {
+pub(crate) fn heart_pill_text(e: &EncounterInfo) -> String {
+    match e.boss_max_hp {
         Some(max) => fmt_short(max as i64),
         None => "\u{2014}".to_string(),
     }
+}
+
+/// Thousands separators for the heart pill's tooltip (issue #436). The pill
+/// itself is abbreviated (`fmt_short`); the tooltip is the place the exact
+/// figure is spelled out, and an unseparated eight-digit raid HP pool is
+/// unreadable at a glance -- which is the only reason to hover it.
+fn fmt_grouped(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The heart pill's hover tooltip (issue #436): "Boss HP: {curr} / {max}"
 /// once both halves are known, `None` (no tooltip at all) otherwise — a
 /// half-known reading (e.g. a max with no current yet) isn't worth
 /// captioning.
-pub(crate) fn heart_pill_tooltip(snapshot: &Snapshot) -> Option<String> {
-    match (
-        snapshot.encounter.boss_curr_hp,
-        snapshot.encounter.boss_max_hp,
-    ) {
-        (Some(curr), Some(max)) => Some(format!("Boss HP: {curr} / {max}")),
+pub(crate) fn heart_pill_tooltip(e: &EncounterInfo) -> Option<String> {
+    match (e.boss_curr_hp, e.boss_max_hp) {
+        (Some(curr), Some(max)) => Some(format!(
+            "Boss HP: {} / {}",
+            fmt_grouped(curr),
+            fmt_grouped(max)
+        )),
         _ => None,
     }
 }
@@ -4183,58 +4200,49 @@ mod tests {
 
     // -- heart pill boss HP (issue #436) ------------------------------------
 
-    fn snapshot_with_encounter(encounter: EncounterInfo) -> Snapshot {
-        Snapshot {
-            duration_ms: 0,
-            total_damage: 0,
-            total_dps: 0.0,
-            total_absorbed: 0,
-            total_immune: 0,
-            rows: Vec::new(),
-            encounter,
-            local_uid: None,
-            capture_alive: true,
-        }
-    }
-
     #[test]
     fn heart_pill_text_shows_fmt_short_of_boss_max_hp_when_known() {
-        let snapshot = snapshot_with_encounter(EncounterInfo {
+        let encounter = EncounterInfo {
             boss_max_hp: Some(1_500_000),
             ..Default::default()
-        });
-        assert_eq!(heart_pill_text(&snapshot), fmt_short(1_500_000));
+        };
+        assert_eq!(heart_pill_text(&encounter), fmt_short(1_500_000));
     }
 
     #[test]
     fn heart_pill_text_is_an_em_dash_when_boss_max_hp_is_unknown() {
-        let snapshot = snapshot_with_encounter(EncounterInfo::default());
-        assert_eq!(heart_pill_text(&snapshot), "\u{2014}");
+        assert_eq!(heart_pill_text(&EncounterInfo::default()), "\u{2014}");
     }
 
     #[test]
     fn heart_pill_tooltip_shows_curr_and_max_when_both_known() {
-        let snapshot = snapshot_with_encounter(EncounterInfo {
+        let encounter = EncounterInfo {
             boss_curr_hp: Some(400_000),
             boss_max_hp: Some(1_500_000),
             ..Default::default()
-        });
+        };
         assert_eq!(
-            heart_pill_tooltip(&snapshot),
-            Some("Boss HP: 400000 / 1500000".to_string())
+            heart_pill_tooltip(&encounter),
+            Some("Boss HP: 400,000 / 1,500,000".to_string())
         );
     }
 
     #[test]
     fn heart_pill_tooltip_is_none_when_either_half_is_unknown() {
-        let max_only = snapshot_with_encounter(EncounterInfo {
+        let max_only = EncounterInfo {
             boss_max_hp: Some(1_500_000),
             ..Default::default()
-        });
+        };
         assert_eq!(heart_pill_tooltip(&max_only), None);
+        assert_eq!(heart_pill_tooltip(&EncounterInfo::default()), None);
+    }
 
-        let neither = snapshot_with_encounter(EncounterInfo::default());
-        assert_eq!(heart_pill_tooltip(&neither), None);
+    #[test]
+    fn fmt_grouped_separates_every_third_digit() {
+        assert_eq!(fmt_grouped(0), "0");
+        assert_eq!(fmt_grouped(999), "999");
+        assert_eq!(fmt_grouped(1_000), "1,000");
+        assert_eq!(fmt_grouped(1_500_000), "1,500,000");
     }
 
     // -- encounter title/subtitle (issue #9 slice 2) -----------------------
