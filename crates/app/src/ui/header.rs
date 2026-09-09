@@ -1956,21 +1956,26 @@ pub(super) fn header_emblem_rect(row: egui::Rect, text_band_height: f32) -> egui
 /// That mask used to be skipped here, on the reasoning that the diagonal
 /// gradient already reaches zero by the bottom-right. It does — but only
 /// *there*: the bottom-*left* corner is still at `HEADER_WASH_TOP_ALPHA /
-/// 2`, and the oversized emblem is painted at a flat alpha across the
-/// whole rect, so the wash ended in a hard slate edge at its bottom (which
-/// is the first player row's top, `first_player_row_top_offset`) instead of
+/// 2`, so the gradient ended in a hard slate edge at its bottom (which is
+/// the first player row's top, `first_player_row_top_offset`) instead of
 /// dissolving into the rows. `header_wash_mask` reproduces the mask, and
-/// `header_wash_gradient_strips` / `header_wash_emblem_strips` apply it to
-/// both layers. The one liberty taken: the source's brush is relative to a
-/// fixed `Height="98"` border, ours to the wash rect, whose height is
-/// derived from the measured header content (issues #81/#91/#158) — the
-/// mask is a fraction of whatever that rect turns out to be.
+/// `header_wash_gradient_strips` applies it to the gradient. The one liberty
+/// taken: the source's brush is relative to a fixed `Height="98"` border,
+/// ours to the wash rect, whose height is derived from the measured header
+/// content (issues #81/#91/#158) — the mask is a fraction of whatever that
+/// rect turns out to be.
+///
+/// Issue #437: the oversized emblem is *not* masked or clipped to this
+/// rect — see `header_wash_emblem_rect`/`draw_header_wash` — because doing
+/// so is what hid the mark almost entirely once the wash rect shrank to its
+/// correctly-measured, small header-band height (#399).
 ///
 /// Issue #81 replaced a fixed `98.0`pt run — taller than the drag band
 /// itself, so its tail bled into the player rows — with a height derived
 /// from the content. Issue #91 settles which content: the whole header band
-/// (`header_band_height`), stat-pill row included. The gradient and the
-/// oversized emblem share one rect, so both now run the full band. Issue
+/// (`header_band_height`), stat-pill row included. The gradient runs the
+/// full band (the oversized emblem has its own box and clip since issue
+/// #437, above). Issue
 /// #91 believed that made both flush with the first player row; issue #158
 /// found the band's own bottom edge is actually 8pt short of it (the blank
 /// `SEPARATOR_HEIGHT` band between the header and the rows, plus the
@@ -1989,8 +1994,10 @@ pub(super) const HEADER_WASH_TOP_ALPHA: u8 = 0x50;
 pub(super) const HEADER_WASH_EMBLEM_SIZE: f32 = 200.0;
 /// How far the wash emblem's right edge overhangs the wash's own right edge,
 /// in points: the source right-aligns the wash `Svg.HPBar` with a `-25` right
-/// margin, so its last 25pt hang off the panel and the wash's clip rect cuts
-/// them away — the mirror of the gutter emblem's `HEADER_EMBLEM_LEFT_BLEED`.
+/// margin, so its last 25pt hang off the panel and `draw_header_wash`'s clip
+/// rect (the panel itself, issue #437 — not the wash rect) cuts them away at
+/// the panel's right edge — the mirror of the gutter emblem's
+/// `HEADER_EMBLEM_LEFT_BLEED`.
 ///
 /// Nudged in from the source's literal `25` to `17` (issue #255's
 /// live-window pass): at `25` the emblem's circular arc edge sat almost
@@ -2001,21 +2008,19 @@ pub(super) const HEADER_WASH_EMBLEM_SIZE: f32 = 200.0;
 /// clearing the toggle glyph boxes without touching the wash's size, alpha
 /// or the toggle cluster's own layout.
 pub(super) const HEADER_WASH_EMBLEM_BLEED: f32 = 17.0;
-/// How far above the wash's centerline the watermark's box rides, in
-/// points: the source's `Margin="0 -20 -25 20"` on a
-/// `VerticalAlignment="Center"` `Path`
-/// (`DamageMeter.UI/HUD/Controls/MainView.xaml`). A `-20` top paired with a
-/// `+20` bottom leaves the box's own height untouched and shifts the
-/// centered square up by the margin — unlike the gutter emblem's lone
-/// negative bottom margin (`HEADER_EMBLEM_BOTTOM_BLEED`), which grows the
-/// height it is centered in instead. `header_wash_emblem_rect` subtracts it
-/// from the centered y.
-pub(super) const HEADER_WASH_EMBLEM_RISE: f32 = 20.0;
-/// `Opacity=".05"` on a SlateGray fill — the alpha the wash emblem is
-/// painted at at the *top* of the wash. Everything below is dimmer: the
-/// source's `OpacityMask` scales this down to nothing by
-/// `HEADER_WASH_MASK_END` (`header_wash_emblem_strips`), so the watermark
-/// fades out rather than ending in a straight line at the first player row.
+/// `Opacity=".05"` on a SlateGray fill — the flat alpha the wash emblem is
+/// painted at, everywhere in its box.
+///
+/// Issue #437: the wash gradient's `OpacityMask` (`header_wash_mask`,
+/// `HEADER_WASH_MASK_END`) no longer applies to this — the fade strips that
+/// used to blit the emblem through it (the since-removed
+/// `header_wash_emblem_strips`) also
+/// clipped its 200pt box down to the small wash band's own height, which is
+/// what actually hid the mark once the band-measurement fix (#399) made
+/// that band the true ~70-80pt header height instead of the whole window.
+/// The emblem is a single flat `painter.image()` blit again (matching
+/// v0.3.0), clipped to the panel rather than the wash rect, so its full box
+/// paints regardless of how tall the wash band measures.
 pub(super) const HEADER_WASH_EMBLEM_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(0x70, 0x80, 0x90, 13);
 
@@ -2104,52 +2109,6 @@ fn strip_frac(i: usize) -> f32 {
     i as f32 / HEADER_WASH_MASK_STRIPS as f32 * HEADER_WASH_MASK_END
 }
 
-/// The wash's oversized `Svg.HPBar` watermark under the same
-/// `OpacityMask`, as `(rect, uv, [top-left, top-right, bottom-left,
-/// bottom-right])` per strip. `painter.image` takes one flat tint for the
-/// whole blit, which cannot fade, so the watermark is drawn as a textured
-/// mesh instead: each strip is the slice of `header_wash_emblem_rect` that
-/// falls inside it, its `uv` addresses that same slice of the image (0..1
-/// over the full `HEADER_WASH_EMBLEM_SIZE` box, so the art is not
-/// restretched strip by strip), and its corner tints are
-/// `HEADER_WASH_EMBLEM_COLOR` scaled by `header_wash_mask` at the strip's
-/// own top and bottom. Strips whose slice is empty are the caller's to
-/// skip; the rects that overhang the wash (`HEADER_WASH_EMBLEM_BLEED`) rely
-/// on its clip rect exactly as the single blit used to.
-pub(super) fn header_wash_emblem_strips(
-    wash: egui::Rect,
-    opacity: Opacity,
-) -> Vec<(egui::Rect, egui::Rect, [egui::Color32; 4])> {
-    let emblem = header_wash_emblem_rect(wash);
-    let alpha = f32::from(HEADER_WASH_EMBLEM_COLOR.a());
-    let uv_y = |y: f32| (y - emblem.top()) / emblem.height();
-
-    (0..HEADER_WASH_MASK_STRIPS)
-        .map(|i| {
-            let top_frac = strip_frac(i);
-            let bottom_frac = strip_frac(i + 1);
-            let rect = egui::Rect::from_min_max(
-                egui::pos2(wash.left(), wash.top() + top_frac * wash.height()),
-                egui::pos2(wash.right(), wash.top() + bottom_frac * wash.height()),
-            )
-            .intersect(emblem);
-            let uv = egui::Rect::from_min_max(
-                egui::pos2(
-                    (rect.left() - emblem.left()) / emblem.width(),
-                    uv_y(rect.top()),
-                ),
-                egui::pos2(
-                    (rect.right() - emblem.left()) / emblem.width(),
-                    uv_y(rect.bottom()),
-                ),
-            );
-            let top = header_wash_slate(alpha * header_wash_mask(top_frac), opacity);
-            let bottom = header_wash_slate(alpha * header_wash_mask(bottom_frac), opacity);
-            (rect, uv, [top, top, bottom, bottom])
-        })
-        .collect()
-}
-
 /// Where the wash panel sits for a central panel of `panel`: inset from the
 /// panel's left, top and right edges by `HEADER_WASH_INSET`, and running down
 /// `height` points rather than to the panel's bottom. Pure geometry, so the
@@ -2164,30 +2123,46 @@ pub(super) fn header_wash_rect(panel: egui::Rect, height: f32) -> egui::Rect {
     )
 }
 
-/// Where the wash's oversized emblem sits inside a wash of `wash`: centered
-/// on it and then lifted `HEADER_WASH_EMBLEM_RISE` (the source's `-20`
-/// top / `+20` bottom margin pair), and right-aligned so exactly
-/// `HEADER_WASH_EMBLEM_BLEED` points overhang its right edge. Taller than the
-/// wash as well as wider, so both the overhang and the top/bottom overflow
-/// rely on the caller's clip rect.
+/// Where the wash's oversized emblem sits inside a wash of `wash`:
+/// top-anchored to the wash's own top edge (which is the header's top edge
+/// plus `HEADER_WASH_INSET`, regardless of how tall the wash band itself
+/// measures), and right-aligned so exactly `HEADER_WASH_EMBLEM_BLEED` points
+/// overhang its right edge. Taller than the wash as well as wider, so both
+/// the overhang and the bottom overflow rely on the caller's clip rect.
+///
+/// Issue #437: v0.3.0 centered this on the wash and rode `20`pt above its
+/// centerline (the source's `Margin="0 -20 -25 20"`) — reasonable when the
+/// wash was (through the #340 bug this docstring's neighbors describe)
+/// effectively the whole window, so its center sat well below the header.
+/// Once the band-measurement fix (#399) made the wash the true, small
+/// header band, centering on it put most of the 200pt box above the
+/// header entirely. Anchoring to the top edge instead keeps the box's top
+/// where the header itself begins and lets the box's bottom run down past
+/// the wash band into the rows, painted by `draw_header_wash` through a
+/// clip rect wide enough not to cut that overflow away.
 pub(super) fn header_wash_emblem_rect(wash: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(
         egui::pos2(
             wash.right() + HEADER_WASH_EMBLEM_BLEED - HEADER_WASH_EMBLEM_SIZE,
-            wash.center().y - HEADER_WASH_EMBLEM_SIZE / 2.0 - HEADER_WASH_EMBLEM_RISE,
+            wash.top(),
         ),
         egui::Vec2::splat(HEADER_WASH_EMBLEM_SIZE),
     )
 }
 
 /// Paints the header's decorative background wash — a diagonal gradient
-/// panel with a huge, nearly-invisible emblem bleeding off its right edge —
-/// clipped to its own rect so it can never bleed into the rows below or over
-/// the panel's rounded corners. `panel` is the whole central panel's rect
-/// (not the drag band); `height` (issue #158, `first_player_row_top_offset`
-/// of `header_band_height` less `HEADER_WASH_INSET`) is what actually
-/// bounds the wash — the whole header band plus the blank seam gap below
-/// it, stopping exactly where the first player row begins
+/// panel with a huge, nearly-invisible emblem bleeding off its right edge.
+/// The gradient is clipped to its own rect so it can never bleed into the
+/// rows below or over the panel's rounded corners; the emblem (issue #437)
+/// is deliberately clipped wider, to `panel` instead, so its oversized box
+/// can paint straight through into the row area behind it: the rows' own
+/// chrome is painted over it and, being translucent, is faintly tinted by
+/// it — the v0.3.0 look.
+/// `panel` is the whole central panel's rect (not the drag band); `height`
+/// (issue #158, `first_player_row_top_offset` of `header_band_height` less
+/// `HEADER_WASH_INSET`) is what actually bounds the gradient — the whole
+/// header band plus the blank seam gap below it, stopping exactly where the
+/// first player row begins
 /// (`wash_covers_the_stat_pill_row_but_stops_at_the_first_player_row`).
 ///
 /// The source rounds the wash's top corners (`CornerRadius="7 7 0 0"`); egui
@@ -2237,24 +2212,23 @@ pub(super) fn draw_header_wash(
         painter.add(egui::Shape::mesh(gradient_mesh(rect, tl, tr, bl, br)));
     }
 
+    // Issue #437: clipped to `panel`, not `wash_rect` — the emblem's 200pt
+    // box is top-anchored to the wash's own top edge (`header_wash_emblem_
+    // rect`) and taller than the small band the band-measurement fix (#399)
+    // now correctly measures, so a clip that stopped at the wash's own
+    // bottom (as the gradient's does) would cut nearly all of it away
+    // again. `panel` is the whole central panel, so the box's overflow
+    // paints straight through into the player rows behind them — this is
+    // called from `draw_header` before the rows are drawn, so their own ink
+    // lands on top of it.
     if let Some(emblem) = icons.glyphs.get(GlyphIcon::Emblem) {
-        for (rect, uv, colors) in header_wash_emblem_strips(wash_rect, opacity) {
-            if !rect.is_positive() {
-                continue;
-            }
-            let mut mesh = egui::Mesh::with_texture(emblem.id());
-            for (pos, uv, color) in [
-                (rect.left_top(), uv.left_top(), colors[0]),
-                (rect.right_top(), uv.right_top(), colors[1]),
-                (rect.left_bottom(), uv.left_bottom(), colors[2]),
-                (rect.right_bottom(), uv.right_bottom(), colors[3]),
-            ] {
-                mesh.vertices.push(egui::epaint::Vertex { pos, uv, color });
-            }
-            mesh.add_triangle(0, 1, 2);
-            mesh.add_triangle(1, 3, 2);
-            painter.add(egui::Shape::mesh(mesh));
-        }
+        let emblem_rect = header_wash_emblem_rect(wash_rect);
+        ui.painter().with_clip_rect(panel).image(
+            emblem.id(),
+            emblem_rect,
+            UV_FULL,
+            opacity.apply(HEADER_WASH_EMBLEM_COLOR),
+        );
     }
 }
 
@@ -2693,9 +2667,9 @@ mod tests {
         let emblems = frame.glyph_boxes(GlyphIcon::Emblem);
         assert_eq!(
             emblems.len(),
-            1 + HEADER_WASH_MASK_STRIPS,
-            "expected the gutter mark plus the wash wallpaper's masked \
-             strips (`header_wash_emblem_strips`): {emblems:?}"
+            2,
+            "expected the gutter mark plus the wash wallpaper's single \
+             watermark blit: {emblems:?}"
         );
         // The gutter mark bleeds off the panel's left edge; the wash
         // wallpaper is right-aligned to the wash. Leftmost is the gutter.
@@ -2743,6 +2717,49 @@ mod tests {
             gutter.right() <= panel_min.x + HEADER_GUTTER_WIDTH + 0.01,
             "gutter emblem ink runs to x={}, past the {HEADER_GUTTER_WIDTH}pt gutter",
             gutter.right()
+        );
+    }
+
+    /// Issue #437: the band-measurement fix (#399) left the wash wallpaper
+    /// clipped to the same small rect as the gradient, so the 200pt emblem's
+    /// visible slice shrank to whatever sliver of it fell inside the
+    /// ~70-80pt band — effectively nothing. The emblem must instead paint
+    /// through its own, wider clip (the panel), so its visible ink must
+    /// exceed the full wash band it decorates — note the painted gradient's
+    /// union is only the masked `HEADER_WASH_MASK_END` fraction of that
+    /// band, so the band itself is the taller bar to clear.
+    #[test]
+    fn the_wash_emblem_paints_past_the_wash_band_not_confined_to_it() {
+        let snapshot = header_test_snapshot(30_100_000_000);
+        let frame = header_painted_boxes(&snapshot);
+        let wash = frame.gradient_box();
+
+        let emblems = frame.glyph_boxes(GlyphIcon::Emblem);
+        // The gutter mark plus the wash's own single watermark blit — no
+        // longer the gutter mark plus `HEADER_WASH_MASK_STRIPS` fade strips.
+        assert_eq!(
+            emblems.len(),
+            2,
+            "expected the gutter mark plus one wash watermark blit: {emblems:?}"
+        );
+        let wash_emblem = emblems
+            .iter()
+            .copied()
+            .max_by(|a, b| a.right().total_cmp(&b.right()))
+            .expect("the header painted no wash emblem");
+
+        let wash_band_height = wash.height() / HEADER_WASH_MASK_END;
+        assert_eq!(
+            wash_emblem.top(),
+            wash.top(),
+            "the wash emblem's visible top must be the wash's top"
+        );
+        assert!(
+            wash_emblem.height() > wash_band_height + 1.0,
+            "the wash emblem's visible ink is {}pt tall, no taller than the \
+             {}pt wash band it decorates — it is still confined to the band",
+            wash_emblem.height(),
+            wash_band_height
         );
     }
 
@@ -5348,19 +5365,20 @@ mod tests {
     }
 
     /// The wash emblem hangs off the wash's right edge by exactly the
-    /// source's `-25` right margin, and rides `20`pt above the wash's
-    /// centerline — the source's `Margin="0 -20 -25 20"` on a
-    /// `VerticalAlignment="Center"` box, whose `-20` top / `+20` bottom pair
-    /// lifts the centered square rather than resizing it. The mirror of the
-    /// gutter emblem's left-edge bleed, and the reason the wash must be
-    /// painted through its own clip rect.
+    /// source's `-25` right margin (mirroring the gutter emblem's left-edge
+    /// bleed), and top-anchors to the wash's own top edge (issue #437) so
+    /// its top stays put regardless of how tall the wash band measures,
+    /// rather than centering on it and riding a fixed rise above the
+    /// centerline. The reason the wash must be painted through a clip rect
+    /// wider than the wash itself.
     #[test]
-    fn the_wash_emblem_bleeds_off_the_right_edge_by_the_named_overhang() {
+    fn the_wash_emblem_bleeds_off_the_right_edge_and_top_anchors_to_the_wash() {
         let wash = header_wash_rect(wash_test_panel(), WASH_TEST_HEIGHT);
         let emblem = header_wash_emblem_rect(wash);
         assert_eq!(emblem.right() - wash.right(), HEADER_WASH_EMBLEM_BLEED);
         assert!(emblem.left() > wash.left());
-        assert_eq!(emblem.center().y, wash.center().y - 20.0);
+        assert_eq!(emblem.top(), wash.top());
+        assert_eq!(emblem.bottom(), wash.top() + HEADER_WASH_EMBLEM_SIZE);
         assert_eq!(emblem.width(), HEADER_WASH_EMBLEM_SIZE);
         assert_eq!(emblem.height(), HEADER_WASH_EMBLEM_SIZE);
     }
@@ -5416,44 +5434,6 @@ mod tests {
         assert_eq!(last_colors[3].a(), 0, "bottom-right of the last strip");
     }
 
-    /// The same mask over the oversized `Svg.HPBar` watermark: it is blitted
-    /// strip by strip so its flat `HEADER_WASH_EMBLEM_COLOR` alpha fades
-    /// with depth instead of ending abruptly at the wash's bottom edge, and
-    /// each strip's UVs address the slice of the 200pt image that actually
-    /// falls inside it, so the picture is not restretched per strip.
-    #[test]
-    fn the_wash_emblem_strips_fade_the_watermark_out_by_the_mask_stop() {
-        let wash = header_wash_rect(wash_test_panel(), WASH_TEST_HEIGHT);
-        let emblem = header_wash_emblem_rect(wash);
-        let strips = header_wash_emblem_strips(wash, Opacity::OPAQUE);
-
-        assert_eq!(strips.len(), HEADER_WASH_MASK_STRIPS);
-        for (rect, uv, colors) in &strips {
-            assert!(
-                emblem.contains_rect(*rect),
-                "{rect:?} escapes the emblem box"
-            );
-            assert!(
-                (uv.top() - (rect.top() - emblem.top()) / emblem.height()).abs() < 1e-4,
-                "the strip's UVs must address its own slice of the image"
-            );
-            assert!((uv.bottom() - (rect.bottom() - emblem.top()) / emblem.height()).abs() < 1e-4);
-            for color in colors {
-                assert!(
-                    color.a() <= HEADER_WASH_EMBLEM_COLOR.a(),
-                    "the mask can only dim the watermark, never brighten it"
-                );
-            }
-            assert_eq!(colors[0], colors[1], "a strip's top tint is uniform");
-            assert_eq!(colors[2], colors[3], "a strip's bottom tint is uniform");
-        }
-
-        assert_eq!(strips[0].2[0].a(), HEADER_WASH_EMBLEM_COLOR.a());
-        let last = strips[HEADER_WASH_MASK_STRIPS - 1].2;
-        assert_eq!(last[2].a(), 0, "the watermark is gone by the mask's stop");
-        assert_eq!(last[3].a(), 0);
-    }
-
     /// Issue #255's live-window pass shrank `HEADER_WASH_EMBLEM_BLEED` from
     /// the source's literal `25` to `17` so the wash emblem stopped painting
     /// through the title row's toggle pill. Nothing tested that: the bleed's
@@ -5505,13 +5485,16 @@ mod tests {
 
     /// The wash emblem is drawn far larger than the band it decorates, so it
     /// overflows the wash vertically too — a change that made it fit would
-    /// mean it had stopped reading as an oversized watermark.
+    /// mean it had stopped reading as an oversized watermark. Issue #437:
+    /// it top-anchors to the wash's own top edge rather than centering on
+    /// it, so the overflow is entirely below the wash, not split above and
+    /// below it.
     #[test]
     fn the_wash_emblem_is_taller_than_the_wash_it_sits_in() {
         let wash = header_wash_rect(wash_test_panel(), WASH_TEST_HEIGHT);
         let emblem = header_wash_emblem_rect(wash);
         assert!(emblem.height() > wash.height());
-        assert!(emblem.top() < wash.top());
+        assert_eq!(emblem.top(), wash.top());
         assert!(emblem.bottom() > wash.bottom());
     }
 
