@@ -308,19 +308,13 @@ pub(super) fn draw_header(
     // `header_band_height` budgets for.
     let row_size = egui::vec2(ui.available_width(), BUTTON_ROW_HEIGHT);
     let (row_rect, _) = ui.allocate_exact_size(row_size, egui::Sense::hover());
-    let (pills_rect, cluster_rect) = split_stat_row(row_rect);
+    let pills_rect = reserved_pills_rect(row_rect);
     let mut pills_ui = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(pills_rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     pills_ui.set_clip_rect(pills_rect.intersect(ui.clip_rect()));
-    let mut cluster_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(cluster_rect)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-    );
-    cluster_ui.set_clip_rect(cluster_rect.intersect(ui.clip_rect()));
     {
         let ui = &mut pills_ui;
         // The whole row is inset from the panel's left content edge
@@ -364,6 +358,17 @@ pub(super) fn draw_header(
             ),
         );
     }
+    // Placed *after* the pills have actually rendered (issue #435), from
+    // their real ink extent (`pills_ui.min_rect().right()`) rather than a
+    // fixed slot — see `split_stat_row`'s own comment for the narrow-row
+    // clamp this still keeps.
+    let cluster_rect = split_stat_row(row_rect, pills_ui.min_rect().right());
+    let mut cluster_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(cluster_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    cluster_ui.set_clip_rect(cluster_rect.intersect(ui.clip_rect()));
     toggle_cluster(
         &mut cluster_ui,
         tx_command,
@@ -482,6 +487,13 @@ pub(super) const STAT_ROW_TOGGLE_CLUSTER_WIDTH: f32 = 2.0 * TOGGLE_PAD_X
     + TOGGLE_CLOUD_SIDE
     + TOGGLE_GAP
     + TOGGLE_HISTORY_SIDE;
+
+/// Gap between the stat pills' rendered right edge and the toggle
+/// cluster that follows them (issue #435), matching `apply_theme`'s
+/// `item_spacing.x` (6.0) — the same gap the pills already use between
+/// each other — so the cluster reads as a fourth member of the same run
+/// rather than a separately-positioned block.
+pub(super) const STAT_ROW_PILLS_CLUSTER_GAP: f32 = 6.0;
 
 /// Gap, in points, between the title row's toggle pill (issue #185) and the
 /// dropdown chevron's reserved strip to its right. `TOGGLE_PAD_X`'s value,
@@ -703,33 +715,49 @@ pub(super) fn availability_label(
     if active { label } else { unavailable }
 }
 
-/// Splits the stat row's rect into the stat pills' area and the toggle
-/// cluster's, reserving the cluster's fixed `STAT_ROW_TOGGLE_CLUSTER_WIDTH`
-/// on the *right* of `row_rect` before the pills get a say. `draw_header`
-/// used to lay the pills and the cluster out in one shared child `Ui`,
-/// sized purely by the layout cursor's left-to-right advance — so at a
-/// narrow window (below ~372pt of panel) the pills' own ink pushed the
+/// Reserves the toggle cluster's fixed `STAT_ROW_TOGGLE_CLUSTER_WIDTH` on
+/// the *right* of `row_rect` for `draw_header` to size the pills' child
+/// `Ui` from — before the pills have actually rendered and so before
+/// their real right edge (`pills_right`, below) is known. This upper
+/// bound is what keeps the pills (informational) the thing that clips at
+/// a narrow window, never the controls: see `split_stat_row`'s own
+/// comment for the rest of that history (issue #400).
+pub(super) fn reserved_pills_rect(row_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        row_rect.min,
+        egui::pos2(
+            row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH,
+            row_rect.bottom(),
+        ),
+    )
+}
+
+/// Places the toggle cluster immediately after the stat pills' *actual*
+/// rendered right edge, `pills_right` — not pinned to a fixed slot
+/// regardless of how far short of it the pills' own ink reaches (issue
+/// #435). The gap between the cluster and the pills is
+/// `STAT_ROW_PILLS_CLUSTER_GAP`, the same gap the pills use between
+/// themselves, so the whole row reads as one run of controls.
+///
+/// The result is clamped so its left edge never passes
+/// `row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH`: `draw_header` used
+/// to lay the pills and the cluster out in one shared child `Ui`, sized
+/// purely by the layout cursor's left-to-right advance — so at a narrow
+/// window (below ~372pt of panel) the pills' own ink pushed the
 /// cluster's `allocate_exact_size` rect past `row_ui`'s clip rect, and
 /// `toggle_cluster`'s `is_rect_visible` early return silently dropped
 /// Share/Reset/History with no other way to reach Reset. The cluster's
-/// width is fixed and known up front, so reserving its slot first — in a
-/// `Ui` of its own, with the pills given whatever width is left over in a
-/// second one — makes the pills (informational) the thing that clips at a
-/// narrow width, never the controls. Pure so the split is unit-testable
-/// without a live `egui::Context`; `draw_header` is the only caller.
-pub(super) fn split_stat_row(row_rect: egui::Rect) -> (egui::Rect, egui::Rect) {
-    let cluster_rect = egui::Rect::from_min_max(
-        egui::pos2(
-            row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH,
-            row_rect.top(),
-        ),
-        row_rect.max,
-    );
-    let pills_rect = egui::Rect::from_min_max(
-        row_rect.min,
-        egui::pos2(cluster_rect.left(), row_rect.bottom()),
-    );
-    (pills_rect, cluster_rect)
+/// width is fixed and known up front, so this clamp reserves its slot
+/// unconditionally, no matter how far the pills' ink actually reaches.
+/// Pure so the split is unit-testable without a live `egui::Context`;
+/// `draw_header` is the only caller.
+pub(super) fn split_stat_row(row_rect: egui::Rect, pills_right: f32) -> egui::Rect {
+    let max_left = row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH;
+    let left = (pills_right + STAT_ROW_PILLS_CLUSTER_GAP).min(max_left);
+    egui::Rect::from_min_max(
+        egui::pos2(left, row_rect.top()),
+        egui::pos2(left + STAT_ROW_TOGGLE_CLUSTER_WIDTH, row_rect.bottom()),
+    )
 }
 
 pub(super) fn toggle_cluster(
@@ -2936,17 +2964,20 @@ mod tests {
     /// Regression for the toggle cluster's silent-drop bug: at a stat row
     /// no wider than `MIN_INNER_SIZE.x` (issue #400's overflow floor, well
     /// past the ~372pt panel width the pills alone start overflowing at),
-    /// `split_stat_row`'s cluster half must still land entirely inside
+    /// the cluster rect `split_stat_row` returns must still land entirely inside
     /// `row_rect` — the reservation is unconditional on the row's own
     /// width, not on the pills leaving enough room behind. Reset has no
     /// other entry point, so if this ever fails again the button is gone.
+    /// `pills_right` is passed as `row_rect.right()` here to model the
+    /// worst case: the pills' ink claims the entire reserved area and
+    /// still must not push the cluster past the row.
     #[test]
     fn split_stat_row_keeps_the_toggle_cluster_inside_a_narrow_row() {
         let row_rect = egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
             egui::vec2(MIN_INNER_SIZE.x, BUTTON_ROW_HEIGHT),
         );
-        let (pills_rect, cluster_rect) = split_stat_row(row_rect);
+        let cluster_rect = split_stat_row(row_rect, row_rect.right());
 
         assert!(
             row_rect.contains_rect(cluster_rect),
@@ -2954,9 +2985,42 @@ mod tests {
         );
         assert_eq!(cluster_rect.width(), STAT_ROW_TOGGLE_CLUSTER_WIDTH);
         assert_eq!(cluster_rect.right(), row_rect.right());
-        assert!(
-            pills_rect.right() <= cluster_rect.left(),
-            "the pills area {pills_rect:?} overlaps the toggle cluster {cluster_rect:?}"
+    }
+
+    /// Issue #435: the toggle cluster used to be pinned to a fixed
+    /// right-hand slot regardless of how far short of it the stat pills'
+    /// own ink actually reached, leaving a gap between the DPS/Damage
+    /// trio and Share/Reset/History at any width wider than the ~372pt
+    /// overflow floor. When there is slack (`pills_right` well short of
+    /// `row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH`) the cluster's
+    /// left edge must track `pills_right`, offset by the same
+    /// `STAT_ROW_PILLS_CLUSTER_GAP` the pills use between themselves.
+    #[test]
+    fn split_stat_row_tracks_the_pills_right_edge_when_there_is_slack() {
+        let row_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, BUTTON_ROW_HEIGHT));
+        let pills_right = 200.0;
+        let cluster_rect = split_stat_row(row_rect, pills_right);
+
+        assert_eq!(
+            cluster_rect.left(),
+            pills_right + STAT_ROW_PILLS_CLUSTER_GAP
+        );
+        assert_eq!(cluster_rect.width(), STAT_ROW_TOGGLE_CLUSTER_WIDTH);
+    }
+
+    /// `STAT_ROW_PILLS_CLUSTER_GAP` claims to match `apply_theme`'s
+    /// `item_spacing.x` — the gap the pills use between themselves — so
+    /// the cluster reads as a fourth member of the same run. Pin that
+    /// claim: if the theme's spacing moves, this fails instead of the
+    /// cluster silently drifting off-rhythm.
+    #[test]
+    fn stat_row_pills_cluster_gap_matches_the_theme_item_spacing() {
+        let ctx = egui::Context::default();
+        super::super::apply_theme(&ctx);
+        assert_eq!(
+            ctx.global_style().spacing.item_spacing.x,
+            STAT_ROW_PILLS_CLUSTER_GAP
         );
     }
 
