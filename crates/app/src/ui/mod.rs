@@ -1187,6 +1187,7 @@ fn demo_snapshot() -> Snapshot {
             scene_name: Some("Purge! Field of Forgotten Illusions"),
             scene_boss_name: None,
             multi_boss_scene: false,
+            ..EncounterInfo::default()
         },
         local_uid: None,
         capture_alive: true,
@@ -4140,6 +4141,7 @@ mod tests {
                 scene_name: None,
                 scene_boss_name: None,
                 multi_boss_scene: false,
+                ..EncounterInfo::default()
             },
             local_uid: None,
             capture_alive: true,
@@ -4463,15 +4465,18 @@ mod tests {
         frame
     }
 
-    /// The reference render shows a total-damage figure alongside the DPS
-    /// figure (e.g. "30.10B"), abbreviated with the same `fmt_short` used
-    /// everywhere else — `snapshot.total_damage` existed but was never
-    /// painted before this change.
+    /// The heart pill shows the selected boss's total health, abbreviated
+    /// with the same `fmt_short` used everywhere else (issue #436) — not
+    /// `snapshot.total_damage`, which climbed with the fight instead of
+    /// reading as an HP figure and is no longer painted anywhere in the
+    /// header.
     #[test]
-    fn draw_header_shows_total_damage_abbreviated() {
-        let texts = header_rendered_texts(&header_test_snapshot(30_100_000_000));
-        let expected = fmt_short(30_100_000_000);
-        assert_eq!(expected, "30.10B");
+    fn draw_header_shows_boss_max_hp_abbreviated() {
+        let mut snapshot = header_test_snapshot(30_100_000_000);
+        snapshot.encounter.boss_max_hp = Some(1_500_000_000);
+        let texts = header_rendered_texts(&snapshot);
+        let expected = fmt_short(1_500_000_000);
+        assert_eq!(expected, "1.50B");
         assert!(
             texts.iter().any(|text| text.contains(&expected)),
             "expected a painted text containing {expected:?}, got {texts:?}"
