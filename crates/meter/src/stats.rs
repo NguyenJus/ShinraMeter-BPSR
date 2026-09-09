@@ -515,6 +515,20 @@ pub struct EncounterInfo {
     /// agree) — `is_boss` is the single source of truth for the display
     /// gate, `boss_name` for the text.
     pub is_boss: bool,
+    /// The selected boss's total health (issue #436), read off the same
+    /// tracked enemy entry `boss_monster_id` names. `None` whenever
+    /// `is_boss` is `false` (no recognized boss selected) or the HP attrs
+    /// (0x2C2E/0x2C38) simply haven't arrived yet for this entity.
+    ///
+    /// Frozen with the rest of the fight while a finished fight is held on
+    /// screen (issue #152): the reading is pinned in `FightIdentity` while
+    /// the fight is live, so zoning out — which empties the meter's tracked
+    /// enemies — leaves the header's heart pill showing the held boss's HP
+    /// rather than blanking it under a title that still names that boss.
+    pub boss_max_hp: Option<u64>,
+    /// The selected boss's current health (issue #436), alongside
+    /// `boss_max_hp` above. Can be `Some(0)` for a boss that just died.
+    pub boss_curr_hp: Option<u64>,
     pub scene_id: Option<u32>,
     pub scene_name: Option<&'static str>,
     /// The current dungeon scene's final boss (issue #125), when it is one of

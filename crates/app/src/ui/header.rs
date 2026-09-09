@@ -226,8 +226,28 @@ pub(super) fn draw_header(
     // Cleared here, outside the popup body, because the body only runs
     // while the popup is open; `Popup::default_response_id` is exactly the
     // id `Popup::menu(&chevron_response)` below keys its open state under.
-    if !egui::Popup::is_id_open(ctx, egui::Popup::default_response_id(&chevron_response)) {
+    let popup_open =
+        egui::Popup::is_id_open(ctx, egui::Popup::default_response_id(&chevron_response));
+    if !popup_open {
         reset_menu_page(ctx);
+    }
+    // Issue #434: a resolved "Check for updates" result must not survive
+    // the dropdown closing — otherwise a stale `Done`/`InstallFailed` from
+    // the last time it was opened keeps showing instead of the plain "Check
+    // for updates" row. Only on the open→closed *transition*, though: doing
+    // it on every closed frame would also throw away a result that landed
+    // while the popup was shut, which nobody has seen yet. `Checking`/
+    // `Installing`/`Restarting` are left alone; see that function's own doc
+    // comment for why.
+    let was_open = ctx.data_mut(|data| {
+        let previous = data
+            .get_temp::<bool>(menu_popup_was_open_id())
+            .unwrap_or(false);
+        data.insert_temp(menu_popup_was_open_id(), popup_open);
+        previous
+    });
+    if was_open && !popup_open {
+        reset_update_check_if_resolved(update_check);
     }
     // `CloseOnClickOutside` rather than the default `CloseOnClick` (issue
     // #93, now a standing rule — see `menu.rs`'s issue #120 block): this
@@ -288,19 +308,13 @@ pub(super) fn draw_header(
     // `header_band_height` budgets for.
     let row_size = egui::vec2(ui.available_width(), BUTTON_ROW_HEIGHT);
     let (row_rect, _) = ui.allocate_exact_size(row_size, egui::Sense::hover());
-    let (pills_rect, cluster_rect) = split_stat_row(row_rect);
+    let pills_rect = reserved_pills_rect(row_rect);
     let mut pills_ui = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(pills_rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     pills_ui.set_clip_rect(pills_rect.intersect(ui.clip_rect()));
-    let mut cluster_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(cluster_rect)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-    );
-    cluster_ui.set_clip_rect(cluster_rect.intersect(ui.clip_rect()));
     {
         let ui = &mut pills_ui;
         // The whole row is inset from the panel's left content edge
@@ -332,18 +346,34 @@ pub(super) fn draw_header(
                 icons.glyphs.get(GlyphIcon::Speed).map(|t| t.id()),
             ),
         );
-        // Total damage for the fight (reference render's e.g. "30.10B"). The
-        // heart icon is the reference's own choice of glyph here; despite it
-        // this is `snapshot.total_damage` and nothing else — there is no
-        // party-HP figure anywhere in this codebase.
-        stat_pill(
+        // The selected boss's total health (issue #436) — the heart icon is
+        // the reference's own choice of glyph here, and until #436 this pill
+        // drew `snapshot.total_damage` under it, which climbed with the
+        // fight instead of reading as an HP figure. `total_damage` is kept
+        // on `Snapshot` for the rows/history that still want it; this pill
+        // no longer does.
+        let heart_pill = stat_pill(
             ui,
             StatPill::header(
-                &fmt_short(snapshot.total_damage),
+                &heart_pill_text(&snapshot.encounter),
                 icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
             ),
         );
+        if let Some(tooltip) = heart_pill_tooltip(&snapshot.encounter) {
+            heart_pill.on_hover_text(tooltip);
+        }
     }
+    // Placed *after* the pills have actually rendered (issue #435), from
+    // their real ink extent (`pills_ui.min_rect().right()`) rather than a
+    // fixed slot — see `split_stat_row`'s own comment for the narrow-row
+    // clamp this still keeps.
+    let cluster_rect = split_stat_row(row_rect, pills_ui.min_rect().right());
+    let mut cluster_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(cluster_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    cluster_ui.set_clip_rect(cluster_rect.intersect(ui.clip_rect()));
     toggle_cluster(
         &mut cluster_ui,
         tx_command,
@@ -462,6 +492,13 @@ pub(super) const STAT_ROW_TOGGLE_CLUSTER_WIDTH: f32 = 2.0 * TOGGLE_PAD_X
     + TOGGLE_CLOUD_SIDE
     + TOGGLE_GAP
     + TOGGLE_HISTORY_SIDE;
+
+/// Gap between the stat pills' rendered right edge and the toggle
+/// cluster that follows them (issue #435), matching `apply_theme`'s
+/// `item_spacing.x` (6.0) — the same gap the pills already use between
+/// each other — so the cluster reads as a fourth member of the same run
+/// rather than a separately-positioned block.
+pub(super) const STAT_ROW_PILLS_CLUSTER_GAP: f32 = 6.0;
 
 /// Gap, in points, between the title row's toggle pill (issue #185) and the
 /// dropdown chevron's reserved strip to its right. `TOGGLE_PAD_X`'s value,
@@ -683,33 +720,49 @@ pub(super) fn availability_label(
     if active { label } else { unavailable }
 }
 
-/// Splits the stat row's rect into the stat pills' area and the toggle
-/// cluster's, reserving the cluster's fixed `STAT_ROW_TOGGLE_CLUSTER_WIDTH`
-/// on the *right* of `row_rect` before the pills get a say. `draw_header`
-/// used to lay the pills and the cluster out in one shared child `Ui`,
-/// sized purely by the layout cursor's left-to-right advance — so at a
-/// narrow window (below ~372pt of panel) the pills' own ink pushed the
+/// Reserves the toggle cluster's fixed `STAT_ROW_TOGGLE_CLUSTER_WIDTH` on
+/// the *right* of `row_rect` for `draw_header` to size the pills' child
+/// `Ui` from — before the pills have actually rendered and so before
+/// their real right edge (`pills_right`, below) is known. This upper
+/// bound is what keeps the pills (informational) the thing that clips at
+/// a narrow window, never the controls: see `split_stat_row`'s own
+/// comment for the rest of that history (issue #400).
+pub(super) fn reserved_pills_rect(row_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        row_rect.min,
+        egui::pos2(
+            row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH,
+            row_rect.bottom(),
+        ),
+    )
+}
+
+/// Places the toggle cluster immediately after the stat pills' *actual*
+/// rendered right edge, `pills_right` — not pinned to a fixed slot
+/// regardless of how far short of it the pills' own ink reaches (issue
+/// #435). The gap between the cluster and the pills is
+/// `STAT_ROW_PILLS_CLUSTER_GAP`, the same gap the pills use between
+/// themselves, so the whole row reads as one run of controls.
+///
+/// The result is clamped so its left edge never passes
+/// `row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH`: `draw_header` used
+/// to lay the pills and the cluster out in one shared child `Ui`, sized
+/// purely by the layout cursor's left-to-right advance — so at a narrow
+/// window (below ~372pt of panel) the pills' own ink pushed the
 /// cluster's `allocate_exact_size` rect past `row_ui`'s clip rect, and
 /// `toggle_cluster`'s `is_rect_visible` early return silently dropped
 /// Share/Reset/History with no other way to reach Reset. The cluster's
-/// width is fixed and known up front, so reserving its slot first — in a
-/// `Ui` of its own, with the pills given whatever width is left over in a
-/// second one — makes the pills (informational) the thing that clips at a
-/// narrow width, never the controls. Pure so the split is unit-testable
-/// without a live `egui::Context`; `draw_header` is the only caller.
-pub(super) fn split_stat_row(row_rect: egui::Rect) -> (egui::Rect, egui::Rect) {
-    let cluster_rect = egui::Rect::from_min_max(
-        egui::pos2(
-            row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH,
-            row_rect.top(),
-        ),
-        row_rect.max,
-    );
-    let pills_rect = egui::Rect::from_min_max(
-        row_rect.min,
-        egui::pos2(cluster_rect.left(), row_rect.bottom()),
-    );
-    (pills_rect, cluster_rect)
+/// width is fixed and known up front, so this clamp reserves its slot
+/// unconditionally, no matter how far the pills' ink actually reaches.
+/// Pure so the split is unit-testable without a live `egui::Context`;
+/// `draw_header` is the only caller.
+pub(super) fn split_stat_row(row_rect: egui::Rect, pills_right: f32) -> egui::Rect {
+    let max_left = row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH;
+    let left = (pills_right + STAT_ROW_PILLS_CLUSTER_GAP).min(max_left);
+    egui::Rect::from_min_max(
+        egui::pos2(left, row_rect.top()),
+        egui::pos2(left + STAT_ROW_TOGGLE_CLUSTER_WIDTH, row_rect.bottom()),
+    )
 }
 
 pub(super) fn toggle_cluster(
@@ -1359,6 +1412,48 @@ pub(super) fn handle_share_screenshot(
 /// this precedence wholesale and only fills in the non-boss blank this
 /// function leaves on purpose (issue #424), so a saved label matches the
 /// live header whenever the header showed one (issue #39, DECISION D2).
+/// The header heart pill's text (issue #436): the selected boss's total
+/// health, or an em dash placeholder — the same "not known yet" convention
+/// `fmt_death_time` uses — when `Meter::snapshot` has no `boss_max_hp` for
+/// the current target.
+pub(crate) fn heart_pill_text(e: &EncounterInfo) -> String {
+    match e.boss_max_hp {
+        Some(max) => fmt_short(max as i64),
+        None => "\u{2014}".to_string(),
+    }
+}
+
+/// Thousands separators for the heart pill's tooltip (issue #436). The pill
+/// itself is abbreviated (`fmt_short`); the tooltip is the place the exact
+/// figure is spelled out, and an unseparated eight-digit raid HP pool is
+/// unreadable at a glance -- which is the only reason to hover it.
+fn fmt_grouped(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The heart pill's hover tooltip (issue #436): "Boss HP: {curr} / {max}"
+/// once both halves are known, `None` (no tooltip at all) otherwise — a
+/// half-known reading (e.g. a max with no current yet) isn't worth
+/// captioning.
+pub(crate) fn heart_pill_tooltip(e: &EncounterInfo) -> Option<String> {
+    match (e.boss_curr_hp, e.boss_max_hp) {
+        (Some(curr), Some(max)) => Some(format!(
+            "Boss HP: {} / {}",
+            fmt_grouped(curr),
+            fmt_grouped(max)
+        )),
+        _ => None,
+    }
+}
+
 pub(crate) fn encounter_title(e: &EncounterInfo) -> String {
     if e.is_boss {
         // `is_boss` is only ever true alongside a `Some` `boss_monster_id`
@@ -2319,6 +2414,157 @@ pub(super) fn draw_subtitle_line(ui: &mut egui::Ui, text: &str) {
 mod tests {
     use super::*;
     use crate::ui::tests::*;
+
+    /// Issue #434: `draw_header` calls `reset_update_check_if_resolved` on
+    /// the frame the popup goes from open to closed — so a resolved check
+    /// does not survive the dropdown closing and reopening, and the row
+    /// reads "Check for updates" again rather than a stale "Up to date"/
+    /// "Update failed". The previous frame is seeded as "open" directly,
+    /// since a test frame cannot open the real popup.
+    #[test]
+    fn draw_header_resets_a_resolved_update_check_when_the_popup_is_closed() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(0);
+        let mut update_check = UpdateCheckState::Done(Ok(CheckOutcome::UpToDate));
+        ctx.data_mut(|data| data.insert_temp(menu_popup_was_open_id(), true));
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header(
+                ui,
+                &ctx,
+                &snapshot,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut WindowGesture::default(),
+                None,
+                false,
+                true,
+                &mut update_check,
+                &unused_log_export_sender(),
+                &mut 0,
+                false,
+                &mut false,
+                None,
+                &mut false,
+            );
+        });
+        output.drop_without_applying_deltas();
+
+        assert!(
+            matches!(update_check, UpdateCheckState::Idle),
+            "a resolved check must reset to Idle once the popup is closed, got {update_check:?}"
+        );
+    }
+
+    /// The other half of the transition rule: a result that lands while the
+    /// dropdown is *already* closed has never been shown to anyone, so
+    /// resetting it would silently discard the answer the user asked for.
+    /// Resetting on every closed frame — rather than on open→closed — is
+    /// exactly what would break this.
+    #[test]
+    fn draw_header_keeps_a_result_that_landed_while_the_popup_was_already_closed() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(0);
+        let mut update_check = UpdateCheckState::Done(Ok(CheckOutcome::UpToDate));
+        // The popup was already shut on the previous frame, too.
+        ctx.data_mut(|data| data.insert_temp(menu_popup_was_open_id(), false));
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header(
+                ui,
+                &ctx,
+                &snapshot,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut WindowGesture::default(),
+                None,
+                false,
+                true,
+                &mut update_check,
+                &unused_log_export_sender(),
+                &mut 0,
+                false,
+                &mut false,
+                None,
+                &mut false,
+            );
+        });
+        output.drop_without_applying_deltas();
+
+        assert!(
+            matches!(
+                update_check,
+                UpdateCheckState::Done(Ok(CheckOutcome::UpToDate))
+            ),
+            "a result that landed while the popup was shut must survive, got {update_check:?}"
+        );
+    }
+
+    /// Counterpart to the test above: an in-flight check must survive the
+    /// same closed-popup frames untouched — closing the dropdown must never
+    /// look like it dropped the thread draining into `Checking`.
+    #[test]
+    fn draw_header_leaves_an_in_flight_update_check_alone_when_the_popup_is_closed() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let snapshot = header_test_snapshot(0);
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let mut update_check = UpdateCheckState::Checking { rx };
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header(
+                ui,
+                &ctx,
+                &snapshot,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                &icons,
+                &mut WindowGesture::default(),
+                None,
+                false,
+                true,
+                &mut update_check,
+                &unused_log_export_sender(),
+                &mut 0,
+                false,
+                &mut false,
+                None,
+                &mut false,
+            );
+        });
+        output.drop_without_applying_deltas();
+
+        assert!(
+            matches!(update_check, UpdateCheckState::Checking { .. }),
+            "an in-flight check must survive a closed popup, got {update_check:?}"
+        );
+    }
+
     /// Issue #91: the timer is inset from the panel's left content edge by
     /// `HEADER_STAT_ROW_INSET_X` rather than sitting flush against the
     /// window border the way its old half-pill did. That gap is the whole
@@ -2782,17 +3028,20 @@ mod tests {
     /// Regression for the toggle cluster's silent-drop bug: at a stat row
     /// no wider than `MIN_INNER_SIZE.x` (issue #400's overflow floor, well
     /// past the ~372pt panel width the pills alone start overflowing at),
-    /// `split_stat_row`'s cluster half must still land entirely inside
+    /// the cluster rect `split_stat_row` returns must still land entirely inside
     /// `row_rect` — the reservation is unconditional on the row's own
     /// width, not on the pills leaving enough room behind. Reset has no
     /// other entry point, so if this ever fails again the button is gone.
+    /// `pills_right` is passed as `row_rect.right()` here to model the
+    /// worst case: the pills' ink claims the entire reserved area and
+    /// still must not push the cluster past the row.
     #[test]
     fn split_stat_row_keeps_the_toggle_cluster_inside_a_narrow_row() {
         let row_rect = egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
             egui::vec2(MIN_INNER_SIZE.x, BUTTON_ROW_HEIGHT),
         );
-        let (pills_rect, cluster_rect) = split_stat_row(row_rect);
+        let cluster_rect = split_stat_row(row_rect, row_rect.right());
 
         assert!(
             row_rect.contains_rect(cluster_rect),
@@ -2800,9 +3049,42 @@ mod tests {
         );
         assert_eq!(cluster_rect.width(), STAT_ROW_TOGGLE_CLUSTER_WIDTH);
         assert_eq!(cluster_rect.right(), row_rect.right());
-        assert!(
-            pills_rect.right() <= cluster_rect.left(),
-            "the pills area {pills_rect:?} overlaps the toggle cluster {cluster_rect:?}"
+    }
+
+    /// Issue #435: the toggle cluster used to be pinned to a fixed
+    /// right-hand slot regardless of how far short of it the stat pills'
+    /// own ink actually reached, leaving a gap between the DPS/Damage
+    /// trio and Share/Reset/History at any width wider than the ~372pt
+    /// overflow floor. When there is slack (`pills_right` well short of
+    /// `row_rect.right() - STAT_ROW_TOGGLE_CLUSTER_WIDTH`) the cluster's
+    /// left edge must track `pills_right`, offset by the same
+    /// `STAT_ROW_PILLS_CLUSTER_GAP` the pills use between themselves.
+    #[test]
+    fn split_stat_row_tracks_the_pills_right_edge_when_there_is_slack() {
+        let row_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, BUTTON_ROW_HEIGHT));
+        let pills_right = 200.0;
+        let cluster_rect = split_stat_row(row_rect, pills_right);
+
+        assert_eq!(
+            cluster_rect.left(),
+            pills_right + STAT_ROW_PILLS_CLUSTER_GAP
+        );
+        assert_eq!(cluster_rect.width(), STAT_ROW_TOGGLE_CLUSTER_WIDTH);
+    }
+
+    /// `STAT_ROW_PILLS_CLUSTER_GAP` claims to match `apply_theme`'s
+    /// `item_spacing.x` — the gap the pills use between themselves — so
+    /// the cluster reads as a fourth member of the same run. Pin that
+    /// claim: if the theme's spacing moves, this fails instead of the
+    /// cluster silently drifting off-rhythm.
+    #[test]
+    fn stat_row_pills_cluster_gap_matches_the_theme_item_spacing() {
+        let ctx = egui::Context::default();
+        super::super::apply_theme(&ctx);
+        assert_eq!(
+            ctx.global_style().spacing.item_spacing.x,
+            STAT_ROW_PILLS_CLUSTER_GAP
         );
     }
 
@@ -4166,6 +4448,53 @@ mod tests {
             "separator bottom {} drifts past the title/subtitle gap",
             rect.bottom()
         );
+    }
+
+    // -- heart pill boss HP (issue #436) ------------------------------------
+
+    #[test]
+    fn heart_pill_text_shows_fmt_short_of_boss_max_hp_when_known() {
+        let encounter = EncounterInfo {
+            boss_max_hp: Some(1_500_000),
+            ..Default::default()
+        };
+        assert_eq!(heart_pill_text(&encounter), fmt_short(1_500_000));
+    }
+
+    #[test]
+    fn heart_pill_text_is_an_em_dash_when_boss_max_hp_is_unknown() {
+        assert_eq!(heart_pill_text(&EncounterInfo::default()), "\u{2014}");
+    }
+
+    #[test]
+    fn heart_pill_tooltip_shows_curr_and_max_when_both_known() {
+        let encounter = EncounterInfo {
+            boss_curr_hp: Some(400_000),
+            boss_max_hp: Some(1_500_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            heart_pill_tooltip(&encounter),
+            Some("Boss HP: 400,000 / 1,500,000".to_string())
+        );
+    }
+
+    #[test]
+    fn heart_pill_tooltip_is_none_when_either_half_is_unknown() {
+        let max_only = EncounterInfo {
+            boss_max_hp: Some(1_500_000),
+            ..Default::default()
+        };
+        assert_eq!(heart_pill_tooltip(&max_only), None);
+        assert_eq!(heart_pill_tooltip(&EncounterInfo::default()), None);
+    }
+
+    #[test]
+    fn fmt_grouped_separates_every_third_digit() {
+        assert_eq!(fmt_grouped(0), "0");
+        assert_eq!(fmt_grouped(999), "999");
+        assert_eq!(fmt_grouped(1_000), "1,000");
+        assert_eq!(fmt_grouped(1_500_000), "1,500,000");
     }
 
     // -- encounter title/subtitle (issue #9 slice 2) -----------------------
