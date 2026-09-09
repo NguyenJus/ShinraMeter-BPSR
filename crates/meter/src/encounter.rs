@@ -490,6 +490,12 @@ struct FightIdentity {
     /// field at once). A trash pull has no identity worth pinning, so
     /// `recompute_boss` never records one.
     boss_monster_id: u32,
+    /// The tracked entity `boss_monster_id` was read off of, for issue
+    /// #436's boss HP fields: `boss_entity` can move on (to a corpse, to a
+    /// different add, or to nothing) once the fight is held, so this pins
+    /// the same entity `Meter::enemies` HP lookup must key on to stay the
+    /// one this fight was actually about.
+    boss_uid: EntityId,
     /// The scene the fight was in, `None` if it was never known.
     scene_id: Option<u32>,
 }
@@ -3851,9 +3857,11 @@ impl Meter {
         // dies cannot rename the fight that is being held.
         if let Some(id) = monster_id
             && tables::is_boss_monster(id)
+            && let Some(uid) = self.boss_entity
         {
             self.fight_identity = Some(FightIdentity {
                 boss_monster_id: id,
+                boss_uid: uid,
                 scene_id: self.scene_id,
             });
         }
@@ -4157,16 +4165,29 @@ impl Meter {
             FightState::Ended => self.fight_identity,
             FightState::Active | FightState::Idle => None,
         };
-        let (boss_monster_id, scene_id) = match held {
+        let (boss_monster_id, scene_id, boss_uid) = match held {
             // A scene the held fight never captured falls back to whatever
             // the meter knows now. The case that matters is an `EnterScene`
             // landing after the pull's last damage/HP event (`replay_dump`'s
             // real capture does exactly that), where "now" is that same
             // scene; a fight that never knew its scene at all has no better
             // answer to offer than the current one.
-            Some(held) => (Some(held.boss_monster_id), held.scene_id.or(self.scene_id)),
-            None => (self.boss_monster_id(), self.scene_id),
+            Some(held) => (
+                Some(held.boss_monster_id),
+                held.scene_id.or(self.scene_id),
+                Some(held.boss_uid),
+            ),
+            None => (self.boss_monster_id(), self.scene_id, self.boss_entity),
         };
+        // issue #436: the header's heart pill wants the boss's total health,
+        // not the running damage total. `boss_uid` above is pinned the same
+        // way `boss_monster_id` is (frozen on a held fight, live otherwise),
+        // so this reads the same entity's HP the display fields are named
+        // after rather than whatever `recompute_boss` has since moved on to.
+        let (boss_curr_hp, boss_max_hp) = boss_uid
+            .and_then(|uid| self.enemies.get(&uid))
+            .map(|e| (e.curr_hp, e.max_hp))
+            .unwrap_or((None, None));
         // issue #42: `recompute_boss` prefers a recognized boss but still
         // falls back to an HP heuristic when no monster in the pull is in the
         // table, so `boss_monster_id` alone can't tell a real boss from a big
@@ -4209,6 +4230,11 @@ impl Meter {
                 None
             },
             is_boss,
+            // issue #436: gated on `is_boss` for the same reason `boss_name`
+            // is — an HP-heuristic trash pull's numbers aren't worth
+            // showing as if they were a boss health bar.
+            boss_max_hp: if is_boss { boss_max_hp } else { None },
+            boss_curr_hp: if is_boss { boss_curr_hp } else { None },
             scene_id,
             scene_name: scene_id.and_then(tables::scene_name),
             scene_boss_name,
@@ -11991,6 +12017,20 @@ mod tests {
             assert_eq!(snap.encounter.boss_monster_id, Some(103));
             assert_eq!(snap.encounter.boss_name, Some("Ignisor"));
             assert!(snap.encounter.is_boss);
+        }
+
+        /// issue #436: the header's heart pill wants the selected boss's
+        /// total health, so the snapshot must carry it alongside
+        /// `boss_monster_id`/`boss_name` once an `EnemyHp` for that uid has
+        /// landed.
+        #[test]
+        fn snapshot_exposes_boss_hp_after_an_enemy_hp_update() {
+            let mut m = Meter::new();
+            m.apply(&boss_hit(10, 0));
+            m.apply(&hp(10, 80, 100, Some(103), 0));
+            let snap = m.snapshot(1000);
+            assert_eq!(snap.encounter.boss_max_hp, Some(100));
+            assert_eq!(snap.encounter.boss_curr_hp, Some(80));
         }
 
         /// issue #112: the curated `BOSS_MONSTER_IDS` list jumped straight

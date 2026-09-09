@@ -332,17 +332,22 @@ pub(super) fn draw_header(
                 icons.glyphs.get(GlyphIcon::Speed).map(|t| t.id()),
             ),
         );
-        // Total damage for the fight (reference render's e.g. "30.10B"). The
-        // heart icon is the reference's own choice of glyph here; despite it
-        // this is `snapshot.total_damage` and nothing else — there is no
-        // party-HP figure anywhere in this codebase.
-        stat_pill(
+        // The selected boss's total health (issue #436) — the heart icon is
+        // the reference's own choice of glyph here, and until #436 this pill
+        // drew `snapshot.total_damage` under it, which climbed with the
+        // fight instead of reading as an HP figure. `total_damage` is kept
+        // on `Snapshot` for the rows/history that still want it; this pill
+        // no longer does.
+        let heart_pill = stat_pill(
             ui,
             StatPill::header(
-                &fmt_short(snapshot.total_damage),
+                &heart_pill_text(snapshot),
                 icons.glyphs.get(GlyphIcon::Heart).map(|t| t.id()),
             ),
         );
+        if let Some(tooltip) = heart_pill_tooltip(snapshot) {
+            heart_pill.on_hover_text(tooltip);
+        }
     }
     toggle_cluster(
         &mut cluster_ui,
@@ -1359,6 +1364,31 @@ pub(super) fn handle_share_screenshot(
 /// this precedence wholesale and only fills in the non-boss blank this
 /// function leaves on purpose (issue #424), so a saved label matches the
 /// live header whenever the header showed one (issue #39, DECISION D2).
+/// The header heart pill's text (issue #436): the selected boss's total
+/// health, or an em dash placeholder — the same "not known yet" convention
+/// `fmt_death_time` uses — when `Meter::snapshot` has no `boss_max_hp` for
+/// the current target.
+pub(crate) fn heart_pill_text(snapshot: &Snapshot) -> String {
+    match snapshot.encounter.boss_max_hp {
+        Some(max) => fmt_short(max as i64),
+        None => "\u{2014}".to_string(),
+    }
+}
+
+/// The heart pill's hover tooltip (issue #436): "Boss HP: {curr} / {max}"
+/// once both halves are known, `None` (no tooltip at all) otherwise — a
+/// half-known reading (e.g. a max with no current yet) isn't worth
+/// captioning.
+pub(crate) fn heart_pill_tooltip(snapshot: &Snapshot) -> Option<String> {
+    match (
+        snapshot.encounter.boss_curr_hp,
+        snapshot.encounter.boss_max_hp,
+    ) {
+        (Some(curr), Some(max)) => Some(format!("Boss HP: {curr} / {max}")),
+        _ => None,
+    }
+}
+
 pub(crate) fn encounter_title(e: &EncounterInfo) -> String {
     if e.is_boss {
         // `is_boss` is only ever true alongside a `Some` `boss_monster_id`
@@ -4149,6 +4179,62 @@ mod tests {
             "separator bottom {} drifts past the title/subtitle gap",
             rect.bottom()
         );
+    }
+
+    // -- heart pill boss HP (issue #436) ------------------------------------
+
+    fn snapshot_with_encounter(encounter: EncounterInfo) -> Snapshot {
+        Snapshot {
+            duration_ms: 0,
+            total_damage: 0,
+            total_dps: 0.0,
+            total_absorbed: 0,
+            total_immune: 0,
+            rows: Vec::new(),
+            encounter,
+            local_uid: None,
+            capture_alive: true,
+        }
+    }
+
+    #[test]
+    fn heart_pill_text_shows_fmt_short_of_boss_max_hp_when_known() {
+        let snapshot = snapshot_with_encounter(EncounterInfo {
+            boss_max_hp: Some(1_500_000),
+            ..Default::default()
+        });
+        assert_eq!(heart_pill_text(&snapshot), fmt_short(1_500_000));
+    }
+
+    #[test]
+    fn heart_pill_text_is_an_em_dash_when_boss_max_hp_is_unknown() {
+        let snapshot = snapshot_with_encounter(EncounterInfo::default());
+        assert_eq!(heart_pill_text(&snapshot), "\u{2014}");
+    }
+
+    #[test]
+    fn heart_pill_tooltip_shows_curr_and_max_when_both_known() {
+        let snapshot = snapshot_with_encounter(EncounterInfo {
+            boss_curr_hp: Some(400_000),
+            boss_max_hp: Some(1_500_000),
+            ..Default::default()
+        });
+        assert_eq!(
+            heart_pill_tooltip(&snapshot),
+            Some("Boss HP: 400000 / 1500000".to_string())
+        );
+    }
+
+    #[test]
+    fn heart_pill_tooltip_is_none_when_either_half_is_unknown() {
+        let max_only = snapshot_with_encounter(EncounterInfo {
+            boss_max_hp: Some(1_500_000),
+            ..Default::default()
+        });
+        assert_eq!(heart_pill_tooltip(&max_only), None);
+
+        let neither = snapshot_with_encounter(EncounterInfo::default());
+        assert_eq!(heart_pill_tooltip(&neither), None);
     }
 
     // -- encounter title/subtitle (issue #9 slice 2) -----------------------

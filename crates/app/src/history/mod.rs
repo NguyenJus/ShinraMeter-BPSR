@@ -545,6 +545,7 @@ mod tests {
                 scene_name: Some("Test Scene"),
                 scene_boss_name: Some("Test Boss"),
                 multi_boss_scene: false,
+                ..EncounterInfo::default()
             },
             local_uid: None,
             capture_alive: true,
