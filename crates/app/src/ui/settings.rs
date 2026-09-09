@@ -12,6 +12,12 @@ use super::*;
 /// once per app frame regardless of whether the dropdown happens to be
 /// open that frame, so a result that lands while it's closed is still
 /// there — not dropped — the moment it's reopened.
+///
+/// Issue #434: a *resolved* result (`Done`/`InstallFailed`) is reset back
+/// to `Idle` by `reset_update_check_if_resolved`, but only on the frame the
+/// dropdown goes from open to closed — i.e. once it has actually been
+/// shown. A result that lands while the dropdown is already closed is
+/// therefore still waiting, unread, the next time it opens.
 #[derive(Debug, Default)]
 pub(super) enum UpdateCheckState {
     /// No request has been made yet this session, or this is a fresh
@@ -25,12 +31,13 @@ pub(super) enum UpdateCheckState {
     },
     /// The most recent request has resolved, successfully or not.
     Done(Result<CheckOutcome, String>),
-    /// Issue #250: the user clicked "Update now" and a spawned thread is
-    /// downloading the release asset and swapping it in. `available` is the
-    /// `CheckOutcome::UpdateAvailable` that offer came from, kept so the
-    /// dropdown can keep naming the tag and can re-offer the same install
-    /// if this one fails; `rx` carries the installed executable's path (to
-    /// relaunch) or the reason it didn't get that far.
+    /// Issue #250: the user clicked the row while it read "Install {tag}"
+    /// and a spawned thread is downloading the release asset and swapping
+    /// it in. `available` is the `CheckOutcome::UpdateAvailable` that offer
+    /// came from, kept so the dropdown can keep naming the tag and can
+    /// re-offer the same install if this one fails; `rx` carries the
+    /// installed executable's path (to relaunch) or the reason it didn't
+    /// get that far.
     Installing {
         available: CheckOutcome,
         rx: Receiver<Result<PathBuf, String>>,
@@ -41,8 +48,10 @@ pub(super) enum UpdateCheckState {
     /// saying why.
     Restarting,
     /// Issue #250: the download, the swap or the relaunch failed. Carries
-    /// the original offer so the dropdown can redraw the "Update now"
-    /// button beside the error and a retry costs one click.
+    /// the original offer so the row can re-offer it: a click retries the
+    /// install (or, for an asset-less release, opens its release page), and
+    /// a right-click opens the release page either way. A retry costs one
+    /// click.
     InstallFailed {
         available: CheckOutcome,
         error: String,
@@ -76,22 +85,63 @@ pub(super) fn update_check_row_label(update_check: &UpdateCheckState) -> String 
         UpdateCheckState::Done(Ok(CheckOutcome::UpToDate)) => {
             format!("Up to date (v{})", env!("CARGO_PKG_VERSION"))
         }
-        UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable { tag, .. })) => {
-            format!("Update available: {tag}")
-        }
+        UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable {
+            tag,
+            asset_url: Some(_),
+            ..
+        })) => format!("Install {tag}"),
+        UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable {
+            tag,
+            asset_url: None,
+            ..
+        })) => format!("Open {tag} release page"),
         UpdateCheckState::Done(Err(err)) => format!("Update failed: {err}"),
         UpdateCheckState::Installing { .. } => "Installing…".to_string(),
         UpdateCheckState::Restarting => "Restarting…".to_string(),
-        UpdateCheckState::InstallFailed { error, .. } => format!("Install failed: {error}"),
+        UpdateCheckState::InstallFailed { available, error } => {
+            let tag = match available {
+                CheckOutcome::UpdateAvailable { tag, .. } => tag.as_str(),
+                CheckOutcome::UpToDate => "the update",
+            };
+            format!("Retry install of {tag}: {error}")
+        }
     }
+}
+
+/// The release page a given state has to point at, or `None` when there is
+/// no release to point at (`Idle`, `Checking`, `UpToDate`, a failed check,
+/// `Installing`, `Restarting`). Split out of `draw_header_menu` so the URL
+/// the row's tooltip quotes and the URL its right-click opens are the same
+/// value, provably, rather than two matches that can drift.
+pub(super) fn release_notes_url(update_check: &UpdateCheckState) -> Option<&str> {
+    let available = match update_check {
+        UpdateCheckState::Done(Ok(available)) => available,
+        UpdateCheckState::InstallFailed { available, .. } => available,
+        _ => return None,
+    };
+    match available {
+        CheckOutcome::UpdateAvailable { url, .. } => Some(url),
+        CheckOutcome::UpToDate => None,
+    }
+}
+
+/// The hover text naming the release page, for the states that have one
+/// (issue #434). `Trailing` has no button variant and `menu_row` paints a
+/// plain label, so the URL must never be presented as an inline link that
+/// does nothing — it reads in the tooltip, and the tooltip says which
+/// gesture actually opens it.
+pub(super) fn release_notes_tooltip(update_check: &UpdateCheckState) -> Option<String> {
+    release_notes_url(update_check).map(|url| format!("Release notes: {url} — right-click to open"))
 }
 
 /// Puts a resolved "Check for updates" result back to `Idle` when the
 /// header dropdown is closed (issue #434), so the row reads "Check for
 /// updates" again the next time it opens rather than still showing a stale
 /// `Done`/`InstallFailed` from whenever the last check or install attempt
-/// landed. Called from `draw_header` on the same frames that call
-/// `reset_menu_page` — every frame the popup is *not* open.
+/// landed. Called from `draw_header` only on the frame the popup goes from
+/// open to closed, never on every closed frame: a result that lands while
+/// the dropdown is shut has not been shown to anyone yet, and discarding it
+/// unseen is exactly the bug this reset exists to avoid the other half of.
 ///
 /// Never touches `Checking`, `Installing` or `Restarting`: those are work
 /// still in flight (or, for `Restarting`, a terminal state the window is
@@ -698,12 +748,10 @@ mod tests {
     }
 
     /// Issue #434: a release with no downloadable asset (every release
-    /// tagged before issue #249, or one whose upload never finished) no
-    /// longer earns a separate "Download" link branch — the row reads the
-    /// same "Update available: vX" either way, and clicking it still tries
-    /// `start_update_install`, which itself resolves a missing asset to a
-    /// stated `InstallFailed` (see that function's tests) rather than the
-    /// row ever needing to know the difference up front.
+    /// tagged before issue #249, or one whose upload never finished) is
+    /// still offered, but the row names the only action it can actually
+    /// perform — opening the release page — rather than an install that
+    /// would loop straight back into `InstallFailed`.
     #[test]
     fn draw_header_menu_shows_update_available_regardless_of_asset_presence() {
         let ctx = egui::Context::default();
@@ -744,8 +792,25 @@ mod tests {
         assert!(
             texts
                 .iter()
-                .any(|t| t.starts_with("Update available: v0.3.0")),
+                .any(|t| t.starts_with("Open v0.3.0 release page")),
             "expected the update-available line among the painted text, got {texts:?}"
+        );
+    }
+
+    /// Issue #434, the asset-bearing half of the test above: an offer that
+    /// can actually be installed reads as the install it will start, and
+    /// the row paints exactly the pure label the tests pin.
+    #[test]
+    fn draw_header_menu_offers_the_install_when_the_release_carries_an_asset() {
+        let state = UpdateCheckState::Done(Ok(update_available(Some(
+            "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/app.exe",
+        ))));
+        let expected = update_check_row_label(&state);
+        let texts = header_menu_texts(state);
+        assert_eq!(expected, "Install v0.3.0");
+        assert!(
+            texts.contains(&expected),
+            "expected {expected:?} among the painted text, got {texts:?}"
         );
     }
 
@@ -783,8 +848,50 @@ mod tests {
             error: "the connection was reset".to_string(),
         });
         assert!(
-            texts.contains(&"Install failed: the connection was reset".to_string()),
+            texts.contains(&"Retry install of v0.3.0: the connection was reset".to_string()),
             "expected the failure line, got {texts:?}"
+        );
+    }
+
+    /// Issue #434: the row is one elided line, and `Galley::text()` hands
+    /// back the string that was *laid out*, not what fits — so every other
+    /// render test here would happily pass on a label the user can only
+    /// read the first 30 characters of. This one looks at the galley
+    /// instead: a long install error must stay on one row and must actually
+    /// be marked elided, which is what makes the hover tooltip carrying the
+    /// full text load-bearing rather than decorative.
+    #[test]
+    fn draw_header_menu_elides_a_long_install_error_onto_one_row() {
+        let error = "the connection was reset by the peer while downloading the release asset, \
+                     and every retry since has failed the same way for the same reason, so the \
+                     install never got as far as writing a single byte to disk"
+            .to_string();
+        assert!(error.len() > 190, "the error must overflow the row");
+        let state = UpdateCheckState::InstallFailed {
+            available: update_available(Some("https://github.com/x/y.exe")),
+            error,
+        };
+        let label = update_check_row_label(&state);
+        let galleys = header_menu_galleys(state);
+
+        let row = galleys
+            .iter()
+            .find(|galley| galley.text().starts_with(&label))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a galley laid out from {label:?}, got {:?}",
+                    galleys.iter().map(|g| g.text()).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            row.rows.len(),
+            1,
+            "the row must stay on a single line, got {} rows",
+            row.rows.len()
+        );
+        assert!(
+            row.elided,
+            "an error this long must be elided, so the tooltip is the only way to read it"
         );
     }
 
@@ -809,8 +916,14 @@ mod tests {
             format!("Up to date (v{})", env!("CARGO_PKG_VERSION"))
         );
         assert_eq!(
+            update_check_row_label(&UpdateCheckState::Done(Ok(update_available(Some(
+                "https://github.com/x/y.exe"
+            ))))),
+            "Install v0.3.0"
+        );
+        assert_eq!(
             update_check_row_label(&UpdateCheckState::Done(Ok(update_available(None)))),
-            "Update available: v0.3.0"
+            "Open v0.3.0 release page"
         );
         assert_eq!(
             update_check_row_label(&UpdateCheckState::Done(Err("no network".to_string()))),
@@ -833,7 +946,48 @@ mod tests {
                 available: update_available(None),
                 error: "the connection was reset".to_string(),
             }),
-            "Install failed: the connection was reset"
+            "Retry install of v0.3.0: the connection was reset"
+        );
+        // `InstallFailed` can only carry the offer it failed on, but the
+        // type admits `UpToDate`; the label still has to read as a sentence
+        // rather than "Retry install of : ...".
+        assert_eq!(
+            update_check_row_label(&UpdateCheckState::InstallFailed {
+                available: CheckOutcome::UpToDate,
+                error: "the connection was reset".to_string(),
+            }),
+            "Retry install of the update: the connection was reset"
+        );
+    }
+
+    /// Issue #434: the row's label is a plain, elided label — the release
+    /// page can only be reached through the tooltip's stated right-click,
+    /// so the URL it quotes must come from the offer itself and must be
+    /// absent for every state with no release to point at.
+    #[test]
+    fn release_notes_tooltip_quotes_the_offer_url_and_only_for_an_offer() {
+        let url = "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/tag/v0.3.0";
+        assert_eq!(
+            release_notes_tooltip(&UpdateCheckState::Done(Ok(update_available(Some(
+                "https://github.com/x/y.exe"
+            ))))),
+            Some(format!("Release notes: {url} — right-click to open"))
+        );
+        assert_eq!(
+            release_notes_tooltip(&UpdateCheckState::InstallFailed {
+                available: update_available(None),
+                error: "boom".to_string(),
+            }),
+            Some(format!("Release notes: {url} — right-click to open"))
+        );
+        assert_eq!(
+            release_notes_tooltip(&UpdateCheckState::Done(Ok(CheckOutcome::UpToDate))),
+            None
+        );
+        assert_eq!(release_notes_tooltip(&UpdateCheckState::Idle), None);
+        assert_eq!(
+            release_notes_tooltip(&UpdateCheckState::Done(Err("no network".to_string()))),
+            None
         );
     }
 

@@ -330,6 +330,15 @@ pub(super) fn menu_page_id() -> egui::Id {
     egui::Id::new("header_menu_page")
 }
 
+/// The `egui` temp-memory key holding whether the header dropdown was open
+/// on the *previous* frame (issue #434). `draw_header` needs the open→
+/// closed transition, not merely "closed", to reset a resolved update
+/// check, and `Popup`'s own open flag only says what this frame is; the
+/// same global-key reasoning as `menu_page_id` applies.
+pub(super) fn menu_popup_was_open_id() -> egui::Id {
+    egui::Id::new("header_menu_popup_was_open")
+}
+
 /// Puts the dropdown back on its root page. Called from `draw_header` on
 /// every frame the popup is *not* open, so a menu that was closed while
 /// drilled into Columns does not reopen there: a dropdown that remembers
@@ -1215,67 +1224,86 @@ fn draw_menu_root(
     // layout — the same mechanism every other row here already uses to
     // stay on one line.
     let label = update_check_row_label(update_check);
-    // A release page is worth linking to only once an update has actually
-    // been offered (`Done(Ok(UpdateAvailable))`, or its failed-install
-    // retry) — `UpToDate`, `Idle` and the error states have no release to
-    // point at.
-    let release_notes_url: Option<&str> = match update_check {
-        UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable { url, .. })) => Some(url),
-        UpdateCheckState::InstallFailed { available, .. } => match available {
-            CheckOutcome::UpdateAvailable { url, .. } => Some(url),
-            CheckOutcome::UpToDate => None,
-        },
-        _ => None,
-    };
-    // Fits inline only if the row's label plus the link both clear the
-    // row's own label band — measured against the same font/inset/icon-slot
-    // geometry `menu_row` lays the label out with. Too long, and the link
-    // moves to a hover tooltip instead of silently truncating out of the
-    // row (`menu_row`'s ellipsis would otherwise just eat it).
-    let row_available_width =
-        ui.available_width() - 2.0 * MENU_ROW_INSET - MENU_ICON_SLOT - MENU_ROW_LABEL_GAP;
-    let combined_with_link = release_notes_url.map(|_| format!("{label} · Release notes"));
-    let show_link_inline = combined_with_link.as_ref().is_some_and(|combined| {
-        ui.painter()
-            .layout_no_wrap(
-                combined.clone(),
-                regular(MENU_LABEL_FONT_SIZE),
-                egui::Color32::WHITE,
-            )
-            .size()
-            .x
-            <= row_available_width
-    });
-    let row_label = if show_link_inline {
-        combined_with_link.expect("show_link_inline implies combined_with_link is Some")
-    } else {
-        label
-    };
     let response = menu_row(
         ui,
         MenuRow {
             icon: None,
-            label: &row_label,
+            label: &label,
             trailing: Trailing::None,
             enabled: !busy,
         },
     );
-    let response = match release_notes_url {
-        Some(url) if !show_link_inline => response.on_hover_text(format!("Release notes: {url}")),
-        _ => response,
+    // Issue #434: the row is a single elided label, so anything longer than
+    // its ~208px band is unreadable in place — the error states put their
+    // full text in the tooltip, and the release page (which `Trailing` has
+    // no button variant to hold, and which must not be faked as an inline
+    // "link" that a plain label cannot open) names the gesture that opens
+    // it. Both lines share one tooltip so a failed install shows the reason
+    // and the release page together.
+    let mut hover_lines = Vec::new();
+    if matches!(
+        update_check,
+        UpdateCheckState::Done(Err(_)) | UpdateCheckState::InstallFailed { .. }
+    ) {
+        hover_lines.push(label.clone());
+    }
+    hover_lines.extend(release_notes_tooltip(update_check));
+    let response = if hover_lines.is_empty() {
+        response
+    } else {
+        response.on_hover_text(hover_lines.join("\n"))
     };
     if response.clicked() {
         match update_check {
-            UpdateCheckState::Done(Ok(available @ CheckOutcome::UpdateAvailable { .. })) => {
+            // An offer that carries a downloadable asset installs in place;
+            // its label says so ("Install {tag}").
+            UpdateCheckState::Done(Ok(
+                available @ CheckOutcome::UpdateAvailable {
+                    asset_url: Some(_), ..
+                },
+            ))
+            | UpdateCheckState::InstallFailed {
+                available:
+                    available @ CheckOutcome::UpdateAvailable {
+                        asset_url: Some(_), ..
+                    },
+                ..
+            } => {
                 *update_check = start_update_install(available.clone());
             }
-            UpdateCheckState::InstallFailed { available, .. } => {
-                *update_check = start_update_install(available.clone());
+            // An asset-less release (anything tagged before issue #249, or
+            // an upload that never finished) has nothing to download, so
+            // `start_update_install` would only loop straight back into
+            // `InstallFailed`. Open the release page instead — the label
+            // ("Open {tag} release page") promises exactly that.
+            UpdateCheckState::Done(Ok(CheckOutcome::UpdateAvailable {
+                url,
+                asset_url: None,
+                ..
+            }))
+            | UpdateCheckState::InstallFailed {
+                available:
+                    CheckOutcome::UpdateAvailable {
+                        url,
+                        asset_url: None,
+                        ..
+                    },
+                ..
+            } => {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
             _ => {
                 *update_check = start_update_check();
             }
         }
+    }
+    // The release page stays reachable even when the primary click is spent
+    // on the install, which is the only way to reach it at all now that the
+    // old `hyperlink_to` line is gone.
+    if response.secondary_clicked()
+        && let Some(url) = release_notes_url(update_check)
+    {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
     }
 
     // Issue #203: a UI-settings reset (window size + opacity), distinct

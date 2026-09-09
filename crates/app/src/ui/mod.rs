@@ -4163,6 +4163,25 @@ mod tests {
         }
     }
 
+    /// `collect_text_shapes`, but keeping the whole `Galley` rather than
+    /// just its text. `Galley::text()` hands back the string that was laid
+    /// out, *before* elision, so it can never show that a row truncated;
+    /// `rows`/`elided` on the galley itself can (issue #434).
+    pub(super) fn collect_text_galleys(
+        shape: &egui::Shape,
+        out: &mut Vec<std::sync::Arc<egui::Galley>>,
+    ) {
+        match shape {
+            egui::Shape::Text(text_shape) => out.push(text_shape.galley.clone()),
+            egui::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_text_galleys(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Walks a painted `Shape`, collecting every `Shape::Mesh`'s
     /// `(texture_id, tint)` — `Painter::image` bakes its `tint` directly
     /// into every vertex (`Mesh::add_rect_with_uv`), so a mesh's first
@@ -5796,6 +5815,45 @@ mod tests {
         }
         output.drop_without_applying_deltas();
         texts
+    }
+
+    /// `header_menu_texts`, but keeping the galleys — see
+    /// `collect_text_galleys` for why a test that has to see elision cannot
+    /// work from the text alone.
+    pub(super) fn header_menu_galleys(
+        state: UpdateCheckState,
+    ) -> Vec<std::sync::Arc<egui::Galley>> {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let mut update_check = state;
+
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_header_menu(
+                ui,
+                &ctx,
+                &tx_command,
+                SettingsHandle {
+                    settings: &mut settings,
+                    tx_settings: &tx_settings,
+                },
+                None,
+                &icons,
+                &mut update_check,
+                &unused_log_export_sender(),
+                &mut 0,
+                &mut false,
+            );
+        });
+        let mut galleys = Vec::new();
+        for clipped in &output.shapes {
+            collect_text_galleys(&clipped.shape, &mut galleys);
+        }
+        output.drop_without_applying_deltas();
+        galleys
     }
 
     pub(super) fn update_available(asset_url: Option<&str>) -> CheckOutcome {
