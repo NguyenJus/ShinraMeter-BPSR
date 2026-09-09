@@ -17,7 +17,7 @@ encounter — the names and figures shown are not from a real parse.*
 ## Download
 
 1. Go to the [latest release](https://github.com/NguyenJus/ShinraMeter-BPSR/releases/latest).
-2. Download the `.exe` asset (`ShinraMeter-BPSR-<version>-windows-x64.exe`)
+2. Download the `.exe` asset (`ShinraMeter-BPSR-windows-x64.exe`)
    and put it somewhere on your PC. That single file is the whole
    application — every icon set, including the class and Imagine icons, is
    compiled into the executable, so there is nothing to extract and nothing

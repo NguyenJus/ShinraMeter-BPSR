@@ -90,12 +90,11 @@ jobs:
             exit 1
           fi
       # Issue #249: the release asset is the bare executable, not a zip
-      # around it. Nothing is versioned here — a branch build has no tag to
-      # version with — but this still runs the same script release.yml does,
-      # so a change that breaks the staging step fails on the PR rather than
-      # on the tag push. `upload-artifact` zips whatever it is given for the
-      # browser download either way, so dropping our own zip costs the CI
-      # artifact nothing.
+      # around it. This stages the same unversioned name release.yml
+      # publishes (issue #444) through the same script, so a change that
+      # breaks the staging step fails on the PR rather than on the tag push.
+      # `upload-artifact` zips whatever it is given for the browser download
+      # either way, so dropping our own zip costs the CI artifact nothing.
       - name: Stage the release asset
         run: |
           scripts/package-release.sh \

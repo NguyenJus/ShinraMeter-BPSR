@@ -173,14 +173,18 @@ pub fn is_newer(current: (u32, u32, u32), remote: (u32, u32, u32)) -> bool {
 /// (issue #250).
 ///
 /// Since issue #249 a release publishes exactly one asset, the bare
-/// executable, named `ShinraMeter-BPSR-<tag>-windows-x64.exe`. This does
-/// not *require* that name, because a release with a hand-uploaded extra
-/// (a checksum file, a debug build) must not break updating: it takes the
-/// first asset whose name ends in `.exe`, preferring one whose name also
-/// says `windows-x64` so a hypothetical second architecture cannot be
-/// picked by upload order. The `.exe` match is ASCII-case-insensitive —
-/// GitHub preserves the uploaded name's case, and a `.EXE` is still the
-/// file we want.
+/// executable. Since issue #444 that asset is named
+/// `ShinraMeter-BPSR-windows-x64.exe`, with no version in the name — the
+/// in-place updater replaces the file at its current path, so a version
+/// baked into the filename would just go stale, and the version is shown
+/// in the app/menu instead. This does not *require* that exact name,
+/// because a release with a hand-uploaded extra (a checksum file, a debug
+/// build) must not break updating, and a pre-#444 release still carries a
+/// version in the name: it takes the first asset whose name ends in
+/// `.exe`, preferring one whose name also says `windows-x64` so a
+/// hypothetical second architecture cannot be picked by upload order. The
+/// `.exe` match is ASCII-case-insensitive — GitHub preserves the uploaded
+/// name's case, and a `.EXE` is still the file we want.
 ///
 /// `None` when nothing matches: a pre-#249 zip-only release, or a release
 /// whose upload never completed. See `CheckOutcome::UpdateAvailable`'s doc
@@ -693,10 +697,26 @@ mod tests {
                 "https://github.com/x/y/releases/download/v1/checksums.txt",
             ),
             asset(
-                "ShinraMeter-BPSR-v0.3.0-windows-x64.exe",
-                "https://github.com/x/y/releases/download/v1/ShinraMeter-BPSR-v0.3.0-windows-x64.exe",
+                "ShinraMeter-BPSR-windows-x64.exe",
+                "https://github.com/x/y/releases/download/v1/ShinraMeter-BPSR-windows-x64.exe",
             ),
         ];
+        assert_eq!(
+            select_asset_url(&assets).as_deref(),
+            Some("https://github.com/x/y/releases/download/v1/ShinraMeter-BPSR-windows-x64.exe")
+        );
+    }
+
+    /// Issue #444 dropped the version from the asset name, but a release
+    /// published before that change still carries one in its filename — the
+    /// `windows-x64` substring match has to keep picking it up rather than
+    /// requiring the new, unversioned name exactly.
+    #[test]
+    fn select_asset_url_still_matches_a_legacy_versioned_name() {
+        let assets = [asset(
+            "ShinraMeter-BPSR-v0.3.0-windows-x64.exe",
+            "https://github.com/x/y/releases/download/v1/ShinraMeter-BPSR-v0.3.0-windows-x64.exe",
+        )];
         assert_eq!(
             select_asset_url(&assets).as_deref(),
             Some(
@@ -711,11 +731,11 @@ mod tests {
     fn select_asset_url_prefers_windows_x64_over_upload_order() {
         let assets = [
             asset(
-                "ShinraMeter-BPSR-v0.3.0-windows-arm64.exe",
+                "ShinraMeter-BPSR-windows-arm64.exe",
                 "https://example/arm64.exe",
             ),
             asset(
-                "ShinraMeter-BPSR-v0.3.0-windows-x64.exe",
+                "ShinraMeter-BPSR-windows-x64.exe",
                 "https://example/x64.exe",
             ),
         ];
@@ -787,10 +807,10 @@ mod tests {
             "prerelease": false,
             "assets": [
                 {
-                    "name": "ShinraMeter-BPSR-v0.3.0-windows-x64.exe",
+                    "name": "ShinraMeter-BPSR-windows-x64.exe",
                     "size": 41234567,
                     "content_type": "application/x-msdownload",
-                    "browser_download_url": "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/ShinraMeter-BPSR-v0.3.0-windows-x64.exe"
+                    "browser_download_url": "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/ShinraMeter-BPSR-windows-x64.exe"
                 }
             ]
         }"#;
@@ -800,7 +820,7 @@ mod tests {
                 "v0.3.0",
                 "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/tag/v0.3.0",
                 Some(
-                    "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/ShinraMeter-BPSR-v0.3.0-windows-x64.exe"
+                    "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/ShinraMeter-BPSR-windows-x64.exe"
                 ),
             ))
         );
@@ -906,11 +926,11 @@ mod tests {
     fn split_download_url_splits_a_real_asset_url() {
         assert_eq!(
             split_download_url(
-                "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/ShinraMeter-BPSR-v0.3.0-windows-x64.exe"
+                "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/ShinraMeter-BPSR-windows-x64.exe"
             ),
             Ok((
                 "github.com".to_string(),
-                "/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/ShinraMeter-BPSR-v0.3.0-windows-x64.exe"
+                "/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/ShinraMeter-BPSR-windows-x64.exe"
                     .to_string()
             ))
         );

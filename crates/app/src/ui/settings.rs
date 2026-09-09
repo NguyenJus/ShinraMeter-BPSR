@@ -799,11 +799,12 @@ mod tests {
 
     /// Issue #434, the asset-bearing half of the test above: an offer that
     /// can actually be installed reads as the install it will start, and
-    /// the row paints exactly the pure label the tests pin.
+    /// the row paints exactly the pure label the tests pin. The asset URL
+    /// uses the unversioned release naming convention.
     #[test]
     fn draw_header_menu_offers_the_install_when_the_release_carries_an_asset() {
         let state = UpdateCheckState::Done(Ok(update_available(Some(
-            "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/app.exe",
+            "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/download/v0.3.0/ShinraMeter-BPSR-windows-x64.exe",
         ))));
         let expected = update_check_row_label(&state);
         let texts = header_menu_texts(state);
