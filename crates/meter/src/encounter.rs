@@ -7037,23 +7037,26 @@ mod tests {
             }
         }
 
-        /// Issue #201: every "Void - Towering Ruin" difficulty tier is a
-        /// single-boss dungeon whose final boss is Kartgriff, so the header
-        /// must name it on entry rather than going blank until the pull.
-        /// 1150-1152 are its Chaotic tiers and 1153/1154 its Unstable
-        /// Space tiers.
-        const TOWERING_RUIN_SCENES: &[u32] = &[1150, 1151, 1152, 1153, 1154];
+        /// Issue #201: every curated Towering Ruin scene — 1150-1152
+        /// ("Chaotic - Towering Ruin") and 1153/1154 ("Unstable -
+        /// Towering Ruin") — is a single-boss dungeon whose final boss is
+        /// Kartgriff, so the header must name it on entry rather than
+        /// going blank until the pull. 1101/1102/1111/1112/1121-1123 name
+        /// a different Towering Ruin dungeon and are left uncurated for
+        /// lack of boss evidence.
+        const CURATED_TOWERING_RUIN_SCENES: &[u32] = &[1150, 1151, 1152, 1153, 1154];
 
-        /// Issue #201: every Mistveil Hunting Ground difficulty tier is a
-        /// single-boss dungeon whose final boss is Mist-Piercing Fang, so
-        /// the header must name it on entry rather than going blank until
-        /// the pull. 5901 is the base scene; 6541/6542 are its Unstable
-        /// Space tiers and 6543-6545 its Chaotic tiers.
-        const MISTVEIL_SCENES: &[u32] = &[5901, 6541, 6542, 6543, 6544, 6545];
+        /// Issue #201: every curated Mistveil Hunting Ground scene —
+        /// 5901 ("Mistveil Hunting Ground"), 6541/6542 ("Unstable Space -
+        /// Mistveil Hunting Ground"), and 6543-6545 ("Chaotic - Mistveil
+        /// Hunting Ground") — is a single-boss dungeon whose final boss
+        /// is Mist-Piercing Fang, so the header must name it on entry
+        /// rather than going blank until the pull.
+        const CURATED_MISTVEIL_SCENES: &[u32] = &[5901, 6541, 6542, 6543, 6544, 6545];
 
         #[test]
-        fn every_towering_ruin_tier_names_kartgriff_before_any_hit_lands() {
-            for &scene in TOWERING_RUIN_SCENES {
+        fn every_curated_towering_ruin_scene_names_kartgriff_before_any_hit_lands() {
+            for &scene in CURATED_TOWERING_RUIN_SCENES {
                 let mut m = Meter::new();
                 m.apply(&ProtocolEvent::Scene {
                     level_map_id: scene,
@@ -7069,12 +7072,14 @@ mod tests {
                     !snap.encounter.multi_boss_scene,
                     "scene {scene} is not a raid"
                 );
+                assert!(!snap.encounter.is_boss, "nothing has been engaged yet");
             }
         }
 
         #[test]
-        fn every_mistveil_hunting_ground_tier_names_mist_piercing_fang_before_any_hit_lands() {
-            for &scene in MISTVEIL_SCENES {
+        fn every_curated_mistveil_hunting_ground_scene_names_mist_piercing_fang_before_any_hit_lands()
+         {
+            for &scene in CURATED_MISTVEIL_SCENES {
                 let mut m = Meter::new();
                 m.apply(&ProtocolEvent::Scene {
                     level_map_id: scene,
@@ -7090,6 +7095,7 @@ mod tests {
                     !snap.encounter.multi_boss_scene,
                     "scene {scene} is not a raid"
                 );
+                assert!(!snap.encounter.is_boss, "nothing has been engaged yet");
             }
         }
 
