@@ -19,13 +19,15 @@
 use std::ffi::{CString, c_void};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bpsr_protocol::{Decoder, InspectSink, ProtocolEvent};
 use crossbeam_channel::Sender;
+
+use crate::clock::{mono_ms, now_ms};
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use windows::Win32::Foundation::HANDLE;
 
@@ -732,7 +734,7 @@ fn recv_loop(
         }
 
         let payload_packet = !payload.is_empty();
-        reassembler.push(seq, payload, now_ms());
+        reassembler.push(seq, payload, mono_ms());
         if reassembler.take_loss() {
             log::info!(
                 "capture: reassembly reported a break in the byte stream; resetting the decoder"
@@ -847,12 +849,4 @@ fn log_heartbeat(beat: &Heartbeat) {
             beat.silent_for,
         ),
     }
-}
-
-/// Monotonic milliseconds since this process started capturing — not an
-/// epoch timestamp — so a forward wall-clock step cannot spuriously trip the
-/// stall guard's time budget.
-fn now_ms() -> u64 {
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
