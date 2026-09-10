@@ -101,7 +101,7 @@ pub struct TcpReassembler {
     /// `now_ms` (caller-supplied, see [`Self::push`]) at which `next_seq`
     /// last advanced. `None` before the first push and after any resync,
     /// until the next push (progress or not) seeds it. Drives the
-    /// wall-clock half of the stall guard (issue #405); the push-count half
+    /// time-budget half of the stall guard (issue #405); the push-count half
     /// (`stall_pushes`) is tracked separately since a busy-but-stuck stream
     /// keeps pushing without ever advancing `next_seq`.
     last_advance_ms: Option<u64>,
@@ -160,11 +160,13 @@ impl TcpReassembler {
     /// stateful state (e.g. a protocol decoder) should reset it when that
     /// returns `true`.
     ///
-    /// `now_ms` is the caller's wall clock (e.g. `SystemTime`-since-epoch
-    /// milliseconds), injected rather than read internally so the stall
-    /// guard's wall-clock budget (issue #405) is host-testable with a driven
+    /// `now_ms` is any caller-supplied millisecond clock, used only for
+    /// deltas between calls; production passes the process-monotonic
+    /// `crate::clock::mono_ms()` (#413), and tests drive it directly. Taking
+    /// it as a parameter rather than reading a clock internally keeps the
+    /// stall guard's time budget (issue #405) host-testable with a driven
     /// clock instead of a real sleep. Callers that never care about the
-    /// wall-clock trip (all the tests below bar the ones exercising it) can
+    /// time-budget trip (all the tests below bar the ones exercising it) can
     /// pass a constant.
     pub fn push(&mut self, seq: u32, payload: &[u8], now_ms: u64) {
         if payload.is_empty() {
@@ -453,11 +455,11 @@ impl TcpReassembler {
         self.buffer.clear();
         self.next_seq = Some(seq);
         self.stall_pushes = 0;
-        // The new anchor has not "just advanced" in wall-clock terms — the
+        // The new anchor has not "just advanced" in time-budget terms — the
         // caller supplies no `now_ms` here — so clear it rather than carry a
         // stale timestamp from the abandoned flow forward. The first
         // no-progress push after a resync seeds the clock off its own
-        // `now_ms`, so the wall-clock trip budget (#405) starts counting
+        // `now_ms`, so the time-budget trip (#405) starts counting
         // from that push rather than being disabled indefinitely.
         self.last_advance_ms = None;
         // An externally driven resync — win.rs adopting a brand-new server

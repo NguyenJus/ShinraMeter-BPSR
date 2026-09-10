@@ -1,5 +1,7 @@
 pub mod backoff;
 pub mod backpressure;
+// pub rather than pub(crate) because the only in-crate caller is cfg(windows),
+// so pub(crate) is dead_code on every other host.
 pub mod clock;
 pub mod detect;
 pub mod error;

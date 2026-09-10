@@ -1,4 +1,4 @@
-//! The two clocks the Windows capture loop ([`crate::win`]) stamps events
+//! The two clocks the Windows capture loop (`win.rs`) stamps events
 //! with, factored out so the split between them stays unit-testable on any
 //! host (win.rs itself cannot be built off Windows).
 
@@ -41,9 +41,11 @@ mod tests {
     /// Issue: the v0.3.1 00:00 reset loop (#413). `Decoder::push_stream`
     /// stamps events the meter compares against `bpsr_app::pipeline::now_ms`'s
     /// wall clock, so the two must share an epoch; only the reassembler's
-    /// stall budget may use the monotonic clock.
+    /// stall budget may use the monotonic clock. The `push_stream`/
+    /// `reassembler.push` wiring this guards lives in `win.rs`, which is
+    /// cfg(windows) and not exercised by this test.
     #[test]
-    fn decoded_events_are_stamped_on_the_wall_clock_not_the_capture_monotonic_one() {
+    fn now_ms_is_epoch_based_and_mono_ms_is_process_relative() {
         // 2020-01-01T00:00:00Z: unmistakably epoch-based, not process-relative.
         assert!(now_ms() > 1_577_836_800_000, "now_ms is not epoch-based");
         assert!(mono_ms() < now_ms(), "mono_ms should not be epoch-based");
