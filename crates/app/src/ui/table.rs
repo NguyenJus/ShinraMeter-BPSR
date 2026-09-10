@@ -26,66 +26,37 @@ use super::*;
 /// width stays pinned at the floor — wider than the viewport — and the
 /// caller's `ScrollArea` picks up the remaining overflow as horizontal
 /// scroll instead of compressing columns any further.
-pub(super) fn row_content_width(viewport_width: f32, stat_columns_total: f32) -> f32 {
+///
+/// `column_viewport_width` is the width available to the *columns*, not
+/// the row list's full width: `draw_rows` passes its `ScrollArea`
+/// viewport minus `ROW_SCROLL_BAR_WIDTH`, which it reserves
+/// unconditionally (issue #439). The returned width is likewise the width
+/// the columns are laid out (and justified) in — each row's own rect is a
+/// separate, never-narrower width, so the share bar and hover band still
+/// reach the panel edge across the reserved strip.
+pub(super) fn row_content_width(column_viewport_width: f32, stat_columns_total: f32) -> f32 {
     let floor_width = stat_columns_total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
-    viewport_width.max(floor_width)
-}
-
-/// Whether the row list's `ScrollArea` will need to scroll horizontally
-/// this frame — the same floor `row_content_width` pins to, but as a plain
-/// predicate so `draw_rows` can decide it *before* computing
-/// `content_width` (issue #404 follow-up). `ScrollStyle::floating` is one
-/// bool shared by both axes, so once the row list's horizontal bar goes
-/// solid (see `row_scroll_style`), a narrow window's horizontal overflow
-/// eats `ROW_SCROLL_BAR_WIDTH` of *height* too, and `row_list_overflows`
-/// needs to know about it before it can predict the vertical bar
-/// correctly.
-pub(super) fn row_content_overflows_horizontally(
-    viewport_width: f32,
-    stat_columns_total: f32,
-) -> bool {
-    let floor_width = stat_columns_total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
-    viewport_width < floor_width
+    column_viewport_width.max(floor_width)
 }
 
 /// Width of the row list's solid vertical scroll bar (issue #404), matching
 /// the reference `ScrollBar`'s `GridRoot Width="8"`
 /// (`DamageMeter.UI/Resources/Styles.xaml` ~830-853). Unlike egui's default
 /// floating bar (0pt allocated, paints on top of the content), a solid bar
-/// takes its width out of the row list's own layout — but only while it is
-/// actually showing. `draw_rows` reserves it out of the viewport itself,
-/// conditional on `row_list_overflows`, before computing `content_width`,
-/// so the row content never lays out into the strip the bar occupies once
-/// it shows, and never loses that strip for nothing when it doesn't.
+/// takes its width out of the row list's own layout.
 ///
-/// The same solid style applies to *both* axes (`row_scroll_style`'s
-/// `floating: false` is one bool for the whole `ScrollStyle`), so a solid
-/// horizontal bar takes this same `ROW_SCROLL_BAR_WIDTH` out of the row
-/// list's *height* whenever `row_content_overflows_horizontally` is true —
-/// `draw_rows` folds that into the height it hands `row_list_overflows`
-/// before deciding the vertical bar, the same way it folds the vertical
-/// bar's width into `row_content_width`.
+/// Issue #439: `draw_rows` reserves this out of the viewport
+/// *unconditionally*, before computing `content_width` — not just while the
+/// bar is actually showing. The original #404 implementation reserved it
+/// only while `row_list_overflows`, which let the column viewport's width
+/// (and therefore every right-justified column's anchor) depend on the row
+/// count: crossing the overflow threshold, by adding rows or by resizing
+/// the window, silently shrank `content_width` by `ROW_SCROLL_BAR_WIDTH`
+/// and jogged every right-justified column sideways. Column placement must
+/// be a pure function of the window's width alone, so the strip is always
+/// reserved now, whether or not the bar (`ScrollBarVisibility::
+/// VisibleWhenNeeded`) actually paints into it this frame.
 pub(super) const ROW_SCROLL_BAR_WIDTH: f32 = 8.0;
-
-/// Whether the row list's vertical scroll bar will actually show this frame
-/// (issue #404 follow-up): egui's non-floating bar with
-/// `ScrollBarVisibility::VisibleWhenNeeded` allocates 0pt of layout space
-/// when the content fits inside the viewport, and the full `bar_width`
-/// only once the content overflows it — so `draw_rows` must reserve
-/// `ROW_SCROLL_BAR_WIDTH` conditionally on the same fact, or every
-/// non-overflowing row list ends up permanently narrower than it needs to
-/// be, with a dead strip on the right where the bar never paints.
-///
-/// A pure function of the row count and the viewport height rather than a
-/// read of the `ScrollArea`'s own state (`scroll_area::State::show_scroll`
-/// is private in egui 0.36.1), so it's unit-testable without a live
-/// `Ui`/`ScrollArea` — the same reasoning `row_content_width` already
-/// follows. `item_spacing.y` is zeroed inside the row list's content `Ui`
-/// (see `draw_rows`), so the content height is exactly `row_count as f32 *
-/// ROW_HEIGHT`, with no per-row gap to add in.
-pub(super) fn row_list_overflows(row_count: usize, viewport_height: f32) -> bool {
-    row_count as f32 * ROW_HEIGHT > viewport_height
-}
 
 /// The row list's solid-bar handle color, the reference's thumb
 /// `Foreground="#8C8C8C"`.
@@ -107,10 +78,8 @@ const ROW_SCROLL_HANDLE_CORNER_RADIUS: u8 = 4;
 /// margins are zeroed so the bar's total allocated width
 /// (`ScrollStyle::allocated_width`) is exactly `ROW_SCROLL_BAR_WIDTH`, with
 /// nothing extra for `draw_rows` to separately account for. `floating` is
-/// one bool for both axes, so the horizontal bar goes solid too — it takes
-/// its `ROW_SCROLL_BAR_WIDTH` out of the row list's *height* the same way
-/// the vertical bar takes it out of the width (see `ROW_SCROLL_BAR_WIDTH`'s
-/// doc and `draw_rows`).
+/// one bool for both axes, so the horizontal bar goes solid on the same
+/// terms as the vertical one.
 fn row_scroll_style() -> egui::style::ScrollStyle {
     egui::style::ScrollStyle {
         floating: false,
@@ -173,37 +142,22 @@ pub(super) fn draw_rows(
             widget.corner_radius = egui::CornerRadius::same(ROW_SCROLL_HANDLE_CORNER_RADIUS);
         }
 
-        // The solid bar takes its `ROW_SCROLL_BAR_WIDTH` out of the
-        // viewport itself (unlike the old floating bar's 0pt
-        // allocation), but only while it's actually showing
-        // (`row_list_overflows`) — so `content_width` leaves room for it
-        // up front only then, otherwise the row content lays out into
-        // the strip the bar occupies once it actually shows, and a list
-        // that fits without scrolling isn't left permanently narrower
-        // for a bar that never paints.
-        //
-        // Both bars are solid (`row_scroll_style`'s `floating: false` is
-        // one bool for the whole style), so a horizontal bar takes its
-        // `ROW_SCROLL_BAR_WIDTH` out of *height* the same way a vertical
-        // one takes it out of width — decided first, from the full
-        // available width, since narrowing the width for the vertical
-        // bar can itself only ever make horizontal overflow worse, never
-        // better. One frame of skew between the two axes is acceptable.
-        let overflows_horizontally =
-            row_content_overflows_horizontally(ui.available_width(), stat_columns_total);
-        let available_height = ui.available_height()
-            - if overflows_horizontally {
-                ROW_SCROLL_BAR_WIDTH
-            } else {
-                0.0
-            };
-        let scroll_bar_reserved = if row_list_overflows(snapshot.rows.len(), available_height) {
-            ROW_SCROLL_BAR_WIDTH
-        } else {
-            0.0
-        };
+        // Issue #439: the solid bar takes its `ROW_SCROLL_BAR_WIDTH` out of
+        // the viewport itself (unlike the old floating bar's 0pt
+        // allocation), and — unlike the original #404 implementation —
+        // unconditionally, whether or not it actually paints this frame
+        // (`ScrollBarVisibility::VisibleWhenNeeded` still hides the bar
+        // itself when the rows fit). Reserving it only while
+        // `row_list_overflows` let the column viewport's width depend on
+        // the row count: crossing the overflow threshold (by adding rows,
+        // or by resizing the window) silently shrank `content_width` by
+        // `ROW_SCROLL_BAR_WIDTH` and every right-justified column (the
+        // Deaths pill, the death-time pill, ...) jogged sideways to
+        // re-justify against the new width. Column placement must be a
+        // pure function of the window's width alone, never of the row
+        // count too, so the width is reserved here up front regardless.
         let content_width = row_content_width(
-            ui.available_width() - scroll_bar_reserved,
+            ui.available_width() - ROW_SCROLL_BAR_WIDTH,
             stat_columns_total,
         );
 
@@ -213,10 +167,14 @@ pub(super) fn draw_rows(
             // rather than shrinking to the content's size, so wrapping
             // rows in it changes nothing when everything already fits.
             .auto_shrink([false, false])
-            // Hidden entirely — no reserved gutter, no visible track —
-            // unless the content actually overflows, so a window sized
-            // to show every row and every column at full width paints
-            // pixel-identically to today's unscrolled layout.
+            // The bar itself — track and thumb — only paints while the
+            // content actually overflows, so a window sized to show
+            // every row and every column shows no bar at all. Its 8pt
+            // strip is nonetheless always reserved out of the column
+            // viewport above (issue #439): what this visibility setting
+            // controls is the painting, not the reservation, which has
+            // to be row-count independent to keep the columns from
+            // jogging sideways as rows come and go.
             .scroll_bar_visibility(
                 egui::containers::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
             )
@@ -228,13 +186,27 @@ pub(super) fn draw_rows(
                 // their neighbors with no gap, which a nonzero
                 // `item_spacing.y` would reintroduce.
                 ui.spacing_mut().item_spacing.y = 0.0;
+                // Issue #439: `content_width` is the *column* viewport —
+                // the row list's width minus the reserved
+                // `ROW_SCROLL_BAR_WIDTH` strip — and only the column
+                // anchors below are justified against it. A row's own
+                // rect is a different width: the share bar, the hover
+                // gradient and the right-click target all have to reach
+                // the panel's right edge, including across the reserved
+                // strip on the frames where the bar does not paint into
+                // it, or every row would visibly stop 8pt short. So rows
+                // are laid out at whichever is wider — the pinned column
+                // floor, or whatever the `ScrollArea`'s viewport actually
+                // has (already net of the bar on the frames where it
+                // shows, so this never manufactures 8pt of horizontal
+                // overflow).
+                let row_width = content_width.max(ui.available_width());
                 // A horizontal `ScrollArea` measures how much there is
                 // to scroll from what its content `Ui` actually ends up
                 // using; an empty `snapshot.rows` would otherwise paint
                 // nothing and report zero content width even when
-                // `content_width` (the floor above) exceeds the
-                // viewport.
-                ui.set_min_width(content_width);
+                // `row_width` (the floor above) exceeds the viewport.
+                ui.set_min_width(row_width);
 
                 let avail = ui.available_rect_before_wrap();
                 let anchors = column_anchors(
@@ -268,8 +240,7 @@ pub(super) fn draw_rows(
                 let top_damage = snapshot.rows.first().map(|r| r.damage).unwrap_or(0);
 
                 for row in &snapshot.rows {
-                    if let Some(uid) = draw_row(ui, row, &layout, icons, top_damage, content_width)
-                    {
+                    if let Some(uid) = draw_row(ui, row, &layout, icons, top_damage, row_width) {
                         *opened = Some(uid);
                     }
                 }
@@ -2532,6 +2503,7 @@ mod tests {
             + NAME_COLUMN_GAP
             + columns_width
             + COLUMN_RIGHT_MARGIN
+            + ROW_SCROLL_BAR_WIDTH
             + HEADER_ROW_EXTRA_WIDTH;
         assert_eq!(default_inner_width(), expected);
         // Issue #80.1 tightened the default columns' widths (`Dps`,
@@ -2546,8 +2518,10 @@ mod tests {
         // `ICON_GUTTER_WIDTH` by `6.0` (2 for the icon, 2 * 2 for the two
         // Imagine slots) and landing here at `433.0`. Trimming
         // `COLUMN_RIGHT_MARGIN` to the source's `2 0` + `1` (4.0 -> 3.0)
-        // then took a point back off, landing at `432.0`.
-        assert_eq!(default_inner_width(), 432.0);
+        // then took a point back off, landing at `432.0`. Issue #439's
+        // unconditionally reserved `ROW_SCROLL_BAR_WIDTH` is the newest
+        // addend, landing at `440.0`.
+        assert_eq!(default_inner_width(), 440.0);
         assert_eq!(COLUMN_RIGHT_MARGIN, 3.0);
     }
 
@@ -2595,126 +2569,117 @@ mod tests {
         );
     }
 
-    /// Issue #404 follow-up: `row_list_overflows` (and therefore
-    /// `draw_rows`' reservation) is a pure function of row count and
-    /// viewport height — `ROW_HEIGHT * 2.0` for one row never overflows,
-    /// `ROW_HEIGHT * 0.5` for one row always does, since one full row
-    /// already exceeds that viewport.
+    /// Issue #439: `draw_rows` must reserve `ROW_SCROLL_BAR_WIDTH` out of
+    /// the *column* viewport unconditionally — including when the rows
+    /// comfortably fit and the solid bar never actually paints
+    /// (`VisibleWhenNeeded`). The original #404 implementation reserved it
+    /// only while the rows overflowed, which is exactly the regression
+    /// #439 reported: a single row (nowhere near overflowing) used to
+    /// justify its columns against the *whole* viewport width, so every
+    /// right-justified column jogged `ROW_SCROLL_BAR_WIDTH` sideways the
+    /// moment more rows were added and the bar started showing. Read off
+    /// the painted output rather than off the `ScrollArea`'s content size,
+    /// which measures the row rects (deliberately full-width, see
+    /// `rows_paint_edge_to_edge_...`) rather than the column band.
     #[test]
-    fn row_list_overflows_is_true_only_once_the_rows_exceed_the_viewport() {
-        assert!(!row_list_overflows(1, ROW_HEIGHT * 2.0));
-        assert!(row_list_overflows(1, ROW_HEIGHT * 0.5));
+    fn row_columns_reserve_the_scroll_bars_width_even_when_rows_do_not_overflow() {
+        let mut snapshot = rows_test_snapshot(1);
+        snapshot.rows[0].deaths = 7;
+        let width = 320.0;
+        let frame = rows_painted_boxes(&snapshot, width, ROW_HEIGHT * 5.0);
+        let row = frame.row_rects()[0];
+        let pill = frame.text_box("7");
+        let clear = row.right() - pill.right();
+        assert!(
+            clear >= ROW_SCROLL_BAR_WIDTH + COLUMN_RIGHT_MARGIN,
+            "the Deaths pill's right edge sits only {clear}pt inside the row's own right edge \
+             ({}): the {ROW_SCROLL_BAR_WIDTH}pt scroll-bar strip plus the \
+             {COLUMN_RIGHT_MARGIN}pt column margin must stay clear of the columns even though \
+             this single row never overflows and the bar itself never paints",
+            row.right()
+        );
     }
 
-    /// Issue #404: the row list's `ScrollArea` now paints a solid, 8pt
-    /// vertical scroll bar rather than egui's default floating one, and a
-    /// solid bar (unlike a floating one) allocates its own layout space
-    /// rather than drawing on top of the content — but only while it is
-    /// actually showing. `draw_rows` must reserve that
-    /// `ROW_SCROLL_BAR_WIDTH` out of the viewport itself when the rows
-    /// overflow it, so the row content never lays out wider than what's
-    /// actually left once the bar takes its slice — comfortably above the
-    /// `MIN_COLUMN_SCALE` floor here, so this isolates the scroll bar's own
-    /// reservation from that separate narrowing behavior.
+    /// Issue #439's other half: only the *column* anchors come off the
+    /// reserved viewport. Each row's own rect — the share bar, the hover
+    /// gradient and the right-click target all ride on it — must still
+    /// reach the panel's right edge, or the rows would visibly stop 8pt
+    /// short of it on every frame where the bar does not paint.
     #[test]
-    fn row_content_reserves_the_solid_scroll_bars_allocated_width_when_rows_overflow() {
+    fn rows_paint_edge_to_edge_when_the_scroll_bar_does_not_show() {
         let snapshot = rows_test_snapshot(3);
-        let stat_columns_total: f32 = stat_columns_for(&Settings::default().ordered_columns())
+        let width = 320.0;
+        let frame = rows_painted_boxes(&snapshot, width, ROW_HEIGHT * 5.0);
+        for row in frame.row_rects() {
+            assert!(
+                (row.right() - width).abs() < 0.5,
+                "row {row:?} stops short of the {width}pt panel's right edge"
+            );
+        }
+    }
+
+    /// Issue #439 x #84: the 8pt strip comes off the viewport *before*
+    /// issue #84's `MIN_COLUMN_SCALE` floor is applied, so the width at
+    /// which the columns stop shrinking and the row list starts scrolling
+    /// horizontally is `ROW_SCROLL_BAR_WIDTH` wider than the bare floor.
+    /// One point inside that band the columns are already pinned.
+    #[test]
+    fn the_column_floor_sits_a_scroll_bars_width_above_the_bare_floor() {
+        let stat_columns_total: f32 = stat_columns_for(&Settings::default().stat_columns())
             .iter()
             .map(|c| c.width)
             .sum();
         let floor = stat_columns_total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
-        let viewport = floor + 200.0;
-        let viewport_height = ROW_HEIGHT * 2.0;
-        let content = rows_content_size(&snapshot, viewport, viewport_height);
-        let expected = viewport - ROW_SCROLL_BAR_WIDTH;
+        let viewport = floor + ROW_SCROLL_BAR_WIDTH - 1.0;
+        // Exactly what `draw_rows` passes: the viewport net of the strip.
+        let content = row_content_width(viewport - ROW_SCROLL_BAR_WIDTH, stat_columns_total);
         assert!(
-            (content.x - expected).abs() < 0.5,
-            "content {content:?} must leave {ROW_SCROLL_BAR_WIDTH}pt out of the {viewport}pt \
-             viewport for the solid vertical scroll bar, landing at {expected}"
+            (content - floor).abs() < 0.5,
+            "at a {viewport}pt viewport the columns must already be pinned at the {floor}pt \
+             floor, not laid out at {content}"
         );
     }
 
-    /// Issue #404 follow-up: when the rows *don't* overflow the viewport,
-    /// the solid bar never shows (`VisibleWhenNeeded`), so `draw_rows` must
-    /// not reserve `ROW_SCROLL_BAR_WIDTH` for it — leaving that strip
-    /// permanently unused would be a regression this test exists to catch.
+    /// Issue #439's own regression harness: at a fixed panel width, the
+    /// Deaths pill (a right-justified counter column) must land at the
+    /// same x position whether the row list has few rows (no vertical
+    /// scroll bar shows) or many (the bar shows and, pre-fix, used to
+    /// shrink the column viewport by `ROW_SCROLL_BAR_WIDTH`). Probes the
+    /// 160-432pt band the issue thread's own investigation used, from a
+    /// window narrower than `MIN_INNER_SIZE` up to the default opening
+    /// width — every one of them wide enough that the columns are still
+    /// tracking the viewport rather than pinned at issue #84's
+    /// `MIN_COLUMN_SCALE` floor, where an unreserved layout would have
+    /// been row-count independent for free.
     #[test]
-    fn row_content_reserves_nothing_when_rows_do_not_overflow() {
-        let snapshot = rows_test_snapshot(1);
-        let stat_columns_total: f32 = stat_columns_for(&Settings::default().ordered_columns())
-            .iter()
-            .map(|c| c.width)
-            .sum();
-        let floor = stat_columns_total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
-        let viewport = floor + 200.0;
-        let viewport_height = ROW_HEIGHT * 2.0;
-        let content = rows_content_size(&snapshot, viewport, viewport_height);
-        assert!(
-            (content.x - viewport).abs() < 0.5,
-            "content {content:?} must match the full {viewport}pt viewport when the single row \
-             doesn't overflow it and the scroll bar never shows"
-        );
-    }
+    fn deaths_pill_x_position_is_stable_across_row_counts_at_the_same_width() {
+        for width in [160.0, 200.0, 300.0, 432.0] {
+            let mut few_rows = rows_test_snapshot(3);
+            let mut many_rows = rows_test_snapshot(30);
+            for row in few_rows.rows.iter_mut().chain(many_rows.rows.iter_mut()) {
+                row.deaths = 7;
+            }
 
-    /// Issue #404 follow-up: once the row list's horizontal bar goes solid
-    /// too (`row_scroll_style`'s `floating: false` is one bool for both
-    /// axes), it eats `ROW_SCROLL_BAR_WIDTH` of *height* whenever it shows
-    /// — so a row count that exactly fills the raw viewport height must
-    /// still be predicted to overflow, and therefore reserve the vertical
-    /// bar, once that height is accounted for.
-    ///
-    /// `rows_content_size`'s `content.x` can't isolate that reservation by
-    /// itself in this narrow-viewport regime: once the viewport is
-    /// narrower than the column floor, `row_content_width` pins `content.x`
-    /// to that floor regardless of whether the vertical bar's width is
-    /// additionally reserved (the floor is already the wider of the two),
-    /// so the width this fix actually changes — the height fed to
-    /// `row_list_overflows` — is asserted directly, and `rows_content_size`
-    /// is reserved for the wide-enough contrast, where no such adjustment
-    /// applies and the full viewport width must come back unchanged.
-    #[test]
-    fn row_list_overflows_once_the_solid_horizontal_bars_height_is_subtracted() {
-        let snapshot = rows_test_snapshot(3);
-        let stat_columns_total: f32 = stat_columns_for(&Settings::default().ordered_columns())
-            .iter()
-            .map(|c| c.width)
-            .sum();
-        let floor = stat_columns_total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
+            // Tall enough that 3 rows never need a vertical scroll bar,
+            // but far too short for 30 — so the bar is *needed* for one
+            // snapshot and not the other at the same panel width.
+            // Whether egui actually paints it on this single frame (its
+            // appearance is animated) is beside the point: the columns'
+            // anchor must not depend on the row count either way.
+            let height = ROW_HEIGHT * 5.0;
 
-        // Narrow: the horizontal bar shows, so 3 rows exactly filling the
-        // raw viewport height must be predicted to overflow only once that
-        // height is reduced by `ROW_SCROLL_BAR_WIDTH`.
-        let narrow_viewport = floor - 20.0;
-        assert!(row_content_overflows_horizontally(
-            narrow_viewport,
-            stat_columns_total
-        ));
-        let raw_height = ROW_HEIGHT * 3.0;
-        assert!(
-            !row_list_overflows(3, raw_height),
-            "3 rows exactly filling {raw_height}pt must not overflow that height on their own"
-        );
-        assert!(
-            row_list_overflows(3, raw_height - ROW_SCROLL_BAR_WIDTH),
-            "the solid horizontal bar's {ROW_SCROLL_BAR_WIDTH}pt of height must tip an exact \
-             fit into overflow, so the vertical bar gets predicted too"
-        );
+            let few = rows_painted_boxes(&few_rows, width, height);
+            let many = rows_painted_boxes(&many_rows, width, height);
 
-        // Wide enough: the horizontal bar never shows, so `draw_rows`
-        // never adjusts the height, and the full viewport width comes
-        // back unreserved.
-        let wide_viewport = floor + 200.0;
-        assert!(!row_content_overflows_horizontally(
-            wide_viewport,
-            stat_columns_total
-        ));
-        let content = rows_content_size(&snapshot, wide_viewport, raw_height);
-        assert!(
-            (content.x - wide_viewport).abs() < 0.5,
-            "content {content:?} must match the full {wide_viewport}pt viewport when the \
-             horizontal bar never shows"
-        );
+            let few_x = few.text_box("7").left();
+            let many_x = many.text_box("7").left();
+            assert!(
+                (few_x - many_x).abs() < 0.5,
+                "at width {width}pt, the Deaths pill sat at x={few_x} with 3 rows (no scroll \
+                 bar) but x={many_x} with 30 rows (scroll bar showing) — column placement must \
+                 be a pure function of the panel width, not the row count"
+            );
+        }
     }
 
     #[test]

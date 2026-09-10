@@ -3228,10 +3228,18 @@ const HEADER_ROW_EXTRA_WIDTH: f32 = 20.0;
 /// — plus `HEADER_ROW_EXTRA_WIDTH` so the header's own (now wider) stat row
 /// fits too.
 ///
-///   icon gutter (class 3.5 + 18.0 + Imagines 32.0 + 3.5 = 57.0) + left pad (2.0)
+///   icon gutter (class 3.5 + 20.0 + Imagines 36.0 + 3.5 = 63.0) + left pad (2.0)
 ///     + name budget (150.0) + gap (10.0)
-///     + columns (DPS 80.0 + crit 56.0 + lucky 56.0 + deaths 48.0 = 240.0)
-///     + right margin (4.0) + header row headroom (20.0) = 483.0
+///     + columns (DPS 56.0 + crit 40.0 + lucky 40.0 + deaths 48.0 = 184.0)
+///     + right margin (3.0) + row scroll bar (8.0)
+///     + header row headroom (20.0) = 440.0
+///
+/// The `ROW_SCROLL_BAR_WIDTH` term is issue #439's: `draw_rows` takes that
+/// 8pt strip out of the column viewport unconditionally, whether or not
+/// the row list's solid bar actually paints into it, so a default window
+/// without this addend would open 8pt too narrow to lay the default
+/// columns out at their full width — exactly the squeeze every other term
+/// here exists to avoid.
 ///
 /// The columns term grew with issue #49's death column joining the default
 /// set; because it is summed rather than written down, the default window
@@ -3249,6 +3257,7 @@ fn default_inner_width() -> f32 {
         + NAME_COLUMN_GAP
         + columns_width
         + COLUMN_RIGHT_MARGIN
+        + ROW_SCROLL_BAR_WIDTH
         + HEADER_ROW_EXTRA_WIDTH
 }
 
