@@ -21,7 +21,26 @@
     "",
     "After editing: `python3 scripts/gen-name-tables.py && cargo fmt -p bpsr-meter`."
   ],
-
+  "1150": {
+    "scene": "Chaotic - Towering Ruin",
+    "boss_id": 1152,
+    "boss": "Kartgriff"
+  },
+  "1151": {
+    "scene": "Chaotic - Towering Ruin",
+    "boss_id": 1152,
+    "boss": "Kartgriff"
+  },
+  "1152": {
+    "scene": "Chaotic - Towering Ruin",
+    "boss_id": 1152,
+    "boss": "Kartgriff"
+  },
+  "1153": {
+    "scene": "Unstable - Towering Ruin",
+    "boss_id": 1152,
+    "boss": "Kartgriff"
+  },
   "1154": {
     "scene": "Unstable - Towering Ruin",
     "boss_id": 1152,
@@ -32,10 +51,40 @@
     "boss_id": 4601,
     "boss": "Abyssal Nappo"
   },
+  "5901": {
+    "scene": "Mistveil Hunting Ground",
+    "boss_id": 33801,
+    "boss": "Mist-Piercing Fang"
+  },
   "6521": {
     "scene": "Chaotic - Mech Facility",
     "boss_id": 33500,
     "boss": "Thanatos - Final Form"
+  },
+  "6541": {
+    "scene": "Unstable Space - Mistveil Hunting Ground",
+    "boss_id": 33801,
+    "boss": "Mist-Piercing Fang"
+  },
+  "6542": {
+    "scene": "Unstable Space - Mistveil Hunting Ground",
+    "boss_id": 33801,
+    "boss": "Mist-Piercing Fang"
+  },
+  "6543": {
+    "scene": "Chaotic - Mistveil Hunting Ground",
+    "boss_id": 33801,
+    "boss": "Mist-Piercing Fang"
+  },
+  "6544": {
+    "scene": "Chaotic - Mistveil Hunting Ground",
+    "boss_id": 33801,
+    "boss": "Mist-Piercing Fang"
+  },
+  "6545": {
+    "scene": "Chaotic - Mistveil Hunting Ground",
+    "boss_id": 33801,
+    "boss": "Mist-Piercing Fang"
   },
   "6561": {
     "scene": "Unstable Space - Sea-Ringed Reef",

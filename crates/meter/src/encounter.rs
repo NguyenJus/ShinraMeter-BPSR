@@ -7037,6 +7037,62 @@ mod tests {
             }
         }
 
+        /// Issue #201: every "Void - Towering Ruin" difficulty tier is a
+        /// single-boss dungeon whose final boss is Kartgriff, so the header
+        /// must name it on entry rather than going blank until the pull.
+        /// 1150-1152 are its Chaotic tiers and 1153/1154 its Unstable
+        /// Space tiers.
+        const TOWERING_RUIN_SCENES: &[u32] = &[1150, 1151, 1152, 1153, 1154];
+
+        /// Issue #201: every Mistveil Hunting Ground difficulty tier is a
+        /// single-boss dungeon whose final boss is Mist-Piercing Fang, so
+        /// the header must name it on entry rather than going blank until
+        /// the pull. 5901 is the base scene; 6541/6542 are its Unstable
+        /// Space tiers and 6543-6545 its Chaotic tiers.
+        const MISTVEIL_SCENES: &[u32] = &[5901, 6541, 6542, 6543, 6544, 6545];
+
+        #[test]
+        fn every_towering_ruin_tier_names_kartgriff_before_any_hit_lands() {
+            for &scene in TOWERING_RUIN_SCENES {
+                let mut m = Meter::new();
+                m.apply(&ProtocolEvent::Scene {
+                    level_map_id: scene,
+                });
+
+                let snap = m.snapshot(1_000);
+                assert_eq!(
+                    snap.encounter.scene_boss_name,
+                    Some("Kartgriff"),
+                    "scene {scene} should name its curated final boss"
+                );
+                assert!(
+                    !snap.encounter.multi_boss_scene,
+                    "scene {scene} is not a raid"
+                );
+            }
+        }
+
+        #[test]
+        fn every_mistveil_hunting_ground_tier_names_mist_piercing_fang_before_any_hit_lands() {
+            for &scene in MISTVEIL_SCENES {
+                let mut m = Meter::new();
+                m.apply(&ProtocolEvent::Scene {
+                    level_map_id: scene,
+                });
+
+                let snap = m.snapshot(1_000);
+                assert_eq!(
+                    snap.encounter.scene_boss_name,
+                    Some("Mist-Piercing Fang"),
+                    "scene {scene} should name its curated final boss"
+                );
+                assert!(
+                    !snap.encounter.multi_boss_scene,
+                    "scene {scene} is not a raid"
+                );
+            }
+        }
+
         #[test]
         fn an_open_world_scene_names_no_boss() {
             // Scene 8 ("Asterleeds") is not a dungeon at all, so it can never
