@@ -14674,9 +14674,19 @@ pub fn is_dungeon_scene(id: u32) -> bool {
 /// Sorted by scene id; `scene_final_boss` binary-searches it.
 #[rustfmt::skip]
 pub(crate) const SCENE_FINAL_BOSSES: &[(u32, u32)] = &[
+    (1150, 1152), // Chaotic - Towering Ruin -> Kartgriff
+    (1151, 1152), // Chaotic - Towering Ruin -> Kartgriff
+    (1152, 1152), // Chaotic - Towering Ruin -> Kartgriff
+    (1153, 1152), // Unstable - Towering Ruin -> Kartgriff
     (1154, 1152), // Unstable - Towering Ruin -> Kartgriff
     (5900, 4601), // Sea-Ringed Reef -> Abyssal Nappo
+    (5901, 33801), // Mistveil Hunting Ground -> Mist-Piercing Fang
     (6521, 33500), // Chaotic - Mech Facility -> Thanatos - Final Form
+    (6541, 33801), // Unstable Space - Mistveil Hunting Ground -> Mist-Piercing Fang
+    (6542, 33801), // Unstable Space - Mistveil Hunting Ground -> Mist-Piercing Fang
+    (6543, 33801), // Chaotic - Mistveil Hunting Ground -> Mist-Piercing Fang
+    (6544, 33801), // Chaotic - Mistveil Hunting Ground -> Mist-Piercing Fang
+    (6545, 33801), // Chaotic - Mistveil Hunting Ground -> Mist-Piercing Fang
     (6561, 4601), // Unstable Space - Sea-Ringed Reef -> Abyssal Nappo
     (6562, 4601), // Unstable Space - Sea-Ringed Reef -> Abyssal Nappo
     (6563, 4601), // Chaotic - Sea-Ringed Reef -> Abyssal Nappo
