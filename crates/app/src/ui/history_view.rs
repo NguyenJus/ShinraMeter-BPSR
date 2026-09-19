@@ -59,6 +59,9 @@ pub(super) struct HistoryUi {
     /// carrying any other id belongs to a click the user has already
     /// superseded, and is dropped.
     pub(super) pending_load_id: Option<i64>,
+    /// The summary whose detail sub-row is visible in the list. Expanding is
+    /// immediate because the summary already contains every displayed field.
+    pub(super) expanded_id: Option<i64>,
 }
 
 /// One saved encounter, rebuilt for display: the id (needed for the delete
@@ -308,6 +311,7 @@ pub(super) fn draw_history(
         HistoryBarAction::Live => *back_to_live = true,
         HistoryBarAction::Back => {
             state.open = None;
+            state.expanded_id = None;
             state.confirm_clear = false;
         }
         HistoryBarAction::ClearAll => {
@@ -334,6 +338,10 @@ pub(super) fn draw_history(
     }
 
     match draw_history_list(ui, state) {
+        Some(HistoryRowAction::Expand(id)) => {
+            state.confirm_clear = false;
+            state.expanded_id = (state.expanded_id != Some(id)).then_some(id);
+        }
         Some(HistoryRowAction::Open(id)) => {
             state.confirm_clear = false;
             state.pending_load_id = Some(id);
@@ -344,6 +352,9 @@ pub(super) fn draw_history(
         }
         Some(HistoryRowAction::Delete(id)) => {
             state.confirm_clear = false;
+            if state.expanded_id == Some(id) {
+                state.expanded_id = None;
+            }
             state.pending = true;
             if let Some(handle) = handle {
                 handle.delete(id, tx);
@@ -381,8 +392,8 @@ pub(super) fn draw_history_bar(ui: &mut egui::Ui, state: &HistoryUi) -> HistoryB
     action
 }
 
-/// The newest-first list of saved encounters, one fixed-height row each.
-/// Returns the row the user clicked, if any.
+/// The newest-first list of saved encounters. Primary click expands a
+/// summary's detail sub-row; secondary click loads the fight into the meter.
 pub(super) fn draw_history_list(ui: &mut egui::Ui, state: &HistoryUi) -> Option<HistoryRowAction> {
     if let Some(message) = &state.error {
         ui.colored_label(egui::Color32::from_rgb(220, 80, 80), message.as_str());
@@ -402,7 +413,9 @@ pub(super) fn draw_history_list(ui: &mut egui::Ui, state: &HistoryUi) -> Option<
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for summary in &state.encounters {
-                if let Some(row_action) = draw_history_row(ui, summary) {
+                if let Some(row_action) =
+                    draw_history_row(ui, summary, state.expanded_id == Some(summary.id))
+                {
                     action = Some(row_action);
                 }
             }
@@ -410,19 +423,29 @@ pub(super) fn draw_history_list(ui: &mut egui::Ui, state: &HistoryUi) -> Option<
     action
 }
 
-/// One list row: title, subtitle, local date+time, duration, total DPS,
-/// player count, and a trailing delete button.
+/// Height of the compact, always-visible history summary. It matches the
+/// meter's normal row pitch so the list stays easy to scan.
+const HISTORY_SUMMARY_ROW_HEIGHT: f32 = ROW_HEIGHT;
+
+/// The expanded sub-row has three two-column lines: ended/duration,
+/// damage/DPS, and players/location. Each cell owns a separate clip rect,
+/// so text can never paint into its neighbour at narrow widths.
+const HISTORY_DETAIL_ROW_HEIGHT: f32 = 54.0;
+
+/// One list row: a compact title/duration summary, an optional detail
+/// sub-row, and a trailing delete button. Primary click expands the details;
+/// secondary click loads the saved fight into the main meter UI.
 pub(super) fn draw_history_row(
     ui: &mut egui::Ui,
     summary: &history::EncounterSummary,
+    expanded: bool,
 ) -> Option<HistoryRowAction> {
     let width = ui.available_width();
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click());
-
-    if !ui.is_rect_visible(rect) {
-        return None;
-    }
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, HISTORY_SUMMARY_ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+    let summary_visible = ui.is_rect_visible(rect);
 
     // The trailing delete button's own hit-test region, inside the row's
     // already-reserved space — checked ahead of the row's own click below so
@@ -440,45 +463,71 @@ pub(super) fn draw_history_row(
         egui::Sense::click(),
     );
 
-    let painter = ui.painter();
-    let center_y = rect.center().y;
+    // The compact row deliberately clips long title text, but never hides
+    // it: hovering anywhere other than the delete control reveals the full
+    // title and location without requiring a wider overlay.
+    let response = response.on_hover_text(format!(
+        "{}\nLocation: {}",
+        summary.title,
+        summary.subtitle.as_deref().unwrap_or("Unknown")
+    ));
 
-    let title_pos = egui::pos2(rect.left() + HISTORY_ROW_PADDING, center_y);
-    let title_rect = paint_bold_text(
-        painter,
-        title_pos,
-        egui::Align2::LEFT_CENTER,
-        &summary.title,
-        FONT_SIZE_ROW,
-        TITLE_TEXT_COLOR,
-    );
-    if let Some(subtitle) = &summary.subtitle {
-        paint_text(
-            painter,
-            egui::pos2(title_rect.right() + HISTORY_ROW_PADDING, center_y),
-            egui::Align2::LEFT_CENTER,
-            subtitle,
-            regular(FONT_SIZE_SUBTITLE),
-            SUBTITLE_TEXT_COLOR,
-            false,
-        );
+    if !summary_visible {
+        // `ScrollArea` may cull the compact row's paint, but its expanded
+        // sibling must still take up space or the scroll range collapses
+        // while the user scrolls through it.
+        if expanded {
+            draw_history_detail_row(ui, summary, width);
+        }
+        return None;
     }
 
-    let stats = format!(
-        "{}    {}    {}/s    {}p",
-        history::format_local_time(summary.ended_at_ms),
-        history::format_duration(summary.duration_ms),
-        fmt_short(summary.total_dps as i64),
-        summary.player_count
+    let painter = ui.painter();
+    let chevron_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + HISTORY_ROW_PADDING, rect.top()),
+        egui::vec2(FONT_SIZE_SUBTITLE, rect.height()),
     );
     paint_text(
         painter,
-        egui::pos2(delete_rect.left() - HISTORY_ROW_PADDING, center_y),
-        egui::Align2::RIGHT_CENTER,
-        &stats,
+        chevron_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        if expanded { "⌄" } else { "›" },
         regular(FONT_SIZE_SUBTITLE),
         SUBTITLE_TEXT_COLOR,
         false,
+    );
+
+    // The title and duration are deliberately assigned disjoint regions.
+    // Saved titles are unbounded, so clipping them is the only way to make
+    // the row fit a narrow overlay without letting fields overlap.
+    let compact_right = delete_rect.left() - HISTORY_ROW_PADDING;
+    let duration_width = (compact_right - rect.left()).clamp(0.0, 72.0);
+    let duration_rect = egui::Rect::from_min_max(
+        egui::pos2(compact_right - duration_width, rect.top()),
+        egui::pos2(compact_right, rect.bottom()),
+    );
+    let title_rect = egui::Rect::from_min_max(
+        egui::pos2(chevron_rect.right() + HISTORY_ROW_PADDING, rect.top()),
+        egui::pos2(
+            (duration_rect.left() - HISTORY_ROW_PADDING).max(chevron_rect.right()),
+            rect.bottom(),
+        ),
+    );
+    paint_history_text(
+        painter,
+        title_rect,
+        egui::Align2::LEFT_CENTER,
+        &summary.title,
+        bold(FONT_SIZE_ROW),
+        TITLE_TEXT_COLOR,
+    );
+    paint_history_text(
+        painter,
+        duration_rect,
+        egui::Align2::RIGHT_CENTER,
+        &history::format_duration(summary.duration_ms),
+        regular(FONT_SIZE_SUBTITLE),
+        SUBTITLE_TEXT_COLOR,
     );
 
     paint_text(
@@ -491,17 +540,97 @@ pub(super) fn draw_history_row(
         false,
     );
 
-    if delete_response.clicked() {
+    let action = if delete_response.clicked() {
         Some(HistoryRowAction::Delete(summary.id))
-    } else if response.clicked() {
+    } else if response.secondary_clicked() && !delete_response.hovered() {
         Some(HistoryRowAction::Open(summary.id))
+    } else if response.clicked() {
+        Some(HistoryRowAction::Expand(summary.id))
     } else {
         None
+    };
+
+    if expanded {
+        draw_history_detail_row(ui, summary, width);
     }
+
+    action
+}
+
+/// Paint one text value inside an explicit cell. Painter-level clipping keeps
+/// the layout robust even below the meter's usual minimum window width.
+fn paint_history_text(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    anchor: egui::Align2,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+) {
+    if rect.is_positive() {
+        painter
+            .with_clip_rect(rect)
+            .text(rect.center(), anchor, text, font, color);
+    }
+}
+
+fn draw_history_detail_row(ui: &mut egui::Ui, summary: &history::EncounterSummary, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width, HISTORY_DETAIL_ROW_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(24));
+
+    let fields = [
+        format!("Ended: {}", history::format_local_time(summary.ended_at_ms)),
+        format!(
+            "Duration: {}",
+            history::format_duration(summary.duration_ms)
+        ),
+        format!("Damage: {}", fmt_short(summary.total_damage)),
+        format!("DPS: {}/s", fmt_short(summary.total_dps as i64)),
+        format!("Players: {}", summary.player_count),
+        format!(
+            "Location: {}",
+            summary.subtitle.as_deref().unwrap_or("Unknown")
+        ),
+    ];
+    for (cell, field) in history_detail_cell_rects(rect).into_iter().zip(&fields) {
+        paint_history_text(
+            painter,
+            cell,
+            egui::Align2::LEFT_CENTER,
+            field,
+            regular(FONT_SIZE_SUBTITLE),
+            SUBTITLE_TEXT_COLOR,
+        );
+    }
+}
+
+/// Returns the six independent detail cells in reading order. Kept separate
+/// from painting so the narrow-width non-overlap guarantee is testable.
+fn history_detail_cell_rects(rect: egui::Rect) -> [egui::Rect; 6] {
+    std::array::from_fn(|index| {
+        let column = index % 2;
+        let line = index / 2;
+        let half_width = rect.width() / 2.0;
+        egui::Rect::from_min_max(
+            egui::pos2(
+                rect.left() + half_width * column as f32 + HISTORY_ROW_PADDING,
+                rect.top() + line as f32 * (rect.height() / 3.0),
+            ),
+            egui::pos2(
+                rect.left() + half_width * (column + 1) as f32 - HISTORY_ROW_PADDING,
+                rect.top() + (line + 1) as f32 * (rect.height() / 3.0),
+            ),
+        )
+    })
 }
 
 /// What a click on the list produced.
 pub(super) enum HistoryRowAction {
+    Expand(i64),
     Open(i64),
     Delete(i64),
 }
@@ -886,6 +1015,147 @@ mod tests {
             panic!("expected the History view");
         };
         assert_eq!(state.error.as_deref(), Some("boom"));
+    }
+
+    fn history_summary_for_ui_test() -> history::EncounterSummary {
+        history::EncounterSummary {
+            id: 42,
+            ended_at_ms: 1_000,
+            duration_ms: 90_000,
+            total_damage: 12_345_678,
+            total_dps: 123_456.0,
+            title: "An exceptionally long encounter name that must remain contained".to_owned(),
+            subtitle: Some("An equally long location name".to_owned()),
+            player_count: 20,
+        }
+    }
+
+    fn history_row_action_after_click(
+        button: egui::PointerButton,
+        pos: egui::Pos2,
+    ) -> HistoryRowAction {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(160.0, 120.0));
+        let summary = history_summary_for_ui_test();
+
+        let layout = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                draw_history_row(ui, &summary, false);
+            },
+        );
+        layout.drop_without_applying_deltas();
+
+        let modifiers = egui::Modifiers::NONE;
+        let mut action = None;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button,
+                        pressed: true,
+                        modifiers,
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button,
+                        pressed: false,
+                        modifiers,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                action = draw_history_row(ui, &summary, false);
+            },
+        );
+        output.drop_without_applying_deltas();
+        action.expect("the row click must produce an action")
+    }
+
+    #[test]
+    fn a_primary_click_on_a_history_row_expands_its_details() {
+        assert!(matches!(
+            history_row_action_after_click(egui::PointerButton::Primary, egui::pos2(24.0, 15.0)),
+            HistoryRowAction::Expand(42)
+        ));
+    }
+
+    #[test]
+    fn a_secondary_click_on_a_history_row_loads_that_fight() {
+        assert!(matches!(
+            history_row_action_after_click(egui::PointerButton::Secondary, egui::pos2(24.0, 15.0)),
+            HistoryRowAction::Open(42)
+        ));
+    }
+
+    #[test]
+    fn a_delete_click_cannot_also_expand_or_load_the_history_row() {
+        // At 160pt wide, the delete control is 18pt wide at x=134..152.
+        assert!(matches!(
+            history_row_action_after_click(egui::PointerButton::Primary, egui::pos2(143.0, 15.0)),
+            HistoryRowAction::Delete(42)
+        ));
+    }
+
+    #[test]
+    fn expanded_detail_cells_are_disjoint_at_a_narrow_width() {
+        let cells = history_detail_cell_rects(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(120.0, HISTORY_DETAIL_ROW_HEIGHT),
+        ));
+
+        for line in 0..3 {
+            let left = cells[line * 2];
+            let right = cells[line * 2 + 1];
+            assert!(
+                left.right() <= right.left(),
+                "line {line}'s cells overlap: {left:?} and {right:?}"
+            );
+        }
+        for cell in cells {
+            assert!(
+                cell.width() > 0.0 && cell.height() > 0.0,
+                "a 120pt-wide overlay must retain a paintable detail cell: {cell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_offscreen_expanded_detail_row_keeps_its_scroll_height() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(160.0, 20.0));
+        let summary = history_summary_for_ui_test();
+
+        let mut content = egui::Rect::NOTHING;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| {
+                // Put the compact row wholly below the clip rect, matching a
+                // virtualized ScrollArea while its expanded sibling is out
+                // of view.
+                ui.allocate_exact_size(egui::vec2(1.0, 40.0), egui::Sense::hover());
+                draw_history_row(ui, &summary, true);
+                content = ui.min_rect();
+            },
+        );
+        output.drop_without_applying_deltas();
+
+        assert!(
+            content.bottom() >= 40.0 + HISTORY_SUMMARY_ROW_HEIGHT + HISTORY_DETAIL_ROW_HEIGHT,
+            "the expanded detail row must remain in the layout even when its summary is culled"
+        );
     }
 
     /// `draw_history_bar`'s "← Live" button is what `OverlayApp::ui` reads
