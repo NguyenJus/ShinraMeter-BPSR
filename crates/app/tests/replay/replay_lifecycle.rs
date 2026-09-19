@@ -25,19 +25,16 @@ const TOWERING_RUIN: u32 = 1101;
 const ASTERIA_PLAINS: u32 = 7;
 
 /// A wipe/re-pull: boss HP dips below `hp_drop_below_pct` (95%) then rolls
-/// back above `hp_rollback_at_pct` (95%), which must auto-reset the
-/// encounter (`crates/meter/src/reset.rs`).
-///
-/// Also the scenario that proves the reset is *selective*: `boss_uid`
-/// (and so `boss_monster_id`/`is_boss`) is recomputed from scratch and
-/// finds nothing (no enemy has `took_damage` any more), but `scene_id`
-/// survives.
+/// back above `hp_rollback_at_pct` (95%). The rollback ends and holds the
+/// attempt, even if the local roster does not show most of the party down;
+/// the next player hit starts the fresh encounter.
 #[test]
-fn boss_hp_rollback_auto_reset() {
+fn boss_hp_rollback_holds_until_the_next_hit() {
     let scenario = Scenario::new("boss_hp_rollback_reset")
         .at(1_000)
         .enter_scene(TOWERING_RUIN)
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
+        .player_appear(P_BRIN, "Brin", prof::FROST_MAGE, 11_500)
         .monster_appear(M_BOSS, IGNISOR, 1_000_000, 1_000_000)
         // A hit is required before the HP curve: `recompute_boss` only
         // considers enemies with `took_damage == true`, so this is what
@@ -49,33 +46,43 @@ fn boss_hp_rollback_auto_reset() {
         .monster_hp(M_BOSS, 700_000)
         .at(3_000)
         .monster_hp(M_BOSS, 300_000)
-        // ...then back up past the 95% rollback threshold: a fresh
-        // pull/wipe, not genuine burst healing.
+        // The party is only partially visible/down when the boss resets.
+        .at(4_000)
+        .monster_hits_player(P_BRIN, Hit::new(M_BOSS, 999, 80_000).kill())
+        // ...then back up past the 95% rollback threshold: a wipe, not
+        // genuine burst healing.
         .at(5_000)
         .monster_hp(M_BOSS, 1_000_000)
-        .capture("boss_hp_rollback_reset");
+        .tick()
+        .capture("boss_hp_rollback_held")
+        // The next player hit, not the rollback, clears the held attempt.
+        .at(8_000)
+        .hit(P_ARIA, M_BOSS, 101, 30_000)
+        .tick()
+        .capture("boss_hp_rollback_repull");
 
     let mut rig = Rig::new();
     let captures = rig.run(&scenario);
 
-    assert_eq!(captures.len(), 1);
-    let capture = &captures[0];
-    assert_eq!(capture.resets, vec![(5_000, ResetReason::BossHpRollback)]);
-    assert_eq!(capture.snapshot.rows.len(), 0, "reset must clear all rows");
-    assert_eq!(capture.snapshot.total_damage, 0);
-    // Reset wipes `boss_uid` itself (recomputed with no enemy carrying
-    // `took_damage`)...
-    assert_eq!(capture.snapshot.encounter.boss_monster_id, None);
-    assert!(!capture.snapshot.encounter.is_boss);
-    // ...but the scene is untouched by a `BossHpRollback` reset (since issue
-    // #422 nothing but a differing dungeon Scene resets it).
-    assert_eq!(capture.snapshot.encounter.scene_id, Some(TOWERING_RUIN));
-    // Issue #201: `scene_boss_name` now comes from the curated
-    // `tables::SCENE_FINAL_BOSSES`, which does not cover this scene — nothing
-    // is learned from the pull any more, so there is no caption to survive.
-    assert_eq!(capture.snapshot.encounter.scene_boss_name, None);
+    assert_eq!(captures.len(), 2);
+    let wiped = &captures[0];
+    let repulled = &captures[1];
+    assert!(
+        wiped.resets.is_empty(),
+        "the rollback must not clear the meter"
+    );
+    assert_eq!(wiped.fight_state, FightState::Ended);
+    assert_eq!(wiped.fight_end_cause, Some(FightEndCause::Wipe));
+    assert_eq!(wiped.hold_kind, Some(HoldKind::Wipe));
+    assert_eq!(wiped.snapshot.total_damage, 50_000);
+    assert_eq!(wiped.snapshot.encounter.boss_monster_id, Some(IGNISOR));
 
-    assert_golden(capture);
+    assert_eq!(repulled.resets, vec![(8_000, ResetReason::NewFight)]);
+    assert_eq!(repulled.fight_state, FightState::Active);
+    assert_eq!(repulled.snapshot.total_damage, 30_000);
+
+    assert_golden(wiped);
+    assert_golden(repulled);
 }
 
 /// `ProtocolEvent::ServerChanged` is never decoded from bytes — its only

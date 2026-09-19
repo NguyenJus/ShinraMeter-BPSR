@@ -277,7 +277,7 @@ pub struct Pipeline {
     fight_end_recorded: bool,
     /// The record `record_fight_end` captured when the current fight ended,
     /// held back until `Meter::fight_config`'s `post_end_grace_ms` window
-    /// has closed on it (issue #post-end-grace).
+    /// has closed and any curated phase continuation is resolved.
     ///
     /// Needed because the meter keeps folding trailing packets into an
     /// ended fight's stats for that whole window
@@ -659,10 +659,11 @@ impl Pipeline {
     ///   longer holds its rows, so the pending record is the only copy left
     ///   — it gets flushed rather than dropped.
     ///
-    /// A resume landing *after* the record has already gone out is out of
-    /// scope here (stock `phase_resume_window_ms` is 60s against a 2s
-    /// grace, so that ordering is the common one): un-writing a row would
-    /// need an update-by-id request the history thread does not have.
+    /// A curated phase hold extends that deferral beyond the ordinary grace
+    /// window. The meter clears it when the next phase resumes, a new fight
+    /// or interruption resets the encounter, or an authoritative dungeon
+    /// completion confirms the terminal form. This keeps phase-one rows out
+    /// of history without guessing from the duration of the transition.
     pub fn record_fight_end(&mut self, state: meter::FightState, now_ms: u64) {
         // No history handle means no history writes at all, so skip the
         // snapshot work rather than building records ~10 times a second for
@@ -694,10 +695,13 @@ impl Pipeline {
             return;
         };
         let grace_ms = self.meter.fight_config().post_end_grace_ms;
-        if now_ms.saturating_sub(ended_at_ms) <= grace_ms {
+        if now_ms.saturating_sub(ended_at_ms) <= grace_ms
+            || self.meter.history_phase_resume_pending()
+        {
             // Still inside the window. Capture the fight exactly once, so a
-            // hold cut short before the window closes still has something
-            // to flush, then leave every later tick alone.
+            // hold cut short before the window closes (or a phase hold that
+            // resolves after it) still has something to flush, then leave
+            // every later tick alone.
             if self.held_fight_start_ms.is_none() {
                 self.held_fight_start_ms = self.meter.fight_start_ms();
                 self.pending_fight_end = self.build_fight_end_record(now_ms, ended_at_ms);
@@ -2023,20 +2027,19 @@ mod tests {
             assert_eq!(count, 1);
         }
 
-        /// Issues #124/#316 x #post-end-grace: a phase-1 boss dying, one
-        /// `Ended` tick observed inside the grace window, and then the
-        /// phase-2 boss's first hit resuming the *same* fight, must leave
-        /// exactly one history row covering both phases — not the pending
-        /// phase-1-only row plus a complete one (PR #333 review, finding 2).
+        /// Issue #429: phase continuation is an explicit meter state, not a
+        /// short grace period. A phase gap longer than the ordinary grace
+        /// window must not persist a truncated row; terminal dungeon state
+        /// resolves the final form promptly.
         #[test]
-        fn a_phase_resume_inside_the_grace_window_records_one_row() {
+        fn a_phase_resume_after_the_grace_window_records_one_row() {
             /// Dragonbane Golem - Right Cannon and - Left Cannon: two
             /// phases of one curated fight
             /// (`bpsr_meter::phase::BOSS_PHASE_GROUPS`).
             const RIGHT_CANNON: u32 = 103_110;
             const LEFT_CANNON: u32 = 103_111;
 
-            let path = temp_history_path("pipeline-phase-resume-grace");
+            let path = temp_history_path("pipeline-phase-resume-after-grace");
             let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
             let mut pipeline = Pipeline::new().with_history(handle.clone());
             let grace = pipeline.meter.fight_config().post_end_grace_ms;
@@ -2049,17 +2052,26 @@ mod tests {
             assert_eq!(state, meter::FightState::Ended, "the kill ends the fight");
             assert_eq!(pipeline.meter.fight_end_ms(), Some(2_000));
 
-            // One `Ended` tick well inside the grace window: the record is
-            // captured but nothing goes out.
+            // The first ended tick captures a possible record but does not
+            // send it.
             pipeline.record_fight_end(state, 2_100);
             assert_eq!(row_count(&handle), 0, "must not race the grace window");
             assert!(pipeline.pending_fight_end.is_some(), "captured, not sent");
 
-            // Phase 2 spawns and takes its first hit, still inside the
-            // grace window: the held fight resumes rather than restarting.
-            pipeline.step(boss_appear(11, LEFT_CANNON, 500, 500, 2_500), 2_500);
-            pipeline.step(hit_on(11, 300, 2_500, false), 2_500);
-            let state = pipeline.tick(2_600);
+            // More than two seconds after phase 1 died, history still must
+            // not write a row: the meter has explicitly armed a continuation.
+            pipeline.record_fight_end(state, 2_000 + grace + 1);
+            assert_eq!(
+                row_count(&handle),
+                0,
+                "the phase hold defers history beyond post_end_grace_ms"
+            );
+
+            // Phase 2 arrives well after grace: it still resumes rather
+            // than creating a second history row.
+            pipeline.step(boss_appear(11, LEFT_CANNON, 500, 500, 5_000), 5_000);
+            pipeline.step(hit_on(11, 300, 5_000, false), 5_000);
+            let state = pipeline.tick(5_100);
             assert_eq!(state, meter::FightState::Active, "the same fight resumed");
             assert_eq!(
                 pipeline.meter.fight_start_ms(),
@@ -2067,7 +2079,7 @@ mod tests {
                 "a resume keeps the fight clock, which is how the pipeline knows"
             );
 
-            pipeline.record_fight_end(state, 2_600);
+            pipeline.record_fight_end(state, 5_100);
             assert_eq!(
                 row_count(&handle),
                 0,
@@ -2078,11 +2090,21 @@ mod tests {
                 "discarded, not queued"
             );
 
-            // Phase 2 dies for real, and the window closes on that end.
-            pipeline.step(hit_on(11, 100, 3_000, true), 3_000);
-            let state = pipeline.tick(3_100);
+            // The final form also belongs to a phase group, so its death is
+            // still ambiguous until the dungeon says the run ended.
+            pipeline.step(hit_on(11, 100, 6_000, true), 6_000);
+            let state = pipeline.tick(6_100);
             assert_eq!(state, meter::FightState::Ended);
-            pipeline.record_fight_end(state, 3_000 + grace + 1);
+            pipeline.record_fight_end(state, 6_000 + grace + 1);
+            assert_eq!(row_count(&handle), 0, "the terminal form is still armed");
+
+            pipeline.step(
+                proto::ProtocolEvent::DungeonState {
+                    state: proto::event::EDungeonState::End,
+                    scene_uuid: None,
+                },
+                8_001,
+            );
 
             let rows = list_rows(&handle);
             drop(handle);
@@ -2095,6 +2117,40 @@ mod tests {
                 rows[0].total_damage, 600,
                 "the row must carry both phases' damage"
             );
+        }
+
+        /// A phase hold is a defer, not a drop. If a different recognized
+        /// boss starts instead of the next form, the reset flushes the
+        /// cached completed encounter.
+        #[test]
+        fn a_phase_interruption_flushes_the_pending_record() {
+            const RIGHT_CANNON: u32 = 103_110;
+
+            let path = temp_history_path("pipeline-phase-interruption");
+            let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+            let mut pipeline = Pipeline::new().with_history(handle.clone());
+            let grace = pipeline.meter.fight_config().post_end_grace_ms;
+
+            pipeline.step(boss_appear(10, RIGHT_CANNON, 900, 1_000, 1_000), 1_000);
+            pipeline.step(hit_on(10, 100, 1_000, false), 1_000);
+            pipeline.step(hit_on(10, 100, 2_000, true), 2_000);
+            let state = pipeline.tick(2_100);
+            pipeline.record_fight_end(state, 2_000 + grace + 1);
+            assert_eq!(row_count(&handle), 0, "the phase row remains deferred");
+
+            // Ignisor is a recognized boss outside the cannon phase group,
+            // so its first hit starts a genuinely new encounter.
+            pipeline.step(boss_appear(20, 103, 1_000, 1_000, 5_000), 5_000);
+            pipeline.step(hit_on(20, 300, 5_000, false), 5_000);
+
+            let rows = list_rows(&handle);
+            drop(handle);
+            drop(pipeline);
+            let _ = thread.join();
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].total_damage, 200);
         }
 
         /// With no history handle attached there is nothing to write, so
@@ -2184,7 +2240,7 @@ mod tests {
             // inside a single 100ms publish tick, and no `pipeline.tick()`
             // call anywhere in this test. Issue #post-end-grace: a hit on
             // the *same* dead target would be folded into the grace window
-            // instead of resetting (see `a_phase_resume_inside_the_grace_
+            // instead of resetting (see `a_phase_resume_after_the_grace_
             // window_records_one_row`), so this must target a different uid
             // to still exercise the no-tick reset-driven flush.
             pipeline.step(hit_on(999, 100, 1_040, false), 1_040);

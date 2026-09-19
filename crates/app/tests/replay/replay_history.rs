@@ -154,6 +154,53 @@ fn a_finished_boss_fight_lands_in_the_database() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A boss bar rolling back is a completed, lost attempt even when the
+/// local roster has not observed every party member down. It must reach
+/// history before the next pull clears the live meter.
+#[test]
+fn a_boss_hp_rollback_wipe_lands_in_the_database() {
+    let path = temp_db_path("rollback-wipe");
+    let _ = std::fs::remove_file(&path);
+
+    let scenario = Scenario::new("history_rollback_wipe")
+        .at(1_000)
+        .enter_scene(TOWERING_RUIN)
+        .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
+        .player_appear(P_BRIN, "Brin", prof::FROST_MAGE, 11_500)
+        .monster_appear(M_BOSS, IGNISOR, 1_000_000, 1_000_000)
+        .at(2_000)
+        .hit(P_ARIA, M_BOSS, 101, 400_000)
+        .at(3_000)
+        .monster_hp(M_BOSS, 300_000)
+        .at(4_000)
+        .monster_hits_player(P_BRIN, Hit::new(M_BOSS, 999, 80_000).kill())
+        .at(8_000)
+        .monster_hp(M_BOSS, 1_000_000)
+        // Past the 2s post-end grace window, so the held wipe is sent.
+        .at(10_500)
+        .tick();
+
+    let (mut rig, history_thread) =
+        Rig::new().with_history(path.clone(), RetentionPolicy::default());
+    rig.run(&scenario);
+    drop(rig);
+    let _ = history_thread.join();
+
+    let store =
+        SqliteHistory::open(&path, RetentionPolicy::default()).expect("reopen the history store");
+    let encounters = store.list(50).expect("list encounters");
+    assert_eq!(encounters.len(), 1);
+    let record = store
+        .load(encounters[0].id)
+        .expect("load encounter")
+        .expect("encounter must exist");
+    assert_eq!(record.ended_at_ms, 8_000);
+    assert_eq!(record.total_damage, 400_000);
+    assert_eq!(record.boss_monster_id, Some(IGNISOR));
+
+    let _ = std::fs::remove_file(&path);
+}
+
 /// `Pipeline::record_fight_end`'s write-exactly-once latch, exercised
 /// through the harness rather than unit-tested directly: a dozen extra
 /// ticks across the post-fight freeze must not produce a dozen rows.

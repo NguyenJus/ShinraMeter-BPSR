@@ -111,39 +111,26 @@ const BOSS_ENGAGEMENT_WINDOW_MS: u64 = 60_000;
 /// wedge this exists to bound.
 const WIPE_HOLD_RELEASE_MS: u64 = 60_000;
 
-/// Fraction of the roster that must be down *at the instant a boss's HP bar
-/// rolls back* for that rollback to be read as a wipe rather than as a bare
-/// reset (issue #259).
+/// Fraction of the roster that must remain down for an explicit revive to
+/// keep a wipe hold in place (issue #366).
 ///
 /// The damage-event wipe path ([`Meter::party_is_wiped`]) demands the whole
 /// roster be down, and has to: a death packet on its own says nothing about
 /// whether the pull is over, so anything short of unanimity there would
-/// freeze the meter mid-fight. The rollback path carries that second signal
-/// itself — the boss the party burned below `hp_drop_below_pct` is back at
-/// `hp_rollback_at_pct` or above, which is the server resetting the
-/// encounter, i.e. the pull is over as a matter of fact rather than of
-/// inference. With that in hand the roster no longer has to be unanimous,
-/// and demanding that it be is what made issue #259's outcome a coin flip:
-/// whether the attempt was recorded depended on whether the last death
-/// packet happened to land before the HP sync did.
+/// freeze the meter mid-fight. Once a wipe hold is already latched, however,
+/// an explicit revive must not release it while nearly everyone remains down.
 ///
 /// Four in five — 12 of a 15-player raid — because the roster is not
 /// exactly "the party still fighting": it can hold a straggler who is
 /// genuinely up (a healer out of range of whatever finished the group, a
 /// player battle-rezzed seconds before the server gave up on the pull, or
 /// a row `apply_damage` opened for someone outside the party), and each of
-/// those alone must not veto the wipe. Three such rows in a fifteen-player
+/// those alone must not release the hold. Three such rows in a fifteen-player
 /// raid is the headroom this buys.
 ///
 /// Deliberately measured against `players.len()` rather than a party size
 /// from the roster packet: `players` is the only roster this crate has, and
-/// it is what both wipe paths already read. Note that the
-/// `party_down=N known_players=M` figures in the `reset`/issue #151 log
-/// lines (spelled `party_down=N/M` before issue #410 renamed the
-/// denominator to what it actually measures) count players with
-/// `deaths > 0` — cumulative, per issue #212 — so it is an upper bound on
-/// how many were down at any one instant and cannot be used to calibrate
-/// this constant directly.
+/// it is what the wipe hold reads.
 const WIPE_PARTY_DOWN_FRACTION: f64 = 0.8;
 
 /// The most health an enemy may have been last seen with for its despawn to
@@ -901,6 +888,16 @@ impl Meter {
         self.fight_lifecycle.phase_resume_boss_id()
     }
 
+    /// Whether a boss death may still resume through a curated next phase.
+    /// History uses this explicit lifecycle state to keep a partial phase
+    /// row from being persisted before the next form appears. Idle-timeout
+    /// arming deliberately does not defer history: it is a recovery hint,
+    /// not proof of a phase transition.
+    pub fn history_phase_resume_pending(&self) -> bool {
+        self.fight_end_cause() == Some(FightEndCause::BossDeath)
+            && self.fight_end_boss_id().is_some_and(phase::has_phase_group)
+    }
+
     /// When the currently-held fight's end was actually latched, as
     /// opposed to when it happened (`fight_end_ms`) — see
     /// [`FightLifecycle::Ended`]'s `observed_ms` field doc for why those
@@ -1512,6 +1509,12 @@ impl Meter {
             // so a level-triggered producer can no longer end the fresh
             // fight that the intervening `NewFight` reset started.
             EDungeonState::End | EDungeonState::Settlement => {
+                // A dungeon's own terminal state resolves an otherwise
+                // ambiguous phase hold. `end_fight_on_boss_death` cannot
+                // know whether a phase-group member was the final form, but
+                // the instance can; leave no stale arming for history to
+                // defer behind once it has said the run is over.
+                self.fight_lifecycle.disarm_phase_resume();
                 let source = match state {
                     EDungeonState::Settlement => "dungeon_state_settlement",
                     _ => "dungeon_state_end",
@@ -2763,39 +2766,14 @@ impl Meter {
             && self.players.values().all(|p| !p.alive)
     }
 
-    /// The looser sibling of [`Self::party_is_wiped`], for the one caller
-    /// that already holds independent proof the pull is over: at least
-    /// [`WIPE_PARTY_DOWN_FRACTION`] of the roster is down *right now*
-    /// (issue #259).
-    ///
-    /// Same `alive`-not-`deaths` reading as `party_is_wiped`, and for the
-    /// same issue #212 reason — a cumulative death counter would make this
-    /// creep true through any long pull with battle rezzes. The only
-    /// difference is unanimity, which the rollback path can afford to drop
-    /// (see [`WIPE_PARTY_DOWN_FRACTION`]) and the death path cannot.
-    ///
-    /// `party_is_wiped` implies this: everyone down is at least four in
-    /// five down, for any non-empty roster.
-    fn party_mostly_down(&self) -> bool {
-        if self.fight_start_ms().is_none()
-            || self.fight_end_ms().is_some()
-            || self.players.is_empty()
-        {
-            return false;
-        }
-        self.roster_mostly_down()
-    }
-
-    /// The roster-fraction half of [`Self::party_mostly_down`], without its
-    /// `fight_start_ms`/`fight_end_ms` guards.
+    /// Whether at least [`WIPE_PARTY_DOWN_FRACTION`] of the roster is down.
     ///
     /// [`Self::release_wipe_hold_if_recovered`] needs this reading, not
-    /// `party_mostly_down`'s: the wipe hold is only ever taken right after
+    /// `party_is_wiped`'s: the wipe hold is only ever taken right after
     /// `latch_fight_end(Wipe)`, so `fight_end_ms` is always `Some` while the
-    /// hold is up, and `party_mostly_down` would therefore read `false`
-    /// unconditionally — releasing the hold on the very first battle-rez
-    /// regardless of how much of the roster actually recovered (issue
-    /// #366 review, finding O1).
+    /// hold is up, and `party_is_wiped` would therefore read `false`
+    /// unconditionally. This direct roster reading keeps a single battle-rez
+    /// from releasing a mostly-down party (issue #366 review, finding O1).
     fn roster_mostly_down(&self) -> bool {
         if self.players.is_empty() {
             return false;
@@ -3309,7 +3287,7 @@ impl Meter {
     /// Lifts the wipe hold (issue #154) early once enough of the roster has
     /// come back up that the party no longer reads as wiped (issue
     /// #339/#272) — an explicit revive/`AttrState`-alive signal is exactly
-    /// the evidence `party_mostly_down` needs that didn't exist before this
+    /// the evidence this roster reading needs that didn't exist before this
     /// issue. Without this the hold only ever lifted on a timeout
     /// ([`WIPE_HOLD_RELEASE_MS`]) or a hit landing on a recognized boss
     /// (`withholds_after_wipe`), even after a battle rez had genuinely
@@ -3713,16 +3691,23 @@ impl Meter {
                 // this crate ever saw it. The next pull's first hit on a
                 // recognized boss clears the hold through `NewFight`.
                 //
-                // `party_mostly_down`, not `party_is_wiped`: the rollback is
-                // itself the proof the pull is over, so the roster does not
-                // have to be unanimous (see `WIPE_PARTY_DOWN_FRACTION`).
+                // The rollback plus any known player down is proof that this
+                // pull ended. A roster is only an incomplete AOI view: the
+                // field trace that prompted this path had two known-down
+                // players out of five while the boss reset, so requiring a
+                // fraction of that roster discarded the wiped attempt before
+                // history could see it. Keep that attempt on screen and let
+                // the next player hit perform the ordinary `NewFight` reset.
+                // A rollback while nobody is known down remains the old
+                // live-fight reset heuristic for de-aggro and re-pulls.
+                //
                 // No `engaged_boss_still_up` gate either, the way the
                 // death-packet path needs one — `should_reset` has already
                 // established that the enemy this is measured off is a
                 // recognized boss whose bar the party burned down and the
                 // server put back, which is a stronger statement of the same
                 // fact.
-                if self.party_mostly_down() {
+                if self.players.values().any(|player| !player.alive) {
                     self.latch_fight_end(
                         FightEndCause::Wipe,
                         e.timestamp_ms,
@@ -9299,12 +9284,12 @@ mod tests {
 
         /// Issue #339/#272: an explicit revive is evidence the wipe hold
         /// didn't have before this issue — enough of the roster coming
-        /// back up (`party_mostly_down` reading false again) lifts the
+        /// back up (`roster_mostly_down` reading false again) lifts the
         /// hold early, rather than making the next real fight wait for
         /// `WIPE_HOLD_RELEASE_MS` or a hit on the recognized boss.
         ///
         /// Issue #366 review, finding O1: `release_wipe_hold_if_recovered`
-        /// used to guard on `party_mostly_down`, which reads `false`
+        /// used to guard on `party_is_wiped`, which reads `false`
         /// unconditionally whenever `fight_end_ms` is set — true for the
         /// entire time a wipe hold is up. That let a *single* battle-rez in
         /// an 8-player wipe drop the hold outright. An 8-player roster
@@ -9843,10 +9828,9 @@ mod tests {
         /// down when the bar refills — here one of five is a straggler who
         /// never produced a death packet at all — so the death path's
         /// `party_is_wiped` never fires, and the rollback arrives to find a
-        /// live fight it is entitled to throw away. `party_mostly_down`
-        /// (four of five, the `WIPE_PARTY_DOWN_FRACTION` threshold) is what
-        /// claims it as a wipe first, and the `held` test then defers the
-        /// reset so the ended attempt survives long enough to be recorded.
+        /// live fight it used to throw away. The rollback is itself proof
+        /// that the pull ended, so it claims the wipe and holds the attempt
+        /// even when the local roster is incomplete.
         #[test]
         fn a_rollback_with_the_party_down_ends_as_a_wipe_instead_of_discarding_the_attempt() {
             let mut m = five_player_pull();
@@ -9880,23 +9864,21 @@ mod tests {
             );
         }
 
-        /// The control (issue #259): a rollback with the party still
-        /// standing is not a wipe — it is the boss being abandoned,
-        /// de-aggroed or re-pulled by someone else, which is the case the
-        /// reset heuristic exists for. Two of five down is below
-        /// `WIPE_PARTY_DOWN_FRACTION`, so nothing about the old behaviour
-        /// changes here.
+        /// A rollback with most of the party still up is still a completed
+        /// attempt: the boss's reset is stronger evidence than the local
+        /// roster, which can be incomplete.
         #[test]
-        fn a_rollback_with_most_of_the_party_still_up_still_resets() {
+        fn a_rollback_with_most_of_the_party_still_up_holds_the_attempt() {
             let mut m = five_player_pull();
             m.apply(&killing_blow(1, 5_000));
             m.apply(&killing_blow(2, 5_100));
 
             let reason = m.apply(&rollback(6_000));
 
-            assert_eq!(reason, Some(ResetReason::BossHpRollback));
-            assert_eq!(m.fight_end_ms(), None, "a reset, not a fight end");
-            assert_eq!(m.snapshot(6_500).total_damage, 0);
+            assert_eq!(reason, None);
+            assert_eq!(m.fight_end_ms(), Some(6_000));
+            assert!(m.is_held());
+            assert_eq!(m.snapshot(6_500).total_damage, 10_000);
         }
     }
 
@@ -12571,7 +12553,7 @@ mod tests {
         /// the fix: a player who died once and was rezzed (their next
         /// action clears `alive`, per `party_is_wiped`'s doc comment) must
         /// not still count as "down" in the reset diagnostic, the same way
-        /// `party_mostly_down`/`party_is_wiped` already read `alive` rather
+        /// `roster_mostly_down`/`party_is_wiped` already read `alive` rather
         /// than `deaths` for the wipe-vs-rollback decision itself.
         #[test]
         fn reset_log_reports_players_currently_down_not_a_cumulative_death_count() {
