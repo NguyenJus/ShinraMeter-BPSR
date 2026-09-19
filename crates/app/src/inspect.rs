@@ -17,7 +17,7 @@
 //!   actually written, each re-encoded through that partial schema; every
 //!   undecoded fragment and every unmodeled opcode is dropped instead of
 //!   written raw, and counted rather than silently lost (see
-//!   `dump::RecordSender::sanitized_out_count`). Set
+//!   `dump::RecordCounters::sanitized_out_count`). Set
 //!   `settings.dump_sanitize: false` to capture the unfiltered raw stream
 //!   instead — needed for protocol discovery (a new opcode can't be
 //!   modeled in `pb.rs` before it's been seen), but the result contains
