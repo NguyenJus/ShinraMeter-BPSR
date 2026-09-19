@@ -39,8 +39,7 @@ pub(super) fn toolbar_icon_image(handle: &egui::TextureHandle) -> egui::Image<'s
 // dropdown menu instead (issue #71), so it always points down — a menu
 // affordance, not a collapse-state indicator.
 
-/// Side of the chevron's square hit/paint box, matched to `TOOLBAR_ICON_SIZE`
-/// so it reads as one of the window controls rather than as decoration.
+/// Side of the chevron's square paint box within the labeled menu button.
 pub(super) const CHEVRON_SIZE: f32 = TOOLBAR_ICON_SIZE;
 
 /// Painted width of the V. The source's `ComboBoxToggleButton` chevron is a
@@ -55,14 +54,9 @@ pub(super) const CHEVRON_PAINT_HEIGHT: f32 = 5.0;
 pub(super) const CHEVRON_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0xCC);
 
-/// Stroke width of the chevron. Thin, matching the reference's hairline
-/// strokes, and a touch heavier than a hairline so it survives at 14pt.
-pub(super) const CHEVRON_STROKE: f32 = 1.5;
-
-/// The chevron's square control box inside the title row's reserved
+/// The labeled menu button's control box inside the title row's reserved
 /// right-hand strip (`HEADER_RIGHT_CONTROL_WIDTH`, which `header_text_rect`
-/// already keeps the title's own paint out of), centered in that strip both
-/// ways.
+/// already keeps the title's own paint out of).
 ///
 /// Degrades rather than inverting at an absurdly narrow window, exactly like
 /// `header_text_rect`: the strip is clamped against the row's left edge, and
@@ -70,12 +64,10 @@ pub(super) const CHEVRON_STROKE: f32 = 1.5;
 /// small-or-empty box inside the row instead of a backwards one.
 pub(super) fn chevron_rect(title_row: egui::Rect) -> egui::Rect {
     let left = (title_row.right() - HEADER_RIGHT_CONTROL_WIDTH).max(title_row.left());
-    let strip = egui::Rect::from_min_max(
+    egui::Rect::from_min_max(
         egui::pos2(left, title_row.top()),
         egui::pos2(title_row.right(), title_row.bottom()),
-    );
-    let side = CHEVRON_SIZE.min(strip.width()).min(strip.height());
-    egui::Rect::from_center_size(strip.center(), egui::Vec2::splat(side))
+    )
 }
 
 /// The title row's toggle pill (issue #185): a `TITLE_TOGGLE_PILL_WIDTH`
@@ -134,24 +126,43 @@ pub(super) fn chevron_points(rect: egui::Rect, pointing_down: bool) -> [egui::Po
 /// registered after `draw_header`'s title-bar drag surface, so it wins the
 /// hit test over it and clicking the chevron never starts a window drag.
 ///
-/// Same hand-supplied accessible name and tooltip as `minimize_button` used
-/// to need, and for the same reason: a raw `interact` `Response` carries no
-/// `WidgetInfo` from anywhere. Always points down (`chevron_points(rect,
-/// true)`) — a menu affordance, not a collapse-state indicator — so the
-/// label names what a click does ("Menu"), not a state.
+/// The visible `Menu` text names this control directly and the small downward
+/// chevron reinforces that it opens a menu. The larger labeled hit target is
+/// easier to discover than an isolated 14pt glyph while retaining the
+/// overlay's compact header.
+/// A raw `interact` response needs the explicit `WidgetInfo` for AccessKit.
 pub(super) fn menu_chevron(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
-    let label = "Menu";
+    let label = "Open menu";
     let response = ui.interact(rect, ui.id().with("menu_chevron"), egui::Sense::click());
     if ui.is_rect_visible(rect) {
+        if response.hovered() {
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius::same(4),
+                ui.visuals().widgets.hovered.weak_bg_fill,
+            );
+        }
+        ui.painter().text(
+            egui::pos2(rect.left() + 2.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            "Menu",
+            egui::FontId::proportional(9.0),
+            CHEVRON_COLOR,
+        );
+        let chevron_side = CHEVRON_SIZE.min(10.0).min(rect.height());
+        let chevron = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - chevron_side / 2.0, rect.center().y),
+            egui::Vec2::splat(chevron_side),
+        );
         ui.painter().add(egui::Shape::line(
-            chevron_points(rect, true).to_vec(),
-            egui::Stroke::new(CHEVRON_STROKE, CHEVRON_COLOR),
+            chevron_points(chevron, true).to_vec(),
+            egui::Stroke::new(1.5, CHEVRON_COLOR),
         ));
     }
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label)
     });
-    response.on_hover_text(label)
+    response.on_hover_text("Open settings and actions menu")
 }
 
 /// Issue #231: the total clearance kept between the header dropdown's
@@ -2073,11 +2084,11 @@ mod tests {
         };
 
         assert!(
-            clicked(true, "History"),
+            clicked(true, "Open encounter history"),
             "History must open the saved-encounter list"
         );
         assert!(
-            !clicked(false, "History: unavailable"),
+            !clicked(false, "Open encounter history: unavailable"),
             "History must stay inert with no history thread"
         );
     }
@@ -2436,11 +2447,11 @@ mod tests {
             .iter()
             .find_map(|(node_id, node)| {
                 node.label()
-                    .is_some_and(|s| s == "Menu")
+                    .is_some_and(|s| s == "Open menu")
                     .then_some(*node_id)
             })
-            .expect("no accessible node labeled \"Menu\" painted");
-        let chevron_pos = accessible_rect_for_label(&update, "Menu").center();
+            .expect("no accessible node labeled \"Open menu\" painted");
+        let chevron_pos = accessible_rect_for_label(&update, "Open menu").center();
         // SAFETY: `chevron_node_id.0` is exactly the `u64` `Id::value()`
         // this node's accesskit id was derived from (`Id::accesskit_id`
         // performs no hashing, only a direct wrap) — recovering that same
@@ -2517,15 +2528,14 @@ mod tests {
         );
     }
 
-    /// Its hit box is a `TOOLBAR_ICON_SIZE` square, the same footprint the
-    /// dropdown's own menu-item icons use, so it is as easy to hit as they
-    /// are.
+    /// The menu control is wide enough to display its label while retaining
+    /// the compact title-row height.
     #[test]
-    fn the_chevron_hit_box_is_a_toolbar_sized_square() {
+    fn the_labeled_menu_button_fits_its_reserved_strip() {
         let chevron = chevron_rect(title_row());
-        assert_eq!(chevron.width(), CHEVRON_SIZE);
-        assert_eq!(chevron.height(), CHEVRON_SIZE);
-        assert_eq!(CHEVRON_SIZE, TOOLBAR_ICON_SIZE);
+        assert_eq!(chevron.width(), HEADER_RIGHT_CONTROL_WIDTH);
+        assert_eq!(chevron.height(), TITLE_LINE_HEIGHT);
+        assert!(chevron.width() >= 34.0);
     }
 
     /// An absurdly narrow row degrades to a small (never inverted) box
@@ -2546,7 +2556,10 @@ mod tests {
     /// the pure function underneath stays general.
     #[test]
     fn chevron_points_mirrors_up_and_down_about_its_center() {
-        let rect = chevron_rect(title_row());
+        let rect = egui::Rect::from_center_size(
+            chevron_rect(title_row()).center(),
+            egui::Vec2::splat(CHEVRON_SIZE),
+        );
         let down = chevron_points(rect, true);
         let up = chevron_points(rect, false);
 
@@ -2567,7 +2580,10 @@ mod tests {
     /// rather than an arrowhead, and it stays inside its box.
     #[test]
     fn the_chevron_is_a_wide_shallow_v_inside_its_box() {
-        let rect = chevron_rect(title_row());
+        let rect = egui::Rect::from_center_size(
+            chevron_rect(title_row()).center(),
+            egui::Vec2::splat(CHEVRON_SIZE),
+        );
         let points = chevron_points(rect, true);
         for point in &points {
             assert!(rect.contains(*point), "{point:?} escapes {rect:?}");
@@ -2601,7 +2617,7 @@ mod tests {
         let label = accessible_label(&update, id);
         output.drop_without_applying_deltas();
 
-        assert_eq!(label.as_deref(), Some("Menu"));
+        assert_eq!(label.as_deref(), Some("Open menu"));
     }
 
     /// `menu_chevron` always points down (issue #71) — it is a menu
@@ -2609,7 +2625,10 @@ mod tests {
     /// the overlay is collapsed.
     #[test]
     fn the_chevron_always_points_down() {
-        let rect = chevron_rect(title_row());
+        let rect = egui::Rect::from_center_size(
+            chevron_rect(title_row()).center(),
+            egui::Vec2::splat(CHEVRON_SIZE),
+        );
         let points = chevron_points(rect, true);
         // The tip is the middle point; the two ends sit opposite it, above
         // the tip when pointing down.
