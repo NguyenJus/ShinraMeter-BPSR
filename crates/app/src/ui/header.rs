@@ -807,8 +807,8 @@ pub(super) fn toggle_cluster(
     let mut screenshot_requested = false;
     let share_label = availability_label(
         share_active,
-        "Copy screenshot to clipboard",
-        "Copy screenshot to clipboard: unavailable",
+        "Copy overlay screenshot to clipboard",
+        "Copy overlay screenshot to clipboard: unavailable outside an encounter",
     );
     if toggle_button(ui, share_rect, share_label, capturing, share_active).clicked() {
         ui.ctx()
@@ -832,7 +832,7 @@ pub(super) fn toggle_cluster(
         egui::pos2(x + TOGGLE_CLOUD_SIDE / 2.0, y),
         egui::Vec2::splat(TOGGLE_CLOUD_SIDE),
     );
-    if toggle_button(ui, reset_rect, "Reset", capturing, true).clicked() {
+    if toggle_button(ui, reset_rect, "Reset current encounter", capturing, true).clicked() {
         let _ = tx_command.try_send(UiCommand::Reset);
     }
     if let Some(reset) = icons.toolbar.get(ToolbarIcon::Reset) {
@@ -861,7 +861,11 @@ pub(super) fn toggle_cluster(
         egui::pos2(x + TOGGLE_HISTORY_SIDE / 2.0, y),
         egui::Vec2::splat(TOGGLE_HISTORY_SIDE),
     );
-    let history_label = availability_label(has_history, "History", "History: unavailable");
+    let history_label = availability_label(
+        has_history,
+        "Open encounter history",
+        "Open encounter history: unavailable",
+    );
     if toggle_button(ui, history_rect, history_label, capturing, has_history).clicked() {
         *open_history = true;
     }
@@ -941,9 +945,9 @@ pub(super) fn title_row_toggles(
     // entry is a belt-and-braces fallback, not the primary way back — this
     // button is.
     let click_through_label = if settings.click_through {
-        "Click-through: on"
+        "Disable click-through (currently on)"
     } else {
-        "Click-through: off"
+        "Enable click-through (currently off)"
     };
     // Issue #292: a second, color-based on/off signal painted behind the
     // icon (see `CLICK_THROUGH_ON_FILL`'s doc comment) — before
@@ -987,9 +991,9 @@ pub(super) fn title_row_toggles(
         egui::Vec2::splat(TOGGLE_ALWAYS_ON_TOP_SIDE),
     );
     let always_on_top_label = if settings.always_on_top {
-        "Always on top: on"
+        "Allow other windows above overlay (currently on)"
     } else {
-        "Always on top: off"
+        "Keep overlay on top (currently off)"
     };
     if toggle_button(ui, always_on_top_rect, always_on_top_label, capturing, true).clicked() {
         settings.toggle_always_on_top();
@@ -1602,16 +1606,13 @@ pub(super) const HEADER_GUTTER_WIDTH: f32 = 34.0;
 /// gutter and the text.
 pub(super) const HEADER_TEXT_PAD_X: f32 = 2.0;
 
-/// Width reserved at the *right* end of the title/subtitle rows — the
-/// source's `ComboBoxToggleButton` chevron column: a `Path Width="10"` in a
-/// column with `Margin="10 0"` (`DamageMeter.UI/Resources/Styles.xaml`
-/// 229-231), i.e. `10 + 2 * 10 = 30`. The same 30 shows up as the
-/// `ComboBox` `ContentMargin="1 1 30 1"` right inset (:318), which is what
-/// keeps the source's content clear of the chevron.
-///
-/// Issue #54's collapse chevron is what occupies that strip — `chevron_rect`
-/// centers its box in exactly this width, on the title row.
-pub(super) const HEADER_RIGHT_CONTROL_WIDTH: f32 = 30.0;
+/// Width reserved at the *right* end of the title/subtitle rows for the
+/// labeled header menu control. The original source used a 30pt chevron
+/// column; the visible `Menu` label makes the overlay's only route to
+/// settings and secondary actions discoverable without relying on a tooltip.
+/// The compact 34pt control preserves clearance from the header's emblem and
+/// leaves usable text width at `MIN_INNER_SIZE`.
+pub(super) const HEADER_RIGHT_CONTROL_WIDTH: f32 = 34.0;
 
 /// The sub-rect of a header row that title/subtitle text may actually paint
 /// into: indented on the left by the fixed `HEADER_GUTTER_WIDTH` +
@@ -3098,7 +3099,8 @@ mod tests {
     /// PR #197 review: with no history thread the History button must be
     /// *genuinely* disabled, not merely dim and click-gated — accesskit has
     /// to publish `enabled: false`, or a screen-reader user hears a usable
-    /// "History: unavailable" button, activates it, and nothing happens.
+    /// "Open encounter history: unavailable" button, activates it, and
+    /// nothing happens.
     #[test]
     fn the_history_button_reports_itself_disabled_without_history() {
         let ctx = egui::Context::default();
@@ -3136,11 +3138,11 @@ mod tests {
         };
 
         assert!(
-            disabled(false, "History: unavailable"),
+            disabled(false, "Open encounter history: unavailable"),
             "History must report enabled: false with no history thread"
         );
         assert!(
-            !disabled(true, "History"),
+            !disabled(true, "Open encounter history"),
             "History must stay enabled when there is a history thread"
         );
     }
@@ -3187,15 +3189,18 @@ mod tests {
         };
 
         assert!(
-            disabled(false, "Copy screenshot to clipboard: unavailable"),
+            disabled(
+                false,
+                "Copy overlay screenshot to clipboard: unavailable outside an encounter",
+            ),
             "Share must report enabled: false when share_active is false"
         );
         assert!(
-            !disabled(true, "Copy screenshot to clipboard"),
+            !disabled(true, "Copy overlay screenshot to clipboard"),
             "Share must stay enabled when share_active is true"
         );
 
-        let label = "Copy screenshot to clipboard: unavailable";
+        let label = "Copy overlay screenshot to clipboard: unavailable outside an encounter";
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
             toggle_cluster(ui, &tx_command, &icons, false, false, true, &mut false);
         });
@@ -3370,7 +3375,8 @@ mod tests {
             .accesskit_update
             .clone()
             .expect("accesskit was enabled for this frame");
-        let pos = accessible_rect_for_label(&update, "Click-through: off").center();
+        let pos =
+            accessible_rect_for_label(&update, "Enable click-through (currently off)").center();
         layout.drop_without_applying_deltas();
 
         let output = ctx.run_ui(click_at(pos), |ui| {
@@ -3424,7 +3430,9 @@ mod tests {
             .accesskit_update
             .clone()
             .expect("accesskit was enabled for this frame");
-        let pos = accessible_rect_for_label(&update, "Always on top: on").center();
+        let pos =
+            accessible_rect_for_label(&update, "Allow other windows above overlay (currently on)")
+                .center();
         layout.drop_without_applying_deltas();
 
         let output = ctx.run_ui(click_at(pos), |ui| {
@@ -3478,7 +3486,8 @@ mod tests {
             .accesskit_update
             .clone()
             .expect("accesskit was enabled for this frame");
-        let share_pos = accessible_rect_for_label(&update, "Copy screenshot to clipboard").center();
+        let share_pos =
+            accessible_rect_for_label(&update, "Copy overlay screenshot to clipboard").center();
         layout.drop_without_applying_deltas();
 
         let output = ctx.run_ui(click_at(share_pos), |ui| {
@@ -3530,7 +3539,8 @@ mod tests {
             .accesskit_update
             .clone()
             .expect("accesskit was enabled for this frame");
-        let share_pos = accessible_rect_for_label(&update, "Copy screenshot to clipboard").center();
+        let share_pos =
+            accessible_rect_for_label(&update, "Copy overlay screenshot to clipboard").center();
         layout.drop_without_applying_deltas();
 
         let hover_input = || egui::RawInput {
@@ -3594,7 +3604,7 @@ mod tests {
         ctx.global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
         let icons = Icons::load(&ctx);
         let (tx_command, _rx_command) = crossbeam_channel::unbounded();
-        const SHARE_LABEL: &str = "Copy screenshot to clipboard";
+        const SHARE_LABEL: &str = "Copy overlay screenshot to clipboard";
 
         let layout = ctx.run_ui(egui::RawInput::default(), |ui| {
             toggle_cluster(ui, &tx_command, &icons, false, true, true, &mut false);
@@ -4238,18 +4248,21 @@ mod tests {
     }
 
     /// The title/subtitle text rect starts at the fixed gutter width and
-    /// stops short of the strip reserved for issue #54's chevron, at every
+    /// stops short of the strip reserved for the labeled menu button, at every
     /// width the window can be dragged to.
-    /// The reserved right strip is the source's own, measured: the
-    /// `ComboBoxToggleButton` template's chevron is a `Path Width="10"` in a
-    /// column with `Margin="10 0"` (`DamageMeter.UI/Resources/Styles.xaml`),
-    /// i.e. a 30pt strip, and the same style reserves it on the content side
-    /// as `ContentMargin="1 1 30 1"`. There is no `Width="32"` anywhere in
-    /// the source, which is what this constant used to claim to be.
+    /// The 34pt strip accommodates the visible `Menu` label,
+    /// so the secondary controls are discoverable without expanding the
+    /// overlay or relying on hover help.
     #[test]
-    fn the_right_control_strip_is_the_sources_thirty_point_chevron_column() {
-        assert_eq!(HEADER_RIGHT_CONTROL_WIDTH, 30.0);
-        assert_eq!(HEADER_RIGHT_CONTROL_WIDTH, 10.0 + 2.0 * 10.0);
+    fn the_right_control_strip_fits_the_labeled_menu_button() {
+        let row = egui::Rect::from_min_size(
+            egui::pos2(7.0, 3.0),
+            egui::vec2(default_inner_width(), TITLE_LINE_HEIGHT),
+        );
+        let menu = chevron_rect(row);
+        assert!(row.contains_rect(menu));
+        assert_eq!(menu.width(), HEADER_RIGHT_CONTROL_WIDTH);
+        assert!(menu.width() > CHEVRON_SIZE);
     }
 
     #[test]

@@ -362,8 +362,8 @@ mod tests {
     /// Settings) no longer renders directly in the header's stat row —
     /// those actions moved into the chevron's dropdown menu, which paints
     /// nothing until opened. A closed-menu frame must carry no accessible
-    /// node labeled for any of the old buttons, only the chevron's own
-    /// "Menu" label. Reset is the one exception: issue #82 moved it back
+    /// node labeled for any of the old buttons, only the menu control's own
+    /// "Open menu" label. Reset is the one exception: issue #82 moved it back
     /// out of the dropdown into the toggle cluster, so it (and the new
     /// Share button) are expected to render directly now.
     #[test]
@@ -420,15 +420,17 @@ mod tests {
             );
         }
         assert!(
-            labels.iter().any(|l| l == "Menu"),
-            "expected the chevron's own \"Menu\" label, got {labels:?}"
+            labels.iter().any(|l| l == "Open menu"),
+            "expected the menu control's \"Open menu\" label, got {labels:?}"
         );
         assert!(
-            labels.iter().any(|l| l == "Reset"),
+            labels.iter().any(|l| l == "Reset current encounter"),
             "expected the toggle cluster's Reset button, got {labels:?}"
         );
         assert!(
-            labels.iter().any(|l| l == "Copy screenshot to clipboard"),
+            labels
+                .iter()
+                .any(|l| l == "Copy overlay screenshot to clipboard"),
             "expected the toggle cluster's Share button, got {labels:?}"
         );
     }
@@ -1880,7 +1882,7 @@ mod tests {
         // Frame 1: closed header, find the chevron.
         let update = frame(egui::RawInput::default());
         assert!(!is_open(&update), "the menu must start closed");
-        let chevron_pos = accessible_rect_for_label(&update, "Menu").center();
+        let chevron_pos = accessible_rect_for_label(&update, "Open menu").center();
 
         // Frame 2: click the chevron. `Popup::menu`'s `open_memory` toggles
         // and the popup paints in the very same frame (egui's `Popup::show`

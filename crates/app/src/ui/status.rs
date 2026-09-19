@@ -923,7 +923,7 @@ mod tests {
             .accesskit_update
             .clone()
             .expect("accesskit was enabled for this frame");
-        let reset_pos = accessible_rect_for_label(&update, "Reset").center();
+        let reset_pos = accessible_rect_for_label(&update, "Reset current encounter").center();
         layout.drop_without_applying_deltas();
 
         let output = ctx.run_ui(click_at(reset_pos), |ui| {
