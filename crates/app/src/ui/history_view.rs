@@ -466,11 +466,16 @@ pub(super) fn draw_history_row(
     // The compact row deliberately clips long title text, but never hides
     // it: hovering anywhere other than the delete control reveals the full
     // title and location without requiring a wider overlay.
-    let response = response.on_hover_text(format!(
+    let summary_tooltip = format!(
         "{}\nLocation: {}",
         summary.title,
         summary.subtitle.as_deref().unwrap_or("Unknown")
-    ));
+    );
+    let tooltip_width = history_tooltip_max_width(ui);
+    let response = response.on_hover_ui(move |ui| {
+        ui.set_max_width(tooltip_width);
+        ui.add(egui::Label::new(summary_tooltip).wrap());
+    });
 
     if !summary_visible {
         // `ScrollArea` may cull the compact row's paint, but its expanded
@@ -598,6 +603,20 @@ fn paint_history_delete(painter: &egui::Painter, rect: egui::Rect) {
     );
 }
 
+/// A tooltip's popup frame adds its own left and right margins. Bound the
+/// label to the viewport's remaining content width so a long saved title or
+/// location wraps before it reaches a narrow overlay's edge.
+fn history_tooltip_max_width(ui: &egui::Ui) -> f32 {
+    history_tooltip_width(
+        ui.ctx().input(|input| input.viewport_rect().width()),
+        ui.spacing().menu_margin.sum().x,
+    )
+}
+
+fn history_tooltip_width(viewport_width: f32, popup_margin_width: f32) -> f32 {
+    (viewport_width - popup_margin_width).max(1.0)
+}
+
 /// Paint one text value inside an explicit cell. Painter-level clipping keeps
 /// the layout robust even below the meter's usual minimum window width.
 fn paint_history_text(
@@ -640,7 +659,12 @@ fn draw_history_detail_row(ui: &mut egui::Ui, summary: &history::EncounterSummar
     // At narrow widths each cell clips independently. Hovering the detail
     // region still exposes all six complete fields, including long location
     // names, without changing the row's fixed expanded height.
-    let _detail_tooltip = response.on_hover_text(fields.join("\n"));
+    let tooltip_width = history_tooltip_max_width(ui);
+    let detail_tooltip = fields.join("\n");
+    let _detail_tooltip = response.on_hover_ui(move |ui| {
+        ui.set_max_width(tooltip_width);
+        ui.add(egui::Label::new(detail_tooltip).wrap());
+    });
     for (cell, field) in history_detail_cell_rects(rect).into_iter().zip(&fields) {
         paint_history_text(
             painter,
@@ -1171,6 +1195,12 @@ mod tests {
                 "a 120pt-wide overlay must retain a paintable detail cell: {cell:?}"
             );
         }
+    }
+
+    #[test]
+    fn history_tooltips_fit_inside_a_narrow_viewport() {
+        assert_eq!(history_tooltip_width(220.0, 12.0), 208.0);
+        assert_eq!(history_tooltip_width(8.0, 12.0), 1.0);
     }
 
     fn history_text_position(shape: &egui::Shape, prefix: &str) -> Option<egui::Pos2> {
