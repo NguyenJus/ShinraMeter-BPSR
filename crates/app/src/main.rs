@@ -374,6 +374,9 @@ fn main() -> eframe::Result {
 
     let (tx_events, rx_events) = bounded::<ProtocolEvent>(EVENT_CAPACITY);
     let (tx_command, rx_command) = bounded::<UiCommand>(COMMAND_CAPACITY);
+    // Capture increments this only when its rate-limited queue-drop warning
+    // is due; the pipeline uses it to emit matching aggregate step timings.
+    let queue_drop_signal = bpsr_capture::QueueDropSignal::new();
 
     // Loaded once, here, rather than inside `OverlayApp::new`: issue #27
     // needs this same value before `OverlayApp` exists, to seed
@@ -394,13 +397,14 @@ fn main() -> eframe::Result {
 
     // Capture is best-effort: on failure `tx_events` is dropped, the pipeline
     // idles, and the overlay explains why.
-    let (status, capture) = match bpsr_capture::start_capture(tx_events, inspect_sink) {
-        Ok(handle) => (StatusLine::Ok, Some(handle)),
-        Err(err) => {
-            log::error!("capture unavailable: {err}");
-            (StatusLine::Error(err.user_message().to_string()), None)
-        }
-    };
+    let (status, capture) =
+        match bpsr_capture::start_capture(tx_events, inspect_sink, queue_drop_signal.clone()) {
+            Ok(handle) => (StatusLine::Ok, Some(handle)),
+            Err(err) => {
+                log::error!("capture unavailable: {err}");
+                (StatusLine::Error(err.user_message().to_string()), None)
+            }
+        };
 
     // Issue #39: `None` when history is switched off in settings.json, or when
     // the database cannot be opened (already logged by `HistoryHandle::spawn`) —
@@ -438,6 +442,7 @@ fn main() -> eframe::Result {
         rx_command,
         names_cache_path(),
         history_handle.clone(),
+        queue_drop_signal,
         capture_restart,
         repaint.clone(),
     );

@@ -310,6 +310,7 @@ fn set_queue_params(api: &Api, handle: HANDLE) {
 pub fn start_capture(
     tx: Sender<ProtocolEvent>,
     inspect_sink: Option<Arc<dyn InspectSink>>,
+    queue_drop_signal: crate::QueueDropSignal,
 ) -> Result<CaptureHandle, CaptureError> {
     let filter = CString::new(FILTER).expect("FILTER is a literal without interior NULs");
     let api = crate::driver::api()?;
@@ -345,6 +346,7 @@ pub fn start_capture(
             thread_restart,
             inspect_sink,
             loop_monitor,
+            queue_drop_signal,
         )
     });
 
@@ -450,6 +452,10 @@ impl Drop for StopOnExit {
     }
 }
 
+// Every argument is an independently-owned capture-thread dependency. A
+// context struct would only hide the same one-time thread handoff behind an
+// extra layer without reducing ownership or shutdown coupling.
+#[allow(clippy::too_many_arguments)]
 fn recv_loop(
     api: &Api,
     handle: HANDLE,
@@ -458,6 +464,7 @@ fn recv_loop(
     restart: CaptureRestart,
     inspect_sink: Option<Arc<dyn InspectSink>>,
     monitor: SharedMonitor,
+    queue_drop_signal: crate::QueueDropSignal,
 ) {
     let stop = StopOnExit(stop);
     let mut buffer = vec![0u8; RECV_BUFFER_SIZE];
@@ -765,11 +772,26 @@ fn recv_loop(
             use crate::backpressure::SendOutcome;
             match drop_counter.try_send(&tx, event, Instant::now()) {
                 SendOutcome::Sent => {}
-                SendOutcome::Dropped(Some(total)) => log::warn!(
-                    "capture: the protocol-event channel is full; dropped {total} event(s) in \
-                     the last ~{:?} (the pipeline is not keeping up)",
-                    crate::backpressure::LOG_INTERVAL,
-                ),
+                SendOutcome::Dropped(Some(report)) => {
+                    queue_drop_signal.note_report();
+                    let kinds = report
+                        .kinds()
+                        .map(|(kind, count)| format!("{kind}={count}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    log::warn!(
+                        "capture: the protocol-event channel is full; dropped {} event(s) in \
+                         the last ~{:?}; kinds=[{kinds}]; observed queue depth={}..{}/{} \
+                         (the pipeline is not keeping up)",
+                        report.total,
+                        crate::backpressure::LOG_INTERVAL,
+                        report.observed_depth.0,
+                        report.observed_depth.1,
+                        report
+                            .capacity
+                            .map_or_else(|| "unbounded".to_string(), |n| n.to_string()),
+                    );
+                }
                 SendOutcome::Dropped(None) => {}
                 SendOutcome::Disconnected => {
                     log::error!(

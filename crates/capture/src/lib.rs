@@ -18,6 +18,7 @@ mod stub;
 #[cfg(windows)]
 mod win;
 
+pub use backpressure::QueueDropSignal;
 pub use restart::CaptureRestart;
 
 #[cfg(not(windows))]
