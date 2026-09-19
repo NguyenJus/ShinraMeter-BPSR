@@ -30,6 +30,45 @@ See [packet inspection](packet-inspection.md) for dump/replay details.
 
 ## Combat and capture
 
+### Investigation record: #458 total HP (2026-09-19)
+
+The latest retained Frost Ogre session was recorded by v0.3.3.  Offline
+replay reconstructs three ordinary recognized-boss lifecycles, each ending
+from the actor-state death signal; the corresponding local history entries
+also exist.  For the selected boss entity, 592 HP-bearing updates have one
+unchanged decoded max of **888,735** and current HP stays in **90–888,735**:
+no current value exceeds max and there is no max update or truncation signal.
+The three corresponding damage totals are **18,576,525–19,494,759**, so the
+pill's decoded total plainly disagrees with the encounter totals.  History
+records encounter damage, which can include other targets, not boss HP;
+these totals must not be used to infer a scale factor or replacement
+denominator.
+
+The retained Basilisk capture (v0.3.2) is internally consistent in the same
+way: 1,068 HP-bearing updates have one unchanged decoded max of **9,869,185**
+and current HP stays in **680–9,869,185**, with no current-over-max reading.
+Its four corresponding damage totals are **17,281,445–70,478,265**, again a
+real mismatch rather than a malformed current/max pair.  These observations
+establish the symptom, not which HP field should replace the pill.
+
+Both dumps are sanitized (`dump_sanitize: true`).  Sanitization explicitly
+retains only its `KEEP_ATTRS` list, which includes current HP (`0x2c2e`) and
+max HP (`0x2c38`) but strips `AttrMaxHpTotal` (`0x2c39`, 11321) before the
+dump is written.  The source names the latter a rollup and notes that no
+tracker currently reads it; that makes it a candidate to observe, not a
+supported replacement.  A sanitized dump therefore cannot rule out that or
+another scaling/phase field, and cannot justify changing the pill from
+decoded `AttrMaxHp`.
+
+The session was still running when inspected, so its shutdown completeness
+summary was not available.  A resolving capture must be a short,
+unsanitized, locally retained session that is closed normally, with the
+visible game current/max HP and meter pill recorded at spawn, after a known
+damage interval, and at every scaling or phase transition.  Retain matching
+timestamps, difficulty, party size, and all dump-ring chunks privately; add
+a synthetic fixture only after those observations establish the expected
+total.
+
 | Issues | Short reproduction and notes to retain |
 | --- | --- |
 | #458: total HP | Use an unsanitized session for one Sea-Ringed Reef pull and one Frost Ogre pull. Record the game's visible current/max HP and the meter pill at spawn, after a known damage interval, and across each phase/scaling change. Record difficulty, party size, and exact screenshot times. Do not infer a scale factor from damage alone. |

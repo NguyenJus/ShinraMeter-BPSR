@@ -39,7 +39,7 @@ pub(super) fn toolbar_icon_image(handle: &egui::TextureHandle) -> egui::Image<'s
 // dropdown menu instead (issue #71), so it always points down — a menu
 // affordance, not a collapse-state indicator.
 
-/// Side of the chevron's square paint box within the labeled menu button.
+/// Side of the chevron's square paint box within the menu button.
 pub(super) const CHEVRON_SIZE: f32 = TOOLBAR_ICON_SIZE;
 
 /// Painted width of the V. The source's `ComboBoxToggleButton` chevron is a
@@ -54,7 +54,7 @@ pub(super) const CHEVRON_PAINT_HEIGHT: f32 = 5.0;
 pub(super) const CHEVRON_COLOR: egui::Color32 =
     egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 0xCC);
 
-/// The labeled menu button's control box inside the title row's reserved
+/// The menu button's control box inside the title row's reserved
 /// right-hand strip (`HEADER_RIGHT_CONTROL_WIDTH`, which `header_text_rect`
 /// already keeps the title's own paint out of).
 ///
@@ -126,10 +126,8 @@ pub(super) fn chevron_points(rect: egui::Rect, pointing_down: bool) -> [egui::Po
 /// registered after `draw_header`'s title-bar drag surface, so it wins the
 /// hit test over it and clicking the chevron never starts a window drag.
 ///
-/// The visible `Menu` text names this control directly and the small downward
-/// chevron reinforces that it opens a menu. The larger labeled hit target is
-/// easier to discover than an isolated 14pt glyph while retaining the
-/// overlay's compact header.
+/// The downward chevron opens the menu. The full reserved strip remains
+/// clickable, with a hover highlight and tooltip to identify the control.
 /// A raw `interact` response needs the explicit `WidgetInfo` for AccessKit.
 pub(super) fn menu_chevron(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
     let label = "Open menu";
@@ -142,18 +140,8 @@ pub(super) fn menu_chevron(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Respons
                 ui.visuals().widgets.hovered.weak_bg_fill,
             );
         }
-        ui.painter().text(
-            egui::pos2(rect.left() + 2.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            "Menu",
-            egui::FontId::proportional(9.0),
-            CHEVRON_COLOR,
-        );
-        let chevron_side = CHEVRON_SIZE.min(10.0).min(rect.height());
-        let chevron = egui::Rect::from_center_size(
-            egui::pos2(rect.right() - chevron_side / 2.0, rect.center().y),
-            egui::Vec2::splat(chevron_side),
-        );
+        let chevron_side = CHEVRON_SIZE.min(rect.width()).min(rect.height());
+        let chevron = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(chevron_side));
         ui.painter().add(egui::Shape::line(
             chevron_points(chevron, true).to_vec(),
             egui::Stroke::new(1.5, CHEVRON_COLOR),
@@ -2528,14 +2516,14 @@ mod tests {
         );
     }
 
-    /// The menu control is wide enough to display its label while retaining
-    /// the compact title-row height.
+    /// The menu control retains the full strip as its hit target and the
+    /// compact title-row height.
     #[test]
-    fn the_labeled_menu_button_fits_its_reserved_strip() {
+    fn the_menu_button_fits_its_reserved_strip() {
         let chevron = chevron_rect(title_row());
         assert_eq!(chevron.width(), HEADER_RIGHT_CONTROL_WIDTH);
         assert_eq!(chevron.height(), TITLE_LINE_HEIGHT);
-        assert!(chevron.width() >= 34.0);
+        assert!(chevron.width() > CHEVRON_SIZE);
     }
 
     /// An absurdly narrow row degrades to a small (never inverted) box
