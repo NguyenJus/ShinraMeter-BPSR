@@ -5206,7 +5206,7 @@ mod tests {
     #[test]
     fn autosize_ignores_the_bare_history_list() {
         assert_eq!(
-            autosize_row_count(&OverlayView::History(Box::new(HistoryUi::default())), 7),
+            autosize_row_count(&OverlayView::History(Box::default()), 7),
             None
         );
     }
