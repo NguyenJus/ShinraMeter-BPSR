@@ -487,15 +487,7 @@ pub(super) fn draw_history_row(
         egui::pos2(rect.left() + HISTORY_ROW_PADDING, rect.top()),
         egui::vec2(FONT_SIZE_SUBTITLE, rect.height()),
     );
-    paint_text(
-        painter,
-        chevron_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        if expanded { "⌄" } else { "›" },
-        regular(FONT_SIZE_SUBTITLE),
-        SUBTITLE_TEXT_COLOR,
-        false,
-    );
+    paint_history_chevron(painter, chevron_rect, expanded);
 
     // The title and duration are deliberately assigned disjoint regions.
     // Saved titles are unbounded, so clipping them is the only way to make
@@ -530,15 +522,7 @@ pub(super) fn draw_history_row(
         SUBTITLE_TEXT_COLOR,
     );
 
-    paint_text(
-        painter,
-        delete_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "✕",
-        regular(FONT_SIZE_SUBTITLE),
-        PILL_VALUE_COLOR,
-        false,
-    );
+    paint_history_delete(painter, delete_rect);
 
     let action = if delete_response.clicked() {
         Some(HistoryRowAction::Delete(summary.id))
@@ -555,6 +539,63 @@ pub(super) fn draw_history_row(
     }
 
     action
+}
+
+/// The bundled UI font intentionally has a small glyph set. Draw the two
+/// history affordances as strokes so they remain visible with every font.
+fn paint_history_chevron(painter: &egui::Painter, rect: egui::Rect, expanded: bool) {
+    let center = rect.center();
+    let stroke = egui::Stroke::new(1.25, SUBTITLE_TEXT_COLOR);
+    if expanded {
+        painter.line_segment(
+            [
+                center + egui::vec2(-3.0, -1.5),
+                center + egui::vec2(0.0, 1.5),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                center + egui::vec2(0.0, 1.5),
+                center + egui::vec2(3.0, -1.5),
+            ],
+            stroke,
+        );
+    } else {
+        painter.line_segment(
+            [
+                center + egui::vec2(-1.5, -3.0),
+                center + egui::vec2(1.5, 0.0),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                center + egui::vec2(1.5, 0.0),
+                center + egui::vec2(-1.5, 3.0),
+            ],
+            stroke,
+        );
+    }
+}
+
+fn paint_history_delete(painter: &egui::Painter, rect: egui::Rect) {
+    let center = rect.center();
+    let stroke = egui::Stroke::new(1.25, PILL_VALUE_COLOR);
+    painter.line_segment(
+        [
+            center + egui::vec2(-3.0, -3.0),
+            center + egui::vec2(3.0, 3.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + egui::vec2(3.0, -3.0),
+            center + egui::vec2(-3.0, 3.0),
+        ],
+        stroke,
+    );
 }
 
 /// Paint one text value inside an explicit cell. Painter-level clipping keeps
@@ -575,7 +616,7 @@ fn paint_history_text(
 }
 
 fn draw_history_detail_row(ui: &mut egui::Ui, summary: &history::EncounterSummary, width: f32) {
-    let (rect, _) = ui.allocate_exact_size(
+    let (rect, response) = ui.allocate_exact_size(
         egui::vec2(width, HISTORY_DETAIL_ROW_HEIGHT),
         egui::Sense::hover(),
     );
@@ -596,6 +637,10 @@ fn draw_history_detail_row(ui: &mut egui::Ui, summary: &history::EncounterSummar
             summary.subtitle.as_deref().unwrap_or("Unknown")
         ),
     ];
+    // At narrow widths each cell clips independently. Hovering the detail
+    // region still exposes all six complete fields, including long location
+    // names, without changing the row's fixed expanded height.
+    let _detail_tooltip = response.on_hover_text(fields.join("\n"));
     for (cell, field) in history_detail_cell_rects(rect).into_iter().zip(&fields) {
         paint_history_text(
             painter,
