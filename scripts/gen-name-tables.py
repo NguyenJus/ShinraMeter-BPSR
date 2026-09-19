@@ -264,6 +264,11 @@ DUNGEON_SCENE_ID_MANUAL_OVERRIDES: dict[int, str] = {
     # (`Meter::engaged_boss_still_up`) never engages in a world-boss scene and
     # a 9s immunity window reads as the end of the encounter.
     7_152: "World Dominator",
+    # Giant Golem Crusade: the upstream dungeon list carries 12050 and
+    # 12051 but omits this live tier. The 2026-09-14 and 2026-09-16 field
+    # logs both enter 12052 and show the normal dungeon lifecycle, so admit
+    # only the observed id rather than inferring the rest of the family.
+    12_052: "Giant Golem Crusade",
 }
 
 # Manual overrides (issue #313): monster names the *curated* community layer
