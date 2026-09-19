@@ -1721,7 +1721,9 @@ impl Meter {
         // ...and the same post-latch arming `end_fight_on_boss_death` does,
         // so the next phase of a multi-phase boss is protected by
         // `withholds_new_fight` rather than reading as a brand-new fight.
-        if let Some(id) = self.boss_monster_id() {
+        if let Some(id) = self.boss_monster_id()
+            && !self.terminal_dungeon_state_seen()
+        {
             self.fight_lifecycle.arm_phase_resume(id);
         }
     }
@@ -2278,7 +2280,9 @@ impl Meter {
                 monster_id,
                 Some(via.as_str()),
             );
-            if let Some(id) = monster_id {
+            if let Some(id) = monster_id
+                && !self.terminal_dungeon_state_seen()
+            {
                 self.fight_lifecycle.arm_phase_resume(id);
             }
             return;
@@ -2370,10 +2374,7 @@ impl Meter {
         // gate closed for the rest of the instance and hold the completion
         // signal forever. `IsFinishTarget` while the state is still `Active`
         // stays gated on both paths.
-        if matches!(
-            self.dungeon_state,
-            Some(EDungeonState::End | EDungeonState::Settlement)
-        ) {
+        if self.terminal_dungeon_state_seen() {
             return false;
         }
         if !self.dungeon_state.is_some_and(|s| s != EDungeonState::Null) {
@@ -2382,6 +2383,17 @@ impl Meter {
         self.current_objective_id
             .and_then(|id| self.objectives.get(&id))
             .is_some_and(|obj| obj.complete != Some(true))
+    }
+
+    /// Whether the instance has already declared this run terminal. The
+    /// signal can precede the killing blow, so the later boss-death path
+    /// must not re-arm a phase continuation that the terminal state already
+    /// resolved.
+    fn terminal_dungeon_state_seen(&self) -> bool {
+        matches!(
+            self.dungeon_state,
+            Some(EDungeonState::End | EDungeonState::Settlement)
+        )
     }
 
     /// Latches the fight end at `end_ms` and logs the single `info`-level

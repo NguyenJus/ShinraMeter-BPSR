@@ -460,22 +460,35 @@ impl Pipeline {
         self.apply_mapped(meter::ProtocolEvent::ServerChanged { timestamp_ms }, now_ms);
     }
 
-    /// Flushes a parked `ServerChanged` on shutdown, regardless of how long
-    /// it has been parked.
+    /// Resolves all deferred fight state on orderly shutdown.
     ///
     /// `tick`'s grace window (`SERVER_CHANGE_GRACE_MS`) only fires on a
     /// ticker tick that never comes once the pipeline thread is on its way
     /// out: a `ServerChanged` parked less than a second before quit would
     /// otherwise never be flushed, and `run`'s final `publish` would see the
     /// fight it interrupted as still `Active` instead of `Ended`, dropping
-    /// it from history. Called immediately before each of `run`'s two
-    /// quit-path `publish` calls.
-    pub fn flush_server_change_for_shutdown(&mut self, now_ms: u64) {
+    /// it from history. A pending phase-continuation record is different:
+    /// shutdown proves no next phase can resume, so it must be sent rather
+    /// than passed through `settle_pending_fight_end`'s same-start discard.
+    /// Called immediately before each of `run`'s two quit-path `publish`
+    /// calls.
+    pub fn finalize_for_shutdown(&mut self, now_ms: u64) {
         log::info!(
-            "capture: flushing any parked server_changed on shutdown so its fight end is not \
-             dropped from history"
+            "capture: finalizing deferred fight state on shutdown so its history record is not \
+             dropped"
         );
         self.flush_pending_server_change(now_ms);
+        self.record_fight_end(self.meter.fight_state(now_ms), now_ms);
+
+        // A held phase may still be pending after the final state capture:
+        // unlike a live resumption, process exit guarantees it cannot grow
+        // into the same encounter. Mark it recorded before sending so the
+        // final publish below cannot build and send it a second time.
+        if self.pending_fight_end.is_some() {
+            self.fight_end_recorded = true;
+            self.held_fight_start_ms = None;
+            self.flush_pending_fight_end();
+        }
     }
 
     /// The tail of `step`, shared with `flush_pending_server_change` so a
@@ -954,7 +967,7 @@ fn run(
                         // Issue #321: flush any fight already sitting in
                         // `FightState::Ended` before the thread exits, same
                         // as the commands arm below.
-                        pipeline.flush_server_change_for_shutdown(now_ms());
+                        pipeline.finalize_for_shutdown(now_ms());
                         publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus, &repaint, &mut last_published);
                         log::info!(
                             "capture channel closed after a quit was requested; this is an \
@@ -1017,7 +1030,7 @@ fn run(
                     ),
                 };
                 if let Some(reason) = quit_reason {
-                    pipeline.flush_server_change_for_shutdown(now_ms());
+                    pipeline.finalize_for_shutdown(now_ms());
                     publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus, &repaint, &mut last_published);
                     log::info!("{reason}");
                     break;
@@ -1568,7 +1581,7 @@ mod tests {
     /// a `ServerChanged` parked less than `SERVER_CHANGE_GRACE_MS` before
     /// quit would never see `tick`'s grace window fire — there is no next
     /// tick — and its fight end would never reach history.
-    /// `flush_server_change_for_shutdown` must land it unconditionally.
+    /// `finalize_for_shutdown` must land it unconditionally.
     #[test]
     fn shutdown_flush_lands_a_parked_server_change_still_inside_the_grace_window() {
         let mut p = Pipeline::new();
@@ -1582,7 +1595,7 @@ mod tests {
 
         // Still well inside the grace window - `tick` would not flush this
         // on its own.
-        p.flush_server_change_for_shutdown(2_100);
+        p.finalize_for_shutdown(2_100);
         assert_eq!(
             p.fight_end_cause(),
             Some(meter::FightEndCause::ServerChanged),
@@ -2150,6 +2163,86 @@ mod tests {
             let _ = std::fs::remove_file(&path);
 
             assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].total_damage, 200);
+        }
+
+        /// A terminal dungeon state can precede the killing blow. Once the
+        /// grouped boss dies, that stored terminal signal must prevent the
+        /// boss-death path from re-arming phase continuation and holding
+        /// history forever.
+        #[test]
+        fn terminal_dungeon_state_before_grouped_boss_death_records_the_fight() {
+            const RIGHT_CANNON: u32 = 103_110;
+
+            let path = temp_history_path("pipeline-terminal-dungeon-before-kill");
+            let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+            let mut pipeline = Pipeline::new().with_history(handle.clone());
+            let grace = pipeline.meter.fight_config().post_end_grace_ms;
+
+            pipeline.step(boss_appear(10, RIGHT_CANNON, 900, 1_000, 1_000), 1_000);
+            pipeline.step(hit_on(10, 100, 1_000, false), 1_000);
+            pipeline.step(
+                proto::ProtocolEvent::DungeonState {
+                    state: proto::event::EDungeonState::End,
+                    scene_uuid: None,
+                },
+                1_500,
+            );
+            pipeline.step(hit_on(10, 100, 2_000, true), 2_000);
+
+            let state = pipeline.tick(2_100);
+            assert_eq!(state, meter::FightState::Ended);
+            assert!(
+                !pipeline.meter.history_phase_resume_pending(),
+                "the prior terminal state resolves the grouped boss death"
+            );
+            pipeline.record_fight_end(state, 2_000 + grace + 1);
+
+            let rows = list_rows(&handle);
+            drop(handle);
+            drop(pipeline);
+            let _ = thread.join();
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(rows.len(), 1, "the terminal dungeon run records once");
+            assert_eq!(rows[0].total_damage, 200);
+        }
+
+        /// An orderly shutdown is an interruption too: after a phase hold
+        /// has outlived the ordinary grace window, its cached record must
+        /// not be discarded as though another phase had resumed.
+        #[test]
+        fn shutdown_finalizer_flushes_a_pending_phase_record() {
+            const RIGHT_CANNON: u32 = 103_110;
+
+            let path = temp_history_path("pipeline-phase-shutdown");
+            let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+            let mut pipeline = Pipeline::new().with_history(handle.clone());
+            let grace = pipeline.meter.fight_config().post_end_grace_ms;
+
+            pipeline.step(boss_appear(10, RIGHT_CANNON, 900, 1_000, 1_000), 1_000);
+            pipeline.step(hit_on(10, 100, 1_000, false), 1_000);
+            pipeline.step(hit_on(10, 100, 2_000, true), 2_000);
+            let state = pipeline.tick(2_100);
+            pipeline.record_fight_end(state, 2_000 + grace + 1);
+            assert!(
+                pipeline.pending_fight_end.is_some(),
+                "the phase row remains deferred"
+            );
+
+            pipeline.finalize_for_shutdown(5_000);
+
+            let rows = list_rows(&handle);
+            drop(handle);
+            drop(pipeline);
+            let _ = thread.join();
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(
+                rows.len(),
+                1,
+                "shutdown must persist the deferred phase row once"
+            );
             assert_eq!(rows[0].total_damage, 200);
         }
 
