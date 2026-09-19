@@ -1607,12 +1607,8 @@ pub(super) const HEADER_GUTTER_WIDTH: f32 = 34.0;
 pub(super) const HEADER_TEXT_PAD_X: f32 = 2.0;
 
 /// Width reserved at the *right* end of the title/subtitle rows for the
-/// labeled header menu control. The original source used a 30pt chevron
-/// column; the visible `Menu` label makes the overlay's only route to
-/// settings and secondary actions discoverable without relying on a tooltip.
-/// The compact 34pt control preserves clearance from the header's emblem and
-/// leaves usable text width at `MIN_INNER_SIZE`.
-pub(super) const HEADER_RIGHT_CONTROL_WIDTH: f32 = 34.0;
+/// header menu chevron, matching the original 30pt control column.
+pub(super) const HEADER_RIGHT_CONTROL_WIDTH: f32 = 30.0;
 
 /// The sub-rect of a header row that title/subtitle text may actually paint
 /// into: indented on the left by the fixed `HEADER_GUTTER_WIDTH` +
@@ -4248,13 +4244,11 @@ mod tests {
     }
 
     /// The title/subtitle text rect starts at the fixed gutter width and
-    /// stops short of the strip reserved for the labeled menu button, at every
+    /// stops short of the strip reserved for the menu button, at every
     /// width the window can be dragged to.
-    /// The 34pt strip accommodates the visible `Menu` label,
-    /// so the secondary controls are discoverable without expanding the
-    /// overlay or relying on hover help.
+    /// The full strip remains clickable around the centered chevron.
     #[test]
-    fn the_right_control_strip_fits_the_labeled_menu_button() {
+    fn the_right_control_strip_fits_the_menu_button() {
         let row = egui::Rect::from_min_size(
             egui::pos2(7.0, 3.0),
             egui::vec2(default_inner_width(), TITLE_LINE_HEIGHT),
