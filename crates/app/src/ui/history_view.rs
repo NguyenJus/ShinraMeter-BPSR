@@ -569,8 +569,8 @@ fn paint_history_text(
 ) {
     if rect.is_positive() {
         painter
-            .with_clip_rect(rect)
-            .text(rect.center(), anchor, text, font, color);
+            .with_clip_rect(painter.clip_rect().intersect(rect))
+            .text(anchor.pos_in_rect(&rect), anchor, text, font, color);
     }
 }
 
@@ -1126,6 +1126,52 @@ mod tests {
                 "a 120pt-wide overlay must retain a paintable detail cell: {cell:?}"
             );
         }
+    }
+
+    fn history_text_position(shape: &egui::Shape, prefix: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text().starts_with(prefix) => Some(text.pos),
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .find_map(|shape| history_text_position(shape, prefix)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn expanded_detail_text_is_anchored_to_the_left_of_its_cell() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let width = 240.0;
+        let summary = history_summary_for_ui_test();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, HISTORY_DETAIL_ROW_HEIGHT),
+                )),
+                ..Default::default()
+            },
+            |ui| draw_history_detail_row(ui, &summary, width),
+        );
+        let ended_pos = output
+            .shapes
+            .iter()
+            .find_map(|clipped| history_text_position(&clipped.shape, "Ended:"))
+            .expect("the expanded detail row must paint its ended field");
+        output.drop_without_applying_deltas();
+
+        let expected = history_detail_cell_rects(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(width, HISTORY_DETAIL_ROW_HEIGHT),
+        ))[0];
+        assert!(
+            (ended_pos.x - expected.left()).abs() < 0.01,
+            "left-aligned detail text must start at the cell's left edge, \
+             not its centre (got {}, expected {})",
+            ended_pos.x,
+            expected.left()
+        );
     }
 
     #[test]
