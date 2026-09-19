@@ -3,10 +3,10 @@
 
 use super::*;
 
-/// Returns whether the Share button (in the toggle cluster painted at the
-/// end of this function) fired a screenshot request this frame — issue #96
-/// (PR #98 review): the caller uses this to know whether to stash this same
-/// frame's row-bottom bound into `OverlayApp::pending_screenshot_bound`.
+/// Returns the Share-button and autosize interactions from this frame. The
+/// caller uses the screenshot result to stash this frame's row-bottom bound
+/// in `OverlayApp::pending_screenshot_bound`; its autosize result is handled
+/// after the header has painted.
 // Issue #156's new `capturing` parameter pushes this to 8 genuinely
 // independent dependencies (egui plumbing, the snapshot, the command
 // channel, the settings handle, icons, the drag gesture, and now the
@@ -75,7 +75,7 @@ pub(super) fn draw_header(
     // Issue #321: forwarded straight through to `draw_header_menu`, the
     // only place that writes to it — see that parameter's doc comment.
     quit_requested: &mut bool,
-) -> bool {
+) -> HeaderResponse {
     let (title, subtitle) = header_text(snapshot, history.as_ref());
     // The header band's height budget — also what `draw_header_wash` and the
     // paint clips below size themselves against, so the whole band is one
@@ -142,7 +142,11 @@ pub(super) fn draw_header(
     // Z-order, so the drag band refuses to start a move while
     // `Settings::always_on_top` is set, and says so with its cursor.
     let drag_locked = drag_locked_by_pin(settings.settings.always_on_top);
-    let drag_surface = ui.interact(band, ui.id().with("title_bar"), egui::Sense::drag());
+    let drag_surface = ui.interact(
+        band,
+        ui.id().with("title_bar"),
+        egui::Sense::click_and_drag(),
+    );
     if drag_surface.hovered() {
         ctx.set_cursor_icon(if drag_locked {
             egui::CursorIcon::NotAllowed
@@ -374,15 +378,18 @@ pub(super) fn draw_header(
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     cluster_ui.set_clip_rect(cluster_rect.intersect(ui.clip_rect()));
-    toggle_cluster(
-        &mut cluster_ui,
-        tx_command,
-        icons,
-        capturing,
-        share_active,
-        has_history,
-        open_history,
-    )
+    HeaderResponse {
+        screenshot_requested: toggle_cluster(
+            &mut cluster_ui,
+            tx_command,
+            icons,
+            capturing,
+            share_active,
+            has_history,
+            open_history,
+        ),
+        autosize_double_clicked: drag_surface.double_clicked_by(egui::PointerButton::Primary),
+    }
 }
 
 // -- toggle cluster (issue #62, #82, #167) --------------------------------
