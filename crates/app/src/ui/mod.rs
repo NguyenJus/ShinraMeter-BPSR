@@ -1877,23 +1877,6 @@ impl eframe::App for OverlayApp {
                 // the corner zones they overlap.
                 let resize_double_clicked =
                     draw_resize_handles(ui, &ctx, &mut self.window_gesture, "root");
-                // Issue #300: a resize-border double-click snaps the
-                // window's height to whichever 5-row/20-row preset it
-                // isn't already at, leaving width untouched — same
-                // `InnerSize` command the header dropdown's "Reset to
-                // defaults" item already uses for its own (width-and-
-                // height) resize.
-                let viewport_rect = ctx.input(|i| i.viewport_rect());
-                if let Some(target_height) = resize_double_click_command(
-                    resize_double_clicked,
-                    viewport_rect.height(),
-                    measured_header_band_height(previous_header_rect),
-                ) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                        viewport_rect.width(),
-                        target_height,
-                    )));
-                }
                 // Issue #39: what the header and rows paint this frame — the
                 // live snapshot, or the open historical one (`history_open`,
                 // cloned above before this closure existed). Computed here,
@@ -1920,7 +1903,7 @@ impl eframe::App for OverlayApp {
                 // because `available_rect_before_wrap` shrinks from the top as
                 // the layout advances.
                 let header_panel = ui.available_rect_before_wrap();
-                let screenshot_requested = draw_header(
+                let header_response = draw_header(
                     ui,
                     &ctx,
                     frame_snapshot,
@@ -1942,6 +1925,30 @@ impl eframe::App for OverlayApp {
                     header_history,
                     &mut self.quit_requested,
                 );
+                // Double-clicking a resize edge or the meter header fits all
+                // current rows exactly, leaving no vertical overflow for the
+                // row scroll area. A north-edge/header click anchors the
+                // bottom of the borderless window; a south-edge click keeps
+                // its top in place.
+                let autosize_trigger =
+                    resize_double_clicked
+                        .map(AutosizeTrigger::Resize)
+                        .or(header_response
+                            .autosize_double_clicked
+                            .then_some(AutosizeTrigger::Header));
+                if let Some(command) = autosize_command(
+                    autosize_trigger,
+                    ctx.input(|i| i.viewport_rect()),
+                    ctx.input(|i| i.viewport().outer_rect),
+                    frame_snapshot.rows.len(),
+                    measured_header_band_height(previous_header_rect),
+                ) {
+                    if let Some(position) = command.outer_position {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(command.inner_size));
+                }
+                let screenshot_requested = header_response.screenshot_requested;
                 // Issue #340: the header's real extent, measured right after
                 // it painted, off the layout cursor it moved — *not* off
                 // `ui.min_rect()`, which a `CentralPanel` has already
@@ -2837,12 +2844,10 @@ fn resize_zones(rect: egui::Rect) -> [(egui::Rect, egui::ResizeDirection, egui::
 /// are drawn from a root `Ui` whose own id is the same in each — without a
 /// salt, two windows' north handles would be one widget.
 ///
-/// Returns whether any of the eight zones was double-clicked this frame
-/// (issue #300) — the root call site turns that into a height-preset
-/// resize via `resize_double_click_command`; the breakdown-viewport call
-/// site (a skill window has no row-count preset of its own) just discards
-/// it. Sensed here rather than left to the caller because only this
-/// function actually owns the eight zone `Response`s.
+/// Returns the resize direction double-clicked this frame. The root call
+/// site fits the meter and preserves the appropriate vertical edge; a skill
+/// window has no row-count target and discards this result. Sensed here
+/// because this function owns the eight handle responses.
 fn draw_resize_handles(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -2852,12 +2857,12 @@ fn draw_resize_handles(
     // salt's `Debug` rendering in `id_source` so an id clash names the
     // widgets that collided. Not ours to drop.
     id_salt: impl std::hash::Hash + std::fmt::Debug,
-) -> bool {
+) -> Option<egui::ResizeDirection> {
     // The viewport this `Ui` belongs to — the root window, or, inside
     // `show_viewport_immediate`'s callback, the child. Either way it is the
     // rect `Ui::max_rect` was built from (egui's `root_ui`).
     let window = ctx.input(|i| i.viewport_rect());
-    let mut double_clicked = false;
+    let mut double_clicked = None;
     // `ResizeDirection` is not `Hash`, so the zone's position in the array is
     // what keeps the eight ids distinct.
     for (index, (zone, direction, cursor)) in resize_zones(window).into_iter().enumerate() {
@@ -2878,7 +2883,7 @@ fn draw_resize_handles(
             begin_window_gesture(ctx, gesture, GestureKind::Resize(direction));
         }
         if handle.double_clicked_by(egui::PointerButton::Primary) {
-            double_clicked = true;
+            double_clicked = Some(direction);
         }
     }
     double_clicked
@@ -3164,48 +3169,72 @@ fn inner_height_for_rows(rows: usize, band_height: f32) -> f32 {
     first_player_row_top_offset(band_height) + rows
 }
 
-/// Issue #300: the inner height a resize-border double-click should snap
-/// the window to, given its inner height right now — alternating between
-/// the same two presets `reset_to_defaults_inner_height`
-/// (`RESET_TO_DEFAULTS_VISIBLE_ROWS`, 5) and `default_inner_height`
-/// (`DEFAULT_VISIBLE_ROWS`, 20) already compute.
-///
-/// No latched "which preset did the last double-click apply" state is
-/// kept anywhere — the current height alone decides: whichever preset is
-/// farther from it wins, with the midpoint between the two as the tie
-/// line. That is what makes back-to-back double-clicks alternate at all:
-/// landing on one preset puts the window closer to it and farther from
-/// the other, so the very next double-click's farther-preset pick is
-/// always the other one. It also means a window resized by hand to some
-/// arbitrary height resolves its first double-click sensibly, with
-/// nothing to initialize.
-fn resize_double_click_preset_height(current_height: f32, band_height: f32) -> f32 {
-    let five_rows = inner_height_for_rows(RESET_TO_DEFAULTS_VISIBLE_ROWS, band_height);
-    let twenty_rows = inner_height_for_rows(DEFAULT_VISIBLE_ROWS, band_height);
-    let midpoint = (five_rows + twenty_rows) / 2.0;
-    if current_height < midpoint {
-        twenty_rows
-    } else {
-        five_rows
-    }
+/// Interactions from the header that the root viewport handles after the
+/// header has finished painting.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct HeaderResponse {
+    screenshot_requested: bool,
+    autosize_double_clicked: bool,
 }
 
-/// Issue #300: turns "did a resize-border zone get double-clicked this
-/// frame" (`draw_resize_handles`' own return value) into the `InnerSize`
-/// height command the root call site should queue, if any.
-///
-/// Kept separate from `resize_double_click_preset_height` so the "was
-/// there actually a double-click this frame" gate and the "what height
-/// does that resolve to" math stay two independently testable decisions —
-/// without it, every ordinary frame (no double-click at all) would need
-/// its own `current_height` threaded through the preset math just to
-/// throw the answer away.
-fn resize_double_click_command(
-    double_clicked: bool,
-    current_height: f32,
+/// The surface that requested an autosize action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutosizeTrigger {
+    /// A resize handle, which determines which vertical window edge moves.
+    Resize(egui::ResizeDirection),
+    /// The meter/header drag surface, treated like the north edge.
+    Header,
+}
+
+/// A complete resize request, including an optional reposition for a
+/// leading-edge autosize.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AutosizeCommand {
+    inner_size: egui::Vec2,
+    outer_position: Option<egui::Pos2>,
+}
+
+/// Height that shows every row without giving `draw_rows` vertical overflow.
+/// The same top offset used by the opening-size helpers accounts for the
+/// header, separator, and their layout spacing; row content is contiguous.
+fn autosize_inner_height(rows: usize, band_height: f32) -> f32 {
+    inner_height_for_rows(rows, band_height).max(MIN_INNER_SIZE.y)
+}
+
+/// Builds the viewport commands for a double-click autosize. North-facing
+/// handles and the meter header move the top edge so the window's bottom is
+/// stable; south-facing handles keep its top stable. Horizontal handles have
+/// no vertical edge to preserve, so they use the conventional top anchor.
+fn autosize_command(
+    trigger: Option<AutosizeTrigger>,
+    viewport_rect: egui::Rect,
+    outer_rect: Option<egui::Rect>,
+    rows: usize,
     band_height: f32,
-) -> Option<f32> {
-    double_clicked.then(|| resize_double_click_preset_height(current_height, band_height))
+) -> Option<AutosizeCommand> {
+    let trigger = trigger?;
+    let inner_size = egui::vec2(
+        viewport_rect.width(),
+        autosize_inner_height(rows, band_height),
+    );
+    let moves_top = matches!(
+        trigger,
+        AutosizeTrigger::Header
+            | AutosizeTrigger::Resize(
+                egui::ResizeDirection::North
+                    | egui::ResizeDirection::NorthEast
+                    | egui::ResizeDirection::NorthWest
+            )
+    );
+    let outer_position = if moves_top {
+        outer_rect.map(|outer| egui::pos2(outer.left(), outer.bottom() - inner_size.y))
+    } else {
+        None
+    };
+    Some(AutosizeCommand {
+        inner_size,
+        outer_position,
+    })
 }
 
 /// Extra width folded into `default_inner_width` on top of the row-column
@@ -5052,113 +5081,95 @@ mod tests {
         );
     }
 
-    /// Issue #340: the presets are built from the header band the overlay
-    /// has actually painted, not from the constant budget — a header that
-    /// measured taller pushes both snap targets down by exactly that much,
-    /// so a double-click still lands the requested row count instead of
-    /// clipping the last row.
     #[test]
-    fn resize_double_click_presets_track_the_measured_header_band() {
-        let budget = header_band_height(BUTTON_ROW_HEIGHT);
-        let taller = budget + 12.0;
-        let five = inner_height_for_rows(RESET_TO_DEFAULTS_VISIBLE_ROWS, taller);
-        let twenty = inner_height_for_rows(DEFAULT_VISIBLE_ROWS, taller);
-        assert_eq!(five, reset_to_defaults_inner_height(None) + 12.0);
-        assert_eq!(twenty, default_inner_height(None) + 12.0);
-        assert_eq!(resize_double_click_preset_height(five, taller), twenty);
-        assert_eq!(resize_double_click_preset_height(twenty, taller), five);
-    }
-
-    /// The gate stays a separate decision from the math, and passes the
-    /// measured band straight through.
-    #[test]
-    fn resize_double_click_command_uses_the_measured_band_when_it_fires() {
-        let band = header_band_height(BUTTON_ROW_HEIGHT) + 5.0;
-        assert_eq!(resize_double_click_command(false, 400.0, band), None);
-        assert_eq!(
-            resize_double_click_command(true, 400.0, band),
-            Some(resize_double_click_preset_height(400.0, band))
+    fn autosize_height_leaves_the_real_row_scroll_area_without_vertical_overflow() {
+        let band = header_band_height(BUTTON_ROW_HEIGHT) + 12.0;
+        let rows = 7;
+        let height = autosize_inner_height(rows, band);
+        let rows_viewport_height = height - first_player_row_top_offset(band);
+        let content = rows_content_size(
+            &rows_test_snapshot(rows),
+            default_inner_width(),
+            rows_viewport_height,
+        );
+        assert!(
+            content.y <= rows_viewport_height + 0.01,
+            "the real ScrollArea overflows vertically at autosize height: content={content:?}, viewport={rows_viewport_height}"
+        );
+        assert!(
+            content.x <= default_inner_width() + 0.01,
+            "the reserved {ROW_SCROLL_BAR_WIDTH}pt column strip must not add horizontal overflow: content={content:?}"
         );
     }
 
-    /// Issue #300: double-clicking a resize border snaps the window
-    /// straight to whichever of the two presets it isn't already at — so a
-    /// window already sitting exactly on one preset always flips to the
-    /// other on the next double-click, the "alternating" the issue asks
-    /// for.
     #[test]
-    fn resize_double_click_preset_height_alternates_between_the_two_presets() {
+    fn autosize_top_edge_and_header_keep_bottom_stable_while_growing_or_shrinking() {
         let band = header_band_height(BUTTON_ROW_HEIGHT);
-        let five = reset_to_defaults_inner_height(None);
-        let twenty = default_inner_height(None);
-        assert_eq!(resize_double_click_preset_height(five, band), twenty);
-        assert_eq!(resize_double_click_preset_height(twenty, band), five);
+        let target_height = autosize_inner_height(8, band);
+        for current_height in [200.0, 500.0] {
+            let viewport =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, current_height));
+            let outer = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), viewport.size());
+            for trigger in [
+                AutosizeTrigger::Resize(egui::ResizeDirection::North),
+                AutosizeTrigger::Header,
+            ] {
+                let command =
+                    autosize_command(Some(trigger), viewport, Some(outer), 8, band).unwrap();
+                assert_eq!(command.inner_size.y, target_height);
+                assert_eq!(
+                    command.outer_position.unwrap().y + command.inner_size.y,
+                    outer.bottom()
+                );
+                assert_eq!(command.outer_position.unwrap().x, outer.left());
+            }
+        }
+        assert!(target_height > 200.0, "the first case must grow");
+        assert!(target_height < 500.0, "the second case must shrink");
     }
 
-    /// Issue #340: `default_inner_height` and `reset_to_defaults_inner_
-    /// height` both thread the same measured header rect into `measured_
-    /// header_band_height`, and the double-click preset swap sizes its own
-    /// band the identical way — so given one real measured rect (not the
-    /// constant budget), the reset preset must still land exactly on the
-    /// height double-clicking the resize border would produce for that
-    /// same rect, and vice versa. If any of the three ever fell back to
-    /// re-deriving the band from `header_band_height(BUTTON_ROW_HEIGHT)`
-    /// instead of the measured rect, this would catch the resulting drift.
     #[test]
-    fn reset_to_defaults_and_double_click_agree_on_height_for_a_measured_rect() {
-        let measured = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 81.0));
-        let band = measured_header_band_height(Some(measured));
-        let five = reset_to_defaults_inner_height(Some(measured));
-        let twenty = default_inner_height(Some(measured));
-        assert_eq!(resize_double_click_preset_height(five, band), twenty);
-        assert_eq!(resize_double_click_preset_height(twenty, band), five);
+    fn autosize_bottom_edge_keeps_top_stable_while_growing_or_shrinking() {
+        let band = header_band_height(BUTTON_ROW_HEIGHT);
+        let target_height = autosize_inner_height(8, band);
+        for current_height in [200.0, 500.0] {
+            let viewport =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, current_height));
+            let outer = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), viewport.size());
+            let command = autosize_command(
+                Some(AutosizeTrigger::Resize(egui::ResizeDirection::South)),
+                viewport,
+                Some(outer),
+                8,
+                band,
+            )
+            .unwrap();
+            assert_eq!(command.outer_position, None);
+            assert_eq!(
+                command.inner_size,
+                egui::vec2(viewport.width(), target_height)
+            );
+        }
+        assert!(target_height > 200.0, "the first case must grow");
+        assert!(target_height < 500.0, "the second case must shrink");
     }
 
-    /// From any height that isn't already sitting on a preset (a window
-    /// resized by hand, or one that has never been snapped), the target is
-    /// whichever preset is farther away — the midpoint between the two
-    /// presets is where that flips.
     #[test]
-    fn resize_double_click_preset_height_picks_the_farther_preset_from_an_arbitrary_height() {
-        let five = reset_to_defaults_inner_height(None);
-        let twenty = default_inner_height(None);
-        let band = header_band_height(BUTTON_ROW_HEIGHT);
-        let midpoint = (five + twenty) / 2.0;
+    fn autosize_does_not_issue_a_command_without_a_double_click() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 300.0));
         assert_eq!(
-            resize_double_click_preset_height(midpoint - 1.0, band),
-            twenty
-        );
-        assert_eq!(
-            resize_double_click_preset_height(midpoint + 1.0, band),
-            five
-        );
-    }
-
-    /// A frame with no resize-border double-click this frame must never
-    /// queue a resize command, no matter what the current height is —
-    /// otherwise every ordinary frame would re-issue the same `InnerSize`
-    /// command against whatever height a manual drag last left the window
-    /// at.
-    #[test]
-    fn resize_double_click_command_is_none_without_a_double_click() {
-        let band = header_band_height(BUTTON_ROW_HEIGHT);
-        assert_eq!(resize_double_click_command(false, 100.0, band), None);
-        assert_eq!(
-            resize_double_click_command(false, reset_to_defaults_inner_height(None), band),
+            autosize_command(
+                None,
+                viewport,
+                Some(egui::Rect::from_min_size(
+                    egui::pos2(100.0, 50.0),
+                    viewport.size()
+                )),
+                8,
+                header_band_height(BUTTON_ROW_HEIGHT),
+            ),
             None
         );
-    }
-
-    /// A resize-border double-click turns into exactly the target height
-    /// `resize_double_click_preset_height` computes from the window's
-    /// current height.
-    #[test]
-    fn resize_double_click_command_uses_the_preset_height_when_double_clicked() {
-        let band = header_band_height(BUTTON_ROW_HEIGHT);
-        let five = reset_to_defaults_inner_height(None);
-        let twenty = default_inner_height(None);
-        assert_eq!(resize_double_click_command(true, five, band), Some(twenty));
-        assert_eq!(resize_double_click_command(true, twenty, band), Some(five));
     }
 
     /// Every row shares the same damage, so `row_bar_frac` (relative to the
