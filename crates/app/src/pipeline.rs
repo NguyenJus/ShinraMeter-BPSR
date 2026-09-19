@@ -63,6 +63,27 @@ impl ProcessingDiagnostics {
     }
 }
 
+/// Emits the pipeline-side aggregate once capture has reported queue loss.
+///
+/// `QueueDropSignal`s are new for each capture session, so generation zero is
+/// the only valid initial observation. In particular, capture starts before
+/// this thread: a report emitted while this thread is being spawned must still
+/// be observed after the first event is processed.
+fn report_queue_drop_if_needed(
+    queue_drop_signal: &QueueDropSignal,
+    observed_drop_generation: &mut u64,
+    processing_diagnostics: &mut ProcessingDiagnostics,
+) -> bool {
+    let generation = queue_drop_signal.generation();
+    if generation == *observed_drop_generation {
+        return false;
+    }
+
+    *observed_drop_generation = generation;
+    processing_diagnostics.report_and_reset();
+    true
+}
+
 /// A handle `publish` can use to wake the overlay's egui event loop the
 /// moment a changed snapshot is ready, instead of relying on the UI thread
 /// to notice on its own next scheduled repaint (issue #349's root cause:
@@ -971,7 +992,10 @@ fn run(
     // of the same one (a tick where nothing changed — the overwhelmingly
     // common case while the game sits idle).
     let mut last_published: Option<meter::Snapshot> = None;
-    let mut observed_drop_generation = queue_drop_signal.generation();
+    // Capture starts before this thread. Start at the fresh signal's known
+    // baseline instead of snapshotting here, otherwise a queue-drop report
+    // emitted during startup would be silently lost.
+    let mut observed_drop_generation = 0;
     let mut processing_diagnostics = ProcessingDiagnostics::default();
 
     loop {
@@ -981,11 +1005,11 @@ fn run(
                     let started = Instant::now();
                     pipeline.step(ev, now_ms());
                     processing_diagnostics.record(started.elapsed());
-                    let generation = queue_drop_signal.generation();
-                    if generation != observed_drop_generation {
-                        observed_drop_generation = generation;
-                        processing_diagnostics.report_and_reset();
-                    }
+                    report_queue_drop_if_needed(
+                        &queue_drop_signal,
+                        &mut observed_drop_generation,
+                        &mut processing_diagnostics,
+                    );
                 }
                 Err(_) => {
                     // PR #329 review, finding 2: an ordinary shutdown
@@ -1127,6 +1151,29 @@ fn publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Capture is started before the pipeline thread. A completed drop-report
+    /// window in that gap must produce the first matching pipeline aggregate,
+    /// rather than being discarded by an initial generation snapshot.
+    #[test]
+    fn observes_a_queue_drop_report_emitted_before_pipeline_startup() {
+        let signal = QueueDropSignal::new();
+        signal.note_report();
+
+        let mut observed_drop_generation = 0;
+        let mut diagnostics = ProcessingDiagnostics::default();
+        diagnostics.record(Duration::from_millis(1));
+
+        assert!(report_queue_drop_if_needed(
+            &signal,
+            &mut observed_drop_generation,
+            &mut diagnostics,
+        ));
+        assert_eq!(observed_drop_generation, 1);
+        assert_eq!(diagnostics.events, 0);
+        assert_eq!(diagnostics.total, Duration::ZERO);
+        assert_eq!(diagnostics.max, Duration::ZERO);
+    }
 
     fn damage(attacker_uid: i64, value: i64, ts: u64) -> proto::DamageEvent {
         proto::DamageEvent {
