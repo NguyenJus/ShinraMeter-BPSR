@@ -111,9 +111,19 @@
     "boss_id": 4601,
     "boss": "Abyssal Nappo"
   },
+  "7152": {
+    "scene": "World Dominator",
+    "boss_id": 20004,
+    "boss": "Ignisor"
+  },
   "8002": {
     "scene": "Canyon Battle",
     "boss_id": 60141,
     "boss": "Apocalypse Destroyer"
+  },
+  "12052": {
+    "scene": "Giant Golem Crusade",
+    "boss_id": 1205001,
+    "boss": "Byrnhald Golem"
   }
 }

@@ -7037,6 +7037,24 @@ mod tests {
             }
         }
 
+        #[test]
+        fn world_dominator_and_giant_golem_crusade_name_their_bosses_on_entry() {
+            for (scene, boss) in [(7_152, "Ignisor"), (12_052, "Byrnhald Golem")] {
+                let mut m = Meter::new();
+                m.apply(&ProtocolEvent::Scene {
+                    level_map_id: scene,
+                });
+
+                let snap = m.snapshot(1_000);
+                assert_eq!(snap.encounter.scene_boss_name, Some(boss), "scene {scene}");
+                assert!(!snap.encounter.is_boss, "nothing has been engaged yet");
+                assert!(
+                    !snap.encounter.multi_boss_scene,
+                    "scene {scene} is not a raid"
+                );
+            }
+        }
+
         /// Issue #201: every curated Towering Ruin scene — 1150-1152
         /// ("Chaotic - Towering Ruin") and 1153/1154 ("Unstable -
         /// Towering Ruin") — is a single-boss dungeon whose final boss is

@@ -11,7 +11,7 @@ encounter.boss_name=Denvel
 encounter.is_boss=true
 encounter.scene_id=7152
 encounter.scene_name=World Dominator
-encounter.scene_boss_name=-
+encounter.scene_boss_name=Ignisor
 resets=
 rows=1
 row uid=1001 name=Aria class=Stormblade ability_score=12000 season_strength=- imagines=[-,-] damage=60000 dps=60000.00 share=100.00 crit=0.00 lucky=0.00 hits=1 deaths=0
