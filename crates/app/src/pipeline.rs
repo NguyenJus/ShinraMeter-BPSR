@@ -63,25 +63,31 @@ impl ProcessingDiagnostics {
     }
 }
 
-/// Emits the pipeline-side aggregate once capture has reported queue loss.
+/// Tracks capture-side queue-drop reports observed by the pipeline.
 ///
 /// `QueueDropSignal`s are new for each capture session, so generation zero is
 /// the only valid initial observation. In particular, capture starts before
 /// this thread: a report emitted while this thread is being spawned must still
 /// be observed after the first event is processed.
-fn report_queue_drop_if_needed(
-    queue_drop_signal: &QueueDropSignal,
-    observed_drop_generation: &mut u64,
-    processing_diagnostics: &mut ProcessingDiagnostics,
-) -> bool {
-    let generation = queue_drop_signal.generation();
-    if generation == *observed_drop_generation {
-        return false;
-    }
+#[derive(Debug, Default)]
+struct QueueDropObserver {
+    observed_generation: u64,
+}
 
-    *observed_drop_generation = generation;
-    processing_diagnostics.report_and_reset();
-    true
+impl QueueDropObserver {
+    fn report_if_needed(
+        &mut self,
+        queue_drop_signal: &QueueDropSignal,
+        processing_diagnostics: &mut ProcessingDiagnostics,
+    ) {
+        let generation = queue_drop_signal.generation();
+        if generation == self.observed_generation {
+            return;
+        }
+
+        self.observed_generation = generation;
+        processing_diagnostics.report_and_reset();
+    }
 }
 
 /// A handle `publish` can use to wake the overlay's egui event loop the
@@ -992,10 +998,7 @@ fn run(
     // of the same one (a tick where nothing changed — the overwhelmingly
     // common case while the game sits idle).
     let mut last_published: Option<meter::Snapshot> = None;
-    // Capture starts before this thread. Start at the fresh signal's known
-    // baseline instead of snapshotting here, otherwise a queue-drop report
-    // emitted during startup would be silently lost.
-    let mut observed_drop_generation = 0;
+    let mut queue_drop_observer = QueueDropObserver::default();
     let mut processing_diagnostics = ProcessingDiagnostics::default();
 
     loop {
@@ -1005,9 +1008,8 @@ fn run(
                     let started = Instant::now();
                     pipeline.step(ev, now_ms());
                     processing_diagnostics.record(started.elapsed());
-                    report_queue_drop_if_needed(
+                    queue_drop_observer.report_if_needed(
                         &queue_drop_signal,
-                        &mut observed_drop_generation,
                         &mut processing_diagnostics,
                     );
                 }
@@ -1160,16 +1162,13 @@ mod tests {
         let signal = QueueDropSignal::new();
         signal.note_report();
 
-        let mut observed_drop_generation = 0;
+        let mut observer = QueueDropObserver::default();
         let mut diagnostics = ProcessingDiagnostics::default();
         diagnostics.record(Duration::from_millis(1));
 
-        assert!(report_queue_drop_if_needed(
-            &signal,
-            &mut observed_drop_generation,
-            &mut diagnostics,
-        ));
-        assert_eq!(observed_drop_generation, 1);
+        observer.report_if_needed(&signal, &mut diagnostics);
+
+        assert_eq!(observer.observed_generation, 1);
         assert_eq!(diagnostics.events, 0);
         assert_eq!(diagnostics.total, Duration::ZERO);
         assert_eq!(diagnostics.max, Duration::ZERO);
