@@ -12,9 +12,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bpsr_capture::CaptureRestart;
+use bpsr_capture::{CaptureRestart, QueueDropSignal};
 use bpsr_meter as meter;
 use bpsr_protocol as proto;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select, tick};
@@ -29,6 +29,66 @@ use crate::ui::{UiCommand, encounter_subtitle, history_title};
 /// *changed* snapshot lands, rather than polling this channel on a fixed
 /// clock.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Aggregate work done by the pipeline between capture-side drop reports.
+/// Timing is always collected, but emitted only when capture observed loss;
+/// this keeps normal sessions free of diagnostic log traffic.
+#[derive(Debug, Default)]
+struct ProcessingDiagnostics {
+    events: u64,
+    total: Duration,
+    max: Duration,
+}
+
+impl ProcessingDiagnostics {
+    fn record(&mut self, elapsed: Duration) {
+        self.events += 1;
+        self.total += elapsed;
+        self.max = self.max.max(elapsed);
+    }
+
+    fn report_and_reset(&mut self) {
+        if self.events != 0 {
+            log::warn!(
+                "pipeline: processed {} protocol event(s) since the previous queue-drop report; \
+                 total step time={:?}, max step time={:?}",
+                self.events,
+                self.total,
+                self.max,
+            );
+        } else {
+            log::warn!("pipeline: no protocol events were processed before this queue-drop report");
+        }
+        *self = Self::default();
+    }
+}
+
+/// Tracks capture-side queue-drop reports observed by the pipeline.
+///
+/// `QueueDropSignal`s are new for each capture session, so generation zero is
+/// the only valid initial observation. In particular, capture starts before
+/// this thread: a report emitted while this thread is being spawned must still
+/// be observed after the first event is processed.
+#[derive(Debug, Default)]
+struct QueueDropObserver {
+    observed_generation: u64,
+}
+
+impl QueueDropObserver {
+    fn report_if_needed(
+        &mut self,
+        queue_drop_signal: &QueueDropSignal,
+        processing_diagnostics: &mut ProcessingDiagnostics,
+    ) {
+        let generation = queue_drop_signal.generation();
+        if generation == self.observed_generation {
+            return;
+        }
+
+        self.observed_generation = generation;
+        processing_diagnostics.report_and_reset();
+    }
+}
 
 /// A handle `publish` can use to wake the overlay's egui event loop the
 /// moment a changed snapshot is ready, instead of relying on the UI thread
@@ -806,6 +866,7 @@ pub fn spawn(
     commands: Receiver<UiCommand>,
     names_cache_path: PathBuf,
     history: Option<HistoryHandle>,
+    queue_drop_signal: QueueDropSignal,
     // Issue #214: the `Send`-able half of the running capture, or `None`
     // when capture never started. This thread owns the UI's command
     // channel, so it is where `UiCommand::RestartCapture` has to land — the
@@ -832,6 +893,7 @@ pub fn spawn(
                 stale,
                 names_cache_path,
                 history,
+                queue_drop_signal,
                 capture_restart,
                 repaint,
             )
@@ -913,6 +975,7 @@ fn run(
     stale: Receiver<meter::Snapshot>,
     names_cache_path: PathBuf,
     history: Option<HistoryHandle>,
+    queue_drop_signal: QueueDropSignal,
     capture_restart: Option<CaptureRestart>,
     repaint: RepaintHandle,
 ) {
@@ -935,12 +998,20 @@ fn run(
     // of the same one (a tick where nothing changed — the overwhelmingly
     // common case while the game sits idle).
     let mut last_published: Option<meter::Snapshot> = None;
+    let mut queue_drop_observer = QueueDropObserver::default();
+    let mut processing_diagnostics = ProcessingDiagnostics::default();
 
     loop {
         select! {
             recv(events) -> msg => match msg {
                 Ok(ev) => {
+                    let started = Instant::now();
                     pipeline.step(ev, now_ms());
+                    processing_diagnostics.record(started.elapsed());
+                    queue_drop_observer.report_if_needed(
+                        &queue_drop_signal,
+                        &mut processing_diagnostics,
+                    );
                 }
                 Err(_) => {
                     // PR #329 review, finding 2: an ordinary shutdown
@@ -1082,6 +1153,26 @@ fn publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Capture is started before the pipeline thread. A completed drop-report
+    /// window in that gap must produce the first matching pipeline aggregate,
+    /// rather than being discarded by an initial generation snapshot.
+    #[test]
+    fn observes_a_queue_drop_report_emitted_before_pipeline_startup() {
+        let signal = QueueDropSignal::new();
+        signal.note_report();
+
+        let mut observer = QueueDropObserver::default();
+        let mut diagnostics = ProcessingDiagnostics::default();
+        diagnostics.record(Duration::from_millis(1));
+
+        observer.report_if_needed(&signal, &mut diagnostics);
+
+        assert_eq!(observer.observed_generation, 1);
+        assert_eq!(diagnostics.events, 0);
+        assert_eq!(diagnostics.total, Duration::ZERO);
+        assert_eq!(diagnostics.max, Duration::ZERO);
+    }
 
     fn damage(attacker_uid: i64, value: i64, ts: u64) -> proto::DamageEvent {
         proto::DamageEvent {
@@ -2634,6 +2725,7 @@ mod tests {
                 rx_command,
                 scratch_path("orderly-shutdown"),
                 None,
+                QueueDropSignal::new(),
                 None,
                 RepaintHandle::new(),
             );
@@ -2673,6 +2765,7 @@ mod tests {
             rx_command,
             scratch_path("restart-capture"),
             None,
+            QueueDropSignal::new(),
             Some(restart.clone()),
             RepaintHandle::new(),
         );
@@ -2712,6 +2805,7 @@ mod tests {
             rx_command,
             scratch_path("restart-capture-none"),
             None,
+            QueueDropSignal::new(),
             None,
             RepaintHandle::new(),
         );
@@ -2743,6 +2837,7 @@ mod tests {
             rx_command,
             scratch_path("capture-dead-status"),
             None,
+            QueueDropSignal::new(),
             None,
             RepaintHandle::new(),
         );

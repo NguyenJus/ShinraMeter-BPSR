@@ -10,6 +10,7 @@ use std::sync::Arc;
 use bpsr_protocol::{InspectSink, ProtocolEvent};
 use crossbeam_channel::Sender;
 
+use crate::QueueDropSignal;
 use crate::error::CaptureError;
 use crate::restart::CaptureRestart;
 
@@ -44,6 +45,7 @@ impl CaptureHandle {
 pub fn start_capture(
     _tx: Sender<ProtocolEvent>,
     _inspect_sink: Option<Arc<dyn InspectSink>>,
+    _queue_drop_signal: QueueDropSignal,
 ) -> Result<CaptureHandle, CaptureError> {
     Err(CaptureError::UnsupportedPlatform)
 }
@@ -55,7 +57,7 @@ mod tests {
     #[test]
     fn start_capture_returns_unsupported_platform() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        match start_capture(tx, None) {
+        match start_capture(tx, None, QueueDropSignal::new()) {
             Err(CaptureError::UnsupportedPlatform) => {}
             Err(other) => panic!("expected UnsupportedPlatform, got {other:?}"),
             Ok(_) => panic!("expected an error on non-Windows"),
