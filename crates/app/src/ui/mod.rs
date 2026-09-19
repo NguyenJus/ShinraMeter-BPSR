@@ -1936,18 +1936,6 @@ impl eframe::App for OverlayApp {
                         .or(header_response
                             .autosize_double_clicked
                             .then_some(AutosizeTrigger::Header));
-                if let Some(command) = autosize_command(
-                    autosize_trigger,
-                    ctx.input(|i| i.viewport_rect()),
-                    ctx.input(|i| i.viewport().outer_rect),
-                    frame_snapshot.rows.len(),
-                    measured_header_band_height(previous_header_rect),
-                ) {
-                    if let Some(position) = command.outer_position {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
-                    }
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(command.inner_size));
-                }
                 let screenshot_requested = header_response.screenshot_requested;
                 // Issue #340: the header's real extent, measured right after
                 // it painted, off the layout cursor it moved — *not* off
@@ -2062,6 +2050,25 @@ impl eframe::App for OverlayApp {
                             &mut back_to_live,
                             &mut opened_skill_uid,
                         );
+                    }
+                }
+                // Size from the row surface that was actually drawn. An open
+                // history encounter has its own bar and separator above the
+                // rows; a bare history list has no player-row surface to fit.
+                let autosize_rows = autosize_row_count(&self.view, self.snapshot.rows.len());
+                if let Some(rows) = autosize_rows {
+                    let (viewport_rect, outer_rect) =
+                        ctx.input(|i| (i.viewport_rect(), i.viewport().outer_rect));
+                    if let Some(command) = autosize_command(
+                        autosize_trigger,
+                        viewport_rect,
+                        outer_rect,
+                        autosize_inner_height_for_row_surface(rows, viewport_rect.top(), rows_top),
+                    ) {
+                        if let Some(position) = command.outer_position {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+                        }
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(command.inner_size));
                     }
                 }
                 // PR #225 review of issue #219: resolved through one
@@ -3197,8 +3204,25 @@ struct AutosizeCommand {
 /// Height that shows every row without giving `draw_rows` vertical overflow.
 /// The same top offset used by the opening-size helpers accounts for the
 /// header, separator, and their layout spacing; row content is contiguous.
+#[cfg(test)]
 fn autosize_inner_height(rows: usize, band_height: f32) -> f32 {
     inner_height_for_rows(rows, band_height).max(MIN_INNER_SIZE.y)
+}
+
+/// Height that leaves exactly `rows` fixed-height player rows below the row
+/// surface's measured top edge. Using the measured edge includes view-specific
+/// chrome such as the history bar and separator without duplicating it here.
+fn autosize_inner_height_for_row_surface(rows: usize, viewport_top: f32, rows_top: f32) -> f32 {
+    (rows_top - viewport_top + rows as f32 * ROW_HEIGHT).max(MIN_INNER_SIZE.y)
+}
+
+/// Player rows eligible for a fit-to-rows resize. The history index has its
+/// own variable-height rows, so only an open encounter participates.
+fn autosize_row_count(view: &OverlayView, live_rows: usize) -> Option<usize> {
+    match view {
+        OverlayView::Live => Some(live_rows),
+        OverlayView::History(state) => state.open.as_ref().map(|open| open.snapshot.rows.len()),
+    }
 }
 
 /// Builds the viewport commands for a double-click autosize. North-facing
@@ -3209,14 +3233,10 @@ fn autosize_command(
     trigger: Option<AutosizeTrigger>,
     viewport_rect: egui::Rect,
     outer_rect: Option<egui::Rect>,
-    rows: usize,
-    band_height: f32,
+    inner_height: f32,
 ) -> Option<AutosizeCommand> {
     let trigger = trigger?;
-    let inner_size = egui::vec2(
-        viewport_rect.width(),
-        autosize_inner_height(rows, band_height),
-    );
+    let inner_size = egui::vec2(viewport_rect.width(), inner_height);
     let moves_top = matches!(
         trigger,
         AutosizeTrigger::Header
@@ -5115,7 +5135,7 @@ mod tests {
                 AutosizeTrigger::Header,
             ] {
                 let command =
-                    autosize_command(Some(trigger), viewport, Some(outer), 8, band).unwrap();
+                    autosize_command(Some(trigger), viewport, Some(outer), target_height).unwrap();
                 assert_eq!(command.inner_size.y, target_height);
                 assert_eq!(
                     command.outer_position.unwrap().y + command.inner_size.y,
@@ -5140,8 +5160,7 @@ mod tests {
                 Some(AutosizeTrigger::Resize(egui::ResizeDirection::South)),
                 viewport,
                 Some(outer),
-                8,
-                band,
+                target_height,
             )
             .unwrap();
             assert_eq!(command.outer_position, None);
@@ -5165,9 +5184,29 @@ mod tests {
                     egui::pos2(100.0, 50.0),
                     viewport.size()
                 )),
-                8,
-                header_band_height(BUTTON_ROW_HEIGHT),
+                autosize_inner_height(8, header_band_height(BUTTON_ROW_HEIGHT)),
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn autosize_row_surface_height_includes_history_chrome() {
+        let viewport_top = 0.0;
+        let history_rows_top = 94.0;
+        let rows = 7;
+        let target = autosize_inner_height_for_row_surface(rows, viewport_top, history_rows_top);
+
+        assert_eq!(
+            target - (history_rows_top - viewport_top),
+            rows as f32 * ROW_HEIGHT
+        );
+    }
+
+    #[test]
+    fn autosize_ignores_the_bare_history_list() {
+        assert_eq!(
+            autosize_row_count(&OverlayView::History(Box::new(HistoryUi::default())), 7),
             None
         );
     }
