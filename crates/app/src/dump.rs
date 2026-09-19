@@ -308,7 +308,31 @@ pub struct RecordSender {
     sanitized_out: Arc<AtomicU64>,
 }
 
+/// Live diagnostic counters without ownership of the record channel.
+/// Keeping these for session exports must not keep the writer alive at exit.
+pub(crate) struct RecordCounters {
+    dropped: Arc<AtomicU64>,
+    sanitized_out: Arc<AtomicU64>,
+}
+
+impl RecordCounters {
+    pub(crate) fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn sanitized_out_count(&self) -> u64 {
+        self.sanitized_out.load(Ordering::Relaxed)
+    }
+}
+
 impl RecordSender {
+    pub(crate) fn counters(&self) -> RecordCounters {
+        RecordCounters {
+            dropped: Arc::clone(&self.dropped),
+            sanitized_out: Arc::clone(&self.sanitized_out),
+        }
+    }
+
     /// Wraps a raw channel sender (the writer thread's, or a test's).
     pub fn new(tx: Sender<Record>) -> Self {
         Self {
@@ -955,6 +979,22 @@ mod tests {
         drop(extra);
         writer.shutdown();
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retained_session_counters_do_not_keep_record_channel_open() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let sender = RecordSender::new(tx);
+        let counters = sender.counters();
+        sender.dropped.fetch_add(2, Ordering::Relaxed);
+        sender.sanitized_out.fetch_add(3, Ordering::Relaxed);
+        drop(sender);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
+        assert_eq!(counters.dropped_count(), 2);
+        assert_eq!(counters.sanitized_out_count(), 3);
     }
 
     // -- rotation (issue #322: a numbered ring — dump-<session>.jsonl, .1,

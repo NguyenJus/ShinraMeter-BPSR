@@ -181,7 +181,7 @@ impl Handle {
 /// module's own unit tests calls (they construct `DumpWriter`/
 /// `DiagnosticSink` directly) — so it can never leak state between tests
 /// or carry a stale value from a previous process.
-static DROPPED_COUNTER: OnceLock<dump::RecordSender> = OnceLock::new();
+static DROPPED_COUNTER: OnceLock<dump::RecordCounters> = OnceLock::new();
 
 /// Whether the current session's dump writer is sanitizing on write (issue
 /// #346), set once by [`init`] regardless of which branch it takes to
@@ -226,7 +226,7 @@ pub fn init(sanitize: bool) -> Option<Handle> {
     } else {
         dump::DumpWriter::spawn(path)
     };
-    let _ = DROPPED_COUNTER.set(writer.sender());
+    let _ = DROPPED_COUNTER.set(writer.sender().counters());
     let _ = SANITIZED.set(sanitize);
     let sink: Arc<dyn InspectSink> = Arc::new(DiagnosticSink::new(writer.sender(), sanitize));
     Some(Handle { sink, writer })
@@ -238,7 +238,9 @@ pub fn init(sanitize: bool) -> Option<Handle> {
 /// by `crate::bundle::build_manifest`'s caller to report how incomplete an
 /// in-progress (or just-finished) dump might be.
 pub(crate) fn dropped_count() -> Option<u64> {
-    DROPPED_COUNTER.get().map(dump::RecordSender::dropped_count)
+    DROPPED_COUNTER
+        .get()
+        .map(dump::RecordCounters::dropped_count)
 }
 
 /// Live sanitized-out-record count for the current session's dump (issue
@@ -249,7 +251,7 @@ pub(crate) fn dropped_count() -> Option<u64> {
 pub(crate) fn sanitized_out_count() -> Option<u64> {
     DROPPED_COUNTER
         .get()
-        .map(dump::RecordSender::sanitized_out_count)
+        .map(dump::RecordCounters::sanitized_out_count)
 }
 
 #[derive(Debug, Clone)]
