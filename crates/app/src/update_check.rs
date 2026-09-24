@@ -57,6 +57,7 @@
 //! a same-directory rename.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// The GitHub `owner/repo` this build's releases are checked against.
 /// Confirmed against the real remote with `gh repo view --json
@@ -80,6 +81,16 @@ const STAGED_SUFFIX: &str = ".new";
 /// whole-filename-append reasoning as `STAGED_SUFFIX`; see the module doc
 /// comment for why the old file has to survive until the next launch.
 const BACKUP_SUFFIX: &str = ".old";
+
+/// Windows can report a predecessor's process image as still open for a
+/// moment after its single-instance guard has been released. Keep cleanup
+/// best-effort, but give those transient sharing/permission failures a short,
+/// bounded chance to settle before leaving the file for a later launch.
+const CLEANUP_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+];
 
 /// What a manual "check for updates" click ends up showing, once the
 /// request (network and all) has resolved. `ui::draw_header_menu` renders
@@ -487,17 +498,55 @@ pub fn swap_in_staged_executable(paths: &UpdatePaths) -> Result<(), String> {
 /// running is correct and the only cost of failing to delete is a file
 /// sitting in a folder.
 pub fn clean_up_previous_update_for(exe: &Path) -> Vec<String> {
+    clean_up_previous_update_for_with(exe, |path| std::fs::remove_file(path), std::thread::sleep)
+}
+
+/// Injectable core of [`clean_up_previous_update_for`]. Keeping the remove
+/// and wait operations here makes the retry policy testable without relying
+/// on a Windows process-image lock or wall-clock timing.
+fn clean_up_previous_update_for_with(
+    exe: &Path,
+    mut remove_file: impl FnMut(&Path) -> std::io::Result<()>,
+    mut sleep: impl FnMut(Duration),
+) -> Vec<String> {
     let paths = update_paths(exe);
     let mut problems = Vec::new();
     for leftover in [&paths.backup, &paths.staged] {
         if !leftover.exists() {
             continue;
         }
-        if let Err(err) = std::fs::remove_file(leftover) {
+        if let Err(err) = remove_leftover_with_retry(leftover, &mut remove_file, &mut sleep) {
             problems.push(format!("couldn't remove {}: {err}", leftover.display()));
         }
     }
     problems
+}
+
+fn remove_leftover_with_retry(
+    leftover: &Path,
+    remove_file: &mut impl FnMut(&Path) -> std::io::Result<()>,
+    sleep: &mut impl FnMut(Duration),
+) -> std::io::Result<()> {
+    for delay in CLEANUP_RETRY_DELAYS {
+        match remove_file(leftover) {
+            Ok(()) => return Ok(()),
+            Err(err) if is_transient_cleanup_error(&err) => sleep(delay),
+            Err(err) => return Err(err),
+        }
+    }
+    remove_file(leftover)
+}
+
+fn is_transient_cleanup_error(err: &std::io::Error) -> bool {
+    // ERROR_SHARING_VIOLATION is not mapped to WouldBlock by std on Windows.
+    // Do not interpret OS code 32 as a sharing violation on other platforms.
+    if cfg!(windows) && err.raw_os_error() == Some(32) {
+        return true;
+    }
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+    )
 }
 
 /// Startup hook for the in-place updater (issue #250): removes the previous
@@ -1168,6 +1217,67 @@ mod tests {
         std::fs::write(&exe, fake_exe("running")).unwrap();
         assert_eq!(clean_up_previous_update_for(&exe), Vec::<String>::new());
         assert!(exe.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clean_up_previous_update_classifies_sharing_violations_by_platform() {
+        assert_eq!(
+            is_transient_cleanup_error(&std::io::Error::from_raw_os_error(32)),
+            cfg!(windows)
+        );
+    }
+
+    #[test]
+    fn clean_up_previous_update_retries_transient_permission_denials() {
+        let dir = scratch_dir("cleanup-retry");
+        let exe = dir.join("ShinraMeter-BPSR.exe");
+        let paths = update_paths(&exe);
+        std::fs::write(&paths.backup, fake_exe("previous")).unwrap();
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+
+        let problems = clean_up_previous_update_for_with(
+            &exe,
+            |_| {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                } else {
+                    Ok(())
+                }
+            },
+            |delay| sleeps.push(delay),
+        );
+
+        assert!(problems.is_empty());
+        assert_eq!(attempts, 3);
+        assert_eq!(sleeps.as_slice(), &CLEANUP_RETRY_DELAYS[..2]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clean_up_previous_update_stops_after_its_bounded_transient_retries() {
+        let dir = scratch_dir("cleanup-retry-limit");
+        let exe = dir.join("ShinraMeter-BPSR.exe");
+        let paths = update_paths(&exe);
+        std::fs::write(&paths.backup, fake_exe("previous")).unwrap();
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+
+        let problems = clean_up_previous_update_for_with(
+            &exe,
+            |_| {
+                attempts += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            },
+            |delay| sleeps.push(delay),
+        );
+
+        assert_eq!(attempts, CLEANUP_RETRY_DELAYS.len() + 1);
+        assert_eq!(sleeps.as_slice(), &CLEANUP_RETRY_DELAYS);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("couldn't remove"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

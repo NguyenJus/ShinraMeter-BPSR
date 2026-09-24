@@ -948,7 +948,21 @@ impl Pipeline {
         }
         self.fight_end_recorded = true;
         self.held_fight_start_ms = None;
-        self.pending_fight_end = self.capture_fight_end_record(now_ms, ended_at_ms);
+        // Normally rebuild at the end of the grace window: packets that
+        // arrived after the end latch still belong to this fight.  A scene
+        // update can arrive while that window is open, though.  It describes
+        // the newly adopted connection, while the held record describes the
+        // fight that just ended.  Rebuilding then would replace the outgoing
+        // scene/boss metadata with the destination's.  Keep the snapshot
+        // captured at the end edge in that case; a destination-scene packet
+        // cannot be trailing combat for the outgoing encounter.
+        if self
+            .pending_fight_end
+            .as_ref()
+            .is_none_or(|pending| pending.scene_id == self.meter.diagnostic_scene_id())
+        {
+            self.pending_fight_end = self.capture_fight_end_record(now_ms, ended_at_ms);
+        }
         self.flush_pending_fight_end();
     }
 
@@ -2254,6 +2268,17 @@ mod tests {
             list_rows(handle).len()
         }
 
+        /// Loads one persisted row so metadata that the history list does
+        /// not expose can be asserted in pipeline regressions.
+        fn load_record(handle: &HistoryHandle, id: i64) -> history::EncounterRecord {
+            let (reply_tx, reply_rx) = crossbeam_channel::unbounded();
+            handle.load(id, &reply_tx);
+            match reply_rx.recv().unwrap() {
+                HistoryEvent::Loaded { record, .. } => *record,
+                other => panic!("expected Loaded, got {other:?}"),
+            }
+        }
+
         /// A player hit on monster `target_uid`, optionally the killing
         /// blow. The module-level `damage` helper is pinned to one target
         /// uid; the phase tests need two distinct boss entities.
@@ -2672,6 +2697,56 @@ mod tests {
                 "the boss-death-ended fight must be recorded even though no tick ever ran \
                  before the next fight's first hit reset the meter"
             );
+        }
+
+        /// A confirmed server change ends the outgoing fight before the
+        /// destination scene is decoded.  Its history row must retain the
+        /// outgoing scene, rather than being relabelled with the scene that
+        /// confirmed the newly adopted connection.
+        #[test]
+        fn server_change_before_destination_scene_keeps_outgoing_history_metadata() {
+            let path = temp_history_path("pipeline-server-change-history-metadata");
+            let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+            let mut pipeline = Pipeline::new().with_history(handle.clone());
+
+            pipeline.step(proto::ProtocolEvent::Scene { level_map_id: 1150 }, 900);
+            pipeline.step(proto::ProtocolEvent::Damage(damage(1, 100, 1_000)), 1_000);
+
+            // The adoption is parked. The destination Scene is the first
+            // decoded frame, so it confirms and flushes ServerChanged first.
+            pipeline.step(proto::ProtocolEvent::ServerChanged, 2_000);
+            pipeline.step(proto::ProtocolEvent::Scene { level_map_id: 7 }, 2_100);
+
+            assert_eq!(
+                pipeline.fight_end_cause(),
+                Some(meter::FightEndCause::ServerChanged)
+            );
+            assert_eq!(
+                pipeline
+                    .pending_fight_end
+                    .as_ref()
+                    .expect("the grace window must retain the outgoing record")
+                    .record
+                    .title,
+                "Kartgriff"
+            );
+
+            // The outgoing fight stays held through the post-end grace
+            // window so any final combat packet can still be folded in.
+            // Flush only after that window, as production does.
+            let state = pipeline.tick(4_001);
+            pipeline.record_fight_end(state, 4_001);
+
+            let rows = list_rows(&handle);
+            let record = load_record(&handle, rows[0].id);
+            drop(handle);
+            drop(pipeline);
+            let _ = thread.join();
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].title, "Kartgriff");
+            assert_eq!(record.scene_id, Some(1150));
         }
 
         #[test]
