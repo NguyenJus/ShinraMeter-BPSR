@@ -103,7 +103,7 @@ impl ColumnKind {
             ColumnKind::LuckyPct => "9%",
             ColumnKind::Hits => "1.20K",
             ColumnKind::Deaths => "2",
-            ColumnKind::DeathTime => "~00:24",
+            ColumnKind::DeathTime => "00:24",
         }
     }
 
@@ -266,11 +266,10 @@ impl ColumnKind {
             // what holds this number to that, the same way
             // `widest_formatted_text_fits_its_column_width_budget` holds
             // every text-only column to its own. Measured at ~39pt for the
-            // widest plausible count ("99") and rounded up to the next
-            // multiple of 8, the same small-margin convention the columns
-            // above use.
+            // widest plausible count ("99") plus the same 10pt gap the
+            // breakdown header leaves before its next pill.
             ColumnKind::Deaths => StatColumn {
-                width: 48.0,
+                width: 51.65625,
                 text: |row| row.deaths.to_string(),
                 color: Color32::from_rgb(DEATH_COUNT_RGB.0, DEATH_COUNT_RGB.1, DEATH_COUNT_RGB.2),
             },
@@ -278,16 +277,16 @@ impl ColumnKind {
             // sibling: the same pill chrome and the same color, led by a
             // stopwatch instead of a skull, exactly as the breakdown
             // window's header cluster pairs the two (issue #254). Its
-            // formatter (`fmt_death_time`) carries the `~` estimate marker
-            // and the em dash for an unmeasured total; see it for why.
+            // formatter (`fmt_death_time`) carries the em dash for an
+            // unmeasured total; see it for why.
             //
             // `width` is measured like `Deaths`'s — the whole pill, not the
             // string — by `ui`'s
             // `death_time_column_width_fits_the_whole_counter_pill`, against
-            // `fmt_duration`'s `120:00` worst case plus the tilde, then
-            // rounded up to the next multiple of 8.
+            // `fmt_duration`'s `120:00` worst case plus the same 10pt
+            // inter-pill gap.
             ColumnKind::DeathTime => StatColumn {
-                width: 88.0,
+                width: 76.84375,
                 text: |row| fmt_death_time(row.dead_ms),
                 color: Color32::from_rgb(DEATH_COUNT_RGB.0, DEATH_COUNT_RGB.1, DEATH_COUNT_RGB.2),
             },
