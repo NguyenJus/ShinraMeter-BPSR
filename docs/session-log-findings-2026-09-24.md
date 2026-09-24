@@ -17,6 +17,28 @@ player names, account identifiers, endpoints, and packet payloads.
   Keep the issue open until a real Windows update validates the cleanup.
 - **#454/#455:** neither reproduced in this session. Their prior failures
   remain open because an uneventful session is not a regression proof.
+- **#285:** the retained inspector ring supplies the requested fresh field
+  evidence: 6 decoded revives, 612,870 `BuffApply` events, 867,506
+  `BuffRemove` events, 32 player-targeted damage-death signals, and 27
+  player dead-state signals. The two death categories can describe the same
+  death and are not a unique-death total. The revive and buff dependencies
+  are already closed, so this uncontrolled session is sufficient capture
+  coverage without reopening protocol discovery.
+
+## Fixed death-time correction defect
+
+Three player deaths were provisionally closed by attributed outgoing damage
+only 70, 71, and 172 milliseconds later; one closing hit was explicitly a
+passive skill. The authoritative revive signals arrived 1.9, 61.1, and 7.9
+seconds after the deaths. This proves that residual damage can be attributed
+to a dead player and is not reliable final evidence of the revive time.
+
+The next-action inference remains as a fallback when no explicit signal is
+captured. A later `Revive` or alive state now supersedes that provisional
+timestamp, including when the explicit packet arrives behind a newer action.
+Ended snapshots cap corrections at the encounter's frozen end, so a late
+revive cannot extend a completed attempt. If a curated next phase resumes the
+same encounter, the preserved authoritative interval becomes visible again.
 
 ## Fixed history-label defect
 
