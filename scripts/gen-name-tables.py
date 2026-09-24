@@ -299,6 +299,8 @@ MONSTER_NAME_MANUAL_OVERRIDES: dict[int, str] = {
 # the one players see. Layered above `SceneName.json` the same way
 # `MONSTER_NAME_MANUAL_OVERRIDES` is layered above the curated monster names.
 SCENE_NAME_MANUAL_OVERRIDES: dict[int, str] = {
+    # Player-confirmed display name; absent from the vendored scene tables.
+    9_300: "Loom of Dreams: Nightmare Purge",
     # `SceneName.json` calls 30001 "Community Map 1"; the shipped client
     # renders it as "Homestead Courtyard", which is the name the issue #433
     # reporter read off their own screen.
@@ -553,6 +555,11 @@ __WD_BOUNDARY_ASSERTS__
         // `SCENE_NAME_MANUAL_OVERRIDES` in `scripts/gen-name-tables.py` pins
         // this the same way `MONSTER_NAME_MANUAL_OVERRIDES` pins monsters.
         assert_eq!(scene_name(30001), Some("Homestead Courtyard"));
+    }
+
+    #[test]
+    fn manually_named_nightmare_purge_scene() {
+        assert_eq!(scene_name(9300), Some("Loom of Dreams: Nightmare Purge"));
     }
 
     #[test]

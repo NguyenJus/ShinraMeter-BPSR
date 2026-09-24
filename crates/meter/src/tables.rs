@@ -3335,6 +3335,7 @@ pub fn scene_name(id: u32) -> Option<&'static str> {
         9205 => "Illusion-Shroud Woods",
         9206 => "Illusion-Shroud Woods",
         9207 => "Illusion-Shroud Woods",
+        9300 => "Loom of Dreams: Nightmare Purge",
         10001 => "Square Practice Field 1",
         10002 => "Square Practice Field 2",
         10003 => "Empty Copy 1",
@@ -14932,6 +14933,11 @@ mod tests {
         // `SCENE_NAME_MANUAL_OVERRIDES` in `scripts/gen-name-tables.py` pins
         // this the same way `MONSTER_NAME_MANUAL_OVERRIDES` pins monsters.
         assert_eq!(scene_name(30001), Some("Homestead Courtyard"));
+    }
+
+    #[test]
+    fn manually_named_nightmare_purge_scene() {
+        assert_eq!(scene_name(9300), Some("Loom of Dreams: Nightmare Purge"));
     }
 
     #[test]
