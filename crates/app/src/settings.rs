@@ -48,13 +48,11 @@ impl ColumnKind {
     /// damage/hits do), so they read better next to the row's name than
     /// mixed in with `Damage`/`Dps`/etc.
     ///
-    /// `Deaths` (issue #49) closes the list, so it is the *rightmost*
-    /// column whenever it is enabled — the position the reference render
-    /// (`docs/reference/new-shinra-ex.webp`) puts its skull counter in, just
-    /// past the percentage. It is also the only column painted as a pill
-    /// rather than as bare text (`ui`'s `ColumnEmphasis::Counter`), so
-    /// keeping it at the end also keeps that chrome from sitting between two
-    /// plain-text columns.
+    /// `Deaths` and `DeathTime` (issues #49/#398) close the list as one
+    /// counter-pill cluster: the skull count sits just past the percentage,
+    /// and the stopwatch total is immediately to its right. Keeping the
+    /// pair at the end prevents their chrome (`ui`'s
+    /// `ColumnEmphasis::Counter`) from sitting between plain-text columns.
     pub const ALL: [ColumnKind; 10] = [
         ColumnKind::AbilityScore,
         ColumnKind::SeasonStrength,
@@ -301,6 +299,14 @@ impl ColumnKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub visible_columns: Vec<ColumnKind>,
+    /// Whether this settings file has passed the issue #398 default-column
+    /// migration. Before that release, the default list ended with `Deaths`;
+    /// a file carrying exactly that old default receives `DeathTime` once on
+    /// load. The marker is persisted so a user can subsequently turn the
+    /// new pill off without it returning at every launch. Non-default column
+    /// lists are never changed.
+    #[serde(default)]
+    pub death_time_default_migrated: bool,
     /// Last on-screen window position (issue #27), applied via
     /// `ViewportBuilder::with_position` on the next launch, or `None` if the
     /// window has never been dragged (or this predates the field). The
@@ -509,21 +515,32 @@ fn default_dump_sanitize() -> bool {
     true
 }
 
+/// The complete default column list before issue #398. Kept separately from
+/// `Settings::default` so the one-time migration can recognize the old
+/// out-of-the-box set without treating a customized list as a default.
+const PRE_DEATH_TIME_DEFAULT_COLUMNS: [ColumnKind; 4] = [
+    ColumnKind::Dps,
+    ColumnKind::CritPct,
+    ColumnKind::LuckyPct,
+    ColumnKind::Deaths,
+];
+
 impl Default for Settings {
     fn default() -> Self {
-        // `Deaths` joins the out-of-the-box set (issue #49) because the
-        // reference render shows the skull counter on every row — it is part
-        // of what the meter looks like, not an opt-in extra. Only *new*
-        // installs (and wiped settings files) get it: an existing
-        // `settings.json` carries its own `visible_columns` and is left
-        // exactly as the user last left it, which is intended.
+        // The death counter and total-death-time pill (issues #49/#398) are
+        // part of the default meter, not opt-in extras. Only new installs
+        // and wiped settings files get this set. Existing customized column
+        // sets are preserved; the exact prior default receives a one-time
+        // DeathTime migration.
         Self {
             visible_columns: vec![
                 ColumnKind::Dps,
                 ColumnKind::CritPct,
                 ColumnKind::LuckyPct,
                 ColumnKind::Deaths,
+                ColumnKind::DeathTime,
             ],
+            death_time_default_migrated: true,
             window_position: None,
             window_size: None,
             opacity: default_opacity(),
@@ -805,6 +822,18 @@ impl Settings {
         self.visible_columns.retain(|c| seen.insert(*c));
         if self.visible_columns.is_empty() {
             self.visible_columns = Self::default().visible_columns;
+        }
+        // Issue #398: users who still have exactly the prior default have
+        // never opted into or out of the new pill, so carry them forward to
+        // the new default. Any other list is a user choice and stays intact.
+        // Mark every legacy file as processed, including customized ones:
+        // otherwise a user could remove `DeathTime`, land on the old default
+        // list, and have it unexpectedly restored on the next launch.
+        if !self.death_time_default_migrated {
+            if self.visible_columns == PRE_DEATH_TIME_DEFAULT_COLUMNS {
+                self.visible_columns.push(ColumnKind::DeathTime);
+            }
+            self.death_time_default_migrated = true;
         }
         // Issue #166: an out-of-range (or hand-edited-to-NaN) `opacity`
         // must be repaired on load too, not only on the next slider drag —
@@ -1881,18 +1910,19 @@ mod tests {
 
     // -- default-columns rework: Dps/CritPct/LuckyPct, with color ---------
 
-    /// The out-of-the-box column set, in order. `Deaths` was appended by
-    /// issue #49 (the reference render shows the skull counter on every row);
-    /// the three columns before it are untouched.
+    /// The out-of-the-box column set, in order. The Deaths/Death Time pair
+    /// is a right-edge counter cluster; the three columns before it are
+    /// untouched.
     #[test]
-    fn default_columns_are_dps_crit_lucky_deaths_in_order() {
+    fn default_columns_are_dps_crit_lucky_and_the_death_counter_cluster_in_order() {
         assert_eq!(
             Settings::default().visible_columns,
             vec![
                 ColumnKind::Dps,
                 ColumnKind::CritPct,
                 ColumnKind::LuckyPct,
-                ColumnKind::Deaths
+                ColumnKind::Deaths,
+                ColumnKind::DeathTime,
             ]
         );
     }
@@ -2006,6 +2036,64 @@ mod tests {
     #[test]
     fn deaths_is_visible_by_default() {
         assert!(Settings::default().is_visible(ColumnKind::Deaths));
+    }
+
+    #[test]
+    fn death_time_is_visible_by_default() {
+        assert!(Settings::default().is_visible(ColumnKind::DeathTime));
+    }
+
+    #[test]
+    fn pre_death_time_default_columns_migrate_to_include_the_timer_once() {
+        let path = temp_settings_path("pre-death-time-default");
+        fs::write(
+            &path,
+            br#"{"visible_columns":["Dps","CritPct","LuckyPct","Deaths"]}"#,
+        )
+        .expect("write pre-death-time default fixture");
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded.visible_columns, Settings::default().visible_columns);
+        assert!(loaded.death_time_default_migrated);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pre_death_time_custom_columns_are_not_migrated() {
+        let path = temp_settings_path("pre-death-time-custom");
+        fs::write(&path, br#"{"visible_columns":["Dps","Deaths"]}"#)
+            .expect("write pre-death-time custom fixture");
+
+        let loaded = load_from(&path);
+
+        assert_eq!(
+            loaded.visible_columns,
+            vec![ColumnKind::Dps, ColumnKind::Deaths]
+        );
+        assert!(loaded.death_time_default_migrated);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migrated_user_can_disable_death_time_without_a_future_readd() {
+        let path = temp_settings_path("death-time-disabled-after-migration");
+        fs::write(
+            &path,
+            br#"{"visible_columns":["Dps","CritPct","LuckyPct","Deaths"]}"#,
+        )
+        .expect("write pre-death-time default fixture");
+
+        let mut settings = load_from(&path);
+        settings.toggle(ColumnKind::DeathTime);
+        save_to(&path, &settings);
+
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded, settings);
+        assert!(!loaded.is_visible(ColumnKind::DeathTime));
+        assert!(loaded.death_time_default_migrated);
+        let _ = fs::remove_file(&path);
     }
 
     /// The plain count, never `fmt_short`'s abbreviation — a wipe count is a

@@ -2063,7 +2063,12 @@ impl eframe::App for OverlayApp {
                         autosize_trigger,
                         viewport_rect,
                         outer_rect,
-                        autosize_inner_height_for_row_surface(rows, viewport_rect.top(), rows_top),
+                        autosize_inner_height_for_row_surface(
+                            rows,
+                            viewport_rect,
+                            rows_top,
+                            rows_area_height,
+                        ),
                     ) {
                         if let Some(position) = command.outer_position {
                             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
@@ -3209,11 +3214,20 @@ fn autosize_inner_height(rows: usize, band_height: f32) -> f32 {
     inner_height_for_rows(rows, band_height).max(MIN_INNER_SIZE.y)
 }
 
-/// Height that leaves exactly `rows` fixed-height player rows below the row
-/// surface's measured top edge. Using the measured edge includes view-specific
-/// chrome such as the history bar and separator without duplicating it here.
-fn autosize_inner_height_for_row_surface(rows: usize, viewport_top: f32, rows_top: f32) -> f32 {
-    (rows_top - viewport_top + rows as f32 * ROW_HEIGHT).max(MIN_INNER_SIZE.y)
+/// Height that leaves exactly `rows` fixed-height player rows in the measured
+/// row surface. The measured top and current available height account for
+/// view-specific chrome such as the history bar and separator, as well as the
+/// frame's lower border; omitting that lower inset left the resized viewport a
+/// point too short and kept its vertical scrollbar visible.
+fn autosize_inner_height_for_row_surface(
+    rows: usize,
+    viewport_rect: egui::Rect,
+    rows_top: f32,
+    rows_area_height: f32,
+) -> f32 {
+    let top_chrome = rows_top - viewport_rect.top();
+    let bottom_chrome = viewport_rect.bottom() - (rows_top + rows_area_height);
+    (top_chrome + rows as f32 * ROW_HEIGHT + bottom_chrome).max(MIN_INNER_SIZE.y)
 }
 
 /// Player rows eligible for a fit-to-rows resize. The history index has its
@@ -3279,9 +3293,9 @@ const HEADER_ROW_EXTRA_WIDTH: f32 = 20.0;
 ///
 ///   icon gutter (class 3.5 + 20.0 + Imagines 36.0 + 3.5 = 63.0) + left pad (2.0)
 ///     + name budget (150.0) + gap (10.0)
-///     + columns (DPS 56.0 + crit 40.0 + lucky 40.0 + deaths 48.0 = 184.0)
+///     + columns (DPS 56.0 + crit 40.0 + lucky 40.0 + deaths 48.0 + death time 88.0 = 272.0)
 ///     + right margin (3.0) + row scroll bar (8.0)
-///     + header row headroom (20.0) = 440.0
+///     + header row headroom (20.0) = 528.0
 ///
 /// The `ROW_SCROLL_BAR_WIDTH` term is issue #439's: `draw_rows` takes that
 /// 8pt strip out of the column viewport unconditionally, whether or not
@@ -5192,15 +5206,138 @@ mod tests {
 
     #[test]
     fn autosize_row_surface_height_includes_history_chrome() {
-        let viewport_top = 0.0;
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 400.0));
         let history_rows_top = 94.0;
+        let history_rows_area_height = 305.0;
         let rows = 7;
-        let target = autosize_inner_height_for_row_surface(rows, viewport_top, history_rows_top);
+        let target = autosize_inner_height_for_row_surface(
+            rows,
+            viewport,
+            history_rows_top,
+            history_rows_area_height,
+        );
 
         assert_eq!(
-            target - (history_rows_top - viewport_top),
+            target - (history_rows_top - viewport.top()) - 1.0,
             rows as f32 * ROW_HEIGHT
         );
+    }
+
+    #[test]
+    fn autosize_includes_the_lower_frame_chrome_for_five_and_twenty_rows() {
+        // The row surface starts 76pt below the viewport and ends 1pt above
+        // its bottom because the central-panel frame owns a 1pt border on
+        // both edges. The old formula counted only the 76pt top inset, so
+        // the new viewport was one point short and `ScrollArea` retained its
+        // vertical scrollbar.
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 800.0));
+        let rows_top = 76.0;
+        let rows_area_height = viewport.height() - rows_top - 1.0;
+
+        for rows in [5, 20] {
+            let target =
+                autosize_inner_height_for_row_surface(rows, viewport, rows_top, rows_area_height);
+            let target_rows_viewport = target - rows_top - 1.0;
+
+            assert_eq!(target_rows_viewport, rows as f32 * ROW_HEIGHT);
+        }
+    }
+
+    /// Runs the live header/seam/row-list layout at `inner_height`. When
+    /// `measure_autosize` is set, returns the exact height the live autosize
+    /// path computes from that layout's measured row surface.
+    fn live_rows_layout(
+        rows: usize,
+        inner_height: f32,
+        measure_autosize: bool,
+    ) -> (Option<f32>, f32, egui::Vec2) {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let icons = Icons::load(&ctx);
+        let snapshot = rows_test_snapshot(rows);
+        let (tx_command, _rx_command) = crossbeam_channel::unbounded();
+        let (tx_settings, _rx_settings) = crossbeam_channel::unbounded();
+        let mut settings = Settings::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(default_inner_width(), inner_height),
+            )),
+            ..Default::default()
+        };
+        let mut target_height = None;
+        let mut rows_area_height = 0.0;
+        let mut content_size = egui::Vec2::ZERO;
+
+        let output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::default()
+                        .fill(Opacity::new(settings.opacity).apply(PANEL_FILL))
+                        .stroke(egui::Stroke::new(
+                            PANEL_BORDER_WIDTH,
+                            Opacity::new(settings.opacity).apply(PANEL_BORDER_COLOR),
+                        ))
+                        .corner_radius(egui::CornerRadius::same(PANEL_CORNER_RADIUS)),
+                )
+                .show(ui, |ui| {
+                    draw_header(
+                        ui,
+                        &ctx,
+                        &snapshot,
+                        &tx_command,
+                        SettingsHandle {
+                            settings: &mut settings,
+                            tx_settings: &tx_settings,
+                        },
+                        &icons,
+                        &mut WindowGesture::default(),
+                        None,
+                        false,
+                        true,
+                        &mut UpdateCheckState::default(),
+                        &unused_log_export_sender(),
+                        &mut 0,
+                        false,
+                        &mut false,
+                        None,
+                        &mut false,
+                    );
+                    ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), SEPARATOR_HEIGHT),
+                        egui::Sense::hover(),
+                    );
+                    let rows_top = ui.cursor().top();
+                    rows_area_height = ui.available_height();
+                    if measure_autosize {
+                        let viewport_rect = ctx.input(|input| input.viewport_rect());
+                        target_height = Some(autosize_inner_height_for_row_surface(
+                            rows,
+                            viewport_rect,
+                            rows_top,
+                            rows_area_height,
+                        ));
+                    }
+                    content_size = draw_rows(ui, &snapshot, &settings, &icons, &mut None);
+                });
+        });
+        output.drop_without_applying_deltas();
+        (target_height, rows_area_height, content_size)
+    }
+
+    #[test]
+    fn live_autosize_fits_five_and_twenty_player_rows_without_scrollbar_overflow() {
+        for rows in [5, 20] {
+            let (target, _, _) = live_rows_layout(rows, 900.0, true);
+            let target = target.expect("autosize measurement must be present");
+            let (_, rows_area_height, content) = live_rows_layout(rows, target, false);
+
+            assert_eq!(rows_area_height, rows as f32 * ROW_HEIGHT);
+            assert!(
+                content.y <= rows_area_height + 0.01,
+                "{rows} rows overflow the actual ScrollArea after autosize: content={content:?}, viewport={rows_area_height}"
+            );
+        }
     }
 
     #[test]
