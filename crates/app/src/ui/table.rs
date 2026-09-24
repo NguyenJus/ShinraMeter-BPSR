@@ -2438,8 +2438,8 @@ mod tests {
         let anchors = column_anchors(0.0, 300.0, &stat_columns_for(&cols), 4.0);
 
         // One anchor per enabled column, whatever the default set currently
-        // is (DPS / crit % / lucky % / deaths since issue #49) — the
-        // invariant is the pairing and the right-edge pin, not the count.
+        // is (DPS / crit % / lucky % / deaths / death time) — the invariant
+        // is the pairing and the right-edge pin, not the count.
         assert_eq!(anchors.len(), cols.len());
         assert_eq!(*anchors.last().unwrap(), 300.0 - 4.0);
     }
@@ -2519,9 +2519,10 @@ mod tests {
         // Imagine slots) and landing here at `433.0`. Trimming
         // `COLUMN_RIGHT_MARGIN` to the source's `2 0` + `1` (4.0 -> 3.0)
         // then took a point back off, landing at `432.0`. Issue #439's
-        // unconditionally reserved `ROW_SCROLL_BAR_WIDTH` is the newest
-        // addend, landing at `440.0`.
-        assert_eq!(default_inner_width(), 440.0);
+        // unconditionally reserved `ROW_SCROLL_BAR_WIDTH` landed at
+        // `440.0`; issue #398 then added the default 88pt death-time pill,
+        // widening the opening size to `528.0` without squeezing names.
+        assert_eq!(default_inner_width(), 528.0);
         assert_eq!(COLUMN_RIGHT_MARGIN, 3.0);
     }
 
@@ -2843,6 +2844,26 @@ mod tests {
             .filter(|kind| column_emphasis(*kind).is_pill())
             .collect();
         assert_eq!(pills, vec![ColumnKind::Deaths, ColumnKind::DeathTime]);
+    }
+
+    #[test]
+    fn default_death_time_pill_is_immediately_right_of_the_death_count() {
+        let columns = Settings::default().stat_columns();
+        let deaths = columns
+            .iter()
+            .position(|kind| *kind == ColumnKind::Deaths)
+            .expect("default columns include the death count");
+        assert_eq!(columns.get(deaths + 1), Some(&ColumnKind::DeathTime));
+
+        let anchors = column_anchors(0.0, 600.0, &stat_columns_for(&columns), 4.0);
+        assert!(
+            anchors[deaths] < anchors[deaths + 1],
+            "the death-time pill must sit to the right of the death count"
+        );
+        assert_eq!(
+            *anchors.last().expect("default columns are non-empty"),
+            596.0
+        );
     }
 
     /// The counter shares the row's flat metric size (issue #62) — it is the
