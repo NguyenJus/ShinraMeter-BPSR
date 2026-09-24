@@ -1897,7 +1897,11 @@ impl Meter {
         // `ProtocolEvent::EnemyHp`, so looking it up here sees exactly what
         // looking it up after the bookkeeping would.
         if self.resumes_held_fight(d) {
-            self.fight_lifecycle.resume();
+            if self.fight_lifecycle.resume() {
+                for stats in self.players.values_mut() {
+                    stats.resume_fight();
+                }
+            }
             log::info!(
                 "encounter: fight resumed {} resume_reason=curated_phase",
                 self.diagnostic_context()
@@ -3308,11 +3312,16 @@ impl Meter {
                         self.record_death(entity, entity.display_uid(), timestamp_ms);
                         self.latch_wipe_if_party_down(timestamp_ms);
                     }
-                } else if let Some(stats) = self.players.get_mut(&entity) {
-                    // Explicit signal, not the inferred "next action" path —
-                    // see `PlayerStats::set_alive`'s `explicit` parameter.
-                    stats.set_alive(true, timestamp_ms, true);
-                    self.release_wipe_hold_if_recovered();
+                } else {
+                    let dead_time_until_ms = self
+                        .fight_ended_at(timestamp_ms)
+                        .map_or(timestamp_ms, |end_ms| timestamp_ms.min(end_ms));
+                    if let Some(stats) = self.players.get_mut(&entity) {
+                        // Explicit signal, not the inferred "next action" path —
+                        // see `PlayerStats::set_alive`'s `explicit` parameter.
+                        stats.set_alive_until(true, timestamp_ms, dead_time_until_ms, true);
+                        self.release_wipe_hold_if_recovered();
+                    }
                 }
             }
             EntityKind::Monster => {
@@ -3355,8 +3364,11 @@ impl Meter {
     /// has not otherwise seen. A revive for an unknown uid (or one that was
     /// never recorded dead) is therefore a no-op.
     fn apply_revive(&mut self, entity: EntityId, timestamp_ms: u64) {
+        let dead_time_until_ms = self
+            .fight_ended_at(timestamp_ms)
+            .map_or(timestamp_ms, |end_ms| timestamp_ms.min(end_ms));
         if let Some(stats) = self.players.get_mut(&entity) {
-            stats.set_alive(true, timestamp_ms, true);
+            stats.set_alive_until(true, timestamp_ms, dead_time_until_ms, true);
             self.release_wipe_hold_if_recovered();
         }
     }
@@ -6616,6 +6628,124 @@ mod tests {
             assert_eq!(row.dead_ms, Some(3_000 + 2_500));
         }
 
+        /// Explicit revive notifications close each interval without
+        /// replacing the total from an earlier death. A `NewFight` reset is
+        /// the boundary: its new row starts with no inherited death time.
+        #[test]
+        fn explicit_revives_accumulate_dead_time_until_a_new_fight_reset() {
+            let mut m = Meter::new();
+            m.apply(&dmg(2, 100, 1_000));
+
+            m.apply(&death_hit(1, 2, 2_000));
+            m.apply(&ProtocolEvent::Revive {
+                entity: pk(2),
+                uid: 2,
+                timestamp_ms: 4_500,
+            });
+            let dead_time = |m: &Meter, now_ms| {
+                m.snapshot(now_ms)
+                    .rows
+                    .iter()
+                    .find(|r| r.uid == 2)
+                    .unwrap()
+                    .dead_ms
+            };
+            assert_eq!(dead_time(&m, 4_500), Some(2_500));
+            assert_eq!(
+                dead_time(&m, 9_000),
+                Some(2_500),
+                "a revived player's closed interval must stay stable"
+            );
+
+            m.apply(&death_hit(1, 2, 10_000));
+            m.apply(&ProtocolEvent::Revive {
+                entity: pk(2),
+                uid: 2,
+                timestamp_ms: 12_500,
+            });
+            assert_eq!(dead_time(&m, 13_000), Some(2_500 + 2_500));
+
+            m.reset(ResetReason::NewFight, 14_000);
+            m.apply(&dmg(2, 50, 15_000));
+            assert_eq!(
+                dead_time(&m, 16_000),
+                Some(0),
+                "the next encounter must not inherit the prior pull's dead time"
+            );
+        }
+
+        /// A hit attributed to a dead player can be a lingering passive,
+        /// not proof that the player is already up. Keep the inferred close
+        /// as a fallback, but let the later dedicated revive packet correct
+        /// the interval to its authoritative timestamp.
+        #[test]
+        fn explicit_revive_corrects_a_passive_damage_inference() {
+            let mut m = Meter::new();
+            m.apply(&dmg(2, 100, 1_000));
+            m.apply(&death_hit(1, 2, 2_000));
+
+            m.apply(&dmg(2, 100, 2_172));
+            let dead_time = |m: &Meter, now_ms| {
+                m.snapshot(now_ms)
+                    .rows
+                    .iter()
+                    .find(|r| r.uid == 2)
+                    .unwrap()
+                    .dead_ms
+            };
+            assert_eq!(
+                dead_time(&m, 5_000),
+                Some(172),
+                "without an explicit signal, the next-action fallback still applies"
+            );
+
+            m.apply(&ProtocolEvent::Revive {
+                entity: pk(2),
+                uid: 2,
+                timestamp_ms: 9_931,
+            });
+            assert_eq!(
+                dead_time(&m, 10_000),
+                Some(7_931),
+                "the explicit revive supersedes residual damage attributed to the corpse"
+            );
+        }
+
+        #[test]
+        fn late_revive_uses_an_unlatched_idle_end_as_its_correction_cutoff() {
+            let mut m = Meter::new();
+            m.apply(&dmg(2, 100, 1_000));
+            m.apply(&death_hit(1, 2, 2_000));
+            m.apply(&dmg(2, 100, 2_100));
+            // Another player supplies the fight's final activity. No tick
+            // follows, so the idle end remains derived rather than stored.
+            m.apply(&dmg(3, 100, 3_000));
+            assert_eq!(m.fight_end_ms(), None);
+
+            m.apply(&ProtocolEvent::Revive {
+                entity: pk(2),
+                uid: 2,
+                timestamp_ms: 20_000,
+            });
+
+            let row = m
+                .snapshot(20_000)
+                .rows
+                .into_iter()
+                .find(|row| row.uid == 2)
+                .unwrap();
+            assert_eq!(
+                row.dead_ms,
+                Some(1_000),
+                "the correction stops at the last hit (the derived idle end), not the late revive"
+            );
+            assert_eq!(
+                m.fight_end_ms(),
+                None,
+                "the regression must exercise the pre-tick, unlatched path"
+            );
+        }
+
         /// A player still down when the snapshot is taken accrues up to the
         /// snapshot's clock — the live half of the "open death" rule (the
         /// frozen half is `a_death_open_at_the_wipe_counts_up_to_the_freeze`
@@ -9356,6 +9486,44 @@ mod tests {
         }
 
         #[test]
+        fn a_late_explicit_revive_cannot_extend_dead_time_past_the_fight_end() {
+            let mut m = pull();
+            m.apply(&killing_blow(1, 5_000));
+            // Residual damage provisionally closes the interval after 100ms.
+            m.apply(&hit(1, BOSS_UID, 500, 5_100));
+            assert_eq!(
+                m.snapshot(5_500)
+                    .rows
+                    .iter()
+                    .find(|row| row.uid == 1)
+                    .unwrap()
+                    .dead_ms,
+                Some(100)
+            );
+
+            // Model the pull freezing as a wipe at 6s, then receiving the
+            // authoritative revive well after the frozen attempt ended.
+            let boss_id = m.boss_monster_id();
+            m.latch_fight_end(FightEndCause::Wipe, 6_000, 6_000, boss_id);
+            m.apply(&ProtocolEvent::Revive {
+                entity: pk(1),
+                uid: 1,
+                timestamp_ms: 10_000,
+            });
+
+            assert_eq!(
+                m.snapshot(10_000)
+                    .rows
+                    .iter()
+                    .find(|row| row.uid == 1)
+                    .unwrap()
+                    .dead_ms,
+                Some(1_000),
+                "the correction ends at the frozen fight end, not the late packet"
+            );
+        }
+
+        #[test]
         fn monster_damage_during_the_wipe_hold_does_not_restart_the_clock() {
             let mut m = wiped();
             for ts in (7_000..=60_000).step_by(1_000) {
@@ -11491,6 +11659,60 @@ mod tests {
                 m.snapshot(21_100).total_damage,
                 1_700,
                 "damage from before the phase change is still counted"
+            );
+        }
+
+        #[test]
+        fn explicit_revive_during_a_phase_end_recovers_its_full_time_on_resume() {
+            let mut m = Meter::new();
+            m.apply(&hp(10, 900, 1_000, ORIGIN, 0));
+            m.apply(&hit(10, 500, 100, false));
+            m.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 2,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 1,
+                    target_kind: EntityKind::Player,
+                    value: 9_999,
+                    is_dead: true,
+                    timestamp_ms: 4_900,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
+            // Residual damage provisionally infers a revive after 50ms.
+            m.apply(&hit(10, 100, 4_950, false));
+            m.apply(&hit(10, 500, 5_000, true));
+            assert_eq!(m.fight_end_ms(), Some(5_000));
+
+            m.apply(&ProtocolEvent::Revive {
+                entity: pk(1),
+                uid: 1,
+                timestamp_ms: 6_000,
+            });
+            assert_eq!(
+                m.snapshot(6_000)
+                    .rows
+                    .iter()
+                    .find(|row| row.uid == 1)
+                    .unwrap()
+                    .dead_ms,
+                Some(100),
+                "while ended, the row remains capped at the provisional phase end"
+            );
+
+            m.apply(&hp(11, 500, 500, CONTINUATION, 6_500));
+            assert_eq!(m.apply(&hit(11, 700, 7_000, false)), None);
+            assert_eq!(m.fight_end_ms(), None, "the curated next phase resumed");
+            assert_eq!(
+                m.snapshot(7_000)
+                    .rows
+                    .iter()
+                    .find(|row| row.uid == 1)
+                    .unwrap()
+                    .dead_ms,
+                Some(1_100),
+                "resume reveals the authoritative death-to-revive interval"
             );
         }
 

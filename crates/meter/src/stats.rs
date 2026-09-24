@@ -202,7 +202,9 @@ pub struct PlayerStats {
     /// milliseconds, summed over every death→revive interval that has
     /// *closed* (issue #254). The interval still open — a player who is
     /// down right now — is added at read time by [`Self::dead_ms_as_of`],
-    /// so this field never depends on a poll.
+    /// so this field never depends on a poll. It retains the authoritative
+    /// raw close even past a provisional fight end; `dead_ms_as_of` hides
+    /// that portion until a curated phase resumes the same encounter.
     ///
     /// This is an **estimate, biased high**, and the display labels it as
     /// one. Only the death edge is observed: `Meter::record_death` has a
@@ -225,6 +227,17 @@ pub struct PlayerStats {
     /// start would silently shorten the death by the gap between the two
     /// copies. This one is written on the up→down edge only.
     pub(crate) dead_since_ms: Option<u64>,
+    /// Timestamp at which an outgoing damage/heal event provisionally
+    /// inferred that this player had revived. Kept after that fallback
+    /// closes the interval so a later authoritative `Revive`/alive
+    /// `AttrState` can correct residual passive damage that fired from the
+    /// corpse before the actual revive.
+    pub(crate) inferred_revive_ms: Option<u64>,
+    /// Portion of `dead_ms` beyond the fight end that was current when an
+    /// explicit alive signal closed/corrected the interval. Snapshots hide
+    /// it while that end stands; a curated phase resume clears this marker
+    /// and reveals the preserved time as part of the continuing encounter.
+    pub(crate) dead_ms_beyond_fight_end: u64,
     /// Per-buff-type breakdown (issue #267), keyed by `base_id` — the Buff
     /// tab. See [`BuffStats`] for what is (and isn't) counted.
     pub buffs: HashMap<i32, BuffStats>,
@@ -267,6 +280,8 @@ impl PlayerStats {
             alive_as_of_ms: None,
             dead_ms: 0,
             dead_since_ms: None,
+            inferred_revive_ms: None,
+            dead_ms_beyond_fight_end: 0,
             buffs: HashMap::new(),
             active_buffs: HashMap::new(),
         }
@@ -294,13 +309,35 @@ impl PlayerStats {
     /// heal) still counts as proof of life for a player whose actual
     /// revive this meter never observed on the wire (`Meter::apply_damage`
     /// passes `false` there), but only that call site does — every other
-    /// caller has a real signal and passes `true`. Purely a diagnostic
-    /// distinction: both still move the dead clock identically on a
-    /// `(false, true)`/`(true, false)` edge; the only difference is the
-    /// debug log below, which fires exactly when the estimate this pill
-    /// used to be entirely built on is still the only evidence available.
+    /// caller has a real signal and passes `true`. Both provisionally move
+    /// the dead clock on a
+    /// `(false, true)` edge, but a later explicit-alive signal can correct
+    /// an inferred close that came from lingering/passive damage. The
+    /// debug log below fires exactly when the estimate this pill used to be
+    /// entirely built on is still the only evidence available.
     pub(crate) fn set_alive(&mut self, alive: bool, timestamp_ms: u64, explicit: bool) {
-        if self.alive_as_of_ms.is_some_and(|last| timestamp_ms < last) {
+        self.set_alive_until(alive, timestamp_ms, timestamp_ms, explicit);
+    }
+
+    /// [`Self::set_alive`] with a separate upper bound for dead-time
+    /// accounting. An explicit alive signal can arrive after an encounter
+    /// has frozen; its state timestamp still participates in event ordering,
+    /// while `visible_dead_time_until_ms` records how much of the raw close
+    /// must stay hidden unless this provisional end later resumes.
+    pub(crate) fn set_alive_until(
+        &mut self,
+        alive: bool,
+        timestamp_ms: u64,
+        visible_dead_time_until_ms: u64,
+        explicit: bool,
+    ) {
+        let stale = self.alive_as_of_ms.is_some_and(|last| timestamp_ms < last);
+        let corrects_inferred = explicit
+            && alive
+            && self
+                .inferred_revive_ms
+                .is_some_and(|inferred_ms| timestamp_ms >= inferred_ms);
+        if stale && !corrects_inferred {
             return;
         }
         if !explicit && !self.alive && alive {
@@ -310,22 +347,58 @@ impl PlayerStats {
                 self.uid
             );
         }
+        // An explicit alive signal supersedes a prior inferred close. Real
+        // captures contain passive/lingering outgoing damage 70-172ms after
+        // death, followed by the dedicated revive notification seconds
+        // later. The fallback must remain useful when no explicit signal is
+        // observed, but once one is observed its timestamp is authoritative.
+        if explicit
+            && alive
+            && let Some(inferred_ms) = self.inferred_revive_ms.take()
+        {
+            self.add_closed_dead_interval(inferred_ms, timestamp_ms, visible_dead_time_until_ms);
+        }
+        // The correction above is valid even if a newer repeated action has
+        // advanced `alive_as_of_ms`; keep that newer ordering evidence rather
+        // than moving the state clock backward to the delayed revive packet.
+        if stale {
+            return;
+        }
+
         // Issue #254: the two *edges* — and only the edges — move the dead
         // clock. A repeated `set_alive(false)` while already down (the
         // retransmitted death packet `Meter::record_death` debounces) leaves
         // the open interval's start where the first copy put it, and a
         // repeated `set_alive(true)` adds nothing.
         match (self.alive, alive) {
-            (true, false) => self.dead_since_ms = Some(timestamp_ms),
+            (true, false) => {
+                self.inferred_revive_ms = None;
+                self.dead_since_ms = Some(timestamp_ms);
+            }
             (false, true) => {
                 if let Some(since) = self.dead_since_ms.take() {
-                    self.dead_ms += timestamp_ms.saturating_sub(since);
+                    self.add_closed_dead_interval(since, timestamp_ms, visible_dead_time_until_ms);
                 }
+                self.inferred_revive_ms = (!explicit).then_some(timestamp_ms);
             }
             _ => {}
         }
         self.alive = alive;
         self.alive_as_of_ms = Some(timestamp_ms);
+    }
+
+    fn add_closed_dead_interval(&mut self, since_ms: u64, until_ms: u64, visible_until_ms: u64) {
+        let raw_ms = until_ms.saturating_sub(since_ms);
+        let visible_ms = visible_until_ms.saturating_sub(since_ms);
+        self.dead_ms += raw_ms;
+        self.dead_ms_beyond_fight_end += raw_ms.saturating_sub(visible_ms);
+    }
+
+    /// A provisional boss/idle end resumed into another phase of the same
+    /// encounter, so time previously hidden beyond that end now belongs to
+    /// the continuing fight.
+    pub(crate) fn resume_fight(&mut self) {
+        self.dead_ms_beyond_fight_end = 0;
     }
 
     /// Estimated total time this player has spent down this encounter as of
@@ -344,7 +417,7 @@ impl PlayerStats {
     ///
     /// See [`Self::dead_ms`] for why the total is an estimate.
     pub(crate) fn dead_ms_as_of(&self, now_ms: u64) -> u64 {
-        self.dead_ms
+        self.dead_ms.saturating_sub(self.dead_ms_beyond_fight_end)
             + self
                 .dead_since_ms
                 .map_or(0, |since| now_ms.saturating_sub(since))
@@ -664,6 +737,37 @@ mod tests {
         assert!(!s.alive);
         assert_eq!(s.dead_ms, 0);
         assert_eq!(s.dead_ms_as_of(9_000), 4_000);
+    }
+
+    #[test]
+    fn a_delayed_explicit_revive_corrects_an_inference_without_rewinding_state() {
+        let mut s = PlayerStats::new(1);
+        s.set_alive(false, 1_000, true);
+        s.set_alive(true, 1_100, false);
+        s.set_alive(true, 1_300, false);
+
+        s.set_alive(true, 1_200, true);
+
+        assert!(s.alive);
+        assert_eq!(s.alive_as_of_ms, Some(1_300));
+        assert_eq!(s.dead_ms, 200);
+        assert_eq!(s.inferred_revive_ms, None);
+    }
+
+    #[test]
+    fn a_delayed_revive_from_the_previous_death_stays_ignored() {
+        let mut s = PlayerStats::new(1);
+        s.set_alive(false, 1_000, true);
+        s.set_alive(true, 1_100, false);
+        s.set_alive(false, 1_300, true);
+
+        s.set_alive(true, 1_200, true);
+
+        assert!(!s.alive);
+        assert_eq!(s.alive_as_of_ms, Some(1_300));
+        assert_eq!(s.dead_ms, 100);
+        assert_eq!(s.dead_since_ms, Some(1_300));
+        assert_eq!(s.dead_ms_as_of(1_500), 300);
     }
 
     #[test]
