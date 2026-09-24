@@ -324,8 +324,31 @@ pub fn export_bundle_to(
     history_source: Option<&Path>,
     include_history: bool,
 ) -> io::Result<Vec<String>> {
+    export_bundle_to_with_missing(
+        dest_dir,
+        entries,
+        manifest,
+        history_source,
+        include_history,
+        &[],
+    )
+}
+
+/// Like [`export_bundle_to`], with failures from an earlier protected copy
+/// folded into the manifest.  Session-bundle log files use this because they
+/// must be copied while `logging`'s rotation lock is held; this function then
+/// copies the remaining, independently-rotating artifacts after that lock is
+/// released and can safely log their failures.
+pub(crate) fn export_bundle_to_with_missing(
+    dest_dir: &Path,
+    entries: &[(String, PathBuf)],
+    manifest: &Manifest,
+    history_source: Option<&Path>,
+    include_history: bool,
+    prior_missing: &[String],
+) -> io::Result<Vec<String>> {
     fs::create_dir_all(dest_dir)?;
-    let mut missing = Vec::new();
+    let mut missing = prior_missing.to_vec();
     for (name, source) in entries {
         let dest = dest_dir.join(name);
         if let Err(err) = fs::copy(source, &dest) {
@@ -521,6 +544,7 @@ mod tests {
     #[test]
     fn bundle_entries_maps_every_source_to_its_own_basename() {
         let log_parts = vec![
+            PathBuf::from("/logs/ShinraMeter-BPSR.log.7"),
             PathBuf::from("/logs/ShinraMeter-BPSR.log.1"),
             PathBuf::from("/logs/ShinraMeter-BPSR.log"),
         ];
@@ -535,6 +559,10 @@ mod tests {
         assert_eq!(
             entries,
             vec![
+                (
+                    "ShinraMeter-BPSR.log.7".to_string(),
+                    PathBuf::from("/logs/ShinraMeter-BPSR.log.7")
+                ),
                 (
                     "ShinraMeter-BPSR.log.1".to_string(),
                     PathBuf::from("/logs/ShinraMeter-BPSR.log.1")

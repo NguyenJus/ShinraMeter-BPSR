@@ -29,6 +29,163 @@ use crate::ui::{UiCommand, encounter_subtitle, history_title};
 /// *changed* snapshot lands, rather than polling this channel on a fixed
 /// clock.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
+/// The pipeline emits one bounded aggregate per interval. This deliberately
+/// trades exact per-event tracing for enough context to diagnose a stall from
+/// a normal retained log.
+const DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(30);
+const SLOW_WORK_THRESHOLD: Duration = Duration::from_millis(100);
+const SLOW_SELECT_GAP_THRESHOLD: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Default)]
+struct TimingSummary {
+    count: u64,
+    total: Duration,
+    max: Duration,
+}
+
+impl TimingSummary {
+    fn record(&mut self, elapsed: Duration) {
+        self.count += 1;
+        self.total += elapsed;
+        self.max = self.max.max(elapsed);
+    }
+}
+
+/// Bounded, rolling context for the pipeline's single select loop.
+///
+/// Queue depth is a proxy for event age: protocol events do not all carry a
+/// comparable capture timestamp, so this module intentionally does not claim
+/// an age it cannot measure. `select_gap` includes time spent waiting for any
+/// ready input and is therefore a scheduling/idle-gap observation, not CPU
+/// time in the pipeline.
+#[derive(Debug)]
+struct RollingDiagnostics {
+    started_at: Instant,
+    window_started: Instant,
+    last_activity: Instant,
+    first_event_at: Option<Instant>,
+    last_event_at: Option<Instant>,
+    capture_before: bpsr_capture::QueueTelemetry,
+    event_queue_high_water: usize,
+    command_queue_high_water: usize,
+    select_gap_max: Duration,
+    events: TimingSummary,
+    commands: TimingSummary,
+    ticks: TimingSummary,
+    publishes: TimingSummary,
+}
+
+impl RollingDiagnostics {
+    fn new(now: Instant, capture_before: bpsr_capture::QueueTelemetry) -> Self {
+        Self {
+            started_at: now,
+            window_started: now,
+            last_activity: now,
+            first_event_at: None,
+            last_event_at: None,
+            capture_before,
+            event_queue_high_water: 0,
+            command_queue_high_water: 0,
+            select_gap_max: Duration::ZERO,
+            events: TimingSummary::default(),
+            commands: TimingSummary::default(),
+            ticks: TimingSummary::default(),
+            publishes: TimingSummary::default(),
+        }
+    }
+
+    fn activity(&mut self, now: Instant) {
+        self.select_gap_max = self
+            .select_gap_max
+            .max(now.duration_since(self.last_activity));
+        self.last_activity = now;
+    }
+
+    fn event_received(&mut self, now: Instant) {
+        if self.first_event_at.is_none() {
+            log::info!(
+                "pipeline: first decoded protocol event received {:.1?} after pipeline start",
+                now.duration_since(self.started_at)
+            );
+            self.first_event_at = Some(now);
+        }
+        self.last_event_at = Some(now);
+    }
+
+    fn report(
+        &mut self,
+        now: Instant,
+        capture: &QueueDropSignal,
+        event_queue_capacity: Option<usize>,
+        force: bool,
+    ) {
+        let elapsed = now.duration_since(self.window_started);
+        if !force && elapsed < DIAGNOSTIC_INTERVAL {
+            return;
+        }
+        let current = capture.telemetry();
+        let ingress = current
+            .accepted
+            .saturating_sub(self.capture_before.accepted);
+        let dropped = current.dropped.saturating_sub(self.capture_before.dropped);
+        log::info!(
+            "pipeline diagnostics: window={elapsed:.1?}; capture ingress={ingress} ({:.1}/s), \
+             capture drops={dropped} ({:.1}/s); drained={}; event queue depth-after-recv high-water={}/{} \
+             (depth is the event-age proxy); command queue high-water={}; step count={} total={:?} max={:?}; \
+             command count={} total={:?} max={:?}; tick count={} total={:?} max={:?}; \
+             publish count={} total={:?} max={:?}; \
+             select-gap max={:?}; last decoded-event age={}; capture queue depth high-water(session)={}",
+            ingress as f64 / elapsed.as_secs_f64(),
+            dropped as f64 / elapsed.as_secs_f64(),
+            self.events.count,
+            self.event_queue_high_water,
+            event_queue_capacity.map_or_else(|| "unbounded".to_string(), |n| n.to_string()),
+            self.command_queue_high_water,
+            self.events.count,
+            self.events.total,
+            self.events.max,
+            self.commands.count,
+            self.commands.total,
+            self.commands.max,
+            self.ticks.count,
+            self.ticks.total,
+            self.ticks.max,
+            self.publishes.count,
+            self.publishes.total,
+            self.publishes.max,
+            self.select_gap_max,
+            self.last_event_at.map_or_else(
+                || "none since pipeline start".to_string(),
+                |last| format!("{:.1?}", now.duration_since(last)),
+            ),
+            current.depth_high_water,
+        );
+        if self.events.max >= SLOW_WORK_THRESHOLD
+            || self.commands.max >= SLOW_WORK_THRESHOLD
+            || self.ticks.max >= SLOW_WORK_THRESHOLD
+            || self.publishes.max >= SLOW_WORK_THRESHOLD
+            || self.select_gap_max >= SLOW_SELECT_GAP_THRESHOLD
+        {
+            log::warn!(
+                "pipeline diagnostics: slow work or scheduling gap in the preceding {:.1?}; \
+                 step_max={:?} command_max={:?} tick_max={:?} publish_max={:?} select_gap_max={:?}",
+                elapsed,
+                self.events.max,
+                self.commands.max,
+                self.ticks.max,
+                self.publishes.max,
+                self.select_gap_max
+            );
+        }
+        let first_event_at = self.first_event_at;
+        let last_event_at = self.last_event_at;
+        let started_at = self.started_at;
+        *self = Self::new(now, current);
+        self.started_at = started_at;
+        self.first_event_at = first_event_at;
+        self.last_event_at = last_event_at;
+    }
+}
 
 /// Aggregate work done by the pipeline between capture-side drop reports.
 /// Timing is always collected, but emitted only when capture observed loss;
@@ -38,6 +195,13 @@ struct ProcessingDiagnostics {
     events: u64,
     total: Duration,
     max: Duration,
+}
+
+#[derive(Debug)]
+struct PendingFightEnd {
+    record: history::EncounterRecord,
+    fight_id: u64,
+    scene_id: Option<u32>,
 }
 
 impl ProcessingDiagnostics {
@@ -79,14 +243,15 @@ impl QueueDropObserver {
         &mut self,
         queue_drop_signal: &QueueDropSignal,
         processing_diagnostics: &mut ProcessingDiagnostics,
-    ) {
+    ) -> bool {
         let generation = queue_drop_signal.generation();
         if generation == self.observed_generation {
-            return;
+            return false;
         }
 
         self.observed_generation = generation;
         processing_diagnostics.report_and_reset();
+        true
     }
 }
 
@@ -351,7 +516,7 @@ pub struct Pipeline {
     /// this is the only copy left. `None` once flushed, once discarded (see
     /// `settle_pending_fight_end`), or if the fight had no history worth
     /// building.
-    pending_fight_end: Option<history::EncounterRecord>,
+    pending_fight_end: Option<PendingFightEnd>,
     /// `Meter::fight_start_ms` as it was when `pending_fight_end` was
     /// captured, and `None` whenever nothing is pending.
     ///
@@ -777,13 +942,13 @@ impl Pipeline {
             // every later tick alone.
             if self.held_fight_start_ms.is_none() {
                 self.held_fight_start_ms = self.meter.fight_start_ms();
-                self.pending_fight_end = self.build_fight_end_record(now_ms, ended_at_ms);
+                self.pending_fight_end = self.capture_fight_end_record(now_ms, ended_at_ms);
             }
             return;
         }
         self.fight_end_recorded = true;
         self.held_fight_start_ms = None;
-        self.pending_fight_end = self.build_fight_end_record(now_ms, ended_at_ms);
+        self.pending_fight_end = self.capture_fight_end_record(now_ms, ended_at_ms);
         self.flush_pending_fight_end();
     }
 
@@ -804,6 +969,15 @@ impl Pipeline {
         let title = history_title(&snapshot.encounter);
         let subtitle = encounter_subtitle(&snapshot.encounter);
         history::record_from_snapshot(&snapshot, ended_at_ms, title, subtitle)
+    }
+
+    fn capture_fight_end_record(&self, now_ms: u64, ended_at_ms: u64) -> Option<PendingFightEnd> {
+        self.build_fight_end_record(now_ms, ended_at_ms)
+            .map(|record| PendingFightEnd {
+                record,
+                fight_id: self.meter.diagnostic_fight_id(),
+                scene_id: self.meter.diagnostic_scene_id(),
+            })
     }
 
     /// Decides what happens to `pending_fight_end` when the state leaves
@@ -827,11 +1001,16 @@ impl Pipeline {
     /// has not already gone out. See `record_fight_end`'s doc comment for
     /// why the send is decoupled from the build.
     fn flush_pending_fight_end(&mut self) {
-        let Some(record) = self.pending_fight_end.take() else {
+        let Some(PendingFightEnd {
+            record,
+            fight_id,
+            scene_id,
+        }) = self.pending_fight_end.take()
+        else {
             return;
         };
         if let Some(history) = &self.history {
-            history.record(record);
+            history.record_with_context(record, fight_id, scene_id);
         }
     }
 
@@ -983,6 +1162,9 @@ fn run(
     if let Some(history) = history {
         pipeline = pipeline.with_history(history);
     }
+    // Kept separately because `events` is replaced by `never()` after a
+    // disconnect, and `never()` has no bounded queue capacity.
+    let event_queue_capacity = events.capacity();
     // Replaced by `never()` once capture disconnects, so a dead channel does
     // not spin the select loop.
     let mut events = events;
@@ -1000,20 +1182,39 @@ fn run(
     let mut last_published: Option<meter::Snapshot> = None;
     let mut queue_drop_observer = QueueDropObserver::default();
     let mut processing_diagnostics = ProcessingDiagnostics::default();
+    let mut rolling_diagnostics =
+        RollingDiagnostics::new(Instant::now(), queue_drop_signal.telemetry());
+    log::info!("pipeline: ready; waiting for decoded protocol events");
 
     loop {
         select! {
             recv(events) -> msg => match msg {
                 Ok(ev) => {
+                    let activity_at = Instant::now();
+                    rolling_diagnostics.activity(activity_at);
+                    rolling_diagnostics.event_received(activity_at);
+                    rolling_diagnostics.event_queue_high_water = rolling_diagnostics
+                        .event_queue_high_water
+                        .max(events.len());
                     let started = Instant::now();
                     pipeline.step(ev, now_ms());
                     processing_diagnostics.record(started.elapsed());
-                    queue_drop_observer.report_if_needed(
+                    rolling_diagnostics.events.record(started.elapsed());
+                    let queue_drop_reported = queue_drop_observer.report_if_needed(
                         &queue_drop_signal,
                         &mut processing_diagnostics,
                     );
+                    if queue_drop_reported {
+                        rolling_diagnostics.report(
+                            Instant::now(),
+                            &queue_drop_signal,
+                            event_queue_capacity,
+                            true,
+                        );
+                    }
                 }
                 Err(_) => {
+                    rolling_diagnostics.activity(Instant::now());
                     // PR #329 review, finding 2: an ordinary shutdown
                     // reaches this arm too. `main.rs` stops capture (which
                     // joins the capture thread and so drops `tx_events`) as
@@ -1039,7 +1240,7 @@ fn run(
                         // `FightState::Ended` before the thread exits, same
                         // as the commands arm below.
                         pipeline.finalize_for_shutdown(now_ms());
-                        publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus, &repaint, &mut last_published);
+                        publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus, &repaint, &mut last_published, &mut rolling_diagnostics);
                         log::info!(
                             "capture channel closed after a quit was requested; this is an \
                              orderly shutdown"
@@ -1066,6 +1267,11 @@ fn run(
                 }
             },
             recv(commands) -> msg => {
+                let activity_at = Instant::now();
+                rolling_diagnostics.activity(activity_at);
+                rolling_diagnostics.command_queue_high_water = rolling_diagnostics
+                    .command_queue_high_water
+                    .max(commands.len());
                 // Issue #321: a fight already sitting in `FightState::Ended`
                 // at quit time would otherwise never reach history —
                 // `record_fight_end` only ever runs from the tick arm
@@ -1086,13 +1292,16 @@ fn run(
                 // flush and the same INFO-level line.
                 let quit_reason = match msg {
                     Ok(cmd) => {
+                        let started = Instant::now();
                         if handle_command(cmd, &mut pipeline, &mut skill_focus, &capture_restart)
                             == CommandOutcome::Quit
                         {
+                            rolling_diagnostics.commands.record(started.elapsed());
                             Some(
                                 "quit requested; pipeline flushed its final snapshot and is shutting down",
                             )
                         } else {
+                            rolling_diagnostics.commands.record(started.elapsed());
                             None
                         }
                     }
@@ -1102,14 +1311,30 @@ fn run(
                 };
                 if let Some(reason) = quit_reason {
                     pipeline.finalize_for_shutdown(now_ms());
-                    publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus, &repaint, &mut last_published);
+                    publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus, &repaint, &mut last_published, &mut rolling_diagnostics);
                     log::info!("{reason}");
                     break;
                 }
             },
-            recv(ticker) -> _ => publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus, &repaint, &mut last_published),
+            recv(ticker) -> _ => {
+                rolling_diagnostics.activity(Instant::now());
+                publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus, &repaint, &mut last_published, &mut rolling_diagnostics);
+            },
         }
+        rolling_diagnostics.report(
+            Instant::now(),
+            &queue_drop_signal,
+            event_queue_capacity,
+            false,
+        );
     }
+
+    rolling_diagnostics.report(
+        Instant::now(),
+        &queue_drop_signal,
+        event_queue_capacity,
+        true,
+    );
 
     // Shutdown save: catches identity data learned since the last
     // reset/encounter-end save (e.g. a session with no resets at all). Then
@@ -1133,11 +1358,15 @@ fn publish(
     // value (the overwhelmingly common case while the game sits idle) does
     // not needlessly wake the overlay.
     last_published: &mut Option<meter::Snapshot>,
+    rolling_diagnostics: &mut RollingDiagnostics,
 ) {
     // One `now` for the whole tick: the fight-state advance and the snapshot
     // it feeds must agree on what time it is.
     let now = now_ms();
+    let tick_started = Instant::now();
     let state = pipeline.tick(now);
+    rolling_diagnostics.ticks.record(tick_started.elapsed());
+    let publish_started = Instant::now();
     let snap = pipeline.snapshot_focused(now, skill_focus);
     pipeline.record_fight_end(state, now);
     if last_published.as_ref() != Some(&snap) {
@@ -1148,6 +1377,9 @@ fn publish(
         let _ = stale.try_recv();
         let _ = tx_snapshot.try_send(pipeline.snapshot_focused(now, skill_focus));
     }
+    rolling_diagnostics
+        .publishes
+        .record(publish_started.elapsed());
 }
 
 #[cfg(test)]
@@ -2562,6 +2794,8 @@ mod tests {
             let skill_focus: Vec<i64> = Vec::new();
             let repaint = RepaintHandle::new();
             let mut last_published: Option<meter::Snapshot> = None;
+            let mut rolling_diagnostics =
+                RollingDiagnostics::new(Instant::now(), QueueDropSignal::new().telemetry());
 
             // The call `Ok(UiCommand::Quit)` and `Err(_)` both make just
             // before `break`.
@@ -2572,6 +2806,7 @@ mod tests {
                 &skill_focus,
                 &repaint,
                 &mut last_published,
+                &mut rolling_diagnostics,
             );
 
             let count = row_count(&handle);
@@ -2623,6 +2858,8 @@ mod tests {
             let ctx = egui::Context::default();
             repaint.install(ctx.clone());
             let mut last_published: Option<meter::Snapshot> = None;
+            let mut rolling_diagnostics =
+                RollingDiagnostics::new(Instant::now(), QueueDropSignal::new().telemetry());
 
             settle_repaints(&ctx);
 
@@ -2633,6 +2870,7 @@ mod tests {
                 &skill_focus,
                 &repaint,
                 &mut last_published,
+                &mut rolling_diagnostics,
             );
             assert!(
                 ctx.has_requested_repaint(),
@@ -2649,6 +2887,7 @@ mod tests {
                 &skill_focus,
                 &repaint,
                 &mut last_published,
+                &mut rolling_diagnostics,
             );
             assert!(
                 !ctx.has_requested_repaint(),

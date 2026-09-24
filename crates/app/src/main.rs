@@ -298,7 +298,10 @@ fn join_with_timeout<T>(name: &str, handle: JoinHandle<T>, deadline: Duration) -
     }
     match handle.join() {
         Ok(value) => {
-            log::info!("shutdown: thread {name} joined");
+            log::info!(
+                "shutdown: thread {name} joined in {}ms",
+                started.elapsed().as_millis()
+            );
             Some(value)
         }
         Err(payload) => {
@@ -337,6 +340,7 @@ fn main() -> eframe::Result {
     // `logging::init` (issue #69) turns logging on by default and tees it to
     // a file so a user hitting a bug can actually produce diagnostics.
     logging::init();
+    let startup_started = Instant::now();
 
     // Issue #277: a second copy of the meter is never what the user meant.
     // Both instances append to the same log (every event line then appears
@@ -360,6 +364,13 @@ fn main() -> eframe::Result {
         }
     };
 
+    let session_diagnostics = _instance
+        .as_ref()
+        .map(|_| bpsr_app::session_diagnostics::SessionDiagnostics::start());
+    if session_diagnostics.is_none() {
+        log::warn!("session continuity: disabled because the single-instance guard is unavailable");
+    }
+
     // Issue #250: the previous in-place update, if there was one, left the
     // build it replaced beside the executable as `<exe>.old` — Windows will
     // not let a running image be deleted, so the process that installed the
@@ -374,8 +385,8 @@ fn main() -> eframe::Result {
 
     let (tx_events, rx_events) = bounded::<ProtocolEvent>(EVENT_CAPACITY);
     let (tx_command, rx_command) = bounded::<UiCommand>(COMMAND_CAPACITY);
-    // Capture increments this only when its rate-limited queue-drop warning
-    // is due; the pipeline uses it to emit matching aggregate step timings.
+    // Capture increments this when it generates a rate-limited queue-drop
+    // report; the pipeline uses the generation to publish aggregate diagnostics.
     let queue_drop_signal = bpsr_capture::QueueDropSignal::new();
 
     // Loaded once, here, rather than inside `OverlayApp::new`: issue #27
@@ -499,6 +510,12 @@ fn main() -> eframe::Result {
         "ShinraMeter-BPSR",
         native_options,
         Box::new(move |cc| {
+            log::info!(
+                "startup: UI created elapsed_ms={} pixels_per_point={} viewport_inner_rect={:?}",
+                startup_started.elapsed().as_millis(),
+                cc.egui_ctx.pixels_per_point(),
+                cc.egui_ctx.input(|i| i.viewport().inner_rect)
+            );
             repaint.install(cc.egui_ctx.clone());
             fonts::install_cjk_fallback(&cc.egui_ctx);
             ui::apply_theme(&cc.egui_ctx);
@@ -527,6 +544,12 @@ fn main() -> eframe::Result {
     // shutdown without relying on `OverlayApp`'s own command sender having
     // already been dropped.
     //
+    log::info!(
+        "UI event loop returned: ok={} uptime_ms={}",
+        result.is_ok(),
+        startup_started.elapsed().as_millis()
+    );
+
     // PR #329 review, finding 2: the `Quit` must be queued *before* capture
     // stops. The pipeline's events channel disconnecting is otherwise
     // indistinguishable from the capture thread crashing, and it would log
@@ -537,15 +560,18 @@ fn main() -> eframe::Result {
     // Issue #401: one shared budget for the whole shutdown path, spent down
     // as each join below runs, rather than a fresh deadline per thread —
     // see `SHUTDOWN_BUDGET`.
-    let shutdown_deadline = Instant::now() + SHUTDOWN_BUDGET;
+    let shutdown_started = Instant::now();
+    let shutdown_deadline = shutdown_started + SHUTDOWN_BUDGET;
+    let mut joined_workers = true;
     if let Some(handle) = capture {
         handle.stop_within(shutdown_deadline.saturating_duration_since(Instant::now()));
     }
-    join_with_timeout(
+    joined_workers &= join_with_timeout(
         "pipeline",
         pipeline_thread,
         shutdown_deadline.saturating_duration_since(Instant::now()),
-    );
+    )
+    .is_some();
     // Issue #39: both `HistoryHandle` clones are gone by now — the
     // pipeline's, joined just above, and `OverlayApp`'s own (moved into
     // `OverlayApp::new` above, not merely cloned into it), dropped when
@@ -559,21 +585,23 @@ fn main() -> eframe::Result {
     // the warn line `join_with_timeout` logs when it detaches is what would
     // say so.
     if let Some(thread) = history_thread {
-        join_with_timeout(
+        joined_workers &= join_with_timeout(
             "history",
             thread,
             shutdown_deadline.saturating_duration_since(Instant::now()),
-        );
+        )
+        .is_some();
     }
     // `OverlayApp` (and its `tx_settings`) is dropped by the time
     // `run_native` returns, which closes the settings-writer's channel and
     // lets its thread exit; joining here just makes sure the last-sent
     // settings value has finished being persisted before the process ends.
-    join_with_timeout(
+    joined_workers &= join_with_timeout(
         "settings",
         settings_thread,
         shutdown_deadline.saturating_duration_since(Instant::now()),
-    );
+    )
+    .is_some();
     // Capture has already stopped above, so its `Decoder`'s reference to the
     // sink is gone by now — this drops the last one, which is what lets
     // `DiagnosticSink`'s summary actually log (see `inspect::Handle::shutdown`).
@@ -582,16 +610,23 @@ fn main() -> eframe::Result {
     // thread and bounded the same way as the pipeline/history/settings
     // joins above, instead of calling it here directly.
     if let Some(inspect_handle) = inspect_handle {
-        join_with_timeout(
+        joined_workers &= join_with_timeout(
             "inspect",
             std::thread::spawn(move || inspect_handle.shutdown()),
             shutdown_deadline.saturating_duration_since(Instant::now()),
-        );
+        )
+        .is_some();
     }
     // Issue #401: the last line of a healthy shutdown. A log that ends
     // without it says the process never reached the end of `main` — which,
     // with no window left, is otherwise indistinguishable from a clean exit.
-    log::info!("shutdown: complete");
+    log::info!(
+        "shutdown: complete elapsed_ms={} joined_workers={joined_workers}",
+        shutdown_started.elapsed().as_millis()
+    );
+    if let Some(session) = session_diagnostics {
+        session.complete(joined_workers);
+    }
 
     result
 }

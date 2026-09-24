@@ -22,7 +22,13 @@ use super::{EncounterRecord, EncounterSummary, HistoryStore, RetentionPolicy};
 /// their own reply channel, so the thread never has to know the shape of
 /// whatever channel the UI happens to be using.
 pub enum HistoryRequest {
-    Record(Box<EncounterRecord>),
+    Record {
+        record: Box<EncounterRecord>,
+        /// Process-local meter correlation captured at enqueue time. It is
+        /// diagnostic-only and deliberately never enters the SQLite schema.
+        fight_id: u64,
+        scene_id: Option<u32>,
+    },
     List {
         limit: u32,
         reply: Sender<HistoryEvent>,
@@ -97,11 +103,33 @@ impl HistoryHandle {
     }
 
     /// Enqueues a finished encounter. Never blocks: the channel is
-    /// unbounded, and a dead receiver (the thread has already exited) is
-    /// silently ignored — there is no reply channel to carry that failure
-    /// to, and nothing the caller could do about it anyway.
+    /// unbounded. A dead receiver means the history thread exited, which is
+    /// reported with the encounter's diagnostic identity.
     pub fn record(&self, record: EncounterRecord) {
-        let _ = self.tx.send(HistoryRequest::Record(Box::new(record)));
+        let scene_id = record.scene_id;
+        self.record_with_context(record, 0, scene_id);
+    }
+
+    /// Enqueues a finished encounter with the pipeline's diagnostic identity.
+    /// The identifiers exist only to correlate this request's eventual
+    /// recorded/skipped/failed log with meter and pipeline diagnostics.
+    pub fn record_with_context(
+        &self,
+        record: EncounterRecord,
+        fight_id: u64,
+        scene_id: Option<u32>,
+    ) {
+        if self
+            .tx
+            .send(HistoryRequest::Record {
+                record: Box::new(record),
+                fight_id,
+                scene_id,
+            })
+            .is_err()
+        {
+            log::warn!("{}", describe_enqueue_failure(fight_id, scene_id));
+        }
     }
 
     /// Requests the newest `limit` encounters; the reply lands on `reply`.
@@ -137,13 +165,27 @@ impl HistoryHandle {
     }
 }
 
+/// Describes a failed record enqueue. Kept pure so the disconnected-writer
+/// path has a focused regression test without depending on a process-global
+/// logger.
+fn describe_enqueue_failure(fight_id: u64, scene_id: Option<u32>) -> String {
+    format!(
+        "history: failed to enqueue encounter because the history thread is unavailable fight_id={fight_id} scene_id={scene_id:?}"
+    )
+}
+
 /// Builds the one-line INFO summary for a `Record` outcome (issue #409): a
 /// successful insert (`id` some) or a skip below the retention floor (`id`
 /// none) both get a line, so the log alone can confirm whether a given
 /// fight actually reached `history.sqlite`. `EncounterRecord` carries no end
 /// cause today, so the line reports the fields it does carry rather than
 /// inventing one.
-fn describe_recorded(id: Option<i64>, record: &EncounterRecord) -> String {
+fn describe_recorded(
+    id: Option<i64>,
+    record: &EncounterRecord,
+    fight_id: u64,
+    scene_id: Option<u32>,
+) -> String {
     let scene = record
         .scene_name
         .as_deref()
@@ -154,11 +196,11 @@ fn describe_recorded(id: Option<i64>, record: &EncounterRecord) -> String {
     let players = record.players.len();
     match id {
         Some(id) => format!(
-            "history: recorded encounter id={id} scene={scene:?} boss={boss:?} \
+            "history: recorded encounter id={id} fight_id={fight_id} scene_id={scene_id:?} scene={scene:?} boss={boss:?} \
              is_boss={is_boss} duration_ms={duration_ms} players={players}"
         ),
         None => format!(
-            "history: skipped encounter below the retention floor scene={scene:?} \
+            "history: skipped encounter below the retention floor fight_id={fight_id} scene_id={scene_id:?} scene={scene:?} \
              boss={boss:?} is_boss={is_boss} duration_ms={duration_ms} players={players}"
         ),
     }
@@ -174,11 +216,20 @@ fn describe_recorded(id: Option<i64>, record: &EncounterRecord) -> String {
 fn run(mut store: SqliteHistory, rx: Receiver<HistoryRequest>) {
     while let Ok(req) = rx.recv() {
         match req {
-            HistoryRequest::Record(record) => match store.insert(&record) {
-                Ok(Some(id)) => log::info!("{}", describe_recorded(Some(id), &record)),
-                Ok(None) => log::info!("{}", describe_recorded(None, &record)),
+            HistoryRequest::Record {
+                record,
+                fight_id,
+                scene_id,
+            } => match store.insert(&record) {
+                Ok(Some(id)) => log::info!(
+                    "{}",
+                    describe_recorded(Some(id), &record, fight_id, scene_id)
+                ),
+                Ok(None) => log::info!("{}", describe_recorded(None, &record, fight_id, scene_id)),
                 Err(err) => {
-                    log::warn!("history: failed to record an encounter: {err}");
+                    log::warn!(
+                        "history: failed to record encounter fight_id={fight_id} scene_id={scene_id:?}: {err}"
+                    );
                 }
             },
             HistoryRequest::List { limit, reply } => match store.list(limit) {
@@ -233,6 +284,7 @@ mod tests {
 
     use super::*;
     use crate::history::{record_from_snapshot, temp_history_path};
+    use crate::test_log;
     use bpsr_meter::{EncounterInfo, PlayerRow, Snapshot};
 
     fn sample_record(title: &str) -> EncounterRecord {
@@ -423,9 +475,11 @@ mod tests {
     fn describe_recorded_names_a_successful_insert() {
         let record = sample_record("Boss Fight");
 
-        let line = describe_recorded(Some(7), &record);
+        let line = describe_recorded(Some(7), &record, 42, Some(3_110));
 
-        assert!(line.starts_with("history: recorded encounter id=7 "));
+        assert!(
+            line.starts_with("history: recorded encounter id=7 fight_id=42 scene_id=Some(3110) ")
+        );
         assert!(line.contains("duration_ms=10000"));
         assert!(line.contains("players=1"));
     }
@@ -434,9 +488,32 @@ mod tests {
     fn describe_recorded_names_a_skip_below_the_retention_floor() {
         let record = sample_record("Trash Pull");
 
-        let line = describe_recorded(None, &record);
+        let line = describe_recorded(None, &record, 42, Some(3_110));
 
-        assert!(line.starts_with("history: skipped encounter below the retention floor "));
-        assert!(!line.contains("id="));
+        assert!(line.starts_with(
+            "history: skipped encounter below the retention floor fight_id=42 scene_id=Some(3110) "
+        ));
+        assert!(!line.contains("encounter id="));
+    }
+
+    #[test]
+    fn disconnected_record_enqueue_identifies_the_lost_encounter() {
+        test_log::install();
+        const FIGHT_ID: u64 = 9_876_543_210;
+        let (tx, rx) = unbounded();
+        drop(rx);
+        let handle = HistoryHandle { tx };
+        handle.record_with_context(sample_record("Lost Fight"), FIGHT_ID, Some(3_110));
+
+        assert!(
+            test_log::logged(
+                log::Level::Warn,
+                &[&format!(
+                    "failed to enqueue encounter because the history thread is unavailable fight_id={FIGHT_ID} scene_id=Some(3110)"
+                )]
+            ),
+            "the disconnected writer must WARN with the lost encounter identity; captured: {:?}",
+            test_log::captured()
+        );
     }
 }

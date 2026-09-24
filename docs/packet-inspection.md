@@ -169,7 +169,7 @@ this binary at:
 1. Run `replay-dump` against the bundle's dump file (all of its numbered
    ring chunks are read automatically, same as `inspect-replay`) and save
    its stdout.
-2. Filter the bundle's own log file (`ShinraMeter-BPSR.log`/`.log.1`) down
+2. Filter the bundle's own log file (`ShinraMeter-BPSR.log` and numbered `.log.1`–`.log.7` siblings) down
    to the same `encounter:`-prefixed lines the live app logged, e.g.
    `grep 'encounter:'`.
 3. Diff the two line-for-line. Both are the same lifecycle narrative,

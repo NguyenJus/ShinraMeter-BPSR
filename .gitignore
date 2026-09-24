@@ -28,7 +28,7 @@ docs/reference/
 # The log file `logging.rs` falls back to when there is no %APPDATA% (issue
 # #69), plus its startup-rotation copy.
 /ShinraMeter-BPSR.log
-/ShinraMeter-BPSR.log.1
+/ShinraMeter-BPSR.log.[1-7]
 
 # Packet-inspection diagnostic dumps (issue #25; on by default since issue
 # #346, set SHINRA_INSPECT=0 to disable). Sanitized dumps (the default) are
@@ -46,3 +46,7 @@ __pycache__/
 # token-savior MCP's local code index. Regenerated on demand, several MB, and
 # specific to one checkout path — never useful to commit.
 /.token-savior-cache.json
+
+# Local cross-launch diagnostic marker (when APPDATA is unset).
+/ShinraMeter-BPSR-session-state.json
+/ShinraMeter-BPSR-session-state.json.pending

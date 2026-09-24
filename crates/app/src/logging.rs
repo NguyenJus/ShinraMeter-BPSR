@@ -12,10 +12,11 @@
 //! `%APPDATA%\ShinraMeter-BPSR\logs\ShinraMeter-BPSR.log` (or
 //! `ShinraMeter-BPSR.log` in the working directory if `APPDATA` is unset —
 //! e.g. this Linux dev host), overridable with `SHINRA_LOG_FILE=<path>`. It
-//! is opened in append mode and rotated to `<path>.1` (replacing any
-//! previous `.1`) whenever it grows past [`MAX_LOG_BYTES`] — checked both at
+//! is opened in append mode and rotates through the live file plus `.1`
+//! through `.7` whenever a chunk reaches [`MAX_LOG_BYTES`] — checked both at
 //! startup and, since an always-on overlay can run for days without one,
-//! while the process is live (see [`Tee`]), so the log can't grow unbounded.
+//! while the process is live (see [`Tee`]). This retains up to roughly 40 MiB
+//! while keeping disk use bounded.
 //!
 //! Logs may contain player names and other identifying traffic — never
 //! attach one to an issue or PR (see `.gitignore`).
@@ -26,8 +27,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// A log file at or above this size gets rotated to `<path>.1`.
+/// A log chunk at or above this size gets rotated.
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+/// The total number of retained chunks: the live log plus seven numbered
+/// prior chunks.
+const LOG_CHUNK_COUNT: u8 = 8;
 
 static SESSION_ID: OnceLock<String> = OnceLock::new();
 
@@ -116,6 +121,12 @@ pub fn init() {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<none, stderr only>".to_string()),
         log::max_level(),
+    );
+
+    log::info!(
+        "log retention: {LOG_CHUNK_COUNT} chunks x {} MiB ({} MiB total maximum)",
+        MAX_LOG_BYTES / (1024 * 1024),
+        u64::from(LOG_CHUNK_COUNT) * MAX_LOG_BYTES / (1024 * 1024),
     );
 
     log::info!("{}", env_overrides_summary(|key| std::env::var(key).ok()));
@@ -228,30 +239,57 @@ pub(crate) fn rotated_path(path: &Path) -> PathBuf {
     PathBuf::from(rotated)
 }
 
-/// Renames `path` to `<path>.1` (replacing any previous `.1`) if `len` (its
-/// current size) is at or above [`MAX_LOG_BYTES`]. Best-effort: a rename
-/// failure is pushed onto `warnings` rather than acted on — losing rotation
+/// Returns the numbered path for a retained log chunk. `.1` deliberately
+/// goes through [`rotated_path`], whose suffix semantics are shared with the
+/// inspect dump; higher log chunks extend that same spelling.
+fn log_chunk_path(path: &Path, chunk: u8) -> PathBuf {
+    debug_assert!((1..LOG_CHUNK_COUNT).contains(&chunk));
+    if chunk == 1 {
+        return rotated_path(path);
+    }
+    let mut numbered = path.as_os_str().to_owned();
+    numbered.push(format!(".{chunk}"));
+    PathBuf::from(numbered)
+}
+
+/// Shifts retained chunks one slot toward the oldest end, discarding `.7`.
+/// Callers hold [`ROTATION_LOCK`] for the complete shift and primary rename,
+/// so an export sees either the old chronological set or the new one.
+fn shift_log_chunks(path: &Path) -> io::Result<()> {
+    let oldest = log_chunk_path(path, LOG_CHUNK_COUNT - 1);
+    if oldest.exists() {
+        fs::remove_file(&oldest)?;
+    }
+    for chunk in (1..LOG_CHUNK_COUNT - 1).rev() {
+        let from = log_chunk_path(path, chunk);
+        if from.exists() {
+            fs::rename(&from, log_chunk_path(path, chunk + 1))?;
+        }
+    }
+    Ok(())
+}
+
+/// Rotates an oversized primary through the retained chunk ring. Best-effort:
+/// a failure is pushed onto `warnings` rather than acted on — losing rotation
 /// isn't worth aborting startup over.
 fn rotate_if_needed(path: &Path, len: u64, warnings: &mut Vec<String>) {
     if !should_rotate(len, MAX_LOG_BYTES) {
         return;
     }
-    let rotated = rotated_path(path);
-    if let Err(err) = fs::rename(path, &rotated) {
+    let _guard = lock_rotation();
+    if let Err(err) = shift_log_chunks(path).and_then(|()| fs::rename(path, rotated_path(path))) {
         warnings.push(format!(
-            "failed to rotate log file {} to {} ({err}); continuing without rotation",
+            "failed to rotate log file {} through its retained chunks ({err}); continuing without rotation",
             path.display(),
-            rotated.display()
         ));
     }
 }
 
 /// Serializes [`Tee::rotate`]'s rename against [`export_logs_to`]'s read of
 /// the parts it snapshotted (PR #227 review). Without it the logging thread
-/// could rename `<path>` onto `<path>.1` in between — replacing the very
-/// `.1` the export had already decided to bundle, and leaving a fresh empty
-/// primary behind — so a whole rotation's worth of records would vanish
-/// from the bundle with nothing reporting it.
+/// could shift a numbered chunk after the export had decided to bundle it,
+/// leaving a fresh empty primary behind — so a whole rotation's worth of
+/// records would vanish from the bundle with nothing reporting it.
 ///
 /// Only the rename is guarded, not every record: an append racing an export
 /// just adds lines to the tail of the part being copied, which is harmless.
@@ -317,7 +355,8 @@ impl Tee {
         }
     }
 
-    /// Moves the current file to `<path>.1` and reopens `path` empty.
+    /// Moves the current file to `.1`, shifting `.1` through `.6` toward
+    /// `.7`, and reopens `path` empty.
     ///
     /// Best-effort, like the startup rotation, but the failure can't be
     /// reported through `log::warn!`: this runs *inside* the logger's own
@@ -327,7 +366,6 @@ impl Tee {
     /// persistently failing rotation is retried once per `max_bytes` rather
     /// than on every subsequent record.
     fn rotate(&mut self) {
-        let rotated = rotated_path(&self.path);
         // Held across the rename (and the reopen that follows it) so an
         // "Export logs" bundle can't have snapshotted its parts before it
         // and read them back after it — see `ROTATION_LOCK`.
@@ -336,13 +374,13 @@ impl Tee {
         // `FILE_SHARE_DELETE` on Windows, so this is legal there too); it is
         // dropped by the reopen below, which is the last write it could have
         // taken anyway.
-        let result = fs::rename(&self.path, &rotated)
+        let result = shift_log_chunks(&self.path)
+            .and_then(|()| fs::rename(&self.path, rotated_path(&self.path)))
             .and_then(|()| open_log_file(&self.path).map(|file| self.file = file));
         if let Err(err) = result {
             let note = format!(
-                "[log rotation] failed to rotate {} to {} ({err}); continuing in place\n",
+                "[log rotation] failed to rotate {} through its retained chunks ({err}); continuing in place\n",
                 self.path.display(),
-                rotated.display()
             );
             let _ = self.file.write_all(note.as_bytes());
             let _ = self.stderr.write_all(note.as_bytes());
@@ -382,27 +420,53 @@ impl Write for Tee {
 pub(crate) const EXPORT_DEFAULT_FILENAME: &str = "ShinraMeter-BPSR-logs.log";
 
 /// Which on-disk log files a "Export logs" export (issue #220) should
-/// bundle, oldest first: the rotated `<path>.1` (if [`Tee::rotate`] ever
-/// ran this session or a previous one) followed by the live file at `path`.
-/// Oldest-first so a plain concatenation reads chronologically, same
+/// bundle, oldest first: `.7` through `.1` when present, then the live file
+/// at `path`. Oldest-first so a plain concatenation reads chronologically, same
 /// direction a user scrolling a single combined file would expect.
 ///
 /// A part that doesn't exist on disk is simply left out rather than erroring
 /// — there's nothing unusual about a fresh install with no rotation yet, or
 /// (defensively, in tests) a primary file that hasn't been written to yet.
 pub(crate) fn files_to_export(primary: &Path) -> Vec<PathBuf> {
-    [rotated_path(primary), primary.to_path_buf()]
-        .into_iter()
+    (1..LOG_CHUNK_COUNT)
+        .rev()
+        .map(|chunk| log_chunk_path(primary, chunk))
+        .chain(std::iter::once(primary.to_path_buf()))
         .filter(|path| path.exists())
         .collect()
+}
+
+/// Copies the current retained log set into a session-bundle directory and
+/// returns the bundle names that could not be copied.  The listing and every
+/// copy share [`ROTATION_LOCK`], so a rotation cannot shift a numbered chunk
+/// between those two steps.
+///
+/// This deliberately does not log failures: [`Tee::rotate`] holds the
+/// logger's writer lock while it waits for the same lock, so logging here
+/// could deadlock.  The bundle exporter records and reports the returned
+/// names after the guard is released instead.
+pub(crate) fn copy_logs_to_bundle(primary: &Path, dest_dir: &Path) -> io::Result<Vec<String>> {
+    fs::create_dir_all(dest_dir)?;
+    let _guard = lock_rotation();
+
+    let mut missing = Vec::new();
+    for source in files_to_export(primary) {
+        let Some(name) = source.file_name() else {
+            continue;
+        };
+        if fs::copy(&source, dest_dir.join(name)).is_err() {
+            missing.push(name.to_string_lossy().into_owned());
+        }
+    }
+    Ok(missing)
 }
 
 /// Bundles every file [`files_to_export`] finds for `primary` into a single
 /// file at `dest` — the destination the user picked via the native save
 /// dialog (`platform::choose_log_export_path`), since that dialog can only
 /// ever choose one file, not a folder. Each part is preceded by a header
-/// line naming its source path, so a multi-part export (current file plus a
-/// rotated `.1`) still reads unambiguously once concatenated.
+/// line naming its source path, so a multi-part export still reads
+/// unambiguously once concatenated.
 ///
 /// Errors if there is nothing to export ([`files_to_export`] came back
 /// empty), if `dest` is itself one of those parts (see below), or if any
@@ -529,6 +593,9 @@ fn install_panic_hook() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     use bpsr_test_support::scratch_path;
 
     use super::*;
@@ -668,6 +735,30 @@ mod tests {
         assert!(should_rotate(MAX_LOG_BYTES + 1, MAX_LOG_BYTES));
     }
 
+    #[test]
+    fn startup_rotation_uses_the_same_retained_chunk_ring() {
+        let path = scratch_path("startup-log-ring");
+        for chunk in 1..LOG_CHUNK_COUNT {
+            fs::write(log_chunk_path(&path, chunk), format!("old-{chunk}")).unwrap();
+        }
+        fs::write(&path, b"startup-current").unwrap();
+        let mut warnings = Vec::new();
+
+        rotate_if_needed(&path, MAX_LOG_BYTES, &mut warnings);
+
+        assert!(warnings.is_empty());
+        assert_eq!(
+            fs::read(log_chunk_path(&path, 1)).unwrap(),
+            b"startup-current"
+        );
+        assert_eq!(fs::read(log_chunk_path(&path, 7)).unwrap(), b"old-6");
+        assert!(!path.exists());
+
+        for chunk in 1..LOG_CHUNK_COUNT {
+            let _ = fs::remove_file(log_chunk_path(&path, chunk));
+        }
+    }
+
     // -- Tee ----------------------------------------------------------------
 
     /// The threshold is crossed by a running process, not just found crossed
@@ -711,6 +802,32 @@ mod tests {
         let _ = fs::remove_file(&rotated);
     }
 
+    #[test]
+    fn tee_rotation_shifts_all_retained_chunks_and_discards_only_the_oldest() {
+        let path = scratch_path("log-ring-rotate");
+        for chunk in 1..LOG_CHUNK_COUNT {
+            fs::write(log_chunk_path(&path, chunk), format!("old-{chunk}")).unwrap();
+        }
+        fs::write(&path, b"current").unwrap();
+
+        let mut tee = Tee::with_max_bytes(path.clone(), open_log_file(&path).unwrap(), 8);
+        tee.write_all(b"!").unwrap();
+
+        assert_eq!(fs::read(log_chunk_path(&path, 1)).unwrap(), b"current!");
+        for chunk in 2..LOG_CHUNK_COUNT {
+            assert_eq!(
+                fs::read(log_chunk_path(&path, chunk)).unwrap(),
+                format!("old-{}", chunk - 1).as_bytes()
+            );
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"");
+
+        let _ = fs::remove_file(&path);
+        for chunk in 1..LOG_CHUNK_COUNT {
+            let _ = fs::remove_file(log_chunk_path(&path, chunk));
+        }
+    }
+
     // -- files_to_export / export_logs_to (issue #220) ----------------------
 
     #[test]
@@ -734,6 +851,25 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&rotated);
+    }
+
+    #[test]
+    fn files_to_export_orders_all_chunks_oldest_first_and_skips_missing_ones() {
+        let path = scratch_path("export-ring");
+        let dot2 = log_chunk_path(&path, 2);
+        let dot7 = log_chunk_path(&path, 7);
+        fs::write(&dot7, b"oldest").unwrap();
+        fs::write(&dot2, b"middle").unwrap();
+        fs::write(&path, b"newest").unwrap();
+
+        assert_eq!(
+            files_to_export(&path),
+            vec![dot7.clone(), dot2.clone(), path.clone()]
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&dot2);
+        let _ = fs::remove_file(&dot7);
     }
 
     #[test]
@@ -782,6 +918,114 @@ mod tests {
     }
 
     #[test]
+    fn export_logs_to_orders_every_retained_chunk_chronologically() {
+        let path = scratch_path("export-ring-order");
+        let dest = scratch_path("export-ring-order-dest");
+        for chunk in 1..LOG_CHUNK_COUNT {
+            fs::write(log_chunk_path(&path, chunk), format!("CHUNK-{chunk}")).unwrap();
+        }
+        fs::write(&path, b"CURRENT").unwrap();
+
+        export_logs_to(&path, &dest).unwrap();
+        let exported = fs::read_to_string(&dest).unwrap();
+        let mut previous = 0;
+        for chunk in (1..LOG_CHUNK_COUNT).rev() {
+            let position = exported.find(&format!("CHUNK-{chunk}")).unwrap();
+            assert!(
+                position > previous,
+                "chunks must be oldest-first: {exported:?}"
+            );
+            previous = position;
+        }
+        assert!(exported.find("CURRENT").unwrap() > previous);
+
+        let _ = fs::remove_file(&path);
+        for chunk in 1..LOG_CHUNK_COUNT {
+            let _ = fs::remove_file(log_chunk_path(&path, chunk));
+        }
+        let _ = fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn copy_logs_to_bundle_copies_the_whole_stable_retained_ring() {
+        let path = scratch_path("bundle-stable-ring");
+        let dir = std::env::temp_dir().join(format!(
+            "ShinraMeter-BPSR-bundle-stable-ring-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        for chunk in 1..LOG_CHUNK_COUNT {
+            fs::write(log_chunk_path(&path, chunk), format!("CHUNK-{chunk}")).unwrap();
+        }
+        fs::write(&path, b"CURRENT").unwrap();
+
+        assert!(copy_logs_to_bundle(&path, &dir).unwrap().is_empty());
+        for chunk in 1..LOG_CHUNK_COUNT {
+            let copied = dir.join(log_chunk_path(&path, chunk).file_name().unwrap());
+            assert_eq!(
+                fs::read(copied).unwrap(),
+                format!("CHUNK-{chunk}").as_bytes()
+            );
+        }
+        assert_eq!(
+            fs::read(dir.join(path.file_name().unwrap())).unwrap(),
+            b"CURRENT"
+        );
+
+        let _ = fs::remove_file(&path);
+        for chunk in 1..LOG_CHUNK_COUNT {
+            let _ = fs::remove_file(log_chunk_path(&path, chunk));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_logs_to_bundle_waits_for_an_in_progress_rotation() {
+        let path = scratch_path("bundle-waits-for-rotation");
+        let dir = std::env::temp_dir().join(format!(
+            "ShinraMeter-BPSR-bundle-waits-for-rotation-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::write(&path, b"CURRENT").unwrap();
+
+        let _rotation = lock_rotation();
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (copied_tx, copied_rx) = mpsc::sync_channel(0);
+        let copy_path = path.clone();
+        let copy_dir = dir.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            copied_tx
+                .send(copy_logs_to_bundle(&copy_path, &copy_dir))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        assert!(
+            copied_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the bundle copy must wait while rotation owns its lock"
+        );
+        drop(_rotation);
+
+        assert!(
+            copied_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        worker.join().unwrap();
+        assert_eq!(
+            fs::read(dir.join(path.file_name().unwrap())).unwrap(),
+            b"CURRENT"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn export_logs_to_errors_when_there_is_nothing_to_export() {
         let path = scratch_path("export-dest-nothing-source");
         let dest = scratch_path("export-dest-nothing-dest");
@@ -798,13 +1042,18 @@ mod tests {
     fn export_logs_to_refuses_a_destination_that_is_one_of_its_sources() {
         let path = scratch_path("export-dest-is-a-source");
         let rotated = rotated_path(&path);
+        let older = log_chunk_path(&path, 5);
         fs::write(&rotated, b"OLDER-PART").unwrap();
+        fs::write(&older, b"OLDEST-PART").unwrap();
         fs::write(&path, b"NEWER-PART").unwrap();
 
         let err = export_logs_to(&path, &path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
         let err = export_logs_to(&path, &rotated).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = export_logs_to(&path, &older).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
         // Spelled differently, same file — the comparison canonicalizes, so
@@ -819,9 +1068,11 @@ mod tests {
 
         assert_eq!(fs::read(&path).unwrap(), b"NEWER-PART");
         assert_eq!(fs::read(&rotated).unwrap(), b"OLDER-PART");
+        assert_eq!(fs::read(&older).unwrap(), b"OLDEST-PART");
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&rotated);
+        let _ = fs::remove_file(&older);
     }
 
     #[test]

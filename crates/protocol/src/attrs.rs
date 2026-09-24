@@ -57,6 +57,12 @@ pub mod attr_id {
     /// follow it — see `encounter::Meter::recompute_boss` for why the boss
     /// heuristic must not require it.
     pub const MAX_HP: i32 = 0x2C38;
+    /// `AttrMaxHpTotal` (11321, `0x2C39`) — a numeric HP rollup adjacent to
+    /// [`MAX_HP`]. It is retained in sanitized captures and surfaced only in
+    /// bounded diagnostics while field evidence establishes whether it is a
+    /// useful denominator. Meter combat semantics deliberately continue to
+    /// use [`MAX_HP`].
+    pub const MAX_HP_TOTAL: i32 = 0x2C39;
     /// `AttrState` (11, `0x0B`) — the entity's current actor state (issue
     /// #339/#272). Both Dead (9) and the known-alive set are load-bearing
     /// for this crate; see [`actor_state_is_dead`] for the full
@@ -806,6 +812,7 @@ pub fn enemy_hp_from_attrs(
                 attr.id,
                 attr_id::HP
                     | attr_id::MAX_HP
+                    | attr_id::MAX_HP_TOTAL
                     | attr_id::MONSTER_ID
                     | attr_id::POSITION
                     | attr_id::TARGET_POSITION

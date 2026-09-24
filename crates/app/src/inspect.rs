@@ -90,6 +90,18 @@ const HEX_PREFIX_LEN: usize = 32;
 /// says so instead of silently under-reporting.
 const MAX_TRACKED_UIDS_PER_ATTR: usize = 16;
 
+/// Bounded observations of the numeric `AttrMaxHpTotal` candidate. This is
+/// intentionally aggregate-only: a sanitized diagnostic must not create a
+/// new entity-identity trail while we establish what this adjacent HP value
+/// means in real captures.
+#[derive(Debug, Default)]
+struct MaxHpTotalStat {
+    count: u64,
+    invalid_count: u64,
+    min: Option<u64>,
+    max: Option<u64>,
+}
+
 /// True unless `SHINRA_INSPECT` is set to an explicit opt-out value (`0`,
 /// `false`, `off`, or `no`, case-insensitively) — diagnostics default on
 /// since issue #346 (sanitized on write, so a fresh dump is safe to share;
@@ -286,6 +298,7 @@ struct DiagnosticSink {
     sanitize: bool,
     services: Mutex<HashMap<u64, ServiceStat>>,
     attrs: Mutex<HashMap<i32, AttrStat>>,
+    max_hp_total: Mutex<MaxHpTotalStat>,
 }
 
 /// What [`DiagnosticSink::log_summary`] and its callers print in place of a
@@ -300,6 +313,7 @@ impl DiagnosticSink {
             sanitize,
             services: Mutex::new(HashMap::new()),
             attrs: Mutex::new(HashMap::new()),
+            max_hp_total: Mutex::new(MaxHpTotalStat::default()),
         }
     }
 
@@ -386,6 +400,20 @@ impl DiagnosticSink {
                 );
             }
         }
+        let max_hp_total = self.max_hp_total.lock().unwrap();
+        if max_hp_total.count > 0 || max_hp_total.invalid_count > 0 {
+            log::info!(
+                "packet-inspect summary: attr_max_hp_total id=0x2c39 count={} invalid={} min={} max={}",
+                max_hp_total.count,
+                max_hp_total.invalid_count,
+                max_hp_total
+                    .min
+                    .map_or_else(|| "<none>".to_owned(), |v| v.to_string()),
+                max_hp_total
+                    .max
+                    .map_or_else(|| "<none>".to_owned(), |v| v.to_string()),
+            );
+        }
     }
 }
 
@@ -452,6 +480,18 @@ impl InspectSink for DiagnosticSink {
     }
 
     fn on_attr(&self, uid: i64, attr_id: i32, raw: &[u8], known: bool) {
+        if attr_id == bpsr_protocol::attrs::attr_id::MAX_HP_TOTAL {
+            let mut stat = self.max_hp_total.lock().unwrap();
+            match decode_varint_u64(raw) {
+                Some(value) => {
+                    stat.count += 1;
+                    stat.min = Some(stat.min.map_or(value, |min| min.min(value)));
+                    stat.max = Some(stat.max.map_or(value, |max| max.max(value)));
+                }
+                None => stat.invalid_count += 1,
+            }
+            return;
+        }
         // A known id is already decoded elsewhere and isn't a discovery —
         // this sink only aggregates/logs the unrecognized ones (slice A's
         // behavior, preserved as-is after slice B widened the seam itself
@@ -474,6 +514,20 @@ impl InspectSink for DiagnosticSink {
             }
         }
     }
+}
+
+fn decode_varint_u64(bytes: &[u8]) -> Option<u64> {
+    let mut value = 0u64;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if index == 10 || (index == 9 && byte > 1) {
+            return None;
+        }
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn hex_prefix(bytes: &[u8]) -> String {
@@ -724,6 +778,36 @@ mod tests {
         assert_eq!(stat.count, 3);
         assert_eq!(stat.uids.len(), 2);
         assert_eq!(attrs.get(&0x42).unwrap().count, 1);
+    }
+
+    #[test]
+    fn max_hp_total_observation_is_numeric_and_does_not_retain_entity_identity() {
+        let (sink, _rx) = new_sanitized_sink();
+        // 300 and 1,000,000, followed by a malformed varint.
+        sink.on_attr(
+            7,
+            bpsr_protocol::attrs::attr_id::MAX_HP_TOTAL,
+            &[0xac, 0x02],
+            true,
+        );
+        sink.on_attr(
+            99,
+            bpsr_protocol::attrs::attr_id::MAX_HP_TOTAL,
+            &[0xc0, 0x84, 0x3d],
+            true,
+        );
+        sink.on_attr(
+            100,
+            bpsr_protocol::attrs::attr_id::MAX_HP_TOTAL,
+            &[0x80],
+            true,
+        );
+
+        let stat = sink.max_hp_total.lock().unwrap();
+        assert_eq!(stat.count, 2);
+        assert_eq!(stat.invalid_count, 1);
+        assert_eq!(stat.min, Some(300));
+        assert_eq!(stat.max, Some(1_000_000));
     }
 
     /// `log_summary` iterates `attrs`, which is keyed by `attr_id` alone —

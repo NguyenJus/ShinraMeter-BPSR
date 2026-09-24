@@ -14,9 +14,12 @@ pub mod logging;
 pub mod paths;
 pub mod pipeline;
 pub mod platform;
+pub mod session_diagnostics;
 pub mod settings;
 pub mod single_instance;
 pub mod skill_icons;
 pub mod skills;
+#[cfg(test)]
+mod test_log;
 pub mod ui;
 pub mod update_check;

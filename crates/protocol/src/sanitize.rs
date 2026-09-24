@@ -101,11 +101,12 @@ fn encode_name_attr(name: &str) -> Vec<u8> {
 /// other attr id is dropped by `scrub_attrs`, unconditionally. This is what
 /// keeps the "no residual strings" self-check trivially true: none of these
 /// carry text except `NAME`, which is always overwritten.
-const KEEP_ATTRS: [i32; 12] = [
+const KEEP_ATTRS: [i32; 13] = [
     0x01,   // NAME
     0x0A,   // MONSTER_ID
     0x2C2E, // HP
     0x2C38, // MAX_HP
+    0x2C39, // MAX_HP_TOTAL (candidate rollup; diagnostics only)
     0xDC,   // PROFESSION_ID
     0x272E, // FIGHT_POINT
     0x2756, // SEASON_LEVEL
@@ -385,6 +386,13 @@ mod tests {
                     raw_data: vec![1, 2, 3],
                 },
                 pb::Attr {
+                    id: crate::attrs::attr_id::MAX_HP_TOTAL,
+                    // 1,000,000 as a protobuf varint. This candidate is
+                    // numeric-only, so preservation must retain its bytes
+                    // exactly through the sanitizer's decode/re-encode.
+                    raw_data: vec![0xc0, 0x84, 0x3d],
+                },
+                pb::Attr {
                     id: crate::attrs::attr_id::SHIELD_LIST,
                     raw_data: vec![4, 5, 6],
                 },
@@ -399,8 +407,14 @@ mod tests {
             ],
         };
         scrub_attrs(&mut ac, &mut r, PLAYER_UUID);
-        assert_eq!(ac.attrs.len(), 4, "the unlisted attr id must be dropped");
+        assert_eq!(ac.attrs.len(), 5, "the unlisted attr id must be dropped");
         assert!(ac.attrs.iter().any(|a| a.id == crate::attrs::attr_id::HP));
+        let max_hp_total = ac
+            .attrs
+            .iter()
+            .find(|a| a.id == crate::attrs::attr_id::MAX_HP_TOTAL)
+            .expect("MAX_HP_TOTAL must survive scrub_attrs's KEEP_ATTRS filter");
+        assert_eq!(max_hp_total.raw_data, vec![0xc0, 0x84, 0x3d]);
         assert!(
             ac.attrs
                 .iter()
