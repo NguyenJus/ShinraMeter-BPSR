@@ -80,6 +80,23 @@ total.
 | #425: field validation | On a current build, complete one Chaotic dungeon, close normally, and immediately relaunch. Record any blank meter, stalls, server-change reset, or already-running error. Keep both session ids and logs; old v0.3.0 logs cannot validate newer fixes. |
 | #380: proxy ownership | Record accelerator/helper name and version. Reproduce no-adoption with it enabled, then repeat with it disabled. Save both session logs and the helper/game process names and PIDs locally; note whether the helper owns the server TCP socket. Do not change ownership policy based only on a VPN being installed. |
 
+The retained v0.3.3 sessions on 2026-09-21 and 2026-09-22 did reproduce
+**#455** and emitted PR #465's bounded reports: the decoder queue reached its
+4,096-event capacity and discarded event batches.  These logs establish that
+loss remains possible under busy real sessions.  The accompanying `Pipeline::step`
+aggregate stayed sub-microsecond on average with a low-millisecond maximum in
+the largest observed batch, but it excludes ticker, command, scheduler, and
+lock-wait time, so it cannot identify a consumer bottleneck or attribute loss
+to the UI.  A separate long v0.3.3 session closed with the inspect thread
+joined and reported zero writer-dropped dump records.  That validates the
+inspector-shutdown path, but it is not a complete #425 validation because no
+immediate relaunch was retained.
+
+Offline replay of the newest sanitized v0.3.3 dump did not contain a floor-50
+run, a #429 phase-group transition, or scene-9300 lifecycle traffic.  It is
+therefore not evidence that #456 or #429 is resolved; retain the focused
+captures specified above.
+
 ## Protocol discovery
 
 Use unsanitized dumps for these controlled experiments. Do not change reported
