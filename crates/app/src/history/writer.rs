@@ -284,6 +284,7 @@ mod tests {
 
     use super::*;
     use crate::history::{record_from_snapshot, temp_history_path};
+    use crate::test_log;
     use bpsr_meter::{EncounterInfo, PlayerRow, Snapshot};
 
     fn sample_record(title: &str) -> EncounterRecord {
@@ -497,15 +498,22 @@ mod tests {
 
     #[test]
     fn disconnected_record_enqueue_identifies_the_lost_encounter() {
+        test_log::install();
+        const FIGHT_ID: u64 = 9_876_543_210;
         let (tx, rx) = unbounded();
         drop(rx);
         let handle = HistoryHandle { tx };
-        handle.record_with_context(sample_record("Lost Fight"), 42, Some(3_110));
+        handle.record_with_context(sample_record("Lost Fight"), FIGHT_ID, Some(3_110));
 
-        let line = describe_enqueue_failure(42, Some(3_110));
-
-        assert!(line.starts_with("history: failed to enqueue encounter"));
-        assert!(line.contains("fight_id=42"));
-        assert!(line.contains("scene_id=Some(3110)"));
+        assert!(
+            test_log::logged(
+                log::Level::Warn,
+                &[&format!(
+                    "failed to enqueue encounter because the history thread is unavailable fight_id={FIGHT_ID} scene_id=Some(3110)"
+                )]
+            ),
+            "the disconnected writer must WARN with the lost encounter identity; captured: {:?}",
+            test_log::captured()
+        );
     }
 }

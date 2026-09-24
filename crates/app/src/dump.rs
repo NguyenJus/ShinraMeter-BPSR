@@ -1431,65 +1431,20 @@ mod tests {
     }
 
     // -- rotation log signal (issue #322: a routine rotation used to leave
-    // no trace at all — see the module-level `diagnostics` submodule for
-    // the shared log-capture harness and its "positive assertions only"
-    // discipline, since `log` allows exactly one logger per test binary). -
+    // no trace at all — see `crate::test_log` for the shared log-capture
+    // harness and its "positive assertions only" discipline, since `log`
+    // allows exactly one logger per test binary). --------------------------
 
     mod diagnostics {
         use super::*;
-        use std::sync::{Mutex, Once};
-
-        static CAPTURED: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
-
-        struct CaptureLogger;
-
-        impl log::Log for CaptureLogger {
-            fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
-                true
-            }
-
-            fn log(&self, record: &log::Record<'_>) {
-                if let Ok(mut captured) = CAPTURED.lock() {
-                    captured.push(record.args().to_string());
-                }
-            }
-
-            fn flush(&self) {}
-        }
-
-        /// Installs [`CAPTURE_LOGGER`] once per process. Idempotent, so any
-        /// number of tests can call it, in any order, from any thread.
-        fn install_capture() {
-            static INSTALL: Once = Once::new();
-            INSTALL.call_once(|| {
-                let _ = log::set_logger(&CAPTURE_LOGGER);
-                log::set_max_level(log::LevelFilter::Trace);
-            });
-        }
-
-        /// Whether any captured line contains every one of `needles` —
-        /// callers pass a value unique to their test (a distinct `ts_ms` or
-        /// temp path) as one of the needles, so a match can only have come
-        /// from that test, never a different test sharing this
-        /// process-wide capture buffer.
-        fn logged(needles: &[&str]) -> bool {
-            CAPTURED
-                .lock()
-                .map(|captured| {
-                    captured
-                        .iter()
-                        .any(|line| needles.iter().all(|needle| line.contains(needle)))
-                })
-                .unwrap_or(false)
-        }
+        use crate::test_log;
 
         /// A successful rotation logs the bytes written and the first/last
         /// `ts_ms` of the chunk being rotated out — tracked by `run_writer`
         /// as records are written, never by re-reading the rotated file.
         #[test]
         fn rotation_logs_bytes_written_and_the_rotated_chunks_ts_ms_range() {
-            install_capture();
+            test_log::install();
             let path = temp_path("log-rotate");
             let record = |ts_ms: u64| Record {
                 ts_ms,
@@ -1509,13 +1464,16 @@ mod tests {
             writer.shutdown();
 
             assert!(
-                logged(&[
-                    "inspect dump rotated",
-                    &first_ts.to_string(),
-                    &last_ts.to_string()
-                ]),
+                test_log::logged(
+                    log::Level::Info,
+                    &[
+                        "inspect dump rotated",
+                        &first_ts.to_string(),
+                        &last_ts.to_string()
+                    ]
+                ),
                 "expected a rotation log line naming both ts_ms bounds; captured: {:?}",
-                CAPTURED.lock().unwrap()
+                test_log::captured()
             );
 
             let _ = fs::remove_file(&path);
@@ -1526,7 +1484,7 @@ mod tests {
         /// (chunk size + ring budget) once at startup, not only on failure.
         #[test]
         fn writer_logs_its_path_and_retention_policy_at_startup() {
-            install_capture();
+            test_log::install();
             let path = temp_path("log-startup");
             let chunk_bytes = 123_456_u64;
             let total_bytes = 654_321_u64;
@@ -1536,14 +1494,17 @@ mod tests {
             writer.shutdown();
 
             assert!(
-                logged(&[
-                    "inspect dump writer started",
-                    &path.display().to_string(),
-                    &chunk_bytes.to_string(),
-                    &total_bytes.to_string(),
-                ]),
+                test_log::logged(
+                    log::Level::Info,
+                    &[
+                        "inspect dump writer started",
+                        &path.display().to_string(),
+                        &chunk_bytes.to_string(),
+                        &total_bytes.to_string(),
+                    ]
+                ),
                 "expected a startup log line naming the path and retention policy; captured: {:?}",
-                CAPTURED.lock().unwrap()
+                test_log::captured()
             );
 
             let _ = fs::remove_file(&path);
@@ -1553,7 +1514,7 @@ mod tests {
         /// itself logged, naming the deleted chunk's path.
         #[test]
         fn budget_eviction_logs_the_deleted_chunk_path() {
-            install_capture();
+            test_log::install();
             let path = temp_path("log-evict");
             let record = |ts_ms: u64| Record {
                 ts_ms,
@@ -1573,9 +1534,9 @@ mod tests {
 
             let evicted = numbered_sibling(&path, 2).display().to_string();
             assert!(
-                logged(&["deleted oldest chunk", &evicted]),
+                test_log::logged(log::Level::Info, &["deleted oldest chunk", &evicted]),
                 "expected an eviction log line naming the deleted chunk; captured: {:?}",
-                CAPTURED.lock().unwrap()
+                test_log::captured()
             );
             assert!(!numbered_sibling(&path, 2).exists());
 

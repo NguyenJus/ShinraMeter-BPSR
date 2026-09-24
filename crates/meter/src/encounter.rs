@@ -13137,6 +13137,7 @@ mod tests {
 
         #[test]
         fn fight_end_context_pins_the_dying_boss_template_after_a_boss_transition() {
+            install_capture();
             let mut meter = Meter::new();
             meter.apply(&ProtocolEvent::EnemyHp(EnemyHp {
                 entity: ek(10),
@@ -13163,11 +13164,29 @@ mod tests {
             // A sequential boss can replace `boss_entity` before the first
             // boss's end diagnostic is built. The passed id remains the
             // dying boss and must win for template_id too.
-            let context = meter.diagnostic_context_with_template(Some(103));
-            assert!(context.contains("template_id=103"), "{context}");
+            const DYING_BOSS: u32 = 103;
+            meter.latch_fight_end_with_reason(
+                FightEndCause::BossDeath,
+                2,
+                2,
+                Some(DYING_BOSS),
+                Some("test"),
+            );
+
+            let needle = format!(
+                "cause=boss_death boss_monster_id={DYING_BOSS} name=Ignisor reason=test \
+                 fight_id={} scene_id=<unknown> difficulty=<unknown> template_id={DYING_BOSS}",
+                meter.diagnostic_fight_id,
+            );
             assert!(
-                !context.contains(&format!("template_id={DIAG_BOSS}")),
-                "{context}"
+                logged(&needle),
+                "the production fight-end log must retain the dying boss in both identity fields"
+            );
+
+            let context = meter.diagnostic_context();
+            assert!(
+                context.contains(&format!("template_id={DIAG_BOSS}")),
+                "the lifecycle latch must not mutate the current boss selection: {context}"
             );
         }
 
