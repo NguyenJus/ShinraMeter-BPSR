@@ -2,6 +2,11 @@
 
 use super::*;
 
+/// A centered `100%` final stat can extend 4.41pt past its scaled slot.
+/// Keep 5pt beside the counter cluster so its widest pair remains reachable
+/// at the minimum supported width with the row scrollbar present.
+const COUNTER_CLUSTER_EDGE_HEADROOM: f32 = 5.0;
+
 /// Takes the whole `Icons` bundle rather than just `ClassIcons`: since issue
 /// #49 a row paints a toolbar-set texture too (the death counter's skull),
 /// and handing both sets down as one argument keeps `draw_row` from growing
@@ -34,8 +39,26 @@ use super::*;
 /// the columns are laid out (and justified) in — each row's own rect is a
 /// separate, never-narrower width, so the share bar and hover band still
 /// reach the panel edge across the reserved strip.
+#[cfg(test)]
 pub(super) fn row_content_width(column_viewport_width: f32, stat_columns_total: f32) -> f32 {
     let floor_width = stat_columns_total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
+    column_viewport_width.max(floor_width)
+}
+
+/// `row_content_width` with the trailing counter-pill reservation held at
+/// its physical width. At a narrow viewport the text columns may shrink to
+/// `MIN_COLUMN_SCALE`, but the pills must never be squeezed into their
+/// scaled slots and clipped at the row edge.
+pub(super) fn row_content_width_with_counter_reservation(
+    column_viewport_width: f32,
+    stat_columns_total: f32,
+    counter_columns_total: f32,
+) -> f32 {
+    let text_columns_total = stat_columns_total - counter_columns_total;
+    let floor_width = counter_columns_total
+        + text_columns_total * MIN_COLUMN_SCALE
+        + COLUMN_RIGHT_MARGIN
+        + COUNTER_CLUSTER_EDGE_HEADROOM;
     column_viewport_width.max(floor_width)
 }
 
@@ -116,6 +139,12 @@ pub(super) fn draw_rows(
     let columns = settings.stat_columns();
     let stat_columns = stat_columns_for(&columns);
     let stat_columns_total: f32 = stat_columns.iter().map(|c| c.width).sum();
+    let counter_columns_total: f32 = columns
+        .iter()
+        .zip(&stat_columns)
+        .filter(|(kind, _)| column_emphasis(**kind).is_pill())
+        .map(|(_, column)| column.width)
+        .sum();
 
     // Issue #404: the row list gets a solid, 8pt vertical scroll bar with a
     // static `#8C8C8C` handle and a transparent track, in place of egui's
@@ -156,9 +185,10 @@ pub(super) fn draw_rows(
         // re-justify against the new width. Column placement must be a
         // pure function of the window's width alone, never of the row
         // count too, so the width is reserved here up front regardless.
-        let content_width = row_content_width(
+        let content_width = row_content_width_with_counter_reservation(
             ui.available_width() - ROW_SCROLL_BAR_WIDTH,
             stat_columns_total,
+            counter_columns_total,
         );
 
         egui::ScrollArea::both()
@@ -209,17 +239,19 @@ pub(super) fn draw_rows(
                 ui.set_min_width(row_width);
 
                 let avail = ui.available_rect_before_wrap();
-                let anchors = column_anchors(
+                let anchors = column_anchors_with_counter_reservation(
                     avail.left(),
                     avail.left() + content_width,
                     &stat_columns,
-                    COLUMN_RIGHT_MARGIN,
+                    &columns,
+                    COLUMN_RIGHT_MARGIN + COUNTER_CLUSTER_EDGE_HEADROOM,
                 );
-                let scale = column_scale_from_widths(
+                let scale = column_scale_with_counter_reservation(
                     avail.left(),
                     avail.left() + content_width,
-                    &stat_columns.iter().map(|c| c.width).collect::<Vec<_>>(),
-                    COLUMN_RIGHT_MARGIN,
+                    &stat_columns,
+                    &columns,
+                    COLUMN_RIGHT_MARGIN + COUNTER_CLUSTER_EDGE_HEADROOM,
                 );
                 let layout = RowLayout {
                     kinds: &columns,
@@ -370,6 +402,7 @@ pub(super) fn stat_columns_for(columns: &[ColumnKind]) -> Vec<StatColumn> {
 /// than the columns' combined width, every column width is scaled down
 /// proportionally so the columns still fit rather than spilling past the
 /// rect's left edge — graceful degradation for a narrow window.
+#[cfg(test)]
 pub(super) fn column_anchors(
     rect_left: f32,
     rect_right: f32,
@@ -428,6 +461,64 @@ pub(super) fn column_scale_from_widths(
     } else {
         1.0
     }
+}
+
+/// Counter-pill columns reserve their full physical width. All other
+/// columns share whatever width remains, so compression never clips the
+/// unscaled pill cluster at the row's right edge.
+pub(super) fn column_scale_with_counter_reservation(
+    rect_left: f32,
+    rect_right: f32,
+    columns: &[StatColumn],
+    kinds: &[ColumnKind],
+    margin: f32,
+) -> f32 {
+    debug_assert_eq!(columns.len(), kinds.len());
+    let counter_width: f32 = columns
+        .iter()
+        .zip(kinds)
+        .filter(|(_, kind)| column_emphasis(**kind).is_pill())
+        .map(|(column, _)| column.width)
+        .sum();
+    let text_width: f32 = columns
+        .iter()
+        .zip(kinds)
+        .filter(|(_, kind)| !column_emphasis(**kind).is_pill())
+        .map(|(column, _)| column.width)
+        .sum();
+    let available = (rect_right - rect_left - margin - counter_width).max(0.0);
+    if text_width > available && text_width > 0.0 {
+        available / text_width
+    } else {
+        1.0
+    }
+}
+
+/// Anchors for a row with trailing counter pills. Their slot widths stay
+/// fixed while ordinary stat slots scale, matching
+/// `column_scale_with_counter_reservation`.
+pub(super) fn column_anchors_with_counter_reservation(
+    rect_left: f32,
+    rect_right: f32,
+    columns: &[StatColumn],
+    kinds: &[ColumnKind],
+    margin: f32,
+) -> Vec<f32> {
+    debug_assert_eq!(columns.len(), kinds.len());
+    let scale =
+        column_scale_with_counter_reservation(rect_left, rect_right, columns, kinds, margin);
+    let mut anchors = Vec::with_capacity(columns.len());
+    let mut x = rect_right - margin;
+    for (column, kind) in columns.iter().zip(kinds).rev() {
+        anchors.push(x);
+        x -= if column_emphasis(*kind).is_pill() {
+            column.width
+        } else {
+            column.width * scale
+        };
+    }
+    anchors.reverse();
+    anchors
 }
 
 /// The horizontal clip rect for one stat column's painted text: bounded on
@@ -765,8 +856,19 @@ pub(super) fn draw_row(
     // reads as "time" on sight (the same choice the breakdown window's
     // death-time pill made in issue #254).
     let timer = icons.glyphs.get(GlyphIcon::Timer).map(|t| t.id());
+    let first_pill = layout
+        .kinds
+        .iter()
+        .position(|kind| column_emphasis(*kind).is_pill());
+    let mut final_text_right = None;
 
-    for ((anchor_x, column), kind) in layout.anchors.iter().zip(layout.columns).zip(layout.kinds) {
+    for (index, ((anchor_x, column), kind)) in layout
+        .anchors
+        .iter()
+        .zip(layout.columns)
+        .zip(layout.kinds)
+        .enumerate()
+    {
         let text = (column.text)(row);
         // Each column's own weight/size (issue #56, `column_emphasis`), not
         // one flat font for the whole row: the DPS value is the headline
@@ -788,21 +890,7 @@ pub(super) fn draw_row(
         let painter = ui
             .painter()
             .with_clip_rect(column_clip_rect(rect, *anchor_x, column.width));
-        if emphasis.is_pill() {
-            paint_counter_pill(
-                &painter,
-                rect,
-                *anchor_x,
-                StatPill::counter(
-                    &text,
-                    match kind {
-                        ColumnKind::DeathTime => timer,
-                        _ => skull,
-                    },
-                    column.color,
-                ),
-            );
-        } else {
+        if !emphasis.is_pill() {
             // Right-aligned on the anchor, except for the centered crit-%
             // (and Lucky-%) column — see `column_text_placement`. Scaled by
             // `layout.scale` (see `RowLayout::scale`) so centering lands on
@@ -810,7 +898,7 @@ pub(super) fn draw_row(
             // nominal width.
             let (pos, align) =
                 column_text_placement(*kind, rect, *anchor_x, column.width * layout.scale);
-            paint_text(
+            let painted = paint_text(
                 &painter,
                 pos,
                 align,
@@ -819,6 +907,68 @@ pub(super) fn draw_row(
                 column.color,
                 false,
             );
+            if first_pill == Some(index + 1) && !text.is_empty() {
+                final_text_right = Some(painted.right());
+            }
+        }
+    }
+
+    // Keep the two trailing counter pills adjacent to the final text column
+    // by their *painted* widths, rather than treating their maximum-width
+    // column reservations as visible space. The reservations still hold the
+    // stat grid stable across rows and provide enough room for the widest
+    // pair; only the chrome within that budget now follows its contents.
+    if let Some(first_pill) = first_pill {
+        let pills: Vec<_> = layout.columns[first_pill..]
+            .iter()
+            .zip(&layout.kinds[first_pill..])
+            .map(|(column, kind)| ((column.text)(row), *column, *kind))
+            .collect();
+        let sizes: Vec<_> = pills
+            .iter()
+            .map(|(text, column, kind)| {
+                let pill = StatPill::counter(
+                    text,
+                    match kind {
+                        ColumnKind::DeathTime => timer,
+                        _ => skull,
+                    },
+                    column.color,
+                );
+                pill_size(
+                    pill_text_size(ui.painter(), &pill),
+                    pill.icon_side,
+                    pill.metrics,
+                    rect.height(),
+                )
+            })
+            .collect();
+        let total_width = sizes.iter().map(|size| size.x).sum::<f32>()
+            + SKILL_HEADER_PILL_GAP * sizes.len().saturating_sub(1) as f32;
+        let left = if first_pill == 0 {
+            // A user may leave only counter columns enabled. With no final
+            // text stat to follow, preserve the old right-aligned behavior.
+            layout.anchors.last().copied().unwrap_or(rect.right()) - total_width
+        } else {
+            final_text_right.unwrap_or(layout.anchors[first_pill - 1]) + SKILL_HEADER_PILL_GAP
+        };
+        let pill_rects = counter_pill_rects_from_left(rect, left, &sizes);
+
+        for (((text, column, kind), size), pill_rect) in pills.iter().zip(&sizes).zip(pill_rects) {
+            let pill = StatPill::counter(
+                text,
+                match kind {
+                    ColumnKind::DeathTime => timer,
+                    _ => skull,
+                },
+                column.color,
+            );
+            let text_size = pill_text_size(ui.painter(), &pill);
+            debug_assert_eq!(
+                *size,
+                pill_size(text_size, pill.icon_side, pill.metrics, rect.height())
+            );
+            paint_stat_pill(ui.painter(), pill_rect, text_size, &pill);
         }
     }
 
@@ -829,15 +979,39 @@ pub(super) fn draw_row(
     response.secondary_clicked().then_some(row.entity)
 }
 
-/// Paints one counter pill (issue #49) so that its **right edge lands on
-/// `anchor`** — the same x a text column's `Align2::RIGHT_CENTER` paint would
-/// end at — and its box is vertically centered in the row.
-///
-/// Anchoring the pill's edge where the text's edge would go is what makes the
-/// pill column obey `column_anchors` exactly like every other column: the
-/// anchor is a pure function of the row rect and the column widths, so the
-/// pill neither shifts when the count gains a digit nor needs a width its
-/// `StatColumn::width` budget doesn't already cover.
+/// Places a counter-pill sequence from its first pill's left edge. Kept
+/// separate from painting so the measured inter-pill geometry is testable
+/// with ordinary and wider values.
+pub(super) fn counter_pill_rects_from_left(
+    row: egui::Rect,
+    first_left: f32,
+    sizes: &[egui::Vec2],
+) -> Vec<egui::Rect> {
+    let mut left = first_left;
+    sizes
+        .iter()
+        .map(|size| {
+            let rect =
+                egui::Rect::from_min_size(egui::pos2(left, row.center().y - size.y / 2.0), *size);
+            left = rect.right() + SKILL_HEADER_PILL_GAP;
+            rect
+        })
+        .collect()
+}
+
+/// Legacy single-pill placement retained for focused geometry tests. Row
+/// rendering uses `counter_pill_rects_from_left` so live pill gaps follow
+/// their measured widths.
+#[cfg(test)]
+pub(super) fn counter_pill_rect(row: egui::Rect, anchor: f32, size: egui::Vec2) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(anchor - size.x, row.center().y - size.y / 2.0),
+        size,
+    )
+}
+
+/// Test-only wrapper for existing focused pill-paint regression coverage.
+#[cfg(test)]
 pub(super) fn paint_counter_pill(
     painter: &egui::Painter,
     row: egui::Rect,
@@ -845,9 +1019,6 @@ pub(super) fn paint_counter_pill(
     pill: StatPill<'_>,
 ) {
     let text_size = pill_text_size(painter, &pill);
-    // Capped at the row's own height for the same reason the header's pills
-    // are capped at the button row's (`pill_size`): a pill taller than its
-    // container would overlap the rows above and below it.
     let size = pill_size(text_size, pill.icon_side, pill.metrics, row.height());
     paint_stat_pill(
         painter,
@@ -855,17 +1026,6 @@ pub(super) fn paint_counter_pill(
         text_size,
         &pill,
     );
-}
-
-/// Where a counter pill of `size` sits in `row` for a column anchored at
-/// `anchor`. Pure geometry, so the right-alignment and centering are
-/// unit-testable without a live painter — same reasoning as
-/// `pill_content_layout`.
-pub(super) fn counter_pill_rect(row: egui::Rect, anchor: f32, size: egui::Vec2) -> egui::Rect {
-    egui::Rect::from_min_size(
-        egui::pos2(anchor - size.x, row.center().y - size.y / 2.0),
-        size,
-    )
 }
 
 /// Per-role base RGB of the damage-share bar (issue #44: healer -> green,
@@ -2505,7 +2665,7 @@ mod tests {
             + COLUMN_RIGHT_MARGIN
             + ROW_SCROLL_BAR_WIDTH
             + HEADER_ROW_EXTRA_WIDTH;
-        assert_eq!(default_inner_width(), expected);
+        assert_eq!(default_inner_width(), expected.ceil());
         // Issue #80.1 tightened the default columns' widths (`Dps`,
         // `CritPct`, `LuckyPct`), shrinking this from its old `451.0` to
         // `387.0`; issue #33's two Imagine slots then widened the icon
@@ -2520,9 +2680,10 @@ mod tests {
         // `COLUMN_RIGHT_MARGIN` to the source's `2 0` + `1` (4.0 -> 3.0)
         // then took a point back off, landing at `432.0`. Issue #439's
         // unconditionally reserved `ROW_SCROLL_BAR_WIDTH` landed at
-        // `440.0`; issue #398 then added the default 88pt death-time pill,
-        // widening the opening size to `528.0` without squeezing names.
-        assert_eq!(default_inner_width(), 528.0);
+        // `440.0`; the death-pill slots now use their measured widths plus
+        // the shared 10pt inter-pill gap, opening at `521.0` without
+        // squeezing names.
+        assert_eq!(default_inner_width(), 521.0);
         assert_eq!(COLUMN_RIGHT_MARGIN, 3.0);
     }
 
@@ -2686,11 +2847,19 @@ mod tests {
     #[test]
     fn scrolling_is_needed_once_the_viewport_narrows_past_the_column_scale_floor() {
         let snapshot = rows_test_snapshot(1);
-        let stat_columns_total: f32 = stat_columns_for(&Settings::default().ordered_columns())
+        let kinds = Settings::default().stat_columns();
+        let columns = stat_columns_for(&kinds);
+        let stat_columns_total: f32 = columns.iter().map(|c| c.width).sum();
+        let counter_columns_total: f32 = kinds
             .iter()
-            .map(|c| c.width)
+            .zip(&columns)
+            .filter(|(kind, _)| column_emphasis(**kind).is_pill())
+            .map(|(_, column)| column.width)
             .sum();
-        let floor = stat_columns_total * MIN_COLUMN_SCALE + COLUMN_RIGHT_MARGIN;
+        let floor = counter_columns_total
+            + (stat_columns_total - counter_columns_total) * MIN_COLUMN_SCALE
+            + COLUMN_RIGHT_MARGIN
+            + COUNTER_CLUSTER_EDGE_HEADROOM;
         let narrow_viewport = floor - 20.0;
         let content = rows_content_size(&snapshot, narrow_viewport, ROW_HEIGHT * 2.0);
         assert!(
@@ -2866,6 +3035,161 @@ mod tests {
         );
     }
 
+    #[test]
+    fn measured_counter_pills_keep_the_header_gap_for_normal_and_wide_values() {
+        let ctx = egui::Context::default();
+        ctx.run_ui(egui::RawInput::default(), |_ui| {})
+            .drop_without_applying_deltas();
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, ROW_HEIGHT));
+        let columns = Settings::default().stat_columns();
+        let first_pill = columns
+            .iter()
+            .position(|kind| column_emphasis(*kind).is_pill())
+            .expect("default columns include the counter-pill pair");
+        let anchors = column_anchors(0.0, 600.0, &stat_columns_for(&columns), 4.0);
+        let first_left = anchors[first_pill - 1] + SKILL_HEADER_PILL_GAP;
+
+        for values in [["1", "00:24"], ["99", "120:00"]] {
+            let sizes: Vec<_> = values
+                .iter()
+                .map(|value| {
+                    let pill = StatPill::counter(value, None, egui::Color32::WHITE);
+                    let text_size = ctx.fonts_mut(|fonts| {
+                        fonts
+                            .layout_no_wrap(
+                                pill.value.to_owned(),
+                                regular(pill.size),
+                                pill.value_color,
+                            )
+                            .rect
+                            .size()
+                    });
+                    pill_size(text_size, pill.icon_side, pill.metrics, row.height())
+                })
+                .collect();
+            let rects = counter_pill_rects_from_left(row, first_left, &sizes);
+
+            assert!(
+                (rects[0].left() - anchors[first_pill - 1] - SKILL_HEADER_PILL_GAP).abs() < 0.01,
+                "the first pill must begin one header-pill gap after the final stat"
+            );
+            assert!(
+                (rects[1].left() - rects[0].right() - SKILL_HEADER_PILL_GAP).abs() < 0.01,
+                "the counter pills must retain the header-pill gap for {values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn drawn_counter_pills_follow_the_final_painted_stat_at_default_and_minimum_width() {
+        fn collect_counter_pills(shape: &egui::Shape, rects: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Rect(rect) if rect.fill == COUNTER_PILL_FILL => rects.push(rect.rect),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_counter_pills(shape, rects);
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn collect_text(shape: &egui::Shape, wanted: &str, rects: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == wanted => {
+                    rects.push(egui::Rect::from_min_size(text.pos, text.galley.size()));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, wanted, rects);
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn render(width: f32, row: &PlayerRow) -> (Vec<egui::Rect>, Vec<egui::Rect>, f32) {
+            let ctx = egui::Context::default();
+            apply_theme(&ctx);
+            let icons = Icons::load(&ctx);
+            let settings = Settings::default();
+            let kinds = settings.stat_columns();
+            let columns = stat_columns_for(&kinds);
+            let total: f32 = columns.iter().map(|column| column.width).sum();
+            let counter_total: f32 = kinds
+                .iter()
+                .zip(&columns)
+                .filter(|(kind, _)| column_emphasis(**kind).is_pill())
+                .map(|(_, column)| column.width)
+                .sum();
+            let row_width = row_content_width_with_counter_reservation(
+                width - ROW_SCROLL_BAR_WIDTH,
+                total,
+                counter_total,
+            );
+            let anchors = column_anchors_with_counter_reservation(
+                0.0,
+                row_width,
+                &columns,
+                &kinds,
+                COLUMN_RIGHT_MARGIN + COUNTER_CLUSTER_EDGE_HEADROOM,
+            );
+            let scale = column_scale_with_counter_reservation(
+                0.0,
+                row_width,
+                &columns,
+                &kinds,
+                COLUMN_RIGHT_MARGIN + COUNTER_CLUSTER_EDGE_HEADROOM,
+            );
+            let mut pills = Vec::new();
+            let mut final_stat = Vec::new();
+            let final_text = (columns[kinds.len() - 3].text)(row);
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, ROW_HEIGHT),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let layout = RowLayout {
+                        kinds: &kinds,
+                        columns: &columns,
+                        anchors: &anchors,
+                        scale,
+                        settings: &settings,
+                    };
+                    draw_row(ui, row, &layout, &icons, row.damage, row_width);
+                },
+            );
+            for clipped in &output.shapes {
+                collect_counter_pills(&clipped.shape, &mut pills);
+                collect_text(&clipped.shape, &final_text, &mut final_stat);
+            }
+            output.drop_without_applying_deltas();
+            pills.sort_by(|a, b| a.left().total_cmp(&b.left()));
+            (pills, final_stat, row_width)
+        }
+
+        let mut row = rows_test_snapshot(1).rows.remove(0);
+        row.deaths = 1;
+        row.dead_ms = Some(24_000);
+        let (pills, final_stat, _) = render(default_inner_width(), &row);
+        assert_eq!(pills.len(), 2, "the default row must paint both pills");
+        let final_stat = final_stat.last().expect("the final stat must be painted");
+        assert!((pills[0].left() - final_stat.right() - SKILL_HEADER_PILL_GAP).abs() < 0.01);
+        assert!((pills[1].left() - pills[0].right() - SKILL_HEADER_PILL_GAP).abs() < 0.01);
+
+        row.deaths = 99;
+        row.dead_ms = Some(120 * 60 * 1000);
+        row.lucky_pct = 100.0;
+        let (pills, _, row_width) = render(220.0, &row);
+        assert_eq!(pills.len(), 2, "the compressed row must retain both pills");
+        assert!(
+            pills.last().unwrap().right() <= row_width + 0.01,
+            "the widest counter cluster must fit the {row_width}pt row rather than be clipped"
+        );
+    }
+
     /// The counter shares the row's flat metric size (issue #62) — it is the
     /// only emphasis level painted as a pill rather than as bare text.
     #[test]
@@ -3035,31 +3359,5 @@ mod tests {
                 rect.right()
             );
         }
-    }
-
-    /// The pill obeys `column_anchors` exactly like a text column does: its
-    /// right edge lands on the anchor (where right-aligned text would end),
-    /// and it is centered in the row.
-    #[test]
-    fn counter_pill_is_right_aligned_on_its_column_anchor() {
-        let row = row_rect();
-        let size = egui::vec2(40.0, 14.0);
-        let pill = counter_pill_rect(row, 250.0, size);
-
-        assert_eq!(pill.right(), 250.0);
-        assert_eq!(pill.size(), size);
-        assert_eq!(pill.center().y, row.center().y);
-    }
-
-    /// A digit-count change must move the pill's *left* edge only — the
-    /// anchored right edge is what keeps the column steady between frames.
-    #[test]
-    fn a_wider_count_grows_the_pill_leftwards_from_its_anchor() {
-        let row = row_rect();
-        let narrow = counter_pill_rect(row, 250.0, egui::vec2(36.0, 14.0));
-        let wide = counter_pill_rect(row, 250.0, egui::vec2(44.0, 14.0));
-
-        assert_eq!(narrow.right(), wide.right());
-        assert!(wide.left() < narrow.left());
     }
 }

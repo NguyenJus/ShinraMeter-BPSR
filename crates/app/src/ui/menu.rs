@@ -1232,6 +1232,7 @@ fn draw_menu_root(
             enabled: !busy,
         },
     );
+    menu_hint(ui, &format!("Version v{}", env!("CARGO_PKG_VERSION")));
     // Issue #434: the row is a single elided label, so anything longer than
     // its ~208px band is unreadable in place — the error states put their
     // full text in the tooltip, and the release page (which `Trailing` has

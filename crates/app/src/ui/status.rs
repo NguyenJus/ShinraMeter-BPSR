@@ -1212,11 +1212,11 @@ mod tests {
             "the counter pill is {pill_width}pt wide, wider than its {}pt column budget",
             column.width
         );
-        // And the budget is a budget, not a wildly oversized reservation —
-        // every point here is a point the player name doesn't get.
+        // The remaining slot width is the gap from the preceding stat to
+        // this first pill, matching the breakdown header's pill gap.
         assert!(
-            column.width - pill_width < 16.0,
-            "the {}pt budget wastes {}pt on a {pill_width}pt pill",
+            (column.width - pill_width - 10.0).abs() < 0.1,
+            "the {}pt budget leaves {}pt after a {pill_width}pt pill",
             column.width,
             column.width - pill_width
         );
@@ -1234,10 +1234,10 @@ mod tests {
             .drop_without_applying_deltas();
 
         let column = ColumnKind::DeathTime.spec();
-        // `fmt_death_time`'s widest plausible value: the estimate tilde plus
-        // `fmt_duration`'s documented `120:00` worst case (an hours field is
+        // `fmt_death_time`'s widest plausible value: `fmt_duration`'s
+        // documented `120:00` worst case (an hours field is
         // deliberately absent, so minutes keep counting up).
-        let pill = StatPill::counter("~120:00", None, column.color);
+        let pill = StatPill::counter("120:00", None, column.color);
         let text_size = ctx.fonts_mut(|f| {
             f.layout_no_wrap(pill.value.to_owned(), regular(pill.size), pill.value_color)
                 .rect
@@ -1245,14 +1245,15 @@ mod tests {
         });
         let pill_width = pill_size(text_size, pill.icon_side, pill.metrics, ROW_HEIGHT).x;
 
+        // Its remainder is the gap from the Deaths pill to this pill.
         assert!(
             pill_width <= column.width,
             "the death-time pill is {pill_width}pt wide, wider than its {}pt column budget",
             column.width
         );
         assert!(
-            column.width - pill_width < 16.0,
-            "the {}pt budget wastes {}pt on a {pill_width}pt pill",
+            (column.width - pill_width - 10.0).abs() < 0.1,
+            "the {}pt budget leaves {}pt after a {pill_width}pt pill",
             column.width,
             column.width - pill_width
         );

@@ -2993,17 +2993,14 @@ pub(crate) fn fmt_duration(ms: u64) -> String {
 /// `PlayerRow::dead_ms`); an empty cell would read as "nobody was on the
 /// floor" rather than "not recorded".
 ///
-/// Zero renders bare: nobody died, so the figure is exact and marking it as
-/// an estimate would be the lie. Anything else takes a `~` prefix, because
-/// the revive edge feeding the total is *inferred* from the player's next
-/// action rather than observed (`PlayerStats::dead_ms`), so the number is
-/// real but biased high — and it sits right beside the exact Deaths count,
-/// where an unmarked estimate would read as equally precise.
+/// Every measured total renders as a bare duration. The revive edge feeding
+/// the total is inferred from the player's next action, but displaying that
+/// implementation detail in every table and breakdown pill made the values
+/// needlessly noisy.
 pub(crate) fn fmt_death_time(dead_ms: Option<u64>) -> String {
     match dead_ms {
         None => "—".to_string(),
-        Some(0) => fmt_duration(0),
-        Some(ms) => format!("~{}", fmt_duration(ms)),
+        Some(ms) => fmt_duration(ms),
     }
 }
 
@@ -3293,9 +3290,10 @@ const HEADER_ROW_EXTRA_WIDTH: f32 = 20.0;
 ///
 ///   icon gutter (class 3.5 + 20.0 + Imagines 36.0 + 3.5 = 63.0) + left pad (2.0)
 ///     + name budget (150.0) + gap (10.0)
-///     + columns (DPS 56.0 + crit 40.0 + lucky 40.0 + deaths 48.0 + death time 88.0 = 272.0)
+///     + columns (DPS 56.0 + crit 40.0 + lucky 40.0 + deaths 51.65625
+///       + death time 76.84375 = 264.5)
 ///     + right margin (3.0) + row scroll bar (8.0)
-///     + header row headroom (20.0) = 528.0
+///     + header row headroom (20.0), rounded up to a whole point = 521.0
 ///
 /// The `ROW_SCROLL_BAR_WIDTH` term is issue #439's: `draw_rows` takes that
 /// 8pt strip out of the column viewport unconditionally, whether or not
@@ -3314,14 +3312,15 @@ fn default_inner_width() -> f32 {
         .iter()
         .map(|c| c.width)
         .sum();
-    ICON_GUTTER_WIDTH
+    (ICON_GUTTER_WIDTH
         + NAME_LEFT_PAD
         + NAME_WIDTH_BUDGET
         + NAME_COLUMN_GAP
         + columns_width
         + COLUMN_RIGHT_MARGIN
         + ROW_SCROLL_BAR_WIDTH
-        + HEADER_ROW_EXTRA_WIDTH
+        + HEADER_ROW_EXTRA_WIDTH)
+        .ceil()
 }
 
 /// Sane upper bound, in points, for a persisted `window_size` axis —
@@ -4106,12 +4105,11 @@ mod tests {
         assert_eq!(fmt_death_time(None), "\u{2014}");
     }
 
-    /// Zero is exact, so it renders bare; anything else is inferred from the
-    /// revive edge and takes the estimate tilde.
+    /// Measured totals render as bare durations, including nonzero values.
     #[test]
-    fn fmt_death_time_marks_a_nonzero_total_as_an_estimate() {
+    fn fmt_death_time_omits_the_estimate_marker() {
         assert_eq!(fmt_death_time(Some(0)), "00:00");
-        assert_eq!(fmt_death_time(Some(84_000)), "~01:24");
+        assert_eq!(fmt_death_time(Some(84_000)), "01:24");
     }
 
     #[test]

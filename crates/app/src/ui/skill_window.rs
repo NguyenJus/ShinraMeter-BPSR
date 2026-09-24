@@ -748,8 +748,7 @@ pub(super) fn skill_header_pill_cluster_width(
 /// to draw at all (a history row with no measured death time — see
 /// `PlayerRow::dead_ms`).
 ///
-/// Delegates to `fmt_death_time` for the zero-bare/nonzero-`~` formatting
-/// rule and its rationale; this header pill just turns that dash case into
+/// Delegates to `fmt_death_time`; this header pill just turns that dash case into
 /// "no pill" instead of painting the dash itself, since these header
 /// capsules are bare painted ovals with no widget behind them — the
 /// header's whole width is a drag band — so a tooltip would mean carving a
@@ -865,7 +864,7 @@ pub(super) fn draw_skill_window(
     // uses, since neither vendored icon set has the reference's dedicated
     // death-time mark and a second clock reads as "time" on sight. Absent
     // (not empty) when the row carries no measured death time; see
-    // `skill_death_time_text` for the `~` on an estimated total.
+    // `skill_death_time_text` for the formatted total.
     let death_time_text = skill_death_time_text(row.dead_ms);
     let death_time_pill = death_time_text.as_ref().map(|value| StatPill {
         value,
@@ -2048,25 +2047,23 @@ mod tests {
         );
     }
 
-    /// Issue #254: the total is an estimate (the revive edge is inferred
-    /// from the player's next action), so it wears a `~` — except at zero,
-    /// which is exact, and except for a history row, which has no measured
-    /// total at all and gets no pill rather than a misleading `00:00`.
+    /// A history row has no measured total and gets no pill rather than a
+    /// misleading `00:00`; measured totals render as bare durations.
     #[test]
-    fn death_time_text_marks_the_estimate_but_not_an_exact_zero() {
+    fn death_time_text_omits_the_estimate_marker() {
         assert_eq!(skill_death_time_text(None), None);
         assert_eq!(skill_death_time_text(Some(0)).as_deref(), Some("00:00"));
         assert_eq!(
             skill_death_time_text(Some(12_400)).as_deref(),
-            Some("~00:12")
+            Some("00:12")
         );
         assert_eq!(
             skill_death_time_text(Some(159_000)).as_deref(),
-            Some("~02:39")
+            Some("02:39")
         );
         assert_eq!(
             skill_death_time_text(Some(120 * 60 * 1000)).as_deref(),
-            Some("~120:00"),
+            Some("120:00"),
             "minutes keep counting up rather than rolling over, like fmt_duration"
         );
     }
