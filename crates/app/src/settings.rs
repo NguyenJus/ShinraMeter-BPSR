@@ -529,9 +529,9 @@ impl Default for Settings {
     fn default() -> Self {
         // The death counter and total-death-time pill (issues #49/#398) are
         // part of the default meter, not opt-in extras. Only new installs
-        // and wiped settings files get this set: an existing settings.json
-        // carries its own visible_columns and is left exactly as the user
-        // last left it.
+        // and wiped settings files get this set. Existing customized column
+        // sets are preserved; the exact prior default receives a one-time
+        // DeathTime migration.
         Self {
             visible_columns: vec![
                 ColumnKind::Dps,
