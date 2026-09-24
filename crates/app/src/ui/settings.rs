@@ -294,7 +294,6 @@ pub(super) fn start_bundle_export(
         .name("export-bundle".to_string())
         .spawn(move || {
             let (log_path, _warning) = crate::logging::log_file_path();
-            let log_parts = crate::logging::files_to_export(&log_path);
 
             let inspect_enabled = crate::inspect::enabled();
             let dump_sanitized = crate::inspect::sanitized().unwrap_or(false);
@@ -305,7 +304,7 @@ pub(super) fn start_bundle_export(
             };
 
             let settings_path = crate::settings::settings_path();
-            let entries = bundle::bundle_entries(&log_parts, &dump_parts, settings_path.as_deref());
+            let entries = bundle::bundle_entries(&[], &dump_parts, settings_path.as_deref());
 
             let session_id = crate::logging::session_id();
             let manifest = bundle::build_manifest(
@@ -327,14 +326,18 @@ pub(super) fn start_bundle_export(
             // and a user who has turned history off should not have it
             // sanitized into a bundle either.
             let history_source = crate::history::history_db_path();
-            let outcome = match bundle::export_bundle_to(
-                &dest,
-                &entries,
-                &manifest,
-                Some(&history_source),
-                include_history,
-            ) {
-                Ok(missing) => Ok((dest, missing)),
+            let outcome = match crate::logging::copy_logs_to_bundle(&log_path, &dest) {
+                Ok(log_missing) => match bundle::export_bundle_to_with_missing(
+                    &dest,
+                    &entries,
+                    &manifest,
+                    Some(&history_source),
+                    include_history,
+                    &log_missing,
+                ) {
+                    Ok(missing) => Ok((dest, missing)),
+                    Err(err) => Err((dest, err.to_string())),
+                },
                 Err(err) => Err((dest, err.to_string())),
             };
             // A dropped receiver means the app is shutting down; the export

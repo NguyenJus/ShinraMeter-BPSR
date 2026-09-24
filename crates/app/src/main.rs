@@ -385,8 +385,8 @@ fn main() -> eframe::Result {
 
     let (tx_events, rx_events) = bounded::<ProtocolEvent>(EVENT_CAPACITY);
     let (tx_command, rx_command) = bounded::<UiCommand>(COMMAND_CAPACITY);
-    // Capture increments this only when its rate-limited queue-drop warning
-    // is due; the pipeline uses it to emit matching aggregate step timings.
+    // Capture increments this when it generates a rate-limited queue-drop
+    // report; the pipeline uses the generation to publish aggregate diagnostics.
     let queue_drop_signal = bpsr_capture::QueueDropSignal::new();
 
     // Loaded once, here, rather than inside `OverlayApp::new`: issue #27

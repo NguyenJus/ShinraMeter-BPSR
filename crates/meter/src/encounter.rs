@@ -2499,9 +2499,13 @@ impl Meter {
         if !self.fight_lifecycle.end(end_ms, observed_ms, cause, armed) {
             return;
         }
+        // A boss-death packet can promote `boss_entity` to the next living
+        // boss before this runs. The packet's id is the authoritative end
+        // identity, so it must also supply the context's template id.
+        let context = self.diagnostic_context_with_template(boss_monster_id);
         log::info!(
             "{}",
-            fight_end_log(cause, boss_monster_id, reason, &self.diagnostic_context())
+            fight_end_log(cause, boss_monster_id, reason, &context)
         );
     }
 
@@ -2516,12 +2520,16 @@ impl Meter {
     /// Difficulty is not exposed by the currently modeled protocol, so its
     /// explicit unknown value distinguishes absent evidence from a default.
     fn diagnostic_context(&self) -> String {
+        self.diagnostic_context_with_template(self.boss_monster_id())
+    }
+
+    /// Builds diagnostic context, optionally pinning the template to an
+    /// authoritative lifecycle event rather than the current boss target.
+    fn diagnostic_context_with_template(&self, template_id: Option<u32>) -> String {
         let scene = self
             .scene_id
             .map_or_else(|| "<unknown>".to_owned(), |id| id.to_string());
-        let template = self
-            .boss_monster_id()
-            .map_or_else(|| "<unknown>".to_owned(), |id| id.to_string());
+        let template = template_id.map_or_else(|| "<unknown>".to_owned(), |id| id.to_string());
         let phase_pending = self.fight_end_boss_id().is_some_and(phase::has_phase_group);
         format!(
             "fight_id={} scene_id={scene} difficulty=<unknown> template_id={template} phase_pending={phase_pending}",
@@ -13125,6 +13133,42 @@ mod tests {
 
             let msg = fight_end_log(FightEndCause::ServerChanged, None, None, "fight_id=1");
             assert!(msg.contains("cause=server_changed"));
+        }
+
+        #[test]
+        fn fight_end_context_pins_the_dying_boss_template_after_a_boss_transition() {
+            let mut meter = Meter::new();
+            meter.apply(&ProtocolEvent::EnemyHp(EnemyHp {
+                entity: ek(10),
+                uid: 10,
+                curr_hp: Some(100),
+                max_hp: Some(100),
+                monster_id: Some(DIAG_BOSS),
+                timestamp_ms: 0,
+            }));
+            meter.apply(&ProtocolEvent::Damage(
+                DamageEvent {
+                    attacker_uid: 1,
+                    attacker_kind: EntityKind::Player,
+                    target_uid: 10,
+                    target_kind: EntityKind::Monster,
+                    value: 1,
+                    timestamp_ms: 1,
+                    ..Default::default()
+                }
+                .test_reconstructed(),
+            ));
+            assert_eq!(meter.boss_monster_id(), Some(DIAG_BOSS));
+
+            // A sequential boss can replace `boss_entity` before the first
+            // boss's end diagnostic is built. The passed id remains the
+            // dying boss and must win for template_id too.
+            let context = meter.diagnostic_context_with_template(Some(103));
+            assert!(context.contains("template_id=103"), "{context}");
+            assert!(
+                !context.contains(&format!("template_id={DIAG_BOSS}")),
+                "{context}"
+            );
         }
 
         /// issue #410: the refusal diagnostic must name *which* death

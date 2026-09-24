@@ -103,9 +103,8 @@ impl HistoryHandle {
     }
 
     /// Enqueues a finished encounter. Never blocks: the channel is
-    /// unbounded, and a dead receiver (the thread has already exited) is
-    /// silently ignored — there is no reply channel to carry that failure
-    /// to, and nothing the caller could do about it anyway.
+    /// unbounded. A dead receiver means the history thread exited, which is
+    /// reported with the encounter's diagnostic identity.
     pub fn record(&self, record: EncounterRecord) {
         let scene_id = record.scene_id;
         self.record_with_context(record, 0, scene_id);
@@ -120,11 +119,17 @@ impl HistoryHandle {
         fight_id: u64,
         scene_id: Option<u32>,
     ) {
-        let _ = self.tx.send(HistoryRequest::Record {
-            record: Box::new(record),
-            fight_id,
-            scene_id,
-        });
+        if self
+            .tx
+            .send(HistoryRequest::Record {
+                record: Box::new(record),
+                fight_id,
+                scene_id,
+            })
+            .is_err()
+        {
+            log::warn!("{}", describe_enqueue_failure(fight_id, scene_id));
+        }
     }
 
     /// Requests the newest `limit` encounters; the reply lands on `reply`.
@@ -158,6 +163,15 @@ impl HistoryHandle {
             reply: reply.clone(),
         });
     }
+}
+
+/// Describes a failed record enqueue. Kept pure so the disconnected-writer
+/// path has a focused regression test without depending on a process-global
+/// logger.
+fn describe_enqueue_failure(fight_id: u64, scene_id: Option<u32>) -> String {
+    format!(
+        "history: failed to enqueue encounter because the history thread is unavailable fight_id={fight_id} scene_id={scene_id:?}"
+    )
 }
 
 /// Builds the one-line INFO summary for a `Record` outcome (issue #409): a
@@ -479,5 +493,19 @@ mod tests {
             "history: skipped encounter below the retention floor fight_id=42 scene_id=Some(3110) "
         ));
         assert!(!line.contains("encounter id="));
+    }
+
+    #[test]
+    fn disconnected_record_enqueue_identifies_the_lost_encounter() {
+        let (tx, rx) = unbounded();
+        drop(rx);
+        let handle = HistoryHandle { tx };
+        handle.record_with_context(sample_record("Lost Fight"), 42, Some(3_110));
+
+        let line = describe_enqueue_failure(42, Some(3_110));
+
+        assert!(line.starts_with("history: failed to enqueue encounter"));
+        assert!(line.contains("fight_id=42"));
+        assert!(line.contains("scene_id=Some(3110)"));
     }
 }

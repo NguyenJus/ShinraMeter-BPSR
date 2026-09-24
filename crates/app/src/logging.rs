@@ -30,7 +30,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// A log chunk at or above this size gets rotated.
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
-/// The live log plus this many numbered prior chunks are retained.
+/// The total number of retained chunks: the live log plus seven numbered
+/// prior chunks.
 const LOG_CHUNK_COUNT: u8 = 8;
 
 static SESSION_ID: OnceLock<String> = OnceLock::new();
@@ -435,6 +436,31 @@ pub(crate) fn files_to_export(primary: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Copies the current retained log set into a session-bundle directory and
+/// returns the bundle names that could not be copied.  The listing and every
+/// copy share [`ROTATION_LOCK`], so a rotation cannot shift a numbered chunk
+/// between those two steps.
+///
+/// This deliberately does not log failures: [`Tee::rotate`] holds the
+/// logger's writer lock while it waits for the same lock, so logging here
+/// could deadlock.  The bundle exporter records and reports the returned
+/// names after the guard is released instead.
+pub(crate) fn copy_logs_to_bundle(primary: &Path, dest_dir: &Path) -> io::Result<Vec<String>> {
+    fs::create_dir_all(dest_dir)?;
+    let _guard = lock_rotation();
+
+    let mut missing = Vec::new();
+    for source in files_to_export(primary) {
+        let Some(name) = source.file_name() else {
+            continue;
+        };
+        if fs::copy(&source, dest_dir.join(name)).is_err() {
+            missing.push(name.to_string_lossy().into_owned());
+        }
+    }
+    Ok(missing)
+}
+
 /// Bundles every file [`files_to_export`] finds for `primary` into a single
 /// file at `dest` — the destination the user picked via the native save
 /// dialog (`platform::choose_log_export_path`), since that dialog can only
@@ -567,6 +593,9 @@ fn install_panic_hook() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     use bpsr_test_support::scratch_path;
 
     use super::*;
@@ -915,6 +944,85 @@ mod tests {
             let _ = fs::remove_file(log_chunk_path(&path, chunk));
         }
         let _ = fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn copy_logs_to_bundle_copies_the_whole_stable_retained_ring() {
+        let path = scratch_path("bundle-stable-ring");
+        let dir = std::env::temp_dir().join(format!(
+            "ShinraMeter-BPSR-bundle-stable-ring-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        for chunk in 1..LOG_CHUNK_COUNT {
+            fs::write(log_chunk_path(&path, chunk), format!("CHUNK-{chunk}")).unwrap();
+        }
+        fs::write(&path, b"CURRENT").unwrap();
+
+        assert!(copy_logs_to_bundle(&path, &dir).unwrap().is_empty());
+        for chunk in 1..LOG_CHUNK_COUNT {
+            let copied = dir.join(log_chunk_path(&path, chunk).file_name().unwrap());
+            assert_eq!(
+                fs::read(copied).unwrap(),
+                format!("CHUNK-{chunk}").as_bytes()
+            );
+        }
+        assert_eq!(
+            fs::read(dir.join(path.file_name().unwrap())).unwrap(),
+            b"CURRENT"
+        );
+
+        let _ = fs::remove_file(&path);
+        for chunk in 1..LOG_CHUNK_COUNT {
+            let _ = fs::remove_file(log_chunk_path(&path, chunk));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_logs_to_bundle_waits_for_an_in_progress_rotation() {
+        let path = scratch_path("bundle-waits-for-rotation");
+        let dir = std::env::temp_dir().join(format!(
+            "ShinraMeter-BPSR-bundle-waits-for-rotation-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::write(&path, b"CURRENT").unwrap();
+
+        let _rotation = lock_rotation();
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (copied_tx, copied_rx) = mpsc::sync_channel(0);
+        let copy_path = path.clone();
+        let copy_dir = dir.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            copied_tx
+                .send(copy_logs_to_bundle(&copy_path, &copy_dir))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        assert!(
+            copied_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the bundle copy must wait while rotation owns its lock"
+        );
+        drop(_rotation);
+
+        assert!(
+            copied_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        worker.join().unwrap();
+        assert_eq!(
+            fs::read(dir.join(path.file_name().unwrap())).unwrap(),
+            b"CURRENT"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

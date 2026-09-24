@@ -1162,6 +1162,9 @@ fn run(
     if let Some(history) = history {
         pipeline = pipeline.with_history(history);
     }
+    // Kept separately because `events` is replaced by `never()` after a
+    // disconnect, and `never()` has no bounded queue capacity.
+    let event_queue_capacity = events.capacity();
     // Replaced by `never()` once capture disconnects, so a dead channel does
     // not spin the select loop.
     let mut events = events;
@@ -1205,7 +1208,7 @@ fn run(
                         rolling_diagnostics.report(
                             Instant::now(),
                             &queue_drop_signal,
-                            events.capacity(),
+                            event_queue_capacity,
                             true,
                         );
                     }
@@ -1318,10 +1321,20 @@ fn run(
                 publish(&mut pipeline, &tx_snapshot, &stale, &skill_focus, &repaint, &mut last_published, &mut rolling_diagnostics);
             },
         }
-        rolling_diagnostics.report(Instant::now(), &queue_drop_signal, events.capacity(), false);
+        rolling_diagnostics.report(
+            Instant::now(),
+            &queue_drop_signal,
+            event_queue_capacity,
+            false,
+        );
     }
 
-    rolling_diagnostics.report(Instant::now(), &queue_drop_signal, events.capacity(), true);
+    rolling_diagnostics.report(
+        Instant::now(),
+        &queue_drop_signal,
+        event_queue_capacity,
+        true,
+    );
 
     // Shutdown save: catches identity data learned since the last
     // reset/encounter-end save (e.g. a session with no resets at all). Then
