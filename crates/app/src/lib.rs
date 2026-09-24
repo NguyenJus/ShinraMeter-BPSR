@@ -14,6 +14,7 @@ pub mod logging;
 pub mod paths;
 pub mod pipeline;
 pub mod platform;
+pub mod session_diagnostics;
 pub mod settings;
 pub mod single_instance;
 pub mod skill_icons;

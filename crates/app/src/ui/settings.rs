@@ -246,8 +246,8 @@ pub(super) type LogExportOutcome = Result<(PathBuf, Vec<String>), (PathBuf, Stri
 /// outcome back over `tx`, a clone of `OverlayApp::tx_log_export` that
 /// `poll_log_export` drains once a frame.
 ///
-/// Off the frame thread because `logging::export_logs_to` copies up to two
-/// files of `logging::MAX_LOG_BYTES` each — a ~10MB disk copy, which is
+/// Off the frame thread because `logging::export_logs_to` copies up to eight
+/// 5 MiB log chunks — a ~40 MiB disk copy, which is
 /// exactly the multi-frame stall the overlay must not take while the game
 /// is running. Same one-shot shape as `start_update_check`, and for the
 /// same reason.

@@ -2845,8 +2845,8 @@ fn wide(s: &str) -> Vec<u16> {
 /// blocking that wasn't already going to happen.
 ///
 /// That reasoning covers this dialog and nothing after it (PR #227
-/// review): both callers' own copy work — up to two files of
-/// `logging::MAX_LOG_BYTES` for "Export logs", a whole session bundle for
+/// review): both callers' own copy work — up to eight 5 MiB chunks for
+/// "Export logs", a whole session bundle for
 /// "Export session bundle" — is *not* already blocking the frame thread,
 /// so each caller runs its copy on its own spawned thread once this
 /// function has returned a destination.

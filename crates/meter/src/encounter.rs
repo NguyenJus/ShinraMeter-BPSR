@@ -365,6 +365,13 @@ pub struct Meter {
     /// instant it becomes true — a caller that only ever calls `snapshot`
     /// must still see the hold.
     fight_lifecycle: FightLifecycle,
+    /// Monotonic, process-local correlation id for lifecycle diagnostics.
+    /// It is deliberately not an entity id and contains no player identity.
+    diagnostic_fight_id: u64,
+    /// The post-end grace path can receive many delayed DoT packets. Keep
+    /// one explanatory diagnostic per correlated fight instead of logging
+    /// every accepted tail packet.
+    grace_logged_fight: Option<u64>,
     /// Identity of the fight currently on the board (issue #152): the
     /// recognized boss it is against and the scene it is being fought in,
     /// captured while the fight is *live* by `recompute_boss`.
@@ -513,6 +520,8 @@ impl Meter {
             boss_entity: None,
             scene_id: None,
             fight_lifecycle: FightLifecycle::Idle,
+            diagnostic_fight_id: 0,
+            grace_logged_fight: None,
             fight_identity: None,
             deaths_seen: 0,
             reset_cfg: ResetConfig::default(),
@@ -933,6 +942,20 @@ impl Meter {
     /// committed to yet.
     pub fn fight_end_cause(&self) -> Option<FightEndCause> {
         self.fight_lifecycle.end_cause()
+    }
+
+    /// Process-local correlation id for the lifecycle currently on the
+    /// board. `0` means combat has not started yet. Consumers may attach it
+    /// to history save/skip diagnostics without using any player identity.
+    pub fn diagnostic_fight_id(&self) -> u64 {
+        self.diagnostic_fight_id
+    }
+
+    /// Most recently confirmed scene id for diagnostic correlation. This is
+    /// intentionally an id only; callers must not derive player identity
+    /// from it.
+    pub fn diagnostic_scene_id(&self) -> Option<u32> {
+        self.scene_id
     }
 
     /// Whether a fight is currently running, as of `now_ms` — the `Active`
@@ -1875,6 +1898,10 @@ impl Meter {
         // looking it up after the bookkeeping would.
         if self.resumes_held_fight(d) {
             self.fight_lifecycle.resume();
+            log::info!(
+                "encounter: fight resumed {} resume_reason=curated_phase",
+                self.diagnostic_context()
+            );
         }
 
         // Real combat activity — a player landing a hit — is the *only*
@@ -1926,6 +1953,13 @@ impl Meter {
         // window existed.
         if self.fight_end_ms().is_some() {
             if self.damage_in_post_end_grace(d) {
+                if self.grace_logged_fight != Some(self.diagnostic_fight_id) {
+                    self.grace_logged_fight = Some(self.diagnostic_fight_id);
+                    log::info!(
+                        "encounter: accepted post-end grace event {} grace_reason=known_target_within_window",
+                        self.diagnostic_context()
+                    );
+                }
                 return self.apply_damage_grace(d);
             }
             return None;
@@ -2086,6 +2120,9 @@ impl Meter {
 
         if self.fight_start_ms().is_none() {
             self.fight_lifecycle.start(d.timestamp_ms);
+            self.diagnostic_fight_id = self.diagnostic_fight_id.saturating_add(1);
+            self.grace_logged_fight = None;
+            log::info!("encounter: fight started {}", self.diagnostic_context());
         }
 
         self.accumulate_damage_stats(d);
@@ -2462,7 +2499,10 @@ impl Meter {
         if !self.fight_lifecycle.end(end_ms, observed_ms, cause, armed) {
             return;
         }
-        log::info!("{}", fight_end_log(cause, boss_monster_id, reason));
+        log::info!(
+            "{}",
+            fight_end_log(cause, boss_monster_id, reason, &self.diagnostic_context())
+        );
     }
 
     /// The monster id of the currently selected boss target, if it has one.
@@ -2470,6 +2510,23 @@ impl Meter {
         self.boss_entity
             .and_then(|uid| self.enemies.get(&uid))
             .and_then(|e| e.monster_id)
+    }
+
+    /// Common, non-identifying context appended to sparse lifecycle records.
+    /// Difficulty is not exposed by the currently modeled protocol, so its
+    /// explicit unknown value distinguishes absent evidence from a default.
+    fn diagnostic_context(&self) -> String {
+        let scene = self
+            .scene_id
+            .map_or_else(|| "<unknown>".to_owned(), |id| id.to_string());
+        let template = self
+            .boss_monster_id()
+            .map_or_else(|| "<unknown>".to_owned(), |id| id.to_string());
+        let phase_pending = self.fight_end_boss_id().is_some_and(phase::has_phase_group);
+        format!(
+            "fight_id={} scene_id={scene} difficulty=<unknown> template_id={template} phase_pending={phase_pending}",
+            self.diagnostic_fight_id,
+        )
     }
 
     /// The monster id of a recognized boss this fight has damaged and that
@@ -4000,7 +4057,13 @@ impl Meter {
         let party_down = self.players.values().filter(|p| !p.alive).count();
         log::info!(
             "{}",
-            reset_log(reason, boss, party_down, self.players.len())
+            reset_log(
+                reason,
+                boss,
+                party_down,
+                self.players.len(),
+                &self.diagnostic_context(),
+            )
         );
         self.players.clear();
         // issue #12/#145 finding 1: `players` just got cleared, so any
@@ -4044,6 +4107,7 @@ impl Meter {
         // cleared-only-some-of-them defect class issue #336 step 3
         // removes.
         self.fight_lifecycle.reset();
+        self.grace_logged_fight = None;
         // issue #391: a held dungeon completion signal describes the fight
         // that was just thrown away — every reset reason drops it, so the
         // next fight's kill cannot be ended by the previous one's signal.
@@ -4597,6 +4661,7 @@ fn fight_end_log(
     cause: FightEndCause,
     boss_monster_id: Option<u32>,
     reason: Option<&str>,
+    context: &str,
 ) -> String {
     let cause = cause.label();
     // issue #410: appended rather than inserted, so every field an
@@ -4608,9 +4673,13 @@ fn fight_end_log(
     match boss_monster_id {
         Some(id) => {
             let name = tables::monster_name(id).unwrap_or("<unresolved>");
-            format!("encounter: fight ended cause={cause} boss_monster_id={id} name={name}{reason}")
+            format!(
+                "encounter: fight ended cause={cause} boss_monster_id={id} name={name}{reason} {context}"
+            )
         }
-        None => format!("encounter: fight ended cause={cause} boss_monster_id=<unknown>{reason}"),
+        None => format!(
+            "encounter: fight ended cause={cause} boss_monster_id=<unknown>{reason} {context}"
+        ),
     }
 }
 
@@ -4719,6 +4788,7 @@ fn reset_log(
     boss: Option<BossHpSnapshot>,
     party_down: usize,
     known_players: usize,
+    context: &str,
 ) -> String {
     let hp = match boss {
         None => "<none>".to_string(),
@@ -4735,7 +4805,7 @@ fn reset_log(
         }
     };
     format!(
-        "encounter: reset reason={reason:?} boss_hp_pct={hp} party_down={party_down} known_players={known_players}"
+        "encounter: reset reason={reason:?} boss_hp_pct={hp} party_down={party_down} known_players={known_players} {context}"
     )
 }
 
@@ -13035,20 +13105,25 @@ mod tests {
 
         #[test]
         fn fight_end_log_names_the_cause_and_the_boss() {
-            let msg = fight_end_log(FightEndCause::BossDeath, Some(103), None);
+            let msg = fight_end_log(FightEndCause::BossDeath, Some(103), None, "fight_id=1");
             assert!(msg.contains("cause=boss_death"));
             assert!(msg.contains("boss_monster_id=103"));
             assert!(msg.contains("name=Ignisor"));
 
-            let msg = fight_end_log(FightEndCause::IdleTimeout, Some(999_999), None);
+            let msg = fight_end_log(
+                FightEndCause::IdleTimeout,
+                Some(999_999),
+                None,
+                "fight_id=1",
+            );
             assert!(msg.contains("cause=idle_timeout"));
             assert!(msg.contains("<unresolved>"));
 
-            let msg = fight_end_log(FightEndCause::Wipe, None, None);
+            let msg = fight_end_log(FightEndCause::Wipe, None, None, "fight_id=1");
             assert!(msg.contains("cause=wipe"));
             assert!(msg.contains("boss_monster_id=<unknown>"));
 
-            let msg = fight_end_log(FightEndCause::ServerChanged, None, None);
+            let msg = fight_end_log(FightEndCause::ServerChanged, None, None, "fight_id=1");
             assert!(msg.contains("cause=server_changed"));
         }
 
@@ -13093,6 +13168,7 @@ mod tests {
                 }),
                 0,
                 4,
+                "fight_id=1",
             );
             assert!(msg.contains("reason=BossHpRollback"));
             // issue #410: the HP always names the entity it belongs to.
@@ -13113,13 +13189,14 @@ mod tests {
                 }),
                 4,
                 4,
+                "fight_id=1",
             );
             assert!(msg.contains("reason=NewFight"));
             assert!(msg.contains("boss_hp_pct=0.0 (uid=20 monster_id=103 alive=false)"));
             assert!(msg.contains("party_down=4 known_players=4"));
 
             // ...and no boss ever tracked at all: `<none>`.
-            let msg = reset_log(ResetReason::NewFight, None, 4, 4);
+            let msg = reset_log(ResetReason::NewFight, None, 4, 4, "fight_id=1");
             assert!(msg.contains("reason=NewFight"));
             assert!(msg.contains("boss_hp_pct=<none>"));
             assert!(msg.contains("party_down=4 known_players=4"));
@@ -13128,7 +13205,7 @@ mod tests {
         #[test]
         fn fight_end_and_reset_logs_never_leak_a_player_name_or_uid() {
             // No boss tracked at all: nothing to carry a uid.
-            let msg = reset_log(ResetReason::Manual, None, 1, 4);
+            let msg = reset_log(ResetReason::Manual, None, 1, 4, "fight_id=1");
             assert!(!msg.contains("uid"));
             assert!(!msg.contains("Player"));
 
@@ -13145,12 +13222,13 @@ mod tests {
                 }),
                 1,
                 4,
+                "fight_id=1",
             );
             assert_eq!(msg.matches("uid=").count(), 1);
             assert!(msg.contains("uid=20"));
             assert!(!msg.contains("Player"));
 
-            let msg = fight_end_log(FightEndCause::Wipe, Some(103), None);
+            let msg = fight_end_log(FightEndCause::Wipe, Some(103), None, "fight_id=1");
             assert!(!msg.contains("uid"));
         }
     }

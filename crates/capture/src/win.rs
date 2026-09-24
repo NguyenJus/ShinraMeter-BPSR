@@ -771,8 +771,9 @@ fn recv_loop(
         for event in decoder.push_stream(&stream, now_ms()) {
             use crate::backpressure::SendOutcome;
             match drop_counter.try_send(&tx, event, Instant::now()) {
-                SendOutcome::Sent => {}
+                SendOutcome::Sent => queue_drop_signal.note_accepted(tx.len()),
                 SendOutcome::Dropped(Some(report)) => {
+                    queue_drop_signal.note_dropped(tx.len());
                     queue_drop_signal.note_report();
                     let kinds = report
                         .kinds()
@@ -792,7 +793,7 @@ fn recv_loop(
                             .map_or_else(|| "unbounded".to_string(), |n| n.to_string()),
                     );
                 }
-                SendOutcome::Dropped(None) => {}
+                SendOutcome::Dropped(None) => queue_drop_signal.note_dropped(tx.len()),
                 SendOutcome::Disconnected => {
                     log::error!(
                         "capture: the protocol-event channel is closed (the pipeline thread is \

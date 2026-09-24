@@ -11,7 +11,7 @@ assume the reported behavior is fixed.
    pull, each relevant event, and the unexpected behavior. Include expected vs
    actual values, and a screenshot when the discrepancy is visual.
 3. Export a session bundle from the header menu immediately after reproducing.
-   Close the meter normally, then also preserve the final log and `.log.1` from
+   Close the meter normally, then also preserve the final log and numbered `.log.1` through `.log.7` siblings from
    `%APPDATA%\ShinraMeter-BPSR\logs` so shutdown diagnostics are retained.
 4. Keep the bundle, notes, screenshots, and any extra captures in a private local
    folder outside the repository. Give the agent that folder's path next session.
@@ -108,3 +108,48 @@ damage or add field semantics until the observations establish their meaning.
   window width, display scale, and a screenshot of any remaining overlap. Check
   left-click expansion and right-click loading against two different fights.
 - **#165, README:** explicitly requests a human rewrite; leave it for the author.
+
+## Diagnostic builds after the September session investigation
+
+Text logs retain eight 5 MiB chunks (current file plus `.1`–`.7`, about
+40 MiB total). Export logs/session bundle includes the complete retained
+text ring in chronological order. The packet-dump ring remains independently
+bounded at 512 MiB by default; increasing text retention does not increase
+packet retention. Busy sessions can still evict early packet data, so export
+soon after the symptom.
+
+Startup records link the previous session ID/version and whether its main
+function reached completion, including the outcome of explicit worker joins.
+A missing completion can mean interruption, forced termination, or a failed
+marker write; it is not by itself proof of a crash. Capture shutdown retains
+its own outcome messages. UI startup also records creation latency, scale,
+and viewport bounds to help distinguish capture stalls from window problems.
+
+The diagnostic changes provide evidence, not fixes for the tracked bugs.
+A few sessions must still include the relevant scene/phase/death transitions;
+HP interpretation still needs a timestamped comparison with the game's display.
+Keep exported artifacts private as above.
+
+On these builds, sanitized dumps retain numeric `AttrMaxHpTotal` (`0x2c39`)
+in addition to current HP (`0x2c2e`) and max HP (`0x2c38`). The inspector's
+bounded summary reports count, invalid-value count, and min/max for the
+candidate; those global extrema are not a boss's HP. To correlate values,
+follow `SyncNearEntities` and delta attribute collections by their remapped
+UUID, join template `0x0a`, and use scene `0x155`/EnterScene ordering. This
+supersedes the older-build limitation above for this specific attribute only;
+other unknown fields are still removed. No candidate is used to change meter
+HP calculations. Difficulty remains unknown where no validated decoder exists.
+
+For queue loss, look for `pipeline diagnostics` summaries and the existing
+capture drop reports together. Counts/rates, sampled queue high-water marks,
+step/command/tick/publish timings, and time since the last decoded event
+separate several failure paths. Queue depth is only a backlog indicator,
+not a measurement of the oldest event's age. Select-loop gaps include idle
+waiting and scheduler delay; they do not measure lock contention directly.
+Use the surrounding summaries rather than attributing a single long gap to
+a particular subsystem.
+
+Encounter start/end/reset/resume/grace lines carry a process-local `fight_id`
+and scene/template context. Correlate within a session/PID, not across runs.
+History diagnostics identify record outcomes so a missing row can be separated
+from an expected retention skip or an enqueue/write failure.

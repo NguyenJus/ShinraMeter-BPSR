@@ -521,6 +521,7 @@ mod tests {
     #[test]
     fn bundle_entries_maps_every_source_to_its_own_basename() {
         let log_parts = vec![
+            PathBuf::from("/logs/ShinraMeter-BPSR.log.7"),
             PathBuf::from("/logs/ShinraMeter-BPSR.log.1"),
             PathBuf::from("/logs/ShinraMeter-BPSR.log"),
         ];
@@ -535,6 +536,10 @@ mod tests {
         assert_eq!(
             entries,
             vec![
+                (
+                    "ShinraMeter-BPSR.log.7".to_string(),
+                    PathBuf::from("/logs/ShinraMeter-BPSR.log.7")
+                ),
                 (
                     "ShinraMeter-BPSR.log.1".to_string(),
                     PathBuf::from("/logs/ShinraMeter-BPSR.log.1")

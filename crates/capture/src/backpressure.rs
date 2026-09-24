@@ -15,7 +15,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -27,11 +27,33 @@ use crossbeam_channel::{Sender, TrySendError};
 /// enough that the loss is visible well inside the stall that caused it.
 pub const LOG_INTERVAL: Duration = Duration::from_secs(5);
 
-/// A lock-free notification from capture to the pipeline that a rate-limited
-/// queue-drop report was emitted. It carries no decoded event data: the
-/// pipeline needs only a boundary for its own aggregate timing report.
+/// A field-free cumulative view of capture's protocol-event handoff.
+///
+/// `depth_high_water` is sampled immediately after successful sends and
+/// rejected sends. It is useful pressure context, not an atomic history of
+/// the channel: the pipeline may drain between a sender's sample and a later
+/// reader's observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueueTelemetry {
+    pub accepted: u64,
+    pub dropped: u64,
+    pub depth_high_water: usize,
+}
+
+#[derive(Debug, Default)]
+struct QueueTelemetryState {
+    generation: AtomicU64,
+    accepted: AtomicU64,
+    dropped: AtomicU64,
+    depth_high_water: AtomicUsize,
+}
+
+/// A lock-free, field-free capture-to-pipeline diagnostic signal. Besides the
+/// rate-limited drop-report generation, it holds cumulative ingress and queue
+/// pressure counters so the pipeline can report rates without touching the
+/// capture thread or decoded event contents.
 #[derive(Clone, Debug, Default)]
-pub struct QueueDropSignal(Arc<AtomicU64>);
+pub struct QueueDropSignal(Arc<QueueTelemetryState>);
 
 impl QueueDropSignal {
     pub fn new() -> Self {
@@ -40,14 +62,54 @@ impl QueueDropSignal {
 
     /// Marks one completed capture-side drop-report window.
     pub fn note_report(&self) {
-        self.0.fetch_add(1, Ordering::Relaxed);
+        self.0.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Returns the current report generation for a consumer to compare with
     /// its last observation. A missed intermediate increment still means one
     /// aggregate report is due; no correctness depends on the exact count.
     pub fn generation(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
+        self.0.generation.load(Ordering::Relaxed)
+    }
+
+    /// Records one successfully accepted event and its queue depth sampled
+    /// immediately afterwards. This is deliberately constant-time and never
+    /// waits on the pipeline.
+    pub fn note_accepted(&self, depth: usize) {
+        self.0.accepted.fetch_add(1, Ordering::Relaxed);
+        self.note_depth(depth);
+    }
+
+    /// Records one event dropped because the bounded event channel was full.
+    pub fn note_dropped(&self, depth: usize) {
+        self.0.dropped.fetch_add(1, Ordering::Relaxed);
+        self.note_depth(depth);
+    }
+
+    fn note_depth(&self, depth: usize) {
+        let mut previous = self.0.depth_high_water.load(Ordering::Relaxed);
+        while depth > previous {
+            match self.0.depth_high_water.compare_exchange_weak(
+                previous,
+                depth,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => previous = observed,
+            }
+        }
+    }
+
+    /// Returns cumulative counters for a consumer to difference over its own
+    /// reporting window. The values are approximate under concurrent capture,
+    /// which is sufficient for observability and keeps the hot path lock-free.
+    pub fn telemetry(&self) -> QueueTelemetry {
+        QueueTelemetry {
+            accepted: self.0.accepted.load(Ordering::Relaxed),
+            dropped: self.0.dropped.load(Ordering::Relaxed),
+            depth_high_water: self.0.depth_high_water.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -419,5 +481,24 @@ mod tests {
         assert_eq!(observer.generation(), 0);
         signal.note_report();
         assert_eq!(observer.generation(), 1);
+    }
+
+    #[test]
+    fn queue_telemetry_is_shared_and_tracks_ingress_drops_and_high_water() {
+        let signal = QueueDropSignal::new();
+        let observer = signal.clone();
+
+        signal.note_accepted(2);
+        signal.note_dropped(4);
+        signal.note_accepted(3);
+
+        assert_eq!(
+            observer.telemetry(),
+            QueueTelemetry {
+                accepted: 2,
+                dropped: 1,
+                depth_high_water: 4,
+            }
+        );
     }
 }

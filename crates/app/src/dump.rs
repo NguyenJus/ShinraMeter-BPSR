@@ -75,7 +75,8 @@ use bpsr_protocol::dump_format::{numbered_sibling, ring_siblings};
 /// numbered chunks shift up by one first (`.1` -> `.2`, `.2` -> `.3`, ...,
 /// see [`shift_ring`]) — and `path` is reopened empty. Checked both at
 /// startup (a pre-existing oversized file from a prior run) and
-/// continuously while the writer thread runs, mirroring `logging::Tee`.
+/// continuously while the writer thread runs, mirroring `logging::Tee`'s
+/// bounded retained-chunk rotation.
 ///
 /// Ten times `logging::MAX_LOG_BYTES`, deliberately — unchanged by issue
 /// #322. The two files are capped for different reasons: a log grows while
