@@ -73,11 +73,11 @@ total.
 | --- | --- |
 | #458: total HP | Use an unsanitized session for one Sea-Ringed Reef pull and one Frost Ogre pull. Record the game's visible current/max HP and the meter pill at spawn, after a known damage interval, and across each phase/scaling change. Record difficulty, party size, and exact screenshot times. Do not infer a scale factor from damage alone. |
 | #456: floor-50 reset | Enter floor 50, kill the boss, then wait without manually resetting or starting another fight. Record scene/difficulty, death time, reset time, and whether the fight appears in history. Preserve logs from scene entry through the next fight. |
-| #429: phase history | On a build containing PR #463, complete Reef or Goblin King. Note each form's death, next form appearance, first hit, final death, and number of history rows. If possible, leave more than two seconds before the next form's first hit. |
+| #429: phase history (fixed) | PR #463 and its delayed-phase regression resolve the defect. Optional field coverage: complete Reef or Goblin King, noting each phase and history row count, with a gap exceeding two seconds. |
 | #449: template identity | Run **base-tier** Mistveil Hunting Ground (scene 5901); preserve the `boss target changed` line with `monster_id`. Separate Towering Ruin 1151–1154 runs can confirm their template ids too. |
 | #455: decoded queue loss | Reproduce a busy encounter on a build containing [PR #465](https://github.com/NguyenJus/ShinraMeter-BPSR/pull/465). Note time, party size, UI actions, and any freeze. Keep the entire session log, especially queue-drop summaries and shutdown. A protocol dump alone cannot identify consumer delay. |
 | #454: repeated TCP holes | Alongside the meter, record a short full-packet TCP trace on the game interface using a local packet-capture tool. Start before the affected pull; stop immediately after a stall. Retain packet timestamps, sequence numbers, payload lengths, and retransmissions. Save the trace privately with the matching log and note tool/interface, capture-drop count, VPN/accelerator state, and stall times. A decoded dump cannot reconstruct missing TCP segments. |
-| #425: field validation | On a current build, complete one Chaotic dungeon, close normally, and immediately relaunch. Record any blank meter, stalls, server-change reset, or already-running error. Keep both session ids and logs; old v0.3.0 logs cannot validate newer fixes. |
+| #425: field validation (complete) | The two latest v0.3.4 sessions supply Chaotic-dungeon and relaunch-after-close coverage; see the [September 25 findings](session-log-findings-2026-09-25.md). Residual TCP and queue-loss work remains in #454/#455. |
 | #380: proxy ownership | Record accelerator/helper name and version. Reproduce no-adoption with it enabled, then repeat with it disabled. Save both session logs and the helper/game process names and PIDs locally; note whether the helper owns the server TCP socket. Do not change ownership policy based only on a VPN being installed. |
 
 The retained v0.3.3 sessions on 2026-09-21 and 2026-09-22 did reproduce
@@ -105,10 +105,10 @@ damage or add field semantics until the observations establish their meaning.
 | Issues | Short reproduction and notes to retain |
 | --- | --- |
 | #345: damage tag 7 | Hit one target with a known skill for several isolated hits, then repeat under a known mitigation/shield change. Note hit times, visible damage numbers, skill, and target state so `Value` and tag 7 can be compared. |
-| #289: attr 0x1bb | Record one full boss pull with timestamped gauge/phase observations, including spawn, gauge changes, and death. Multiple values for the same entity are needed. |
-| #288: movement/facing | On one character, stand still, turn in place, move straight without turning, then stop. Note the start/end of each interval. |
+| #289: attr 0x1bb | Reference identity is `AttrStunned`; see the [September 25 audit](reference-protocol-audit-2026-09-25.md). A future gauge feature still needs controlled value/unit observations; do not infer an enrage gauge. |
+| #288: movement/facing | Reference names now identify direction/jump/velocity fields; `0x1da` is `AttrHateList`, not movement. See the [audit](reference-protocol-audit-2026-09-25.md). Validate units only when a concrete consumer needs them. |
 | #285: death/revive/buffs | Record one raid with a death, revive, and known buff application/expiry. Note times and who received each effect using local aliases. Existing decoders still need field confirmation; an old issue description is not proof the decoder is absent. |
-| #290: list attrs | Defer until a meter feature needs these fields. If investigating, change one equipment/loadout slot at a time while stationary and note each before/after item and timestamp. |
+| #290: list attrs | Reference names identify fight-resource IDs/values, not equipment slots; see the [audit](reference-protocol-audit-2026-09-25.md). Any future consumer must validate list encoding and resource semantics. |
 
 ## Other blockers
 
@@ -170,3 +170,8 @@ Encounter start/end/reset/resume/grace lines carry a process-local `fight_id`
 and scene/template context. Correlate within a session/PID, not across runs.
 History diagnostics identify record outcomes so a missing row can be separated
 from an expected retention skip or an enqueue/write failure.
+
+The [September 25 reference audit](reference-protocol-audit-2026-09-25.md)
+compares the newly retained `0x2c39` values with existing HP by monster. They
+track closely; these observations do not establish a replacement for #458. The user
+reports the mismatch across boss encounters, beyond the two original examples.
