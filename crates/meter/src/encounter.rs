@@ -678,8 +678,9 @@ impl Meter {
     ///   is derived from `last_event_ms` on every call rather than requiring
     ///   a `tick`, so a caller that only ever calls `snapshot` still gets
     ///   the hold — `tick` merely pins it. Suppressed while
-    ///   [`Self::engaged_boss_still_up`] (issue #151): a lull is not the end
-    ///   of a pull the party is still standing in.
+    ///   [`Self::engaged_boss_still_up`] (issue #151), or while the game
+    ///   confirms a dungeon run is in progress: a lull between that run's
+    ///   mob phases is not an encounter boundary.
     ///
     /// The end time is the last damage event, not "now": the fight really
     /// ended when the hitting stopped, and using it keeps the frozen elapsed
@@ -694,6 +695,7 @@ impl Meter {
         if idle > 0
             && now_ms.saturating_sub(self.last_event_ms) >= idle
             && !self.engaged_boss_still_up(now_ms)
+            && !self.dungeon_run_in_progress()
         {
             Some(self.last_event_ms)
         } else {
@@ -2424,6 +2426,25 @@ impl Meter {
         self.current_objective_id
             .and_then(|id| self.objectives.get(&id))
             .is_some_and(|obj| obj.complete != Some(true))
+    }
+
+    /// Whether the game has confirmed an instance run that has not reached
+    /// its terminal state (issue #476). This is deliberately broader than
+    /// [`Self::dungeon_objective_still_running`]: many ordinary dungeon
+    /// mob phases produce no objective update, but an `Active`/`Playing`
+    /// state is still authoritative evidence that the next pack or boss is
+    /// part of this run. It is deliberately narrower than
+    /// [`Self::in_dungeon_scene`]: a scene packet alone can outlive a run,
+    /// so sessions without dungeon-state packets retain the ordinary idle
+    /// timeout fallback.
+    fn dungeon_run_in_progress(&self) -> bool {
+        self.in_dungeon_scene()
+            && self.dungeon_state.is_some_and(|state| {
+                !matches!(
+                    state,
+                    EDungeonState::Null | EDungeonState::End | EDungeonState::Settlement
+                )
+            })
     }
 
     /// Whether the instance has already declared this run terminal. The
@@ -8747,7 +8768,61 @@ mod tests {
         }
 
         #[test]
-        fn the_idle_timeout_still_ends_a_pull_on_trash_in_a_dungeon() {
+        fn a_confirmed_dungeon_run_keeps_mob_phases_in_one_encounter() {
+            let mut m = in_dungeon();
+            m.apply(&ProtocolEvent::DungeonState {
+                state: EDungeonState::Active,
+                scene_uuid: None,
+            });
+            m.apply(&hp(10, 50, Some(TRASH), 0));
+            m.apply(&boss_hit(10, 1_000, true));
+
+            // Each of these gaps is longer than the ordinary idle timeout.
+            // Before #476 the first one made this `Ended`, so the next pack
+            // fired ResetReason::NewFight and discarded the first wave.
+            let second_pack_at = 1_000 + idle() + 10_000;
+            assert_eq!(m.fight_state(second_pack_at), FightState::Active);
+            m.apply(&hp(11, 50, Some(TRASH), second_pack_at));
+            assert_eq!(m.apply(&boss_hit(11, second_pack_at, true)), None);
+
+            let boss_at = second_pack_at + idle() + 10_000;
+            assert_eq!(m.fight_state(boss_at), FightState::Active);
+            m.apply(&hp(12, 100, Some(BOSS), boss_at));
+            assert_eq!(m.apply(&boss_hit(12, boss_at, false)), None);
+            assert_eq!(m.fight_state(boss_at), FightState::Active);
+            assert_eq!(m.snapshot(boss_at).total_damage, 300);
+        }
+
+        #[test]
+        fn a_terminal_dungeon_boss_still_allows_the_next_fight_reset() {
+            let mut m = in_dungeon();
+            m.apply(&ProtocolEvent::DungeonState {
+                state: EDungeonState::Active,
+                scene_uuid: None,
+            });
+            m.apply(&hp(10, 100, Some(BOSS), 1_000));
+            m.apply(&boss_hit(10, 1_000, false));
+            m.apply(&ProtocolEvent::DungeonState {
+                state: EDungeonState::End,
+                scene_uuid: None,
+            });
+            m.apply(&boss_hit(10, 2_000, true));
+            assert_eq!(m.fight_state(2_000), FightState::Ended);
+
+            // End is terminal, so a later pull remains the ordinary
+            // NewFight boundary rather than being merged into the run.
+            assert_eq!(
+                m.apply(&boss_hit(
+                    11,
+                    2_000 + m.fight_config().post_end_grace_ms + 1,
+                    false
+                )),
+                Some(ResetReason::NewFight)
+            );
+        }
+
+        #[test]
+        fn the_idle_timeout_still_ends_a_dungeon_trash_pull_without_run_state() {
             let mut m = in_dungeon();
             m.apply(&hp(10, 50, Some(TRASH), 0));
             m.apply(&boss_hit(10, 1_000, false));
