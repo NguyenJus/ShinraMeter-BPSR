@@ -265,7 +265,9 @@ mod tests {
 
     use super::*;
     use crate::history::sqlite::SqliteHistory;
-    use crate::history::{EncounterRecord, HistoryStore, PlayerRecord, RetentionPolicy};
+    use crate::history::{
+        EncounterRecord, HistoryStore, PlayerRecord, RetentionPolicy, SkillRecord,
+    };
     use bpsr_meter::{EntityId, EntityKind};
 
     fn temp_db_path(tag: &str) -> std::path::PathBuf {
@@ -296,7 +298,13 @@ mod tests {
             lucky_pct: 6.25,
             hits: 40,
             deaths: 2,
+            dead_ms: Some(1_234),
             skills: Vec::new(),
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
+            buffs: Vec::new(),
         }
     }
 
@@ -433,6 +441,59 @@ mod tests {
             assert_eq!(a.player_count, b.player_count);
         }
 
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn sanitize_copy_keeps_history_fidelity_fields() {
+        let src = temp_db_path("history-fidelity");
+        let mut player = sample_player(1, "Alice");
+        player.dead_ms = Some(12_345);
+        let skill = SkillRecord {
+            skill_id: 201,
+            damage: 700,
+            share_pct: 100.0,
+            crit_pct: 0.0,
+            max_crit: 0,
+            avg_crit: 0.0,
+            avg_white: 700.0,
+            avg: 700.0,
+            hits: 1,
+            crit_hits: 0,
+            hits_per_min: 6.0,
+        };
+        player.heals = vec![skill.clone()];
+        player.dealt = vec![skill.clone()];
+        player.received = vec![skill.clone()];
+        player.casts = vec![skill.clone()];
+        player.buffs = vec![skill];
+        let mut store = SqliteHistory::open(&src, RetentionPolicy::default()).unwrap();
+        let id = store
+            .insert(&sample_record(1_000, 10_000, vec![player]))
+            .unwrap()
+            .unwrap();
+        drop(store);
+
+        let dst = temp_db_path("history-fidelity-out");
+        sanitize_copy(&src, &dst).unwrap();
+        let store = SqliteHistory::open(&dst, RetentionPolicy::default()).unwrap();
+        let player = &store.load(id).unwrap().unwrap().players[0];
+
+        assert_eq!(player.dead_ms, Some(12_345));
+        assert_eq!(
+            [
+                &player.heals,
+                &player.dealt,
+                &player.received,
+                &player.casts,
+                &player.buffs,
+            ]
+            .map(|breakdown| breakdown[0].skill_id),
+            [201, 201, 201, 201, 201]
+        );
+
+        drop(store);
         let _ = fs::remove_file(&src);
         let _ = fs::remove_file(&dst);
     }

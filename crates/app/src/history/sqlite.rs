@@ -167,10 +167,12 @@ fn init_schema(conn: &Connection) -> Result<(), HistoryError> {
             lucky_pct       REAL    NOT NULL,
             hits            INTEGER NOT NULL,
             deaths          INTEGER NOT NULL,
+            dead_ms         INTEGER,
             PRIMARY KEY (encounter_id, slot)
         );",
     )?;
     conn.execute_batch(SKILLS_DDL)?;
+    conn.execute_batch(BREAKDOWNS_DDL)?;
     Ok(())
 }
 
@@ -201,6 +203,34 @@ const SKILLS_DDL: &str = "CREATE TABLE IF NOT EXISTS encounter_player_skills (
         hits_per_min    REAL    NOT NULL,
         PRIMARY KEY (encounter_id, slot, skill_slot)
     );";
+
+/// The five non-damage breakdown tabs added in schema v6. Damage skills stay
+/// in their original table so every pre-v6 database remains readable without
+/// rewriting its existing rows.
+const BREAKDOWNS_DDL: &str = "CREATE TABLE IF NOT EXISTS encounter_player_breakdowns (
+        encounter_id    INTEGER NOT NULL REFERENCES encounters(id) ON DELETE CASCADE,
+        slot            INTEGER NOT NULL,
+        tab             INTEGER NOT NULL,
+        skill_slot      INTEGER NOT NULL,
+        skill_id        INTEGER NOT NULL,
+        damage          INTEGER NOT NULL,
+        share_pct       REAL    NOT NULL,
+        crit_pct        REAL    NOT NULL,
+        max_crit        INTEGER NOT NULL,
+        avg_crit        REAL    NOT NULL,
+        avg_white       REAL    NOT NULL,
+        avg             REAL    NOT NULL,
+        hits            INTEGER NOT NULL,
+        crit_hits       INTEGER NOT NULL,
+        hits_per_min    REAL    NOT NULL,
+        PRIMARY KEY (encounter_id, slot, tab, skill_slot)
+    );";
+
+const TAB_HEALS: i64 = 0;
+const TAB_DEALT: i64 = 1;
+const TAB_RECEIVED: i64 = 2;
+const TAB_CASTS: i64 = 3;
+const TAB_BUFFS: i64 = 4;
 
 /// Upgrades a file stamped with the known older version `from` to
 /// `SCHEMA_VERSION`, in place. Every step here is either additive DDL
@@ -333,6 +363,13 @@ fn migrate(conn: &Connection, from: i32) -> Result<(), HistoryError> {
             );
         }
     }
+    // v5 -> v6: preserve the live table's measured death duration and every
+    // breakdown tab that a full history snapshot contains. The new column is
+    // nullable: old rows have an unknown value, never a fabricated zero.
+    if from < 6 {
+        conn.execute_batch("ALTER TABLE encounter_players ADD COLUMN dead_ms INTEGER;")?;
+        conn.execute_batch(BREAKDOWNS_DDL)?;
+    }
     Ok(())
 }
 
@@ -408,14 +445,20 @@ impl HistoryStore for SqliteHistory {
                 "INSERT INTO encounter_players (
                     encounter_id, slot, uid, entity, name, class, ability_score, season_strength,
                     imagine_0, imagine_1, imagine_tier_0, imagine_tier_1,
-                    damage, dps, share_pct, crit_pct, lucky_pct, hits, deaths
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                    damage, dps, share_pct, crit_pct, lucky_pct, hits, deaths, dead_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             )?;
             let mut skill_stmt = tx.prepare(
                 "INSERT INTO encounter_player_skills (
                     encounter_id, slot, skill_slot, skill_id, damage, share_pct, crit_pct,
                     max_crit, avg_crit, avg_white, avg, hits, crit_hits, hits_per_min
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            )?;
+            let mut breakdown_stmt = tx.prepare(
+                "INSERT INTO encounter_player_breakdowns (
+                    encounter_id, slot, tab, skill_slot, skill_id, damage, share_pct, crit_pct,
+                    max_crit, avg_crit, avg_white, avg, hits, crit_hits, hits_per_min
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )?;
             for (slot, player) in record.players.iter().enumerate() {
                 let slot_id = i64::try_from(slot).unwrap_or(i64::MAX);
@@ -439,6 +482,9 @@ impl HistoryStore for SqliteHistory {
                     f64::from(player.lucky_pct),
                     i64::try_from(player.hits).unwrap_or(i64::MAX),
                     i64::from(player.deaths),
+                    player
+                        .dead_ms
+                        .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX)),
                 ])?;
 
                 for (skill_slot, skill) in player.skills.iter().enumerate() {
@@ -458,6 +504,33 @@ impl HistoryStore for SqliteHistory {
                         i64::try_from(skill.crit_hits).unwrap_or(i64::MAX),
                         skill.hits_per_min,
                     ])?;
+                }
+                for (tab, breakdown) in [
+                    (TAB_HEALS, &player.heals),
+                    (TAB_DEALT, &player.dealt),
+                    (TAB_RECEIVED, &player.received),
+                    (TAB_CASTS, &player.casts),
+                    (TAB_BUFFS, &player.buffs),
+                ] {
+                    for (skill_slot, skill) in breakdown.iter().enumerate() {
+                        breakdown_stmt.execute(params![
+                            encounter_id,
+                            slot_id,
+                            tab,
+                            i64::try_from(skill_slot).unwrap_or(i64::MAX),
+                            skill.skill_id,
+                            skill.damage,
+                            f64::from(skill.share_pct),
+                            f64::from(skill.crit_pct),
+                            skill.max_crit,
+                            skill.avg_crit,
+                            skill.avg_white,
+                            skill.avg,
+                            i64::try_from(skill.hits).unwrap_or(i64::MAX),
+                            i64::try_from(skill.crit_hits).unwrap_or(i64::MAX),
+                            skill.hits_per_min,
+                        ])?;
+                    }
                 }
             }
         }
@@ -551,13 +624,13 @@ impl HistoryStore for SqliteHistory {
         let mut stmt = self.conn.prepare(
             "SELECT uid, entity, name, class, ability_score, season_strength, imagine_0,
                     imagine_1, imagine_tier_0, imagine_tier_1, damage, dps, share_pct, crit_pct,
-                    lucky_pct, hits, deaths, slot
+                    lucky_pct, hits, deaths, dead_ms, slot
              FROM encounter_players WHERE encounter_id = ?1 ORDER BY slot",
         )?;
         let loaded = stmt
             .query_map(params![id], |row| {
                 let uid: i64 = row.get(0)?;
-                let slot: i64 = row.get(17)?;
+                let slot: i64 = row.get(18)?;
                 // Issue #379: a pre-v3 row has no stored `entity` and reads
                 // back `NULL` here; reconstruct the same `EntityId` a live
                 // encounter would have derived for a bare display uid, so
@@ -607,7 +680,15 @@ impl HistoryStore for SqliteHistory {
                     lucky_pct: row.get::<_, f64>(14)? as f32,
                     hits: u64::try_from(row.get::<_, i64>(15)?).unwrap_or(0),
                     deaths: u32::try_from(row.get::<_, i64>(16)?).unwrap_or(0),
+                    dead_ms: row
+                        .get::<_, Option<i64>>(17)?
+                        .and_then(|ms| u64::try_from(ms).ok()),
                     skills: Vec::new(),
+                    heals: Vec::new(),
+                    dealt: Vec::new(),
+                    received: Vec::new(),
+                    casts: Vec::new(),
+                    buffs: Vec::new(),
                 })))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -666,6 +747,49 @@ impl HistoryStore for SqliteHistory {
             }
         }
 
+        let mut stmt = self.conn.prepare(
+            "SELECT slot, tab, skill_id, damage, share_pct, crit_pct, max_crit, avg_crit,
+                    avg_white, avg, hits, crit_hits, hits_per_min
+             FROM encounter_player_breakdowns WHERE encounter_id = ?1
+             ORDER BY slot, tab, skill_slot",
+        )?;
+        let breakdowns = stmt.query_map(params![id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                SkillRecord {
+                    skill_id: row.get(2)?,
+                    damage: row.get(3)?,
+                    share_pct: row.get::<_, f64>(4)? as f32,
+                    crit_pct: row.get::<_, f64>(5)? as f32,
+                    max_crit: row.get(6)?,
+                    avg_crit: row.get(7)?,
+                    avg_white: row.get(8)?,
+                    avg: row.get(9)?,
+                    hits: u64::try_from(row.get::<_, i64>(10)?).unwrap_or(0),
+                    crit_hits: u64::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
+                    hits_per_min: row.get(12)?,
+                },
+            ))
+        })?;
+        for entry in breakdowns {
+            let (slot, tab, skill) = entry?;
+            let Some(player) = slot_to_index
+                .get(&slot)
+                .and_then(|index| record.players.get_mut(*index))
+            else {
+                continue;
+            };
+            match tab {
+                TAB_HEALS => player.heals.push(skill),
+                TAB_DEALT => player.dealt.push(skill),
+                TAB_RECEIVED => player.received.push(skill),
+                TAB_CASTS => player.casts.push(skill),
+                TAB_BUFFS => player.buffs.push(skill),
+                _ => log::warn!("history: ignoring unknown breakdown tab {tab} in encounter {id}"),
+            }
+        }
+
         Ok(Some(record))
     }
 
@@ -704,7 +828,13 @@ mod tests {
             lucky_pct: 6.25,
             hits: 40,
             deaths: 2,
+            dead_ms: Some(1_234),
             skills: Vec::new(),
+            heals: Vec::new(),
+            dealt: Vec::new(),
+            received: Vec::new(),
+            casts: Vec::new(),
+            buffs: Vec::new(),
         }
     }
 
@@ -1178,6 +1308,32 @@ mod tests {
         assert_eq!(loaded.local_uid, Some(1));
     }
 
+    #[test]
+    fn inserting_and_loading_preserves_death_time_and_every_breakdown_tab() {
+        let mut player = sample_player(1, "Alice");
+        player.dead_ms = Some(12_345);
+        player.heals = vec![sample_skill(201, 700)];
+        player.dealt = vec![sample_skill(202, 600)];
+        player.received = vec![sample_skill(203, 500)];
+        player.casts = vec![sample_skill(204, 0)];
+        player.buffs = vec![sample_skill(205, 400)];
+        let mut store = SqliteHistory::in_memory(RetentionPolicy::default()).unwrap();
+        let id = store
+            .insert(&sample_record(1_000, 10_000, vec![player.clone()]))
+            .unwrap()
+            .unwrap();
+
+        let loaded = store.load(id).unwrap().unwrap();
+        let loaded = &loaded.players[0];
+
+        assert_eq!(loaded.dead_ms, player.dead_ms);
+        assert_eq!(loaded.heals, player.heals);
+        assert_eq!(loaded.dealt, player.dealt);
+        assert_eq!(loaded.received, player.received);
+        assert_eq!(loaded.casts, player.casts);
+        assert_eq!(loaded.buffs, player.buffs);
+    }
+
     /// Issue #379: two players who share a recycled display `uid` in the
     /// same live encounter must stay two distinct rows on reload, each
     /// carrying its own `entity`.
@@ -1547,6 +1703,61 @@ mod tests {
             loaded.is_none(),
             "an encounter with no loadable players must not be returned"
         );
+    }
+
+    #[test]
+    fn a_v5_database_migrates_without_inventing_death_time_or_breakdowns() {
+        let path = crate::history::temp_history_path("v5-history-fidelity-migration");
+        let _ = fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V1_SCHEMA).unwrap();
+            conn.execute_batch(SKILLS_DDL).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE encounters ADD COLUMN local_uid INTEGER;
+                 ALTER TABLE encounter_players ADD COLUMN entity INTEGER;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO encounters (
+                    ended_at_ms, duration_ms, total_damage, total_dps, boss_monster_id,
+                    boss_name, is_boss, scene_id, scene_name, title, subtitle,
+                    player_count, meter_version, local_uid
+                 ) VALUES (1000, 10000, 10000, 1000.0, 7, 'Boss', 1, 3, 'Scene', 'Boss',
+                           'Scene', 1, '0.2.2', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO encounter_players (
+                    encounter_id, slot, uid, entity, name, class, ability_score, season_strength,
+                    imagine_0, imagine_1, imagine_tier_0, imagine_tier_1,
+                    damage, dps, share_pct, crit_pct, lucky_pct, hits, deaths
+                 ) VALUES (1, 0, 1, 65536, 'Alice', 'FrostMage', 999, 42, 1, NULL, 3, NULL,
+                           5000, 500.0, 33.3, 12.5, 6.25, 40, 2)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 5).unwrap();
+        }
+
+        let store = SqliteHistory::open(&path, RetentionPolicy::default()).unwrap();
+        let loaded = store.load(1).unwrap().unwrap();
+        let version: i32 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        drop(store);
+        let _ = fs::remove_file(&path);
+
+        let player = &loaded.players[0];
+        assert_eq!(player.dead_ms, None, "old unrecorded time stays unknown");
+        assert!(player.heals.is_empty());
+        assert!(player.dealt.is_empty());
+        assert!(player.received.is_empty());
+        assert!(player.casts.is_empty());
+        assert!(player.buffs.is_empty());
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
