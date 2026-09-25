@@ -901,7 +901,13 @@ mod tests {
                     lucky_pct: 6.25,
                     hits: 40,
                     deaths: 0,
+                    dead_ms: Some(0),
                     skills: Vec::new(),
+                    heals: Vec::new(),
+                    dealt: Vec::new(),
+                    received: Vec::new(),
+                    casts: Vec::new(),
+                    buffs: Vec::new(),
                 }],
             })
             .unwrap();

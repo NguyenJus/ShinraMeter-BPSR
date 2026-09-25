@@ -65,10 +65,12 @@ pub fn history_db_path() -> PathBuf {
 /// A file stamped with an *older* known version is migrated forward in place
 /// by `sqlite::migrate`, so an existing history survives the upgrade with
 /// its older encounters simply carrying no skill rows / no local uid / no
-/// stored entity. Only a version this build has never heard of (a downgrade,
+/// v5 → v6 adds nullable player death time and the five remaining skill
+/// breakdowns. Existing rows retain an unknown death time and empty lists.
+/// Only a version this build has never heard of (a downgrade,
 /// or a hand-edited file) is still renamed aside and replaced, since there
 /// is nothing to migrate *from*.
-pub const SCHEMA_VERSION: i32 = 5;
+pub const SCHEMA_VERSION: i32 = 6;
 
 /// Retention rules, applied inside every `HistoryStore::insert` (spec §5.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,11 +195,21 @@ pub struct PlayerRecord {
     pub lucky_pct: f32,
     pub hits: u64,
     pub deaths: u32,
+    /// Estimated total time this player spent dead. `None` is deliberately
+    /// preserved for encounters written before schema v6, where it was never
+    /// measured rather than known to be zero.
+    pub dead_ms: Option<u64>,
     /// This player's per-skill breakdown (issue #222), damage-descending —
     /// the order `SkillRow` arrives in and the order the breakdown window
     /// draws, preserved verbatim through the `slot` column rather than
     /// re-sorted on load.
     pub skills: Vec<SkillRecord>,
+    /// The remaining live breakdown tabs, each retaining the meter's order.
+    pub heals: Vec<SkillRecord>,
+    pub dealt: Vec<SkillRecord>,
+    pub received: Vec<SkillRecord>,
+    pub casts: Vec<SkillRecord>,
+    pub buffs: Vec<SkillRecord>,
 }
 
 impl From<&PlayerRow> for PlayerRecord {
@@ -218,7 +230,13 @@ impl From<&PlayerRow> for PlayerRecord {
             lucky_pct: row.lucky_pct,
             hits: row.hits,
             deaths: row.deaths,
+            dead_ms: row.dead_ms,
             skills: row.skills.iter().map(SkillRecord::from).collect(),
+            heals: row.heals.iter().map(SkillRecord::from).collect(),
+            dealt: row.dealt.iter().map(SkillRecord::from).collect(),
+            received: row.received.iter().map(SkillRecord::from).collect(),
+            casts: row.casts.iter().map(SkillRecord::from).collect(),
+            buffs: row.buffs.iter().map(SkillRecord::from).collect(),
         }
     }
 }
@@ -252,32 +270,22 @@ impl PlayerRecord {
             lucky_pct: self.lucky_pct,
             hits: self.hits,
             deaths: self.deaths,
-            // Issue #254: the schema has no death-time column, so a
-            // replayed row reports the total as unmeasured rather than as
-            // zero. See `PlayerRow::dead_ms`.
-            dead_ms: None,
+            dead_ms: self.dead_ms,
             // Issue #222: persisted since schema v2, so a historical row
             // opens the same breakdown a live one does. Encounters saved
             // before v2 have no skill rows and land here empty.
             skills: self.skills.iter().map(SkillRecord::to_skill_row).collect(),
-            // Issue #245: the Heal / Skill dealt / Skill received
-            // breakdowns are live-only. The saved-fight schema persists
-            // one per-skill list — the damage one — and widening it would
-            // be a fourth schema revision for data the window already has
-            // an honest empty state for ("No per-skill data recorded for
-            // this fight", `skill_window_empty_message`). Left as a
-            // follow-up rather than smuggled into this change.
-            heals: Vec::new(),
-            dealt: Vec::new(),
-            received: Vec::new(),
-            casts: Vec::new(),
-            // Issue #267: same story as `heals`/`dealt`/`received`/`casts`
-            // above — the Buff tab is live-only, and the schema has no
-            // per-buff column to replay.
-            buffs: Vec::new(),
-            // Issue #338: same story as `dead_ms` above — no schema column,
-            // so a replayed row reads unmeasured/absent rather than a real
-            // (and misleadingly precise) zero-or-unknown value.
+            heals: self.heals.iter().map(SkillRecord::to_skill_row).collect(),
+            dealt: self.dealt.iter().map(SkillRecord::to_skill_row).collect(),
+            received: self
+                .received
+                .iter()
+                .map(SkillRecord::to_skill_row)
+                .collect(),
+            casts: self.casts.iter().map(SkillRecord::to_skill_row).collect(),
+            buffs: self.buffs.iter().map(SkillRecord::to_skill_row).collect(),
+            // Issue #338: no schema column for these channels yet, so a
+            // replayed row has no absorbed/immune totals to report.
             absorbed_total: 0,
             immune_total: 0,
             shield: None,
@@ -752,6 +760,35 @@ mod tests {
                 skill.hits_per_min
             ),
             (60.0, 25.0, 1_500.5, 900.25, 1_200.75, 40.5)
+        );
+    }
+
+    #[test]
+    fn snapshot_record_and_rehydration_preserve_death_time_and_all_breakdowns() {
+        let mut row = sample_row(1, "Alice");
+        row.dead_ms = Some(12_345);
+        row.heals = vec![sample_skill(201, 700)];
+        row.dealt = vec![sample_skill(202, 600)];
+        row.received = vec![sample_skill(203, 500)];
+        row.casts = vec![sample_skill(204, 0)];
+        row.buffs = vec![sample_skill(205, 400)];
+        let snapshot = sample_snapshot(vec![row], 1_000);
+
+        let record = record_from_snapshot(&snapshot, 1_000, "Title".to_string(), None).unwrap();
+        let rebuilt = record.to_snapshot();
+        let row = &rebuilt.rows[0];
+
+        assert_eq!(row.dead_ms, Some(12_345));
+        assert_eq!(
+            [
+                &row.heals,
+                &row.dealt,
+                &row.received,
+                &row.casts,
+                &row.buffs,
+            ]
+            .map(|breakdown| breakdown[0].skill_id),
+            [201, 202, 203, 204, 205]
         );
     }
 
