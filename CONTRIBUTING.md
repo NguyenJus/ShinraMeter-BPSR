@@ -84,12 +84,13 @@ build-windows without the release link or its manifest/DLL assertions:
 ```
 
 This runs, in order: `cargo fmt --all --check`, `scripts/package-release.test.sh`,
+`scripts/check-windows-exe.test.sh`,
 `cargo clippy -q --workspace --all-targets --target x86_64-pc-windows-gnu --
 -D warnings`, `cargo test -q --workspace`, and `cargo check -q --workspace
 --target x86_64-pc-windows-gnu` — a locally green run means the lint jobs
 pass too, so CI shouldn't surprise you with a fmt/clippy failure it caught
-first. CI also runs `windows-latest` build of the app and a smoke run with
-`--version`, and a `cargo-deny` check (`deny.toml`) for
+first. CI also runs a `windows-latest` build of the app, its library tests on
+Windows, a smoke run with `--version`, and a `cargo-deny` check (`deny.toml`) for
 advisories/licenses/bans/sources; `cargo deny check` reproduces the latter
 locally if `cargo-deny` is
 installed.

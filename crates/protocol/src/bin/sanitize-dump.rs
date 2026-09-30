@@ -637,6 +637,7 @@ mod tests {
                 attrs: None,
                 skill_effects: Some(proto::pb::SkillEffect {
                     damages: vec![proto::pb::SyncDamageInfo {
+                        actual_value: 0,
                         is_miss: false,
                         r#type: proto::pb::EDamageType::Normal as i32,
                         type_flag: 0,

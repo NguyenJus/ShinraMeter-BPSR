@@ -112,6 +112,7 @@ pub fn base_damage(attacker_uuid: i64, owner_id: i32, value: i64) -> pb::SyncDam
         r#type: pb::EDamageType::Normal as i32,
         type_flag: 0,
         value,
+        actual_value: 0,
         lucky_value: 0,
         hp_lessen_value: value,
         attacker_uuid,
@@ -140,6 +141,7 @@ pub fn damage_info(hit: &Hit) -> pb::SyncDamageInfo {
         },
         type_flag: hit.crit as i32,
         value: if hit.lucky { 0 } else { hit.value },
+        actual_value: 0,
         lucky_value: if hit.lucky { hit.value } else { 0 },
         hp_lessen_value: hit.value,
         attacker_uuid: hit

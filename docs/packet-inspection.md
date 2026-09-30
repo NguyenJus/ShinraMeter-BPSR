@@ -5,13 +5,14 @@ issue #346, opt out with `SHINRA_INSPECT=0` — unrecognized service/method id
 logging, unknown attr id logging, and a frame dump for offline replay).
 That tooling only makes observation *possible* — turning an
 observation into a confirmed constant still requires a deliberate procedure
-against live game traffic on a Windows box running `ShinraMeter-BPSR`. This is
-that procedure. It has not been run yet (no Windows box was available while
-building slice A); this doc is what to follow the first time someone does.
+against live game traffic on a Windows box running `ShinraMeter-BPSR`. Use
+this procedure for each new field or behavior; previous sessions do not
+establish an unobserved field's meaning.
 
 Sanitized dumps — the default, `dump_sanitize: true` in `settings.json` —
-contain only the modeled opcodes with player names and ids pseudonymised,
-and are safe to attach to an issue or a session bundle. A dump written with
+contain only the modeled opcodes with player names and ids pseudonymised.
+Keep session artifacts private as required by `CONTRIBUTING.md`; publish only
+minimal reviewed, redacted evidence or synthetic regressions. A dump written with
 `dump_sanitize: false` holds raw player names and identifying traffic (see
 `.gitignore`) and must never be attached; extract only the minimal bytes
 needed as a synthetic fixture under `crates/test-support/src/wire.rs` instead.
@@ -20,6 +21,11 @@ For protocol discovery (unmodeled opcodes, undecodable payloads) set
 prior sessions' dumps from the inspect directory: anything older than 7 days
 is deleted, and the rest is trimmed oldest-first to the ring's total byte
 budget.
+
+The September 29 stabilization changes retain numeric damage `ActualValue`
+(tag 7) in sanitized dumps for #345. Its reference schema is known, but its
+live semantics remain unverified; retention does not change reported damage.
+Older sanitized dumps discarded the field and cannot establish its absence.
 
 ## Setup
 

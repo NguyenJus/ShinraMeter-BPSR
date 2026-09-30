@@ -82,17 +82,7 @@ jobs:
       - run: cargo build --release --target x86_64-pc-windows-gnu
 
       - name: Assert the executable needs no registered DLL and self-elevates
-        run: |
-          set -euo pipefail
-          exe=target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe
-          if x86_64-w64-mingw32-objdump -p "$exe" | grep -qi 'DLL Name: WinDivert'; then
-            echo "::error::WinDivert is linked at load time; the exe needs WinDivert.dll beside it"
-            exit 1
-          fi
-          if ! strings -a "$exe" | grep -q 'requireAdministrator'; then
-            echo "::error::the UAC manifest is missing from the executable"
-            exit 1
-          fi
+        run: scripts/check-windows-exe.sh target/x86_64-pc-windows-gnu/release/ShinraMeter-BPSR.exe
 
       # Issue #249: the asset is the bare executable — every icon set is
       # compiled in via `include_bytes!` (issue #123), so a zip around one

@@ -39,6 +39,12 @@ pub struct SyncDamageInfo {
     pub type_flag: i32,
     #[prost(int64, tag = "6")]
     pub value: i64,
+    /// Diagnostic retention only (#345). BPSR-ZDPS's generated Csharp.cs
+    /// at cfeb58c declares ActualValue as int64/tag 7. Its live meaning is
+    /// unverified; preserve it through sanitized dumps without using it
+    /// for reported damage. Proto3 zero does not distinguish absent from zero.
+    #[prost(int64, tag = "7")]
+    pub actual_value: i64,
     #[prost(int64, tag = "8")]
     pub lucky_value: i64,
     #[prost(int64, tag = "9")]
@@ -779,6 +785,7 @@ mod tests {
     #[test]
     fn round_trip_sync_damage_info() {
         let msg = SyncDamageInfo {
+            actual_value: 0,
             is_miss: false,
             r#type: EDamageType::Normal as i32,
             type_flag: 1,

@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bpsr_meter::{EntityId, EntityKind};
 use rusqlite::{Connection, OpenFlags};
@@ -86,6 +86,14 @@ impl Remap {
     }
 }
 
+/// SQLite rollback journal sibling used by sanitizer cleanup and bundle
+/// destination preflight.
+pub(crate) fn journal_path(dst: &Path) -> PathBuf {
+    let mut journal = dst.as_os_str().to_owned();
+    journal.push("-journal");
+    PathBuf::from(journal)
+}
+
 /// Snapshots the history database at `src` into `dst`, then rewrites every
 /// `encounter_players` row's `uid` and `name` in the copy to a stable
 /// pseudonym pair (see [`Remap`]) — the same uid always yields the same
@@ -115,12 +123,21 @@ impl Remap {
 /// be mistaken for a finished one by a caller that only checks whether the
 /// file exists.
 pub fn sanitize_copy(src: &Path, dst: &Path) -> Result<SanitizeReport, HistoryError> {
+    // Both paths may be removed during sanitization or error cleanup. Check
+    // their identities before either operation can touch the live source.
+    let journal = journal_path(dst);
+    if crate::paths::same_file_if_exists(src, dst).map_err(HistoryError::Copy)?
+        || crate::paths::same_file_if_exists(src, &journal).map_err(HistoryError::Copy)?
+    {
+        return Err(HistoryError::Copy(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the sanitized history destination or journal is the source database",
+        )));
+    }
     match sanitize_into(src, dst) {
         Ok(report) => Ok(report),
         Err(err) => {
             let _ = fs::remove_file(dst);
-            let mut journal = dst.as_os_str().to_owned();
-            journal.push("-journal");
             let _ = fs::remove_file(journal);
             Err(err)
         }
@@ -496,6 +513,48 @@ mod tests {
         drop(store);
         let _ = fs::remove_file(&src);
         let _ = fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn sanitize_copy_refuses_a_hard_link_to_the_source() {
+        let source = seed_history();
+        let destination = temp_db_path("hard-link-destination");
+        let original = fs::read(&source).unwrap();
+        fs::hard_link(&source, &destination).unwrap();
+        assert!(sanitize_copy(&source, &destination).is_err());
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read(&destination).unwrap(), original);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn sanitize_copy_refuses_a_destination_aliasing_the_source() {
+        let source = seed_history();
+        let original = fs::read(&source).unwrap();
+        assert!(sanitize_copy(&source, &source).is_err());
+        let alias = source
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(source.file_name().unwrap());
+        assert!(sanitize_copy(&source, &alias).is_err());
+        assert_eq!(fs::read(&source).unwrap(), original);
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn sanitize_copy_refuses_a_source_at_its_journal_path() {
+        let source = seed_history();
+        let destination = temp_db_path("source-is-journal");
+        let journal = journal_path(&destination);
+        fs::rename(&source, &journal).unwrap();
+        let original = fs::read(&journal).unwrap();
+
+        assert!(sanitize_copy(&journal, &destination).is_err());
+        assert_eq!(fs::read(&journal).unwrap(), original);
+        assert!(!destination.exists());
+        fs::remove_file(journal).unwrap();
     }
 
     #[test]

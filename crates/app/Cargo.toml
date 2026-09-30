@@ -1,6 +1,6 @@
 [package]
 name = "ShinraMeter-BPSR"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2024"
 license = "GPL-3.0-only"
 
@@ -33,6 +33,8 @@ log = { workspace = true }
 env_logger = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+same-file = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true }
 chrono = { workspace = true }

@@ -30,6 +30,18 @@ pub const SERVICE_UUID: u64 = 0x0000_0000_6333_5342;
 /// other service uuid is still dropped.
 pub const TEAM_NTF_SERVICE_UUID: u64 = 0x0000_0000_399F_CA69;
 pub const MAX_FRAMEDOWN_DEPTH: usize = 4;
+
+/// Total decoded payload/work allowance per `Decoder::push_stream` call,
+/// including every outer and nested FrameDown and Notify. Per-fragment
+/// limits alone allow sibling compressed frames to multiply memory/CPU use
+/// at each nesting level. This permits a maximum-sized payload at every
+/// supported depth along one path.
+const MAX_EXPANDED_BYTES: usize = MAX_FRAME_LEN as usize * (MAX_FRAMEDOWN_DEPTH + 1);
+/// Work charged for starting one zstd decoder, even when the payload is tiny
+/// or malformed before producing output. This prevents a frame full of
+/// zero-output failures from bypassing the shared expansion budget without
+/// treating each cheap header error as if it expanded a full 10 MiB.
+const DECOMPRESSION_ATTEMPT_COST: usize = 64 * 1024;
 /// Highest raw fragment-type discriminant the wire format defines. Used to
 /// sanity-check a header before trusting its length prefix.
 pub const MAX_FRAGMENT_TYPE: u16 = FragmentType::FrameDown as u16;
@@ -127,11 +139,16 @@ pub fn split_frames(stream: &[u8]) -> SplitFrames<'_> {
             None => break,
         };
         if total_len > MAX_FRAME_LEN {
+            // TCP may split the six-byte header after its length word.
+            // Wait for the type before deciding whether a plausible length
+            // is skippable; absence of bytes is not evidence of corruption.
+            if total_len <= MAX_SKIPPABLE_FRAME_LEN && remaining.len() < MIN_FRAME_LEN as usize {
+                break;
+            }
             // Trust an over-large length enough to skip its body only when the
             // packet type behind it also looks like a real frame header — a
             // random 4-byte prefix must not make us discard megabytes of good
-            // stream. Without that evidence (type bytes not buffered yet) the
-            // length is not trusted either.
+            // stream.
             let packet_type = remaining
                 .get(4..6)
                 .and_then(|b| <[u8; 2]>::try_from(b).ok())
@@ -179,20 +196,87 @@ pub fn split_frames(stream: &[u8]) -> SplitFrames<'_> {
 /// expand to tens of GB, and `FrameDown` nests up to `MAX_FRAMEDOWN_DEPTH`
 /// decompressions — from OOM-killing the process. Exceeding it is a decode
 /// failure (the fragment is dropped), never a panic.
-fn decompress(payload: &[u8]) -> Option<Vec<u8>> {
+enum DecompressOutcome {
+    Decoded(Vec<u8>),
+    Failed {
+        // Includes the requested read capacity if that read failed, because
+        // zstd may write output before reporting a checksum or stream error.
+        produced: usize,
+        hit_output_limit: bool,
+    },
+}
+
+fn decompress(payload: &[u8], max_output: usize) -> DecompressOutcome {
     use std::io::Read;
 
-    let decoder = zstd::stream::read::Decoder::new(payload).ok()?;
+    let mut decoder = match zstd::stream::read::Decoder::new(payload) {
+        Ok(decoder) => decoder,
+        Err(_) => {
+            return DecompressOutcome::Failed {
+                produced: 0,
+                hit_output_limit: false,
+            };
+        }
+    };
+    // The output cap does not bound zstd's internal history window. A
+    // 16 MiB window accommodates any permitted 10 MiB payload.
+    if decoder.window_log_max(24).is_err() {
+        return DecompressOutcome::Failed {
+            produced: 0,
+            hit_output_limit: false,
+        };
+    }
     // One byte past the cap, so "too large" is detectable without ever
     // buffering more than `MAX_FRAME_LEN + 1` bytes.
-    let mut limited = decoder.take(u64::from(MAX_FRAME_LEN) + 1);
     let mut out = Vec::new();
-    limited.read_to_end(&mut out).ok()?;
-    if out.len() > MAX_FRAME_LEN as usize {
-        log::debug!("bpsr-protocol: zstd output exceeded MAX_FRAME_LEN, dropping fragment");
-        return None;
+    let mut chunk = [0; DECOMPRESSION_ATTEMPT_COST];
+    loop {
+        let requested = chunk.len().min(max_output + 1 - out.len());
+        match decoder.read(&mut chunk[..requested]) {
+            Ok(0) => return DecompressOutcome::Decoded(out),
+            Ok(read) => {
+                out.extend_from_slice(&chunk[..read]);
+                if out.len() > max_output {
+                    log::debug!(
+                        "bpsr-protocol: zstd output exceeded expansion budget, dropping fragment"
+                    );
+                    return DecompressOutcome::Failed {
+                        produced: max_output,
+                        hit_output_limit: true,
+                    };
+                }
+            }
+            Err(_) => {
+                // Read errors do not report how many bytes zstd wrote into
+                // the buffer. Charge the full request as well as earlier
+                // successful reads so corrupt trailers cannot hide work.
+                let produced = (out.len() + requested).min(max_output);
+                return DecompressOutcome::Failed {
+                    produced,
+                    hit_output_limit: produced == max_output,
+                };
+            }
+        }
     }
-    Some(out)
+}
+
+/// Expansion/work allowance shared by every outer and nested frame decoded
+/// from one `Decoder::push_stream` call. The public `parse_frame` convenience
+/// wrapper creates its own allowance because it parses one independent frame.
+pub(crate) struct ExpansionBudget {
+    remaining: usize,
+}
+
+impl ExpansionBudget {
+    pub(crate) fn new() -> Self {
+        Self {
+            remaining: MAX_EXPANDED_BYTES,
+        }
+    }
+
+    fn spend(&mut self, amount: usize) {
+        self.remaining = self.remaining.saturating_sub(amount);
+    }
 }
 
 /// Parses one complete outer frame (as produced by `split_frames`), pushing
@@ -209,6 +293,21 @@ pub fn parse_frame(
     sink: Option<&dyn InspectSink>,
     now_ms: u64,
 ) {
+    let mut budget = ExpansionBudget::new();
+    parse_frame_with_budget(frame, depth, out, sink, now_ms, &mut budget);
+}
+
+pub(crate) fn parse_frame_with_budget(
+    frame: &[u8],
+    depth: usize,
+    out: &mut Vec<Notify>,
+    sink: Option<&dyn InspectSink>,
+    now_ms: u64,
+    budget: &mut ExpansionBudget,
+) {
+    if budget.remaining == 0 {
+        return;
+    }
     let mut reader = Reader::new(frame);
     let _total_len = match reader.read_u32() {
         Some(v) => v,
@@ -223,24 +322,48 @@ pub fn parse_frame(
     let body = reader.read_rest();
 
     match fragment_type {
-        FragmentType::Notify => handle_notify(body, is_zstd, out, sink, now_ms),
-        FragmentType::FrameDown => handle_frame_down(body, is_zstd, depth, out, sink, now_ms),
+        FragmentType::Notify => handle_notify(body, is_zstd, out, sink, now_ms, budget),
+        FragmentType::FrameDown => {
+            handle_frame_down(body, is_zstd, depth, out, sink, now_ms, budget)
+        }
         _ => {}
     }
 }
 
 /// Shared zstd-or-passthrough payload step; `None` means "drop the
 /// fragment" (a decompression failure), matching the pre-#25 behavior.
-fn decode_payload(raw_payload: &[u8], is_zstd: bool) -> Option<Vec<u8>> {
+fn decode_payload(
+    raw_payload: &[u8],
+    is_zstd: bool,
+    budget: &mut ExpansionBudget,
+) -> Option<Vec<u8>> {
     if is_zstd {
-        match decompress(raw_payload) {
-            Some(p) => Some(p),
-            None => {
-                log::debug!("bpsr-protocol: zstd decode failed for Notify payload");
+        let limit = budget.remaining.min(MAX_FRAME_LEN as usize);
+        match decompress(raw_payload, limit) {
+            DecompressOutcome::Decoded(p) => {
+                budget.spend(p.len().max(DECOMPRESSION_ATTEMPT_COST).min(limit));
+                Some(p)
+            }
+            DecompressOutcome::Failed {
+                produced,
+                hit_output_limit,
+            } => {
+                let charge = if hit_output_limit {
+                    limit
+                } else {
+                    produced.max(DECOMPRESSION_ATTEMPT_COST).min(limit)
+                };
+                budget.spend(charge);
+                log::debug!("bpsr-protocol: zstd payload decode failed");
                 None
             }
         }
     } else {
+        if raw_payload.len() > budget.remaining {
+            budget.remaining = 0;
+            return None;
+        }
+        budget.spend(raw_payload.len());
         Some(raw_payload.to_vec())
     }
 }
@@ -282,6 +405,7 @@ fn handle_notify(
     out: &mut Vec<Notify>,
     sink: Option<&dyn InspectSink>,
     now_ms: u64,
+    budget: &mut ExpansionBudget,
 ) {
     let Some(body) = parse_notify_body(body) else {
         return;
@@ -295,7 +419,7 @@ fn handle_notify(
     if sink.is_none() && !is_accepted_service(body.service_uuid) {
         return;
     }
-    let payload = decode_payload(body.raw_payload, is_zstd);
+    let payload = decode_payload(body.raw_payload, is_zstd, budget);
     if let Some(sink) = sink {
         // A payload we failed to decompress is still reported, as the raw
         // undecompressed bytes flagged `payload_decoded = false` — malformed
@@ -335,6 +459,7 @@ fn handle_frame_down(
     out: &mut Vec<Notify>,
     sink: Option<&dyn InspectSink>,
     now_ms: u64,
+    budget: &mut ExpansionBudget,
 ) {
     if depth >= MAX_FRAMEDOWN_DEPTH {
         return;
@@ -345,23 +470,18 @@ fn handle_frame_down(
         None => return,
     };
     let raw_nested = reader.read_rest();
-    let nested = if is_zstd {
-        match decompress(raw_nested) {
-            Some(p) => p,
-            None => {
-                log::debug!("bpsr-protocol: zstd decode failed for FrameDown body");
-                return;
-            }
-        }
-    } else {
-        raw_nested.to_vec()
+    let Some(nested) = decode_payload(raw_nested, is_zstd, budget) else {
+        return;
     };
     let result = split_frames(&nested);
     if result.desync.is_some() {
         log::debug!("bpsr-protocol: desync while splitting FrameDown nested stream");
     }
     for f in result.frames {
-        parse_frame(f, depth + 1, out, sink, now_ms);
+        if budget.remaining == 0 {
+            break;
+        }
+        parse_frame_with_budget(f, depth + 1, out, sink, now_ms, budget);
     }
 }
 
@@ -562,6 +682,124 @@ mod tests {
     }
 
     #[test]
+    fn zstd_window_is_bounded_independently_of_output_size() {
+        // Valid zstd frame: unknown content size, one last raw block "abc".
+        // Its advertised history window need not match its tiny output.
+        let mut compressed = vec![0x28, 0xb5, 0x2f, 0xfd, 0, (24 - 10) << 3, 25, 0, 0];
+        compressed.extend_from_slice(b"abc");
+        assert!(matches!(
+            decompress(&compressed, 3),
+            DecompressOutcome::Decoded(payload) if payload == b"abc"
+        ));
+        compressed[5] = (25 - 10) << 3; // 32 MiB history for three output bytes
+        assert!(matches!(
+            decompress(&compressed, 3),
+            DecompressOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn compressed_siblings_share_one_outer_frame_expansion_budget() {
+        // Every individual fragment satisfies the old 10 MiB cap, and
+        // nesting depth is only two. Without an aggregate budget, adding
+        // more siblings scales retained payloads without a useful bound.
+        let payload = vec![0; MAX_FRAME_LEN as usize];
+        let notify = build_notify_frame(1, &payload, true);
+        let inner = build_framedown_frame(1, &notify.repeat(3), true);
+        let outer = build_framedown_frame(1, &inner.repeat(2), true);
+        assert!(outer.len() < 4096);
+        let mut out = Vec::new();
+        parse_frame(&outer, 0, &mut out, None, 0);
+        assert!(!out.is_empty());
+        assert!(out.iter().map(|n| n.payload.len()).sum::<usize>() <= MAX_EXPANDED_BYTES);
+
+        // Refusing the excessive expansion does not poison a new frame.
+        out.clear();
+        parse_frame(&build_notify_frame(2, b"ok", true), 0, &mut out, None, 0);
+        assert_eq!(out[0].payload, b"ok");
+    }
+
+    #[test]
+    fn failed_expansions_also_spend_the_shared_budget() {
+        let payload = vec![0; MAX_FRAME_LEN as usize + 1];
+        let notify = build_notify_frame(1, &payload, true);
+        let outer = build_framedown_frame(1, &notify.repeat(8), false);
+        let sink = RecordingSink::new();
+        let mut out = Vec::new();
+        parse_frame(&outer, 0, &mut out, Some(&sink), 0);
+        assert!(out.is_empty());
+        // At most five limited decompressions, even for invalid siblings.
+        assert_eq!(sink.notifies.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn cheap_zstd_errors_do_not_spend_fictitious_full_expansions() {
+        let invalid = build_frame(2, true, &build_notify_body(1, b"x"));
+        let valid = build_notify_frame(2, b"valid", false);
+        let mut nested = invalid.repeat(5);
+        nested.extend(valid);
+        let outer = build_framedown_frame(1, &nested, false);
+
+        let mut out = Vec::new();
+        parse_frame(&outer, 0, &mut out, None, 0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].payload, b"valid");
+    }
+
+    fn compressed_with_corrupt_checksum(payload_len: usize) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 0).unwrap();
+        encoder.include_checksum(true).unwrap();
+        encoder.write_all(&vec![0; payload_len]).unwrap();
+        let mut compressed = encoder.finish().unwrap();
+        *compressed.last_mut().unwrap() ^= 1;
+        compressed
+    }
+
+    #[test]
+    fn checksum_errors_charge_output_written_during_the_failed_read() {
+        for payload_len in [
+            DECOMPRESSION_ATTEMPT_COST - 1,
+            DECOMPRESSION_ATTEMPT_COST,
+            DECOMPRESSION_ATTEMPT_COST + 1,
+            2 * DECOMPRESSION_ATTEMPT_COST - 1,
+            2 * DECOMPRESSION_ATTEMPT_COST,
+            2 * DECOMPRESSION_ATTEMPT_COST + 1,
+            MAX_FRAME_LEN as usize - 1,
+            MAX_FRAME_LEN as usize,
+        ] {
+            let compressed = compressed_with_corrupt_checksum(payload_len);
+            let mut budget = ExpansionBudget::new();
+            assert!(decode_payload(&compressed, true, &mut budget).is_none());
+            let spent = MAX_EXPANDED_BYTES - budget.remaining;
+            assert!(
+                spent >= payload_len,
+                "checksum failure undercharged {payload_len} output bytes: {spent}"
+            );
+            assert!(
+                spent <= (payload_len + DECOMPRESSION_ATTEMPT_COST).min(MAX_FRAME_LEN as usize),
+                "checksum failure overcharged {payload_len} output bytes: {spent}"
+            );
+        }
+    }
+
+    #[test]
+    fn checksum_failures_exhaust_the_shared_budget_after_five_full_expansions() {
+        let compressed = compressed_with_corrupt_checksum(MAX_FRAME_LEN as usize);
+        let frame = build_frame(2, true, &build_notify_body(1, &compressed));
+        let mut budget = ExpansionBudget::new();
+        let sink = RecordingSink::new();
+        let mut out = Vec::new();
+        for _ in 0..6 {
+            parse_frame_with_budget(&frame, 0, &mut out, Some(&sink), 0, &mut budget);
+        }
+        assert!(out.is_empty());
+        assert_eq!(budget.remaining, 0);
+        assert_eq!(sink.notifies.lock().unwrap().len(), 5);
+    }
+
+    #[test]
     fn total_len_too_small_is_desync() {
         let buf = 5u32.to_be_bytes().to_vec();
         let result = split_frames(&buf);
@@ -602,13 +840,12 @@ mod tests {
         assert_eq!(result.desync, Some(Desync::Unrecoverable));
     }
 
-    /// An over-large length whose packet type has not arrived yet cannot be
-    /// corroborated, so it is not trusted for skipping either.
+    /// A plausible over-large length waits for its fragmented type bytes.
     #[test]
-    fn oversized_len_without_type_bytes_is_unrecoverable() {
+    fn oversized_len_without_type_bytes_waits_for_the_header() {
         let buf = (MAX_FRAME_LEN + 1).to_be_bytes();
         let result = split_frames(&buf);
-        assert_eq!(result.desync, Some(Desync::Unrecoverable));
+        assert_eq!(result.desync, None);
         assert_eq!(result.consumed, 0);
     }
 

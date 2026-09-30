@@ -3155,8 +3155,29 @@ pub fn choose_background_image_path(_title: &str) -> Option<std::path::PathBuf> 
 /// are themselves only ever run from a spawned `std::thread`, never the UI
 /// thread, so there is nothing here for a blocking call to stall — see
 /// those functions' doc comments.
-#[cfg(windows)]
 pub fn http_get_bytes(host: &str, path: &str, user_agent: &str) -> Result<Vec<u8>, String> {
+    http_get_bytes_limited(host, path, user_agent, 256 * 1024 * 1024)
+}
+
+/// Enforce limits before growing the buffer; shared with host tests.
+#[cfg(any(windows, test))]
+fn append_http_chunk(body: &mut Vec<u8>, chunk: &[u8], limit: usize) -> Result<(), String> {
+    if chunk.len() > limit.saturating_sub(body.len()) {
+        return Err(format!("HTTP response exceeds the {limit}-byte limit"));
+    }
+    body.try_reserve(chunk.len())
+        .map_err(|err| format!("couldn't allocate the HTTP response buffer: {err}"))?;
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn http_get_bytes_limited(
+    host: &str,
+    path: &str,
+    user_agent: &str,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
     use windows::Win32::Foundation::GetLastError;
     use windows::Win32::Networking::WinHttp::{
         INTERNET_DEFAULT_HTTPS_PORT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
@@ -3202,6 +3223,7 @@ pub fn http_get_bytes(host: &str, path: &str, user_agent: &str) -> Result<Vec<u8
     // dangling or foreign pointer. None of these calls touch the window or
     // its `HWND`, so nothing here interacts with `OVERLAY_HWND` or the
     // reposition-exemption machinery elsewhere in this module.
+    let started = std::time::Instant::now();
     let agent = wide(user_agent);
     let session = unsafe {
         WinHttpOpen(
@@ -3329,26 +3351,38 @@ pub fn http_get_bytes(host: &str, path: &str, user_agent: &str) -> Result<Vec<u8
     // ready (never the whole body at once), and a `0` is WinHTTP's own
     // end-of-response signal.
     let mut body = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
     loop {
+        // Per-operation WinHTTP timeouts alone permit an endless stream of
+        // small chunks. A download also has a total ten-minute budget;
+        // an in-flight call may consume its existing receive timeout.
+        if started.elapsed() > std::time::Duration::from_secs(600) {
+            return Err("HTTP download exceeded the ten-minute time limit".to_string());
+        }
         let mut available: u32 = 0;
         unsafe { WinHttpQueryDataAvailable(request.0, &mut available) }
             .map_err(|err| describe("WinHttpQueryDataAvailable", err))?;
         if available == 0 {
             break;
         }
-        let mut chunk = vec![0u8; available as usize];
+        let requested = available.min(chunk.len() as u32);
+        if requested as usize > limit.saturating_sub(body.len()) {
+            return Err(format!("HTTP response exceeds the {limit}-byte limit"));
+        }
         let mut read: u32 = 0;
         unsafe {
             WinHttpReadData(
                 request.0,
                 chunk.as_mut_ptr() as *mut core::ffi::c_void,
-                available,
+                requested,
                 &mut read,
             )
         }
         .map_err(|err| describe("WinHttpReadData", err))?;
-        chunk.truncate(read as usize);
-        body.extend_from_slice(&chunk);
+        if read == 0 {
+            break;
+        }
+        append_http_chunk(&mut body, &chunk[..read as usize], limit)?;
     }
 
     Ok(body)
@@ -3359,7 +3393,12 @@ pub fn http_get_bytes(host: &str, path: &str, user_agent: &str) -> Result<Vec<u8
 /// parsing/comparison/path logic and never call this at all; a real "is an
 /// update available" answer, or a real download, needs a real Windows build.
 #[cfg(not(windows))]
-pub fn http_get_bytes(_host: &str, _path: &str, _user_agent: &str) -> Result<Vec<u8>, String> {
+fn http_get_bytes_limited(
+    _host: &str,
+    _path: &str,
+    _user_agent: &str,
+    _limit: usize,
+) -> Result<Vec<u8>, String> {
     Err("update checks are only supported on Windows builds".to_string())
 }
 
@@ -3374,13 +3413,22 @@ pub fn http_get_bytes(_host: &str, _path: &str, _user_agent: &str) -> Result<Vec
 /// that makes the WinHTTP call correct (timeouts, the redirect policy, the
 /// status check, the chunked drain) stays in one place because of it.
 pub fn http_get(host: &str, path: &str, user_agent: &str) -> Result<String, String> {
-    let body = http_get_bytes(host, path, user_agent)?;
+    let body = http_get_bytes_limited(host, path, user_agent, 2 * 1024 * 1024)?;
     String::from_utf8(body).map_err(|err| format!("response was not valid UTF-8: {err}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_response_limit_rejects_growth_without_modifying_the_body() {
+        let mut body = Vec::new();
+        append_http_chunk(&mut body, b"abcd", 4).unwrap();
+        assert!(append_http_chunk(&mut body, b"e", 4).is_err());
+        assert_eq!(body, b"abcd");
+        assert!(append_http_chunk(&mut Vec::new(), b"abcde", 4).is_err());
+    }
 
     #[test]
     fn maps_the_reachability_family_to_plain_language() {

@@ -12,6 +12,7 @@ export RUSTFLAGS="-D warnings"
 
 cargo fmt --all --check
 scripts/package-release.test.sh
+scripts/check-windows-exe.test.sh
 cargo clippy -q --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 cargo test -q --workspace
 cargo check -q --workspace --target x86_64-pc-windows-gnu

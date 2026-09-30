@@ -120,6 +120,8 @@ pub enum CheckOutcome {
         tag: String,
         url: String,
         asset_url: Option<String>,
+        /// SHA-256 published by GitHub for this exact release asset.
+        asset_digest: Option<String>,
     },
 }
 
@@ -129,6 +131,8 @@ pub enum CheckOutcome {
 pub struct ReleaseAsset {
     pub name: String,
     pub browser_download_url: String,
+    #[serde(default)]
+    pub digest: Option<String>,
 }
 
 /// Everything this module reads out of a `.../releases/latest` response,
@@ -139,6 +143,7 @@ pub struct ReleaseInfo {
     pub tag_name: String,
     pub html_url: String,
     pub asset_url: Option<String>,
+    pub asset_digest: Option<String>,
 }
 
 /// Parses a release tag like `v0.2.0` — or `0.2.0`, with no leading `v`,
@@ -201,6 +206,10 @@ pub fn is_newer(current: (u32, u32, u32), remote: (u32, u32, u32)) -> bool {
 /// whose upload never completed. See `CheckOutcome::UpdateAvailable`'s doc
 /// comment for what the UI does with that.
 pub fn select_asset_url(assets: &[ReleaseAsset]) -> Option<String> {
+    select_asset(assets).map(|asset| asset.browser_download_url.clone())
+}
+
+fn select_asset(assets: &[ReleaseAsset]) -> Option<&ReleaseAsset> {
     let is_exe = |asset: &&ReleaseAsset| {
         std::path::Path::new(&asset.name)
             .extension()
@@ -210,7 +219,6 @@ pub fn select_asset_url(assets: &[ReleaseAsset]) -> Option<String> {
         .iter()
         .find(|asset| is_exe(asset) && asset.name.to_ascii_lowercase().contains("windows-x64"))
         .or_else(|| assets.iter().find(is_exe))
-        .map(|asset| asset.browser_download_url.clone())
 }
 
 /// The subset of a GitHub `.../releases/latest` response this module reads.
@@ -244,6 +252,7 @@ pub fn parse_release_response(json: &str) -> Result<ReleaseInfo, String> {
             tag_name: response.tag_name,
             html_url: response.html_url,
             asset_url: select_asset_url(&response.assets),
+            asset_digest: select_asset(&response.assets).and_then(|asset| asset.digest.clone()),
         })
         .map_err(|err| format!("couldn't parse the GitHub releases response: {err}"))
 }
@@ -271,6 +280,7 @@ pub fn decide(current_version: &str, release: &ReleaseInfo) -> Result<CheckOutco
             tag: release.tag_name.clone(),
             url: release.html_url.clone(),
             asset_url: release.asset_url.clone(),
+            asset_digest: release.asset_digest.clone(),
         })
     } else {
         Ok(CheckOutcome::UpToDate)
@@ -404,23 +414,62 @@ pub fn update_paths(exe: &Path) -> UpdatePaths {
     }
 }
 
-/// Whether a downloaded body actually looks like a Windows executable.
-///
-/// `MZ` is the DOS header magic every PE image on Windows still starts
-/// with. The check exists because the failure it catches is otherwise
-/// silent and nasty: a captive portal, a proxy error page or a GitHub
-/// maintenance page comes back with HTTP 200 and a few kilobytes of HTML,
-/// and without this the app would cheerfully rename that over its own
-/// executable and relaunch it. Refusing early leaves the installation
-/// untouched.
-///
-/// Two bytes is not integrity verification and is not claimed to be — a
-/// real check would need a signature or a published checksum, neither of
-/// which the release pipeline produces today. What makes the download
-/// trustworthy is that its URL came from a TLS-verified `api.github.com`
-/// response and points at a pinned host (`split_download_url`).
+/// Reject malformed, truncated, or incompatible images before replacing
+/// the installation. This verifies the x64 PE headers and file-backed
+/// section bounds, not a publisher signature or cryptographic integrity.
 pub fn looks_like_windows_executable(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"MZ")
+    fn word(bytes: &[u8], offset: usize) -> Option<u16> {
+        Some(u16::from_le_bytes(
+            bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
+        ))
+    }
+    fn dword(bytes: &[u8], offset: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(
+            bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+        ))
+    }
+    let valid = || -> Option<bool> {
+        if !bytes.starts_with(b"MZ") {
+            return Some(false);
+        }
+        let pe = usize::try_from(dword(bytes, 0x3c)?).ok()?;
+        if pe < 64 || bytes.get(pe..pe.checked_add(4)?)? != b"PE\0\0" {
+            return Some(false);
+        }
+        let coff = pe.checked_add(4)?;
+        let sections = usize::from(word(bytes, coff.checked_add(2)?)?);
+        let optional_size = usize::from(word(bytes, coff.checked_add(16)?)?);
+        let flags = word(bytes, coff.checked_add(18)?)?;
+        let optional = coff.checked_add(20)?;
+        if word(bytes, coff)? != 0x8664 // AMD64
+            || sections == 0 || sections > 96
+            || optional_size < 112
+            || flags & 0x0002 == 0 // executable image
+            || flags & 0x2000 != 0 // a DLL cannot be relaunched
+            || word(bytes, optional)? != 0x20b
+        // PE32+
+        {
+            return Some(false);
+        }
+        let table = optional.checked_add(optional_size)?;
+        let table_end = table.checked_add(sections.checked_mul(40)?)?;
+        let headers = usize::try_from(dword(bytes, optional.checked_add(60)?)?).ok()?;
+        if headers < table_end || headers > bytes.len() {
+            return Some(false);
+        }
+        for section in 0..sections {
+            let offset = table.checked_add(section.checked_mul(40)?)?;
+            let raw_size = usize::try_from(dword(bytes, offset.checked_add(16)?)?).ok()?;
+            let raw_start = usize::try_from(dword(bytes, offset.checked_add(20)?)?).ok()?;
+            if raw_size != 0
+                && (raw_start < headers || raw_start.checked_add(raw_size)? > bytes.len())
+            {
+                return Some(false);
+            }
+        }
+        Some(true)
+    };
+    valid().unwrap_or(false)
 }
 
 /// Writes a downloaded executable to the staged path, refusing a body that
@@ -430,11 +479,20 @@ pub fn looks_like_windows_executable(bytes: &[u8]) -> bool {
 pub fn stage_downloaded_executable(paths: &UpdatePaths, bytes: &[u8]) -> Result<(), String> {
     if !looks_like_windows_executable(bytes) {
         return Err(format!(
-            "the downloaded release asset isn't a Windows executable ({} bytes, no MZ header) — the download probably returned an error page",
+            "the downloaded release asset isn't a Windows executable ({} bytes, invalid or truncated x64 PE image) — the download may be incomplete or an error page",
             bytes.len()
         ));
     }
-    std::fs::write(&paths.staged, bytes).map_err(|err| {
+    // Flush the staged image before any rename can remove the working
+    // executable from its target path.
+    use std::io::Write;
+    let write = || -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&paths.staged)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    };
+    write().map_err(|err| {
+        let _ = std::fs::remove_file(&paths.staged);
         format!(
             "couldn't write the downloaded update to {}: {err}",
             paths.staged.display()
@@ -566,6 +624,45 @@ pub fn clean_up_previous_update() {
     }
 }
 
+/// Missing or unsupported digests require a manual download. Never replace
+/// the installation with a body that cannot be checked against the asset
+/// selected from the authenticated GitHub API response.
+fn parse_asset_digest(digest: Option<&str>) -> Result<[u8; 32], String> {
+    let invalid = || {
+        "the release asset has no valid SHA-256 digest; download it manually from the release page"
+            .to_string()
+    };
+    let hex = digest
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .ok_or_else(invalid)?;
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid());
+    }
+    let mut expected = [0u8; 32];
+    for (index, byte) in expected.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).map_err(|_| invalid())?;
+    }
+    Ok(expected)
+}
+
+fn verify_asset_digest(bytes: &[u8], expected: [u8; 32]) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let actual: [u8; 32] = Sha256::digest(bytes).into();
+    if actual != expected {
+        return Err("the downloaded update does not match GitHub's SHA-256 digest; the existing installation was left untouched".to_string());
+    }
+    Ok(())
+}
+
+fn stage_verified_executable(
+    paths: &UpdatePaths,
+    bytes: &[u8],
+    expected: [u8; 32],
+) -> Result<(), String> {
+    verify_asset_digest(bytes, expected)?;
+    stage_downloaded_executable(paths, bytes)
+}
+
 /// Runs a whole in-place update (issue #250): downloads `asset_url`,
 /// verifies it looks like an executable, stages it beside the running one
 /// and swaps it in. Returns the path the caller should relaunch.
@@ -580,15 +677,55 @@ pub fn clean_up_previous_update() {
 /// `relaunch` and then asks the viewport to close, so this function stays a
 /// pure "put the new file where the old one was" step with a `Result` a
 /// caller can render.
-pub fn install_update(asset_url: &str, current_version: &str) -> Result<PathBuf, String> {
+pub fn install_update(
+    asset_url: &str,
+    current_version: &str,
+    digest: Option<&str>,
+) -> Result<PathBuf, String> {
     let (host, path) = split_download_url(asset_url)?;
+    let expected = parse_asset_digest(digest)?;
     let exe = std::env::current_exe()
         .map_err(|err| format!("couldn't find the running executable's own path: {err}"))?;
     let paths = update_paths(&exe);
     let bytes = crate::platform::http_get_bytes(&host, &path, &user_agent(current_version))?;
-    stage_downloaded_executable(&paths, &bytes)?;
+    stage_verified_executable(&paths, &bytes, expected)?;
     swap_in_staged_executable(&paths)?;
     Ok(paths.target)
+}
+
+/// A failed process spawn must leave the working build at the launch path.
+/// Keep the rejected image in `.new` while restoring the previous image;
+/// if restoration fails, put the installed image back whenever possible.
+pub fn relaunch_or_restore(exe: &Path) -> Result<(), String> {
+    relaunch(exe).map_err(
+        |err| match restore_previous_executable(&update_paths(exe)) {
+            Ok(()) => format!("{err}; the previous executable was restored"),
+            Err(restore) => format!("{err}; {restore}"),
+        },
+    )
+}
+
+fn restore_previous_executable(paths: &UpdatePaths) -> Result<(), String> {
+    if !paths.backup.is_file() {
+        return Err(format!(
+            "the previous executable is unavailable at {}",
+            paths.backup.display()
+        ));
+    }
+    let moved = paths.target.exists();
+    if moved {
+        std::fs::rename(&paths.target, &paths.staged).map_err(|err| format!("couldn't move the rejected update aside: {err}; the previous executable remains at {}", paths.backup.display()))?;
+    }
+    if let Err(err) = std::fs::rename(&paths.backup, &paths.target) {
+        if moved {
+            let _ = std::fs::rename(&paths.staged, &paths.target);
+        }
+        return Err(format!(
+            "couldn't restore the previous executable ({err}); it remains at {}",
+            paths.backup.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Starts the just-installed executable. Called from the UI thread the
@@ -646,8 +783,19 @@ mod tests {
     /// A byte string that passes `looks_like_windows_executable`, standing
     /// in for a real PE image — the swap logic never looks past the header.
     fn fake_exe(marker: &str) -> Vec<u8> {
-        let mut bytes = b"MZ\x90\x00".to_vec();
-        bytes.extend_from_slice(marker.as_bytes());
+        let mut bytes = vec![0u8; 1024];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&128u32.to_le_bytes());
+        bytes[128..132].copy_from_slice(b"PE\0\0");
+        bytes[132..134].copy_from_slice(&0x8664u16.to_le_bytes());
+        bytes[134..136].copy_from_slice(&1u16.to_le_bytes());
+        bytes[148..150].copy_from_slice(&240u16.to_le_bytes());
+        bytes[150..152].copy_from_slice(&2u16.to_le_bytes());
+        bytes[152..154].copy_from_slice(&0x20bu16.to_le_bytes());
+        bytes[212..216].copy_from_slice(&512u32.to_le_bytes());
+        bytes[408..412].copy_from_slice(&512u32.to_le_bytes());
+        bytes[412..416].copy_from_slice(&512u32.to_le_bytes());
+        bytes[512..512 + marker.len()].copy_from_slice(marker.as_bytes());
         bytes
     }
 
@@ -656,6 +804,7 @@ mod tests {
             tag_name: tag.to_string(),
             html_url: url.to_string(),
             asset_url: asset_url.map(str::to_string),
+            asset_digest: None,
         }
     }
 
@@ -663,6 +812,7 @@ mod tests {
         ReleaseAsset {
             name: name.to_string(),
             browser_download_url: url.to_string(),
+            digest: None,
         }
     }
 
@@ -936,6 +1086,7 @@ mod tests {
                 asset_url: Some(
                     "https://github.com/x/y/releases/download/v0.3.0/app.exe".to_string()
                 ),
+                asset_digest: None,
             })
         );
     }
@@ -949,6 +1100,7 @@ mod tests {
                 tag: "v0.3.0".to_string(),
                 url: "https://example.com".to_string(),
                 asset_url: None,
+                asset_digest: None,
             })
         );
     }
@@ -1078,11 +1230,92 @@ mod tests {
         assert_ne!(paths.backup.extension().unwrap(), "exe");
     }
 
+    #[test]
+    fn digest_verification_accepts_the_standard_sha256_vector() {
+        let expected = parse_asset_digest(Some(
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ))
+        .unwrap();
+        assert!(verify_asset_digest(b"abc", expected).is_ok());
+        assert!(verify_asset_digest(b"ab", expected).is_err());
+    }
+
+    #[test]
+    fn missing_or_malformed_digest_is_refused() {
+        for digest in [
+            None,
+            Some("sha256:abcd"),
+            Some("md5:abcd"),
+            Some("sha256:éééééééééééééééééééééééééééééééé"),
+        ] {
+            assert!(parse_asset_digest(digest).is_err());
+        }
+    }
+
+    #[test]
+    fn digest_and_pe_failures_preserve_the_installed_executable() {
+        use sha2::{Digest, Sha256};
+        let dir = scratch_dir("verify-install");
+        let paths = update_paths(&dir.join("ShinraMeter-BPSR.exe"));
+        let original = fake_exe("installed");
+        std::fs::write(&paths.target, &original).unwrap();
+        let downloaded = fake_exe("downloaded");
+        let digest: [u8; 32] = Sha256::digest(&downloaded).into();
+        assert!(stage_verified_executable(&paths, &downloaded[..512], digest).is_err());
+        let mut corrupted = downloaded.clone();
+        corrupted[513] ^= 1;
+        assert!(stage_verified_executable(&paths, &corrupted, digest).is_err());
+        let invalid = b"MZ";
+        assert!(
+            stage_verified_executable(&paths, invalid, Sha256::digest(invalid).into()).is_err()
+        );
+        assert_eq!(std::fs::read(&paths.target).unwrap(), original);
+        assert!(!paths.staged.exists());
+        assert!(!paths.backup.exists());
+        stage_verified_executable(&paths, &downloaded, digest).unwrap();
+        assert_eq!(std::fs::read(&paths.staged).unwrap(), downloaded);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn release_digest_follows_the_selected_asset() {
+        let json = r#"{"tag_name":"v1.0.0","html_url":"https://github.com/releases/1","assets":[{"name":"other.exe","browser_download_url":"https://github.com/other.exe","digest":"sha256:other"},{"name":"windows-x64.exe","browser_download_url":"https://github.com/x64.exe","digest":"sha256:selected"}]}"#;
+        let release = parse_release_response(json).unwrap();
+        assert_eq!(
+            release.asset_url.as_deref(),
+            Some("https://github.com/x64.exe")
+        );
+        assert_eq!(release.asset_digest.as_deref(), Some("sha256:selected"));
+        assert!(
+            matches!(decide("0.0.1", &release), Ok(CheckOutcome::UpdateAvailable { asset_digest: Some(digest), .. }) if digest == "sha256:selected")
+        );
+    }
+
     // -- looks_like_windows_executable ----------------------------------
 
     #[test]
-    fn looks_like_windows_executable_accepts_an_mz_header() {
+    fn looks_like_windows_executable_accepts_an_x64_pe_image() {
         assert!(looks_like_windows_executable(&fake_exe("body")));
+    }
+
+    #[test]
+    fn looks_like_windows_executable_rejects_truncated_and_incompatible_images() {
+        let image = fake_exe("complete");
+        for length in 0..image.len() {
+            assert!(
+                !looks_like_windows_executable(&image[..length]),
+                "accepted {length} bytes"
+            );
+        }
+        let mut wrong_arch = image.clone();
+        wrong_arch[132..134].copy_from_slice(&0x14cu16.to_le_bytes());
+        assert!(!looks_like_windows_executable(&wrong_arch));
+        let mut dll = image.clone();
+        dll[150..152].copy_from_slice(&0x2002u16.to_le_bytes());
+        assert!(!looks_like_windows_executable(&dll));
+        let mut overflow = image;
+        overflow[0x3c..0x40].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(!looks_like_windows_executable(&overflow));
     }
 
     #[test]
@@ -1191,6 +1424,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn rollback_restores_the_previous_build_after_a_failed_launch() {
+        let dir = scratch_dir("launch-rollback");
+        let paths = update_paths(&dir.join("ShinraMeter-BPSR.exe"));
+        std::fs::write(&paths.target, fake_exe("old build")).unwrap();
+        std::fs::write(&paths.staged, fake_exe("new build")).unwrap();
+        swap_in_staged_executable(&paths).unwrap();
+        restore_previous_executable(&paths).unwrap();
+        assert_eq!(std::fs::read(&paths.target).unwrap(), fake_exe("old build"));
+        assert_eq!(std::fs::read(&paths.staged).unwrap(), fake_exe("new build"));
+        assert!(!paths.backup.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_spawn_restores_the_backup_without_exiting() {
+        let dir = scratch_dir("spawn-rollback");
+        let paths = update_paths(&dir.join("ShinraMeter-BPSR.exe"));
+        // A missing target cannot start a process on any platform.
+        std::fs::write(&paths.backup, fake_exe("old build")).unwrap();
+        let err = relaunch_or_restore(&paths.target).unwrap_err();
+        assert!(err.contains("previous executable was restored"));
+        assert_eq!(std::fs::read(&paths.target).unwrap(), fake_exe("old build"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     // -- clean_up_previous_update_for -----------------------------------
 
     #[test]
@@ -1290,13 +1549,13 @@ mod tests {
     /// WinHTTP request, which `platform::http_get_bytes` stubs out here.
     #[test]
     fn install_update_refuses_an_untrusted_asset_url_before_touching_anything() {
-        let err = install_update("https://evil.example/payload.exe", "0.2.0")
+        let err = install_update("https://evil.example/payload.exe", "0.2.0", None)
             .expect_err("an untrusted host must be refused");
         assert!(err.contains("github.com"), "unexpected error: {err}");
     }
 
     #[test]
     fn install_update_refuses_a_non_https_asset_url() {
-        assert!(install_update("http://github.com/x/y.exe", "0.2.0").is_err());
+        assert!(install_update("http://github.com/x/y.exe", "0.2.0", None).is_err());
     }
 }

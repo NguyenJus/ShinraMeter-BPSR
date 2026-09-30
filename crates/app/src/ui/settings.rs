@@ -202,6 +202,7 @@ pub(super) fn start_update_check() -> UpdateCheckState {
 pub(super) fn start_update_install(available: CheckOutcome) -> UpdateCheckState {
     let CheckOutcome::UpdateAvailable {
         asset_url: Some(asset_url),
+        asset_digest,
         ..
     } = &available
     else {
@@ -218,6 +219,7 @@ pub(super) fn start_update_install(available: CheckOutcome) -> UpdateCheckState 
         };
     };
     let url = asset_url.clone();
+    let digest = asset_digest.clone();
     let (tx, rx) = crossbeam_channel::unbounded();
     std::thread::Builder::new()
         .name("update-install".to_string())
@@ -225,6 +227,7 @@ pub(super) fn start_update_install(available: CheckOutcome) -> UpdateCheckState 
             let _ = tx.send(update_check::install_update(
                 &url,
                 env!("CARGO_PKG_VERSION"),
+                digest.as_deref(),
             ));
         })
         .expect("failed to spawn the update-install thread");
@@ -297,14 +300,29 @@ pub(super) fn start_bundle_export(
 
             let inspect_enabled = crate::inspect::enabled();
             let dump_sanitized = crate::inspect::sanitized().unwrap_or(false);
-            let dump_parts = if inspect_enabled && dump_sanitized {
-                bundle::dump_ring_parts(&crate::inspect::dump_path())
+            let protected_dump_parts = if inspect_enabled {
+                let dump_path = crate::inspect::dump_path();
+                let mut parts = bundle::dump_ring_parts(&dump_path);
+                if !parts.contains(&dump_path) {
+                    parts.push(dump_path);
+                }
+                parts
             } else {
                 Vec::new()
             };
+            let dump_parts: &[PathBuf] = if dump_sanitized {
+                &protected_dump_parts
+            } else {
+                &[]
+            };
 
             let settings_path = crate::settings::settings_path();
-            let entries = bundle::bundle_entries(&[], &dump_parts, settings_path.as_deref());
+            let entries = bundle::bundle_entries(&[], dump_parts, settings_path.as_deref());
+            let mut protected_sources = protected_dump_parts;
+            protected_sources.push(crate::paths::names_cache_path().0);
+            let (lock_path, _) = crate::single_instance::lock_file_path();
+            protected_sources.push(lock_path.with_extension("pid"));
+            protected_sources.push(lock_path);
 
             let session_id = crate::logging::session_id();
             let manifest = bundle::build_manifest(
@@ -326,7 +344,14 @@ pub(super) fn start_bundle_export(
             // and a user who has turned history off should not have it
             // sanitized into a bundle either.
             let history_source = crate::history::history_db_path();
-            let outcome = match crate::logging::copy_logs_to_bundle(&log_path, &dest) {
+            let outcome = match crate::logging::copy_logs_to_bundle(
+                &log_path,
+                &dest,
+                &entries,
+                Some(&history_source),
+                include_history,
+                &protected_sources,
+            ) {
                 Ok(log_missing) => match bundle::export_bundle_to_with_missing(
                     &dest,
                     &entries,
@@ -769,6 +794,7 @@ mod tests {
             tag: "v0.3.0".to_string(),
             url: "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/tag/v0.3.0".to_string(),
             asset_url: None,
+            asset_digest: None,
         }));
 
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {

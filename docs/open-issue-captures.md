@@ -104,7 +104,7 @@ damage or add field semantics until the observations establish their meaning.
 
 | Issues | Short reproduction and notes to retain |
 | --- | --- |
-| #345: damage tag 7 | Hit one target with a known skill for several isolated hits, then repeat under a known mitigation/shield change. Note hit times, visible damage numbers, skill, and target state so `Value` and tag 7 can be compared. |
+| #345: damage tag 7 | Hit one target with a known skill for several isolated hits, then repeat under a known mitigation/shield change. Note hit times, visible damage numbers, skill, and target state so `Value` and tag 7 can be compared. Builds containing the September 29 stabilization changes retain numeric `ActualValue` in sanitized dumps; older sanitized dumps stripped it. Reported damage still uses the established fields. |
 | #289: attr 0x1bb | Reference identity is `AttrStunned`; see the [September 25 audit](reference-protocol-audit-2026-09-25.md). A future gauge feature still needs controlled value/unit observations; do not infer an enrage gauge. |
 | #288: movement/facing | Reference names now identify direction/jump/velocity fields; `0x1da` is `AttrHateList`, not movement. See the [audit](reference-protocol-audit-2026-09-25.md). Validate units only when a concrete consumer needs them. |
 | #285: death/revive/buffs | Record one raid with a death, revive, and known buff application/expiry. Note times and who received each effect using local aliases. Existing decoders still need field confirmation; an old issue description is not proof the decoder is absent. |

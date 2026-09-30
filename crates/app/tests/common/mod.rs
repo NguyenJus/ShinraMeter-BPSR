@@ -195,6 +195,13 @@ impl Rig {
         self.fight_state
     }
 
+    /// Matches the orderly pipeline shutdown: finalize deferred state, then
+    /// perform the final publish tick before dropping the history sender.
+    pub fn finalize_for_shutdown(&mut self, now_ms: u64) {
+        self.pipeline.finalize_for_shutdown(now_ms);
+        self.tick(now_ms);
+    }
+
     /// Takes a snapshot without recording a `Capture`, for a
     /// `feed_notify`-driven test that wants to build its own `Capture`
     /// (label, at_ms, resets) around it.

@@ -173,22 +173,33 @@ impl<'a> BlobReader<'a> {
         mut on_field: impl FnMut(&mut Self, i32) -> Option<Field>,
     ) -> Option<()> {
         let body_end = self.struct_header()?;
-        loop {
-            let idx = self.read_i32()?;
-            if idx == END {
-                return Some(());
-            }
-            match on_field(self, idx)? {
-                Field::Handled => {}
-                Field::Unknown => {
-                    self.seek_to(body_end)?;
-                    return if self.read_i32()? == END {
-                        Some(())
-                    } else {
-                        None
-                    };
+        // Limit every field read, including nested structs, to this body's
+        // declared boundary. Otherwise a truncated child can consume its
+        // parent's fields and an early END can silently override `size`.
+        let outer_buf = self.buf;
+        self.buf = &outer_buf[..body_end];
+        let fields = (|| {
+            while self.pos < body_end {
+                let idx = self.read_i32()?;
+                if idx <= 0 {
+                    return None;
+                }
+                match on_field(self, idx)? {
+                    Field::Handled => {}
+                    Field::Unknown => {
+                        self.seek_to(body_end)?;
+                        break;
+                    }
                 }
             }
+            Some(())
+        })();
+        self.buf = outer_buf;
+        fields?;
+        if self.read_i32()? == END {
+            Some(())
+        } else {
+            None
         }
     }
 
@@ -471,6 +482,30 @@ mod tests {
         assert!(!detect_stream_safe(&buf));
         let data = parse_dungeon_dirty_data(&buf).unwrap();
         assert_eq!(data.flow_info.unwrap().state, 3);
+    }
+
+    #[test]
+    fn fields_cannot_escape_their_declared_struct_body() {
+        let mut outer_truncated = synthetic_non_stream_safe_blob();
+        // A zero-length outer body must have END immediately after its
+        // header, rather than decoding fields beyond the claimed boundary.
+        outer_truncated[4..8].copy_from_slice(&0i32.to_le_bytes());
+        assert!(parse_dungeon_dirty_data(&outer_truncated).is_none());
+
+        let mut child_truncated = synthetic_non_stream_safe_blob();
+        // FlowInfo's body contains index + value (8 bytes). A size of 4
+        // must not let the value be read out of the enclosing body.
+        child_truncated[16..20].copy_from_slice(&4i32.to_le_bytes());
+        assert!(parse_dungeon_dirty_data(&child_truncated).is_none());
+    }
+
+    #[test]
+    fn early_end_does_not_override_the_declared_struct_size() {
+        let mut buf = Vec::new();
+        for word in [BEGIN, 8, END, 42, END] {
+            buf.extend_from_slice(&word.to_le_bytes());
+        }
+        assert!(parse_dungeon_dirty_data(&buf).is_none());
     }
 
     #[test]
