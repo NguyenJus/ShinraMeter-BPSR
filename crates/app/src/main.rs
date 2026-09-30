@@ -5,6 +5,7 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -21,26 +22,6 @@ use ui::{OverlayApp, StatusLine, UiCommand};
 /// Bounded so a stalled pipeline never grows unboundedly behind capture.
 const EVENT_CAPACITY: usize = 4096;
 const COMMAND_CAPACITY: usize = 64;
-
-/// Where the cross-session uid -> (name, class) cache (issue #12) lives:
-/// `%APPDATA%\ShinraMeter-BPSR\names.json`. `bpsr-meter` deliberately knows
-/// nothing about this path (it's caller-supplied, no Windows-specific
-/// assumptions, no `directories` crate) — the app crate owns picking it.
-/// Falls back to a current-directory file, logged, if `APPDATA` isn't set
-/// (e.g. non-Windows dev/CI environments).
-fn names_cache_path() -> PathBuf {
-    let (path, warning) = paths::resolve(
-        None,
-        std::env::var("APPDATA").ok().as_deref(),
-        &["ShinraMeter-BPSR", "names.json"],
-        "ShinraMeter-BPSR-names.json",
-        "APPDATA is not set; falling back to a working-directory file for the name cache",
-    );
-    if let Some(warning) = warning {
-        log::warn!("{warning}");
-    }
-    path
-}
 
 /// Issue #89: how the overlay window and its swapchain get created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -448,10 +429,15 @@ fn main() -> eframe::Result {
     // the overlay's event loop the moment a changed snapshot is ready.
     let repaint = pipeline::RepaintHandle::new();
 
+    let (name_cache_path, warning) = paths::names_cache_path();
+    if let Some(warning) = warning {
+        log::warn!("{warning}");
+    }
+
     let (rx_snapshot, pipeline_thread) = pipeline::spawn(
         rx_events,
         rx_command,
-        names_cache_path(),
+        name_cache_path,
         history_handle.clone(),
         queue_drop_signal,
         capture_restart,

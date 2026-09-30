@@ -726,6 +726,17 @@ impl Pipeline {
         now_ms: u64,
     ) -> Option<meter::ResetReason> {
         let reason = if self.history.is_some() {
+            // Capture late boss metadata before a real scene transition
+            // replaces the live scene. Later refreshes can then preserve
+            // the latest outgoing identity alongside final combat totals.
+            if let meter::ProtocolEvent::Scene { level_map_id } = &ev
+                && self
+                    .meter
+                    .diagnostic_scene_id()
+                    .is_some_and(|previous| previous != *level_map_id)
+            {
+                self.refresh_pending_fight_end(now_ms);
+            }
             let (reason, ended) = self.meter.apply_preserving_ended_fight(&ev);
             if !self.fight_end_recorded
                 && let Some(ended) = ended
@@ -894,11 +905,13 @@ impl Pipeline {
     /// One `Meter::snapshot` per fight end in the common case: an
     /// idle-timeout end is already `idle_timeout_ms` (9s stock) past
     /// `fight_end_ms` the first tick it is observed, i.e. long past the 2s
-    /// grace window, so it takes the flush path straight away. At most two
+    /// grace window, so it takes the flush path straight away. Ordinarily two
     /// for a boss-death end genuinely observed inside the window — one to
     /// capture the pending record, one to rebuild it when the window
-    /// closes. Every tick in between does no snapshot work at all, and a
-    /// pipeline with no history handle (`Pipeline::new()`, most tests)
+    /// closes. A scene transition during that hold also refreshes the
+    /// outgoing record before applying the new scene. Every tick in between
+    /// does no snapshot work at all, and a pipeline with no history handle
+    /// (`Pipeline::new()`, most tests)
     /// returns before touching the meter (PR #333 review, finding 1).
     ///
     /// # Leaving `Ended` early
@@ -1017,9 +1030,13 @@ impl Pipeline {
         else {
             return;
         };
-        // Scene packets can replace live metadata while the old rows remain
-        // held. Keep the end-edge identity, but use all final combat stats.
-        let scene_id = if let Some(pending) = &self.pending_fight_end {
+        // A known scene transition can replace live metadata while the old
+        // rows remain held. The first scene learned after an attach belongs
+        // to the same fight, so late boss packets can still enrich it.
+        let scene_id = if let Some(pending) = &self.pending_fight_end
+            && matches!((pending.scene_id, ended.scene_id),
+                (Some(previous), Some(current)) if previous != current)
+        {
             record.boss_monster_id = pending.record.boss_monster_id;
             record.boss_name = pending.record.boss_name.clone();
             record.is_boss = pending.record.is_boss;
@@ -1523,7 +1540,15 @@ mod tests {
             tx_events.try_send(event(i)).unwrap();
         }
         tx_command
-            .send(UiCommand::SkillFocus((1..=20).collect()))
+            .send(UiCommand::SkillFocus(
+                (1..=20)
+                    .map(|uid| {
+                        proto::EntityId::from_display_uid(uid, proto::EntityKind::Player)
+                            .expect("in-range test uid")
+                            .0 as i64
+                    })
+                    .collect(),
+            ))
             .unwrap();
         let started = Instant::now();
         let (rx_snapshot, thread) = spawn(
@@ -1556,6 +1581,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
         assert_eq!(snap.rows.len(), 20);
         assert!(snap.rows.iter().all(|row| row.skills.len() == 64));
+        assert!(snap.rows.iter().all(|row| row.dealt.len() == 64));
         eprintln!(
             "stalled-UI burst: {count} events, 20 players × 64 skills, elapsed={:?}",
             started.elapsed()
@@ -2505,6 +2531,128 @@ mod tests {
             let _ = std::fs::remove_file(&path);
 
             assert_eq!(count, 1);
+        }
+
+        #[test]
+        fn late_boss_identity_in_the_same_scene_reaches_history() {
+            for (initial_scene, boundary) in [
+                (true, "grace_expiry"),
+                (true, "early_reset"),
+                (false, "grace_expiry"),
+                (false, "early_reset"),
+            ] {
+                let path = temp_history_path(&format!("{initial_scene}-{boundary}"));
+                let (handle, thread) =
+                    HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+                let mut pipeline = Pipeline::new().with_history(handle.clone());
+
+                if initial_scene {
+                    pipeline.step(proto::ProtocolEvent::Scene { level_map_id: 1150 }, 0);
+                }
+                pipeline.step(hit_on(10, 100, 1_000, false), 1_000);
+                pipeline.step(hit_on(10, 100, 2_000, true), 2_000);
+                pipeline.step(
+                    proto::ProtocolEvent::DungeonState {
+                        state: proto::event::EDungeonState::End,
+                        scene_uuid: None,
+                    },
+                    2_000,
+                );
+                if !initial_scene {
+                    pipeline.step(proto::ProtocolEvent::Scene { level_map_id: 1150 }, 2_005);
+                }
+                pipeline.step(boss_appear(10, 103, 0, 1_000, 2_010), 2_010);
+                assert_eq!(
+                    pipeline.snapshot(2_010).encounter.boss_monster_id,
+                    Some(103)
+                );
+
+                match boundary {
+                    "grace_expiry" => {
+                        let state = pipeline.tick(4_001);
+                        pipeline.record_fight_end(state, 4_001);
+                    }
+                    "early_reset" => pipeline.reset(2_020),
+                    _ => unreachable!(),
+                }
+
+                let rows = list_rows(&handle);
+                assert_eq!(rows.len(), 1, "{boundary}");
+                let record = load_record(&handle, rows[0].id);
+                drop(handle);
+                drop(pipeline);
+                thread.join().unwrap();
+                let _ = std::fs::remove_file(&path);
+
+                assert_eq!(record.total_damage, 200, "{boundary}");
+                assert_eq!(record.scene_id, Some(1150), "{boundary}");
+                assert_eq!(record.boss_monster_id, Some(103), "{boundary}");
+                assert_eq!(record.boss_name.as_deref(), Some("Ignisor"), "{boundary}");
+                assert!(record.is_boss, "{boundary}");
+                assert_eq!(record.title, "Ignisor", "{boundary}");
+            }
+        }
+
+        #[test]
+        fn late_boss_identity_survives_scene_transitions_before_history_flush() {
+            for initial_scene in [true, false] {
+                for boundary in ["town_expiry", "town_reset", "town_then_dungeon", "dungeon"] {
+                    let case = format!("late-boss-{initial_scene}-{boundary}");
+                    let path = temp_history_path(&case);
+                    let (handle, thread) =
+                        HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+                    let mut pipeline = Pipeline::new().with_history(handle.clone());
+
+                    if initial_scene {
+                        pipeline.step(proto::ProtocolEvent::Scene { level_map_id: 1150 }, 0);
+                    }
+                    pipeline.step(hit_on(10, 100, 1_000, false), 1_000);
+                    pipeline.step(hit_on(10, 100, 2_000, true), 2_000);
+                    pipeline.step(
+                        proto::ProtocolEvent::DungeonState {
+                            state: proto::event::EDungeonState::End,
+                            scene_uuid: None,
+                        },
+                        2_000,
+                    );
+                    if !initial_scene {
+                        pipeline.step(proto::ProtocolEvent::Scene { level_map_id: 1150 }, 2_005);
+                    }
+                    pipeline.step(boss_appear(10, 103, 0, 1_000, 2_010), 2_010);
+                    pipeline.step(hit_on(10, 75, 2_015, false), 2_015);
+
+                    if boundary != "dungeon" {
+                        pipeline.step(proto::ProtocolEvent::Scene { level_map_id: 8 }, 2_020);
+                    }
+                    match boundary {
+                        "town_expiry" => {
+                            let state = pipeline.tick(4_001);
+                            pipeline.record_fight_end(state, 4_001);
+                        }
+                        "town_reset" => pipeline.reset(2_030),
+                        "town_then_dungeon" | "dungeon" => {
+                            pipeline
+                                .step(proto::ProtocolEvent::Scene { level_map_id: 1001 }, 2_030);
+                        }
+                        _ => unreachable!(),
+                    }
+
+                    let rows = list_rows(&handle);
+                    assert_eq!(rows.len(), 1, "{case}");
+                    let record = load_record(&handle, rows[0].id);
+                    drop(handle);
+                    drop(pipeline);
+                    thread.join().unwrap();
+                    let _ = std::fs::remove_file(&path);
+
+                    assert_eq!(record.total_damage, 275, "{case}");
+                    assert_eq!(record.scene_id, Some(1150), "{case}");
+                    assert_eq!(record.boss_monster_id, Some(103), "{case}");
+                    assert_eq!(record.boss_name.as_deref(), Some("Ignisor"), "{case}");
+                    assert!(record.is_boss, "{case}");
+                    assert_eq!(record.title, "Ignisor", "{case}");
+                }
+            }
         }
 
         #[test]

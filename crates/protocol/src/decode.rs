@@ -20,7 +20,8 @@ use crate::event::{
     damage_kind_of, fits_display_uid, kind_of, uid_of,
 };
 use crate::frame::{
-    Desync, MAX_TAIL_LEN, Notify, SERVICE_UUID, TEAM_NTF_SERVICE_UUID, parse_frame, split_frames,
+    Desync, ExpansionBudget, MAX_TAIL_LEN, Notify, SERVICE_UUID, TEAM_NTF_SERVICE_UUID,
+    parse_frame_with_budget, split_frames,
 };
 use crate::inspect::InspectSink;
 use crate::pb::{self, AoiSyncDelta, EDamageType};
@@ -943,13 +944,14 @@ impl Decoder {
         let entities = &mut self.entities;
         let mut out = Vec::new();
         let mut consumed = 0;
+        let mut expansion_budget = ExpansionBudget::new();
         loop {
             let result = split_frames(&self.tail[consumed..]);
             for f in &result.frames {
                 // Release payloads after each outer frame instead of retaining
                 // every expanded Notify in this TCP batch simultaneously.
                 let mut notifies = Vec::new();
-                parse_frame(f, 0, &mut notifies, sink, now_ms);
+                parse_frame_with_budget(f, 0, &mut notifies, sink, now_ms, &mut expansion_budget);
                 for n in &notifies {
                     decode_notify(n, now_ms, &mut out, sink, entities);
                 }

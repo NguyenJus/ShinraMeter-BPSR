@@ -439,28 +439,41 @@ pub(crate) fn files_to_export(primary: &Path) -> Vec<PathBuf> {
 /// Copies the current retained log set into a session-bundle directory and
 /// returns the bundle names that could not be copied.  The listing and every
 /// copy share [`ROTATION_LOCK`], so a rotation cannot shift a numbered chunk
-/// between those two steps.
+/// between those two steps. Before creating the directory or copying, it
+/// checks all planned bundle outputs against the logs, other entries, history,
+/// and excluded live sources, including history when sanitizing is disabled.
 ///
 /// This deliberately does not log failures: [`Tee::rotate`] holds the
 /// logger's writer lock while it waits for the same lock, so logging here
 /// could deadlock.  The bundle exporter records and reports the returned
 /// names after the guard is released instead.
-pub(crate) fn copy_logs_to_bundle(primary: &Path, dest_dir: &Path) -> io::Result<Vec<String>> {
-    fs::create_dir_all(dest_dir)?;
+pub(crate) fn copy_logs_to_bundle(
+    primary: &Path,
+    dest_dir: &Path,
+    entries: &[(String, PathBuf)],
+    history_source: Option<&Path>,
+    include_history: bool,
+    protected_sources: &[PathBuf],
+) -> io::Result<Vec<String>> {
     let _guard = lock_rotation();
 
+    let parts = files_to_export(primary);
+    crate::bundle::preflight_bundle_dest(
+        dest_dir,
+        entries,
+        history_source,
+        include_history,
+        &parts,
+        protected_sources,
+    )?;
+    fs::create_dir_all(dest_dir)?;
+
     let mut missing = Vec::new();
-    for source in files_to_export(primary) {
+    for source in parts {
         let Some(name) = source.file_name() else {
             continue;
         };
         let dest = dest_dir.join(name);
-        if crate::paths::same_file_if_exists(&source, &dest)? {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the bundle destination contains the source logs; pick a different directory",
-            ));
-        }
         if fs::copy(&source, &dest).is_err() {
             missing.push(name.to_string_lossy().into_owned());
         }
@@ -935,10 +948,144 @@ mod tests {
         );
         assert_eq!(fs::read(&source).unwrap(), b"preserve the live log");
         assert_eq!(
-            copy_logs_to_bundle(&source, &bundle).unwrap_err().kind(),
+            copy_logs_to_bundle(&source, &bundle, &[], None, false, &[])
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidInput
         );
         assert_eq!(fs::read(&source).unwrap(), b"preserve the live log");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bundle_log_copy_rejects_cross_part_alias_before_any_copy() {
+        let dir = scratch_path("bundle-cross-part-alias");
+        let bundle = dir.join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+        let primary = dir.join("session.log");
+        let rotated = log_chunk_path(&primary, 1);
+        fs::write(&primary, b"live current").unwrap();
+        fs::write(&rotated, b"live rotated").unwrap();
+        fs::hard_link(&rotated, bundle.join("session.log")).unwrap();
+
+        assert_eq!(
+            copy_logs_to_bundle(&primary, &bundle, &[], None, false, &[])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read(&rotated).unwrap(), b"live rotated");
+        assert_eq!(fs::read(&primary).unwrap(), b"live current");
+        assert!(!bundle.join(rotated.file_name().unwrap()).exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bundle_log_copy_rejects_settings_output_aliasing_history() {
+        let dir = scratch_path("bundle-settings-history-alias");
+        let bundle = dir.join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+        let primary = dir.join("session.log");
+        let settings = dir.join("settings.json");
+        let history = dir.join("history.sqlite");
+        fs::write(&primary, b"live log").unwrap();
+        fs::write(&settings, b"live settings").unwrap();
+        fs::write(&history, b"live history").unwrap();
+        fs::hard_link(&history, bundle.join("settings.json")).unwrap();
+        let entries = vec![("settings.json".into(), settings)];
+
+        assert_eq!(
+            copy_logs_to_bundle(&primary, &bundle, &entries, Some(&history), false, &[])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read(&history).unwrap(), b"live history");
+        assert!(!bundle.join("session.log").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bundle_log_copy_protects_an_excluded_raw_dump() {
+        let dir = scratch_path("bundle-excluded-raw-dump");
+        let bundle = dir.join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+        let primary = dir.join("session.log");
+        fs::write(&primary, b"live log").unwrap();
+        let raw_dump = bundle.join("manifest.json");
+        fs::write(&raw_dump, b"live raw dump").unwrap();
+
+        assert_eq!(
+            copy_logs_to_bundle(
+                &primary,
+                &bundle,
+                &[],
+                None,
+                false,
+                std::slice::from_ref(&raw_dump),
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read(&raw_dump).unwrap(), b"live raw dump");
+        assert!(!bundle.join("session.log").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bundle_log_copy_protects_an_excluded_name_cache_hard_link() {
+        let dir = scratch_path("bundle-excluded-names-alias");
+        let bundle = dir.join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+        let primary = dir.join("session.log");
+        let names = dir.join("names.json");
+        let settings = dir.join("settings.json");
+        fs::write(&primary, b"live log").unwrap();
+        fs::write(&names, b"live name cache").unwrap();
+        fs::write(&settings, b"live settings").unwrap();
+        fs::hard_link(&names, bundle.join("settings.json")).unwrap();
+        let entries = vec![("settings.json".into(), settings)];
+
+        assert_eq!(
+            copy_logs_to_bundle(
+                &primary,
+                &bundle,
+                &entries,
+                None,
+                false,
+                std::slice::from_ref(&names),
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read(&names).unwrap(), b"live name cache");
+        assert!(!bundle.join("session.log").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bundle_log_copy_accepts_a_separate_held_instance_lock() {
+        let dir = scratch_path("bundle-held-instance-lock");
+        let bundle = dir.join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+        let primary = dir.join("session.log");
+        let lock_path = dir.join("instance.lock");
+        fs::write(&primary, b"live log").unwrap();
+        let guard = match crate::single_instance::acquire_at(&lock_path) {
+            crate::single_instance::Acquisition::Acquired(guard) => guard,
+            other => panic!("expected to hold the instance lock: {other:?}"),
+        };
+        let protected = vec![lock_path.clone(), lock_path.with_extension("pid")];
+
+        assert!(
+            copy_logs_to_bundle(&primary, &bundle, &[], None, false, &protected)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(bundle.join("session.log")).unwrap(), b"live log");
+        drop(guard);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -948,7 +1095,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.log");
         fs::write(&path, b"preserve this session").unwrap();
-        let err = copy_logs_to_bundle(&path, &dir).unwrap_err();
+        let err = copy_logs_to_bundle(&path, &dir, &[], None, false, &[]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(fs::read(&path).unwrap(), b"preserve this session");
         fs::remove_dir_all(dir).unwrap();
@@ -967,7 +1114,11 @@ mod tests {
         }
         fs::write(&path, b"CURRENT").unwrap();
 
-        assert!(copy_logs_to_bundle(&path, &dir).unwrap().is_empty());
+        assert!(
+            copy_logs_to_bundle(&path, &dir, &[], None, false, &[])
+                .unwrap()
+                .is_empty()
+        );
         for chunk in 1..LOG_CHUNK_COUNT {
             let copied = dir.join(log_chunk_path(&path, chunk).file_name().unwrap());
             assert_eq!(
@@ -1005,7 +1156,14 @@ mod tests {
         let worker = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
             copied_tx
-                .send(copy_logs_to_bundle(&copy_path, &copy_dir))
+                .send(copy_logs_to_bundle(
+                    &copy_path,
+                    &copy_dir,
+                    &[],
+                    None,
+                    false,
+                    &[],
+                ))
                 .unwrap();
         });
         started_rx.recv().unwrap();

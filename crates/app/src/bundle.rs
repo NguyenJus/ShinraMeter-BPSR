@@ -295,8 +295,8 @@ pub fn bundle_entries(
 /// was on but the dump file hasn't been created yet, or a permission
 /// error) is skipped with a warning rather than aborting the whole export,
 /// since a partial bundle is still useful to whoever's debugging it.
-/// `Err` only when `dest_dir` itself can't be created or `manifest.json`
-/// can't be written — those leave nothing worth handing over at all.
+/// `Err` when a planned output aliases a live input, `dest_dir` can't be
+/// created, or `manifest.json` can't be written.
 ///
 /// Every skipped entry's bundle name is recorded in the written manifest's
 /// [`Manifest::missing`] list *and* returned, so neither a reader of the
@@ -334,6 +334,50 @@ pub fn export_bundle_to(
     )
 }
 
+/// Check every planned bundle write against every live input before the
+/// first copy. `log_parts` is supplied by the log exporter while its rotation
+/// lock is held. `protected_sources` includes live artifacts deliberately
+/// excluded from the bundle, such as an unsanitized dump ring.
+pub(crate) fn preflight_bundle_dest(
+    dest_dir: &Path,
+    entries: &[(String, PathBuf)],
+    history_source: Option<&Path>,
+    include_history: bool,
+    log_parts: &[PathBuf],
+    protected_sources: &[PathBuf],
+) -> io::Result<()> {
+    let sources: Vec<&Path> = log_parts
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(entries.iter().map(|(_, source)| source.as_path()))
+        .chain(history_source)
+        .chain(protected_sources.iter().map(PathBuf::as_path))
+        .collect();
+    let mut destinations: Vec<PathBuf> = log_parts
+        .iter()
+        .filter_map(|source| source.file_name().map(|name| dest_dir.join(name)))
+        .chain(entries.iter().map(|(name, _)| dest_dir.join(name)))
+        .collect();
+    if include_history && history_source.is_some() {
+        let sanitized = dest_dir.join(SANITIZED_HISTORY_FILE_NAME);
+        destinations.push(crate::history::sanitize::journal_path(&sanitized));
+        destinations.push(sanitized);
+    }
+    destinations.push(dest_dir.join("manifest.json"));
+
+    for dest in &destinations {
+        for source in &sources {
+            if crate::paths::same_file_if_exists(source, dest)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the bundle destination contains a source artifact; pick a different directory",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Like [`export_bundle_to`], with failures from an earlier protected copy
 /// folded into the manifest.  Session-bundle log files use this because they
 /// must be copied while `logging`'s rotation lock is held; this function then
@@ -347,18 +391,8 @@ pub(crate) fn export_bundle_to_with_missing(
     include_history: bool,
     prior_missing: &[String],
 ) -> io::Result<Vec<String>> {
+    preflight_bundle_dest(dest_dir, entries, history_source, include_history, &[], &[])?;
     fs::create_dir_all(dest_dir)?;
-    // Validate before copying: an export into an artifact's own directory
-    // must not truncate the live source while trying to copy it to itself.
-    for (name, source) in entries {
-        let dest = dest_dir.join(name);
-        if crate::paths::same_file_if_exists(source, &dest)? {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the bundle destination contains a source artifact; pick a different directory",
-            ));
-        }
-    }
     let mut missing = prior_missing.to_vec();
     for (name, source) in entries {
         let dest = dest_dir.join(name);
@@ -721,6 +755,122 @@ mod tests {
             fs::read(source).unwrap(),
             b"preserve the diagnostic artifact"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn export_bundle_to_rejects_cross_entry_alias_before_any_copy() {
+        let dir =
+            std::env::temp_dir().join(format!("shinra-bundle-cross-entry-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let bundle = dir.join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+        let dump = dir.join("dump.jsonl");
+        let settings = dir.join("settings.json");
+        fs::write(&dump, b"live dump").unwrap();
+        fs::write(&settings, b"live settings").unwrap();
+        fs::hard_link(&dump, bundle.join("settings.json")).unwrap();
+        let entries = vec![
+            ("dump.jsonl".into(), dump.clone()),
+            ("settings.json".into(), settings.clone()),
+        ];
+        let manifest = build_manifest(
+            "1-1700000000",
+            "0.3.5",
+            1_700_000_000,
+            DumpStatus {
+                inspect_enabled: true,
+                dump_byte_budget: 100,
+                dropped_records: Some(0),
+                dump_sanitized: true,
+                sanitized_out_records: None,
+            },
+        );
+
+        assert_eq!(
+            export_bundle_to(&bundle, &entries, &manifest, None, false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read(&dump).unwrap(), b"live dump");
+        assert_eq!(fs::read(&settings).unwrap(), b"live settings");
+        assert!(!bundle.join("dump.jsonl").exists());
+        assert!(!bundle.join("manifest.json").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn export_bundle_to_rejects_manifest_aliasing_disabled_history() {
+        let dir = std::env::temp_dir().join(format!(
+            "shinra-bundle-manifest-history-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let bundle = dir.join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+        let history = dir.join("history.sqlite");
+        fs::write(&history, b"live history").unwrap();
+        fs::hard_link(&history, bundle.join("manifest.json")).unwrap();
+        let manifest = build_manifest(
+            "1-1700000000",
+            "0.3.5",
+            1_700_000_000,
+            DumpStatus {
+                inspect_enabled: false,
+                dump_byte_budget: 0,
+                dropped_records: None,
+                dump_sanitized: false,
+                sanitized_out_records: None,
+            },
+        );
+
+        assert_eq!(
+            export_bundle_to(&bundle, &[], &manifest, Some(&history), false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read(&history).unwrap(), b"live history");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn export_bundle_to_rejects_a_source_at_the_sanitized_journal_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "shinra-bundle-journal-source-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let bundle = dir.join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+        let source = bundle.join("history.sanitized.sqlite-journal");
+        let history = dir.join("history.sqlite");
+        fs::write(&source, b"preserve live source").unwrap();
+        fs::write(&history, b"corrupt history").unwrap();
+        let entries = vec![("settings.json".into(), source.clone())];
+        let manifest = build_manifest(
+            "1-1700000000",
+            "0.3.5",
+            1_700_000_000,
+            DumpStatus {
+                inspect_enabled: false,
+                dump_byte_budget: 0,
+                dropped_records: None,
+                dump_sanitized: false,
+                sanitized_out_records: None,
+            },
+        );
+
+        assert_eq!(
+            export_bundle_to(&bundle, &entries, &manifest, Some(&history), true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read(&source).unwrap(), b"preserve live source");
+        assert!(!bundle.join("settings.json").exists());
+        assert!(!bundle.join("manifest.json").exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

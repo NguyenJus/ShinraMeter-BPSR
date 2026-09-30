@@ -60,6 +60,18 @@ pub fn ensure_parent_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Location of the cross-session name cache, shared by startup and bundle
+/// export so an output alias cannot overwrite the live cache.
+pub fn names_cache_path() -> (PathBuf, Option<String>) {
+    resolve(
+        None,
+        std::env::var("APPDATA").ok().as_deref(),
+        &["ShinraMeter-BPSR", "names.json"],
+        "ShinraMeter-BPSR-names.json",
+        "APPDATA is not set; falling back to a working-directory file for the name cache",
+    )
+}
+
 /// Compare existing filesystem identities, including hard links and path
 /// aliases. Missing files cannot share an identity; other lookup errors
 /// must stop destructive export/sanitization operations before they write.

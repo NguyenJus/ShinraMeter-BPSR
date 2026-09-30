@@ -18,8 +18,9 @@ correctness audit, not a guarantee against future game-protocol changes.
   its header after four or five bytes also broke recovery. Regressions cover
   header splits and recovery into the following valid frame.
 - Nested compressed siblings could exceed the intended decompression bounds.
-  One outer frame now shares a 50 MiB expansion budget across all descendants,
-  including failed attempts. Each fragment retains its 10 MiB output limit;
+  One decoder push now shares a 50 MiB expansion budget across all outer
+  frames and descendants, including conservatively counted failed reads. Each
+  fragment retains its 10 MiB output limit;
   zstd's history window is capped at 16 MiB. Decoded payloads are released
   after each outer frame. Extreme valid traffic exceeding these limits is
   intentionally refused; these are resource limits, not inferred game semantics.
@@ -60,7 +61,11 @@ correctness audit, not a guarantee against future game-protocol changes.
 - History requests after the worker disconnects now return errors instead of
   leaving the UI waiting for replies that will never arrive.
 - History sanitization and diagnostic export reject destinations aliasing their
-  source before writing. File identity checks cover ordinary paths, symlinks,
+  sources before writing. Bundle preflight checks every planned output,
+  including the manifest, against all inputs and live history even when history
+  inclusion is disabled. The UI also protects excluded raw captures, the name
+  cache, and instance lock files. Preflight runs before the initial log copy
+  under the rotation lock. File identity checks cover ordinary paths, symlinks,
   and hard links, with regressions proving source preservation.
 
 ## Updater and release fixes
@@ -106,7 +111,7 @@ quantity or a valid universal replacement denominator.
 | #449 template identity | Scene 1154 directly observes damaged Kartgriff template 1152, corroborating that curated tier. Still no scene-5901 evidence; do not select a template from a matching name alone. |
 | #380 proxy ownership | No paired helper-enabled/disabled transport and ownership evidence. Preserve the current known-other-process rejection rather than weakening adoption security on repeated signatures. |
 | #345 ActualValue | Reference type confirmed; no validated replacement semantics. Future sanitized dumps retain the numeric field, reducing the need for unsanitized collection. |
-| #274 Windows update | Requires a genuine older-to-newer update with executable locks, elevation, driver handoff, and later cleanup. Unit tests and `--version` do not establish that complete cycle. |
+| #274 Windows update | Native update, instance/driver handoff, rollback failures, lock recovery and later restart passed on Windows 11 build 26200; see the September 30 results and fixture limits below. This does not establish behavior on every installation. |
 | #351 release profiles | No comparative Windows startup/frame-time benchmark; retain the existing release profile. |
 | #165 README | Explicitly requests a human rewrite; left for the author. |
 
@@ -130,7 +135,7 @@ names without replacing existing names or changing boss/scene policy. Source:
 [BPSR-ZDPS SkillOverrides.en.json](https://github.com/Blue-Protocol-Source/BPSR-ZDPS/blob/cfeb58c0acc85bc17181b413b9e50b0b26c15c5d/BPSR-ZDPS/Data/SkillOverrides.en.json).
 The tag-7 schema comes from [generated Csharp.cs](https://github.com/Blue-Protocol-Source/BPSR-ZDPS/blob/cfeb58c0acc85bc17181b413b9e50b0b26c15c5d/BPSR-ZDPSLib/protos/Csharp.cs#L22946).
 
-## Verification
+## Initial PR verification
 
 - `scripts/check.sh`: passed, including formatting, shell packaging/release
   regressions, Windows all-target clippy with warnings denied, full workspace
@@ -144,8 +149,8 @@ The tag-7 schema comes from [generated Csharp.cs](https://github.com/Blue-Protoc
 - `cargo deny check`: advisories, bans, licenses, and sources passed after the
   dependency changes.
 - Independent high-tier review covered the full diff and cross-module state,
-  schema, and update interfaces. Review findings were addressed; no actionable
-  findings remain. The reviewer reused author test receipts; the final checks
+  schema, and update interfaces. Findings identified in that pass were addressed.
+  The reviewer reused author test receipts; the final checks
   above were run separately after integration.
 - Optimized Windows cross-build passed; the shared executable inspection passed.
   The updater's actual PE validator accepted the 20,889,088-byte built executable
@@ -156,5 +161,91 @@ The tag-7 schema comes from [generated Csharp.cs](https://github.com/Blue-Protoc
   library tests above did run successfully. Hosted Windows CI also passed the
   release build, library tests, and elevated release `--version` smoke check.
 
-These checks do not exercise a live game session or a complete in-place update
-transaction. The remaining evidence requirements above are not test passes.
+These initial checks did not exercise a live game session or a complete in-place
+update transaction. The September 30 follow-up below records native UI coverage.
+
+## Adversarial PR follow-up
+
+A separate review of PR #481 reproduced additional boundary failures:
+
+- Cross-artifact export aliases could overwrite live history, including through
+  `manifest.json`. Complete preflight now rejects them before any bundle write.
+  It also includes the sanitizer's destination journal: error cleanup could
+  otherwise delete a live source at that path. Direct sanitization protects its
+  source against both destination paths before attempting the copy or cleanup.
+- History discarded boss identity learned during end grace in the same scene.
+  Regressions cover grace expiry, early reset, first scene discovery, and a town
+  transition after late boss identity arrives.
+- Coalesced compressed outer frames each received a fresh expansion allowance.
+  A 2,624-byte synthetic batch expanded 72 MiB. The allowance now spans a whole
+  decoder push, with frame alignment retained for recovery on the next push.
+- Five immediately invalid compressed siblings exhausted the allowance without
+  producing output and suppressed a valid sibling. Failed decompression now
+  uses bounded reads and conservatively counts the failed read's capacity,
+  including bytes that zstd can produce before returning a checksum error.
+  Each attempt costs at least 64 KiB of allowance, capped by the remaining
+  fragment allowance, keeping immediately invalid attempts cheap but bounded.
+- The stalled-UI regression supplied display UIDs instead of full entity IDs,
+  so it never built focused breakdowns. It now uses full player IDs and checks
+  all 64 dealt-skill entries per player. Decompression diagnostics also use a
+  fragment-neutral label.
+
+Follow-up verification:
+
+- Independent adversarial re-review found no remaining actionable findings in
+  the final fixes. The original journal-deletion probes now reject the operation
+  and preserve the live source without copying any bundle entries.
+- `scripts/check.sh` passed: formatting, both shell regression suites, Windows
+  all-target clippy, **2,212 workspace tests (zero failed or ignored)**, and
+  Windows cross-target checking.
+- Native Windows application library tests executed through WSL interop:
+  **1,156 passed, zero failed**, including export with the real instance lock
+  held and both journal-source preservation regressions.
+- The optimized Windows release build and `scripts/check-windows-exe.sh` passed.
+- These headless tests do not replace the real elevated older-to-newer updater
+  transaction, driver/instance handoff, rollback, or post-restart cleanup test.
+  The elevated UI harness was not running during this follow-up.
+
+## September 30 native UI verification
+
+Native Windows UI testing completed on Windows 11 Pro build 26200 using isolated
+installations, settings, history, logs and instance locks. The reviewed candidate
+rendered and its menu, update check, history list/details, and export UI worked.
+No additional product defects were reproduced.
+
+| Case | Result |
+| --- | --- |
+| Genuine update | Passed authenticated GitHub download/digest verification, staging, swap and elevated relaunch into published v0.3.5. The predecessor exited and exactly one responsive successor remained. |
+| Instance and capture handoff | The successor waited for the previous instance lock, acquired it after shutdown, started WinDivert and adopted the running game's connection. This verifies resumed capture, not combat-statistical correctness. |
+| Cleanup and ordinary restart | Staging and backup files disappeared; a subsequent normal restart remained usable with neither file present. |
+| Process-creation failure | Deleting the new target after verified swap forced real process creation to fail. The old overlay stayed usable, showed retry feedback, and restored the exact original executable bytes. |
+| Restoration failure | A separate lock denied deletion/rename of the backup. The overlay stayed usable; its full error identified the retained backup path, whose bytes matched the original. Releasing the injected lock permitted manual restoration. |
+| Validation and file locks | Digest mismatch and invalid PE fixtures left the installation and process intact with retry/error UI. Locking the current executable blocked swap without corrupting it; retry succeeded after releasing the lock. |
+| Reviewed-candidate successor | A local-asset fixture installed the original reviewed candidate; its hash matched, it acquired the instance lock, started WinDivert and rendered successfully. |
+| Paths | Updates passed with spaces and Unicode in the installation path, including a 240-character executable path. Paths beyond the Windows legacy limit were not tested. |
+| History and settings | Four synthetic encounters and their details loaded. All four persisted across normal close/restart without duplication, together with the changed opacity setting. |
+| Safe export | Export succeeded under the live instance lock. Sanitized history retained four encounters and 20 player rows; source names were replaced by pseudonyms and SQLite integrity passed. |
+| Export aliases | Manifest, settings, name-cache, history, sanitizer-journal and raw-dump aliases were rejected with visible feedback and unchanged protected-source hashes. |
+| Unsanitized dump exclusion | A nonempty synthetic raw dump was omitted. Its marker was absent from every exported file, and the manifest explicitly recorded exclusion. |
+
+The genuine network transaction used a disposable build of the reviewed source
+reporting v0.3.4, because both the candidate and current published release report
+v0.3.5. It installed the actual published asset; the separate local-asset case
+covered the reviewed candidate as successor. The published asset SHA-256 was
+`8f1d1418c7fb70db868f86b87d2f3b827ca61d5c80e967ec11706828e15f624c`; the original
+reviewed candidate was
+`0ff2189a4fbbd03d082408ed6fb3e0356f937279370b92f93be9e35023d0e583`.
+
+Disposable test hooks provided a bounded post-swap pause for fault injection,
+local bytes with an explicit digest for validation/candidate tests, and a bundle
+destination override for pre-existing alias directories. Local-asset cases
+bypassed HTTP acquisition and asset-digest provenance; alias cases bypassed only
+the native destination chooser. Production validation, swap, relaunch, export
+preflight and UI feedback remained in use. The genuine network case left these
+hooks disabled. No hooks or fixture executables are included in the PR.
+
+Independent evidence verification found no source-hash changes from the reviewed
+candidate and no mismatches in the completed receipts. Logs and screenshots are
+retained privately; none are published here. These results do not establish
+recovery after a successor is created successfully but later fails initialization,
+or resolve unrelated live-combat/protocol issues. No issues were closed.
