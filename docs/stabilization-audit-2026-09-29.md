@@ -45,6 +45,9 @@ correctness audit, not a guarantee against future game-protocol changes.
   the existing end policy after accumulation, respecting the configured death
   behavior and incomplete-objective/other-boss guards. History's recording
   latch is reset for each new encounter, including immediately ended fights.
+- The obsolete ignored shutdown replay now calls the production finalizer and
+  checks trailing grace damage and exactly-once persistence; separate abrupt-drop
+  coverage remains enabled.
 - A slow UI caused a full snapshot queue to rebuild the snapshot unnecessarily.
   The pipeline now reuses the rejected snapshot. A deterministic burst exercises
   20,480 events, 20 players, 64 skills per player, a full 4,096-event ingress
@@ -131,8 +134,10 @@ The tag-7 schema comes from [generated Csharp.cs](https://github.com/Blue-Protoc
 
 - `scripts/check.sh`: passed, including formatting, shell packaging/release
   regressions, Windows all-target clippy with warnings denied, full workspace
-  tests, and Windows cross-target checking. Workspace tests: **2,196 passed,
-  zero failed, one pre-existing ignored test**.
+  tests, and Windows cross-target checking. After enabling the obsolete skipped
+  shutdown regression, the replay suite passed **38 tests, zero ignored**; its
+  Windows clippy and formatting checks also passed. Reusing unchanged suite
+  results gives **2,197 passing workspace tests, zero failed, zero ignored**.
 - Application library tests built for `x86_64-pc-windows-gnu` and executed on
   Windows through WSL interop: **1,145 passed, zero failed**.
 - All three offline generated-table checks and the upstream drift check passed.
@@ -148,8 +153,8 @@ The tag-7 schema comes from [generated Csharp.cs](https://github.com/Blue-Protoc
 - Local release `--version` smoke did not complete through WSL: no banner was
   produced before interruption. The release manifest requires elevation before
   `main`; elevation is a suspected limitation, not a verified cause. Native
-  library tests above did run successfully. CI retains its elevated Windows
-  release-startup smoke check.
+  library tests above did run successfully. Hosted Windows CI also passed the
+  release build, library tests, and elevated release `--version` smoke check.
 
 These checks do not exercise a live game session or a complete in-place update
 transaction. The remaining evidence requirements above are not test passes.

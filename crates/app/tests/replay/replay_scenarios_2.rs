@@ -1,8 +1,8 @@
 //! System tests for issue #342's second batch of missing replay scenarios:
 //! a monster uid recycled onto a different monster in the next pull, a
 //! dungeon's own enter/leave flow signals (`SyncDungeonData`) alongside
-//! ordinary scene changes, two dungeons pulled back to back, and an app
-//! shutdown (the whole pipeline dropped) mid-pull. Each scenario is driven
+//! ordinary scene changes, two dungeons pulled back to back, abrupt pipeline
+//! drop mid-pull, and orderly shutdown during post-end grace. Each scenario is driven
 //! through the real capture/protocol/pipeline stack (`common::Rig`) and
 //! asserted against checked-in goldens (`common::assert_golden`), the same
 //! way `replay_scenarios.rs` (issue #342's first batch) does.
@@ -21,12 +21,10 @@
 //!
 //! ## `was_tracked_boss`/`recompute_boss` ordering
 //!
-//! A recognized boss's first-ever hit only *becomes* `boss_uid` once
-//! `recompute_boss` runs on it — a hit that is simultaneously both the
-//! target's first-ever damage and its killing blow reads `was_tracked_boss`
-//! (computed just ahead of that recompute) as `false` and never ends the
-//! fight. A real pull always lands an ordinary hit before the kill; several
-//! scenarios below establish that ordering before landing a kill.
+//! A recognized boss's first hit becomes the selected boss during
+//! `recompute_boss`. A lethal encounter opener now ends after accumulation
+//! establishes its clock; the scenarios below use an ordinary hit followed
+//! by a kill to exercise encounters with a nonzero duration.
 
 use crate::common::{Rig, assert_golden};
 use bpsr_app::history::sqlite::SqliteHistory;
@@ -377,12 +375,9 @@ fn back_to_back_dungeons() {
     assert_golden(fresh);
 }
 
-/// Issue #342, scenario 9(a): the app closing — the whole `Pipeline` (and
-/// its `HistoryHandle`) dropped, exactly as `main.rs`'s process exit does,
-/// with no history-flushing shutdown call anywhere on that path (unlike
-/// `Pipeline::shutdown_names_cache`, which the name cache does get), using
-/// `Rig::with_history` and a real temp-file SQLite store the same way
-/// `replay_history.rs` does.
+/// Issue #342, scenario 9(a): abrupt drop of the whole `Pipeline` and its
+/// `HistoryHandle`, without the orderly shutdown finalizer. Uses a real
+/// temp-file SQLite store, as `replay_history.rs` does.
 ///
 /// A fight that already finished and cleared its post-end grace window —
 /// already sent to the history channel — survives an abrupt drop happening
@@ -454,29 +449,20 @@ fn app_shutdown_mid_next_pull_keeps_flushed_fight() {
     assert_eq!(rows[0].total_damage, 90_000);
 }
 
-/// Issue #342, scenario 9(b): a real gap this test pins deliberately, not
-/// by accident. `Pipeline::record_fight_end` only ever sends a fight's
-/// `pending_fight_end` to history from a *later* tick/step call — once the
-/// post-end grace window has closed, or the state leaves `Ended` early
-/// (`crates/app/src/pipeline.rs`'s `record_fight_end`/
-/// `settle_pending_fight_end`). There is no `Drop for Pipeline` and nothing
-/// on this shutdown path flushes a still-pending record. A fight that ends
-/// and the app closes again before either of those fires — well inside
-/// `post_end_grace_ms` — never reaches the history channel at all: its
-/// whole record is silently lost. See this PR's "Deviations / follow-ups".
+/// Issue #342, scenario 9(b): orderly shutdown explicitly finalizes deferred
+/// history before its final publish. A completed fight and its trailing
+/// grace damage must persist even when shutdown precedes grace expiry.
+/// Scenario 9(a) separately exercises abrupt drop of a still-active pull.
 #[test]
-#[ignore = "known gap: pending_fight_end is not flushed when Pipeline is dropped inside post_end_grace_ms; see #342 follow-ups"]
-fn app_shutdown_inside_grace_window_loses_the_record() {
-    // The gap: a fight that ends and the app closes again before a later
-    // tick has closed the grace window over it.
+fn orderly_app_shutdown_inside_grace_window_preserves_the_record() {
     let path_b = std::env::temp_dir().join(format!(
-        "shinra-shutdown-mid-fight-grace-gap-{}.sqlite",
+        "shinra-orderly-shutdown-inside-grace-{}.sqlite",
         std::process::id()
     ));
     let _guard_b = TempDb(path_b.clone());
     let _ = std::fs::remove_file(&path_b);
 
-    let scenario_b = Scenario::new("app_shutdown_inside_grace_window_loses_the_record")
+    let scenario_b = Scenario::new("orderly_app_shutdown_inside_grace_window_preserves_the_record")
         .at(1_000)
         .enter_scene(TOWERING_RUIN)
         .player_appear(P_ARIA, "Aria", prof::STORMBLADE, 12_000)
@@ -487,9 +473,9 @@ fn app_shutdown_inside_grace_window_loses_the_record() {
         // Clear of `min_duration_ms`'s 5_000ms floor, same as scenario (a).
         .at(8_000)
         .hits(M_BOSS, vec![Hit::new(P_ARIA, 101, 40_000).kill()])
-        // Still well inside the 2_000ms grace window: `record_fight_end`
-        // only builds and caches `pending_fight_end` here, it does not
-        // send it -- that needs a *later* tick this scenario never makes.
+        .at(8_100)
+        .hit(P_ARIA, M_BOSS, 101, 10_000)
+        // Ordinary ticks still defer history inside the 2_000ms grace.
         .at(8_500)
         .tick();
 
@@ -497,10 +483,13 @@ fn app_shutdown_inside_grace_window_loses_the_record() {
     rig.run(&scenario_b);
     assert_eq!(rig.fight_state(), FightState::Ended);
 
+    // The real run loop calls this finalizer before its final publish on
+    // Quit or command-channel disconnect, then drops the history sender.
+    rig.finalize_for_shutdown(8_500);
     drop(rig);
     thread
         .join()
-        .expect("history writer thread must not panic on abrupt pipeline drop");
+        .expect("history writer thread must drain the orderly shutdown record");
 
     let store =
         SqliteHistory::open(&path_b, RetentionPolicy::default()).expect("reopen the history store");
@@ -508,9 +497,7 @@ fn app_shutdown_inside_grace_window_loses_the_record() {
     assert_eq!(
         rows.len(),
         1,
-        "desired behaviour: a fight that ends inside its own post-end grace \
-         window must still be flushed to history when the app closes, \
-         instead of being silently lost"
+        "orderly shutdown must flush the pending completed fight exactly once"
     );
-    assert_eq!(rows[0].total_damage, 90_000);
+    assert_eq!(rows[0].total_damage, 100_000);
 }
