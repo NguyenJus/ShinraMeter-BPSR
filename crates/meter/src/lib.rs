@@ -10,7 +10,7 @@ pub mod sim;
 pub mod stats;
 pub mod tables;
 
-pub use encounter::{Meter, skill_row_from_stats};
+pub use encounter::{EndedFight, Meter, skill_row_from_stats};
 pub use event::{
     CastEvent, Class, DamageEvent, DamageKind, DisappearReason, EDungeonState, EnemyHp, EntityId,
     EntityKind, PlayerInfo, ProtocolEvent, Role, fits_display_uid, kind_of, uid_of,

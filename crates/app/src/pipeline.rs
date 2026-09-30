@@ -703,6 +703,7 @@ impl Pipeline {
              dropped"
         );
         self.flush_pending_server_change(now_ms);
+        self.refresh_pending_fight_end(now_ms);
         self.record_fight_end(self.meter.fight_state(now_ms), now_ms);
 
         // A held phase may still be pending after the final state capture:
@@ -724,7 +725,25 @@ impl Pipeline {
         ev: meter::ProtocolEvent,
         now_ms: u64,
     ) -> Option<meter::ResetReason> {
-        let reason = self.meter.apply(&ev);
+        let reason = if self.history.is_some() {
+            let (reason, ended) = self.meter.apply_preserving_ended_fight(&ev);
+            if !self.fight_end_recorded
+                && let Some(ended) = ended
+            {
+                self.preserve_reset_fight(ended);
+                self.flush_pending_fight_end();
+            }
+            if reason.is_some() {
+                // Every reset starts a fresh recording lifecycle, including
+                // when the previous encounter was already persisted and the
+                // resetting event also ends the new encounter immediately.
+                self.held_fight_start_ms = None;
+                self.fight_end_recorded = false;
+            }
+            reason
+        } else {
+            self.meter.apply(&ev)
+        };
         if let Some(reason) = reason {
             log::debug!("meter reset: {reason:?}");
             self.save_names_cache();
@@ -755,6 +774,10 @@ impl Pipeline {
 
     /// Manual reset, triggered by the overlay's Reset button.
     pub fn reset(&mut self, now_ms: u64) {
+        self.refresh_pending_fight_end(now_ms);
+        self.flush_pending_fight_end();
+        self.held_fight_start_ms = None;
+        self.fight_end_recorded = false;
         self.meter.reset(meter::ResetReason::Manual, now_ms);
         self.save_names_cache();
     }
@@ -948,19 +971,11 @@ impl Pipeline {
         }
         self.fight_end_recorded = true;
         self.held_fight_start_ms = None;
-        // Normally rebuild at the end of the grace window: packets that
-        // arrived after the end latch still belong to this fight.  A scene
-        // update can arrive while that window is open, though.  It describes
-        // the newly adopted connection, while the held record describes the
-        // fight that just ended.  Rebuilding then would replace the outgoing
-        // scene/boss metadata with the destination's.  Keep the snapshot
-        // captured at the end edge in that case; a destination-scene packet
-        // cannot be trailing combat for the outgoing encounter.
-        if self
-            .pending_fight_end
-            .as_ref()
-            .is_none_or(|pending| pending.scene_id == self.meter.diagnostic_scene_id())
-        {
+        // Always rebuild final stats, while retaining the end-edge identity
+        // if a scene packet has changed the live metadata during the hold.
+        if self.pending_fight_end.is_some() {
+            self.refresh_pending_fight_end(now_ms);
+        } else {
             self.pending_fight_end = self.capture_fight_end_record(now_ms, ended_at_ms);
         }
         self.flush_pending_fight_end();
@@ -992,6 +1007,48 @@ impl Pipeline {
                 fight_id: self.meter.diagnostic_fight_id(),
                 scene_id: self.meter.diagnostic_scene_id(),
             })
+    }
+
+    fn preserve_reset_fight(&mut self, ended: meter::EndedFight) {
+        let title = history_title(&ended.snapshot.encounter);
+        let subtitle = encounter_subtitle(&ended.snapshot.encounter);
+        let Some(mut record) =
+            history::record_from_snapshot(&ended.snapshot, ended.ended_at_ms, title, subtitle)
+        else {
+            return;
+        };
+        // Scene packets can replace live metadata while the old rows remain
+        // held. Keep the end-edge identity, but use all final combat stats.
+        let scene_id = if let Some(pending) = &self.pending_fight_end {
+            record.boss_monster_id = pending.record.boss_monster_id;
+            record.boss_name = pending.record.boss_name.clone();
+            record.is_boss = pending.record.is_boss;
+            record.scene_id = pending.record.scene_id;
+            record.scene_name = pending.record.scene_name.clone();
+            record.title = pending.record.title.clone();
+            record.subtitle = pending.record.subtitle.clone();
+            pending.scene_id
+        } else {
+            ended.scene_id
+        };
+        self.pending_fight_end = Some(PendingFightEnd {
+            record,
+            fight_id: ended.fight_id,
+            scene_id,
+        });
+    }
+
+    fn refresh_pending_fight_end(&mut self, now_ms: u64) {
+        if self.pending_fight_end.is_some()
+            && let Some(ended_at_ms) = self.meter.fight_end_ms()
+        {
+            self.preserve_reset_fight(meter::EndedFight {
+                snapshot: self.meter.snapshot(now_ms),
+                ended_at_ms,
+                fight_id: self.meter.diagnostic_fight_id(),
+                scene_id: self.meter.diagnostic_scene_id(),
+            });
+        }
     }
 
     /// Decides what happens to `pending_fight_end` when the state leaves
@@ -1387,9 +1444,11 @@ fn publish(
         repaint.wake();
         *last_published = Some(snap.clone());
     }
-    if tx_snapshot.try_send(snap).is_err() {
+    if let Err(TrySendError::Full(snap)) = tx_snapshot.try_send(snap) {
         let _ = stale.try_recv();
-        let _ = tx_snapshot.try_send(pipeline.snapshot_focused(now, skill_focus));
+        // Recover the already-built snapshot. A slow UI should only replace
+        // its stale slot, rather than rebuilding every focused skill table.
+        let _ = tx_snapshot.try_send(snap);
     }
     rolling_diagnostics
         .publishes
@@ -1441,6 +1500,66 @@ mod tests {
             timestamp_ms: ts,
             is_dead: false,
         }
+    }
+
+    /// Exercise a full capture-sized queue and a stalled UI with all twenty
+    /// players' skill breakdowns open. The producer blocks after the initial
+    /// burst: this checks accounting and consumer progress, not a guarantee
+    /// against capture's nonblocking queue-full drops under arbitrary load.
+    #[test]
+    fn a_stalled_snapshot_consumer_does_not_block_a_combat_burst() {
+        let path = bpsr_test_support::scratch_path("pipeline-stalled-ui-burst");
+        let (tx_events, rx_events) = bounded(4_096);
+        let (tx_command, rx_command) = crossbeam_channel::unbounded();
+        let ts = now_ms();
+        let count = 20 * 64 * 16;
+        let event = |i: usize| {
+            proto::ProtocolEvent::Damage(proto::DamageEvent {
+                skill_id: 1_000 + ((i / 20) % 64) as i32,
+                ..damage((i % 20 + 1) as i64, 1, ts)
+            })
+        };
+        for i in 0..4_096 {
+            tx_events.try_send(event(i)).unwrap();
+        }
+        tx_command
+            .send(UiCommand::SkillFocus((1..=20).collect()))
+            .unwrap();
+        let started = Instant::now();
+        let (rx_snapshot, thread) = spawn(
+            rx_events,
+            rx_command,
+            path.clone(),
+            None,
+            QueueDropSignal::new(),
+            None,
+            RepaintHandle::new(),
+        );
+        // Keep the UI slot occupied throughout production and explicitly
+        // publish at least two ticks while it remains unread.
+        for i in 4_096..count {
+            tx_events
+                .send_timeout(event(i), Duration::from_secs(5))
+                .unwrap();
+        }
+        std::thread::sleep(TICK_INTERVAL * 3);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snap = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let snap = rx_snapshot.recv_timeout(remaining).unwrap();
+            if snap.total_damage == count as i64 {
+                break snap;
+            }
+        };
+        tx_command.send(UiCommand::Quit).unwrap();
+        thread.join().unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(snap.rows.len(), 20);
+        assert!(snap.rows.iter().all(|row| row.skills.len() == 64));
+        eprintln!(
+            "stalled-UI burst: {count} events, 20 players × 64 skills, elapsed={:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -2386,6 +2505,91 @@ mod tests {
             let _ = std::fs::remove_file(&path);
 
             assert_eq!(count, 1);
+        }
+
+        #[test]
+        fn trailing_grace_damage_survives_an_early_reset_or_shutdown() {
+            for boundary in ["new_fight", "manual", "scene", "town", "shutdown"] {
+                let path = temp_history_path(boundary);
+                let (handle, thread) =
+                    HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+                let mut pipeline = Pipeline::new().with_history(handle.clone());
+                pipeline.step(proto::ProtocolEvent::Scene { level_map_id: 1150 }, 0);
+                pipeline.step(boss_appear(10, 103, 1_000, 1_000, 0), 0);
+                pipeline.step(hit_on(10, 100, 1_000, false), 1_000);
+                pipeline.step(hit_on(10, 100, 2_000, true), 2_000);
+                pipeline.step(hit_on(10, 75, 2_010, false), 2_010);
+                assert_eq!(pipeline.snapshot(2_010).total_damage, 275);
+                match boundary {
+                    "new_fight" => {
+                        pipeline.step(hit_on(20, 300, 2_020, false), 2_020);
+                    }
+                    "manual" => pipeline.reset(2_020),
+                    "scene" => {
+                        pipeline.step(proto::ProtocolEvent::Scene { level_map_id: 1001 }, 2_020);
+                    }
+                    "town" => {
+                        pipeline.step(proto::ProtocolEvent::Scene { level_map_id: 7 }, 2_020);
+                        let state = pipeline.tick(4_001);
+                        pipeline.record_fight_end(state, 4_001);
+                    }
+                    "shutdown" => pipeline.finalize_for_shutdown(2_020),
+                    _ => unreachable!(),
+                }
+                pipeline.record_fight_end(pipeline.meter.fight_state(2_020), 2_020);
+                let rows = list_rows(&handle);
+                let record = load_record(&handle, rows[0].id);
+                drop(handle);
+                drop(pipeline);
+                thread.join().unwrap();
+                let _ = std::fs::remove_file(&path);
+                assert_eq!(rows.len(), 1, "{boundary}");
+                assert_eq!(rows[0].total_damage, 275, "{boundary}");
+                assert_eq!(record.scene_id, Some(1150), "{boundary}");
+                assert_eq!(record.boss_monster_id, Some(103), "{boundary}");
+            }
+        }
+
+        #[test]
+        fn a_previously_recorded_fight_does_not_hide_a_new_lethal_opener() {
+            let path = temp_history_path("recorded-then-lethal-opener");
+            let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+            let mut pipeline = Pipeline::new().with_history(handle.clone());
+            pipeline.step(boss_appear(10, 103, 1_000, 1_000, 0), 0);
+            pipeline.step(hit_on(10, 100, 1_000, false), 1_000);
+            pipeline.step(hit_on(10, 100, 2_000, true), 2_000);
+            let state = pipeline.tick(4_001);
+            pipeline.record_fight_end(state, 4_001);
+            assert_eq!(row_count(&handle), 1);
+            pipeline.step(boss_appear(20, 103, 1_000, 1_000, 5_000), 5_000);
+            pipeline.step(hit_on(20, 300, 5_000, true), 5_000);
+            assert_eq!(pipeline.meter.fight_state(5_000), meter::FightState::Ended);
+            let state = pipeline.tick(8_001);
+            pipeline.record_fight_end(state, 8_001);
+            let rows = list_rows(&handle);
+            drop(handle);
+            drop(pipeline);
+            thread.join().unwrap();
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].total_damage, 300);
+            assert_eq!(rows[1].total_damage, 200);
+        }
+
+        #[test]
+        fn an_idle_end_reset_by_damage_before_the_next_tick_reaches_history() {
+            let path = temp_history_path("idle-end-damage-before-tick");
+            let (handle, thread) = HistoryHandle::spawn(path.clone(), no_floor_policy()).unwrap();
+            let mut pipeline = Pipeline::new().with_history(handle.clone());
+            pipeline.step(hit_on(10, 100, 1_000, false), 1_000);
+            pipeline.step(hit_on(20, 300, 10_001, false), 10_001);
+            let rows = list_rows(&handle);
+            drop(handle);
+            drop(pipeline);
+            thread.join().unwrap();
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].total_damage, 100);
         }
 
         /// Issue #429: phase continuation is an explicit meter state, not a

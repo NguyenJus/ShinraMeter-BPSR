@@ -302,7 +302,18 @@ fn target_key(d: &DamageEvent) -> EntityId {
     d.target
 }
 
+/// A completed encounter captured immediately before a reset clears its rows.
+/// Only callers of [`Meter::apply_preserving_ended_fight`] request this work.
+pub struct EndedFight {
+    pub snapshot: Snapshot,
+    pub ended_at_ms: u64,
+    pub fight_id: u64,
+    pub scene_id: Option<u32>,
+}
+
 pub struct Meter {
+    capture_ended_reset: bool,
+    ended_reset: Option<EndedFight>,
     /// Per-player state, keyed on the whole-uuid [`EntityId`] rather than the
     /// truncated display uid (issue #335). The display uid is not unique —
     /// a server session recycles it, and a shadow/mirror entity shares one
@@ -511,6 +522,8 @@ struct FightIdentity {
 impl Meter {
     pub fn new() -> Self {
         Self {
+            capture_ended_reset: false,
+            ended_reset: None,
             players: HashMap::new(),
             names: HashMap::new(),
             names_seq: 0,
@@ -1015,6 +1028,21 @@ impl Meter {
         } else {
             FightState::Idle
         }
+    }
+
+    /// Applies an event and preserves an ended fight if that event resets it.
+    /// The snapshot is built at the actual reset boundary, including an idle
+    /// end latched by this very event, without predicting reset conditions or
+    /// cloning the encounter on every event. Ordinary [`Self::apply`] callers
+    /// incur no snapshot work.
+    pub fn apply_preserving_ended_fight(
+        &mut self,
+        ev: &ProtocolEvent,
+    ) -> (Option<ResetReason>, Option<EndedFight>) {
+        self.capture_ended_reset = true;
+        let reason = self.apply(ev);
+        self.capture_ended_reset = false;
+        (reason, self.ended_reset.take())
     }
 
     /// Routes an event into the encounter state. Returns `Some(reason)` when
@@ -2124,7 +2152,8 @@ impl Meter {
         // to track it in.
         self.last_event_ms = self.last_event_ms.max(d.timestamp_ms);
 
-        if self.fight_start_ms().is_none() {
+        let started_fight = self.fight_start_ms().is_none();
+        if started_fight {
             self.fight_lifecycle.start(d.timestamp_ms);
             self.diagnostic_fight_id = self.diagnostic_fight_id.saturating_add(1);
             self.grace_logged_fight = None;
@@ -2132,6 +2161,20 @@ impl Meter {
         }
 
         self.accumulate_damage_stats(d);
+
+        // A lethal opening hit establishes the fight clock only above, and
+        // the boss was not selected before its first damage. Give that kill
+        // the same immediate end as a later hit. Already-ended fights are
+        // ignored by the shared handler; its objective and other-boss gates
+        // still decide whether this kill completes the encounter.
+        if started_fight
+            && self.fight_cfg.end_on_boss_death
+            && d.is_dead
+            && d.target_kind == EntityKind::Monster
+            && self.boss_entity == Some(target_key(d))
+        {
+            self.end_fight_on_boss_death(target_key(d), d.timestamp_ms, DeathSignal::DamageIsDead);
+        }
 
         reason
     }
@@ -4073,6 +4116,16 @@ impl Meter {
     /// so no separate clearing step is needed here.
     ///
     pub fn reset(&mut self, reason: ResetReason, now_ms: u64) {
+        if self.capture_ended_reset
+            && let Some(ended_at_ms) = self.fight_end_ms()
+        {
+            self.ended_reset = Some(EndedFight {
+                snapshot: self.snapshot(now_ms),
+                ended_at_ms,
+                fight_id: self.diagnostic_fight_id,
+                scene_id: self.scene_id,
+            });
+        }
         // `reset` is itself already an event, never a per-snapshot poll, so
         // this is naturally sparse (issue #69) — no transition-only guard
         // needed the way scene/boss logging above requires one.
@@ -8480,6 +8533,27 @@ mod tests {
 
             assert_eq!(m.fight_state(1_100), FightState::Ended);
             assert_eq!(m.snapshot(60_000).duration_ms, 1_000);
+        }
+
+        #[test]
+        fn a_lethal_opening_hit_honors_boss_death_configuration() {
+            for enabled in [false, true] {
+                let mut m = Meter::with_fight_config(FightConfig {
+                    end_on_boss_death: enabled,
+                    ..FightConfig::default()
+                });
+                m.apply(&hp(10, 50, Some(103), 0));
+                m.apply(&boss_hit(10, 1_000, true));
+                assert_eq!(m.snapshot(1_100).total_damage, 100);
+                assert_eq!(
+                    m.fight_state(1_100),
+                    if enabled {
+                        FightState::Ended
+                    } else {
+                        FightState::Active
+                    }
+                );
+            }
         }
 
         /// Issue #339/#272: a recognized boss's decoded `AttrState` going
@@ -14688,6 +14762,17 @@ mod tests {
             m.apply(&boss_hit(BOSS_UID, 2_000, true));
 
             assert_eq!(m.fight_state(2_100), FightState::Active);
+        }
+
+        #[test]
+        fn a_lethal_opening_hit_does_not_override_an_incomplete_objective() {
+            let mut m = Meter::new();
+            m.apply(&dungeon_state(EDungeonState::Active));
+            m.apply(&objective(100, Some(0), Some(false)));
+            m.apply(&hp(BOSS_UID, BOSS, 1_000));
+            m.apply(&boss_hit(BOSS_UID, 2_000, true));
+            assert_eq!(m.fight_state(2_100), FightState::Active);
+            assert_eq!(m.fight_end_ms(), None);
         }
 
         /// §8's counterpart: once the current objective is marked
