@@ -1526,13 +1526,13 @@ impl OverlayApp {
         available: CheckOutcome,
         result: Result<PathBuf, String>,
     ) -> UpdateCheckState {
-        self.finish_update_install_with(ctx, available, result, update_check::relaunch)
+        self.finish_update_install_with(ctx, available, result, update_check::relaunch_or_restore)
     }
 
     /// The body of `finish_update_install`, with the actual relaunch call
     /// taken as a parameter instead of hard-coded to `update_check::relaunch`.
     /// `finish_update_install` is the only production caller and always
-    /// passes `update_check::relaunch`, so behavior is unchanged; tests use
+    /// passes `update_check::relaunch_or_restore`; tests use
     /// this seam to drive the success branch without spawning a real
     /// process.
     fn finish_update_install_with(
@@ -1552,16 +1552,10 @@ impl OverlayApp {
             }
         };
         if let Err(err) = relaunch(&installed) {
-            // The swap succeeded, so the executable on disk *is* the new
-            // build — only starting it failed. Say so explicitly: telling
-            // the user the update failed would be wrong, and re-running the
-            // download would be pointless work.
             log::error!("installed the update but couldn't relaunch: {err}");
             return UpdateCheckState::InstallFailed {
                 available,
-                error: format!(
-                    "the update was installed but couldn't be started ({err}) — close the meter and open it again"
-                ),
+                error: format!("the installed update couldn't be started ({err})"),
             };
         }
         log::info!(
@@ -6060,6 +6054,7 @@ mod tests {
             tag: "v0.3.0".to_string(),
             url: "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/tag/v0.3.0".to_string(),
             asset_url: asset_url.map(str::to_string),
+            asset_digest: None,
         }
     }
 

@@ -33,6 +33,8 @@ log = { workspace = true }
 env_logger = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+same-file = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true }
 chrono = { workspace = true }

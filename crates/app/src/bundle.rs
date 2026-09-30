@@ -348,6 +348,17 @@ pub(crate) fn export_bundle_to_with_missing(
     prior_missing: &[String],
 ) -> io::Result<Vec<String>> {
     fs::create_dir_all(dest_dir)?;
+    // Validate before copying: an export into an artifact's own directory
+    // must not truncate the live source while trying to copy it to itself.
+    for (name, source) in entries {
+        let dest = dest_dir.join(name);
+        if crate::paths::same_file_if_exists(source, &dest)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the bundle destination contains a source artifact; pick a different directory",
+            ));
+        }
+    }
     let mut missing = prior_missing.to_vec();
     for (name, source) in entries {
         let dest = dest_dir.join(name);
@@ -676,6 +687,71 @@ mod tests {
     }
 
     // -- export_bundle_to (touches disk) -----------------------------------
+
+    #[test]
+    fn export_bundle_to_refuses_a_hard_link_to_the_source() {
+        let dir =
+            std::env::temp_dir().join(format!("shinra-bundle-hard-link-{}", std::process::id()));
+        let bundle = dir.join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+        let source = dir.join("dump.jsonl");
+        let destination = bundle.join("dump.jsonl");
+        fs::write(&source, b"preserve the diagnostic artifact").unwrap();
+        fs::hard_link(&source, &destination).unwrap();
+        let manifest = build_manifest(
+            "1-1700000000",
+            "0.3.5",
+            1_700_000_000,
+            DumpStatus {
+                inspect_enabled: true,
+                dump_byte_budget: 100,
+                dropped_records: Some(0),
+                dump_sanitized: true,
+                sanitized_out_records: None,
+            },
+        );
+        let entries = vec![("dump.jsonl".into(), source.clone())];
+        assert_eq!(
+            export_bundle_to(&bundle, &entries, &manifest, None, false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            fs::read(source).unwrap(),
+            b"preserve the diagnostic artifact"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn export_bundle_to_preserves_an_artifact_when_the_destination_overlaps() {
+        let dir =
+            std::env::temp_dir().join(format!("shinra-bundle-overlap-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("dump.jsonl");
+        fs::write(&source, b"preserve this diagnostic artifact").unwrap();
+        let manifest = build_manifest(
+            "1-1700000000",
+            "0.3.5",
+            1_700_000_000,
+            DumpStatus {
+                inspect_enabled: true,
+                dump_byte_budget: 100,
+                dropped_records: Some(0),
+                dump_sanitized: true,
+                sanitized_out_records: None,
+            },
+        );
+        let entries = vec![("dump.jsonl".into(), source.clone())];
+        let err = export_bundle_to(&dir, &entries, &manifest, None, false).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            fs::read(source).unwrap(),
+            b"preserve this diagnostic artifact"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn export_bundle_to_copies_every_entry_and_writes_the_manifest() {

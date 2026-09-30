@@ -63,8 +63,10 @@ impl SqliteHistory {
         let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match version {
             0 => {
-                init_schema(&conn)?;
-                conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                let tx = conn.unchecked_transaction()?;
+                init_schema(&tx)?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                tx.commit()?;
             }
             v if v == SCHEMA_VERSION => {}
             v if v > 0 && v < SCHEMA_VERSION => {
@@ -91,8 +93,18 @@ impl SqliteHistory {
                 );
                 drop(conn);
                 let bak_path = path.with_extension(format!("v{v}.bak"));
-                let _ = fs::remove_file(&bak_path);
-                fs::rename(path, &bak_path).map_err(HistoryError::RenameAside)?;
+                // A repeated downgrade must not destroy an earlier preserved
+                // database. Keep the historical name when it is available,
+                // otherwise choose a numbered sibling.
+                let mut backup = bak_path.clone();
+                let mut suffix = 1u64;
+                while backup.exists() {
+                    let mut name = bak_path.as_os_str().to_owned();
+                    name.push(format!(".{suffix}"));
+                    backup = name.into();
+                    suffix += 1;
+                }
+                fs::rename(path, &backup).map_err(HistoryError::RenameAside)?;
                 return Self::open_inner(path, policy, false);
             }
             v => {
@@ -104,8 +116,10 @@ impl SqliteHistory {
                      forcing a fresh schema",
                     path.display()
                 );
-                init_schema(&conn)?;
-                conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                let tx = conn.unchecked_transaction()?;
+                init_schema(&tx)?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                tx.commit()?;
             }
         }
 
@@ -1792,6 +1806,39 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn repeated_unknown_schema_reset_preserves_existing_backups() {
+        let path = super::super::temp_history_path("unknown-backup-preservation");
+        let backup = path.with_extension("v99.bak");
+        let mut next_name = backup.as_os_str().to_owned();
+        next_name.push(".1");
+        let next = std::path::PathBuf::from(next_name);
+        fs::write(&backup, b"previous preserved history").unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 99).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE preserved (value TEXT); INSERT INTO preserved VALUES ('newer history');",
+        )
+        .unwrap();
+        drop(conn);
+        let store = SqliteHistory::open(&path, RetentionPolicy::default()).unwrap();
+        assert!(store.list(10).unwrap().is_empty());
+        assert_eq!(fs::read(&backup).unwrap(), b"previous preserved history");
+        let saved = Connection::open(&next).unwrap();
+        assert_eq!(
+            saved
+                .query_row("SELECT value FROM preserved", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "newer history"
+        );
+        drop(saved);
+        drop(store);
+        for file in [path, backup, next] {
+            fs::remove_file(file).unwrap();
+        }
     }
 
     #[test]

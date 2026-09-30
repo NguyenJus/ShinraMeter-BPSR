@@ -60,6 +60,20 @@ pub fn ensure_parent_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Compare existing filesystem identities, including hard links and path
+/// aliases. Missing files cannot share an identity; other lookup errors
+/// must stop destructive export/sanitization operations before they write.
+pub(crate) fn same_file_if_exists(source: &Path, destination: &Path) -> io::Result<bool> {
+    if source == destination {
+        return Ok(true);
+    }
+    match same_file::is_same_file(source, destination) {
+        Ok(same) => Ok(same),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -454,7 +454,14 @@ pub(crate) fn copy_logs_to_bundle(primary: &Path, dest_dir: &Path) -> io::Result
         let Some(name) = source.file_name() else {
             continue;
         };
-        if fs::copy(&source, dest_dir.join(name)).is_err() {
+        let dest = dest_dir.join(name);
+        if crate::paths::same_file_if_exists(&source, &dest)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the bundle destination contains the source logs; pick a different directory",
+            ));
+        }
+        if fs::copy(&source, &dest).is_err() {
             missing.push(name.to_string_lossy().into_owned());
         }
     }
@@ -498,18 +505,16 @@ pub(crate) fn export_logs_to(primary: &Path, dest: &Path) -> io::Result<()> {
     // the app's own log file, and asking the user to confirm an overwrite
     // is not the same as telling them it destroys the thing they're trying
     // to hand over — so the destination is checked here instead.
-    let dest_key = comparable_path(dest)?;
-    if let Some(part) = parts
-        .iter()
-        .find(|part| comparable_path(part).is_ok_and(|key| key == dest_key))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{} is one of the log files being exported; pick a different destination",
-                part.display()
-            ),
-        ));
+    for part in &parts {
+        if crate::paths::same_file_if_exists(part, dest)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is one of the log files being exported; pick a different destination",
+                    part.display()
+                ),
+            ));
+        }
     }
 
     let mut out = File::create(dest)?;
@@ -520,37 +525,6 @@ pub(crate) fn export_logs_to(primary: &Path, dest: &Path) -> io::Result<()> {
         writeln!(out)?;
     }
     Ok(())
-}
-
-/// The form of `path` that any two paths naming the same file share —
-/// symlinks, `.` and `..` resolved — so a destination spelled
-/// `logs\..\logs\ShinraMeter-BPSR.log` is still recognized as the live log
-/// (PR #227 review).
-///
-/// `canonicalize` only works on a file that exists, and an export
-/// destination usually doesn't yet — naming a new file is the save
-/// dialog's whole job — so a missing path falls back to canonicalizing its
-/// parent directory (which the dialog's `OFN_PATHMUSTEXIST` guarantees does
-/// exist) and re-joining the file name. That is enough for the comparison
-/// it feeds: a destination that doesn't exist can't be a source part, which
-/// by definition does.
-fn comparable_path(path: &Path) -> io::Result<PathBuf> {
-    if let Ok(canonical) = path.canonicalize() {
-        return Ok(canonical);
-    }
-    let name = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} names no file to export to", path.display()),
-        )
-    })?;
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        // A bare file name is relative to the working directory — the same
-        // place `log_file_path_from`'s own fallback puts the log file.
-        _ => Path::new("."),
-    };
-    Ok(parent.canonicalize()?.join(name))
 }
 
 /// Chains onto whatever panic hook was previously installed (never replaces
@@ -944,6 +918,40 @@ mod tests {
             let _ = fs::remove_file(log_chunk_path(&path, chunk));
         }
         let _ = fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn log_exports_refuse_hard_links_to_the_live_source() {
+        let dir = scratch_path("export-hard-link");
+        let bundle = dir.join("bundle");
+        fs::create_dir_all(&bundle).unwrap();
+        let source = dir.join("session.log");
+        let destination = bundle.join("session.log");
+        fs::write(&source, b"preserve the live log").unwrap();
+        fs::hard_link(&source, &destination).unwrap();
+        assert_eq!(
+            export_logs_to(&source, &destination).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read(&source).unwrap(), b"preserve the live log");
+        assert_eq!(
+            copy_logs_to_bundle(&source, &bundle).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read(&source).unwrap(), b"preserve the live log");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copy_logs_to_bundle_refuses_to_overwrite_its_source() {
+        let dir = scratch_path("bundle-overlap");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.log");
+        fs::write(&path, b"preserve this session").unwrap();
+        let err = copy_logs_to_bundle(&path, &dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&path).unwrap(), b"preserve this session");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -132,9 +132,26 @@ impl HistoryHandle {
         }
     }
 
+    /// A dead writer must complete UI requests with a failure, rather than
+    /// leave the view waiting for a reply that can never arrive.
+    fn send_with_reply(&self, request: HistoryRequest) {
+        if let Err(err) = self.tx.send(request) {
+            let reply = match err.0 {
+                HistoryRequest::List { reply, .. }
+                | HistoryRequest::Load { reply, .. }
+                | HistoryRequest::Delete { reply, .. }
+                | HistoryRequest::Clear { reply } => reply,
+                HistoryRequest::Record { .. } => unreachable!("record uses its own enqueue path"),
+            };
+            let message = "history thread is unavailable";
+            log::warn!("history: {message}");
+            let _ = reply.send(HistoryEvent::Failed(message.to_string()));
+        }
+    }
+
     /// Requests the newest `limit` encounters; the reply lands on `reply`.
     pub fn list(&self, limit: u32, reply: &Sender<HistoryEvent>) {
-        let _ = self.tx.send(HistoryRequest::List {
+        self.send_with_reply(HistoryRequest::List {
             limit,
             reply: reply.clone(),
         });
@@ -143,7 +160,7 @@ impl HistoryHandle {
     /// Requests one encounter's full detail (players included); the reply
     /// lands on `reply`.
     pub fn load(&self, id: i64, reply: &Sender<HistoryEvent>) {
-        let _ = self.tx.send(HistoryRequest::Load {
+        self.send_with_reply(HistoryRequest::Load {
             id,
             reply: reply.clone(),
         });
@@ -151,7 +168,7 @@ impl HistoryHandle {
 
     /// Requests that one encounter be deleted; the reply lands on `reply`.
     pub fn delete(&self, id: i64, reply: &Sender<HistoryEvent>) {
-        let _ = self.tx.send(HistoryRequest::Delete {
+        self.send_with_reply(HistoryRequest::Delete {
             id,
             reply: reply.clone(),
         });
@@ -159,7 +176,7 @@ impl HistoryHandle {
 
     /// Requests that every encounter be deleted; the reply lands on `reply`.
     pub fn clear(&self, reply: &Sender<HistoryEvent>) {
-        let _ = self.tx.send(HistoryRequest::Clear {
+        self.send_with_reply(HistoryRequest::Clear {
             reply: reply.clone(),
         });
     }
@@ -326,6 +343,24 @@ mod tests {
             total_immune: 0,
         };
         record_from_snapshot(&snapshot, 1_000, title.to_string(), None).unwrap()
+    }
+
+    #[test]
+    fn disconnected_writer_replies_to_every_ui_request() {
+        let (tx, rx) = unbounded();
+        drop(rx);
+        let handle = HistoryHandle { tx };
+        let (reply_tx, reply_rx) = unbounded();
+        handle.list(10, &reply_tx);
+        handle.load(1, &reply_tx);
+        handle.delete(1, &reply_tx);
+        handle.clear(&reply_tx);
+        for _ in 0..4 {
+            assert!(
+                matches!(reply_rx.try_recv(), Ok(HistoryEvent::Failed(message))
+                if message == "history thread is unavailable")
+            );
+        }
     }
 
     #[test]

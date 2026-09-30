@@ -202,6 +202,7 @@ pub(super) fn start_update_check() -> UpdateCheckState {
 pub(super) fn start_update_install(available: CheckOutcome) -> UpdateCheckState {
     let CheckOutcome::UpdateAvailable {
         asset_url: Some(asset_url),
+        asset_digest,
         ..
     } = &available
     else {
@@ -218,6 +219,7 @@ pub(super) fn start_update_install(available: CheckOutcome) -> UpdateCheckState 
         };
     };
     let url = asset_url.clone();
+    let digest = asset_digest.clone();
     let (tx, rx) = crossbeam_channel::unbounded();
     std::thread::Builder::new()
         .name("update-install".to_string())
@@ -225,6 +227,7 @@ pub(super) fn start_update_install(available: CheckOutcome) -> UpdateCheckState 
             let _ = tx.send(update_check::install_update(
                 &url,
                 env!("CARGO_PKG_VERSION"),
+                digest.as_deref(),
             ));
         })
         .expect("failed to spawn the update-install thread");
@@ -769,6 +772,7 @@ mod tests {
             tag: "v0.3.0".to_string(),
             url: "https://github.com/NguyenJus/ShinraMeter-BPSR/releases/tag/v0.3.0".to_string(),
             asset_url: None,
+            asset_digest: None,
         }));
 
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {

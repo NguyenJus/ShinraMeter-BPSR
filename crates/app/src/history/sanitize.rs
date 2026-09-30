@@ -115,6 +115,14 @@ impl Remap {
 /// be mistaken for a finished one by a caller that only checks whether the
 /// file exists.
 pub fn sanitize_copy(src: &Path, dst: &Path) -> Result<SanitizeReport, HistoryError> {
+    // This check must precede both destination deletion and error cleanup.
+    // A save path aliasing the source must never erase the history database.
+    if crate::paths::same_file_if_exists(src, dst).map_err(HistoryError::Copy)? {
+        return Err(HistoryError::Copy(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the sanitized history destination is the source database",
+        )));
+    }
     match sanitize_into(src, dst) {
         Ok(report) => Ok(report),
         Err(err) => {
@@ -496,6 +504,34 @@ mod tests {
         drop(store);
         let _ = fs::remove_file(&src);
         let _ = fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn sanitize_copy_refuses_a_hard_link_to_the_source() {
+        let source = seed_history();
+        let destination = temp_db_path("hard-link-destination");
+        let original = fs::read(&source).unwrap();
+        fs::hard_link(&source, &destination).unwrap();
+        assert!(sanitize_copy(&source, &destination).is_err());
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read(&destination).unwrap(), original);
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn sanitize_copy_refuses_a_destination_aliasing_the_source() {
+        let source = seed_history();
+        let original = fs::read(&source).unwrap();
+        assert!(sanitize_copy(&source, &source).is_err());
+        let alias = source
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(source.file_name().unwrap());
+        assert!(sanitize_copy(&source, &alias).is_err());
+        assert_eq!(fs::read(&source).unwrap(), original);
+        fs::remove_file(source).unwrap();
     }
 
     #[test]
