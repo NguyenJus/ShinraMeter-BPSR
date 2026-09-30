@@ -265,3 +265,25 @@ fn header_only_partial_bytes_do_not_panic() {
         assert!(events.is_empty());
     }
 }
+
+#[test]
+fn oversized_frame_preserves_following_frames_at_every_header_split() {
+    let good = damage_notify_frame(
+        (2i64 << 16) | 64,
+        base_damage((1i64 << 16) | 640, 1, 10),
+        false,
+    );
+    let total_len = bpsr_protocol::frame::MAX_FRAME_LEN + 1;
+    let mut stream = total_len.to_be_bytes().to_vec();
+    stream.extend_from_slice(&2u16.to_be_bytes());
+    stream.resize(total_len as usize, 0);
+    stream.extend_from_slice(&good);
+    // The oversized body and next valid frame can be coalesced by TCP.
+    // Header fragmentation must not change which frames survive rejection.
+    for cut in 0..=6 {
+        let mut decoder = Decoder::new();
+        assert!(decoder.push_stream(&stream[..cut], 0).is_empty());
+        assert_eq!(decoder.push_stream(&stream[cut..], 1).len(), 1, "cut={cut}");
+        assert_eq!(decoder.pending_len(), 0);
+    }
+}

@@ -303,6 +303,40 @@ mod tests {
     const PLAYER_UUID: i64 = (7i64 << 16) | 640;
 
     #[test]
+    fn sanitizer_retains_diagnostic_actual_value_and_remaps_identity() {
+        let original = pb::SyncNearDeltaInfo {
+            delta_infos: vec![pb::AoiSyncDelta {
+                uuid: (91i64 << 16) | 64,
+                skill_effects: Some(pb::SkillEffect {
+                    damages: vec![pb::SyncDamageInfo {
+                        attacker_uuid: PLAYER_UUID,
+                        value: 100,
+                        actual_value: 75,
+                        ..Default::default()
+                    }],
+                }),
+                ..Default::default()
+            }],
+        };
+        let payload = sanitize(
+            opcode::SYNC_NEAR_DELTA_INFO,
+            &original.encode_to_vec(),
+            &mut Remap::new(),
+        )
+        .unwrap();
+        let decoded = pb::SyncNearDeltaInfo::decode(payload.as_slice()).unwrap();
+        let hit = &decoded.delta_infos[0]
+            .skill_effects
+            .as_ref()
+            .unwrap()
+            .damages[0];
+        assert_eq!(hit.value, 100);
+        assert_eq!(hit.actual_value, 75);
+        assert_ne!(hit.attacker_uuid, PLAYER_UUID);
+        assert_ne!(decoded.delta_infos[0].uuid, original.delta_infos[0].uuid);
+    }
+
+    #[test]
     fn uuid_remap_preserves_low_16_bits_and_is_stable() {
         let mut r = Remap::new();
         let a = r.uuid(PLAYER_UUID);

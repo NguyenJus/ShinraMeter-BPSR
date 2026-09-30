@@ -942,37 +942,44 @@ impl Decoder {
         let sink = self.sink.as_deref();
         let entities = &mut self.entities;
         let mut out = Vec::new();
-        let (consumed, desync) = {
-            let result = split_frames(&self.tail);
-            let mut notifies = Vec::new();
+        let mut consumed = 0;
+        loop {
+            let result = split_frames(&self.tail[consumed..]);
             for f in &result.frames {
+                // Release payloads after each outer frame instead of retaining
+                // every expanded Notify in this TCP batch simultaneously.
+                let mut notifies = Vec::new();
                 parse_frame(f, 0, &mut notifies, sink, now_ms);
+                for n in &notifies {
+                    decode_notify(n, now_ms, &mut out, sink, entities);
+                }
             }
-            for n in &notifies {
-                decode_notify(n, now_ms, &mut out, sink, entities);
+            consumed += result.consumed;
+            match result.desync {
+                None => break,
+                Some(Desync::Unrecoverable) => {
+                    log::debug!("bpsr-protocol: stream desync, dropping buffered tail");
+                    consumed = self.tail.len();
+                    break;
+                }
+                Some(Desync::Oversized { total_len }) => {
+                    // Skip exactly this frame, retaining any following frames
+                    // already coalesced into the same TCP batch.
+                    let dropped = (total_len as usize).min(self.tail.len() - consumed);
+                    consumed += dropped;
+                    self.skip = u64::from(total_len) - dropped as u64;
+                    log::debug!(
+                        "bpsr-protocol: refusing {total_len}-byte frame, skipping {} more bytes",
+                        self.skip
+                    );
+                    if self.skip > 0 {
+                        break;
+                    }
+                }
             }
-            (result.consumed, result.desync)
-        };
+        }
         if consumed > 0 {
             self.tail.drain(..consumed);
-        }
-        match desync {
-            None => {}
-            Some(Desync::Unrecoverable) => {
-                log::debug!("bpsr-protocol: stream desync, dropping buffered tail");
-                self.tail.clear();
-            }
-            Some(Desync::Oversized { total_len }) => {
-                // `tail` now starts at the refused frame's length prefix, so
-                // whatever is buffered already counts against the skip.
-                let buffered = self.tail.len() as u64;
-                self.tail.clear();
-                self.skip = u64::from(total_len).saturating_sub(buffered);
-                log::debug!(
-                    "bpsr-protocol: refusing {total_len}-byte frame, skipping {} more bytes",
-                    self.skip
-                );
-            }
         }
         // Backstop: a pending frame is capped at MAX_FRAME_LEN, so the tail
         // cannot legitimately exceed MAX_TAIL_LEN. If it ever does, the stream
@@ -1032,6 +1039,7 @@ mod tests {
             r#type: EDamageType::Normal as i32,
             type_flag: 0,
             value: 100,
+            actual_value: 0,
             lucky_value: 0,
             hp_lessen_value: 100,
             attacker_uuid: ATTACKER_UUID,
@@ -1066,6 +1074,17 @@ mod tests {
             ProtocolEvent::Damage(d) => d,
             other => panic!("expected Damage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn diagnostic_actual_value_does_not_replace_reported_damage() {
+        let dmg = pb::SyncDamageInfo {
+            actual_value: 999,
+            ..base_damage()
+        };
+        let mut out = Vec::new();
+        decode_notify(&notify_for_damage(dmg), 0, &mut out, None);
+        assert_eq!(only_damage(out).value, 100);
     }
 
     #[test]

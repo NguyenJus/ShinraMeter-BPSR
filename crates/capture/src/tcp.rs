@@ -98,13 +98,11 @@ pub struct TcpReassembler {
     /// already consumed: a buffer-cap trim or a stall-guard resync. Cleared
     /// by [`Self::take_loss`].
     loss: bool,
-    /// `now_ms` (caller-supplied, see [`Self::push`]) at which `next_seq`
-    /// last advanced. `None` before the first push and after any resync,
-    /// until the next push (progress or not) seeds it. Drives the
-    /// time-budget half of the stall guard (issue #405); the push-count half
-    /// (`stall_pushes`) is tracked separately since a busy-but-stuck stream
-    /// keeps pushing without ever advancing `next_seq`.
-    last_advance_ms: Option<u64>,
+    /// Start of the current no-progress interval while waiting on a gap.
+    /// `None` when caught up: healthy idle time must not spend a future
+    /// gap's recovery budget. Progress with another gap pending restarts
+    /// this clock, as does a stall-guard re-anchor.
+    stalled_since_ms: Option<u64>,
 }
 
 impl TcpReassembler {
@@ -133,7 +131,7 @@ impl TcpReassembler {
             stall_pushes: 0,
             stall_backoff: 1,
             loss: false,
-            last_advance_ms: None,
+            stalled_since_ms: None,
         }
     }
 
@@ -232,7 +230,11 @@ impl TcpReassembler {
         if after != before {
             // Forward progress: whatever gap was being waited on is gone.
             self.stall_pushes = 0;
-            self.last_advance_ms = Some(now_ms);
+            self.stalled_since_ms = if self.cache.is_empty() {
+                None
+            } else {
+                Some(now_ms)
+            };
             // Progress with nothing left cached: the stream is fully caught
             // up, not just past the one gap that last tripped. Only this —
             // not merely surviving to the next push — earns back the
@@ -250,10 +252,10 @@ impl TcpReassembler {
             // `stall_pushes`, once `next_seq` has been stuck for longer than
             // `STALL_TIME_BUDGET_MS` *and* the cache behind the gap is
             // holding more than `STALL_BYTES_BUDGET`.
-            let stuck_for_ms = match self.last_advance_ms {
+            let stuck_for_ms = match self.stalled_since_ms {
                 Some(last) => now_ms.saturating_sub(last),
                 None => {
-                    self.last_advance_ms = Some(now_ms);
+                    self.stalled_since_ms = Some(now_ms);
                     0
                 }
             };
@@ -301,7 +303,11 @@ impl TcpReassembler {
                     }
                 }
                 self.loss = true;
-                self.last_advance_ms = Some(now_ms);
+                self.stalled_since_ms = if self.cache.is_empty() {
+                    None
+                } else {
+                    Some(now_ms)
+                };
                 // The cluster that just tripped the guard is exactly the
                 // condition most likely to repeat right away (#283): back
                 // off so the next gap gets more real chances to fill
@@ -455,13 +461,9 @@ impl TcpReassembler {
         self.buffer.clear();
         self.next_seq = Some(seq);
         self.stall_pushes = 0;
-        // The new anchor has not "just advanced" in time-budget terms — the
-        // caller supplies no `now_ms` here — so clear it rather than carry a
-        // stale timestamp from the abandoned flow forward. The first
-        // no-progress push after a resync seeds the clock off its own
-        // `now_ms`, so the time-budget trip (#405) starts counting
-        // from that push rather than being disabled indefinitely.
-        self.last_advance_ms = None;
+        // A new flow has no pending gap. Its first no-progress push seeds
+        // the time budget from that push, excluding healthy idle time.
+        self.stalled_since_ms = None;
         // An externally driven resync — win.rs adopting a brand-new server
         // connection onto this instance — starts a fresh flow, whose gaps
         // have nothing to do with the dead flow's. Carrying the old flow's
@@ -980,6 +982,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn healthy_idle_time_does_not_expire_a_new_reordering_gap() {
+        let mut r = TcpReassembler::new();
+        r.push(1000, b"AAA", 0);
+        assert_eq!(r.take_stream(), b"AAA");
+        // Two ordinary-sized segments arrive out of order after a quiet
+        // interval. Their missing prefix is only milliseconds late.
+        let chunk = vec![b'X'; 40 * 1024];
+        r.push(1006, &chunk, 60_000);
+        r.push(1006 + chunk.len() as u32, &chunk, 60_001);
+        assert!(
+            !r.take_loss(),
+            "idle time is not time spent waiting on a gap"
+        );
+        assert!(r.take_stream().is_empty());
+        r.push(1003, b"BBB", 60_002);
+        let mut expected = b"BBB".to_vec();
+        expected.extend_from_slice(&chunk);
+        expected.extend_from_slice(&chunk);
+        assert_eq!(r.take_stream(), expected);
+        assert!(!r.take_loss());
+    }
+
     /// The mirror image: below either budget, the guard must not trip early
     /// just because the clock or cache crossed one threshold alone.
     #[test]
@@ -1009,7 +1034,7 @@ mod tests {
         );
     }
 
-    /// After a `resync` (win.rs adopting a new connection), `last_advance_ms`
+    /// After a `resync` (win.rs adopting a new connection), `stalled_since_ms`
     /// is cleared. If the first push after that never advances `next_seq`
     /// (e.g. the adopting packet itself lands past a gap), the wall-clock
     /// budget must not stay disabled forever — the first no-progress push
@@ -1017,9 +1042,9 @@ mod tests {
     #[test]
     fn a_no_progress_push_after_resync_still_seeds_the_wall_clock_budget() {
         let mut r = TcpReassembler::new();
-        r.resync(1000); // next_seq = 1000, last_advance_ms cleared to None
+        r.resync(1000); // next_seq = 1000, stalled_since_ms cleared to None
         let big = vec![b'X'; 70 * 1024]; // well over STALL_BYTES_BUDGET
-        // First no-progress push after the resync: seeds last_advance_ms at
+        // First no-progress push after the resync: seeds stalled_since_ms at
         // t=0 rather than tripping immediately.
         r.push(5000, &big, 0);
         assert!(
